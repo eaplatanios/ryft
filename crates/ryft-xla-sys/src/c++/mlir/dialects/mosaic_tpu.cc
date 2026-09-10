@@ -10,7 +10,7 @@
 #include "mlir/CAPI/Support.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "jaxlib/mosaic/dialect/tpu/tpu_dialect.h"
+#include "xla/mosaic/dialect/tpu/tpu_dialect.h"
 
 namespace {
 
@@ -265,10 +265,6 @@ MlirAttribute mlirMosaicTpuElementWindowAttrGetPadHigh(MlirAttribute attribute) 
   auto typedAttribute = dynCastAttribute<mlir::tpu::ElementWindowAttr>(attribute);
   return typedAttribute ? getDenseI64ArrayAttr(typedAttribute.getContext(), typedAttribute.getPadHigh())
                         : MlirAttribute{nullptr};
-}
-
-bool mlirAttributeIsAMosaicTpuVectorLayoutAttr(MlirAttribute attribute) {
-  return isAttribute<mlir::tpu::VectorLayoutAttr>(attribute);
 }
 
 bool mlirAttributeIsAMosaicTpuTiledLayoutAttr(MlirAttribute attribute) {

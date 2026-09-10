@@ -84,7 +84,7 @@ def check_mosaic_surface(jax_root: Path, ryft_mlir_root: Path) -> None:
     )
     interface_names = sorted(set(re.findall(r'AttrInterface<"([^"]+)"', tablegen)))
 
-    expected_counts = {"attributes": 16, "interfaces": 1, "operations": 37, "types": 1}
+    expected_counts = {"attributes": 17, "interfaces": 1, "operations": 43, "types": 3}
     actual_counts = {
         "attributes": len(attribute_names),
         "interfaces": len(interface_names),
@@ -288,8 +288,8 @@ def check_versions_and_routes(jax_root: Path, ryft_xla_sys_root: Path, ryft_mlir
     modules_text = read(ryft_mlir_root, "src/modules.rs")
     operations_text = read(ryft_mlir_root, "src/operations/operation.rs")
     for function_name, source_text in (
-        ("parse_module_bytes", modules_text),
-        ("parse_operation_bytes", operations_text),
+        ("parse_module_from_bytes", modules_text),
+        ("parse_operation_from_bytes", operations_text),
         ("bytecode", operations_text),
     ):
         if not re.search(rf"\bfn\s+{function_name}\b", source_text):
@@ -500,6 +500,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 OPERATIONS = [
+    "arrive_dyn_expect_tx_supported",
+    "assume_multiple",
+    "async_store_smem",
+    "get_cluster_ref",
+    "mma",
+    "vector_concat",
     "arrive",
     "arrive_expect_tx",
     "async_load",
@@ -553,7 +559,8 @@ ATTRIBUTES = [
     "TileTransform",
     "TiledLayout",
     "Tmem",
-    "TransposeTransform",
+    "SmemCluster",
+    "TMEMLoadReduction",
     "WGSplatFragLayout",
     "WGStridedFragLayout",
 ]
@@ -579,6 +586,8 @@ class SourceFixture:
     def _create(self) -> None:
         tablegen = [
             'def MosaicGPU_Barrier : MosaicGPU_Type<"Barrier", "barrier">;',
+            'def MosaicGPU_B6x16P32 : MosaicGPU_Type<"B6x16P32", "b6x16p32">;',
+            'def MosaicGPU_P2B6 : MosaicGPU_Type<"P2B6", "p2b6">;',
             'def MosaicGPU_CopyPartitionAttrInterface : AttrInterface<"CopyPartition">;',
         ]
         tablegen.extend(
@@ -837,12 +846,12 @@ pub const MOSAIC_GPU_FFI_TARGET: &str = "mosaic_gpu_v2";
                 + ["pub struct CopyPartitionAttributeRef;"]
             ),
         )
-        self.write(self.ryft_mlir, "src/dialects/mosaic/gpu/types.rs", "pub struct BarrierTypeRef;\n")
-        self.write(self.ryft_mlir, "src/modules.rs", "pub fn parse_module_bytes() {}\n")
+        self.write(self.ryft_mlir, "src/dialects/mosaic/gpu/types.rs", "pub struct BarrierTypeRef;\npub struct B6x16P32TypeRef;\npub struct P2B6TypeRef;\n")
+        self.write(self.ryft_mlir, "src/modules.rs", "pub fn parse_module_from_bytes() {}\n")
         self.write(
             self.ryft_mlir,
             "src/operations/operation.rs",
-            "pub fn parse_operation_bytes() {}\npub fn bytecode() {}\n",
+            "pub fn parse_operation_from_bytes() {}\npub fn bytecode() {}\n",
         )
 
     def args(self) -> argparse.Namespace:

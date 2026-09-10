@@ -91,7 +91,7 @@ RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmDependentLibrariesAttr(MlirAttribut
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmUwTableKindAttr(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdStringAttr(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdConstantAttr(MlirAttribute attribute);
-RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdFuncAttr(MlirAttribute attribute);
+RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdGlobalValueAttr(MlirAttribute attribute);
 RYFT_XLA_SYS_EXPORT bool mlirAttributeIsALlvmMdNodeAttr(MlirAttribute attribute);
 
 RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmAddressSpaceAttrGet(MlirContext context, uint32_t addressSpace);

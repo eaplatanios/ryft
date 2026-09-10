@@ -1,13 +1,25 @@
+//! Typed constructors and accessors for Mosaic GPU operations.
+//!
+//! Constructors load the dialect and return detached operations for insertion into an MLIR block. Operand segment
+//! attributes preserve the positions of optional and variadic operands. Construct a containing module and call
+//! [`Operation::verify`] to check the dialect's type, shape, memory-space, and region constraints.
+//!
+//! These operations describe GPU work; constructing or verifying them does not execute that work or synchronize a GPU.
+//! Refer to the [Mosaic GPU definitions] for operation semantics and constraints.
+//!
+//! [Mosaic GPU definitions]: https://github.com/jax-ml/jax/blob/main/jaxlib/mosaic/dialect/gpu/mosaic_gpu.td
+
+use crate::dialects::mosaic::gpu::attributes::{
+    AtomicOpType, AtomicOpTypeAttributeRef, CopyPartitionAttributeRef, Dimension, DimensionAttributeRef,
+    MultimemLoadReductionType, MultimemLoadReductionTypeAttributeRef, OobFillMode, OobFillModeAttributeRef,
+    TiledLayoutAttributeRef, TmaReduction, TmaReductionAttributeRef, TmemLoadReduction, TmemLoadReductionAttributeRef,
+    WgStridedFragLayoutAttributeRef,
+};
+use crate::macros::{mlir_op, mlir_op_trait};
 use crate::{
     ArrayAttributeRef, Attribute, BooleanAttributeRef, DenseInteger64ArrayAttributeRef, DetachedOp, DetachedRegion,
     DialectHandle, Error, IntegerAttributeRef, Location, Operation, OperationBuilder, OperationResultRef, RegionRef,
-    StringAttributeRef, TypeRef, ValueRef, mlir_op, mlir_op_trait,
-};
-
-use super::attributes::{
-    AtomicOpType, AtomicOpTypeAttributeRef, CopyPartitionAttributeRef, MultimemLoadReductionType,
-    MultimemLoadReductionTypeAttributeRef, OobFillMode, OobFillModeAttributeRef, TiledLayoutAttributeRef, TmaReduction,
-    TmaReductionAttributeRef, WgStridedFragLayoutAttributeRef,
+    StringAttributeRef, TypeRef, Value, ValueRef,
 };
 
 /// Name of the [`Attribute`] that stores an arrival count.
@@ -50,21 +62,27 @@ mlir_op_trait!(InitializeBarrier, ZeroSuccessors);
 pub fn initialize_barrier<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     base_pointer: ValueRef<'v, 'c, 't>,
     arrival_count: i64,
-    num_barriers: i64,
+    num_barriers: i32,
     orders_tensor_core: bool,
     location: L,
 ) -> Result<DetachedInitializeBarrierOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if arrival_count <= 0 {
+        return Err(Error::invalid_argument("expected positive `arrival_count` for `mosaic_gpu.initialize_barrier`"));
+    }
+    if num_barriers <= 0 {
+        return Err(Error::invalid_argument("expected positive `num_barriers` for `mosaic_gpu.initialize_barrier`"));
+    }
     OperationBuilder::new("mosaic_gpu.initialize_barrier", location)
         .add_operand(base_pointer)
         .add_attribute(
             ARRIVAL_COUNT_ATTRIBUTE,
-            context.integer_attribute(context.signless_integer_type(32), arrival_count),
+            context.integer_attribute(context.signless_integer_type(64), arrival_count),
         )
         .add_attribute(
             NUM_BARRIERS_ATTRIBUTE,
-            context.integer_attribute(context.signless_integer_type(32), num_barriers),
+            context.integer_attribute(context.signless_integer_type(32), i64::from(num_barriers)),
         )
         .add_attribute(ORDERS_TENSOR_CORE_ATTRIBUTE, context.boolean_attribute(orders_tensor_core))
         .build()
@@ -109,9 +127,6 @@ pub fn arrive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         })
 }
 
-/// Name of the [`Attribute`] that stores the expected byte-transfer count.
-pub const EXPECT_TX_ATTRIBUTE: &str = "expect_tx";
-
 /// Mosaic GPU [`Operation`] that arrives at a barrier and sets an expected transfer count.
 pub trait ArriveExpectTxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the barrier memref.
@@ -120,8 +135,8 @@ pub trait ArriveExpectTxOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the expected byte-transfer count.
-    fn expect_tx(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
-        self.integer_attribute(EXPECT_TX_ATTRIBUTE)
+    fn expect_tx(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
     }
 }
 
@@ -130,16 +145,18 @@ mlir_op_trait!(ArriveExpectTx, ZeroRegions);
 mlir_op_trait!(ArriveExpectTx, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`ArriveExpectTxOperation`] at the specified [`Location`].
+///
+/// `expect_tx` must be an `i32` value containing a nonnegative byte count at execution time. The count may be computed
+/// dynamically; negative counts have undefined behavior in the underlying operation.
 pub fn arrive_expect_tx<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     barrier: ValueRef<'v, 'c, 't>,
-    expect_tx: i64,
+    expect_tx: ValueRef<'v, 'c, 't>,
     location: L,
 ) -> Result<DetachedArriveExpectTxOperation<'c, 't>, Error> {
-    let context = location.context();
-    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.arrive_expect_tx", location)
         .add_operand(barrier)
-        .add_attribute(EXPECT_TX_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), expect_tx))
+        .add_operand(expect_tx)
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -258,13 +275,18 @@ mlir_op_trait!(QueryClusterCancel, ZeroSuccessors);
 /// Constructs a new detached/owned [`QueryClusterCancelOperation`] at the specified [`Location`].
 pub fn query_cluster_cancel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     cancellation_result: ValueRef<'v, 'c, 't>,
-    result_types: &[TypeRef<'c, 't>],
     location: L,
 ) -> Result<DetachedQueryClusterCancelOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.query_cluster_cancel", location)
         .add_operand(cancellation_result)
-        .add_results(result_types)
+        .add_results(&[
+            context.signless_integer_type(32),
+            context.signless_integer_type(32),
+            context.signless_integer_type(32),
+            context.signless_integer_type(1),
+        ])
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -274,7 +296,7 @@ pub fn query_cluster_cancel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that stores Mosaic GPU operand segment sizes.
-pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes";
+pub const OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operandSegmentSizes";
 
 /// Name of the [`Attribute`] that stores Mosaic GPU slice lengths.
 pub const SLICE_LENGTHS_ATTRIBUTE: &str = "slice_lengths";
@@ -289,6 +311,10 @@ pub const LEADER_TRACKED_ATTRIBUTE: &str = "leader_tracked";
 pub const OOB_FILL_MODE_ATTRIBUTE: &str = "oob_fill_mode";
 
 /// Mosaic GPU [`Operation`] that schedules an asynchronous global-to-shared memory load.
+///
+/// The source indices and slice lengths describe the transferred tile. The optional barrier records completion, and
+/// the optional peer ID selects a global-memory peer. A false predicate suppresses the transfer. Issuing the load does
+/// not make its destination immediately ready for use.
 pub trait AsyncLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source memref.
     fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -301,8 +327,19 @@ pub trait AsyncLoadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     }
 
     /// Returns the completion barrier.
-    fn barrier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
-        self.operand_value(2)
+    fn barrier(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
+    }
+
+    /// Returns the optional global-memory peer device ID.
+    fn global_memory_peer_id(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 5)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
     }
 
     /// Returns the index operands.
@@ -357,12 +394,16 @@ mlir_op_trait!(AsyncLoad, ZeroRegions);
 mlir_op_trait!(AsyncLoad, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AsyncLoadOperation`] at the specified [`Location`].
+///
+/// `indices` and `slice_lengths` must have equal lengths. `collective` contains Mosaic GPU dimension attributes;
+/// `leader_tracked` selects an optional copy partition strategy, and `oob_fill_mode` controls out-of-bounds loads.
 pub fn async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
     destination: ValueRef<'v, 'c, 't>,
-    barrier: ValueRef<'v, 'c, 't>,
+    barrier: Option<ValueRef<'v, 'c, 't>>,
     indices: &[ValueRef<'v, 'c, 't>],
     predicate: ValueRef<'v, 'c, 't>,
+    global_memory_peer_id: Option<ValueRef<'v, 'c, 't>>,
     slice_lengths: &[i64],
     collective: ArrayAttributeRef<'c, 't>,
     leader_tracked: Option<CopyPartitionAttributeRef<'c, 't>>,
@@ -371,21 +412,28 @@ pub fn async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAsyncLoadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if indices.len() != slice_lengths.len() {
+        return Err(Error::invalid_argument(
+            "expected equal numbers of `indices` and `slice_lengths` for `mosaic_gpu.async_load`",
+        ));
+    }
     let mut builder = OperationBuilder::new("mosaic_gpu.async_load", location)
         .add_operand(source)
         .add_operand(destination)
-        .add_operand(barrier)
+        .add_operands(barrier.as_slice())
         .add_operands(indices)
         .add_operand(predicate)
+        .add_operands(global_memory_peer_id.as_slice())
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
                 1,
                 1,
-                1,
+                i32::from(barrier.is_some()),
                 i32::try_from(indices.len())
                     .map_err(|_| Error::invalid_argument("too many `mosaic_gpu.async_load` indices"))?,
                 1,
+                i32::from(global_memory_peer_id.is_some()),
             ])?,
         )
         .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)
@@ -454,6 +502,11 @@ pub fn async_prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAsyncPrefetchOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if indices.len() != slice_lengths.len() {
+        return Err(Error::invalid_argument(
+            "expected equal numbers of `indices` and `slice_lengths` for `mosaic_gpu.async_prefetch`",
+        ));
+    }
     OperationBuilder::new("mosaic_gpu.async_prefetch", location)
         .add_operand(source)
         .add_operands(indices)
@@ -483,7 +536,14 @@ pub const REDUCTION_OP_ATTRIBUTE: &str = "reduction_op";
 /// Name of the [`Attribute`] that stores whether an async store commits its group.
 pub const COMMIT_GROUP_ATTRIBUTE: &str = "commit_group";
 
+/// Name of the [`Attribute`] that enables broadcasting a store to all global-memory peers.
+pub const IS_GLOBAL_BROADCAST_ATTRIBUTE: &str = "is_global_broadcast";
+
 /// Mosaic GPU [`Operation`] that schedules an asynchronous shared-to-global memory store.
+///
+/// The index operands and slice lengths describe the destination tile. The optional peer ID selects a global-memory
+/// peer; `is_global_broadcast` broadcasts to all peers. `reduction_op` optionally combines transferred values with the
+/// destination, and `commit_group` controls whether the transfer group is committed.
 pub trait AsyncStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source memref.
     fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -513,6 +573,19 @@ pub trait AsyncStoreOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             )));
         }
         self.operand_value(range.start)
+    }
+
+    /// Returns the optional global-memory peer device ID.
+    fn global_memory_peer_id(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
+    }
+
+    /// Returns whether the store broadcasts to all global-memory peers.
+    fn is_global_broadcast(&self) -> Result<BooleanAttributeRef<'c, 't>, Error> {
+        self.boolean_attribute(IS_GLOBAL_BROADCAST_ATTRIBUTE)
     }
 
     /// Returns the destination slice lengths.
@@ -545,18 +618,26 @@ pub fn async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     destination: ValueRef<'v, 'c, 't>,
     indices: &[ValueRef<'v, 'c, 't>],
     predicate: ValueRef<'v, 'c, 't>,
+    global_memory_peer_id: Option<ValueRef<'v, 'c, 't>>,
     slice_lengths: &[i64],
     commit_group: Option<bool>,
     reduction_op: Option<TmaReduction>,
+    is_global_broadcast: bool,
     location: L,
 ) -> Result<DetachedAsyncStoreOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if indices.len() != slice_lengths.len() {
+        return Err(Error::invalid_argument(
+            "expected equal numbers of `indices` and `slice_lengths` for `mosaic_gpu.async_store`",
+        ));
+    }
     let mut builder = OperationBuilder::new("mosaic_gpu.async_store", location)
         .add_operand(source)
         .add_operand(destination)
         .add_operands(indices)
         .add_operand(predicate)
+        .add_operands(global_memory_peer_id.as_slice())
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -565,9 +646,11 @@ pub fn async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 i32::try_from(indices.len())
                     .map_err(|_| Error::invalid_argument("too many `mosaic_gpu.async_store` indices"))?,
                 1,
+                i32::from(global_memory_peer_id.is_some()),
             ])?,
         )
-        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?);
+        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)
+        .add_attribute(IS_GLOBAL_BROADCAST_ATTRIBUTE, context.boolean_attribute(is_global_broadcast));
     if let Some(commit_group) = commit_group {
         builder = builder.add_attribute(COMMIT_GROUP_ATTRIBUTE, context.boolean_attribute(commit_group));
     }
@@ -984,15 +1067,20 @@ mlir_op_trait!(SliceSmem, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`SliceSmemOperation`] at the specified [`Location`].
 pub fn slice_smem<'c, 't: 'c, L: Location<'c, 't>>(
-    offset: i64,
+    offset: i32,
     alias_id: Option<i64>,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedSliceSmemOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
-    let mut builder = OperationBuilder::new("mosaic_gpu.slice_smem", location)
-        .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), offset));
+    if offset < 0 {
+        return Err(Error::invalid_argument("expected non-negative `offset` for `mosaic_gpu.slice_smem`"));
+    }
+    let mut builder = OperationBuilder::new("mosaic_gpu.slice_smem", location).add_attribute(
+        OFFSET_ATTRIBUTE,
+        context.integer_attribute(context.signless_integer_type(32), i64::from(offset)),
+    );
     if let Some(alias_id) = alias_id {
         builder = builder
             .add_attribute(ALIAS_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), alias_id));
@@ -1037,10 +1125,10 @@ pub fn wgmma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     accumulator: ValueRef<'v, 'c, 't>,
     a: ValueRef<'v, 'c, 't>,
     b: ValueRef<'v, 'c, 't>,
-    result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedWgmmaOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let result_type = accumulator.r#type()?;
     OperationBuilder::new("mosaic_gpu.wgmma", location)
         .add_operand(accumulator)
         .add_operand(a)
@@ -1056,6 +1144,11 @@ pub fn wgmma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 pub const COLLECTIVE_MMA_ATTRIBUTE: &str = "collective";
 
 /// Mosaic GPU [`Operation`] that schedules a `tcgen05.mma` matrix multiply-accumulate.
+///
+/// The tensor-memory accumulator is updated in place. `accumulate` selects whether its previous contents contribute
+/// to the result. Optional scale operands support scaled multiplication, and optional sparse metadata describes the
+/// sparsity of `a`. Completion must be tracked with [`TcGen05CommitArriveOperation`] and a barrier wait before using
+/// the updated accumulator.
 pub trait TcGen05MmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the accumulator memref.
     fn accumulator(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -1199,13 +1292,13 @@ mlir_op_trait!(OptimizationBarrier, ZeroSuccessors);
 /// Constructs a new detached/owned [`OptimizationBarrierOperation`] at the specified [`Location`].
 pub fn optimization_barrier<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     operands: &[ValueRef<'v, 'c, 't>],
-    result_types: &[TypeRef<'c, 't>],
     location: L,
 ) -> Result<DetachedOptimizationBarrierOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let result_types = operands.iter().map(|operand| operand.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("mosaic_gpu.optimization_barrier", location)
         .add_operands(operands)
-        .add_results(result_types)
+        .add_results(&result_types)
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1250,6 +1343,9 @@ pub const IN_TRANSFORMS_ATTRIBUTE: &str = "in_transforms";
 pub const OUT_LAYOUTS_ATTRIBUTE: &str = "out_layouts";
 
 /// Mosaic GPU [`Operation`] that defines a custom Mosaic GPU primitive.
+///
+/// The body receives the input values through block arguments and terminates with [`ReturnOperation`]. Input layouts,
+/// input transforms, and output layouts describe how the primitive crosses the surrounding layout boundary.
 pub trait CustomPrimitiveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the custom primitive operands.
     fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
@@ -1308,6 +1404,9 @@ pub fn custom_primitive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Mosaic GPU [`Operation`] that evaluates a block in parallel on all warps.
+///
+/// The isolated body contains one block whose arguments correspond to the operands. It has no terminator and cannot
+/// implicitly capture values from the enclosing region.
 pub trait WarpMapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the values captured by this warp map.
     fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
@@ -1396,6 +1495,9 @@ pub const COLLECTIVE_TMEM_ATTRIBUTE: &str = "collective";
 pub const PACKING_ATTRIBUTE: &str = "packing";
 
 /// Mosaic GPU [`Operation`] that allocates tensor memory.
+///
+/// The allocation pointer is written to a rank-zero shared-memory `i32` memref. The result is a rank-two tensor-memory
+/// memref. `packing` is a positive packing factor; collective allocation coordinates two thread blocks.
 pub trait TmemAllocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the shared-memory pointer used to store the allocation pointer.
     fn smem_ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -1428,16 +1530,22 @@ mlir_op_trait!(TmemAlloc, ZeroSuccessors);
 pub fn tmem_alloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     smem_ptr: ValueRef<'v, 'c, 't>,
     collective: bool,
-    packing: i64,
+    packing: i32,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedTmemAllocOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if packing <= 0 {
+        return Err(Error::invalid_argument("expected positive `packing` for `mosaic_gpu.tmem_alloc`"));
+    }
     OperationBuilder::new("mosaic_gpu.tmem_alloc", location)
         .add_operand(smem_ptr)
         .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
-        .add_attribute(PACKING_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), packing))
+        .add_attribute(
+            PACKING_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), i64::from(packing)),
+        )
         .add_result(result_type)
         .build()
         .and_then(|operation| unsafe {
@@ -1448,6 +1556,8 @@ pub fn tmem_alloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Mosaic GPU [`Operation`] that relinquishes tensor-memory allocation permission.
+///
+/// Once a thread executes this operation, its thread block must not issue further tensor-memory allocations.
 pub trait TmemRelinquishAllocPermitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns whether this applies to collective tensor-memory allocations.
     fn collective(&self) -> Result<BooleanAttributeRef<'c, 't>, Error> {
@@ -1504,41 +1614,56 @@ pub fn tmem_dealloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     )
 }
 
+/// Name of the [`Attribute`] that selects an optional tensor-memory load reduction.
+pub const REDUCE_ATTRIBUTE: &str = "reduce";
+
 /// Mosaic GPU [`Operation`] that copies tensor memory into registers asynchronously.
+///
+/// Without a reduction, this produces the loaded vector. A reduction also produces a second vector containing the
+/// reduced values.
 pub trait AsyncLoadTmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor-memory source.
     fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
         self.operand_value(0)
     }
 
-    /// Returns the loaded vector.
-    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
-        self.as_ref().result(0)
+    /// Returns the loaded vector followed by the reduced vector, when a reduction was requested.
+    fn results(&self) -> Result<Vec<OperationResultRef<'o, 'c, 't>>, Error> {
+        (0..self.result_count()).map(|index| self.result(index)).collect()
+    }
+
+    /// Returns the optional tensor-memory load reduction.
+    fn reduction(&self) -> Result<Option<TmemLoadReductionAttributeRef<'c, 't>>, Error> {
+        Ok(self.attribute(REDUCE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()))
     }
 }
 
 mlir_op!(AsyncLoadTmem);
-mlir_op_trait!(AsyncLoadTmem, OneOperand);
-mlir_op_trait!(AsyncLoadTmem, OneResult);
 mlir_op_trait!(AsyncLoadTmem, ZeroRegions);
 mlir_op_trait!(AsyncLoadTmem, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`AsyncLoadTmemOperation`] at the specified [`Location`].
+///
+/// Result types are inferred from `source`: the loaded vector retains its shape and element type, and an optional
+/// reduction produces a second vector with the final dimension removed.
 pub fn async_load_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
-    result_type: TypeRef<'c, 't>,
+    reduction: Option<TmemLoadReduction>,
     location: L,
 ) -> Result<DetachedAsyncLoadTmemOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
-    OperationBuilder::new("mosaic_gpu.async_load_tmem", location)
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let mut builder = OperationBuilder::new("mosaic_gpu.async_load_tmem", location)
         .add_operand(source)
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe {
-            operation
-                .cast()
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::async_load_tmem`"))
-        })
+        .enable_result_type_inference();
+    if let Some(reduction) = reduction {
+        builder = builder.add_attribute(REDUCE_ATTRIBUTE, context.mosaic_gpu_tmem_load_reduction_attribute(reduction)?);
+    }
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::async_load_tmem`"))
+    })
 }
 
 /// Mosaic GPU [`Operation`] that copies registers into tensor memory asynchronously.
@@ -1706,6 +1831,9 @@ pub fn async_store_scales_smem_to_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Mosaic GPU [`Operation`] that slices a tensor-memory memref.
+///
+/// The offset is measured in tensor-memory columns and must be a nonnegative multiple of four. An optional 64-bit
+/// alias ID distinguishes potentially aliasing allocations.
 pub trait SliceTmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source tensor-memory memref.
     fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -1715,6 +1843,15 @@ pub trait SliceTmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the tensor-memory column offset.
     fn offset(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
         self.integer_attribute(OFFSET_ATTRIBUTE)
+    }
+
+    /// Returns the optional identifier used to distinguish potentially aliasing allocations.
+    fn alias_id(&self) -> Result<Option<IntegerAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(ALIAS_ID_ATTRIBUTE) {
+            self.integer_attribute(ALIAS_ID_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the sliced tensor-memory memref.
@@ -1732,22 +1869,32 @@ mlir_op_trait!(SliceTmem, ZeroSuccessors);
 /// Constructs a new detached/owned [`SliceTmemOperation`] at the specified [`Location`].
 pub fn slice_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'v, 'c, 't>,
-    offset: i64,
+    offset: i32,
+    alias_id: Option<i64>,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedSliceTmemOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
-    OperationBuilder::new("mosaic_gpu.slice_tmem", location)
+    if offset < 0 {
+        return Err(Error::invalid_argument("expected non-negative `offset` for `mosaic_gpu.slice_tmem`"));
+    }
+    let mut builder = OperationBuilder::new("mosaic_gpu.slice_tmem", location)
         .add_operand(source)
-        .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), offset))
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe {
-            operation
-                .cast()
-                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::slice_tmem`"))
-        })
+        .add_attribute(
+            OFFSET_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), i64::from(offset)),
+        )
+        .add_result(result_type);
+    if let Some(alias_id) = alias_id {
+        builder = builder
+            .add_attribute(ALIAS_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), alias_id));
+    }
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::slice_tmem`"))
+    })
 }
 
 /// Mosaic GPU [`Operation`] that makes a barrier track prior async `tcgen05` operations.
@@ -1885,14 +2032,20 @@ mlir_op_trait!(BroadcastedIota, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`BroadcastedIotaOperation`] at the specified [`Location`].
 pub fn broadcasted_iota<'c, 't: 'c, L: Location<'c, 't>>(
-    dimension: i64,
+    dimension: i32,
     result_type: TypeRef<'c, 't>,
     location: L,
 ) -> Result<DetachedBroadcastedIotaOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if dimension < 0 {
+        return Err(Error::invalid_argument("expected non-negative `dimension` for `mosaic_gpu.broadcasted_iota`"));
+    }
     OperationBuilder::new("mosaic_gpu.broadcasted_iota", location)
-        .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), dimension))
+        .add_attribute(
+            DIMENSION_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), i64::from(dimension)),
+        )
         .add_result(result_type)
         .build()
         .and_then(|operation| unsafe {
@@ -1902,486 +2055,2004 @@ pub fn broadcasted_iota<'c, 't: 'c, L: Location<'c, 't>>(
         })
 }
 
+/// Mosaic GPU [`Operation`] that computes `lhs @ rhs + accumulator` synchronously.
+pub trait MmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the accumulator vector.
+    fn accumulator(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the left matrix.
+    fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the right matrix.
+    fn rhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
+    }
+}
+
+mlir_op!(Mma);
+mlir_op_trait!(Mma, OneResult);
+mlir_op_trait!(Mma, ZeroRegions);
+mlir_op_trait!(Mma, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`MmaOperation`] at the specified [`Location`].
+pub fn mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    accumulator: ValueRef<'v, 'c, 't>,
+    lhs: ValueRef<'v, 'c, 't>,
+    rhs: ValueRef<'v, 'c, 't>,
+    location: L,
+) -> Result<DetachedMmaOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
+    OperationBuilder::new("mosaic_gpu.mma", location)
+        .add_operands(&[accumulator, lhs, rhs])
+        .add_result(accumulator.r#type()?)
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::mma`"))
+        })
+}
+
+/// Mosaic GPU [`Operation`] that concatenates vectors along a dimension.
+pub trait VectorConcatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the concatenation dimension.
+    fn dimension(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(DIMENSION_ATTRIBUTE)
+    }
+
+    /// Returns the vectors in concatenation order.
+    fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
+        self.operand_values().collect()
+    }
+}
+
+mlir_op!(VectorConcat);
+mlir_op_trait!(VectorConcat, OneResult);
+mlir_op_trait!(VectorConcat, ZeroRegions);
+mlir_op_trait!(VectorConcat, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`VectorConcatOperation`] at the specified [`Location`].
+pub fn vector_concat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    operands: &[ValueRef<'v, 'c, 't>],
+    dimension: i32,
+    result_type: TypeRef<'c, 't>,
+    location: L,
+) -> Result<DetachedVectorConcatOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if operands.is_empty() || dimension < 0 {
+        return Err(Error::invalid_argument("expected nonempty vectors and a nonnegative concatenation dimension"));
+    }
+    OperationBuilder::new("mosaic_gpu.vector_concat", location)
+        .add_operands(operands)
+        .add_result(result_type)
+        .add_attribute(
+            DIMENSION_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), i64::from(dimension)),
+        )
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::vector_concat`"))
+        })
+}
+
+/// Name of the [`Attribute`] that stores the assumed positive divisor.
+pub const MULTIPLE_ATTRIBUTE: &str = "multiple";
+
+/// Mosaic GPU [`Operation`] that assumes an integer value is divisible by a positive constant.
+pub trait AssumeMultipleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the assumed divisor.
+    fn multiple(&self) -> Result<IntegerAttributeRef<'c, 't>, Error> {
+        self.integer_attribute(MULTIPLE_ATTRIBUTE)
+    }
+
+    /// Returns the value to which the divisibility assumption applies.
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+}
+
+mlir_op!(AssumeMultiple);
+mlir_op_trait!(AssumeMultiple, OneOperand);
+mlir_op_trait!(AssumeMultiple, OneResult);
+mlir_op_trait!(AssumeMultiple, ZeroRegions);
+mlir_op_trait!(AssumeMultiple, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`AssumeMultipleOperation`] at the specified [`Location`].
+///
+/// `multiple` must be positive. This records a compiler assumption; it does not check divisibility at execution time.
+pub fn assume_multiple<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    value: ValueRef<'v, 'c, 't>,
+    multiple: i32,
+    location: L,
+) -> Result<DetachedAssumeMultipleOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    if multiple <= 0 {
+        return Err(Error::invalid_argument("expected a positive `multiple`"));
+    }
+    OperationBuilder::new("mosaic_gpu.assume_multiple", location)
+        .add_operand(value)
+        .add_result(value.r#type()?)
+        .add_attribute(
+            MULTIPLE_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), i64::from(multiple)),
+        )
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::assume_multiple`"))
+        })
+}
+
+/// Mosaic GPU [`Operation`] that maps a memref to a peer block's shared memory.
+pub trait GetClusterRefOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the source memref.
+    fn source(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the optional X coordinate of the peer block.
+    fn x(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
+    }
+
+    /// Returns the optional Y coordinate of the peer block.
+    fn y(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 2)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
+    }
+
+    /// Returns the optional Z coordinate of the peer block.
+    fn z(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?
+            .next()
+            .map(|index| self.operand_value(index))
+            .transpose()
+    }
+}
+
+mlir_op!(GetClusterRef);
+mlir_op_trait!(GetClusterRef, OneResult);
+mlir_op_trait!(GetClusterRef, ZeroRegions);
+mlir_op_trait!(GetClusterRef, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`GetClusterRefOperation`] at the specified [`Location`].
+///
+/// `coordinates` contains optional `i32` operands in X, Y, Z order. An absent coordinate keeps the current block's
+/// coordinate along that dimension. The result preserves the source shape, element type, and layout while using
+/// the cluster shared-memory space.
+pub fn get_cluster_ref<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    source: ValueRef<'v, 'c, 't>,
+    coordinates: [Option<ValueRef<'v, 'c, 't>>; 3],
+    location: L,
+) -> Result<DetachedGetClusterRefOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    OperationBuilder::new("mosaic_gpu.get_cluster_ref", location)
+        .add_operand(source)
+        .add_operands(coordinates[0].as_slice())
+        .add_operands(coordinates[1].as_slice())
+        .add_operands(coordinates[2].as_slice())
+        .enable_result_type_inference()
+        .add_attribute(
+            OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context.dense_i32_array_attribute(&[
+                1,
+                i32::from(coordinates[0].is_some()),
+                i32::from(coordinates[1].is_some()),
+                i32::from(coordinates[2].is_some()),
+            ])?,
+        )
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::get_cluster_ref`"))
+        })
+}
+
+/// Name of the [`Attribute`] that stores the destination cluster dimension.
+pub const CLUSTER_DIMENSION_ATTRIBUTE: &str = "cluster_dim";
+
+/// Mosaic GPU [`Operation`] that asynchronously stores register values into a cluster peer's shared memory.
+pub trait AsyncStoreSmemOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the value being stored.
+    fn value(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the destination memref.
+    fn destination(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the completion barrier.
+    fn barrier(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
+    }
+
+    /// Returns the destination cluster dimension.
+    fn cluster_dimension(&self) -> Result<DimensionAttributeRef<'c, 't>, Error> {
+        self.attribute(CLUSTER_DIMENSION_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{CLUSTER_DIMENSION_ATTRIBUTE}` attribute in `{}`",
+                self.name(),
+            ))
+        })
+    }
+
+    /// Returns the peer block index within the cluster dimension.
+    fn cluster_index(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(3)
+    }
+
+    /// Returns the optional atomic reduction applied at the destination.
+    fn atomic_type(&self) -> Result<Option<AtomicOpTypeAttributeRef<'c, 't>>, Error> {
+        Ok(self.attribute(ATOMIC_TYPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()))
+    }
+
+    /// Returns whether an optimized lowering is explicitly requested.
+    fn optimized(&self) -> Result<Option<BooleanAttributeRef<'c, 't>>, Error> {
+        if self.has_attribute(OPTIMIZED_ATTRIBUTE) {
+            self.boolean_attribute(OPTIMIZED_ATTRIBUTE).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+mlir_op!(AsyncStoreSmem);
+mlir_op_trait!(AsyncStoreSmem, ZeroRegions);
+mlir_op_trait!(AsyncStoreSmem, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`AsyncStoreSmemOperation`] at the specified [`Location`].
+pub fn async_store_smem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    value: ValueRef<'v, 'c, 't>,
+    destination: ValueRef<'v, 'c, 't>,
+    barrier: ValueRef<'v, 'c, 't>,
+    cluster_dimension: Dimension,
+    cluster_index: ValueRef<'v, 'c, 't>,
+    atomic_type: Option<AtomicOpType>,
+    optimized: Option<bool>,
+    location: L,
+) -> Result<DetachedAsyncStoreSmemOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::mosaic_gpu()?)?;
+    let mut builder = OperationBuilder::new("mosaic_gpu.async_store_smem", location)
+        .add_operands(&[value, destination, barrier, cluster_index])
+        .add_attribute(CLUSTER_DIMENSION_ATTRIBUTE, context.mosaic_gpu_dimension_attribute(cluster_dimension)?);
+    if let Some(atomic_type) = atomic_type {
+        builder =
+            builder.add_attribute(ATOMIC_TYPE_ATTRIBUTE, context.mosaic_gpu_atomic_op_type_attribute(atomic_type)?);
+    }
+    if let Some(optimized) = optimized {
+        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized));
+    }
+    builder.build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::async_store_smem`"))
+    })
+}
+
+/// Name of the temporary upstream capability marker. New programs should not emit this operation.
+pub const ARRIVE_DYN_EXPECT_TX_SUPPORTED_OPERATION_NAME: &str = "mosaic_gpu.arrive_dyn_expect_tx_supported";
+
+/// Temporary upstream capability marker, exposed for inspecting existing IR only.
+pub trait ArriveDynExpectTxSupportedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
+
+mlir_op!(ArriveDynExpectTxSupported);
+mlir_op_trait!(ArriveDynExpectTxSupported, ZeroOperands);
+mlir_op_trait!(ArriveDynExpectTxSupported, ZeroRegions);
+mlir_op_trait!(ArriveDynExpectTxSupported, ZeroSuccessors);
+
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::dialects::func;
+    use crate::dialects::gpu::AddressSpace;
     use crate::{
-        Attribute, AttributeRef, Block, Context, DialectHandle, Operation, Region, Size, Type, TypeRef, Value,
-    };
-
-    use super::super::attributes::{
-        AtomicOpType, CopyPartitionAttributeRef, MultimemLoadReductionType, OobFillMode, TmaReduction,
+        Attribute, Block, Context, DetachedBlock, DialectHandle, Location, Module, Operation, Region, Size, Type,
+        TypeRef, Value, VectorTypeDimension,
     };
 
     use super::*;
 
-    /// Common scalar and tensor types used by Mosaic GPU operation wrapper tests.
-    #[derive(Copy, Clone)]
-    struct TestTypes<'c, 't> {
-        /// One-bit signless integer type.
-        i1: TypeRef<'c, 't>,
-
-        /// 32-bit signless integer type.
-        i32: TypeRef<'c, 't>,
-
-        /// 64-bit signless integer type.
-        i64: TypeRef<'c, 't>,
-
-        /// 32-bit floating-point tensor type.
-        tensor_f32: TypeRef<'c, 't>,
+    /// Constructs a statically shaped memref fixture with an explicit memory space.
+    fn memref_type<'c, 't, L: Location<'c, 't>>(
+        context: &'c Context<'t>,
+        element_type: TypeRef<'c, 't>,
+        shape: &[usize],
+        memory_space: Option<crate::AttributeRef<'c, 't>>,
+        location: L,
+    ) -> TypeRef<'c, 't> {
+        let shape = shape.iter().copied().map(Size::Static).collect::<Vec<_>>();
+        context.mem_ref_type(element_type, shape.as_slice(), None, memory_space, location).unwrap().as_ref()
     }
 
-    impl<'c, 't> TestTypes<'c, 't> {
-        /// Builds the common test type set in `context`.
-        fn new(context: &'c Context<'t>, location: impl crate::Location<'c, 't>) -> Self {
-            let i1_type = context.signless_integer_type(1);
-            let i32_type = context.signless_integer_type(32);
-            let i64_type = context.signless_integer_type(64);
-            let f32_type = context.float32_type();
-            let tensor_f32_type = context.tensor_type(f32_type, &[Size::Static(4)], None, location).unwrap();
-
-            Self {
-                i1: i1_type.as_ref(),
-                i32: i32_type.as_ref(),
-                i64: i64_type.as_ref(),
-                tensor_f32: tensor_f32_type.as_ref(),
-            }
-        }
+    /// Constructs a statically shaped vector fixture.
+    fn vector_type<'c, 't, L: Location<'c, 't>>(
+        context: &'c Context<'t>,
+        element_type: TypeRef<'c, 't>,
+        shape: &[usize],
+        location: L,
+    ) -> TypeRef<'c, 't> {
+        let shape = shape.iter().copied().map(VectorTypeDimension::Fixed).collect::<Vec<_>>();
+        context.vector_type(element_type, shape.as_slice(), location).unwrap().as_ref()
     }
 
-    macro_rules! mosaic_gpu_operation_test {
-        ($test_name:ident, |$context:ident, $location:ident, $values:ident, $types:ident| $body:block $(,)?) => {
-            #[test]
-            fn $test_name() {
-                let $context = Context::new();
-                $context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
-                let $location = $context.unknown_location();
-                let $types = TestTypes::new(&$context, $location);
-                let block = $context.block(&[
-                    ($types.i32, $location),
-                    ($types.i32, $location),
-                    ($types.i32, $location),
-                    ($types.i1, $location),
-                    ($types.tensor_f32, $location),
-                    ($types.tensor_f32, $location),
-                    ($types.i64, $location),
-                    ($types.tensor_f32, $location),
-                ]);
-                let $values = (0..8).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-
-                $body
-            }
-        };
+    /// Inserts a function containing the tested operations and a void terminator.
+    fn append_void_function<'c, 't, L: Copy + Location<'c, 't>>(
+        module: &Module<'c, 't>,
+        name: &str,
+        argument_types: &[TypeRef<'c, 't>],
+        mut block: DetachedBlock<'c, 't>,
+        location: L,
+    ) {
+        block.append_operation(func::r#return(&[] as &[crate::ValueRef], location).unwrap()).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(
+                func::func(
+                    name,
+                    func::FuncAttributes {
+                        arguments: argument_types.iter().copied().map(Into::into).collect(),
+                        results: Vec::new(),
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 
-    mosaic_gpu_operation_test!(test_initialize_barrier_operation, |_context, location, values, _types| {
-        let operation = initialize_barrier(values[0], 4, 2, true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.initialize_barrier"));
-        assert_eq!(operation.base_pointer().unwrap(), values[0]);
+    #[test]
+    fn test_initialize_barrier_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let pointer_type = context.llvm_pointer_type(3).unwrap().as_ref();
+        let mut block = context.block(&[(pointer_type, location)]);
+        let pointer = block.argument(0).unwrap().as_ref();
+        let operation = initialize_barrier(pointer, 4, 2, true, location).unwrap();
+        assert_eq!(operation.base_pointer().unwrap(), pointer);
         assert_eq!(operation.arrival_count().unwrap().signless_value(), 4);
         assert_eq!(operation.num_barriers().unwrap().signless_value(), 2);
         assert!(operation.orders_tensor_core().unwrap().value());
-    });
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "initialize_barrier", &[pointer_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @initialize_barrier(%arg0: !llvm.ptr<3>) {
+                    \"mosaic_gpu.initialize_barrier\"(%arg0) <{arrival_count = 4 : i64, num_barriers = 2 : \
+                i32, orders_tensor_core = true}> : (!llvm.ptr<3>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_arrive_operation, |_context, location, values, _types| {
-        let operation = arrive(values[0], true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.arrive"));
-        assert_eq!(operation.barrier().unwrap(), values[0]);
+    #[test]
+    fn test_arrive_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let barrier_type = context.mosaic_gpu_barrier_type(true).unwrap().as_ref();
+        let barrier_memref = memref_type(&context, barrier_type, &[], Some(workgroup), location);
+        let mut block = context.block(&[(barrier_memref, location)]);
+        let barrier = block.argument(0).unwrap().as_ref();
+        let operation = arrive(barrier, true, location).unwrap();
+        assert_eq!(operation.barrier().unwrap(), barrier);
         assert!(operation.orders_tensor_core().unwrap().value());
-    });
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "arrive", &[barrier_memref], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @arrive(%arg0: memref<!mosaic_gpu.barrier<orders_tensor_core = true>, \
+                #gpu.address_space<workgroup>>) {
+                    \"mosaic_gpu.arrive\"(%arg0) <{orders_tensor_core = true}> : \
+                (memref<!mosaic_gpu.barrier<orders_tensor_core = true>, #gpu.address_space<workgroup>>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_arrive_expect_tx_operation, |_context, location, values, _types| {
-        let operation = arrive_expect_tx(values[0], 128, location).unwrap();
+    #[test]
+    fn test_arrive_expect_tx_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let barrier_type = context.mosaic_gpu_barrier_type(false).unwrap().as_ref();
+        let barrier_memref = memref_type(&context, barrier_type, &[], Some(workgroup), location);
+        let count_type = context.signless_integer_type(32).as_ref();
+        let argument_types = [barrier_memref, count_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let barrier = block.argument(0).unwrap().as_ref();
+        let count = block.argument(1).unwrap().as_ref();
+        let operation = arrive_expect_tx(barrier, count, location).unwrap();
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert_eq!(operation.expect_tx().unwrap(), count);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "arrive_expect_tx", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @arrive_expect_tx(%arg0: memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>, %arg1: i32) {
+                    mosaic_gpu.arrive_expect_tx barrier(%arg0 : memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>) %arg1
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.arrive_expect_tx"));
-        assert_eq!(operation.barrier().unwrap(), values[0]);
-        assert_eq!(operation.expect_tx().unwrap().signless_value(), 128);
-    });
+    #[test]
+    fn test_wait_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let barrier_memref = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let mut block = context.block(&[(barrier_memref, location), (predicate_type, location)]);
+        let barrier = block.argument(0).unwrap().as_ref();
+        let parity = block.argument(1).unwrap().as_ref();
+        let operation = wait(barrier, parity, location).unwrap();
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert_eq!(operation.parity().unwrap(), parity);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "wait", &[barrier_memref, predicate_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @wait(%arg0: memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, %arg1: \
+                i1) {
+                    mosaic_gpu.wait barrier(%arg0 : memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>) parity(%arg1 : i1)
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_wait_operation, |_context, location, values, _types| {
-        let operation = wait(values[0], values[1], location).unwrap();
+    #[test]
+    fn test_try_cluster_cancel_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let cancellation_type =
+            memref_type(&context, context.signless_integer_type(8).as_ref(), &[16], Some(workgroup), location);
+        let barrier_type = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [cancellation_type, barrier_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let cancellation = block.argument(0).unwrap().as_ref();
+        let barrier = block.argument(1).unwrap().as_ref();
+        let predicate = block.argument(2).unwrap().as_ref();
+        let operation = try_cluster_cancel(cancellation, barrier, predicate, location).unwrap();
+        assert_eq!(operation.cancellation_result().unwrap(), cancellation);
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert_eq!(operation.predicate().unwrap(), predicate);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "try_cluster_cancel", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @try_cluster_cancel(%arg0: memref<16xi8, #gpu.address_space<workgroup>>, %arg1: \
+                memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, %arg2: i1) {
+                    \"mosaic_gpu.try_cluster_cancel\"(%arg0, %arg1, %arg2) : (memref<16xi8, \
+                #gpu.address_space<workgroup>>, memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, \
+                i1) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.wait"));
-        assert_eq!(operation.barrier().unwrap(), values[0]);
-        assert_eq!(operation.parity().unwrap(), values[1]);
-    });
+    #[test]
+    fn test_query_cluster_cancel_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let cancellation_type =
+            memref_type(&context, context.signless_integer_type(8).as_ref(), &[16], Some(workgroup), location);
+        let mut block = context.block(&[(cancellation_type, location)]);
+        let cancellation = block.argument(0).unwrap().as_ref();
+        let operation = query_cluster_cancel(cancellation, location).unwrap();
+        assert_eq!(operation.cancellation_result().unwrap(), cancellation);
+        assert_eq!(operation.x().unwrap().r#type().unwrap(), context.signless_integer_type(32));
+        assert_eq!(operation.y().unwrap().r#type().unwrap(), context.signless_integer_type(32));
+        assert_eq!(operation.z().unwrap().r#type().unwrap(), context.signless_integer_type(32));
+        assert_eq!(operation.success().unwrap().r#type().unwrap(), context.signless_integer_type(1));
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "query_cluster_cancel", &[cancellation_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @query_cluster_cancel(%arg0: memref<16xi8, #gpu.address_space<workgroup>>) {
+                    %x, %y, %z, %success = \"mosaic_gpu.query_cluster_cancel\"(%arg0) : (memref<16xi8, \
+                #gpu.address_space<workgroup>>) -> (i32, i32, i32, i1)
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_try_cluster_cancel_operation, |_context, location, values, _types| {
-        let operation = try_cluster_cancel(values[0], values[1], values[3], location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.try_cluster_cancel"));
-        assert_eq!(operation.cancellation_result().unwrap(), values[0]);
-        assert_eq!(operation.barrier().unwrap(), values[1]);
-        assert_eq!(operation.predicate().unwrap(), values[3]);
-    });
-
-    mosaic_gpu_operation_test!(test_query_cluster_cancel_operation, |_context, location, values, types| {
-        let operation =
-            query_cluster_cancel(values[0], &[types.i32, types.i32, types.i32, types.i1], location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.query_cluster_cancel"));
-        assert_eq!(operation.cancellation_result().unwrap(), values[0]);
-        assert_eq!(operation.cancellation_result().unwrap(), values[0]);
-        assert_eq!(operation.x().unwrap().r#type().unwrap(), types.i32);
-        assert_eq!(operation.y().unwrap().r#type().unwrap(), types.i32);
-        assert_eq!(operation.z().unwrap().r#type().unwrap(), types.i32);
-    });
-
-    mosaic_gpu_operation_test!(test_async_load_operation, |context, location, values, _types| {
-        let collective = context.array_attribute(&[] as &[AttributeRef]);
-        let leader_tracked = context
-            .mosaic_gpu_copy_partitioned_attribute(1)
-            .unwrap()
-            .cast::<CopyPartitionAttributeRef>()
-            .unwrap();
+    #[test]
+    fn test_async_load_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let float_type = context.float32_type().as_ref();
+        let source_type = memref_type(&context, float_type, &[8, 16], None, location);
+        let destination_type = memref_type(&context, float_type, &[8, 16], Some(workgroup), location);
+        let barrier_type = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [source_type, destination_type, barrier_type, integer_type, integer_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = (0..6).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let collective = context.array_attribute(&[] as &[crate::AttributeRef]);
         let operation = async_load(
-            values[4],
-            values[5],
             values[0],
-            &[values[1], values[2]],
-            values[3],
-            &[16, 32],
+            values[1],
+            Some(values[2]),
+            &values[3..5],
+            values[5],
+            None,
+            &[8, 16],
             collective,
-            Some(leader_tracked),
+            None,
             OobFillMode::Zeros,
             location,
         )
         .unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_load"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
-        assert_eq!(operation.barrier().unwrap(), values[0]);
-        assert_eq!(operation.indices().unwrap(), vec![values[1], values[2]]);
-        assert_eq!(operation.predicate().unwrap(), values[3]);
-        assert_eq!(operation.slice_lengths().unwrap().values().collect::<Vec<_>>(), vec![16, 32]);
-        assert!(operation.collective().unwrap().is_empty());
-        assert!(operation.leader_tracked().unwrap().is_some());
+        assert_eq!(operation.source().unwrap(), values[0]);
+        assert_eq!(operation.destination().unwrap(), values[1]);
+        assert_eq!(operation.barrier().unwrap(), Some(values[2]));
+        assert_eq!(operation.indices().unwrap(), values[3..5]);
+        assert_eq!(operation.predicate().unwrap(), values[5]);
+        assert_eq!(operation.slice_lengths().unwrap().values().collect::<Vec<_>>(), vec![8, 16]);
         assert_eq!(operation.oob_fill_mode().unwrap().value().unwrap(), OobFillMode::Zeros);
-    });
-
-    mosaic_gpu_operation_test!(test_async_prefetch_operation, |context, location, values, _types| {
-        let collective = context.array_attribute(&[] as &[AttributeRef]);
-        let operation =
-            async_prefetch(values[4], &[values[1], values[2]], values[3], &[16, 32], collective, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_prefetch"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.indices().unwrap(), vec![values[1], values[2]]);
-        assert_eq!(operation.predicate().unwrap(), values[3]);
-        assert_eq!(operation.slice_lengths().unwrap().values().collect::<Vec<_>>(), vec![16, 32]);
-        assert!(operation.collective().unwrap().is_empty());
-    });
-
-    mosaic_gpu_operation_test!(test_async_store_operation, |_context, location, values, _types| {
-        let operation = async_store(
-            values[4],
+        assert_eq!(operation.global_memory_peer_id().unwrap(), None);
+        assert_eq!(operation.collective().unwrap(), collective);
+        assert_eq!(operation.leader_tracked().unwrap(), None);
+        // Omitting the barrier must not shift the indices, predicate, or peer operand.
+        let peer_load = async_load(
+            values[0],
+            values[1],
+            None,
+            &values[3..5],
             values[5],
-            &[values[1], values[2]],
-            values[3],
-            &[16, 32],
-            Some(true),
-            Some(TmaReduction::Add),
+            Some(values[3]),
+            &[8, 16],
+            collective,
+            None,
+            OobFillMode::Zeros,
             location,
         )
         .unwrap();
+        assert_eq!(peer_load.barrier().unwrap(), None);
+        assert_eq!(peer_load.indices().unwrap(), values[3..5]);
+        assert_eq!(peer_load.predicate().unwrap(), values[5]);
+        assert_eq!(peer_load.global_memory_peer_id().unwrap(), Some(values[3]));
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_load", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_load(%arg0: memref<8x16xf32>, %arg1: memref<8x16xf32, \
+                #gpu.address_space<workgroup>>, %arg2: memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>, %arg3: i32, %arg4: i32, %arg5: i1) {
+                    \"mosaic_gpu.async_load\"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) <{collective = [], \
+                oob_fill_mode = 2 : i32, operandSegmentSizes = array<i32: 1, 1, 1, 2, 1, 0>, slice_lengths = \
+                array<i64: 8, 16>}> : (memref<8x16xf32>, memref<8x16xf32, #gpu.address_space<workgroup>>, \
+                memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, i32, i32, i1) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_store"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
-        assert_eq!(operation.indices().unwrap(), vec![values[1], values[2]]);
+    #[test]
+    fn test_async_prefetch_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[8, 16], None, location);
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [source_type, integer_type, integer_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = (0..4).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let collective = context.array_attribute(&[] as &[crate::AttributeRef]);
+        let operation = async_prefetch(values[0], &values[1..3], values[3], &[8, 16], collective, location).unwrap();
+        assert_eq!(operation.source().unwrap(), values[0]);
+        assert_eq!(operation.indices().unwrap(), values[1..3]);
         assert_eq!(operation.predicate().unwrap(), values[3]);
-        assert_eq!(operation.slice_lengths().unwrap().values().collect::<Vec<_>>(), vec![16, 32]);
-        assert_eq!(operation.commit_group().unwrap().map(|attribute| attribute.value()), Some(true));
+        assert_eq!(operation.slice_lengths().unwrap().values().collect::<Vec<_>>(), vec![8, 16]);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_prefetch", &argument_types, block, location);
+        assert!(module.verify().unwrap());
         assert_eq!(
-            operation.reduction_op().unwrap().map(|attribute| attribute.value().unwrap()),
-            Some(TmaReduction::Add),
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_prefetch(%arg0: memref<8x16xf32>, %arg1: i32, %arg2: i32, %arg3: i1) {
+                    \"mosaic_gpu.async_prefetch\"(%arg0, %arg1, %arg2, %arg3) <{collective = [], \
+                operandSegmentSizes = array<i32: 1, 2, 1>, slice_lengths = array<i64: 8, 16>}> : \
+                (memref<8x16xf32>, i32, i32, i1) -> ()
+                    return
+                  }
+                }
+            "},
         );
-    });
+    }
 
-    mosaic_gpu_operation_test!(test_vector_load_operation, |_context, location, values, types| {
-        let operation = vector_load(values[4], Some(true), types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.vector_load"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.optimized().unwrap().map(|attribute| attribute.value()), Some(true));
-        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_f32);
-    });
-
-    mosaic_gpu_operation_test!(test_multimem_load_reduce_operation, |_context, location, values, types| {
-        let operation =
-            multimem_load_reduce(values[4], MultimemLoadReductionType::Add, types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.multimem_load_reduce"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.reduction_type().unwrap().value().unwrap(), MultimemLoadReductionType::Add);
-        assert_eq!(operation.source().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_vector_store_operation, |_context, location, values, _types| {
-        let operation =
-            vector_store(values[4], values[5], Some(true), Some(AtomicOpType::Add), true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.vector_store"));
-        assert_eq!(operation.value_to_store().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
-        assert_eq!(operation.optimized().unwrap().map(|attribute| attribute.value()), Some(true));
-        assert_eq!(
-            operation.atomic_type().unwrap().map(|attribute| attribute.value().unwrap()),
-            Some(AtomicOpType::Add),
-        );
-        assert!(operation.multimem().unwrap().value());
-    });
-
-    mosaic_gpu_operation_test!(test_layout_cast_operation, |context, location, values, types| {
-        let layout = context
-            .mosaic_gpu_wg_strided_frag_layout_attribute(context.dense_i64_array_attribute(&[4]).unwrap(), 1)
-            .unwrap();
-        let operation = layout_cast(values[4], layout, types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.layout_cast"));
-        assert_eq!(operation.x().unwrap(), values[4]);
-        assert!(operation.strided_layout().unwrap().is_some());
-        assert!(operation.tiled_layout().unwrap().is_none());
-        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_f32);
-    });
-
-    mosaic_gpu_operation_test!(test_tmem_layout_cast_operation, |context, location, values, types| {
-        let empty = context.array_attribute(&[] as &[AttributeRef]);
-        let layout = context.mosaic_gpu_tiled_layout_attribute(empty, empty, empty, 0).unwrap();
-        let operation = tmem_layout_cast(values[4], layout, types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tmem_layout_cast"));
-        assert_eq!(operation.r#ref().unwrap(), values[4]);
-        assert_eq!(operation.new_layout().unwrap(), layout);
-        assert_eq!(operation.r#ref().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_broadcast_in_dim_operation, |_context, location, values, types| {
-        let operation = broadcast_in_dim(values[4], &[0], types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.broadcast_in_dim"));
-        assert_eq!(operation.operand_value(0).unwrap(), values[4]);
-        assert_eq!(operation.broadcast_dimensions().unwrap().values().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(operation.operand_value(0).unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_reinterpret_cast_operation, |_context, location, values, types| {
-        let operation = reinterpret_cast(values[4], types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.reinterpret_cast"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.source().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_slice_smem_operation, |_context, location, _values, types| {
-        let operation = slice_smem(16, Some(2), types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.slice_smem"));
-        assert_eq!(operation.offset().unwrap().signless_value(), 16);
-        assert_eq!(operation.alias_id().unwrap().map(|attribute| attribute.signless_value()), Some(2));
-        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.tensor_f32);
-    });
-
-    mosaic_gpu_operation_test!(test_wgmma_operation, |_context, location, values, types| {
-        let operation = wgmma(values[4], values[5], values[7], types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.wgmma"));
-        assert_eq!(operation.accumulator().unwrap(), values[4]);
-        assert_eq!(operation.a().unwrap(), values[5]);
-        assert_eq!(operation.b().unwrap(), values[7]);
-        assert_eq!(operation.accumulator().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_tcgen05_mma_operation, |_context, location, values, _types| {
-        let operation = tcgen05_mma(
+    #[test]
+    fn test_async_store_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let float_type = context.float32_type().as_ref();
+        let source_type = memref_type(&context, float_type, &[8, 16], Some(workgroup), location);
+        let destination_type = memref_type(&context, float_type, &[8, 16], None, location);
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [source_type, destination_type, integer_type, integer_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = (0..5).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let operation = async_store(
+            values[0],
+            values[1],
+            &values[2..4],
             values[4],
-            values[5],
-            values[7],
-            values[3],
-            Some(values[1]),
+            None,
+            &[8, 16],
+            Some(true),
+            Some(TmaReduction::Add),
+            false,
+            location,
+        )
+        .unwrap();
+        assert_eq!(operation.source().unwrap(), values[0]);
+        assert_eq!(operation.destination().unwrap(), values[1]);
+        assert_eq!(operation.indices().unwrap(), values[2..4]);
+        assert_eq!(operation.predicate().unwrap(), values[4]);
+        assert_eq!(operation.reduction_op().unwrap().unwrap().value().unwrap(), TmaReduction::Add);
+        assert_eq!(operation.global_memory_peer_id().unwrap(), None);
+        assert!(!operation.is_global_broadcast().unwrap().value());
+        let peer_store = async_store(
+            values[0],
+            values[1],
+            &values[2..4],
+            values[4],
             Some(values[2]),
-            Some(values[6]),
+            &[8, 16],
+            None,
+            None,
             true,
             location,
         )
         .unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tcgen05_mma"));
-        assert_eq!(operation.accumulator().unwrap(), values[4]);
-        assert_eq!(operation.a().unwrap(), values[5]);
-        assert_eq!(operation.b().unwrap(), values[7]);
-        assert_eq!(operation.accumulate().unwrap(), values[3]);
-        assert_eq!(operation.a_scale().unwrap(), Some(values[1]));
-        assert_eq!(operation.b_scale().unwrap(), Some(values[2]));
-        assert_eq!(operation.a_sparse_metadata().unwrap(), Some(values[6]));
-        assert!(operation.collective().unwrap().value());
-    });
-
-    mosaic_gpu_operation_test!(test_optimization_barrier_operation, |_context, location, values, types| {
-        let operation =
-            optimization_barrier(&[values[4], values[5]], &[types.tensor_f32, types.tensor_f32], location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.optimization_barrier"));
-        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![values[4], values[5]]);
-        let results = operation.as_ref().results().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(peer_store.global_memory_peer_id().unwrap(), Some(values[2]));
+        assert_eq!(peer_store.indices().unwrap(), values[2..4]);
+        assert_eq!(peer_store.predicate().unwrap(), values[4]);
+        assert!(peer_store.is_global_broadcast().unwrap().value());
+        assert_eq!(peer_store.reduction_op().unwrap(), None);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store", &argument_types, block, location);
+        assert!(module.verify().unwrap());
         assert_eq!(
-            results.iter().map(|result| result.r#type().unwrap()).collect::<Vec<_>>(),
-            vec![types.tensor_f32, types.tensor_f32,]
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store(%arg0: memref<8x16xf32, #gpu.address_space<workgroup>>, %arg1: \
+                memref<8x16xf32>, %arg2: i32, %arg3: i32, %arg4: i1) {
+                    \"mosaic_gpu.async_store\"(%arg0, %arg1, %arg2, %arg3, %arg4) <{commit_group = true, \
+                is_global_broadcast = false, operandSegmentSizes = array<i32: 1, 1, 2, 1, 0>, reduction_op = \
+                0 : i32, slice_lengths = array<i64: 8, 16>}> : (memref<8x16xf32, \
+                #gpu.address_space<workgroup>>, memref<8x16xf32>, i32, i32, i1) -> ()
+                    return
+                  }
+                }
+            "},
         );
-    });
+    }
 
-    mosaic_gpu_operation_test!(test_return_operation, |_context, location, values, _types| {
-        let operation = r#return(&[values[4], values[5]], location).unwrap();
+    #[test]
+    fn test_vector_load_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[4, 8], None, location);
+        let result_type = vector_type(&context, context.float32_type().as_ref(), &[4, 8], location);
+        let mut block = context.block(&[(source_type, location)]);
+        let source = block.argument(0).unwrap().as_ref();
+        let operation = vector_load(source, Some(true), result_type, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.optimized().unwrap().unwrap().value(), true);
+        assert_eq!(VectorLoadOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "vector_load", &[source_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @vector_load(%arg0: memref<4x8xf32>) {
+                    %0 = \"mosaic_gpu.vector_load\"(%arg0) <{optimized = true}> : (memref<4x8xf32>) -> \
+                vector<4x8xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.return"));
-        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![values[4], values[5]]);
-    });
+    #[test]
+    fn test_multimem_load_reduce_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[4, 8], None, location);
+        let result_type = vector_type(&context, context.float32_type().as_ref(), &[4, 8], location);
+        let mut block = context.block(&[(source_type, location)]);
+        let source = block.argument(0).unwrap().as_ref();
+        let operation = multimem_load_reduce(source, MultimemLoadReductionType::Add, result_type, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.reduction_type().unwrap().value().unwrap(), MultimemLoadReductionType::Add);
+        assert_eq!(MultimemLoadReduceOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "multimem_load_reduce", &[source_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @multimem_load_reduce(%arg0: memref<4x8xf32>) {
+                    %0 = \"mosaic_gpu.multimem_load_reduce\"(%arg0) <{reduction_type = 0 : i32}> : \
+                (memref<4x8xf32>) -> vector<4x8xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_custom_primitive_operation, |context, location, values, types| {
-        let empty = context.array_attribute(&[] as &[AttributeRef]);
+    #[test]
+    fn test_vector_store_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let float_type = context.float32_type().as_ref();
+        let vector = vector_type(&context, float_type, &[4, 8], location);
+        let destination = memref_type(&context, float_type, &[4, 8], None, location);
+        let argument_types = [vector, destination];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let value = block.argument(0).unwrap().as_ref();
+        let destination_value = block.argument(1).unwrap().as_ref();
         let operation =
-            custom_primitive(&[values[4]], empty, empty, empty, &[types.tensor_f32], context.region(), location)
-                .unwrap();
+            vector_store(value, destination_value, Some(true), Some(AtomicOpType::Add), true, location).unwrap();
+        assert_eq!(operation.value_to_store().unwrap(), value);
+        assert_eq!(operation.destination().unwrap(), destination_value);
+        assert_eq!(operation.atomic_type().unwrap().unwrap().value().unwrap(), AtomicOpType::Add);
+        assert!(operation.multimem().unwrap().value());
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "vector_store", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @vector_store(%arg0: vector<4x8xf32>, %arg1: memref<4x8xf32>) {
+                    \"mosaic_gpu.vector_store\"(%arg0, %arg1) <{atomic_type = 0 : i32, multimem = true, \
+                optimized = true}> : (vector<4x8xf32>, memref<4x8xf32>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.custom_primitive"));
-        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![values[4]]);
-        assert!(operation.in_layouts().unwrap().is_empty());
-        assert!(operation.in_transforms().unwrap().is_empty());
-        assert!(operation.out_layouts().unwrap().is_empty());
-        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 0);
-    });
+    #[test]
+    fn test_layout_cast_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let layout = context
+            .mosaic_gpu_wg_strided_frag_layout_attribute(context.dense_i64_array_attribute(&[4]).unwrap(), 1)
+            .unwrap();
+        let mut block = context.block(&[(vector, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = layout_cast(value, layout, vector, location).unwrap();
+        assert_eq!(operation.x().unwrap(), value);
+        assert_eq!(operation.strided_layout().unwrap(), Some(layout));
+        assert!(operation.tiled_layout().unwrap().is_none());
+        assert_eq!(LayoutCastOperation::result(&operation).unwrap().r#type().unwrap(), vector);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "layout_cast", &[vector], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @layout_cast(%arg0: vector<4xf32>) {
+                    %0 = mosaic_gpu.layout_cast x(%arg0 : vector<4xf32>) {new_layout = \
+                #mosaic_gpu.WGStridedFragLayout<[4], 1>}
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_warp_map_operation, |context, location, values, _types| {
-        let operation = warp_map(&[values[4]], context.region(), location).unwrap();
+    #[test]
+    fn test_tmem_layout_cast_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let tmem_ref = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let empty = context.array_attribute(&[] as &[crate::AttributeRef]);
+        let layout = context.mosaic_gpu_tiled_layout_attribute(empty, empty, empty, 0).unwrap();
+        let mut block = context.block(&[(tmem_ref, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = tmem_layout_cast(value, layout, tmem_ref, location).unwrap();
+        assert_eq!(operation.r#ref().unwrap(), value);
+        assert_eq!(operation.new_layout().unwrap(), layout);
+        assert_eq!(TmemLayoutCastOperation::result(&operation).unwrap().r#type().unwrap(), tmem_ref);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tmem_layout_cast", &[tmem_ref], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tmem_layout_cast(%arg0: memref<32x32xf32, #mosaic_gpu.tmem>) {
+                    %0 = \"mosaic_gpu.tmem_layout_cast\"(%arg0) <{new_layout = #mosaic_gpu.TiledLayout<[], \
+                warp_dims = [], lane_dims = [], vector_dim = 0>}> : (memref<32x32xf32, #mosaic_gpu.tmem>) -> \
+                memref<32x32xf32, #mosaic_gpu.tmem>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.warp_map"));
-        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![values[4]]);
-        assert_eq!(operation.as_ref().region(0).unwrap().blocks().unwrap().count(), 0);
-    });
+    #[test]
+    fn test_broadcast_in_dim_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let input = vector_type(&context, context.float32_type().as_ref(), &[1], location);
+        let output = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let mut block = context.block(&[(input, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = broadcast_in_dim(value, &[0], output, location).unwrap();
+        assert_eq!(BroadcastInDimOperation::operand(&operation).unwrap(), value);
+        assert_eq!(operation.broadcast_dimensions().unwrap().values().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(BroadcastInDimOperation::result(&operation).unwrap().r#type().unwrap(), output);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "broadcast_in_dim", &[input], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @broadcast_in_dim(%arg0: vector<1xf32>) {
+                    %0 = mosaic_gpu.broadcast_in_dim(%arg0 : vector<1xf32>) {broadcast_dimensions = \
+                array<i64: 0>} -> vector<4xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_with_transforms_operation, |context, location, values, types| {
-        let transform = context.mosaic_gpu_tile_transform_attribute(&[16]).unwrap();
+    #[test]
+    fn test_reinterpret_cast_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[2, 8], None, location);
+        let result_type = memref_type(&context, context.float32_type().as_ref(), &[4, 4], None, location);
+        let mut block = context.block(&[(source_type, location)]);
+        let source = block.argument(0).unwrap().as_ref();
+        let operation = reinterpret_cast(source, result_type, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(ReinterpretCastOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "reinterpret_cast", &[source_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @reinterpret_cast(%arg0: memref<2x8xf32>) {
+                    %0 = \"mosaic_gpu.reinterpret_cast\"(%arg0) : (memref<2x8xf32>) -> memref<4x4xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_slice_smem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let result_type = memref_type(&context, context.float32_type().as_ref(), &[4, 4], Some(workgroup), location);
+        let mut block = context.block_with_no_arguments();
+        let without_alias = slice_smem(16, None, result_type, location).unwrap();
+        assert_eq!(without_alias.alias_id().unwrap(), None);
+        let operation = slice_smem(16, Some(4294967296), result_type, location).unwrap();
+        assert_eq!(operation.offset().unwrap().signless_value(), 16);
+        assert_eq!(operation.alias_id().unwrap().unwrap().signless_value(), 4294967296);
+        assert_eq!(SliceSmemOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "slice_smem", &[], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @slice_smem() {
+                    %0 = \"mosaic_gpu.slice_smem\"() <{alias_id = 4294967296 : i64, offset = 16 : i32}> : () \
+                -> memref<4x4xf32, #gpu.address_space<workgroup>>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_wgmma_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let accumulator_type = vector_type(&context, context.float32_type().as_ref(), &[64, 8], location);
+        let a_type = memref_type(&context, context.float16_type().as_ref(), &[64, 16], Some(workgroup), location);
+        let b_type = memref_type(&context, context.float16_type().as_ref(), &[16, 8], Some(workgroup), location);
+        let argument_types = [accumulator_type, a_type, b_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let operation = wgmma(values[0], values[1], values[2], location).unwrap();
+        assert_eq!(operation.accumulator().unwrap(), values[0]);
+        assert_eq!(operation.a().unwrap(), values[1]);
+        assert_eq!(operation.b().unwrap(), values[2]);
+        assert_eq!(WgmmaOperation::result(&operation).unwrap().r#type().unwrap(), accumulator_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "wgmma", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @wgmma(%arg0: vector<64x8xf32>, %arg1: memref<64x16xf16, \
+                #gpu.address_space<workgroup>>, %arg2: memref<16x8xf16, #gpu.address_space<workgroup>>) {
+                    %0 = mosaic_gpu.wgmma accumulator(%arg0 : vector<64x8xf32>) a(%arg1 : memref<64x16xf16, \
+                #gpu.address_space<workgroup>>) b(%arg2 : memref<16x8xf16, #gpu.address_space<workgroup>>) -> \
+                vector<64x8xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_tcgen05_mma_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let accumulator_type = memref_type(&context, context.float32_type().as_ref(), &[32, 8], Some(tmem), location);
+        let a_type = memref_type(&context, context.float16_type().as_ref(), &[32, 16], Some(workgroup), location);
+        let b_type = memref_type(&context, context.float16_type().as_ref(), &[16, 8], Some(workgroup), location);
+        let predicate_type = context.signless_integer_type(1).as_ref();
+        let argument_types = [accumulator_type, a_type, b_type, predicate_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = (0..4).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let operation =
+            tcgen05_mma(values[0], values[1], values[2], values[3], None, None, None, false, location).unwrap();
+        assert_eq!(operation.accumulator().unwrap(), values[0]);
+        assert_eq!(operation.a().unwrap(), values[1]);
+        assert_eq!(operation.b().unwrap(), values[2]);
+        assert_eq!(operation.accumulate().unwrap(), values[3]);
+        assert!(operation.a_scale().unwrap().is_none());
+        assert!(operation.a_sparse_metadata().unwrap().is_none());
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tcgen05_mma", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tcgen05_mma(%arg0: memref<32x8xf32, #mosaic_gpu.tmem>, %arg1: memref<32x16xf16, \
+                #gpu.address_space<workgroup>>, %arg2: memref<16x8xf16, #gpu.address_space<workgroup>>, \
+                %arg3: i1) {
+                    \"mosaic_gpu.tcgen05_mma\"(%arg0, %arg1, %arg2, %arg3) <{collective = false, \
+                operandSegmentSizes = array<i32: 1, 1, 1, 1, 0, 0, 0>}> : (memref<32x8xf32, \
+                #mosaic_gpu.tmem>, memref<32x16xf16, #gpu.address_space<workgroup>>, memref<16x8xf16, \
+                #gpu.address_space<workgroup>>, i1) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_optimization_barrier_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let argument_types = [integer_type, vector];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let values = [block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
+        let operation = optimization_barrier(&values, location).unwrap();
+        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), values);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), integer_type);
+        assert_eq!(operation.result(1).unwrap().r#type().unwrap(), vector);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "optimization_barrier", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @optimization_barrier(%arg0: i32, %arg1: vector<4xf32>) {
+                    %0:2 = \"mosaic_gpu.optimization_barrier\"(%arg0, %arg1) : (i32, vector<4xf32>) -> (i32, \
+                vector<4xf32>)
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_return_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let layout = context
+            .mosaic_gpu_wg_strided_frag_layout_attribute(context.dense_i64_array_attribute(&[4]).unwrap(), 1)
+            .unwrap();
+        let layouts = context.array_attribute(&[layout.as_ref()]);
+        let empty = context.array_attribute(&[] as &[crate::AttributeRef]);
+        let mut body = context.region();
+        let mut body_block = context.block(&[(vector, location)]);
+        let result = body_block.argument(0).unwrap().as_ref();
+        let operation = r#return(&[result], location).unwrap();
+        assert_eq!(operation.operand_values().collect::<Result<Vec<_>, _>>().unwrap(), vec![result]);
+        body_block.append_operation(operation).unwrap();
+        body.append_block(body_block).unwrap();
+        let mut block = context.block(&[(vector, location)]);
+        let argument = block.argument(0).unwrap().as_ref();
+        block
+            .append_operation(
+                custom_primitive(&[argument], layouts, empty, layouts, &[vector], body, location).unwrap(),
+            )
+            .unwrap();
+        append_void_function(&module, "return", &[vector], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @return(%arg0: vector<4xf32>) {
+                    %0 = \"mosaic_gpu.custom_primitive\"(%arg0) <{in_layouts = \
+                [#mosaic_gpu.WGStridedFragLayout<[4], 1>], in_transforms = [], out_layouts = \
+                [#mosaic_gpu.WGStridedFragLayout<[4], 1>]}> ({
+                    ^bb0(%arg1: vector<4xf32>):
+                      mosaic_gpu.return %arg1 : vector<4xf32>
+                    }) : (vector<4xf32>) -> vector<4xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_custom_primitive_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let layout = context
+            .mosaic_gpu_wg_strided_frag_layout_attribute(context.dense_i64_array_attribute(&[4]).unwrap(), 1)
+            .unwrap();
+        let layouts = context.array_attribute(&[layout.as_ref()]);
+        let empty = context.array_attribute(&[] as &[crate::AttributeRef]);
+        let mut body = context.region();
+        let mut body_block = context.block(&[(vector, location)]);
+        let body_argument = body_block.argument(0).unwrap().as_ref();
+        body_block.append_operation(r#return(&[body_argument], location).unwrap()).unwrap();
+        body.append_block(body_block).unwrap();
+        let mut block = context.block(&[(vector, location)]);
+        let argument = block.argument(0).unwrap().as_ref();
+        let operation = custom_primitive(&[argument], layouts, empty, layouts, &[vector], body, location).unwrap();
+        assert_eq!(CustomPrimitiveOperation::operands(&operation).unwrap(), vec![argument]);
+        assert_eq!(operation.in_layouts().unwrap(), layouts);
+        assert_eq!(operation.out_layouts().unwrap(), layouts);
+        assert_eq!(operation.body().unwrap().blocks().unwrap().count(), 1);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "custom_primitive", &[vector], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @custom_primitive(%arg0: vector<4xf32>) {
+                    %0 = \"mosaic_gpu.custom_primitive\"(%arg0) <{in_layouts = \
+                [#mosaic_gpu.WGStridedFragLayout<[4], 1>], in_transforms = [], out_layouts = \
+                [#mosaic_gpu.WGStridedFragLayout<[4], 1>]}> ({
+                    ^bb0(%arg1: vector<4xf32>):
+                      mosaic_gpu.return %arg1 : vector<4xf32>
+                    }) : (vector<4xf32>) -> vector<4xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_warp_map_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let mut region = context.region();
+        region.append_block(context.block(&[(integer_type, location)])).unwrap();
+        let mut block = context.block(&[(integer_type, location)]);
+        let argument = block.argument(0).unwrap().as_ref();
+        let operation = warp_map(&[argument], region, location).unwrap();
+        assert_eq!(WarpMapOperation::operands(&operation).unwrap(), vec![argument]);
+        assert_eq!(WarpMapOperation::region(&operation).unwrap().blocks().unwrap().count(), 1);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "warp_map", &[integer_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @warp_map(%arg0: i32) {
+                    \"mosaic_gpu.warp_map\"(%arg0) ({
+                    ^bb0(%arg1: i32):
+                    }) : (i32) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_with_transforms_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let memref = memref_type(&context, context.float32_type().as_ref(), &[4, 4], Some(workgroup), location);
+        let transform = context.mosaic_gpu_tile_transform_attribute(&[2, 2]).unwrap();
         let transforms = context.array_attribute(&[transform.as_ref()]);
-        let operation = with_transforms(values[4], transforms, types.tensor_f32, location).unwrap();
+        let mut block = context.block(&[(memref, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = with_transforms(value, transforms, memref, location).unwrap();
+        assert_eq!(operation.r#ref().unwrap(), value);
+        assert_eq!(operation.transforms().unwrap(), transforms);
+        assert_eq!(WithTransformsOperation::result(&operation).unwrap().r#type().unwrap(), memref);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "with_transforms", &[memref], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @with_transforms(%arg0: memref<4x4xf32, #gpu.address_space<workgroup>>) {
+                    %0 = \"mosaic_gpu.with_transforms\"(%arg0) <{transforms = [#mosaic_gpu.tile<[2, 2]>]}> : \
+                (memref<4x4xf32, #gpu.address_space<workgroup>>) -> memref<4x4xf32, \
+                #gpu.address_space<workgroup>>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.with_transforms"));
-        assert_eq!(operation.r#ref().unwrap(), values[4]);
-        assert_eq!(operation.transforms().unwrap().len(), 1);
-        assert_eq!(operation.r#ref().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_tmem_alloc_operation, |_context, location, values, types| {
-        let operation = tmem_alloc(values[4], true, 4, types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tmem_alloc"));
-        assert_eq!(operation.smem_ptr().unwrap(), values[4]);
+    #[test]
+    fn test_tmem_alloc_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let smem_pointer =
+            memref_type(&context, context.signless_integer_type(32).as_ref(), &[], Some(workgroup), location);
+        let result_type =
+            memref_type(&context, context.signless_integer_type(8).as_ref(), &[32, 64], Some(tmem), location);
+        let mut block = context.block(&[(smem_pointer, location)]);
+        let pointer = block.argument(0).unwrap().as_ref();
+        let operation = tmem_alloc(pointer, true, 4, result_type, location).unwrap();
+        assert_eq!(operation.smem_ptr().unwrap(), pointer);
         assert!(operation.collective().unwrap().value());
         assert_eq!(operation.packing().unwrap().signless_value(), 4);
-        assert_eq!(operation.smem_ptr().unwrap(), values[4]);
-    });
+        assert_eq!(TmemAllocOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tmem_alloc", &[smem_pointer], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tmem_alloc(%arg0: memref<i32, #gpu.address_space<workgroup>>) {
+                    %0 = mosaic_gpu.tmem_alloc smem_ptr(%arg0 : memref<i32, #gpu.address_space<workgroup>>) \
+                {collective = true, packing = 4 : i32} -> memref<32x64xi8, #mosaic_gpu.tmem>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_tmem_relinquish_alloc_permit_operation, |_context, location, _values, _types| {
+    #[test]
+    fn test_tmem_relinquish_alloc_permit_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let mut block = context.block_with_no_arguments();
         let operation = tmem_relinquish_alloc_permit(true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tmem_relinquish_alloc_permit"));
         assert!(operation.collective().unwrap().value());
-    });
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tmem_relinquish_alloc_permit", &[], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tmem_relinquish_alloc_permit() {
+                    \"mosaic_gpu.tmem_relinquish_alloc_permit\"() <{collective = true}> : () -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_tmem_dealloc_operation, |_context, location, values, _types| {
-        let operation = tmem_dealloc(values[4], location).unwrap();
+    #[test]
+    fn test_tmem_dealloc_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let tmem_ref = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let mut block = context.block(&[(tmem_ref, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = tmem_dealloc(value, location).unwrap();
+        assert_eq!(operation.tmem_ref().unwrap(), value);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tmem_dealloc", &[tmem_ref], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tmem_dealloc(%arg0: memref<32x32xf32, #mosaic_gpu.tmem>) {
+                    mosaic_gpu.tmem_dealloc tmem_ref(%arg0 : memref<32x32xf32, #mosaic_gpu.tmem>)
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tmem_dealloc"));
-        assert_eq!(operation.tmem_ref().unwrap(), values[4]);
-    });
+    #[test]
+    fn test_async_load_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let result_type = vector_type(&context, context.float32_type().as_ref(), &[32, 32], location);
+        let mut block = context.block(&[(source_type, location)]);
+        let source = block.argument(0).unwrap().as_ref();
+        let operation = async_load_tmem(source, None, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(AsyncLoadTmemOperation::results(&operation).unwrap(), vec![operation.result(0).unwrap()]);
+        assert!(operation.reduction().unwrap().is_none());
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), result_type);
+        let reduced_type = vector_type(&context, context.float32_type().as_ref(), &[32], location);
+        let reduction = async_load_tmem(source, Some(TmemLoadReduction::Max), location).unwrap();
+        assert_eq!(reduction.reduction().unwrap().unwrap().value(), Ok(TmemLoadReduction::Max));
+        assert_eq!(
+            AsyncLoadTmemOperation::results(&reduction).unwrap(),
+            vec![reduction.result(0).unwrap(), reduction.result(1).unwrap()]
+        );
+        assert_eq!(reduction.result(1).unwrap().r#type().unwrap(), reduced_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_load_tmem", &[source_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_load_tmem(%arg0: memref<32x32xf32, #mosaic_gpu.tmem>) {
+                    %0 = \"mosaic_gpu.async_load_tmem\"(%arg0) : (memref<32x32xf32, #mosaic_gpu.tmem>) -> \
+                vector<32x32xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_async_load_tmem_operation, |_context, location, values, types| {
-        let operation = async_load_tmem(values[4], types.tensor_f32, location).unwrap();
+    #[test]
+    fn test_async_store_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[32, 32], location);
+        let destination = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let argument_types = [vector, destination];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let destination_value = block.argument(1).unwrap().as_ref();
+        let operation = async_store_tmem(source, destination_value, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination().unwrap(), destination_value);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store_tmem", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store_tmem(%arg0: vector<32x32xf32>, %arg1: memref<32x32xf32, \
+                #mosaic_gpu.tmem>) {
+                    \"mosaic_gpu.async_store_tmem\"(%arg0, %arg1) : (vector<32x32xf32>, memref<32x32xf32, \
+                #mosaic_gpu.tmem>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_load_tmem"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.source().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_async_store_tmem_operation, |_context, location, values, _types| {
-        let operation = async_store_tmem(values[4], values[5], location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_store_tmem"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
-    });
-
-    mosaic_gpu_operation_test!(test_async_store_smem_to_tmem_operation, |_context, location, values, _types| {
-        let operation = async_store_smem_to_tmem(values[4], values[5], true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_store_smem_to_tmem"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
+    #[test]
+    fn test_async_store_smem_to_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(workgroup), location);
+        let destination_type = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let argument_types = [source_type, destination_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let destination = block.argument(1).unwrap().as_ref();
+        let operation = async_store_smem_to_tmem(source, destination, true, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination().unwrap(), destination);
         assert!(operation.collective().unwrap().value());
-    });
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store_smem_to_tmem", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store_smem_to_tmem(%arg0: memref<32x32xf32, \
+                #gpu.address_space<workgroup>>, %arg1: memref<32x32xf32, #mosaic_gpu.tmem>) {
+                    \"mosaic_gpu.async_store_smem_to_tmem\"(%arg0, %arg1) <{collective = true}> : \
+                (memref<32x32xf32, #gpu.address_space<workgroup>>, memref<32x32xf32, #mosaic_gpu.tmem>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(
-        test_async_store_sparse_metadata_smem_to_tmem_operation,
-        |_context, location, values, _types| {
-            let operation = async_store_sparse_metadata_smem_to_tmem(values[4], values[5], true, location).unwrap();
-
-            assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_store_sparse_metadata_smem_to_tmem"));
-            assert_eq!(operation.source().unwrap(), values[4]);
-            assert_eq!(operation.destination().unwrap(), values[5]);
-            assert!(operation.collective().unwrap().value());
-        },
-    );
-
-    mosaic_gpu_operation_test!(test_async_store_scales_smem_to_tmem_operation, |_context, location, values, _types| {
-        let operation = async_store_scales_smem_to_tmem(values[4], values[5], true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.async_store_scales_smem_to_tmem"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.destination().unwrap(), values[5]);
+    #[test]
+    fn test_async_store_sparse_metadata_smem_to_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let i2 = context.signless_integer_type(2).as_ref();
+        let source_type = memref_type(&context, i2, &[1, 1, 128, 64], Some(workgroup), location);
+        let destination_type = memref_type(&context, i2, &[128, 64], Some(tmem), location);
+        let argument_types = [source_type, destination_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let destination = block.argument(1).unwrap().as_ref();
+        let operation = async_store_sparse_metadata_smem_to_tmem(source, destination, true, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination().unwrap(), destination);
         assert!(operation.collective().unwrap().value());
-    },);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store_sparse_metadata_smem_to_tmem", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store_sparse_metadata_smem_to_tmem(%arg0: memref<1x1x128x64xi2, \
+                #gpu.address_space<workgroup>>, %arg1: memref<128x64xi2, #mosaic_gpu.tmem>) {
+                    \"mosaic_gpu.async_store_sparse_metadata_smem_to_tmem\"(%arg0, %arg1) <{collective = \
+                true}> : (memref<1x1x128x64xi2, #gpu.address_space<workgroup>>, memref<128x64xi2, \
+                #mosaic_gpu.tmem>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_slice_tmem_operation, |_context, location, values, types| {
-        let operation = slice_tmem(values[4], 32, types.tensor_f32, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.slice_tmem"));
-        assert_eq!(operation.source().unwrap(), values[4]);
-        assert_eq!(operation.offset().unwrap().signless_value(), 32);
-        assert_eq!(operation.source().unwrap(), values[4]);
-    });
-
-    mosaic_gpu_operation_test!(test_tcgen05_commit_arrive_operation, |_context, location, values, _types| {
-        let operation = tcgen05_commit_arrive(values[0], true, location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.tcgen05_commit_arrive"));
-        assert_eq!(operation.barrier().unwrap(), values[0]);
+    #[test]
+    fn test_async_store_scales_smem_to_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let scale = context.float8e8m0fnu_type().as_ref();
+        let source_type = memref_type(&context, scale, &[1, 1, 32, 16], Some(workgroup), location);
+        let destination_type = memref_type(&context, scale, &[128, 4], Some(tmem), location);
+        let argument_types = [source_type, destination_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let destination = block.argument(1).unwrap().as_ref();
+        let operation = async_store_scales_smem_to_tmem(source, destination, true, location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.destination().unwrap(), destination);
         assert!(operation.collective().unwrap().value());
-    });
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store_scales_smem_to_tmem", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store_scales_smem_to_tmem(%arg0: memref<1x1x32x16xf8E8M0FNU, \
+                #gpu.address_space<workgroup>>, %arg1: memref<128x4xf8E8M0FNU, #mosaic_gpu.tmem>) {
+                    \"mosaic_gpu.async_store_scales_smem_to_tmem\"(%arg0, %arg1) <{collective = true}> : \
+                (memref<1x1x32x16xf8E8M0FNU, #gpu.address_space<workgroup>>, memref<128x4xf8E8M0FNU, \
+                #mosaic_gpu.tmem>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_debug_print_operation, |_context, location, values, _types| {
-        let operation = debug_print("value = {}", values[4], location).unwrap();
+    #[test]
+    fn test_slice_tmem_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tmem = context.mosaic_gpu_tmem_attribute().unwrap().as_ref();
+        let source_type = memref_type(&context, context.float32_type().as_ref(), &[32, 64], Some(tmem), location);
+        let result_type = memref_type(&context, context.float32_type().as_ref(), &[32, 32], Some(tmem), location);
+        let mut block = context.block(&[(source_type, location)]);
+        let source = block.argument(0).unwrap().as_ref();
+        let without_alias = slice_tmem(source, 4, None, result_type, location).unwrap();
+        assert_eq!(without_alias.alias_id().unwrap(), None);
+        let operation = slice_tmem(source, 4, Some(4294967296), result_type, location).unwrap();
+        assert_eq!(operation.alias_id().unwrap().unwrap().signless_value(), 4294967296);
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.offset().unwrap().signless_value(), 4);
+        assert_eq!(SliceTmemOperation::result(&operation).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "slice_tmem", &[source_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @slice_tmem(%arg0: memref<32x64xf32, #mosaic_gpu.tmem>) {
+                    %0 = \"mosaic_gpu.slice_tmem\"(%arg0) <{alias_id = 4294967296 : i64, offset = 4 : i32}> : \
+                (memref<32x64xf32, #mosaic_gpu.tmem>) -> memref<32x32xf32, #mosaic_gpu.tmem>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.debug_print"));
+    #[test]
+    fn test_tcgen05_commit_arrive_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let barrier_type = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let mut block = context.block(&[(barrier_type, location)]);
+        let barrier = block.argument(0).unwrap().as_ref();
+        let operation = tcgen05_commit_arrive(barrier, true, location).unwrap();
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert!(operation.collective().unwrap().value());
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "tcgen05_commit_arrive", &[barrier_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @tcgen05_commit_arrive(%arg0: memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>) {
+                    \"mosaic_gpu.tcgen05_commit_arrive\"(%arg0) <{collective = true}> : \
+                (memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_debug_print_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let mut block = context.block(&[(vector, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = debug_print("value = {}", value, location).unwrap();
         assert_eq!(operation.format().unwrap().string().as_str(), Ok("value = {}"));
-        assert_eq!(operation.value().unwrap(), values[4]);
-    });
+        assert_eq!(operation.value().unwrap(), value);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "debug_print", &[vector], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @debug_print(%arg0: vector<4xf32>) {
+                    \"mosaic_gpu.debug_print\"(%arg0) <{format = \"value = {}\"}> : (vector<4xf32>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_print_layout_operation, |_context, location, values, _types| {
-        let operation = print_layout("layout = {}", values[4], location).unwrap();
-
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.print_layout"));
+    #[test]
+    fn test_print_layout_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let mut block = context.block(&[(vector, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = print_layout("layout = {}", value, location).unwrap();
         assert_eq!(operation.format().unwrap().string().as_str(), Ok("layout = {}"));
-        assert_eq!(operation.value().unwrap(), values[4]);
-    });
+        assert_eq!(operation.value().unwrap(), value);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "print_layout", &[vector], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @print_layout(%arg0: vector<4xf32>) {
+                    \"mosaic_gpu.print_layout\"(%arg0) <{format = \"layout = {}\"}> : (vector<4xf32>) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-    mosaic_gpu_operation_test!(test_broadcasted_iota_operation, |_context, location, _values, types| {
-        let operation = broadcasted_iota(1, types.tensor_f32, location).unwrap();
+    #[test]
+    fn test_broadcasted_iota_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let vector = vector_type(&context, context.signless_integer_type(32).as_ref(), &[4, 8], location);
+        let mut block = context.block_with_no_arguments();
+        let operation = broadcasted_iota(1, vector, location).unwrap();
+        assert_eq!(operation.dimension().unwrap().signless_value(), 1);
+        assert_eq!(BroadcastedIotaOperation::result(&operation).unwrap().r#type().unwrap(), vector);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "broadcasted_iota", &[], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @broadcasted_iota() {
+                    %0 = \"mosaic_gpu.broadcasted_iota\"() <{dimension = 1 : i32}> : () -> vector<4x8xi32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(operation.name().as_str(), Ok("mosaic_gpu.broadcasted_iota"));
-        assert_eq!(operation.dimension().unwrap().signless_value(), 1);
-        assert_eq!(operation.dimension().unwrap().signless_value(), 1);
-    });
+    #[test]
+    fn test_mma_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let accumulator_type = vector_type(&context, context.float32_type().as_ref(), &[16, 8], location);
+        let left_type = vector_type(&context, context.float16_type().as_ref(), &[16, 16], location);
+        let right_type = vector_type(&context, context.float16_type().as_ref(), &[16, 8], location);
+        let argument_types = [accumulator_type, left_type, right_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let accumulator = block.argument(0).unwrap().as_ref();
+        let left = block.argument(1).unwrap().as_ref();
+        let right = block.argument(2).unwrap().as_ref();
+        let operation = mma(accumulator, left, right, location).unwrap();
+        assert_eq!(operation.accumulator().unwrap(), accumulator);
+        assert_eq!(operation.lhs().unwrap(), left);
+        assert_eq!(operation.rhs().unwrap(), right);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), accumulator_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "mma", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @mma(%arg0: vector<16x8xf32>, %arg1: vector<16x16xf16>, %arg2: vector<16x8xf16>) {
+                    %0 = mosaic_gpu.mma accumulator(%arg0 : vector<16x8xf32>) a(%arg1 : vector<16x16xf16>) \
+                b(%arg2 : vector<16x8xf16>) -> vector<16x8xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_vector_concat_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let input_type = vector_type(&context, context.float32_type().as_ref(), &[2], location);
+        let result_type = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let mut block = context.block(&[(input_type, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = vector_concat(&[value, value], 0, result_type, location).unwrap();
+        assert_eq!(VectorConcatOperation::operands(&operation).unwrap(), vec![value, value]);
+        assert_eq!(operation.dimension().unwrap().signless_value(), 0);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), result_type);
+        assert!(matches!(vector_concat(&[], 0, result_type, location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "expected nonempty vectors and a nonnegative concatenation dimension"));
+        assert!(matches!(vector_concat(&[value], -1, result_type, location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "expected nonempty vectors and a nonnegative concatenation dimension"));
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "vector_concat", &[input_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @vector_concat(%arg0: vector<2xf32>) {
+                    %0 = mosaic_gpu.vector_concat(%arg0, %arg0 : vector<2xf32>, vector<2xf32>) {dimension = 0 \
+                : i32} -> vector<4xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_assume_multiple_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let mut block = context.block(&[(integer_type, location)]);
+        let value = block.argument(0).unwrap().as_ref();
+        let operation = assume_multiple(value, 16, location).unwrap();
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.multiple().unwrap().signless_value(), 16);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), integer_type);
+        assert!(matches!(assume_multiple(value, 0, location),
+            Err(Error::InvalidArgument { message, .. }) if message == "expected a positive `multiple`"));
+        assert!(matches!(assume_multiple(value, -1, location),
+            Err(Error::InvalidArgument { message, .. }) if message == "expected a positive `multiple`"));
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "assume_multiple", &[integer_type], block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @assume_multiple(%arg0: i32) {
+                    %0 = mosaic_gpu.assume_multiple %arg0, 16 : i32
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_get_cluster_ref_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let memory_type = memref_type(&context, context.float32_type().as_ref(), &[4], Some(workgroup), location);
+        let cluster = context.mosaic_gpu_smem_cluster_attribute().unwrap().as_ref();
+        let result_type = memref_type(&context, context.float32_type().as_ref(), &[4], Some(cluster), location);
+        let integer_type = context.signless_integer_type(32).as_ref();
+        let argument_types = [memory_type, integer_type];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let source = block.argument(0).unwrap().as_ref();
+        let coordinate = block.argument(1).unwrap().as_ref();
+        let operation = get_cluster_ref(source, [None, Some(coordinate), None], location).unwrap();
+        assert_eq!(operation.source().unwrap(), source);
+        assert_eq!(operation.x().unwrap(), None);
+        assert_eq!(operation.y().unwrap(), Some(coordinate));
+        assert_eq!(operation.z().unwrap(), None);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), result_type);
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "get_cluster_ref", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @get_cluster_ref(%arg0: memref<4xf32, #gpu.address_space<workgroup>>, %arg1: i32) \
+                {
+                    %0 = \"mosaic_gpu.get_cluster_ref\"(%arg0, %arg1) <{operandSegmentSizes = array<i32: 1, \
+                0, 1, 0>}> : (memref<4xf32, #gpu.address_space<workgroup>>, i32) -> memref<4xf32, \
+                #mosaic_gpu.smem_cluster>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_async_store_smem_operation() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let workgroup = context.gpu_address_space_attribute(AddressSpace::Workgroup).unwrap().as_ref();
+        let vector = vector_type(&context, context.float32_type().as_ref(), &[4], location);
+        let memory = memref_type(&context, context.float32_type().as_ref(), &[4], Some(workgroup), location);
+        let barrier = memref_type(
+            &context,
+            context.mosaic_gpu_barrier_type(false).unwrap().as_ref(),
+            &[],
+            Some(workgroup),
+            location,
+        );
+        let integer = context.signless_integer_type(32).as_ref();
+        let argument_types = [vector, memory, barrier, integer];
+        let mut block = context.block(&argument_types.map(|r#type| (r#type, location)));
+        let value = block.argument(0).unwrap().as_ref();
+        let destination = block.argument(1).unwrap().as_ref();
+        let barrier = block.argument(2).unwrap().as_ref();
+        let index = block.argument(3).unwrap().as_ref();
+        let operation = async_store_smem(
+            value,
+            destination,
+            barrier,
+            Dimension::X,
+            index,
+            Some(AtomicOpType::Add),
+            Some(true),
+            location,
+        )
+        .unwrap();
+        assert_eq!(operation.value().unwrap(), value);
+        assert_eq!(operation.destination().unwrap(), destination);
+        assert_eq!(operation.barrier().unwrap(), barrier);
+        assert_eq!(operation.cluster_dimension().unwrap().value(), Ok(Dimension::X));
+        assert_eq!(operation.cluster_index().unwrap(), index);
+        assert_eq!(operation.atomic_type().unwrap().unwrap().value(), Ok(AtomicOpType::Add));
+        assert!(operation.optimized().unwrap().unwrap().value());
+        block.append_operation(operation).unwrap();
+        append_void_function(&module, "async_store_smem", &argument_types, block, location);
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @async_store_smem(%arg0: vector<4xf32>, %arg1: memref<4xf32, \
+                #gpu.address_space<workgroup>>, %arg2: memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>, %arg3: i32) {
+                    \"mosaic_gpu.async_store_smem\"(%arg0, %arg1, %arg2, %arg3) <{atomic_type = \
+                #mosaic_gpu<atomic_op_type add>, cluster_dim = #mosaic_gpu<dimension x>, optimized = true}> : \
+                (vector<4xf32>, memref<4xf32, #gpu.address_space<workgroup>>, memref<!mosaic_gpu.barrier, \
+                #gpu.address_space<workgroup>>, i32) -> ()
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_arrive_dyn_expect_tx_supported_operation() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::mosaic_gpu().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        // This temporary upstream marker has no public constructor. Its wrapper still supports inspecting
+        // existing IR, so construct the fixture through the generic builder.
+        let operation = OperationBuilder::new(ARRIVE_DYN_EXPECT_TX_SUPPORTED_OPERATION_NAME, location).build().unwrap();
+        let operation = unsafe { operation.cast::<DetachedArriveDynExpectTxSupportedOperation>() }.unwrap();
+        assert_eq!(operation.operand_count(), 0);
+        assert_eq!(operation.result_count(), 0);
+        module.body().unwrap().append_operation(operation).unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  \"mosaic_gpu.arrive_dyn_expect_tx_supported\"() : () -> ()
+                }
+            "},
+        );
+    }
 }

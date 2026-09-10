@@ -63,6 +63,8 @@ bool mlirAttributeIsAMosaicGpuEnumAttr(MlirAttribute attribute, enum MlirMosaicG
       return isAttribute<mosaic_gpu::MultimemLoadReductionTypeAttr>(attribute);
     case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE:
       return isAttribute<mosaic_gpu::AtomicOpTypeAttr>(attribute);
+    case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION:
+      return isAttribute<mosaic_gpu::TMEMLoadReductionAttr>(attribute);
   }
   return false;
 }
@@ -86,6 +88,8 @@ MlirAttribute mlirMosaicGpuEnumAttrGet(
           value);
     case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE:
       return getEnumAttribute<mosaic_gpu::AtomicOpType, mosaic_gpu::AtomicOpTypeAttr>(context, value);
+    case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION:
+      return getEnumAttribute<mosaic_gpu::TMEMLoadReduction, mosaic_gpu::TMEMLoadReductionAttr>(context, value);
   }
   return {nullptr};
 }
@@ -104,6 +108,8 @@ MlirStringRef mlirMosaicGpuEnumAttrGetValue(MlirAttribute attribute, enum MlirMo
       return getEnumAttributeValue<mosaic_gpu::MultimemLoadReductionTypeAttr>(attribute);
     case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE:
       return getEnumAttributeValue<mosaic_gpu::AtomicOpTypeAttr>(attribute);
+    case RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION:
+      return getEnumAttributeValue<mosaic_gpu::TMEMLoadReductionAttr>(attribute);
   }
   return {nullptr, 0};
 }
@@ -117,4 +123,15 @@ MlirAttribute mlirMosaicGpuTmemAttrGet(MlirContext context) {
     return {nullptr};
   }
   return wrap(mosaic_gpu::TmemAttr::get(unwrap(context)));
+}
+
+bool mlirAttributeIsAMosaicGpuSmemClusterAttr(MlirAttribute attribute) {
+  return isAttribute<mosaic_gpu::SmemClusterAttr>(attribute);
+}
+
+MlirAttribute mlirMosaicGpuSmemClusterAttrGet(MlirContext context) {
+  if (context.ptr == nullptr) {
+    return {nullptr};
+  }
+  return wrap(mosaic_gpu::SmemClusterAttr::get(unwrap(context)));
 }

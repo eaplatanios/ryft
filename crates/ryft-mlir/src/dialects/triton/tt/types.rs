@@ -132,6 +132,7 @@ mlir_subtype_trait_impls!(TensorDescTypeRef<'c, 't> as Type, mlir_type = Type);
 
 impl<'t> Context<'t> {
     /// Creates a new Triton `tt` [`PointerTypeRef`] owned by this [`Context`].
+    /// The address space must be `0` (tensor descriptor), `1` (global), or `4` (constant).
     pub fn triton_tt_pointer_type<'c, T: Type<'c, 't>>(
         &'c self,
         pointee_type: T,
@@ -185,6 +186,11 @@ mod tests {
         assert_eq!(pointer_type.dialect().unwrap().namespace().unwrap(), "tt");
         assert_eq!(pointer_type.pointee_type().unwrap(), context.float32_type());
         assert_eq!(pointer_type.address_space(), 1);
+        assert!(matches!(
+            context.triton_tt_pointer_type(context.float32_type(), 3),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "invalid arguments to `Context::triton_tt_pointer_type`",
+        ));
     }
 
     #[test]
@@ -197,7 +203,7 @@ mod tests {
         assert_eq!(pointer_type_1, pointer_type_2);
 
         // Different types from the same context must not be equal.
-        let pointer_type_2 = context.triton_tt_pointer_type(context.float32_type(), 3).unwrap();
+        let pointer_type_2 = context.triton_tt_pointer_type(context.float32_type(), 4).unwrap();
         assert_ne!(pointer_type_1, pointer_type_2);
 
         // Same types from different contexts must not be equal.
@@ -212,8 +218,8 @@ mod tests {
         let pointer_type = context.triton_tt_pointer_type(context.float32_type(), 1).unwrap();
         test_type_display_and_debug(pointer_type, "!tt.ptr<f32>");
 
-        let pointer_type = context.triton_tt_pointer_type(context.float32_type(), 3).unwrap();
-        test_type_display_and_debug(pointer_type, "!tt.ptr<f32, 3>");
+        let pointer_type = context.triton_tt_pointer_type(context.float32_type(), 4).unwrap();
+        test_type_display_and_debug(pointer_type, r#"!tt.ptr<f32, "constant">"#);
     }
 
     #[test]

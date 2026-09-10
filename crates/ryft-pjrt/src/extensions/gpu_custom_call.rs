@@ -1,6 +1,6 @@
 use ryft_xla_sys::bindings::{XlaCustomCallStatus, XlaCustomCallStatusSetFailure, XlaCustomCallStatusSetSuccess};
 
-use crate::extensions::ffi::FfiHandler;
+use crate::extensions::ffi::{FfiHandler, FfiHandlerTraits};
 use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn};
 
 /// The PJRT GPU custom call extension provides capabilities for registering custom call targets with GPU backends.
@@ -40,6 +40,14 @@ impl GpuCustomCallExtension {
     /// Returns the underlying PJRT [`Api`].
     pub(crate) fn api(&self) -> Api {
         self.api
+    }
+
+    /// Returns whether the plugin honors explicit GPU custom call handler traits.
+    pub fn supports_handler_traits(&self) -> bool {
+        unsafe {
+            let offset = std::mem::offset_of!(ffi::PJRT_Gpu_Custom_Call_Extension, custom_call_handles_traits);
+            (*self.handle).base.struct_size >= offset + size_of::<bool>() && (*self.handle).custom_call_handles_traits
+        }
     }
 }
 
@@ -160,10 +168,14 @@ impl Api {
                         handler_prepare = std::ptr::null_mut(),
                         handler_initialize = std::ptr::null_mut(),
                         handler_execute = handler.execute,
+                        traits = 0,
                     },
                 )
             }
             GpuCustomCallHandler::Typed(handler) => {
+                if handler.traits.bits() != 0 && !extension.supports_handler_traits() {
+                    return Err(Error::unimplemented("the GPU custom call extension does not support handler traits"));
+                }
                 invoke_pjrt_api_error_fn!(
                     @extension ffi::PJRT_Gpu_Custom_Call_Extension => extension,
                     PJRT_Gpu_Register_Custom_Call,
@@ -181,6 +193,7 @@ impl Api {
                             .map(|handler| handler.to_c_api() as *mut std::ffi::c_void)
                             .unwrap_or(std::ptr::null_mut()),
                         handler_execute = handler.execute.to_c_api() as *mut std::ffi::c_void,
+                        traits = handler.traits.bits(),
                     },
                 )
             }
@@ -305,6 +318,9 @@ pub struct GpuCustomCallTypedHandler {
 
     /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
     execute: FfiHandler,
+
+    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    traits: FfiHandlerTraits,
 }
 
 impl GpuCustomCallTypedHandler {
@@ -335,13 +351,16 @@ impl GpuCustomCallTypedHandler {
     ///     stream it obtains from the execution context, but it *must not* attempt to dereference any input device
     ///     buffers. This also means that it cannot have host-side control flow depend on the runtime values of those
     ///     buffers.
+    ///   - `traits`: Behavioral [`FfiHandlerTraits`] advertised during registration. Registration fails if the plugin
+    ///     cannot honor nonempty traits.
     pub fn new(
         instantiate: Option<FfiHandler>,
         prepare: Option<FfiHandler>,
         initialize: Option<FfiHandler>,
         execute: FfiHandler,
+        traits: FfiHandlerTraits,
     ) -> Self {
-        Self { instantiate, prepare, initialize, execute }
+        Self { instantiate, prepare, initialize, execute, traits }
     }
 }
 
@@ -350,13 +369,13 @@ unsafe impl Sync for GpuCustomCallTypedHandler {}
 
 impl From<FfiHandler> for GpuCustomCallTypedHandler {
     fn from(value: FfiHandler) -> Self {
-        Self::new(None, None, None, value)
+        Self::new(None, None, None, value, FfiHandlerTraits::NONE)
     }
 }
 
 impl From<FfiHandler> for GpuCustomCallHandler {
     fn from(value: FfiHandler) -> Self {
-        Self::Typed(GpuCustomCallTypedHandler::new(None, None, None, value))
+        Self::Typed(GpuCustomCallTypedHandler::new(None, None, None, value, FfiHandlerTraits::NONE))
     }
 }
 
@@ -371,7 +390,7 @@ pub(crate) mod ffi {
     use crate::errors::ffi::PJRT_Error;
     use crate::ffi::PJRT_Extension_Base;
 
-    pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 2;
+    pub const PJRT_API_GPU_EXTENSION_VERSION: usize = 3;
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug)]
@@ -384,6 +403,7 @@ pub(crate) mod ffi {
         pub handler_prepare: *mut std::ffi::c_void,
         pub handler_initialize: *mut std::ffi::c_void,
         pub handler_execute: *mut std::ffi::c_void,
+        pub traits: u32,
     }
 
     impl PJRT_Gpu_Register_Custom_Call_Args {
@@ -395,6 +415,7 @@ pub(crate) mod ffi {
             handler_prepare: *mut std::ffi::c_void,
             handler_initialize: *mut std::ffi::c_void,
             handler_execute: *mut std::ffi::c_void,
+            traits: u32,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -405,6 +426,7 @@ pub(crate) mod ffi {
                 handler_prepare,
                 handler_initialize,
                 handler_execute,
+                traits,
             }
         }
     }
@@ -416,6 +438,7 @@ pub(crate) mod ffi {
     pub struct PJRT_Gpu_Custom_Call_Extension {
         pub base: PJRT_Extension_Base,
         pub PJRT_Gpu_Register_Custom_Call: Option<PJRT_Gpu_Register_Custom_Call>,
+        pub custom_call_handles_traits: bool,
     }
 }
 
@@ -465,6 +488,7 @@ mod tests {
             }),
             compile_portable_executable: false,
             profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
             serialized_multi_slice_configuration: Vec::new(),
             environment_option_overrides: HashMap::new(),
             target_config: None,

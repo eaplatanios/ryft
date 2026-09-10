@@ -190,7 +190,7 @@ shipped in Cargo source packages or native release archives.
 ### Mosaic GPU Contract
 
 The portable archive exposes the pinned Mosaic GPU dialect C API and the `mosaic_gpu-serde` pass. Its Rust constants
-record serde version 6, `MosaicGpuKernelProto` resource version 1, and the `mosaic_gpu_v2` XLA FFI target. Programs
+record serde version 8, `MosaicGpuKernelProto` resource version 3, and the `mosaic_gpu_v2` XLA FFI target. Programs
 cross the compiler boundary as MLIR bytecode; the private wheel functions `MosaicGpuCompile`, `MosaicGpuUnload`, and
 `MosaicGpuClearKernelCache` are not a supported ABI.
 

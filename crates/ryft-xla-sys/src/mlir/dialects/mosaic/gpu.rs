@@ -5,10 +5,10 @@ use crate::bindings::{
 };
 
 /// Version of the `stable_mosaic_gpu.version` MLIR bytecode schema supported by the pinned JAX serde pass.
-pub const MOSAIC_GPU_SERDE_VERSION: i32 = 6;
+pub const MOSAIC_GPU_SERDE_VERSION: i32 = 8;
 
 /// Version of the serialized `MosaicGpuKernelProto` resource schema consumed by the pinned JAX runtime.
-pub const MOSAIC_GPU_RESOURCE_SCHEMA_VERSION: i32 = 1;
+pub const MOSAIC_GPU_RESOURCE_SCHEMA_VERSION: i32 = 3;
 
 /// XLA FFI target registered by the pinned JAX Mosaic GPU runtime.
 pub const MOSAIC_GPU_FFI_TARGET: &str = "mosaic_gpu_v2";
@@ -22,12 +22,26 @@ pub enum MlirMosaicGpuEnumAttribute {
     RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_OOB_FILL_MODE = 3,
     RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_MULTIMEM_LOAD_REDUCTION_TYPE = 4,
     RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_ATOMIC_OP_TYPE = 5,
+    RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION = 6,
 }
 
 unsafe extern "C" {
+    pub fn mlirAttributeIsAMosaicGpuSmemClusterAttr(attribute: MlirAttribute) -> bool;
+    pub fn mlirMosaicGpuSmemClusterAttrGet(context: MlirContext) -> MlirAttribute;
+
     pub fn mlirGetDialectHandle__mosaic_gpu__() -> MlirDialectHandle;
     pub fn mlirDialectRegistryInsertMosaicGpuInlinerExtensions(registry: MlirDialectRegistry);
     pub fn mlirMosaicGpuRegisterSerdePass();
+
+    pub fn mlirMosaicGpuIsAB6x16P32Type(r#type: MlirType) -> bool;
+    pub fn mlirMosaicGpuB6x16P32TypeGet(context: MlirContext, element_type: MlirType) -> MlirType;
+    pub fn mlirMosaicGpuB6x16P32TypeGetElementType(r#type: MlirType) -> MlirType;
+    pub fn mlirMosaicGpuB6x16P32TypeGetTypeID() -> MlirTypeID;
+
+    pub fn mlirMosaicGpuIsAP2B6Type(r#type: MlirType) -> bool;
+    pub fn mlirMosaicGpuP2B6TypeGet(context: MlirContext, element_type: MlirType) -> MlirType;
+    pub fn mlirMosaicGpuP2B6TypeGetElementType(r#type: MlirType) -> MlirType;
+    pub fn mlirMosaicGpuP2B6TypeGetTypeID() -> MlirTypeID;
 
     pub fn mlirMosaicGpuIsABarrierType(r#type: MlirType) -> bool;
     pub fn mlirMosaicGpuBarrierTypeGet(context: MlirContext, orders_tensor_core: bool) -> MlirType;
@@ -82,15 +96,6 @@ unsafe extern "C" {
     -> MlirAttribute;
     pub fn mlirMosaicGpuTileTransformAttrGetTiling(attribute: MlirAttribute) -> MlirAttribute;
 
-    pub fn mlirMosaicGpuIsATransposeTransformAttr(attribute: MlirAttribute) -> bool;
-    pub fn mlirMosaicGpuTransposeTransformAttrGetTypeID() -> MlirTypeID;
-    pub fn mlirMosaicGpuTransposeTransformAttrGet(
-        context: MlirContext,
-        permutation: *mut i32,
-        permutation_size: i32,
-    ) -> MlirAttribute;
-    pub fn mlirMosaicGpuTransposeTransformAttrGetPermutation(attribute: MlirAttribute) -> MlirAttribute;
-
     pub fn mlirMosaicGpuIsASwizzleTransformAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirMosaicGpuSwizzleTransformAttrGetTypeID() -> MlirTypeID;
     pub fn mlirMosaicGpuSwizzleTransformAttrGet(context: MlirContext, swizzle: i32) -> MlirAttribute;
@@ -128,7 +133,6 @@ mod tests {
                 mlirMosaicGpuSwizzleTransformAttrGetTypeID(),
                 mlirMosaicGpuTiledLayoutAttrGetTypeID(),
                 mlirMosaicGpuTileTransformAttrGetTypeID(),
-                mlirMosaicGpuTransposeTransformAttrGetTypeID(),
                 mlirMosaicGpuWGSplatFragLayoutAttrGetTypeID(),
                 mlirMosaicGpuWGStridedFragLayoutAttrGetTypeID(),
             ]

@@ -538,7 +538,7 @@ impl<'o> FfiCallFrame<'o> {
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 pub(crate) mod ffi {
     use crate::extensions::ffi::buffers::ffi::XLA_FFI_DataType;
-    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Extension_Base;
+    use crate::extensions::ffi::handlers::ffi::XLA_FFI_InternalExtension;
 
     // XLA FFI uses byte spans to pass strings to handlers because strings might not be null terminated,
     // and even if they are, looking for a null terminator can become very expensive in tight loops.
@@ -577,7 +577,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Attrs {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub size: i64,
         pub types: *mut XLA_FFI_AttrType,
         pub names: *mut *mut XLA_FFI_ByteSpan,

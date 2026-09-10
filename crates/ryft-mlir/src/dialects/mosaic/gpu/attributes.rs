@@ -1,17 +1,16 @@
 use ryft_xla_sys::bindings::MlirAttribute;
 use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
-    MlirMosaicGpuEnumAttribute, mlirAttributeIsAMosaicGpuEnumAttr, mlirAttributeIsAMosaicGpuTmemAttr,
-    mlirMosaicGpuCopyPartitionedAttrGet, mlirMosaicGpuCopyPartitionedAttrGetAxis, mlirMosaicGpuCopyReplicatedAttrGet,
-    mlirMosaicGpuEnumAttrGet, mlirMosaicGpuEnumAttrGetValue, mlirMosaicGpuIsACopyPartitionAttr,
-    mlirMosaicGpuIsACopyPartitionedAttr, mlirMosaicGpuIsACopyReplicatedAttr, mlirMosaicGpuIsAReplicatedAttr,
-    mlirMosaicGpuIsASwizzleTransformAttr, mlirMosaicGpuIsATileTransformAttr, mlirMosaicGpuIsATiledLayoutAttr,
-    mlirMosaicGpuIsATransposeTransformAttr, mlirMosaicGpuIsAWGSplatFragLayoutAttr,
-    mlirMosaicGpuIsAWGStridedFragLayoutAttr, mlirMosaicGpuReplicatedAttrGet, mlirMosaicGpuReplicatedAttrGetTimes,
+    MlirMosaicGpuEnumAttribute, mlirAttributeIsAMosaicGpuEnumAttr, mlirAttributeIsAMosaicGpuSmemClusterAttr,
+    mlirAttributeIsAMosaicGpuTmemAttr, mlirMosaicGpuCopyPartitionedAttrGet, mlirMosaicGpuCopyPartitionedAttrGetAxis,
+    mlirMosaicGpuCopyReplicatedAttrGet, mlirMosaicGpuEnumAttrGet, mlirMosaicGpuEnumAttrGetValue,
+    mlirMosaicGpuIsACopyPartitionAttr, mlirMosaicGpuIsACopyPartitionedAttr, mlirMosaicGpuIsACopyReplicatedAttr,
+    mlirMosaicGpuIsAReplicatedAttr, mlirMosaicGpuIsASwizzleTransformAttr, mlirMosaicGpuIsATileTransformAttr,
+    mlirMosaicGpuIsATiledLayoutAttr, mlirMosaicGpuIsAWGSplatFragLayoutAttr, mlirMosaicGpuIsAWGStridedFragLayoutAttr,
+    mlirMosaicGpuReplicatedAttrGet, mlirMosaicGpuReplicatedAttrGetTimes, mlirMosaicGpuSmemClusterAttrGet,
     mlirMosaicGpuSwizzleTransformAttrGet, mlirMosaicGpuSwizzleTransformAttrGetSwizzle,
     mlirMosaicGpuTileTransformAttrGet, mlirMosaicGpuTileTransformAttrGetTiling, mlirMosaicGpuTiledLayoutAttrGet,
     mlirMosaicGpuTiledLayoutAttrGetLaneDims, mlirMosaicGpuTiledLayoutAttrGetTiling,
     mlirMosaicGpuTiledLayoutAttrGetVectorDim, mlirMosaicGpuTiledLayoutAttrGetWarpDims, mlirMosaicGpuTmemAttrGet,
-    mlirMosaicGpuTransposeTransformAttrGet, mlirMosaicGpuTransposeTransformAttrGetPermutation,
     mlirMosaicGpuWGSplatFragLayoutAttrGet, mlirMosaicGpuWGSplatFragLayoutAttrGetShape,
     mlirMosaicGpuWGStridedFragLayoutAttrGet, mlirMosaicGpuWGStridedFragLayoutAttrGetShape,
     mlirMosaicGpuWGStridedFragLayoutAttrGetVectorSize,
@@ -136,6 +135,21 @@ macro_rules! mosaic_gpu_enum_attribute {
         }
     };
 }
+
+mosaic_gpu_enum_attribute!(
+    enum_name = TmemLoadReduction,
+    attribute_name = TmemLoadReductionAttributeRef,
+    context_method = mosaic_gpu_tmem_load_reduction_attribute,
+    ffi_kind = MlirMosaicGpuEnumAttribute::RYFT_MLIR_MOSAIC_GPU_ENUM_ATTRIBUTE_TMEM_LOAD_REDUCTION,
+    mnemonic = "tmem_load_reduction",
+    description = "tensor-memory load reduction",
+    variants = {
+        Min => ("min", 0),
+        Max => ("max", 1),
+        AbsMin => ("absmin", 2),
+        AbsMax => ("absmax", 3),
+    },
+);
 
 /// Mosaic GPU warpgroup strided fragment layout [`Attribute`].
 #[derive(Copy, Clone)]
@@ -473,49 +487,6 @@ impl<'c, 't> Attribute<'c, 't> for TileTransformAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(TileTransformAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
-/// Mosaic GPU transpose transform [`Attribute`] for shared-memory memrefs.
-#[derive(Copy, Clone)]
-pub struct TransposeTransformAttributeRef<'c, 't> {
-    /// Handle that represents this [`Attribute`] in the MLIR C API.
-    handle: MlirAttribute,
-
-    /// [`Context`] that owns this [`Attribute`].
-    context: &'c Context<'t>,
-}
-
-impl<'c, 't> TransposeTransformAttributeRef<'c, 't> {
-    /// Returns the permutation.
-    pub fn permutation(&self) -> Result<DenseInteger32ArrayAttributeRef<'c, 't>, Error> {
-        unsafe {
-            DenseInteger32ArrayAttributeRef::from_c_api(
-                mlirMosaicGpuTransposeTransformAttrGetPermutation(self.handle),
-                self.context,
-            )
-            .map_err(|_| Error::internal("expected non-null Mosaic GPU transpose transform permutation"))
-        }
-    }
-}
-
-impl<'c, 't> Attribute<'c, 't> for TransposeTransformAttributeRef<'c, 't> {
-    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
-        if !handle.ptr.is_null() && unsafe { mlirMosaicGpuIsATransposeTransformAttr(handle) } {
-            Ok(Self { handle, context })
-        } else {
-            Err(Error::invalid_argument("expected MLIR attribute handle"))
-        }
-    }
-
-    unsafe fn to_c_api(&self) -> MlirAttribute {
-        self.handle
-    }
-
-    fn context(&self) -> &'c Context<'t> {
-        self.context
-    }
-}
-
-mlir_subtype_trait_impls!(TransposeTransformAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
-
 /// Mosaic GPU swizzle transform [`Attribute`] for shared-memory memrefs.
 #[derive(Copy, Clone)]
 pub struct SwizzleTransformAttributeRef<'c, 't> {
@@ -682,6 +653,36 @@ impl<'c, 't> Attribute<'c, 't> for TmemAttributeRef<'c, 't> {
 
 mlir_subtype_trait_impls!(TmemAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
 
+/// Mosaic GPU cluster shared-memory address-space [`Attribute`].
+#[derive(Copy, Clone)]
+pub struct SmemClusterAttributeRef<'c, 't> {
+    /// Handle that represents this [`Attribute`] in the MLIR C API.
+    handle: MlirAttribute,
+
+    /// [`Context`] that owns this [`Attribute`].
+    context: &'c Context<'t>,
+}
+
+impl<'c, 't> Attribute<'c, 't> for SmemClusterAttributeRef<'c, 't> {
+    unsafe fn from_c_api(handle: MlirAttribute, context: &'c Context<'t>) -> Result<Self, Error> {
+        if !handle.ptr.is_null() && unsafe { mlirAttributeIsAMosaicGpuSmemClusterAttr(handle) } {
+            Ok(Self { handle, context })
+        } else {
+            Err(Error::invalid_argument("expected MLIR attribute handle"))
+        }
+    }
+
+    unsafe fn to_c_api(&self) -> MlirAttribute {
+        self.handle
+    }
+
+    fn context(&self) -> &'c Context<'t> {
+        self.context
+    }
+}
+
+mlir_subtype_trait_impls!(SmemClusterAttributeRef<'c, 't> as Attribute, mlir_type = Attribute);
+
 impl<'t> Context<'t> {
     /// Creates a Mosaic GPU warpgroup strided fragment layout attribute owned by this [`Context`].
     pub fn mosaic_gpu_wg_strided_frag_layout_attribute<'c>(
@@ -768,30 +769,6 @@ impl<'t> Context<'t> {
         }
     }
 
-    /// Creates a Mosaic GPU transpose transform attribute owned by this [`Context`].
-    pub fn mosaic_gpu_transpose_transform_attribute<'c>(
-        &'c self,
-        permutation: &[i32],
-    ) -> Result<TransposeTransformAttributeRef<'c, 't>, Error> {
-        self.load_dialect(DialectHandle::mosaic_gpu()?)?;
-        let mut permutation = permutation.to_vec();
-        let dimension_count = i32::try_from(permutation.len())
-            .map_err(|_| Error::invalid_argument("too many Mosaic GPU transpose dimensions"))?;
-        unsafe {
-            TransposeTransformAttributeRef::from_c_api(
-                mlirMosaicGpuTransposeTransformAttrGet(
-                    *self.handle.borrow_mut(),
-                    permutation.as_mut_ptr(),
-                    dimension_count,
-                ),
-                self,
-            )
-            .map_err(|_| {
-                Error::invalid_argument("invalid arguments to `Context::mosaic_gpu_transpose_transform_attribute`")
-            })
-        }
-    }
-
     /// Creates a Mosaic GPU swizzle transform attribute owned by this [`Context`].
     pub fn mosaic_gpu_swizzle_transform_attribute<'c>(
         &'c self,
@@ -835,6 +812,17 @@ impl<'t> Context<'t> {
     pub fn mosaic_gpu_tmem_attribute<'c>(&'c self) -> Result<TmemAttributeRef<'c, 't>, Error> {
         self.load_dialect(DialectHandle::mosaic_gpu()?)?;
         Ok(unsafe { TmemAttributeRef { handle: mlirMosaicGpuTmemAttrGet(*self.handle.borrow_mut()), context: self } })
+    }
+
+    /// Creates a Mosaic GPU tensor-memory address-space attribute owned by this [`Context`].
+    pub fn mosaic_gpu_smem_cluster_attribute<'c>(&'c self) -> Result<SmemClusterAttributeRef<'c, 't>, Error> {
+        self.load_dialect(DialectHandle::mosaic_gpu()?)?;
+        Ok(unsafe {
+            SmemClusterAttributeRef {
+                handle: mlirMosaicGpuSmemClusterAttrGet(*self.handle.borrow_mut()),
+                context: self,
+            }
+        })
     }
 }
 
@@ -992,16 +980,6 @@ mod tests {
         let attribute = context.mosaic_gpu_tile_transform_attribute(&[64, 32]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.tiling().unwrap(), tiling);
-        test_attribute_casting(attribute);
-    }
-
-    #[test]
-    fn test_transpose_transform_attribute() {
-        let context = Context::new();
-        let permutation = context.dense_i32_array_attribute(&[1, 0]).unwrap();
-        let attribute = context.mosaic_gpu_transpose_transform_attribute(&[1, 0]).unwrap();
-        assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.permutation().unwrap(), permutation);
         test_attribute_casting(attribute);
     }
 

@@ -61,20 +61,20 @@ impl FfiUserData {
 /// for [`FfiHandler`](crate::extensions::ffi::FfiHandler)s.
 pub struct FfiExecutionContext<'o> {
     /// Handle that represents this [`FfiExecutionContext`] in the XLA FFI API.
-    handle: *mut ffi::XLA_FFI_ExecutionContext,
+    handle: *mut ffi::XLA_FFI_InvokeContext,
 
     /// Underlying XLA [`FfiApi`].
     api: FfiApi,
 
     /// [`PhantomData`] used to track the lifetime of the owner of this [`FfiExecutionContext`].
-    owner: PhantomData<&'o mut ffi::XLA_FFI_ExecutionContext>,
+    owner: PhantomData<&'o mut ffi::XLA_FFI_InvokeContext>,
 }
 
 impl<'o> FfiExecutionContext<'o> {
     /// Constructs a new [`FfiExecutionContext`] from the provided
-    /// [`XLA_FFI_ExecutionContext`](ffi::XLA_FFI_ExecutionContext) handle that came
+    /// [`XLA_FFI_InvokeContext`](ffi::XLA_FFI_InvokeContext) handle that came
     /// from a function in the XLA FFI API.
-    pub unsafe fn from_c_api(handle: *mut ffi::XLA_FFI_ExecutionContext, api: FfiApi) -> Result<Self, FfiError> {
+    pub unsafe fn from_c_api(handle: *mut ffi::XLA_FFI_InvokeContext, api: FfiApi) -> Result<Self, FfiError> {
         if handle.is_null() {
             Err(FfiError::invalid_argument("the provided XLA FFI execution context handle is a null pointer"))
         } else {
@@ -82,9 +82,9 @@ impl<'o> FfiExecutionContext<'o> {
         }
     }
 
-    /// Returns the [`XLA_FFI_ExecutionContext`](ffi::XLA_FFI_ExecutionContext) that corresponds to this
+    /// Returns the [`XLA_FFI_InvokeContext`](ffi::XLA_FFI_InvokeContext) that corresponds to this
     /// [`FfiExecutionContext`] and which can be passed to functions in the XLA FFI API.
-    pub unsafe fn to_c_api(&self) -> *mut ffi::XLA_FFI_ExecutionContext {
+    pub unsafe fn to_c_api(&self) -> *mut ffi::XLA_FFI_InvokeContext {
         self.handle
     }
 
@@ -95,11 +95,11 @@ impl<'o> FfiExecutionContext<'o> {
 
     /// Returns opaque user data from this [`FfiExecutionContext`] for the provided `type_id`.
     pub fn user_data(&self, type_id: FfiTypeId) -> Result<FfiUserData, FfiError> {
-        use ffi::XLA_FFI_ExecutionContext_Get_Args;
+        use ffi::XLA_FFI_InvokeContext_Get_Args;
         let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
             self.api,
-            XLA_FFI_ExecutionContext_Get,
+            XLA_FFI_InvokeContext_Get,
             { context = self.handle, type_id = &mut type_id_handle as *mut _ },
             { data },
         )
@@ -232,28 +232,28 @@ pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
-    use crate::extensions::ffi::handlers::ffi::{XLA_FFI_ExecutionStage, XLA_FFI_Extension_Base};
+    use crate::extensions::ffi::handlers::ffi::{XLA_FFI_ExecutionStage, XLA_FFI_InternalExtension};
     use crate::extensions::ffi::types::ffi::XLA_FFI_TypeId;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
     #[repr(C)]
-    pub struct XLA_FFI_ExecutionContext {
+    pub struct XLA_FFI_InvokeContext {
         _data: [u8; 0],
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
 
     #[repr(C)]
-    pub struct XLA_FFI_ExecutionContext_Get_Args {
+    pub struct XLA_FFI_InvokeContext_Get_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub type_id: *mut XLA_FFI_TypeId,
         pub data: *mut std::ffi::c_void,
     }
 
-    impl XLA_FFI_ExecutionContext_Get_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext, type_id: *mut XLA_FFI_TypeId) -> Self {
+    impl XLA_FFI_InvokeContext_Get_Args {
+        pub fn new(context: *mut XLA_FFI_InvokeContext, type_id: *mut XLA_FFI_TypeId) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
                 extension_start: std::ptr::null_mut(),
@@ -264,14 +264,14 @@ pub(crate) mod ffi {
         }
     }
 
-    pub type XLA_FFI_ExecutionContext_Get =
-        unsafe extern "C" fn(args: *mut XLA_FFI_ExecutionContext_Get_Args) -> *mut XLA_FFI_Error;
+    pub type XLA_FFI_InvokeContext_Get =
+        unsafe extern "C" fn(args: *mut XLA_FFI_InvokeContext_Get_Args) -> *mut XLA_FFI_Error;
 
     #[repr(C)]
     pub struct XLA_FFI_State_Set_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub stage: XLA_FFI_ExecutionStage,
         pub type_id: *mut XLA_FFI_TypeId,
         pub state: *mut std::ffi::c_void,
@@ -279,7 +279,7 @@ pub(crate) mod ffi {
 
     impl XLA_FFI_State_Set_Args {
         pub fn new(
-            context: *mut XLA_FFI_ExecutionContext,
+            context: *mut XLA_FFI_InvokeContext,
             stage: XLA_FFI_ExecutionStage,
             type_id: *mut XLA_FFI_TypeId,
             state: *mut std::ffi::c_void,
@@ -300,8 +300,8 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_State_Get_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub stage: XLA_FFI_ExecutionStage,
         pub type_id: *mut XLA_FFI_TypeId,
         pub state: *mut std::ffi::c_void,
@@ -309,7 +309,7 @@ pub(crate) mod ffi {
 
     impl XLA_FFI_State_Get_Args {
         pub fn new(
-            context: *mut XLA_FFI_ExecutionContext,
+            context: *mut XLA_FFI_InvokeContext,
             stage: XLA_FFI_ExecutionStage,
             type_id: *mut XLA_FFI_TypeId,
         ) -> Self {
@@ -329,13 +329,13 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Stream_Get_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub stream: *mut std::ffi::c_void,
     }
 
     impl XLA_FFI_Stream_Get_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
                 extension_start: std::ptr::null_mut(),
@@ -350,15 +350,15 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_DeviceMemory_Allocate_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub size: usize,
         pub alignment: usize,
         pub data: *mut std::ffi::c_void,
     }
 
     impl XLA_FFI_DeviceMemory_Allocate_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext, size: usize, alignment: usize) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext, size: usize, alignment: usize) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
                 extension_start: std::ptr::null_mut(),
@@ -376,14 +376,14 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_DeviceMemory_Free_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub size: usize,
         pub data: *mut std::ffi::c_void,
     }
 
     impl XLA_FFI_DeviceMemory_Free_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext, size: usize, data: *mut std::ffi::c_void) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext, size: usize, data: *mut std::ffi::c_void) -> Self {
             Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), context, size, data }
         }
     }
@@ -396,15 +396,15 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_ThreadPool_Schedule_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub task: Option<XLA_FFI_Task>,
         pub data: *mut std::ffi::c_void,
     }
 
     impl XLA_FFI_ThreadPool_Schedule_Args {
         pub fn new(
-            context: *mut XLA_FFI_ExecutionContext,
+            context: *mut XLA_FFI_InvokeContext,
             task: Option<XLA_FFI_Task>,
             data: *mut std::ffi::c_void,
         ) -> Self {
@@ -418,13 +418,13 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_ThreadPool_NumThreads_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub num_threads: *mut i64,
     }
 
     impl XLA_FFI_ThreadPool_NumThreads_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext, num_threads: *mut i64) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext, num_threads: *mut i64) -> Self {
             Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), context, num_threads }
         }
     }
@@ -435,13 +435,13 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_RunId_Get_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub run_id: i64,
     }
 
     impl XLA_FFI_RunId_Get_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext) -> Self {
             Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), context, run_id: 0 }
         }
     }
@@ -451,13 +451,13 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_DeviceOrdinal_Get_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub device_ordinal: i32,
     }
 
     impl XLA_FFI_DeviceOrdinal_Get_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext) -> Self {
+        pub fn new(context: *mut XLA_FFI_InvokeContext) -> Self {
             Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), context, device_ordinal: 0 }
         }
     }

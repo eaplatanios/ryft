@@ -78,17 +78,13 @@ pub enum BufferType {
     /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
     /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
     /// format with 2 exponent bits and 3 mantissa bits. Only finite values are supported (thus the `FN` suffix).
-    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
-    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
-    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
     F6E2M3FN,
 
     /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
     /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
     /// format with 3 exponent bits and 2 mantissa bits. Only finite values are supported (thus the `FN` suffix).
-    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
-    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
-    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
     F6E3M2FN,
 
     /// [`BufferType`] that represents 8-bit floating-point values that are represented using the format described in
@@ -195,6 +191,8 @@ impl BufferType {
             ffi::PJRT_Buffer_Type_U32 => Self::U32,
             ffi::PJRT_Buffer_Type_U64 => Self::U64,
             ffi::PJRT_Buffer_Type_F4E2M1FN => Self::F4E2M1FN,
+            ffi::PJRT_Buffer_Type_F6E2M3FN => Self::F6E2M3FN,
+            ffi::PJRT_Buffer_Type_F6E3M2FN => Self::F6E3M2FN,
             ffi::PJRT_Buffer_Type_F8E3M4 => Self::F8E3M4,
             ffi::PJRT_Buffer_Type_F8E4M3 => Self::F8E4M3,
             ffi::PJRT_Buffer_Type_F8E4M3FN => Self::F8E4M3FN,
@@ -236,9 +234,8 @@ impl BufferType {
             Self::U32 => ffi::PJRT_Buffer_Type_U32,
             Self::U64 => ffi::PJRT_Buffer_Type_U64,
             Self::F4E2M1FN => ffi::PJRT_Buffer_Type_F4E2M1FN,
-            // The PJRT C API does not define constants for the 6-bit floating-point types yet (XLA itself cannot pass
-            // them through the C API layer), and so they map to the invalid type.
-            Self::F6E2M3FN | Self::F6E3M2FN => ffi::PJRT_Buffer_Type_INVALID,
+            Self::F6E2M3FN => ffi::PJRT_Buffer_Type_F6E2M3FN,
+            Self::F6E3M2FN => ffi::PJRT_Buffer_Type_F6E3M2FN,
             Self::F8E3M4 => ffi::PJRT_Buffer_Type_F8E3M4,
             Self::F8E4M3 => ffi::PJRT_Buffer_Type_F8E4M3,
             Self::F8E4M3FN => ffi::PJRT_Buffer_Type_F8E4M3FN,
@@ -2681,6 +2678,8 @@ pub(crate) mod ffi {
     pub const PJRT_Buffer_Type_F4E2M1FN: PJRT_Buffer_Type = 29;
     pub const PJRT_Buffer_Type_S1: PJRT_Buffer_Type = 30;
     pub const PJRT_Buffer_Type_U1: PJRT_Buffer_Type = 31;
+    pub const PJRT_Buffer_Type_F6E2M3FN: PJRT_Buffer_Type = 32;
+    pub const PJRT_Buffer_Type_F6E3M2FN: PJRT_Buffer_Type = 33;
 
     pub type PJRT_Buffer_MemoryLayout_Type = std::ffi::c_uint;
     pub const PJRT_Buffer_MemoryLayout_Type_Tiled: PJRT_Buffer_MemoryLayout_Type = 0;
@@ -3705,6 +3704,8 @@ mod tests {
             BufferType::U32,
             BufferType::U64,
             BufferType::F4E2M1FN,
+            BufferType::F6E2M3FN,
+            BufferType::F6E3M2FN,
             BufferType::F8E3M4,
             BufferType::F8E4M3,
             BufferType::F8E4M3FN,
@@ -3727,14 +3728,6 @@ mod tests {
             assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
         });
         assert_eq!(unsafe { BufferType::from_c_api(u32::MAX) }, BufferType::Invalid);
-
-        // The 6-bit floating-point types are not representable in the PJRT C API yet, and so they only
-        // round-trip through the Protobuf and string representations.
-        for r#type in [BufferType::F6E2M3FN, BufferType::F6E3M2FN] {
-            assert_eq!(BufferType::from_proto(r#type.proto()), r#type);
-            assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
-            assert_eq!(unsafe { BufferType::from_c_api(r#type.to_c_api()) }, BufferType::Invalid);
-        }
 
         assert_eq!(BufferType::Token.element_size_in_bytes(), Ok(0));
         assert_eq!(BufferType::Predicate.element_size_in_bytes(), Ok(1));

@@ -476,7 +476,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Buffer {
         pub struct_size: usize,
-        pub extension_start: *mut crate::extensions::ffi::ffi::XLA_FFI_Extension_Base,
+        pub extension_start: *mut crate::extensions::ffi::ffi::XLA_FFI_InternalExtension,
         pub data_type: XLA_FFI_DataType,
         pub data: *mut std::ffi::c_void,
         pub rank: i64,

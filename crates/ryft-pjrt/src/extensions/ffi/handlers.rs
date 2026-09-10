@@ -71,6 +71,9 @@ pub enum FfiExecutionStage {
     /// [`FfiExecutionContext`], but they *must not* attempt to dereference any input device buffers. This also means
     /// that they cannot have host-side control flow depend on the runtime values of those buffers.
     Execution,
+
+    /// Records a command buffer without reading or modifying argument buffers.
+    Recording,
 }
 
 impl FfiExecutionStage {
@@ -82,6 +85,7 @@ impl FfiExecutionStage {
             ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_PREPARE => Self::Preparation,
             ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_INITIALIZE => Self::Initialization,
             ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_EXECUTE => Self::Execution,
+            ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_RECORD => Self::Recording,
         }
     }
 
@@ -93,6 +97,7 @@ impl FfiExecutionStage {
             Self::Preparation => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_PREPARE,
             Self::Initialization => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_INITIALIZE,
             Self::Execution => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_EXECUTE,
+            Self::Recording => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_RECORD,
         }
     }
 }
@@ -276,7 +281,7 @@ impl<'o> FfiCallFrame<'o> {
         unsafe {
             let mut extension = (*self.handle).extension_start;
             while !extension.is_null() {
-                if (*extension).r#type == ffi::XLA_FFI_Extension_Type_Metadata {
+                if (*extension).r#type == ffi::XLA_FFI_InternalExtension_Type_Metadata {
                     let metadata = (*(extension as *mut ffi::XLA_FFI_Metadata_Extension)).metadata;
                     if !metadata.is_null() {
                         (*metadata).api_version.major_version = VERSION.major as std::ffi::c_int;
@@ -350,6 +355,9 @@ pub struct FfiHandlerBundle {
 
     /// [`FfiHandler`] to use for the [`FfiExecutionStage::Execution`] stage.
     execute: FfiHandler,
+
+    /// Optional handler for command-buffer recording.
+    record: Option<FfiHandler>,
 }
 
 impl FfiHandlerBundle {
@@ -359,8 +367,9 @@ impl FfiHandlerBundle {
         prepare: Option<FfiHandler>,
         initialize: Option<FfiHandler>,
         execute: FfiHandler,
+        record: Option<FfiHandler>,
     ) -> Self {
-        Self { instantiate, prepare, initialize, execute }
+        Self { instantiate, prepare, initialize, execute, record }
     }
 
     /// Returns the [`XLA_FFI_Handler_Bundle`](ffi::XLA_FFI_Handler_Bundle) that corresponds to this
@@ -371,6 +380,7 @@ impl FfiHandlerBundle {
             prepare: self.prepare.map(|handler| handler.to_c_api()),
             initialize: self.initialize.map(|handler| handler.to_c_api()),
             execute: self.execute.to_c_api(),
+            record: self.record.map(|handler| handler.to_c_api()),
         }
     }
 }
@@ -437,12 +447,12 @@ pub(crate) mod ffi {
 
     use crate::extensions::ffi::attributes::ffi::{XLA_FFI_Attrs, XLA_FFI_ByteSpan};
     use crate::extensions::ffi::context::ffi::{
-        XLA_FFI_DeviceMemory_Allocate, XLA_FFI_DeviceMemory_Free, XLA_FFI_DeviceOrdinal_Get, XLA_FFI_ExecutionContext,
-        XLA_FFI_ExecutionContext_Get, XLA_FFI_RunId_Get, XLA_FFI_State_Get, XLA_FFI_State_Set, XLA_FFI_Stream_Get,
+        XLA_FFI_DeviceMemory_Allocate, XLA_FFI_DeviceMemory_Free, XLA_FFI_DeviceOrdinal_Get, XLA_FFI_InvokeContext,
+        XLA_FFI_InvokeContext_Get, XLA_FFI_RunId_Get, XLA_FFI_State_Get, XLA_FFI_State_Set, XLA_FFI_Stream_Get,
         XLA_FFI_ThreadPool_NumThreads, XLA_FFI_ThreadPool_Schedule,
     };
     use crate::extensions::ffi::errors::ffi::{
-        XLA_FFI_Error, XLA_FFI_Error_Create, XLA_FFI_Error_Destroy, XLA_FFI_Error_GetMessage,
+        XLA_FFI_Error, XLA_FFI_Error_Create, XLA_FFI_Error_Destroy, XLA_FFI_Error_GetDetails,
     };
     use crate::extensions::ffi::futures::ffi::{
         XLA_FFI_Future, XLA_FFI_Future_Create, XLA_FFI_Future_SetAvailable, XLA_FFI_Future_SetError,
@@ -450,12 +460,12 @@ pub(crate) mod ffi {
     use crate::extensions::ffi::types::ffi::{XLA_FFI_Type_Register, XLA_FFI_TypeId};
     use crate::extensions::ffi::versions::ffi::XLA_FFI_Api_Version;
 
-    pub type XLA_FFI_Extension_Type = std::ffi::c_uint;
-    pub const XLA_FFI_Extension_Type_Metadata: XLA_FFI_Extension_Type = 1;
+    pub type XLA_FFI_InternalExtension_Type = std::ffi::c_uint;
+    pub const XLA_FFI_InternalExtension_Type_Metadata: XLA_FFI_InternalExtension_Type = 1;
 
     #[repr(C)]
     pub struct XLA_FFI_Metadata_Extension {
-        pub extension_base: XLA_FFI_Extension_Base,
+        pub extension_base: XLA_FFI_InternalExtension,
         pub metadata: *mut XLA_FFI_Metadata,
     }
 
@@ -468,10 +478,10 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
-    pub struct XLA_FFI_Extension_Base {
+    pub struct XLA_FFI_InternalExtension {
         pub struct_size: usize,
-        pub r#type: XLA_FFI_Extension_Type,
-        pub next: *mut XLA_FFI_Extension_Base,
+        pub r#type: XLA_FFI_InternalExtension_Type,
+        pub next: *mut XLA_FFI_InternalExtension,
     }
 
     // We represent opaque C types as structs with a particular structure that is following the convention
@@ -485,16 +495,16 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Api {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub api_version: XLA_FFI_Api_Version,
         pub internal_api: *const XLA_FFI_InternalApi,
         pub XLA_FFI_Error_Create: Option<XLA_FFI_Error_Create>,
-        pub XLA_FFI_Error_GetMessage: Option<XLA_FFI_Error_GetMessage>,
+        pub XLA_FFI_Error_GetDetails: Option<XLA_FFI_Error_GetDetails>,
         pub XLA_FFI_Error_Destroy: Option<XLA_FFI_Error_Destroy>,
         pub XLA_FFI_Handler_Register: Option<XLA_FFI_Handler_Register>,
         pub XLA_FFI_Stream_Get: Option<XLA_FFI_Stream_Get>,
         pub XLA_FFI_Type_Register: Option<XLA_FFI_Type_Register>,
-        pub XLA_FFI_ExecutionContext_Get: Option<XLA_FFI_ExecutionContext_Get>,
+        pub XLA_FFI_InvokeContext_Get: Option<XLA_FFI_InvokeContext_Get>,
         pub XLA_FFI_State_Set: Option<XLA_FFI_State_Set>,
         pub XLA_FFI_State_Get: Option<XLA_FFI_State_Get>,
         pub XLA_FFI_DeviceMemory_Allocate: Option<XLA_FFI_DeviceMemory_Allocate>,
@@ -515,6 +525,7 @@ pub(crate) mod ffi {
         XLA_FFI_ExecutionStage_PREPARE = 1,
         XLA_FFI_ExecutionStage_INITIALIZE = 2,
         XLA_FFI_ExecutionStage_EXECUTE = 3,
+        XLA_FFI_ExecutionStage_RECORD = 4,
     }
 
     pub type XLA_FFI_ArgType = std::ffi::c_uint;
@@ -523,7 +534,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub size: i64,
         pub types: *mut XLA_FFI_ArgType,
         pub args: *mut *mut std::ffi::c_void,
@@ -535,7 +546,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Rets {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub size: i64,
         pub types: *mut XLA_FFI_RetType,
         pub rets: *mut *mut std::ffi::c_void,
@@ -544,9 +555,9 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_CallFrame {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub api: *const XLA_FFI_Api,
-        pub context: *mut XLA_FFI_ExecutionContext,
+        pub context: *mut XLA_FFI_InvokeContext,
         pub stage: XLA_FFI_ExecutionStage,
         pub args: XLA_FFI_Args,
         pub rets: XLA_FFI_Rets,
@@ -562,6 +573,7 @@ pub(crate) mod ffi {
         pub prepare: Option<XLA_FFI_Handler>,
         pub initialize: Option<XLA_FFI_Handler>,
         pub execute: XLA_FFI_Handler,
+        pub record: Option<XLA_FFI_Handler>,
     }
 
     pub type XLA_FFI_Handler_TraitsBits = std::ffi::c_uint;
@@ -572,7 +584,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct XLA_FFI_Handler_Register_Args {
         pub struct_size: usize,
-        pub extension_start: *mut XLA_FFI_Extension_Base,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
         pub name: XLA_FFI_ByteSpan,
         pub platform: XLA_FFI_ByteSpan,
         pub bundle: XLA_FFI_Handler_Bundle,

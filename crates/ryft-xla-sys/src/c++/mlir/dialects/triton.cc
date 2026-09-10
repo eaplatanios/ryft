@@ -54,7 +54,11 @@ MlirType mlirTritonTtPointerTypeGet(MlirType pointeeType, int32_t addressSpace) 
   if (pointeeType.ptr == nullptr) {
     return {nullptr};
   }
-  return wrap(mlir::triton::PointerType::get(unwrap(pointeeType), static_cast<int>(addressSpace)));
+  auto space = mlir::triton::symbolizePtrAddrSpace(addressSpace);
+  if (!space) {
+    return {nullptr};
+  }
+  return wrap(mlir::triton::PointerType::get(unwrap(pointeeType), *space));
 }
 
 MlirType mlirTritonTtPointerTypeGetPointeeType(MlirType type) {

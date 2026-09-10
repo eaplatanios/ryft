@@ -24,8 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `f16a4aeb435b2896ab96b605f004f982f6c97eb8`, which also upgraded the
-  LLVM, StableHLO (v1.18.0), Shardy, and Triton pins.
+- Upgraded the OpenXLA dependency pin to commit `eb6b90ed013f511eca088c52f541f3c0819f919e` and the JAX dependency pin
+  to commit `a7606f995e1a92707cbeb257e487fa53e7abe84b`, which also upgraded the LLVM, StableHLO (v1.18.0), Shardy, and
+  Triton pins. This also required updating the Bazel dependency for building the native library to version 8.7.0.
 - Replaced the LLVM dialect token type C++ bindings (`mlirTypeIsALlvmTokenType` and `mlirLlvmTokenTypeGet`) with
   builtin dialect token type bindings (`mlirTypeIsAToken` and `mlirTokenTypeGet`) following the upstream MLIR
   replacement of `!llvm.token` with the builtin `token` type.
