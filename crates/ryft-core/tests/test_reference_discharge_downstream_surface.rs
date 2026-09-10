@@ -65,9 +65,10 @@ use ryft_core::{
     ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
     ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
-    RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch,
-    check_count, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
+    RegionId, RegionInterface, RegionRef, RegionSlot, ResidualZeroProvider, Trace, Tracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero,
+    ZeroOperation, batch, check_count, differentiate_at, discharge_reference_free_operation,
+    validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -517,6 +518,9 @@ impl From<ZeroOperation<RegisterIrType>> for RegisterOperation {
         Self::Zero(operation)
     }
 }
+
+// Register zeros need no runtime geometry, so this universe opts into the input-free residual defaults.
+impl ResidualZeroProvider<RegisterIrType> for RegisterOperation {}
 
 impl OperationProvider<RegisterIrType, OneOperation<RegisterIrType>> for RegisterOperation {
     type Operation = Self;

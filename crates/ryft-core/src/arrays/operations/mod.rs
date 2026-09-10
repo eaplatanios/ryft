@@ -92,8 +92,6 @@ mod sharding;
 mod sort;
 mod tag;
 
-pub use constants::ArrayIrResidualZeroProvider;
-
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
 pub(crate) use math::ElementExtremum;

@@ -86,18 +86,43 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+// TODO(eaplatanios): Move to the beginning of `ryft_core::arrays::differentiation`.
+// Homogeneous array operations construct input-free zeros from their output types. Keep this blanket specific to
+// `ArrayType` so that it is disjoint from the runtime-extent protocol for `ArrayIrType` below.
+impl<O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>>> ResidualZeroProvider<ArrayType> for O {}
 
-// These residual-protocol algorithms are deliberately inherent methods duplicated by thin trait implementation
-// delegations below rather than living only on the trait: the `XlaOperation` provider reuses them across operation
-// families, which their `Self`-typed builder and context parameters cannot express. Do not fold them into the trait
-// implementation.
-impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
-    /// Captures the runtime extents needed to materialize a cotangent zero from the ordinary primal `source`.
-    pub fn capture_zero_residuals<
-        V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType> + From<DimensionSizeOperation>,
-    >(
+// TODO(eaplatanios): Move to the beginning of `ryft_core::arrays::differentiation`.
+// Array-IR operation families share declaration, capture, and assembly regardless of their backend representation.
+// Static zeros use the family's `OperationProvider`; dynamic zeros consume one extent operand per dynamic axis.
+// Captured residuals contain one extent per distinct dimension identity, in first-occurrence order. Assembly expands
+// repeated identities back into the constructor's per-axis operand order.
+//
+// Builder-level capture reads each identity's first axis from the ordinary primal array. Value-level capture also
+// accepts first-class dimensions and references: a dimension with the requested identity is reused, an array supplies
+// a `DimensionSizeOperation` read, and a reference is read before obtaining its referent's extent. A source is inspected
+// before staging anything, so a candidate without the requested identity leaves no instructions behind.
+impl<O> ResidualZeroProvider<ArrayIrType> for O
+where
+    O: Operation<Type = ArrayIrType>
+        + OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>, Operation = O>
+        + From<ZeroOperation<ArrayType>>
+        + From<DimensionSizeOperation>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+{
+    #[inline]
+    fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
+        match r#type {
+            ArrayIrType::Array(r#type) => ExactShape::for_residual_zero(r#type.shape())
+                .1
+                .into_iter()
+                .map(|(_, variable)| DimensionType::new(variable).into())
+                .collect(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
         builder: &mut ProgramBuilder<V, O>,
         source: AtomId,
         r#type: &ArrayIrType,
@@ -119,18 +144,8 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
             .collect()
     }
 
-    /// Captures the one extent named by `residual_type` from `source`, or [`None`] when `source`'s type does not carry
-    /// that [`DimensionVariable`](crate::arrays::DimensionVariable). A first-class dimension of exactly the residual
-    /// type already _is_ the extent and is reused without staging anything. An array carrying the variable on an axis
-    /// contributes a [`DimensionSizeOperation`] read of that axis. A reference carrying the variable is read first
-    /// and contributes the extent of its referent. The source's type is inspected before anything is staged, so a
-    /// candidate that does not carry the variable leaves no instruction behind.
-    pub fn capture_zero_residual_value<
-        C: Context<
-                Type = ArrayIrType,
-                Operation: From<DimensionSizeOperation> + From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
-            >,
-    >(
+    #[inline]
+    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = O>>(
         context: &C,
         source: &C::Value,
         residual_type: &ArrayIrType,
@@ -171,12 +186,11 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
         ))
     }
 
-    /// Returns the canonical zero operation for `r#type` and expands one explicit extent residual per distinct dynamic
-    /// identity into the mixed constructor's per-axis operand order.
-    pub fn zero_operation_with_residuals<R: Clone>(
+    #[inline]
+    fn zero_operation_with_residuals<R: Clone>(
         r#type: ArrayIrType,
         residuals: &[R],
-    ) -> Result<(Self, Vec<R>), ProgramError> {
+    ) -> Result<(O, Vec<R>), ProgramError> {
         let r#type = <&ArrayType>::try_from(&r#type)?.clone();
         let (shape, first_axes) = ExactShape::for_residual_zero(r#type.shape());
         let expected_residual_count = first_axes.len();
@@ -192,47 +206,7 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
             return Ok((Self::provide(ZeroOperation::new(r#type.into()), &[])?, Vec::new()));
         }
         let operands = shape.dynamic_dimensions(residuals);
-        Ok((Self::Zero(ZeroOperation::new(r#type)), operands))
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOperation<A> {
-    #[inline]
-    fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
-        match r#type {
-            ArrayIrType::Array(r#type) => ExactShape::for_residual_zero(r#type.shape())
-                .1
-                .into_iter()
-                .map(|(_, variable)| DimensionType::new(variable).into())
-                .collect(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
-        builder: &mut ProgramBuilder<V, Self>,
-        source: AtomId,
-        r#type: &ArrayIrType,
-    ) -> Result<Vec<AtomId>, ProgramError> {
-        ArrayIrOperation::<A>::capture_zero_residuals(builder, source, r#type)
-    }
-
-    #[inline]
-    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = Self>>(
-        context: &C,
-        source: &C::Value,
-        residual_type: &ArrayIrType,
-    ) -> Result<Option<C::Value>, ProgramError> {
-        ArrayIrOperation::<A>::capture_zero_residual_value(context, source, residual_type)
-    }
-
-    #[inline]
-    fn zero_operation_with_residuals<R: Clone>(
-        r#type: ArrayIrType,
-        residuals: &[R],
-    ) -> Result<(Self, Vec<R>), ProgramError> {
-        ArrayIrOperation::<A>::zero_operation_with_residuals(r#type, residuals)
+        Ok((O::from(ZeroOperation::new(r#type)), operands))
     }
 }
 
@@ -1197,12 +1171,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_array_ir_operation_provide() {
+        let r#type = ArrayType::scalar(DataType::F32);
+        let operation = ArrayIrOperation::<Array>::provide(ZeroOperation::new(r#type.clone().into()), &[]).unwrap();
+        assert!(
+            matches!(operation, ArrayIrOperation::Array(ArrayOperation::Zero(operation)) if operation.r#type() == &r#type)
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_zero_residual_types() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![rows.clone().into(), rows.clone().into(), columns.clone().into(), 4.into()]),
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&r#type.into()),
+            vec![DimensionType::new(rows).into(), DimensionType::new(columns.clone()).into()],
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&ArrayType::scalar(DataType::F32).into(),),
+            Vec::<ArrayIrType>::new(),
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_residual_types(&DimensionType::new(columns).into(),),
+            Vec::<ArrayIrType>::new(),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_capture_zero_residuals() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into(), columns.into(), 4.into()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source = builder.add_input(r#type.clone().into());
+        let residuals =
+            ArrayIrOperation::<Array>::capture_zero_residuals(&mut builder, source, &r#type.clone().into()).unwrap();
+
+        // Repeated axes share one residual, captured from the first axis carrying each identity.
+        assert_eq!(residuals, vec![AtomId::new(1), AtomId::new(2)]);
+        assert_eq!(builder.instructions().len(), 2);
+        for (instruction, axis) in builder.instructions().iter().zip([0, 2]) {
+            assert!(
+                matches!(instruction.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == axis)
+            );
+            assert_eq!(instruction.inputs(), &[source]);
+        }
+        let static_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let static_source = builder.add_input(static_type.clone());
+        assert_eq!(
+            ArrayIrOperation::<Array>::capture_zero_residuals(&mut builder, static_source, &static_type,),
+            Ok(Vec::new()),
+        );
+        assert_eq!(builder.instructions().len(), 2);
+    }
+
     /// Identity-directed capture answers per declared residual rather than per exemplar, so it must inspect a
     /// candidate's type before staging anything: a candidate that does not name the requested quantity has to be
     /// rejected without leaving a dead read behind, and a first-class dimension that already *is* the quantity has to
     /// be reused rather than re-read.
     #[test]
-    fn test_capture_zero_residual_value() {
+    fn test_array_ir_operation_capture_zero_residual_value() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
@@ -1264,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_zero_residual_value_reference() {
+    fn test_array_ir_operation_capture_zero_residual_value_reference() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let dimension_type = DimensionType::new(extent.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
@@ -1301,5 +1335,58 @@ mod tests {
         assert_eq!(dimension.extent(), 3);
         assert_eq!(dimension.r#type().extent(), Some(3));
         assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0, 7.0])));
+    }
+
+    #[test]
+    fn test_array_ir_operation_zero_operation_with_residuals() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into(), columns.into()]));
+        let residuals = [AtomId::new(5), AtomId::new(8)];
+        let (operation, operands) =
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.clone().into(), &residuals).unwrap();
+        assert!(matches!(operation, ArrayIrOperation::Zero(operation) if operation.r#type() == &r#type));
+        assert_eq!(operands, vec![residuals[0], residuals[0], residuals[1]]);
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.into(), &residuals[..1],).map(|_| ()),
+            Err(ProgramError::InvalidArgument { message: "dynamic zero expected 2 extent residuals but got 1".into() }),
+        );
+        let static_type = ArrayType::scalar(DataType::F32);
+        let (operation, operands) =
+            ArrayIrOperation::<Array>::zero_operation_with_residuals(static_type.clone().into(), &[] as &[AtomId])
+                .unwrap();
+        assert!(
+            matches!(operation, ArrayIrOperation::Array(ArrayOperation::Zero(operation)) if operation.r#type() == &static_type)
+        );
+        assert_eq!(operands, Vec::<AtomId>::new());
+    }
+
+    #[test]
+    fn test_array_ir_operation_materialize_zero_from_residual_sources() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::unbounded());
+        let r#type: ArrayIrType =
+            ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()])).into();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source = context.input(r#type.clone());
+
+        // The default boundary protocol shares the array-IR capture and assembly rules: one captured extent is reused
+        // for both dynamic axes of the assembled zero.
+        let zero = ArrayIrOperation::<Array>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(r#type.clone()),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &r#type);
+        let builder = context.builder().borrow();
+        let [dimension_size, zero] = builder.instructions() else {
+            panic!("expected one dimension-size instruction followed by one zero instruction");
+        };
+        assert!(
+            matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0)
+        );
+        assert_eq!(dimension_size.inputs(), &[source.atom_id().unwrap()]);
+        assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
     }
 }

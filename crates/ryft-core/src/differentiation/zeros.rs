@@ -6,9 +6,7 @@ use crate::differentiation::DifferentiationError;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::{Zero, ZeroOperation};
-use crate::programs::{
-    AtomId, MaybeZero, Operation, OperationProvider, ProgramBuilder, ProgramError, Type, Typed, Value,
-};
+use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, ProgramError, Type, Typed, Value};
 
 /// Protocol through which an operation family materializes zeros that need runtime values, such as dynamic dimensions,
 /// that cannot be derived from the zero's [`Type`] alone. Those values are captured explicitly as _residuals_.
@@ -26,7 +24,7 @@ use crate::programs::{
 /// dimensions are in scope is during linearization, and so the required extents must be captured then and threaded to
 /// transposition as ordinary residuals. This trait is that capture/spend contract, expressed once per operation
 /// _family_. It is a set of associated functions with no receiver (i.e., `self` argument), because it is invoked
-/// precisely when no [`Operation`] instance exists.
+/// precisely when no [`Operation`](crate::Operation) instance exists.
 ///
 /// The provider itself need not be an operation. Its emitted family is [`OperationProvider::Operation`], which fixes
 /// the operation type of every builder, context, and assembled zero in the protocol. This separates residual semantics
@@ -65,14 +63,15 @@ use crate::programs::{
 ///
 /// # Who Implements It
 ///
-/// Almost nobody needs to implement this trait, by design. Every operation family with an input-free zero (i.e., every
-/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation that
-/// declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
-/// rejects unexpected residuals rather than ignoring them, so a mismatched linearize/transpose pairing cannot be
-/// silently accepted). Providers whose zeros consume runtime dimension operands override the declaration, capture,
-/// and operation-assembly functions. The composite program family and its XLA counterpart delegate these functions to
-/// [`ArrayIrResidualZeroProvider`](crate::ArrayIrResidualZeroProvider), parameterized by the destination family.
-/// Every spending path reuses that shared assembly.
+/// Homogeneous array families with a `From<ZeroOperation<ArrayType>>` conversion receive the input-free defaults:
+/// they declare nothing, capture nothing, and construct a type-only zero. Unexpected residuals are rejected rather
+/// than silently ignored. Eligible [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket
+/// implementation that captures runtime dimensions and assembles zeros with explicit extent operands. This includes
+/// both the core composite family and its XLA counterpart; neither needs its own residual-protocol implementation.
+///
+/// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
+/// implements `OperationProvider<T, ZeroOperation<T>>`; a family requiring residuals overrides declaration, capture,
+/// and assembly together. Every spending path reuses that shared assembly.
 ///
 /// [`LinearCallOperation`](crate::LinearCallOperation) retains residual values needed to transpose a non-trivial linear
 /// map by attaching explicit forward/transpose regions to an instruction. This trait retains the values needed to
@@ -82,7 +81,7 @@ use crate::programs::{
 pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
     /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
-    /// Input-free [`Operation`] families use the empty default. The array-dimension composite family returns one
+    /// Input-free operation families use the empty default. The array-dimension composite family returns one
     /// dimension type per _distinct_ dynamic identity of `r#type`, in first-occurrence order, so repeated axes share
     /// one residual.
     #[inline]
@@ -93,7 +92,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
     /// Stages instructions into `builder` that read the residual values declared by [`Self::zero_residual_types`] from
     /// the primal value `source` (e.g., one `dimension_size` read per declared residual), returning the new atoms in
     /// declaration order. Linearization calls this while `source` is still in scope of the program being built. The
-    /// returned atoms are then threaded to transposition as ordinary residuals. Input-free [`Operation`] families
+    /// returned atoms are then threaded to transposition as ordinary residuals. Input-free operation families
     /// capture nothing.
     #[inline]
     fn capture_zero_residuals<V: Value<Type = T>>(
@@ -137,7 +136,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
     ///
     /// Implementations must inspect `source`'s [`Type`] before staging anything and return [`None`] without side
     /// effects when it does not carry the named quantity, because the caller tries candidates in order and a
-    /// speculative read would leave dead instructions behind. Input-free [`Operation`] families declare no residuals
+    /// speculative read would leave dead instructions behind. Input-free operation families declare no residuals
     /// and therefore never reach this function, so the default answers [`None`].
     #[inline]
     fn capture_zero_residual_value<C: Context<Type = T, Operation = Self::Operation>>(
@@ -241,10 +240,6 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
         Ok(outputs.remove(0))
     }
 }
-
-// Every operation family that absorbs a type-only `ZeroOperation` has an input-free zero, and so the defaulted
-// residual protocol applies verbatim. Composite families without that conversion implement the protocol directly.
-impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ResidualZeroProvider<T> for O {}
 
 /// Captures the runtime values needed to materialize a zero of `r#type` and validates the operation family's residual
 /// protocol. [`ResidualZeroProvider::zero_residual_types`] declares the residual signature, while
