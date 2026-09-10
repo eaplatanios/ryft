@@ -66,11 +66,13 @@ jobs:
       xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
     steps:
       - uses: runs-on/action@v2
+
       - name: Check Out Repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.ref }}
           path: "ryft"
+
       - name: Install Chocolatey, Git, Visual Studio 2019 Build Tools, and LLVM 18
         if: ${{ matrix.config.os == 'windows' }}
         run: |
@@ -91,6 +93,7 @@ jobs:
           # Install LLVM 18
           choco install llvm --version 18.1.8 -y
           echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install LLVM 18 & NUMA
         if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-7' }}
         run: |
@@ -102,6 +105,7 @@ jobs:
           sudo apt-get install -y lsb-release wget software-properties-common gnupg
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo apt-get install libnuma-dev -y
+
       - name: Install CUDA 12
         if: ${{ matrix.config.device == 'cuda-12' }}
         run: |
@@ -110,6 +114,7 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt install -y --no-install-recommends cuda-12-9 cuda-toolkit-12-9 cuda-nvcc-12-9 cuda-nvrtc-dev-12-9
+
       - name: Install CUDA 13
         if: ${{ matrix.config.device == 'cuda-13' }}
         run: |
@@ -118,11 +123,13 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0 cuda-nvcc-13-0 cuda-nvrtc-dev-13-0
+
       - name: Install Python
         uses: actions/setup-python@v5
         if: ${{ matrix.config.os == 'windows' }}
         with:
           python-version: "3.11.9"
+
       - name: Install Bazel
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
@@ -131,6 +138,7 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
+
       - name: Extract XLA Commit ID
         id: extract_xla_commit_id
         shell: bash
@@ -138,6 +146,7 @@ jobs:
           XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
           echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
           echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
+
       - name: Build `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -148,12 +157,49 @@ jobs:
           bazel build --config=${{ matrix.config.platform }} //:ryft-xla-sys-archive
           cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+
+      - name: Test `ryft-xla-sys` Library / Check Archive Contents and Reproducibility
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        run: |
+          bazel test --config=${{ matrix.config.platform }} \
+            //:ryft-xla-sys-archive-content-test \
+            //:ryft-xla-sys-archive-reproducibility-test
+
+      - name: Test `ryft-xla-sys` Library / Run Rust Binding and MLIR Tests
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        env:
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/bazel-bin/ryft-xla-sys-archive.tar.gz
+        run: |
+          cargo test --manifest-path ../../Cargo.toml -p ryft-xla-sys --lib
+          cargo test --manifest-path ../../Cargo.toml -p ryft-mlir --lib
+
+      - name: Test `ryft-xla-sys` Library / Check Upstream API Coverage and Archive Symbols
+        if: ${{ matrix.config.device == 'cpu' }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          python tests/symbol_contract_test.py \
+            --archive bazel-bin/ryft-xla-sys-archive.tar.gz \
+            --jax-root "$OUTPUT_BASE/external/jax" \
+            --xla-root "$OUTPUT_BASE/external/xla" \
+            --llvm-root "$OUTPUT_BASE/external/llvm-project" \
+            --ryft-xla-sys-root . \
+            --ryft-mlir-root ../ryft-mlir
+          python -m unittest tests/symbol_contract_test.py
+
       - name: Upload `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
           path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+
       - name: Build PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -166,6 +212,27 @@ jobs:
           bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-7' && '--config=rocm-7' || '' }} //:pjrt-gpu-plugin
           cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+
+      # The CUDA plugins link JAX's Mosaic GPU runtime with static registration of the `mosaic_gpu_v2` XLA FFI target.
+      # The version script hides every symbol except `GetPjrtApi`, so retention is proven through the registration
+      # string that `XLA_FFI_REGISTER_HANDLER` embeds; the exported-symbol table must still contain only the PJRT entry.
+      - name: Test PJRT Plugin / Check Mosaic GPU Registration and Exported Symbols
+        if: ${{ matrix.config.os == 'linux' && startsWith(matrix.config.device, 'cuda') }}
+        working-directory: ./ryft/crates/ryft-xla-sys
+        shell: bash
+        run: |
+          python3 - "${{ steps.build_pjrt_plugin.outputs.library }}" << 'PY'
+          import pathlib
+          import sys
+          library = pathlib.Path(sys.argv[1]).read_bytes()
+          if library.count(b"mosaic_gpu_v2") == 0:
+              raise SystemExit(f"{sys.argv[1]} does not retain the `mosaic_gpu_v2` XLA FFI registration")
+          print(f"{sys.argv[1]} retains the `mosaic_gpu_v2` registration")
+          PY
+          LIBRARY="${{ steps.build_pjrt_plugin.outputs.library }}"
+          EXPORTED=$(nm -D --defined-only "$LIBRARY" | awk '{print $NF}' | sort -u)
+          test "$EXPORTED" = "GetPjrtApi" || { echo "unexpected exported symbols: $EXPORTED"; exit 1; }
+
       - name: Create PJRT Plugin Archive
         if: ${{ matrix.config.device != 'cpu' }}
         uses: a7ul/tar-action@v1.2.0
@@ -174,6 +241,7 @@ jobs:
           cwd: ./ryft/crates/ryft-xla-sys/
           files: ${{ steps.build_pjrt_plugin.outputs.library }}
           outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+
       - name: Upload PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         uses: actions/upload-artifact@v7
