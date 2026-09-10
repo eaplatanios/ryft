@@ -91,6 +91,44 @@ impl XlaTransformExtension {
             { cleared },
         )
     }
+
+    /// Runs the HLO pass pipeline on a serialized `HloModuleProto` and returns its serialized `HloModuleMetadataProto`
+    /// trace. The returned bytes are owned by Rust; plugin-owned trace storage is released before this function
+    /// returns. Returns [`Error::Unimplemented`] if either trace callback is unavailable.
+    pub fn hlo_pass_pipeline_trace(&self, module: &[u8]) -> Result<Vec<u8>, Error> {
+        use ffi::PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args;
+
+        // Check the destructor before obtaining storage owned by the plugin. Older extension layouts end before
+        // the trace callbacks, so their fields must not be read until the size check succeeds.
+        let destroy = unsafe {
+            let offset = std::mem::offset_of!(
+                ffi::PJRT_Xla_Transform_Extension,
+                PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace,
+            );
+            if (*self.handle).base.struct_size
+                < offset + size_of::<Option<ffi::PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace>>()
+            {
+                return Err(Error::unimplemented("the XLA transform extension does not support HLO pipeline traces"));
+            }
+            (*self.handle).PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace.ok_or_else(|| {
+                Error::unimplemented("the XLA transform extension does not provide an HLO pipeline trace destructor")
+            })?
+        };
+        let mut trace = invoke_pjrt_api_error_fn!(
+            @extension ffi::PJRT_Xla_Transform_Extension => self,
+            PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace,
+            { hlo_module = ffi::PJRT_XlaTransform_string { data: module.as_ptr().cast(), size: module.len() } },
+            { trace },
+        )?;
+        let result = if trace.serialized_trace.is_null() && trace.serialized_trace_size != 0 {
+            Err(Error::internal("the XLA transform extension returned a null HLO pipeline trace with a nonzero size"))
+        } else {
+            Ok(unsafe { slice_from_c_api(trace.serialized_trace.cast::<u8>(), trace.serialized_trace_size) }.to_vec())
+        };
+        let mut arguments = ffi::PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args::new(&mut trace);
+        unsafe { destroy(&mut arguments) };
+        result
+    }
 }
 
 impl Client<'_> {
@@ -486,10 +524,55 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Clear_Xla_Transform_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct PJRT_HloPassPipelineTrace {
+        pub serialized_trace: *const std::ffi::c_char,
+        pub serialized_trace_size: usize,
+    }
+
+    #[repr(C)]
+    pub struct PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args {
+        pub struct_size: usize,
+        pub hlo_module: PJRT_XlaTransform_string,
+        pub trace: PJRT_HloPassPipelineTrace,
+    }
+
+    impl PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args {
+        pub fn new(hlo_module: PJRT_XlaTransform_string) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                hlo_module,
+                trace: PJRT_HloPassPipelineTrace { serialized_trace: std::ptr::null(), serialized_trace_size: 0 },
+            }
+        }
+    }
+
+    pub type PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace =
+        unsafe extern "C" fn(args: *mut PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
+    pub struct PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args {
+        pub struct_size: usize,
+        pub trace: *mut PJRT_HloPassPipelineTrace,
+    }
+
+    impl PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args {
+        pub fn new(trace: *mut PJRT_HloPassPipelineTrace) -> Self {
+            Self { struct_size: size_of::<Self>(), trace }
+        }
+    }
+
+    pub type PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace =
+        unsafe extern "C" fn(args: *mut PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args);
+
+    #[repr(C)]
     pub struct PJRT_Xla_Transform_Extension {
         pub base: PJRT_Extension_Base,
         pub PJRT_Register_Xla_Transform: Option<PJRT_Register_Xla_Transform>,
         pub PJRT_Clear_Xla_Transform: Option<PJRT_Clear_Xla_Transform>,
+        pub PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace: Option<PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace>,
+        pub PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace:
+            Option<PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace>,
     }
 }
 

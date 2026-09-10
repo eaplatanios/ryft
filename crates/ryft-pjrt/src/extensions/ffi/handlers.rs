@@ -448,8 +448,8 @@ pub(crate) mod ffi {
     use crate::extensions::ffi::attributes::ffi::{XLA_FFI_Attrs, XLA_FFI_ByteSpan};
     use crate::extensions::ffi::context::ffi::{
         XLA_FFI_DeviceMemory_Allocate, XLA_FFI_DeviceMemory_Free, XLA_FFI_DeviceOrdinal_Get, XLA_FFI_InvokeContext,
-        XLA_FFI_InvokeContext_Get, XLA_FFI_RunId_Get, XLA_FFI_State_Get, XLA_FFI_State_Set, XLA_FFI_Stream_Get,
-        XLA_FFI_ThreadPool_NumThreads, XLA_FFI_ThreadPool_Schedule,
+        XLA_FFI_InvokeContext_FindExtension, XLA_FFI_InvokeContext_Get, XLA_FFI_RunId_Get, XLA_FFI_State_Get,
+        XLA_FFI_State_Set, XLA_FFI_Stream_Get, XLA_FFI_ThreadPool_NumThreads, XLA_FFI_ThreadPool_Schedule,
     };
     use crate::extensions::ffi::errors::ffi::{
         XLA_FFI_Error, XLA_FFI_Error_Create, XLA_FFI_Error_Destroy, XLA_FFI_Error_GetDetails,
@@ -516,6 +516,7 @@ pub(crate) mod ffi {
         pub XLA_FFI_Future_SetError: Option<XLA_FFI_Future_SetError>,
         pub XLA_FFI_RunId_Get: Option<XLA_FFI_RunId_Get>,
         pub XLA_FFI_DeviceOrdinal_Get: Option<XLA_FFI_DeviceOrdinal_Get>,
+        pub XLA_FFI_InvokeContext_FindExtension: Option<XLA_FFI_InvokeContext_FindExtension>,
     }
 
     #[repr(C)]
@@ -597,11 +598,22 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use ryft_xla_sys::bindings;
+
     use crate::extensions::ffi::errors::FfiError;
     use crate::extensions::ffi::tests::with_test_ffi_call_frame;
     use crate::extensions::ffi::types::FfiTypeId;
 
-    use super::{FfiExecutionStage, FfiInput, FfiOutput};
+    use super::*;
+
+    #[test]
+    fn test_ffi_execution_stage_recording() {
+        assert_eq!(FfiExecutionStage::Recording.to_c_api() as u32, 4);
+        assert_eq!(
+            FfiExecutionStage::from_c_api(FfiExecutionStage::Recording.to_c_api()),
+            FfiExecutionStage::Recording,
+        );
+    }
 
     #[test]
     fn test_ffi_call_frame() {
@@ -622,5 +634,22 @@ mod tests {
             assert!(call_frame.future().is_ok());
             assert!(!call_frame.register_metadata(FfiTypeId::default()));
         });
+    }
+
+    #[test]
+    fn test_ffi_handler_bundle_layout() {
+        assert_eq!(size_of::<ffi::XLA_FFI_Handler_Bundle>(), size_of::<bindings::XLA_FFI_Handler_Bundle>());
+        assert_eq!(
+            std::mem::offset_of!(ffi::XLA_FFI_Handler_Bundle, record),
+            std::mem::offset_of!(bindings::XLA_FFI_Handler_Bundle, record),
+        );
+        assert_eq!(
+            size_of::<ffi::XLA_FFI_Handler_Register_Args>(),
+            size_of::<bindings::XLA_FFI_Handler_Register_Args>(),
+        );
+        assert_eq!(
+            std::mem::offset_of!(ffi::XLA_FFI_Handler_Register_Args, traits),
+            std::mem::offset_of!(bindings::XLA_FFI_Handler_Register_Args, traits),
+        );
     }
 }

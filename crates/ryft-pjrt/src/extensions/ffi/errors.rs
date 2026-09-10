@@ -68,13 +68,19 @@ pub enum FfiError {
 impl FfiError {
     /// Copies the code and message from an owned XLA FFI error and destroys the native error.
     /// Returns `None` for a null handle.
+    ///
+    /// # Safety
+    ///
+    /// A non-null handle must be an owned error allocated by `api`. This function consumes it; the caller
+    /// must not access or destroy it afterward. This boundary supports native FFI handler interoperability.
     pub unsafe fn from_c_api(handle: *mut ffi::XLA_FFI_Error, api: FfiApi) -> Result<Option<Self>, Self> {
         use ffi::*;
 
         if handle.is_null() {
             return Ok(None);
         }
-        let details = invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_GetDetails, { error = handle }, { message, error_code });
+        let details =
+            invoke_xla_ffi_api_void_fn!(api, XLA_FFI_Error_GetDetails, { error = handle }, { message, error_code });
         let result = match details {
             Ok((message, error_code)) => {
                 let message = if message.is_null() {
@@ -84,21 +90,21 @@ impl FfiError {
                 };
                 let backtrace = Backtrace::capture().to_string();
                 Ok(Some(match error_code {
-                    XLA_FFI_Error_Code_CANCELLED => Self::Cancelled { message, backtrace },
-                    XLA_FFI_Error_Code_INVALID_ARGUMENT => Self::InvalidArgument { message, backtrace },
-                    XLA_FFI_Error_Code_DEADLINE_EXCEEDED => Self::DeadlineExceeded { message, backtrace },
-                    XLA_FFI_Error_Code_NOT_FOUND => Self::NotFound { message, backtrace },
-                    XLA_FFI_Error_Code_ALREADY_EXISTS => Self::AlreadyExists { message, backtrace },
-                    XLA_FFI_Error_Code_PERMISSION_DENIED => Self::PermissionDenied { message, backtrace },
-                    XLA_FFI_Error_Code_RESOURCE_EXHAUSTED => Self::ResourceExhausted { message, backtrace },
-                    XLA_FFI_Error_Code_FAILED_PRECONDITION => Self::FailedPrecondition { message, backtrace },
-                    XLA_FFI_Error_Code_ABORTED => Self::Aborted { message, backtrace },
-                    XLA_FFI_Error_Code_OUT_OF_RANGE => Self::OutOfRange { message, backtrace },
-                    XLA_FFI_Error_Code_UNIMPLEMENTED => Self::Unimplemented { message, backtrace },
-                    XLA_FFI_Error_Code_INTERNAL => Self::Internal { message, backtrace },
-                    XLA_FFI_Error_Code_UNAVAILABLE => Self::Unavailable { message, backtrace },
-                    XLA_FFI_Error_Code_DATA_LOSS => Self::DataLoss { message, backtrace },
-                    XLA_FFI_Error_Code_UNAUTHENTICATED => Self::Unauthenticated { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_CANCELLED => Self::Cancelled { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_INVALID_ARGUMENT => Self::InvalidArgument { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_DEADLINE_EXCEEDED => Self::DeadlineExceeded { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_NOT_FOUND => Self::NotFound { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_ALREADY_EXISTS => Self::AlreadyExists { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_PERMISSION_DENIED => Self::PermissionDenied { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_RESOURCE_EXHAUSTED => Self::ResourceExhausted { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_FAILED_PRECONDITION => Self::FailedPrecondition { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_ABORTED => Self::Aborted { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_OUT_OF_RANGE => Self::OutOfRange { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNIMPLEMENTED => Self::Unimplemented { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_INTERNAL => Self::Internal { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNAVAILABLE => Self::Unavailable { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_DATA_LOSS => Self::DataLoss { message, backtrace },
+                    ffi::XLA_FFI_Error_Code_UNAUTHENTICATED => Self::Unauthenticated { message, backtrace },
                     _ => Self::Unknown { message, backtrace },
                 }))
             }
@@ -346,6 +352,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use crate::extensions::ffi::tests::test_ffi_api;
+
     use super::{FfiError, ffi};
 
     #[test]
@@ -419,7 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn test_error_display_and_debug() {
+    fn test_ffi_error_from_c_api() {
+        let api = test_ffi_api();
+        assert_eq!(unsafe { FfiError::from_c_api(std::ptr::null_mut(), api) }, Ok(None));
+        let error = FfiError::invalid_argument("invalid argument");
+        let handle = unsafe { error.to_c_api(api) };
+        assert!(matches!(
+            unsafe { FfiError::from_c_api(handle, api) },
+            Ok(Some(FfiError::InvalidArgument { message, .. })) if message == "invalid argument",
+        ));
+        let handle = unsafe { FfiError::unavailable("").to_c_api(api) };
+        assert!(matches!(
+            unsafe { FfiError::from_c_api(handle, api) },
+            Ok(Some(FfiError::Unavailable { message, .. })) if message.is_empty(),
+        ));
+    }
+
+    #[test]
+    fn test_ffi_error_display_and_debug() {
         let error = FfiError::invalid_argument("bad input");
         assert_eq!(format!("{error}"), "bad input");
         let debug = format!("{error:?}");
