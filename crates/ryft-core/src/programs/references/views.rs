@@ -37,8 +37,8 @@
 //! it inserts an axis into the packed root, and a primal view reapplied unchanged to a batched root would index or
 //! slice the wrong axis. The contract therefore splits the two concerns. [`BatchableReferenceView::batch`] is pure axis
 //! arithmetic on the view (i.e., given the packed source type and the source's batch axis, it returns the view that
-//! selects the same part of each item of the packed source together with the batch axis of the derived reference). The
-//! shared rule [`batch_reference_view_operation`] then binds that batched view through
+//! selects the same part of each item of the packed source together with the batch axis of the derived reference).
+//! The shared rule [`ReferenceViewOperation::batch`] then binds that batched view through
 //! [`reapply_reference_view`](ReferenceViewOperation::reapply_reference_view) on the parent context, so every view
 //! operation of every family batches through one rule and no operation carries the axis arithmetic itself.
 //!
@@ -287,7 +287,7 @@ pub trait BatchableReferenceView: ReferenceView {
 /// current transformed source type before it is reapplied. Batching does not reapply a primal view unchanged, because
 /// a batched root has an extra axis; it first moves the batch axis through the view with
 /// [`BatchableReferenceView::batch`] and then reapplies the batched view, which is what
-/// [`batch_reference_view_operation`] does for every view operation.
+/// [`ReferenceViewOperation::batch`] does for every view operation.
 pub trait ReferenceViewOperation: Operation {
     /// View type of this family, addressing this family's reference types.
     type View: ReferenceView<Type = Self::Type>;
@@ -351,6 +351,172 @@ pub trait ReferenceViewOperation: Operation {
         source: C::Value,
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError>;
+
+    /// Batches this operation by reconstructing its reference views in the parent of `context`. This shared rule
+    /// supports operations whose outputs are all views of one input reference, with no observable effects or attached
+    /// regions. Every other input must be replicated across the batch. For example, indexing a batch of references at
+    /// one shared index is supported; using a different index for each item is not.
+    ///
+    /// The rule adjusts each view through [`BatchableReferenceView::batch`], reapplies it through
+    /// [`reapply_reference_view`](Self::reapply_reference_view), and returns the results in output order with their
+    /// batch axes. Operations with multiple view outputs are reconstructed once per output. Member operation rules
+    /// first convert their operation into the enclosing operation family and invoke this function on that value.
+    /// Reference families that do not support batching need not implement [`BatchableReferenceView`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`BatchingContext`] whose parent is used to reconstruct the views.
+    ///   - `inputs`: Operation inputs in input order, each carrying its value and batch axis according to `P`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchingError::UnsupportedOperation`] when the operation has no views, uses multiple source
+    /// references, has other outputs, observable effects, or attached regions, or receives a mapped non-source
+    /// input. Malformed input positions or missing views produce a [`ProgramError::MalformedProgram`] wrapped in
+    /// [`BatchingError`]. Propagates errors from type inference, view batching, reapplication, and batch construction.
+    fn batch<C: Context<Type = Self::Type, Operation = Self>, P: BatchingPolicy<C>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError>
+    where
+        Self::View: BatchableReferenceView,
+    {
+        let name = self.name();
+        let effects = self.effects();
+        let not_a_view = |output_index: usize| BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{name}` has reference output {output_index} that is not a view, so it cannot batch as a \
+                 view operation",
+            ),
+        };
+
+        // A new allocation cannot be reconstructed by reapplying views of an existing input.
+        if let Some(output_index) = effects.allocation_output_indices().next() {
+            return Err(not_a_view(output_index));
+        }
+
+        // Collect the view outputs while checking that every alias is a view of the same input. Invalid aliases must
+        // produce an error rather than being filtered out, since dropping them would change the operation's outputs.
+        let (source_index, mut output_indices) = effects.reference_aliases().iter().try_fold(
+            (None, Vec::with_capacity(effects.reference_aliases().len())),
+            |(source_index, mut output_indices), alias| {
+                let (output_index, input_index) = (alias.output_index(), alias.input_index());
+                if alias.kind() != ReferenceAliasKind::View {
+                    return Err(not_a_view(output_index));
+                }
+                if let Some(source_index) = source_index
+                    && source_index != input_index
+                {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "`{name}` views inputs {source_index} and {input_index}, but a view operation \
+                             views one source",
+                        ),
+                    });
+                }
+                output_indices.push(output_index);
+                Ok((Some(input_index), output_indices))
+            },
+        )?;
+
+        let Some(source_index) = source_index else {
+            return Err(BatchingError::UnsupportedOperation { message: format!("`{name}` derives no reference view") });
+        };
+
+        // Replaying views preserves only the views themselves. Reject effects and attached computations whose
+        // execution would otherwise be silently dropped by this rule.
+        if effects.summary().has_observable_effects_when_unused() || !self.region_slots().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{name}` has effects or attached regions that cannot be preserved by batching only its \
+                     reference views",
+                ),
+            });
+        }
+
+        // Return values must retain the operation's output order. Gaps identify outputs this rule cannot reconstruct.
+        output_indices.sort_unstable();
+        if output_indices.iter().enumerate().any(|(position, output_index)| position != *output_index) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("`{name}` has outputs other than its reference views"),
+            });
+        }
+
+        // Resolve the shared source, then require all other inputs to have one value shared across the batch.
+        // In particular, independently varying indices would need a different rule for constructing reference views.
+        let Some(source) = inputs.get(source_index) else {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{name}` views input {source_index} but was applied to {} inputs",
+                inputs.len(),
+            ))
+            .into());
+        };
+
+        if let Some((input_index, _)) = inputs
+            .iter()
+            .enumerate()
+            .find(|(index, input)| *index != source_index && !P::batch_axis(input).is_replicated())
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{name}` requires input {input_index} to be replicated; batching a reference view \
+                     through a mapped index input is not supported",
+                ),
+            });
+        }
+
+        // Alias positions alone do not reveal a trailing non-reference output. Check the complete per-item signature
+        // before emitting any views so the reconstructed outputs preserve the operation's full boundary.
+        let input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
+        let output_types = self.infer_output_types(&input_types, &[])?;
+        if output_types.len() != output_indices.len() || output_types.iter().any(|r#type| !r#type.is_reference()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("`{name}` has outputs other than its reference views"),
+            });
+        }
+
+        // Each view is adjusted for the packed source type, then reapplied in the parent context. The returned batch
+        // axis describes where the new reference carries its batch dimension after indexing or slicing.
+        let source_value = P::value(source);
+        let source_axis = P::batch_axis(source);
+        let source_type = source_value.r#type();
+        let outputs = output_indices
+            .into_iter()
+            .map(|output_index| {
+                let Some(view) = self.reference_view(output_index) else {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{name}` derives a reference view at output {output_index} but exposes no \
+                         view transform",
+                    ))
+                    .into());
+                };
+
+                // Symbol positions name instruction inputs; reapplication receives only their values, in symbol order.
+                let symbols = view
+                    .symbols()
+                    .into_iter()
+                    .map(|input_index| {
+                        inputs.get(input_index).map(|input| P::value(input).clone()).ok_or_else(|| {
+                            BatchingError::from(ProgramError::MalformedProgram(format!(
+                                "`{}` describes output {} through input {} but was applied to {} inputs",
+                                name,
+                                output_index,
+                                input_index,
+                                inputs.len(),
+                            )))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (view, output_axis) = view.batch(source_type.as_ref(), source_axis)?;
+                let value =
+                    Self::reapply_reference_view(context.parent(), &view, source_value.clone(), symbols.as_slice())?;
+                P::batch(value, output_axis)
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+
+        Ok(outputs.into())
+    }
 }
 
 /// A [`ReferenceView`] view together with bindings for the values it depends on. [`ReferenceViewPath`]s compose these
@@ -748,153 +914,6 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Batches one reference-view operation of the family of `C` through the [`BatchableReferenceView`] contract: the
-/// shared [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare
-/// only [`View`](ReferenceAliasKind::View) aliases of one source input.
-///
-/// The rule reads the operation's [`effects`](Operation::effects) to find the single source input and the view outputs,
-/// requires every other input (the inputs named by the views' symbols) to be replicated, and then, for each view output
-/// in output order, moves the source's batch axis through the view with [`BatchableReferenceView::batch`] and binds the
-/// batched view over the packed source through [`ReferenceViewOperation::reapply_reference_view`] on the parent
-/// context, supplying the packed value of each input a symbol names. Each reapplication binds one operation on the
-/// parent, so an operation with several view outputs (e.g., a family that splits a register into two halves) is bound
-/// once per output, each time keeping the output the view denotes.
-///
-/// # Parameters
-///
-///   - `operation`: Member operation to batch, converted into the family operation `C::Operation` to reach the
-///     family's view contract.
-///   - `context`: Batching context whose parent the batched views are bound on.
-///   - `inputs`: Batch carriers of the operation's inputs.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::UnsupportedOperation`] when the operation derives no view, views more than one source
-/// input, has outputs other than its views, has observable effects or attached regions, or has a mapped non-source
-/// input (batching a view through a mapped symbol is not supported). Propagates errors from
-/// [`BatchableReferenceView::batch`] and the parent context's binding.
-pub fn batch_reference_view_operation<
-    O: Clone,
-    C: Context<Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<O>>,
-    P: BatchingPolicy<C>,
->(
-    operation: &O,
-    context: &BatchingContext<C, P>,
-    inputs: &[P::Batch],
-) -> Result<BatchedOutputs<C, P>, BatchingError> {
-    let operation = C::Operation::from(operation.clone());
-    let name = operation.name();
-    let effects = operation.effects();
-    let not_a_view = |output_index: usize| BatchingError::UnsupportedOperation {
-        message: format!(
-            "`{name}` has reference output {output_index} that is not a view, so it cannot batch as a view operation",
-        ),
-    };
-    if let Some(output_index) = effects.allocation_output_indices().next() {
-        return Err(not_a_view(output_index));
-    }
-    let mut source_index = None;
-    let mut output_indices = Vec::with_capacity(effects.reference_aliases().len());
-    for alias in effects.reference_aliases() {
-        let (output_index, input_index) = (alias.output_index(), alias.input_index());
-        if alias.kind() != ReferenceAliasKind::View {
-            return Err(not_a_view(output_index));
-        }
-        match source_index {
-            None => source_index = Some(input_index),
-            Some(source_index) if source_index == input_index => {}
-            Some(source_index) => {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "`{name}` views inputs {source_index} and {input_index}, but a view operation views one source",
-                    ),
-                });
-            }
-        }
-        output_indices.push(output_index);
-    }
-    let Some(source_index) = source_index else {
-        return Err(BatchingError::UnsupportedOperation { message: format!("`{name}` derives no reference view") });
-    };
-    // Replaying views preserves only the views themselves. Reject effects and attached computations whose
-    // execution would otherwise be silently dropped by this rule.
-    if effects.summary().has_observable_effects_when_unused() || !operation.region_slots().is_empty() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{name}` has effects or attached regions that cannot be preserved by batching only its reference views",
-            ),
-        });
-    }
-    output_indices.sort_unstable();
-    if output_indices.iter().enumerate().any(|(position, output_index)| position != *output_index) {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!("`{name}` has outputs other than its reference views"),
-        });
-    }
-    let Some(source) = inputs.get(source_index) else {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{name}` views input {source_index} but was applied to {} inputs",
-            inputs.len(),
-        ))
-        .into());
-    };
-    if let Some((input_index, _)) = inputs
-        .iter()
-        .enumerate()
-        .find(|(index, input)| *index != source_index && !P::batch_axis(input).is_replicated())
-    {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{name}` requires input {input_index} to be replicated; batching a reference view through a mapped \
-                 index input is not supported",
-            ),
-        });
-    }
-
-    // Alias positions alone do not reveal a trailing non-reference output. Check the complete per-item signature
-    // before emitting any views so the reconstructed outputs preserve the operation's full boundary.
-    let input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
-    let output_types = operation.infer_output_types(&input_types, &[])?;
-    if output_types.len() != output_indices.len() || output_types.iter().any(|r#type| !r#type.is_reference()) {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!("`{name}` has outputs other than its reference views"),
-        });
-    }
-    let source_value = P::value(source);
-    let source_axis = P::batch_axis(source);
-    let source_type = source_value.r#type();
-    let outputs = output_indices
-        .into_iter()
-        .map(|output_index| {
-            let Some(view) = operation.reference_view(output_index) else {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{name}` derives a reference view at output {output_index} but exposes no view transform",
-                ))
-                .into());
-            };
-            let symbols = view
-                .symbols()
-                .into_iter()
-                .map(|input_index| {
-                    inputs.get(input_index).map(|input| P::value(input).clone()).ok_or_else(|| {
-                        BatchingError::from(ProgramError::MalformedProgram(format!(
-                            "`{name}` describes output {output_index} through input {input_index} but was applied to \
-                             {} inputs",
-                            inputs.len(),
-                        )))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let (view, output_axis) = view.batch(source_type.as_ref(), source_axis)?;
-            let value = C::Operation::reapply_reference_view(context.parent(), &view, source_value.clone(), symbols.as_slice())?;
-            P::batch(value, output_axis)
-        })
-        .collect::<Result<Vec<_>, BatchingError>>()?;
-    Ok(outputs.into())
-}
-
 /// [`Region`] [`Transform`] marker for retained [`ReferenceViewAnalysis`] artifacts.
 struct ReferenceViewAnalysisTransform;
 
@@ -1273,6 +1292,120 @@ mod tests {
             ProgramError::from(error.clone()),
             ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(error))),
         );
+    }
+
+    #[test]
+    fn test_reference_view_operation_batch() {
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context =
+            BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()))
+            .reference_new()
+            .unwrap();
+
+        // A mapped source moves its batch axis through the view and binds the batched view on the parent: the
+        // leading batch axis shifts the indexed per-item axis to packed axis 1 and the output keeps batch axis 0.
+        let batch = ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap();
+        let outputs = ReferenceViewOperation::batch(
+            &TestOperation::from(ReferenceIndexOperation::new(0, 2)),
+            &context,
+            &[batch.clone()],
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![2.0f32, 5.0]))));
+
+        // A replicated source is viewed unchanged and stays replicated.
+        let replicated = ArrayIrBatch::replicated(reference);
+        let outputs = ReferenceViewOperation::batch(
+            &TestOperation::from(ReferenceIndexOperation::new(0, 1)),
+            &context,
+            &[replicated],
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![3.0f32, 4.0, 5.0]))));
+
+        // Only view operations batch through the rule: an operation without a view alias and one with an allocation
+        // output are rejected by name, and so is a mapped input other than the viewed source.
+        assert_eq!(
+            ReferenceViewOperation::batch(
+                &TestOperation::from(ReferenceReadOperation::<ArrayType, ArrayIrType>::new()),
+                &context,
+                &[batch.clone()],
+            )
+            .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`reference_read` derives no reference view".to_string(),
+            }),
+        );
+        assert_eq!(
+            ReferenceViewOperation::batch(
+                &TestOperation::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
+                &context,
+                &[batch.clone()],
+            )
+            .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`reference_new` has reference output 0 that is not a view, so it cannot batch as a view \
+                          operation"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            ReferenceViewOperation::batch(
+                &TestOperation::from(ReferenceIndexOperation::new(0, 1)),
+                &context,
+                &[batch.clone(), batch]
+            )
+            .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`reference_index` requires input 1 to be replicated; batching a reference view through a \
+                          mapped index input is not supported"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_view_operation_batch_rejects_additional_behavior() {
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let parent = TracingContext::<TestValue, SymbolicViewOperation>::new();
+        let extent = parent.lift(extent).unwrap();
+        let input = ArrayIrBatch::replicated(parent.input(reference_type([2])));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+
+        // Replaying only the view would discard either the extra value result or the source read effect.
+        assert_eq!(
+            ReferenceViewOperation::batch(
+                &SymbolicViewOperation::AdditionalBehavior { reads: false },
+                &context,
+                &[input.clone()]
+            )
+            .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`additional_behavior` has outputs other than its reference views".to_string(),
+            }),
+        );
+        assert_eq!(
+            ReferenceViewOperation::batch(&SymbolicViewOperation::AdditionalBehavior { reads: true }, &context, &[input]).err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`additional_behavior` has effects or attached regions that cannot be preserved by batching only its reference views".to_string(),
+            }),
+        );
+        assert_eq!(parent.builder().borrow().instructions().len(), 0);
     }
 
     #[test]
@@ -1954,106 +2087,5 @@ mod tests {
 
         // The source program keeps its own retained view analysis, because only the re-sealed copy was rebased.
         assert!(Arc::ptr_eq(&first.entry_region_ref().reference_view_analysis(0).unwrap(), &retained));
-    }
-    #[test]
-    fn test_batch_reference_view_operation() {
-        let extent = TestValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
-        );
-        let context =
-            BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
-        let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()))
-            .reference_new()
-            .unwrap();
-
-        // A mapped source moves its batch axis through the view and binds the batched view on the parent: the
-        // leading batch axis shifts the indexed per-item axis to packed axis 1 and the output keeps batch axis 0.
-        let batch = ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap();
-        let outputs = batch_reference_view_operation(&ReferenceIndexOperation::new(0, 2), &context, &[batch.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![2.0f32, 5.0]))));
-
-        // A replicated source is viewed unchanged and stays replicated.
-        let replicated = ArrayIrBatch::replicated(reference);
-        let outputs = batch_reference_view_operation(&ReferenceIndexOperation::new(0, 1), &context, &[replicated])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![3.0f32, 4.0, 5.0]))));
-
-        // Only view operations batch through the rule: an operation without a view alias and one with an allocation
-        // output are rejected by name, and so is a mapped input other than the viewed source.
-        assert_eq!(
-            batch_reference_view_operation(
-                &ReferenceReadOperation::<ArrayType, ArrayIrType>::new(),
-                &context,
-                &[batch.clone()],
-            )
-            .err(),
-            Some(BatchingError::UnsupportedOperation {
-                message: "`reference_read` derives no reference view".to_string(),
-            }),
-        );
-        assert_eq!(
-            batch_reference_view_operation(
-                &ReferenceNewOperation::<ArrayType, ArrayIrType>::new(),
-                &context,
-                &[batch.clone()],
-            )
-            .err(),
-            Some(BatchingError::UnsupportedOperation {
-                message: "`reference_new` has reference output 0 that is not a view, so it cannot batch as a view \
-                          operation"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
-            batch_reference_view_operation(&ReferenceIndexOperation::new(0, 1), &context, &[batch.clone(), batch])
-                .err(),
-            Some(BatchingError::UnsupportedOperation {
-                message: "`reference_index` requires input 1 to be replicated; batching a reference view through a \
-                          mapped index input is not supported"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_batch_reference_view_operation_rejects_additional_behavior() {
-        let extent = TestValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
-        );
-        let parent = TracingContext::<TestValue, SymbolicViewOperation>::new();
-        let extent = parent.lift(extent).unwrap();
-        let input = ArrayIrBatch::replicated(parent.input(reference_type([2])));
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-
-        // Replaying only the view would discard either the extra value result or the source read effect.
-        assert_eq!(
-            batch_reference_view_operation(
-                &SymbolicViewOperation::AdditionalBehavior { reads: false },
-                &context,
-                &[input.clone()]
-            )
-            .err(),
-            Some(BatchingError::UnsupportedOperation {
-                message: "`additional_behavior` has outputs other than its reference views".to_string(),
-            }),
-        );
-        assert_eq!(
-            batch_reference_view_operation(&SymbolicViewOperation::AdditionalBehavior { reads: true }, &context, &[input]).err(),
-            Some(BatchingError::UnsupportedOperation {
-                message: "`additional_behavior` has effects or attached regions that cannot be preserved by batching only its reference views".to_string(),
-            }),
-        );
-        assert_eq!(parent.builder().borrow().instructions().len(), 0);
     }
 }
