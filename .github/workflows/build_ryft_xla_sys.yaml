@@ -73,6 +73,15 @@ jobs:
           ref: ${{ github.ref }}
           path: "ryft"
 
+      # `rules_python` creates virtual environments with DLL symlink targets longer than `MAX_PATH`.
+      # Set this before launching Python or Bazel. Windows caches the setting per process.
+      - name: Enable Windows Long Paths
+        if: ${{ matrix.config.os == 'windows' }}
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -Value 1 -Type DWord -ErrorAction Stop
+
       - name: Install Chocolatey, Git, Visual Studio 2019 Build Tools, and LLVM 18
         if: ${{ matrix.config.os == 'windows' }}
         run: |
@@ -129,6 +138,24 @@ jobs:
         if: ${{ matrix.config.os == 'windows' }}
         with:
           python-version: "3.11.9"
+
+      # Defensive check to rule out this as the cause of failure of subsequent steps.
+      - name: Check Windows Long-Path Symlinks
+        if: ${{ matrix.config.os == 'windows' }}
+        shell: python {0}
+        run: |
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          with TemporaryDirectory() as directory:
+              root = Path(directory)
+              source = root.joinpath(*(["long_path_" * 7] * 4), "vcruntime140.dll")
+              assert len(str(source)) > 260
+              source.parent.mkdir(parents=True)
+              source.write_bytes(b"long-path symlink check")
+              link = root / "vcruntime140.dll"
+              link.symlink_to(source)
+              assert link.read_bytes() == source.read_bytes()
+          print("Windows long-path file creation and symlinks work")
 
       - name: Install Bazel
         uses: bazel-contrib/setup-bazel@0.19.0

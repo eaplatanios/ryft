@@ -170,6 +170,124 @@ pub fn erf<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
         })
 }
 
+/// Name of the attribute storing the number of entries selected by [`TopKOperation`].
+pub const TOP_K_COUNT_ATTRIBUTE: &str = "k";
+
+/// Name of the stable ordering attribute of [`TopKOperation`].
+pub const TOP_K_IS_STABLE_ATTRIBUTE: &str = "is_stable";
+
+/// CHLO [`Operation`] that selects the largest [`TopKOperation::k`] entries along the last dimension of an input
+/// tensor, returning their values in descending order and their zero-based `i32` indices along that dimension.
+/// Both results preserve the input shape except that the last dimension has size `k`, which must not exceed the
+/// corresponding input dimension. The values retain the input element type. When [`TopKOperation::is_stable`] is
+/// true (the default), equal values retain their input order; otherwise, their relative order is unspecified.
+///
+/// # Example
+///
+/// The following is an example of a [`TopKOperation`] represented using its [`Display`](std::fmt::Display) rendering:
+///
+/// ```mlir
+/// // %operand: [2.0, 9.0, 9.0, 4.0]
+/// %values, %indices = chlo.top_k(%operand, k = 3) : tensor<4xf32> -> (tensor<3xf32>, tensor<3xi32>)
+/// // %values: [9.0, 9.0, 4.0]
+/// // %indices: [1, 2, 3]
+/// ```
+///
+/// Refer to the [official CHLO specification](https://openxla.org/stablehlo/generated/chlo#chlotop_k_chlotopkop)
+/// for more information.
+pub trait TopKOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the number of entries selected along the last dimension.
+    fn k(&self) -> Result<i64, Error> {
+        Ok(self.integer_attribute(TOP_K_COUNT_ATTRIBUTE)?.signed_value())
+    }
+
+    /// Returns whether ties retain their input order, defaulting to true when the attribute is absent.
+    fn is_stable(&self) -> Result<bool, Error> {
+        if self.has_attribute(TOP_K_IS_STABLE_ATTRIBUTE) {
+            Ok(self.boolean_attribute(TOP_K_IS_STABLE_ATTRIBUTE)?.value())
+        } else {
+            Ok(true)
+        }
+    }
+}
+
+mlir_op!(TopK);
+mlir_op_trait!(TopK, ZeroRegions);
+mlir_op_trait!(TopK, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`TopKOperation`] at the specified [`Location`], inferring the value and index
+/// tensor types from `input` and `k`. Refer to the documentation of [`TopKOperation`] for more information on the
+/// operation semantics.
+///
+/// # Parameters
+///
+///   - `input`: Tensor whose last dimension is searched for the largest entries.
+///   - `k`: Number of entries to select, at most the size of the last input dimension.
+///   - `is_stable`: Whether equal values retain their input order.
+///   - `location`: Source location to attach to the operation.
+pub fn top_k<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    input: V,
+    k: usize,
+    is_stable: bool,
+    location: L,
+) -> Result<DetachedTopKOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::chlo()?)?;
+    let k = i64::try_from(k).map_err(|_| Error::invalid_argument("`k` exceeds the signed 64-bit range"))?;
+    OperationBuilder::new("chlo.top_k", location)
+        .add_operand(input)
+        .add_attribute(TOP_K_COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), k))
+        .add_attribute(TOP_K_IS_STABLE_ATTRIBUTE, context.boolean_attribute(is_stable))
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `chlo::top_k`"))
+        })
+}
+
+/// CHLO [`Operation`] that multiplies two integer tensors element-wise and returns the most significant `N` bits
+/// of each full `2N`-bit product, where `N` is the operand element bit width. Both operands and the result have
+/// matching shapes and integer element types.
+///
+/// # Example
+///
+/// The following is an example of a [`MulhiOperation`] represented using its [`Display`](std::fmt::Display) rendering:
+///
+/// ```mlir
+/// // %lhs: [65536, 131072, 7]
+/// // %rhs: [65536, 65536, 9]
+/// %result = chlo.mulhi %lhs, %rhs : tensor<3xi32>, tensor<3xi32> -> tensor<3xi32>
+/// // %result: [1, 2, 0]
+/// ```
+///
+/// Refer to the [official CHLO specification](https://openxla.org/stablehlo/generated/chlo#chlomulhi_chlomulhiop)
+/// for more information.
+pub trait MulhiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
+
+mlir_op!(Mulhi);
+mlir_op_trait!(Mulhi, OneResult);
+mlir_op_trait!(Mulhi, ZeroRegions);
+mlir_op_trait!(Mulhi, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`MulhiOperation`] at the specified [`Location`], using the left operand's tensor
+/// type for the result. Refer to the documentation of [`MulhiOperation`] for more information on the operation
+/// semantics.
+pub fn mulhi<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    lhs: V,
+    rhs: V,
+    location: L,
+) -> Result<DetachedMulhiOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::chlo()?)?;
+    OperationBuilder::new("chlo.mulhi", location)
+        .add_result(lhs.r#type()?)
+        .add_operand(lhs)
+        .add_operand(rhs)
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `chlo::mulhi`"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -361,5 +479,59 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_top_k() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let input_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(2), Size::Static(8)], None, location)
+            .unwrap();
+        let block = context.block(&[(input_type, location)]);
+        for is_stable in [true, false] {
+            let operation = top_k(block.argument(0).unwrap(), 3, is_stable, location).unwrap();
+            assert!(operation.verify());
+            assert_eq!(operation.k(), Ok(3));
+            assert_eq!(operation.is_stable(), Ok(is_stable));
+            assert_eq!(operation.result_count(), 2);
+            assert_eq!(operation.result(0).unwrap().r#type().unwrap().to_string(), "tensor<2x3xf32>");
+            assert_eq!(operation.result(1).unwrap().r#type().unwrap().to_string(), "tensor<2x3xi32>");
+        }
+        assert!(top_k(block.argument(0).unwrap(), 9, true, location).is_err());
+        let mut operation = top_k(block.argument(0).unwrap(), 3, false, location).unwrap();
+        assert!(operation.remove_attribute(TOP_K_IS_STABLE_ATTRIBUTE));
+        assert_eq!(operation.is_stable(), Ok(true));
+        assert!(operation.verify());
+    }
+
+    #[test]
+    fn test_mulhi() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let input_type =
+            context.tensor_type(context.signless_integer_type(32), &[Size::Static(4)], None, location).unwrap();
+        let mut block = context.block(&[(input_type, location), (input_type, location)]);
+        let operation = mulhi(block.argument(0).unwrap(), block.argument(1).unwrap(), location).unwrap();
+        assert!(operation.verify());
+        assert_eq!(operation.operand_count(), 2);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), input_type.as_ref());
+        let operation = block.append_operation(operation).unwrap();
+        block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+        let function = func::func(
+            "test_mulhi",
+            func::FuncAttributes {
+                arguments: vec![input_type.into(), input_type.into()],
+                results: vec![input_type.into()],
+                ..Default::default()
+            },
+            block.try_into().unwrap(),
+            location,
+        )
+        .unwrap();
+        assert!(function.verify());
+        let parsed = context.parse_operation_from_bytes(function.bytecode(), "mulhi.mlir").unwrap();
+        assert!(parsed.verify());
+        assert_eq!(parsed.to_string(), function.to_string());
     }
 }
