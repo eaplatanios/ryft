@@ -15,6 +15,121 @@ use crate::operations::{
 use crate::programs::{OperationProjection, ProgramError, Typed, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
+/// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
+/// reconstructed inside a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region)s.
+/// A [`Shape`] describes an array _type_: each axis is either a static extent or a [`DimensionVariable`] identity.
+/// What a staged region needs is one step more concrete (i.e., where the runtime extent of each axis lives) and the
+/// only values in scope there are the region's residual inputs. [`ExactShape`] is that plan, containing one
+/// [`ExactShapeDimension`] per axis, referring to static extents directly and to dynamic extents by residual slot
+/// index. It is produced by [`LinearResiduals::retain_shape`] next to the residual list that gives those indices
+/// meaning during rule staging or by [`Self::for_residual_zero`] when planning disconnected-cotangent zeros, and
+/// consumed inside regions after the primal trace is out of reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactShape(Vec<ExactShapeDimension>);
+
+impl ExactShape {
+    /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
+    /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
+    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by
+    /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) and the dynamic-zero constructors: when a pullback input
+    /// receives no cotangent, its zero must still be materialized with the primal input's exact runtime extents.
+    /// Residual slots are assigned by first axis occurrence, and repeated uses of one dimension identity reuse the same
+    /// slot, preserving equality between axes without retaining duplicate scalar values. The returned list contains one
+    /// `(axis, variable)` entry per distinct dynamic identity, in slot order, telling the caller which source axis to
+    /// read (e.g., with [`DimensionSizeOperation`]) to obtain each residual value.
+    pub fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
+        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse
+        // that slot, preserving equality between axes without retaining duplicate scalar values.
+        let mut first_axes = Vec::new();
+        let dimensions = shape
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| match dimension {
+                Dimension::Static(extent) => ExactShapeDimension::Static(*extent),
+                Dimension::Dynamic(variable) => {
+                    let residual =
+                        first_axes.iter().position(|(_, candidate)| candidate == variable).unwrap_or_else(|| {
+                            let residual = first_axes.len();
+                            first_axes.push((axis, variable.clone()));
+                            residual
+                        });
+                    ExactShapeDimension::Residual(residual)
+                }
+            })
+            .collect();
+        (Self(dimensions), first_axes)
+    }
+
+    /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
+    /// body). Static axes stage a [`DimensionValue`] [`ConstantOperation`], while dynamic axes clone the residual
+    /// value their slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by
+    /// operations that take one dimension operand per output axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] in which static extents are staged as dimension constants.
+    ///   - `residuals`: Residual values owned by `context`, indexed by this plan's residual slots (i.e., the region's
+    ///     view of the [`LinearResiduals`] list this shape was built against).
+    pub fn dimensions<C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>>(
+        &self,
+        context: &C,
+        residuals: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        self.0
+            .iter()
+            .map(|dimension| match dimension {
+                ExactShapeDimension::Static(extent) => Ok(context
+                    .bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?
+                    .remove(0)),
+                ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
+            })
+            .collect()
+    }
+
+    /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order. Constructors
+    /// such as the dynamic zero consume one dimension operand per _dynamic_ axis, in axis order, while this plan stores
+    /// deduplicated residual slots. This method expands the plan back into that operand convention: static axes
+    /// contribute nothing, and repeated identities intentionally produce repeated operands referring to the one
+    /// shared residual value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `residuals`: Residual values indexed by this plan's residual slots.
+    pub fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
+        // Mixed array constructors consume one operand per dynamic axis. Expand deduplicated residual slots back into
+        // axis order here, so repeated identities intentionally produce repeated operands.
+        self.0
+            .iter()
+            .filter_map(|dimension| match dimension {
+                ExactShapeDimension::Static(_) => None,
+                ExactShapeDimension::Residual(index) => Some(residuals[*index].clone()),
+            })
+            .collect()
+    }
+
+    /// Returns this exact shape transposed by `permutation`, so that output axis `i` is copied from source axis
+    /// `permutation[i]`. Rules whose transpose sees a permuted view of a retained shape (e.g., a reshape with a
+    /// `dimensions` permutation) use this to derive that view without retaining any additional residuals. Residual
+    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
+    #[inline]
+    pub fn transposed(&self, permutation: &Permutation) -> Self {
+        Self(permutation.iter().map(|axis| self.0[*axis]).collect())
+    }
+}
+
+/// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
+/// the point of view of a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region).
+/// This is the [`ExactShape`] counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExactShapeDimension {
+    /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
+    Static(usize),
+
+    /// Index of the ordinary Single Static Assignment (SSA) residual that carries this dynamic extent.
+    Residual(usize),
+}
+
 /// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
 /// gather, or a shape-changing collective) while it stages a [`LinearCallOperation`](crate::LinearCallOperation).
 ///
@@ -162,121 +277,6 @@ impl<V: Value<Type = ArrayIrType>> Default for LinearResiduals<V> {
     }
 }
 
-/// Exact runtime [`Shape`] expressed in the coordinate system of a [`LinearResiduals`] list, so that it can be
-/// reconstructed inside a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region)s.
-/// A [`Shape`] describes an array _type_: each axis is either a static extent or a [`DimensionVariable`] identity.
-/// What a staged region needs is one step more concrete (i.e., where the runtime extent of each axis lives) and the
-/// only values in scope there are the region's residual inputs. [`ExactShape`] is that plan, containing one
-/// [`ExactShapeDimension`] per axis, referring to static extents directly and to dynamic extents by residual slot
-/// index. It is produced by [`LinearResiduals::retain_shape`] next to the residual list that gives those indices
-/// meaning during rule staging or by [`Self::for_residual_zero`] when planning disconnected-cotangent zeros, and
-/// consumed inside regions after the primal trace is out of reach.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExactShape(Vec<ExactShapeDimension>);
-
-impl ExactShape {
-    /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
-    /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
-    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by
-    /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) and the dynamic-zero constructors: when a pullback input
-    /// receives no cotangent, its zero must still be materialized with the primal input's exact runtime extents.
-    /// Residual slots are assigned by first axis occurrence, and repeated uses of one dimension identity reuse the same
-    /// slot, preserving equality between axes without retaining duplicate scalar values. The returned list contains one
-    /// `(axis, variable)` entry per distinct dynamic identity, in slot order, telling the caller which source axis to
-    /// read (e.g., with [`DimensionSizeOperation`]) to obtain each residual value.
-    pub fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
-        // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse
-        // that slot, preserving equality between axes without retaining duplicate scalar values.
-        let mut first_axes = Vec::new();
-        let dimensions = shape
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(axis, dimension)| match dimension {
-                Dimension::Static(extent) => ExactShapeDimension::Static(*extent),
-                Dimension::Dynamic(variable) => {
-                    let residual =
-                        first_axes.iter().position(|(_, candidate)| candidate == variable).unwrap_or_else(|| {
-                            let residual = first_axes.len();
-                            first_axes.push((axis, variable.clone()));
-                            residual
-                        });
-                    ExactShapeDimension::Residual(residual)
-                }
-            })
-            .collect();
-        (Self(dimensions), first_axes)
-    }
-
-    /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
-    /// body). Static axes stage a [`DimensionValue`] [`ConstantOperation`], while dynamic axes clone the residual
-    /// value their slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by
-    /// operations that take one dimension operand per output axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: [`Context`] in which static extents are staged as dimension constants.
-    ///   - `residuals`: Residual values owned by `context`, indexed by this plan's residual slots (i.e., the region's
-    ///     view of the [`LinearResiduals`] list this shape was built against).
-    pub fn dimensions<C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>>(
-        &self,
-        context: &C,
-        residuals: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        self.0
-            .iter()
-            .map(|dimension| match dimension {
-                ExactShapeDimension::Static(extent) => Ok(context
-                    .bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?
-                    .remove(0)),
-                ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
-            })
-            .collect()
-    }
-
-    /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order. Constructors
-    /// such as the dynamic zero consume one dimension operand per _dynamic_ axis, in axis order, while this plan stores
-    /// deduplicated residual slots. This method expands the plan back into that operand convention: static axes
-    /// contribute nothing, and repeated identities intentionally produce repeated operands referring to the one
-    /// shared residual value.
-    ///
-    /// # Parameters
-    ///
-    ///   - `residuals`: Residual values indexed by this plan's residual slots.
-    pub fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
-        // Mixed array constructors consume one operand per dynamic axis. Expand deduplicated residual slots back into
-        // axis order here, so repeated identities intentionally produce repeated operands.
-        self.0
-            .iter()
-            .filter_map(|dimension| match dimension {
-                ExactShapeDimension::Static(_) => None,
-                ExactShapeDimension::Residual(index) => Some(residuals[*index].clone()),
-            })
-            .collect()
-    }
-
-    /// Returns this exact shape transposed by `permutation`, so that output axis `i` is copied from source axis
-    /// `permutation[i]`. Rules whose transpose sees a permuted view of a retained shape (e.g., a reshape with a
-    /// `dimensions` permutation) use this to derive that view without retaining any additional residuals. Residual
-    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
-    #[inline]
-    pub fn transposed(&self, permutation: &Permutation) -> Self {
-        Self(permutation.iter().map(|axis| self.0[*axis]).collect())
-    }
-}
-
-/// One dimension of an [`ExactShape`] that describes where the runtime extent of the corresponding axis lives, from
-/// the point of view of a [`LinearCallOperation`](crate::LinearCallOperation)'s attached [`Region`](crate::Region).
-/// This is the [`ExactShape`] counterpart of [`Dimension`], which is the per-axis entry of a [`Shape`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ExactShapeDimension {
-    /// Compile-time extent that can be reconstructed as a dimension constant in either attached region.
-    Static(usize),
-
-    /// Index of the ordinary Single Static Assignment (SSA) residual that carries this dynamic extent.
-    Residual(usize),
-}
-
 impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayExtentBatchingPolicy<C>>
     CotangentBatchingPolicy<C> for ArrayBatchingPolicy<P>
 {
@@ -376,6 +376,34 @@ mod tests {
     use crate::programs::{MaybeZero, TypeError};
 
     use super::*;
+
+    #[test]
+    fn test_exact_shape_dimensions() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(n.variable().clone())]);
+        let (plan, _) = ExactShape::for_residual_zero(&shape);
+
+        // Static axes stage dimension constants, while dynamic axes reuse the residual values without staging
+        // anything new.
+        let context = TestContext::new();
+        let residual = context.input(n.into());
+        let dimensions = plan.dimensions(&context, std::slice::from_ref(&residual)).unwrap();
+        let [static_dimension, dynamic_dimension] = dimensions.as_slice() else {
+            panic!("expected one dimension value per axis");
+        };
+        assert!(matches!(
+            static_dimension.r#type().as_ref(),
+            ArrayIrType::Dimension(r#type) if r#type.extent() == Some(2),
+        ));
+        assert_eq!(dynamic_dimension.atom_id().unwrap(), residual.atom_id().unwrap());
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged dimension constant");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+    }
 
     #[test]
     fn test_linear_residuals() {
@@ -517,34 +545,6 @@ mod tests {
                 ExactShapeDimension::Residual(0),
             ]),
         );
-    }
-
-    #[test]
-    fn test_exact_shape_dimensions() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
-        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(n.variable().clone())]);
-        let (plan, _) = ExactShape::for_residual_zero(&shape);
-
-        // Static axes stage dimension constants, while dynamic axes reuse the residual values without staging
-        // anything new.
-        let context = TestContext::new();
-        let residual = context.input(n.into());
-        let dimensions = plan.dimensions(&context, std::slice::from_ref(&residual)).unwrap();
-        let [static_dimension, dynamic_dimension] = dimensions.as_slice() else {
-            panic!("expected one dimension value per axis");
-        };
-        assert!(matches!(
-            static_dimension.r#type().as_ref(),
-            ArrayIrType::Dimension(r#type) if r#type.extent() == Some(2),
-        ));
-        assert_eq!(dynamic_dimension.atom_id().unwrap(), residual.atom_id().unwrap());
-        let builder = context.builder().borrow();
-        let [instruction] = builder.instructions() else {
-            panic!("expected exactly one staged dimension constant");
-        };
-        assert!(matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
     }
 
     #[test]
