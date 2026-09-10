@@ -9,10 +9,9 @@ diff --git a/jaxlib/mosaic/dialect/gpu/BUILD b/jaxlib/mosaic/dialect/gpu/BUILD
      srcs = ["mosaic_gpu.td"],
      includes = ["."],
      deps = [
-@@ -215,6 +216,7 @@
- # Alwayslink target, used when exporting the C API from a shared library.
+@@ -194,5 +195,6 @@
  cc_library(
-     name = "gpu_dialect_capi_objects",
+     name = "gpu_dialect_capi",
 +    visibility = ["//visibility:public"],
      srcs = DIALECT_CAPI_SOURCES,
      hdrs = DIALECT_CAPI_HEADERS,
@@ -28,10 +27,10 @@ diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
      deps = [
          ":custom_call",
          ":runtime",
-@@ -239,6 +240,7 @@
- # Alwayslink target, used when exporting the C API from a shared library.
+@@ -219,6 +220,7 @@
+ # from Python.
  cc_library(
-     name = "mlir_capi_objects",
+     name = "mlir_capi",
 +    visibility = ["//visibility:public"],
      srcs = CAPI_SOURCES,
      hdrs = CAPI_HEADERS,

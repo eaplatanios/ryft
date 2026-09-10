@@ -92,8 +92,7 @@ unsafe extern "C" {
 
     pub fn mlirMosaicGpuIsATileTransformAttr(attribute: MlirAttribute) -> bool;
     pub fn mlirMosaicGpuTileTransformAttrGetTypeID() -> MlirTypeID;
-    pub fn mlirMosaicGpuTileTransformAttrGet(context: MlirContext, tiling: *mut i32, tiling_size: i32)
-    -> MlirAttribute;
+    pub fn mlirMosaicGpuTileTransformAttrGet(context: MlirContext, tiling: MlirAttribute) -> MlirAttribute;
     pub fn mlirMosaicGpuTileTransformAttrGetTiling(attribute: MlirAttribute) -> MlirAttribute;
 
     pub fn mlirMosaicGpuIsASwizzleTransformAttr(attribute: MlirAttribute) -> bool;

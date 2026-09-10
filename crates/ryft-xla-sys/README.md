@@ -61,19 +61,19 @@ potentially different build time and runtime requirements:
   `PJRT_PLUGIN_CUDA_13_LIB` is not set. Note that this plugin has various runtime dependencies that are not included
   in the shared library provided by this feature, including but not limited to: `cublas`, `cudart`, `cudnn`, `cufft`,
   `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nccl`, `nvrtc`, and `nvshmem`. For Ubuntu
-  24.04 on x86-64, you can install these dependencies using the following commands:
+  24.04 on x86-64, you can install the CUDA 13.2 dependencies used by the pinned build with these commands:
 
   ```bash
   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
   sudo dpkg -i cuda-keyring_1.1-1_all.deb
   sudo apt update -y
-  sudo apt install cuda-toolkit-13-0 \
-    libcublas-13-0 \
-    cuda-cudart-13-0 \
-    cuda-nvrtc-13-0 \
-    libcufft-13-0 \
+  sudo apt install cuda-toolkit-13-2 \
+    libcublas-13-2 \
+    cuda-cudart-13-2 \
+    cuda-nvrtc-13-2 \
+    libcufft-13-2 \
     libnccl2 \
-    libnvjitlink-13-0 \
+    libnvjitlink-13-2 \
     libcudnn9-cuda-13 \
     libcudnn9-dev-cuda-13
   ```
@@ -209,6 +209,12 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
     - Update `XLA_COMMIT` and `XLA_SHA256` in `WORKSPACE`.
     - Update any `build.rs` references that still point to the old commit.
     - Update `JAX_COMMIT` and `JAX_SHA256` only when required by the selected OpenXLA commit.
+    - Align `.bazelversion` and dependency initialization with the selected OpenXLA sources. Keep Bazel sandboxing
+      enabled as unsandboxed actions can pick up undeclared, checked-in generated headers from third-party repositories
+      instead of the generated headers supplied by their declared dependencies.
+    - Keep MLIR C API dependencies in one target family as mixing normal targets with their `Objects` variants
+      introduces duplicate definitions. Cargo links the merged archive with `+whole-archive` to retain upstream
+      registration-only objects, including the PJRT CPU compiler.
 2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
     - Make sure your OpenXLA upgrade changes are committed and pushed to a branch before triggering the workflow.
     - Trigger the GitHub workflow that builds `ryft-xla-sys` on the branch that contains your changes:

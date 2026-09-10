@@ -230,7 +230,7 @@ jobs:
           print(f"{sys.argv[1]} retains the `mosaic_gpu_v2` registration")
           PY
           LIBRARY="${{ steps.build_pjrt_plugin.outputs.library }}"
-          EXPORTED=$(nm -D --defined-only "$LIBRARY" | awk '{print $NF}' | sort -u)
+          EXPORTED=$(nm -D --defined-only "$LIBRARY" | awk '{sub(/@.*/, "", $NF); print $NF}' | sort -u)
           test "$EXPORTED" = "GetPjrtApi" || { echo "unexpected exported symbols: $EXPORTED"; exit 1; }
 
       - name: Create PJRT Plugin Archive

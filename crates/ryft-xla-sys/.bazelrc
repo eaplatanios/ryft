@@ -9,7 +9,6 @@ common --color=yes
 common --verbose_failures=true
 
 build -c opt
-build --spawn_strategy=local
 build --repo_env USE_HERMETIC_CC_TOOLCHAIN=1
 build --repo_env=HERMETIC_PYTHON_VERSION=3.11
 build --output_filter=DONT_MATCH_ANYTHING

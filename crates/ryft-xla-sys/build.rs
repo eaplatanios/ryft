@@ -339,8 +339,9 @@ impl BuildConfiguration {
         let library_directory = ryft_xla_sys_directory.join("lib");
         let library_directory = library_directory.canonicalize().unwrap_or(library_directory);
 
-        // Configure static linking for the native library.
-        println!("cargo::rustc-link-lib=static=ryft-xla-sys");
+        // The merged archive contains registration-only objects from upstream `alwayslink` libraries.
+        // Preserve their initializers when linking outside Bazel, including the PJRT CPU compiler registration.
+        println!("cargo::rustc-link-lib=static:+whole-archive=ryft-xla-sys");
         match &self.operating_system {
             OperatingSystem::Linux => {
                 println!("cargo::rustc-link-lib=stdc++");
@@ -479,8 +480,12 @@ impl BuildConfiguration {
     /// to the path of the resulting shared library such that it can be loaded by `ryft-pjrt`.
     fn configure_pjrt_plugin(&self, device: Device) {
         let build_configuration = Self { device, ..*self };
-        let plugin_directory = build_configuration.artifact_directory(Artifact::PjrtPlugin).unwrap();
-        let plugin_path = plugin_directory.join(build_configuration.pjrt_plugin_library_file_name());
+        let plugin_path = build_configuration.artifact_directory(Artifact::PjrtPlugin).unwrap();
+        let plugin_path = if plugin_path.is_file() {
+            plugin_path
+        } else {
+            plugin_path.join(build_configuration.pjrt_plugin_library_file_name())
+        };
         println!(
             "cargo:rustc-env=RYFT_PJRT_PLUGIN_{}={}",
             device.to_string().to_uppercase().replace("-", "_"),
