@@ -915,8 +915,13 @@ macro_rules! mlir_binary_op {
 /// ```
 #[macro_export]
 macro_rules! mlir_pass {
-    ($rust_name:ident, $mlir_name:ident) => {
+    ($rust_name:ident, $mlir_name:ident $(, $documentation:literal)? $(,)?) => {
         paste::paste! {
+            #[doc = concat!(
+                "Creates a new [`Pass`](crate::Pass) for insertion into a ",
+                "[`PassManager`](crate::PassManager).",
+                $("\n\n", $documentation,)?
+            )]
             pub fn [<create_ $rust_name>]() -> Result<$crate::Pass, $crate::errors::Error> {
                 unsafe {
                     $crate::Pass::from_c_api(ryft_xla_sys::bindings::[<mlirCreate $mlir_name>]())
@@ -928,6 +933,7 @@ macro_rules! mlir_pass {
                 }
             }
 
+            #[doc = concat!("Registers this pass once. Repeated calls are safe.", $("\n\n", $documentation,)?)]
             pub fn [<register_ $rust_name>]() {
                 // Use `OnceLock` to ensure that the pass registration function is called at most once.
                 static INITIALIZED: OnceLock<()> = OnceLock::new();
@@ -940,4 +946,6 @@ macro_rules! mlir_pass {
     };
 }
 
-pub(crate) use crate::{mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_subtype_trait_impls};
+pub(crate) use crate::{
+    mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_pass, mlir_subtype_trait_impls,
+};
