@@ -3690,13 +3690,12 @@ pub(crate) mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::LinearizationTracer;
     use crate::differentiation::{Differentiate, differentiate_at};
-    use crate::macros::{check_count, check_gradient, check_types};
+    use crate::macros::{check_count, check_types};
     use crate::operations::{
-        AddOperation, ConditionOperation, Constant, CumulativeSum, Dot, DotDimensionNumbers, MulOperation, Reduce,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScanOperation, Sin,
-        ZeroOperation,
+        AddOperation, ConditionOperation, Constant, MulOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+        ReferenceWriteOperation, Sin, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -3708,7 +3707,7 @@ pub(crate) mod tests {
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
-        ProjectedProgramValue,
+        ProjectedProgramValue, TestArrayContext,
     };
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
@@ -4001,7 +4000,7 @@ pub(crate) mod tests {
     /// each cotangent reference locally from `destinations`, splicing the transposed program behind those allocations
     /// so the interpreted program owns the state it mutates, and freezing the allocations afterwards. Returns the
     /// transposed program's non-reference outputs followed by the final contents of every destination, in order.
-    fn run_transposed_with_destinations(
+    pub(crate) fn run_transposed_with_destinations(
         transposed: &ReferenceTestProgram,
         cotangents: Vec<Array>,
         destinations: Vec<Array>,
@@ -4808,29 +4807,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_transposed_program_omits_unrequested_matrix_gradient() {
-        let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let (_, pullback) = differentiate_at((left, right))
-            .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())))
+    fn test_pullback_transposed_program_omits_unrequested_gradient() {
+        let (_, pullback) = TestArrayContext::new()
+            .differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
+            .vjp(|(left, right)| Ok(left * right))
             .unwrap();
         let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
         let selected = pullback
             .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
             .unwrap();
-        // The caller's request reaches the production linearization and reverse sweep. The ignored right gradient
-        // removes one whole dot product, rather than merely discarding its result after replay.
-        assert_eq!(both.instructions().iter().filter(|instruction| instruction.operation().name() == "dot").count(), 2);
+        // Destination selection prunes the unrequested derivative computation before replay.
+        assert_eq!(both.instructions().iter().filter(|instruction| instruction.operation().name() == "mul").count(), 2);
         assert_eq!(
-            selected.instructions().iter().filter(|instruction| instruction.operation().name() == "dot").count(),
+            selected.instructions().iter().filter(|instruction| instruction.operation().name() == "mul").count(),
             1
         );
         assert_eq!(
             pullback.apply_with_destinations(
-                CotangentSeed::Value(Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0])),
+                CotangentSeed::Value(Array::scalar(4.0)),
                 (CotangentDestination::Return, CotangentDestination::Ignore),
             ),
-            Ok((Some(Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5])), None))
+            Ok((Some(Array::scalar(8.0)), None)),
         );
     }
 
@@ -5265,79 +5262,6 @@ pub(crate) mod tests {
         );
         assert_eq!(value, reference_test_scalar(9.0));
         assert_eq!(destination.freeze(), Ok(reference_test_scalar(6.0)));
-    }
-
-    #[test]
-    fn test_pullback_apply_with_destinations_scan_reference_carry() {
-        // `f(r, xs) = scan { add_update(r, x_i); y_i = read(r) }` accumulates the scanned elements into the carried
-        // reference and reports the running state: `y_i = r + Σ_{j ≤ i} x_j`. Its pure equivalent is the prefix sum of
-        // `xs` shifted by the initial state, whose gradient under unit output cotangents is `x̄_j = length - j` and
-        // `r̄ = length`.
-        let body = {
-            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            builder.add_input(ArrayType::scalar(DataType::I64).into());
-            let carry = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            let element = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
-                .unwrap();
-            let current =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![carry], None).unwrap()[0];
-            builder
-                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                    vec![carry, current],
-                    vec![Placeholder; 3],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let function = move |(reference, elements): (ReferenceTestTracer, ReferenceTestTracer)| {
-            let context = reference.context().clone();
-            let mut outputs = context.bind(
-                ScanOperation::<ReferenceTestValue>::new(1, 3),
-                vec![body.clone()],
-                &[reference, elements],
-            )?;
-            Ok(outputs.remove(1))
-        };
-        let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let (value, pullback) = differentiate_at((
-            ArrayIrValue::Reference(reference.clone()),
-            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])),
-        ))
-        .vjp(function)
-        .unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::vector(vec![2.0_f32, 4.0, 7.0])));
-        assert_eq!(reference.read(), Ok(Array::scalar(7.0_f32)));
-
-        // The destination starts at the zero post-state cotangent and ends holding the cotangent of the initial state.
-        let destination = ArrayReference::new(Array::scalar(0.0_f32));
-        assert_eq!(
-            pullback.apply_with_destinations(
-                CotangentSeed::Value(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))),
-                (
-                    CotangentDestination::Reference(ArrayIrValue::Reference(destination.clone())),
-                    CotangentDestination::Return,
-                ),
-            ),
-            Ok((None, Some(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 2.0, 1.0]))))),
-        );
-        assert_eq!(destination.read(), Ok(Array::scalar(3.0_f32)));
-
-        // The pure equivalent (the discharged program's dataflow, summed to a scalar) agrees with the reference
-        // pullback, and finite differences confirm its gradient.
-        assert_eq!(
-            differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
-                .gradient(|xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)))
-                .unwrap(),
-            Array::vector(vec![3.0, 2.0, 1.0]),
-        );
-        check_gradient!(
-            |xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)),
-            at = Array::vector(vec![1.0, 2.0, 3.0]),
-            step = 1e-3,
-            tolerance = 1e-6,
-        );
     }
 
     #[test]
@@ -6833,431 +6757,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_program_transpose_with_respect_to_scan_reference_carry() {
-        // `scan { add_update(r, x_i); y_i = read(r) }` over a reference carry: `y_i = r + Σ_{j ≤ i} x_j`, so with unit
-        // output cotangents `x̄_j = length - j` and the destination ends holding `Σ ȳ_i = length`. The reference carry
-        // is threaded through the reversed scan positionally and the body's view of it accumulates in place.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let element = body_builder.add_input(scalar_type.clone());
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
-            .unwrap();
-        let current =
-            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![carry], None).unwrap()[0];
-        let body = body_builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![carry, current],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let elements = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
-        let outputs = builder
-            .add_instruction(
-                ScanOperation::<ReferenceTestValue>::new(1, 3),
-                vec![body],
-                vec![reference, elements],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                outputs,
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-
-        // The forwarded reference output shares the input's accumulator and has no cotangent slot, so the transposed
-        // program consumes `[ȳs, r̄]` and produces `[r̄, x̄s]`.
-        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(
-            transposed.input_types(),
-            vec![
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
-                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
-            ],
-        );
-        assert_eq!(
-            transposed.output_types(),
-            vec![
-                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]))
-            ],
-        );
-        let scan = transposed
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.operation().name() == "scan")
-            .unwrap();
-        assert!(matches!(
-            scan.operation(),
-            ReferenceTestOperation::Scan(operation) if operation.carry_count() == 1 && operation.reverse(),
-        ));
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![Array::vector(vec![1.0_f32, 1.0, 1.0])],
-                vec![Array::scalar(0.0_f32)],
-                vec![],
-            ),
-            vec![Array::vector(vec![3.0_f32, 2.0, 1.0]), Array::scalar(3.0_f32)],
-        );
-
-        // The same program with a view of the carry inside the body accumulates into the root's accumulator through
-        // the view: `add_update(r[1], x_i)` over `r: ref<f32[2]>` gives `x̄_i = r̄[1]`.
-        let vector_reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
-        let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = body_builder.add_input(vector_reference_type.clone());
-        let element = body_builder.add_input(scalar_type.clone());
-        let view = body_builder
-            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![carry], None)
-            .unwrap()[0];
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, element], None)
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![carry],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(vector_reference_type.clone());
-        let elements = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
-        let outputs = builder
-            .add_instruction(
-                ScanOperation::<ReferenceTestValue>::new(1, 3),
-                vec![body],
-                vec![reference, elements],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![vector_reference_type]);
-        assert_eq!(
-            run_transposed_with_destinations(&transposed, vec![], vec![Array::vector(vec![10.0_f32, 20.0])], vec![]),
-            vec![Array::vector(vec![20.0_f32, 20.0, 20.0]), Array::vector(vec![10.0_f32, 20.0])],
-        );
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_scan_write_only_reference_carry() {
-        // `scan { write(r, x_i); y_i = x_i }` only stores into its reference carry. Under an `Ignore` destination for
-        // the reference no later instruction accumulated into its root and the body never reads it, so its state
-        // cotangent is provably zero: the body is transposed with an `Ignore` destination as well, the dead carry is
-        // dropped from the reversed scan, and the pullback stages no cotangent reference at all instead of allocating,
-        // zeroing, and freezing a dead accumulator around the reversed scan.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
-        let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let element = body_builder.add_input(scalar_type.clone());
-        body_builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![carry, element], None)
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![carry, element],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let elements = builder.add_input(stack_type.clone());
-        let outputs = builder
-            .add_instruction(
-                ScanOperation::<ReferenceTestValue>::new(1, 3),
-                vec![body],
-                vec![reference, elements],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                outputs,
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let transposed = program
-            .transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
-            .unwrap();
-        assert_eq!(transposed.input_types(), vec![stack_type.clone()]);
-        assert_eq!(transposed.output_types(), vec![stack_type.clone()]);
-        let names = transposed
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["scan"]);
-        assert!(matches!(
-            transposed.instructions()[0].operation(),
-            ReferenceTestOperation::Scan(operation) if operation.carry_count() == 0 && operation.reverse(),
-        ));
-        assert_eq!(
-            run_transposed_with_destinations(&transposed, vec![Array::vector(vec![1.0_f32, 2.0, 3.0])], vec![], vec![]),
-            vec![Array::vector(vec![1.0_f32, 2.0, 3.0])],
-        );
-
-        // Under a `Reference` destination the carry's state cotangent is live, so the cotangent reference is threaded
-        // through the reversed scan as a carry and the body's store transposes against it.
-        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(
-            transposed.input_types(),
-            vec![stack_type.clone(), ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
-        );
-        assert_eq!(
-            transposed.output_types(),
-            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), stack_type]
-        );
-        let names = transposed
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"reference_swap"), "{names:?}");
-        assert!(!names.contains(&"reference_new"), "{names:?}");
-        assert!(matches!(
-            transposed.instructions()[0].operation(),
-            ReferenceTestOperation::Scan(operation) if operation.carry_count() == 1 && operation.reverse(),
-        ));
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![Array::vector(vec![1.0_f32, 2.0, 3.0])],
-                vec![Array::scalar(5.0_f32)],
-                vec![],
-            ),
-            vec![Array::vector(vec![1.0_f32, 2.0, 8.0]), Array::scalar(0.0_f32)],
-        );
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_condition_reference_operand() {
-        // Both branches receive the cotangent reference of the reference operand: the taken branch's transpose acts on
-        // it in place (`add_update` reads the destination into `x̄`, `write` swaps a zero into it).
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let true_branch = {
-            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            let value = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
-                .unwrap();
-            builder
-                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
-                .unwrap()
-        };
-        let false_branch = {
-            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            let value = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
-                .unwrap();
-            builder
-                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let true_branch = builder.import_region(true_branch.entry_region_ref());
-        let false_branch = builder.import_region(false_branch.entry_region_ref());
-        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
-        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let value = builder.add_input(scalar_type.clone());
-        builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, reference, value],
-                None,
-            )
-            .unwrap();
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                Vec::new(),
-                vec![Placeholder; 3],
-                Vec::<Placeholder>::new(),
-            )
-            .unwrap();
-
-        // The predicate is a known parameter of the linear map, so the transposed program consumes `[r̄, p]`.
-        let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
-        assert_eq!(
-            transposed.input_types(),
-            vec![
-                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))
-            ],
-        );
-        assert_eq!(
-            transposed.output_types(),
-            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
-        );
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(true)]
-            ),
-            vec![Array::scalar(5.0_f32), Array::scalar(5.0_f32)],
-        );
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(false)]
-            ),
-            vec![Array::scalar(5.0_f32), Array::scalar(0.0_f32)],
-        );
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_condition_write_only_reference_operand() {
-        // Both branches only store into the reference operand (`write` when taken, `add_update` otherwise) and forward
-        // `x` as the live output. Under an `Ignore` destination for the reference no later instruction accumulated
-        // into its root and neither branch reads it, so its state cotangent is provably zero: the branches are
-        // transposed with an `Ignore` destination as well and the pullback stages no cotangent reference at all
-        // instead of allocating, zeroing, and freezing a dead accumulator around the transposed condition.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
-        let true_branch = {
-            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            let value = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
-                .unwrap();
-            builder
-                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                    vec![value],
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let false_branch = {
-            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            let value = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
-                .unwrap();
-            builder
-                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                    vec![value],
-                    vec![Placeholder; 2],
-                    vec![Placeholder],
-                )
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let true_branch = builder.import_region(true_branch.entry_region_ref());
-        let false_branch = builder.import_region(false_branch.entry_region_ref());
-        let predicate = builder.add_input(predicate_type.clone());
-        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let value = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, reference, value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![output],
-                vec![Placeholder; 3],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let transposed = program
-            .transpose_with_respect_to(&[1, 2], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
-            .unwrap();
-        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), predicate_type.clone()]);
-        assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
-        let names = transposed
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["condition"]);
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![Array::scalar(3.0_f32)],
-                vec![],
-                vec![Array::scalar(true)],
-            ),
-            vec![Array::scalar(3.0_f32)],
-        );
-
-        // Under a `Reference` destination the operand's state cotangent is live, so both branches receive the
-        // cotangent reference and their stores transpose against it.
-        let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
-        assert_eq!(
-            transposed.input_types(),
-            vec![
-                scalar_type.clone(),
-                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-                predicate_type
-            ],
-        );
-        assert_eq!(
-            transposed.output_types(),
-            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
-        );
-        let names = transposed
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"reference_swap"), "{names:?}");
-        assert!(names.contains(&"reference_read"), "{names:?}");
-        assert!(!names.contains(&"reference_new"), "{names:?}");
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![Array::scalar(3.0_f32)],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(true)],
-            ),
-            vec![Array::scalar(8.0_f32), Array::scalar(0.0_f32)],
-        );
-        assert_eq!(
-            run_transposed_with_destinations(
-                &transposed,
-                vec![Array::scalar(3.0_f32)],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(false)],
-            ),
-            vec![Array::scalar(8.0_f32), Array::scalar(5.0_f32)],
-        );
-    }
-
-    #[test]
     fn test_program_linearize_pullback_with_local_tangent_accumulator() {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
@@ -7339,31 +6838,23 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vjp() {
-        // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = sin(x)` at
-        // `x = 2` the primal output is `sin(2)`, and the returned pullback maps any number of output cotangents back
+        // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = x²` at
+        // `x = 2` the primal output is `4`, and the returned pullback maps any number of output cotangents back
         // through the transposed Jacobian without re-tracing or re-differentiating.
-        let (value, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(|x, ()| x.sin(), Array::scalar(2.0), ())
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(
-            pullback.apply(Array::scalar(3.0)).unwrap().to_f64s()[0],
-            3.0 * 2.0f64.cos(),
-            epsilon = 1e-9
-        );
+        let (value, pullback) = TestArrayContext::new().vjp(|x, ()| Ok(x.clone() * x), Array::scalar(2.0), ()).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(3.0)).unwrap().to_f64s()[0], 3.0 * 4.0, epsilon = 1e-9);
 
         // The builder's `vjp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
         // declarations: a rank-zero `Array` input recovers the eager array domain.
-        let (value, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| x.sin()).unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
+        let (value, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(|token, ()| Ok(token), token.clone(), ())
-            .unwrap();
+        let (value, pullback) = TestArrayContext::new().vjp(|token, ()| Ok(token), token.clone(), ()).unwrap();
         assert_eq!(value, token.clone());
         assert_eq!(pullback.apply(zero.clone()), Ok(zero.clone()));
         assert!(matches!(
@@ -7375,9 +6866,9 @@ pub(crate) mod tests {
 
         // Under an active trace, the builder's `vjp` terminal recovers the staging context from its tracer input,
         // so the primal work and the pullback replay both stage into the enclosing trace.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| {
-                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|x| x.sin())?;
+                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|x| Ok(x.clone() * x))?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
@@ -7386,12 +6877,12 @@ pub(crate) mod tests {
         .unwrap();
         let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 4.0, epsilon = 1e-9);
 
         // Replaying a pullback inside an enclosing trace likewise carries absent token cotangents through zero-space
         // leaves and never constructs a token-valued zero operation.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| {
                 let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|token| Ok(token))?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
@@ -7481,14 +6972,13 @@ pub(crate) mod tests {
         // JAX-parity marquee behavior: the closure can branch on a Boolean *primal* with host control flow, because the
         // duals' primal halves carry concrete known values under an eager context (exactly like branching on concrete
         // primals under JAX's `grad`). For a true predicate and `x = 3`, `f(x) = x * x` with gradient `2x = 6`, and
-        // the untaken `sin(x)` branch is never traced at all. The Boolean's cotangent remains in the zero space.
+        // the untaken branch is never evaluated. Its panic sentinel makes accidental evaluation observable.
+        // The Boolean's cotangent remains in the zero space.
         let (value, (predicate_gradient, gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at((Array::scalar(true), Array::scalar(3.0)))
-            .value_and_gradient(
-                |(predicate, x)| {
-                    if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }
-                },
-            )
+            .value_and_gradient(|(predicate, x)| {
+                if predicate.concretize().unwrap() { x.clone() * x } else { panic!("untaken branch was evaluated") }
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
         assert_eq!(predicate_gradient, Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap(),);

@@ -2818,15 +2818,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayTracingContext,
-        ArrayType, DataType, ReferenceIndexOperation,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        ReferenceIndexOperation,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, StagingContext};
     use crate::operations::{
         AddOperation, ConditionOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
         ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, SinOperation, SubOperation, Zero,
+        ReferenceWriteOperation, SubOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, Concretizable, EffectClasses, Effects, ProgramBuilder, ProgramError, ReferenceType};
@@ -3291,7 +3291,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_parent() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(
             context.parent().bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)]),
             Ok(vec![Array::scalar(3.0)]),
@@ -3300,7 +3300,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_import_known() {
-        let parent = TracingContext::<TestValue, TestOperation>::new();
+        let parent = TracingContext::<TestValue, TestArrayIrOperation>::new();
         let source = PartialEvaluationContext::new(parent.clone());
         let target = source.deferred_sibling();
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
@@ -3308,7 +3308,7 @@ mod tests {
             PartialTracer::new(source.clone(), PartialEvaluationValue::known(parent.input(scalar_type.clone())));
         source
             .residualize(
-                AddOperation::new(),
+                TestArrayOperation::Add(AddOperation::new()),
                 Vec::new(),
                 &[known.value().unwrap().clone(), known.value().unwrap().clone()],
             )
@@ -3332,7 +3332,7 @@ mod tests {
         let unknown = PartialTracer::new(source.clone(), source.unknown_input(scalar_type.clone(), 0));
         assert!(matches!(target.import_known(&unknown), Err(ProgramError::MalformedProgram(message))
             if message == "cannot import an unknown value from another partial-evaluation context",),);
-        let other_parent = TracingContext::<TestValue, TestOperation>::new();
+        let other_parent = TracingContext::<TestValue, TestArrayIrOperation>::new();
         let foreign = PartialTracer::new(
             PartialEvaluationContext::new(other_parent.clone()),
             PartialEvaluationValue::known(other_parent.input(scalar_type)),
@@ -3341,7 +3341,9 @@ mod tests {
             if message == "cannot import a value from a partial-evaluation context with a different parent context",),);
 
         // Binding a foreign value cannot reinterpret its atom identifier in this builder, including in release builds.
-        let poisoned = target.bind(AddOperation::new(), Vec::new(), &[known.clone(), known]).unwrap();
+        let poisoned = target
+            .bind(TestArrayOperation::Add(AddOperation::new()), Vec::new(), &[known.clone(), known])
+            .unwrap();
         assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(message))
             if message == "cannot bind a value belonging to another partial-evaluation context; import known values explicitly",),);
         assert!(target.builder.borrow().instructions().is_empty());
@@ -3349,7 +3351,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_import_known_deduplicates_eager_inputs() {
-        let source = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let source = PartialEvaluationContext::new(TestArrayContext::new());
         let target = source.deferred_sibling();
         let input = PartialTracer::new(source.clone(), PartialEvaluationValue::known_input(Array::scalar(3.0)));
         let first = target.import_known(&input).unwrap();
@@ -3372,7 +3374,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_import_known_retains_discarded_errors() {
-        let source = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let source = PartialEvaluationContext::new(TestArrayContext::new());
         let target = source.deferred_sibling();
         let known = source.lift(Array::scalar(3.0)).unwrap();
         assert_eq!(
@@ -3390,7 +3392,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
         // are known values with no residual materialization decision yet.
         let inputs =
@@ -3645,7 +3647,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_residualize() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         let inputs =
             [PartialEvaluationValue::known(Array::scalar(2.0)), PartialEvaluationValue::known(Array::scalar(3.0))];
         // `residualize` emits the operation into the residual program, materializing each known input as a fresh
@@ -3671,7 +3673,7 @@ mod tests {
         // single residual input.
         let shared = PartialEvaluationValue::known_input(Array::scalar(4.0));
         let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
-        let second = context.residualize(SinOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
+        let second = context.residualize(AddOperation::new(), Vec::new(), &[shared.clone(), shared.clone()]).unwrap();
         assert_eq!(
             shared.materialization(),
             PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) },
@@ -3682,10 +3684,10 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_inline_program() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `inline_program` replays a program over seed values. All-known seeds fold every instruction, lifting the
         // program constant into the known-side context, and so the replay returns folded values.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0));
@@ -3790,14 +3792,14 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_inline_partitioned_program() {
-        // Partition `x - sin(a)` with `a` known. Its single-operation halves can serve as boundary operations;
+        // Partition `x - -a` with `a` known. Its single-operation halves can serve as boundary operations;
         // subtraction makes swapping the known coefficient and unknown input observable in the result.
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
-        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, sine], None).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, negated], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -3809,7 +3811,7 @@ mod tests {
                     PartialEvaluationValue::known(Array::scalar(2.0)),
                     context.unknown_input(ArrayType::scalar(DataType::F64), 0),
                 ],
-                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
+                |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
                 |_| (ArrayOperation::Sub(SubOperation::new()), Vec::new()),
             )
             .unwrap();
@@ -3820,13 +3822,13 @@ mod tests {
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(2.0_f64.sin()))],
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(-2.0_f64))],
         );
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(evaluation.program.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(1)]);
         assert_eq!(
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0)]),
-            Ok(vec![Array::scalar(5.0 - 2.0_f64.sin())]),
+            Ok(vec![Array::scalar(5.0 - (-2.0_f64))]),
         );
     }
 
@@ -3835,9 +3837,10 @@ mod tests {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated], vec![Placeholder], vec![Placeholder])
+            .unwrap();
         let partition = program.partition(&[true]).unwrap();
 
         // Preserve the empty residual program's boundary with a region wrapper. It emits no outputs and is removed
@@ -3846,28 +3849,28 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[PartialEvaluationValue::known(Array::scalar(2.0))],
-                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
+                |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
                 |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(2.0_f64.sin())));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0_f64)));
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert!(evaluation.inputs.is_empty());
-        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(Array::scalar(2.0_f64.sin()))]);
+        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(Array::scalar(-2.0_f64))]);
         assert!(evaluation.program.instructions().is_empty());
         assert!(evaluation.program.input_ids().is_empty());
         assert!(evaluation.program.output_ids().is_empty());
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(vec![Array::scalar(2.0_f64.sin())]));
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(vec![Array::scalar(-2.0_f64)]));
     }
 
     #[test]
     fn test_partial_evaluation_context_known_constant() {
         // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
         // constant, while under a staging known-side context only literal-backed tracers do.
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(context.known_constant(&Array::scalar(5.0)), Ok(Array::scalar(5.0)));
-        let staging = ArrayTracingContext::new();
+        let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
         let literal = staging.constant(Array::scalar(4.0));
@@ -3882,38 +3885,38 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_all_knowns_are_constants() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let staging = ArrayTracingContext::new();
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
         let literal = staging.constant(Array::scalar(4.0));
 
         // A known feeder still occupies an input of the residual program.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        assert!(context.all_knowns_are_constants(&PartialEvaluation::<EagerContext<Array, ArrayOperation<Array>>> {
+        assert!(context.all_knowns_are_constants(&PartialEvaluation::<TestArrayContext> {
             program: program.clone(),
             inputs: vec![PartialEvaluationInput::Known(Array::scalar(1.0))],
             outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(Array::scalar(2.0))],
         }),);
 
-        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<TestArrayTracingContext> {
             program: program.clone(),
             inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
             outputs: vec![PartialEvaluationOutput::Unknown(0)],
         }),);
 
-        assert!(staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+        assert!(staging_context.all_knowns_are_constants(&PartialEvaluation::<TestArrayTracingContext> {
             program: program.clone(),
             inputs: vec![PartialEvaluationInput::Known(literal.clone())],
             outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(literal)],
         }),);
 
         // Symbolic outputs must also reject constant-only reconstruction even when every feeder is constant.
-        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<TestArrayTracingContext> {
             program,
             inputs: vec![PartialEvaluationInput::Unknown(0)],
             outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(symbolic)],
@@ -3922,8 +3925,8 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_any_known_is_symbolic() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let staging = ArrayTracingContext::new();
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
         let literal = staging.constant(Array::scalar(4.0));
@@ -3941,7 +3944,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_lift() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         let lifted = context.lift(Array::scalar(2.0)).unwrap();
         assert_eq!(
             lifted.value().unwrap().materialization(),
@@ -3954,7 +3957,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_bind() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         let lifted = context.lift(Array::scalar(2.0)).unwrap();
         let folded = context.bind(AddOperation::new(), Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
@@ -4016,8 +4019,8 @@ mod tests {
         // not return an error; it poisons its outputs so the infallible operator sugar driving closures never panics.
         // The poison propagates through later binds, resolves `Opaque`, rejects concretizing extractions with the
         // deferred error, and surfaces that original error at the value boundary.
-        let outer_a = ArrayTracingContext::new();
-        let outer_b = ArrayTracingContext::new();
+        let outer_a = TestArrayTracingContext::new();
+        let outer_b = TestArrayTracingContext::new();
         let context = PartialEvaluationContext::new(outer_a.clone());
         let known_a = PartialTracer::new(
             context.clone(),
@@ -4091,14 +4094,14 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_is_eager() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert!(context.is_eager());
-        assert!(!PartialEvaluationContext::new(ArrayTracingContext::new()).is_eager());
+        assert!(!PartialEvaluationContext::new(TestArrayTracingContext::new()).is_eager());
     }
 
     #[test]
     fn test_partial_evaluation_context_provenance() {
-        let parent = ArrayTracingContext::new();
+        let parent = TestArrayTracingContext::new();
         let (context, initial) = parent.invoke_with_provenance_scope(ProvenanceScope::new("parent"), || {
             (PartialEvaluationContext::new(parent.clone()), parent.provenance())
         });
@@ -4120,7 +4123,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_resolve() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         let lifted = context.lift(Array::scalar(2.0)).unwrap();
         assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Array::scalar(2.0)));
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
@@ -4198,7 +4201,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_zero() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
         let zero = context.zero(&ArrayType::scalar(DataType::Boolean)).unwrap();
         assert_eq!(zero.value().unwrap().as_known(), Some(&Array::scalar(false)));
         assert_eq!(zero.concretize(), Ok(false));
@@ -4456,7 +4459,7 @@ mod tests {
 
     #[test]
     fn test_region_partition_with_configuration_rejects_invalid_required_output() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -4840,7 +4843,7 @@ mod tests {
         // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
         // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
         // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0));
@@ -4851,7 +4854,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outer = ArrayTracingContext::new();
+        let outer = TestArrayTracingContext::new();
         let known = outer.input(ArrayType::scalar(DataType::F64));
         let evaluation = program
             .partially_evaluate_in_context(
@@ -5110,15 +5113,15 @@ mod tests {
 
     #[test]
     fn test_program_partition() {
-        // `f(a, x) = (a + a, sin(a) * x)` partitioned with `a` known and `x` unknown: `a + a` is a fully known output,
-        // `sin(a)` is a residual edge trailing it among the known program's outputs, and the residual program computes
+        // `f(a, x) = (a + a, -a * x)` partitioned with `a` known and `x` unknown: `a + a` is a fully known output,
+        // `-a` is a residual edge trailing it among the known program's outputs, and the residual program computes
         // the mixed output over the surviving unknown input plus the edge.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![negated, x], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![doubled, product], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -5135,7 +5138,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = add %0 %0
-                    %2:f64[] = sin %0
+                    %2:f64[] = neg %0
                 in (%1, %2)
             "}
             .trim_end(),
@@ -5156,7 +5159,7 @@ mod tests {
         let residual_outputs =
             partition.residual_program.interpret(vec![Array::scalar(3.0), known_outputs[1].clone()]).unwrap();
         assert_eq!(known_outputs[0], Array::scalar(4.0));
-        assert_eq!(residual_outputs, vec![Array::scalar(3.0 * 2.0f64.sin())]);
+        assert_eq!(residual_outputs, vec![Array::scalar(3.0 * (-2.0_f64))]);
 
         // All-unknown known-ness produces an empty known program and residualizes everything.
         let partition = program.partition(&[false, false]).unwrap();

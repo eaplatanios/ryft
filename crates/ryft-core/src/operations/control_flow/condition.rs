@@ -1684,7 +1684,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::reverse::tests::transposition_statistics;
+    use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -2084,6 +2084,196 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_condition_transposition_reference_operand_destinations() {
+        // Both branches receive the cotangent reference of the reference operand: the taken branch's transpose acts on
+        // it in place (`add_update` reads the destination into `x̄`, `write` swaps a zero into it).
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let true_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let value = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let value = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(scalar_type.clone());
+        builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, value],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::<Placeholder>::new())
+            .unwrap();
+
+        // The predicate is a known parameter of the linear map, so the transposed program consumes `[r̄, p]`.
+        let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
+        assert_eq!(
+            transposed.input_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))
+            ],
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
+        );
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![],
+                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(true)]
+            ),
+            vec![Array::scalar(5.0_f32), Array::scalar(5.0_f32)],
+        );
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![],
+                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(false)]
+            ),
+            vec![Array::scalar(5.0_f32), Array::scalar(0.0_f32)],
+        );
+    }
+
+    #[test]
+    fn test_condition_transposition_write_only_reference_operand_destinations() {
+        // Both branches only store into the reference operand (`write` when taken, `add_update` otherwise) and forward
+        // `x` as the live output. Under an `Ignore` destination for the reference no later instruction accumulated
+        // into its root and neither branch reads it, so its state cotangent is provably zero: the branches are
+        // transposed with an `Ignore` destination as well and the pullback stages no cotangent reference at all
+        // instead of allocating, zeroing, and freezing a dead accumulator around the transposed condition.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
+        let true_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let value = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let value = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(predicate_type.clone());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let transposed = program
+            .transpose_with_respect_to(&[1, 2], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
+            .unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), predicate_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
+        let names = transposed
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["condition"]);
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![Array::scalar(3.0_f32)],
+                vec![],
+                vec![Array::scalar(true)],
+            ),
+            vec![Array::scalar(3.0_f32)],
+        );
+
+        // Under a `Reference` destination the operand's state cotangent is live, so both branches receive the
+        // cotangent reference and their stores transpose against it.
+        let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
+        assert_eq!(
+            transposed.input_types(),
+            vec![
+                scalar_type.clone(),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                predicate_type
+            ],
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
+        );
+        let names = transposed
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"reference_swap"), "{names:?}");
+        assert!(names.contains(&"reference_read"), "{names:?}");
+        assert!(!names.contains(&"reference_new"), "{names:?}");
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![Array::scalar(3.0_f32)],
+                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(true)],
+            ),
+            vec![Array::scalar(8.0_f32), Array::scalar(0.0_f32)],
+        );
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![Array::scalar(3.0_f32)],
+                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(false)],
+            ),
+            vec![Array::scalar(8.0_f32), Array::scalar(5.0_f32)],
         );
     }
 

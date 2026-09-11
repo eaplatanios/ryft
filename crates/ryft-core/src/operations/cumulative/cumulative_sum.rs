@@ -317,7 +317,11 @@ mod tests {
         LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
-    use crate::macros::{check_operation_batching, check_operation_differentiation, check_operation_transposition};
+    use crate::differentiation::differentiate_at;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_transposition,
+    };
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ValueProjection};
 
@@ -605,6 +609,24 @@ mod tests {
                 primal_outputs = [Array::vector(vec![6.0, 5.0, 3.0])],
                 tangent_outputs = [Array::vector(vec![3.0, 2.0, 1.0])],
             }],
+        );
+    }
+
+    #[test]
+    fn test_cumulative_sum_differentiation_of_reduced_prefix_sums() {
+        // Summing the prefix sums weights each input by the number of outputs it contributes to.
+        // Finite differences independently confirm these reverse-mode weights.
+        assert_eq!(
+            differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+                .gradient(|xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)))
+                .unwrap(),
+            Array::vector(vec![3.0, 2.0, 1.0]),
+        );
+        check_gradient!(
+            |xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)),
+            at = Array::vector(vec![1.0, 2.0, 3.0]),
+            step = 1e-3,
+            tolerance = 1e-6,
         );
     }
 

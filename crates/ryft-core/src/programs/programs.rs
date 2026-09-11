@@ -2039,7 +2039,7 @@ mod tests {
     use crate::programs::references::ReferenceType;
     use crate::programs::regions::{RegionInterface, RegionSlot};
     use crate::programs::types::TypeError;
-    use crate::tests::{TestOrderedStateOperation, TestRegionOperation};
+    use crate::tests::{TestArrayOperation, TestOrderedStateOperation, TestRegionOperation};
 
     use super::*;
 
@@ -2195,7 +2195,7 @@ mod tests {
     #[test]
     fn test_program() {
         // Test simple program with one argument.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(3.0f64));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
@@ -2218,7 +2218,7 @@ mod tests {
         assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
         // Test simple program with two arguments.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
@@ -2269,7 +2269,7 @@ mod tests {
         assert!(matches!(output, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
 
         // Test a program with two outputs that are copies of the same value.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder
@@ -2291,7 +2291,7 @@ mod tests {
         assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F32)));
 
         // Test a case where we have an output atom with no parent instruction.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_variable(ArrayType::scalar(DataType::F64));
         assert!(matches!(
@@ -2300,7 +2300,7 @@ mod tests {
         ));
 
         // Test a case where we have an instruction input atom with no parent instruction.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_variable(ArrayType::scalar(DataType::F64));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, v0], None).unwrap()[0];
@@ -2314,7 +2314,7 @@ mod tests {
     fn test_program_new_rejects_unbound_atoms() {
         // Test that an unbound program input atom is reported.
         let input = AtomId::new(0);
-        let program = Program::<Array, ArrayOperation<Array>, Array, ()>::new(
+        let program = Program::<Array, TestArrayOperation, Array, ()>::new(
             Placeholder,
             (),
             vec![Region::new(Vec::new(), vec![input], Vec::new(), Vec::new())],
@@ -2328,7 +2328,7 @@ mod tests {
         // Test that an unbound instruction output atom is reported.
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
-        let program = Program::<Array, ArrayOperation<Array>, Array, Array>::new(
+        let program = Program::<Array, TestArrayOperation, Array, Array>::new(
             Placeholder,
             Placeholder,
             vec![Region::new(
@@ -2351,7 +2351,7 @@ mod tests {
         let region =
             Region::new(vec![Atom::Variable(ArrayType::scalar(DataType::F32))], Vec::new(), vec![output], Vec::new());
         assert!(matches!(
-            Program::<Array, ArrayOperation<Array>, (), Array>::new(
+            Program::<Array, TestArrayOperation, (), Array>::new(
                 (),
                 Placeholder,
                 vec![region],
@@ -2381,7 +2381,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            Program::<Array, TestArrayOperation, Vec<Array>, Vec<Array>>::new(
                 vec![Placeholder],
                 vec![Placeholder],
                 vec![region],
@@ -2394,7 +2394,7 @@ mod tests {
 
     #[test]
     fn test_program_instruction_by_output() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(3.0f64));
         let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -2417,7 +2417,7 @@ mod tests {
 
     #[test]
     fn test_program_live_sets() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let live_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let live_constant = builder.add_constant(Array::scalar(3.0f64));
@@ -2600,7 +2600,7 @@ mod tests {
 
     #[test]
     fn test_program_to_flat_program_and_into_flat_program() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
@@ -2621,14 +2621,14 @@ mod tests {
 
     #[test]
     fn test_program_construction_and_restructuring_validate_boundaries() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap();
         let entry = program.entry();
         let regions = program.regions.clone().into_regions();
 
         assert!(matches!(
-            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            Program::<Array, TestArrayOperation, Vec<Array>, Vec<Array>>::new(
                 Vec::new(),
                 vec![Placeholder],
                 regions.clone(),
@@ -2644,7 +2644,7 @@ mod tests {
         let mut unreachable_regions = regions;
         unreachable_regions.push(unreachable_regions[0].clone());
         assert!(matches!(
-            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            Program::<Array, TestArrayOperation, Vec<Array>, Vec<Array>>::new(
                 vec![Placeholder],
                 vec![Placeholder],
                 unreachable_regions.clone(),
@@ -2654,7 +2654,7 @@ mod tests {
                 if message == "entry region ^0 must be the final region in the arena",
         ));
         assert!(matches!(
-            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            Program::<Array, TestArrayOperation, Vec<Array>, Vec<Array>>::new(
                 vec![Placeholder],
                 vec![Placeholder],
                 unreachable_regions,
@@ -3295,7 +3295,7 @@ mod tests {
         let shape = RegionSimplificationShape::of(&region);
         assert!(!shape.atoms_are_instruction_ordered);
 
-        let program = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+        let program = Program::<Array, TestArrayOperation, Vec<Array>, Vec<Array>>::new(
             vec![Placeholder],
             vec![Placeholder, Placeholder],
             vec![region],
@@ -3461,7 +3461,7 @@ mod tests {
     fn test_program_into_simplified_retains_transform_caches_for_identity_rebuilds() {
         // The move-based rebuild recognizes the identity exactly like the cloning one, which matters because the
         // standard pipeline builds a program and immediately consumes it with `into_simplified`.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
@@ -3643,7 +3643,7 @@ mod tests {
         // Build the same program twice, so that the consuming `into_filtered` can be compared
         // against the borrowing `filter`.
         let build = || {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
             let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
             let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
             let c0 = builder.add_constant(Array::scalar(2.0f64));
@@ -3692,7 +3692,7 @@ mod tests {
         // chain an order of magnitude past that threshold on a default-size test thread.
         const CHAIN_LENGTH: usize = 4000;
         let build = || {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let mut value = input;
             for _ in 0..CHAIN_LENGTH {
@@ -3824,7 +3824,7 @@ mod tests {
 
     #[test]
     fn test_program_render_with_provenance() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let scoped = builder
             .add_instruction(

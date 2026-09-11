@@ -4009,13 +4009,14 @@ mod tests {
         DotDimensionNumbers, DotOperation, DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation,
         NegOperation, OneLike, ParallelReduceOperation, ParallelReductionKind, Reduce, ReductionKind,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReshardOperation, SinOperation, Slice, ZeroOperation,
+        ReshardOperation, Slice, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope, ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
+    use crate::tests::{TestArrayContext, TestArrayOperation};
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
@@ -4853,33 +4854,42 @@ mod tests {
     fn test_static_array_extent_batching_policy() {
         // The static policy's `BatchingPolicy` surface is the `ArrayBatch` carrier: `batch` checks the mapped axis,
         // `replicated` records no axis, and the accessors read the carrier's value, axis, and per-item type.
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let batch =
-            <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::batch(matrix.clone(), BatchAxis::new(-1))
-                .unwrap();
+        let batch = <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch(
+            matrix.clone(),
+            BatchAxis::new(-1),
+        )
+        .unwrap();
         assert_eq!(batch, ArrayBatch::new(matrix.clone(), Some(1)).unwrap());
-        assert_eq!(<StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::value(&batch), &matrix);
-        assert_eq!(<StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::batch_axis(&batch), BatchAxis::new(1));
+        assert_eq!(<StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::value(&batch), &matrix);
         assert_eq!(
-            <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::unbatched_type(&batch).into_owned(),
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch_axis(&batch),
+            BatchAxis::new(1),
+        );
+        assert_eq!(
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::unbatched_type(&batch).into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),
         );
         assert_eq!(
-            <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::batch(matrix.clone(), BatchAxis::new(2)),
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch(
+                matrix.clone(),
+                BatchAxis::new(2),
+            ),
             Err(BatchingError::BatchAxisOutOfBounds {
                 r#type: Box::new(matrix.r#type().into_owned()),
                 axis: Axis::from(2),
             }),
         );
-        let replicated = <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::replicated(matrix.clone());
+        let replicated =
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::replicated(matrix.clone());
         assert_eq!(replicated, ArrayBatch::replicated(matrix.clone()));
         assert_eq!(
-            <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::batch_axis(&replicated),
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch_axis(&replicated),
             BatchAxis::replicated(),
         );
         assert_eq!(
-            <StaticArrayExtentBatchingPolicy as BatchingPolicy<Parent>>::unbatched_type(&replicated).into_owned(),
+            <StaticArrayExtentBatchingPolicy as BatchingPolicy<TestArrayContext>>::unbatched_type(&replicated)
+                .into_owned(),
             matrix.r#type().into_owned(),
         );
     }
@@ -4888,7 +4898,7 @@ mod tests {
     fn test_static_array_extent_batching_policy_axis_dimension() {
         // The static policy's extent is one host `usize`, so the mapped axis is always an exact static dimension and
         // `axis_size` never fails.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context = BatchingContext::new(TestArrayContext::new(), 3);
         assert_eq!(StaticArrayExtentBatchingPolicy::axis_dimension(&context), Ok(Dimension::Static(3)));
         assert_eq!(StaticArrayExtentBatchingPolicy::axis_size(&context), Ok(3));
     }
@@ -4897,7 +4907,7 @@ mod tests {
     fn test_static_array_extent_batching_policy_match_axis() {
         // `match_axis` is `ArrayBatch::match_axis` fed with the context's extent and batch axis sharding: a mapped
         // batch is transposed onto the requested axis and a replicated batch is broadcast to gain it there.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
         let batched = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0)).unwrap();
         let matched = StaticArrayExtentBatchingPolicy::match_axis(&context, &batched, Axis::from(1)).unwrap();
         assert_eq!(matched.batch_axis(), BatchAxis::new(1));
@@ -4929,7 +4939,7 @@ mod tests {
         // The algorithm has already decided the operand-to-output axis mapping and the result's batch axis, so the
         // static policy only broadcasts the packed value to the requested type and relocates ragged metadata through
         // that same mapping. The dimension sources are not needed because the type is fully static.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
         let broadcasted = StaticArrayExtentBatchingPolicy::broadcast_input(
@@ -5582,8 +5592,6 @@ mod tests {
 
     #[test]
     fn test_array_batching_policy() {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-
         // The wrapper is a zero-sized nominal marker that lends the homogeneous array rules a policy type of their own.
         // It renders without its extent-policy parameter, since that parameter only selects the extent discipline.
         assert_eq!(
@@ -5597,23 +5605,25 @@ mod tests {
 
         // Every `BatchingPolicy` function delegates to the extent policy, so the carrier surface is `ArrayBatch`'s.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let batch = <ArrayBatchingPolicy as BatchingPolicy<Parent>>::batch(matrix.clone(), BatchAxis::new(-1)).unwrap();
+        let batch =
+            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch(matrix.clone(), BatchAxis::new(-1))
+                .unwrap();
         assert_eq!(batch, ArrayBatch::new(matrix.clone(), Some(1)).unwrap());
-        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<Parent>>::value(&batch), &matrix);
-        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<Parent>>::batch_axis(&batch), BatchAxis::new(1));
+        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::value(&batch), &matrix);
+        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::batch_axis(&batch), BatchAxis::new(1));
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingPolicy<Parent>>::unbatched_type(&batch).into_owned(),
+            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::unbatched_type(&batch).into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),
         );
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingPolicy<Parent>>::replicated(matrix.clone()),
+            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::replicated(matrix.clone()),
             ArrayBatch::replicated(matrix.clone()),
         );
 
         // The static extent policy keeps the defaults: no operation validation beyond the rules themselves, and no
         // boundary operands because the extent is a host `usize` rather than a first-class value.
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingPolicy<Parent>>::validate_operation_outputs(
+            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::validate_operation_outputs(
                 "add",
                 &[batch],
                 &[],
@@ -5621,7 +5631,10 @@ mod tests {
             ),
             Ok(()),
         );
-        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<Parent>>::boundary_operands(&2), Vec::<Array>::new());
+        assert_eq!(
+            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::boundary_operands(&2),
+            Vec::<Array>::new()
+        );
     }
 
     #[test]
@@ -5699,11 +5712,9 @@ mod tests {
 
     #[test]
     fn test_array_batching_policy_batch_region() -> Result<(), BatchingError> {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-
         // The homogeneous replay interprets the region over `ArrayBatch` carriers: constants are lifted into the parent
         // and replicated, and every instruction runs through its batching rule against the eager parent.
-        let parent = DomainTracingContext::<Parent>::new();
+        let parent = DomainTracingContext::<TestArrayContext>::new();
         let builder = parent.builder().clone();
         let input_atom = builder
             .borrow_mut()
@@ -5716,8 +5727,8 @@ mod tests {
             Placeholder,
             vec![Placeholder, Placeholder],
         )?;
-        let context = BatchingContext::new(Parent::new(), 2);
-        let outputs = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::batch_region(
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
+        let outputs = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_region(
             &context,
             program.entry_region_ref(),
             vec![ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?],
@@ -5734,11 +5745,9 @@ mod tests {
 
     #[test]
     fn test_array_batching_policy_batch_program() -> Result<(), BatchingError> {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-
         // Structural batching of a region is `RegionRef::batched` under the context's extent, axis name, and batch axis
         // sharding, so the result is a boundary-preserving program over the packed types.
-        let parent = DomainTracingContext::<Parent>::new();
+        let parent = DomainTracingContext::<TestArrayContext>::new();
         let builder = parent.builder().clone();
         let input_atom = builder
             .borrow_mut()
@@ -5751,8 +5760,8 @@ mod tests {
             Placeholder,
             vec![Placeholder, Placeholder],
         )?;
-        let context = BatchingContext::new(Parent::new(), 2);
-        let batched = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::batch_program(
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
+        let batched = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_program(
             &context,
             program.entry_region_ref(),
             &[BatchAxis::new(0)],
@@ -5776,14 +5785,12 @@ mod tests {
 
     #[test]
     fn test_array_batching_policy_align_batch_axis() -> Result<(), BatchingError> {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-
         // The homogeneous policy stages alignment through the parent's operation family: a replicated batch is
         // broadcast to gain the mapped axis at the requested position, a mapped batch moves its axis there, and a
         // batch that already carries the requested axis is returned unchanged.
-        let context = BatchingContext::new(Parent::new(), 2);
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
-        let broadcasted = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+        let broadcasted = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::align_batch_axis(
             &context,
             replicated,
             Axis::from(1),
@@ -5791,7 +5798,7 @@ mod tests {
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
         assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
         let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?;
-        let moved = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+        let moved = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::align_batch_axis(
             &context,
             mapped.clone(),
             Axis::from(1),
@@ -5799,10 +5806,10 @@ mod tests {
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
         assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
         assert_eq!(
-            <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+            <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::align_batch_axis(
                 &context,
                 mapped.clone(),
-                Axis::from(0)
+                Axis::from(0),
             )?,
             mapped,
         );
@@ -5813,20 +5820,19 @@ mod tests {
     fn test_array_batching_policy_static_batch_axis_extent() {
         // The homogeneous policy's extent is one host `usize` fixed when the transform was constructed, so it is always
         // statically known (e.g., to named-axis queries).
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context = BatchingContext::new(TestArrayContext::new(), 3);
         assert_eq!(ArrayBatchingPolicy::static_batch_axis_extent(&context), Some(3));
     }
 
     #[test]
     fn test_array_batching_policy_pack_inputs() -> Result<(), BatchingError> {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-        let parent = Parent::new();
+        let parent = TestArrayContext::new();
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let vector = Array::vector(vec![7.0, 8.0]);
 
         // Each input is wrapped with its declared axis (normalized against its rank), the extent is inferred from the
         // mapped inputs, and the context records that extent with no axis name and a replicated batch axis placement.
-        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
             &parent,
             vec![matrix.clone(), vector.clone()],
             vec![BatchAxis::new(-2), BatchAxis::replicated()],
@@ -5838,7 +5844,7 @@ mod tests {
         assert_eq!(inputs, vec![ArrayBatch::new(matrix.clone(), Some(0))?, ArrayBatch::replicated(vector.clone())]);
 
         // An explicit extent must agree with the inferred one, and a name becomes the context's axis name.
-        let (context, _) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+        let (context, _) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
             &parent,
             vec![matrix.clone()],
             vec![BatchAxis::new(0)],
@@ -5847,7 +5853,7 @@ mod tests {
         assert_eq!(*context.axis_extent(), 2);
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
                 &parent,
                 vec![matrix.clone()],
                 vec![BatchAxis::new(0)],
@@ -5859,7 +5865,7 @@ mod tests {
 
         // An explicit extent alone still permits an input-free transform, while without it there is no mapped
         // dimension to infer the extent from.
-        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
             &parent,
             Vec::new(),
             Vec::new(),
@@ -5868,7 +5874,7 @@ mod tests {
         assert_eq!(*context.axis_extent(), 3);
         assert_eq!(inputs, Vec::new());
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
                 &parent,
                 Vec::new(),
                 Vec::new(),
@@ -5878,7 +5884,7 @@ mod tests {
             Some(BatchingError::EmptyBatch),
         );
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
                 &parent,
                 vec![vector.clone()],
                 vec![BatchAxis::replicated()],
@@ -5891,7 +5897,7 @@ mod tests {
         // The flat axis declaration is validated against the inputs before zipping so that unmatched entries cannot be
         // silently dropped.
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
                 &parent,
                 vec![matrix.clone()],
                 vec![BatchAxis::new(0), BatchAxis::new(0)],
@@ -5911,7 +5917,7 @@ mod tests {
             [1.0_f64, 2.0, 3.0].into_iter().flat_map(f64::to_le_bytes).collect(),
         );
         assert_eq!(
-            <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+            <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
                 &parent,
                 vec![dynamic],
                 vec![BatchAxis::new(0)],
@@ -5930,7 +5936,7 @@ mod tests {
         let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
-        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::pack_inputs(
+        let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
             &parent,
             vec![
                 Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
@@ -5963,7 +5969,7 @@ mod tests {
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::materialize_output(
                 &context,
                 rows.clone(),
-                BatchAxis::new(0)
+                BatchAxis::new(0),
             ),
             Ok(matrix),
         );
@@ -5971,7 +5977,7 @@ mod tests {
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::materialize_output(
                 &context,
                 rows.clone(),
-                BatchAxis::new(1)
+                BatchAxis::new(1),
             ),
             Ok(Array::matrix(4, 3, vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0])),
         );
@@ -5983,7 +5989,7 @@ mod tests {
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::materialize_output(
                 &context,
                 replicated,
-                BatchAxis::new(0)
+                BatchAxis::new(0),
             ),
             Ok(Array::matrix(3, 2, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0])),
         );
@@ -5991,7 +5997,7 @@ mod tests {
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::materialize_output(
                 &context,
                 rows.clone(),
-                BatchAxis::replicated()
+                BatchAxis::replicated(),
             ),
             Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::replicated(), actual: BatchAxis::new(0) }),
         );
@@ -6004,7 +6010,7 @@ mod tests {
             <ArrayBatchingPolicy as BatchingEntrypointPolicy<Parent>>::materialize_output(
                 &context,
                 ragged,
-                BatchAxis::new(0)
+                BatchAxis::new(0),
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
@@ -6079,20 +6085,20 @@ mod tests {
         let validate = <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::validate_operation_outputs;
         assert_eq!(
             validate("neg", std::slice::from_ref(&input), std::slice::from_ref(&ragged_output), &Vec::new()),
-            Ok(())
+            Ok(()),
         );
         assert_eq!(
             validate(
                 "dimension_size",
                 std::slice::from_ref(&input),
                 std::slice::from_ref(&mapped_dimension_output),
-                &Vec::new()
+                &Vec::new(),
             ),
             Ok(()),
         );
         assert_eq!(
             validate("reduce", std::slice::from_ref(&input), std::slice::from_ref(&dense), &vec![length]),
-            Ok(())
+            Ok(()),
         );
         assert_eq!(validate("neg", std::slice::from_ref(&dense), std::slice::from_ref(&dense), &Vec::new()), Ok(()));
         assert_eq!(
@@ -7447,7 +7453,7 @@ mod tests {
 
         // Batching rules always receive the active `BatchingContext`, with the underlying work running
         // through its parent context.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
 
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = ArrayBatch::new(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))
@@ -7542,7 +7548,7 @@ mod tests {
         assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]));
 
         // Unary elementwise operations use the same blanket rule and preserve the mapped input axis.
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context = BatchingContext::new(TestArrayContext::new(), 3);
         let input = ArrayBatch::new(Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let outputs = NegOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -7583,8 +7589,8 @@ mod tests {
                 BatchAxis::new(0),
             )
             .unwrap();
-            let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-                .with_axis_sharding(ShardingDimension::sharded(["x"]));
+            let context =
+                BatchingContext::new(TestArrayContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
             let outputs = AddOperation::new()
                 .batch(&context, &EmptyRegionDriver, &[sharded, replicated])
                 .unwrap()
@@ -7602,7 +7608,7 @@ mod tests {
         // The per-item type of a mapped operand drops the mapped dimension's placement, and the batched output restores
         // exactly that placement at the operand's own mapped position, whichever position that is.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
         for (batch_axis, dimensions) in [vec![2, 3, 4], vec![3, 2, 4], vec![3, 4, 2]].into_iter().enumerate() {
             let mut sharding_dimensions = vec![ShardingDimension::replicated(); 3];
             sharding_dimensions[batch_axis] = ShardingDimension::sharded(["x"]);
@@ -7639,7 +7645,7 @@ mod tests {
         // operation to the full common batched shape so the staged add receives shape-congruent operands. This is
         // required for backends such as XLA whose elementwise lowering (e.g., `stablehlo.add`) has no implicit
         // broadcasting.
-        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let parent = DomainTracingContext::<TestArrayContext>::new();
         let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
@@ -7692,9 +7698,7 @@ mod tests {
             let unbatched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
                 .with_sharding(unbatched_sharding)
                 .unwrap();
-            let (_, program) =
-                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![unbatched_type])
-                    .unwrap();
+            let (_, program) = TestArrayContext::trace(|inputs: Vec<_>| Ok(inputs), vec![unbatched_type]).unwrap();
 
             let (batched, output_axes) = program
                 .entry_region_ref()
@@ -7725,9 +7729,9 @@ mod tests {
     #[test]
     fn test_region_ref_batched_cache_specializes_arguments() {
         // Repeated structural requests are served from the region's retained artifact, keyed by the complete request.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let region = program.entry_region_ref();
@@ -7842,7 +7846,7 @@ mod tests {
 
     #[test]
     fn test_region_ref_batched_cache_preserves_mixed_rank_align_all_semantics() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F64));
         let vector = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let program = builder
@@ -8039,7 +8043,7 @@ mod tests {
     fn test_program_batched() {
         // Trace a per-item squaring function into a flat program over per-item vector types.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
             vec![vector_type.clone()],
         )
@@ -8139,14 +8143,14 @@ mod tests {
         let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
         let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let mapped = builder.add_input(vector_type.clone());
         let replicated = builder.add_input(vector_type);
         let summed = builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![mapped, replicated], Some(first.clone()))
             .unwrap()[0];
         let output = builder
-            .add_instruction(SinOperation::new(), Vec::new(), vec![summed], Some(second.clone()))
+            .add_instruction(NegOperation::new(), Vec::new(), vec![summed], Some(second.clone()))
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -8167,15 +8171,15 @@ mod tests {
                 .iter()
                 .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
                 .collect::<Vec<_>>(),
-            vec![("broadcast", first.clone()), ("add", first), ("sin", second)],
+            vec![("broadcast", first.clone()), ("add", first), ("neg", second)],
         );
     }
 
     #[test]
     fn test_program_batched_rejects_mismatched_output_axes_count() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -8204,7 +8208,7 @@ mod tests {
         let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
         let unbatched_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
             vec![unbatched_type.clone()],
         )
@@ -8221,7 +8225,7 @@ mod tests {
         // target dimension is resolved by `DimensionSource` from the source axis that supplied it instead of being
         // rejected. The staged homogeneous `broadcast` therefore retains the dynamic extent in its stored output type,
         // and the replicated input keeps its unbatched dynamically shaped type.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
             vec![unbatched_type.clone(), unbatched_type],
         )
@@ -8252,7 +8256,7 @@ mod tests {
     fn test_batch_over_arrays() {
         // `Batch::batch` on an explicit context maps the closure over the mapped input axis: each item of the
         // length-3 batch is squared, and the output carries its mapped axis back at the requested position.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: Array = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 Array::vector(vec![1.0, 2.0, 3.0]),
@@ -8265,7 +8269,7 @@ mod tests {
 
         // A mapped output declaration broadcasts a naturally replicated result across the explicit batch.
         // The signed `-1` declaration places that new batch dimension last.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: Array = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 Array::vector(vec![1.0, 2.0, 3.0]),
@@ -8293,7 +8297,7 @@ mod tests {
         // `batch` composes inside traced code without threading a context. The traced function squares each row of
         // its `[2, 3]` input by batching a per-item squaring closure over axis 0.
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |inputs: Vec<_>| {
                 let mapped =
                     batch(|x| Ok(x.clone() * x), inputs[0].clone(), BatchAxis::new(0), BatchAxis::new(0), None)?;
@@ -8309,7 +8313,7 @@ mod tests {
         // Nested inside an eager `batch`, the inner free `batch` recovers the outer `BatchingContext` from its
         // `BatchingTracer` input, so that `batch` nests inside `batch`: the outer level maps rows and the inner level
         // maps items within each row.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: Array = TestArrayContext::new()
             .batch(
                 |row| Ok(batch(|item| Ok(item.clone() * item), row, BatchAxis::new(0), BatchAxis::new(0), None)?),
                 Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -8322,7 +8326,7 @@ mod tests {
 
         // The inner level may mix mapped and replicated inputs of its own: here the row is mapped while a captured bias
         // is replicated across the inner batch items.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: Array = TestArrayContext::new()
             .batch(
                 |(row, bias)| {
                     let context = row.context().clone();
@@ -8345,7 +8349,7 @@ mod tests {
 
         // A replicated input with an explicit batch size runs the closure on the shared value and returns
         // a replicated output.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: Array = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 Array::vector(vec![1.0, 2.0, 3.0]),
@@ -8358,7 +8362,7 @@ mod tests {
 
         // Declaring a mapped output as replicated is rejected: collapsing a mapped axis requires an explicit
         // reduction inside the batched function.
-        let error = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let error = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 Array::vector(vec![1.0, 2.0, 3.0]),
@@ -8377,7 +8381,7 @@ mod tests {
     fn test_batch_composes_with_differentiation() {
         // Differentiation inside a batched function sees per-item tracers: forward mode produces the per-item value and
         // tangent, and reverse mode the per-item value and gradient, each mapped back onto the batch axis.
-        let (value, tangent): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let (value, tangent): (Array, Array) = TestArrayContext::new()
             .batch(
                 |x| {
                     let context = x.context().clone();
@@ -8393,7 +8397,7 @@ mod tests {
         assert_eq!(value, Array::vector(vec![4.0, 9.0]));
         assert_eq!(tangent, Array::vector(vec![4.0, 6.0]));
 
-        let (value, gradient): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let (value, gradient): (Array, Array) = TestArrayContext::new()
             .batch(
                 |x| {
                     let context = x.context().clone();

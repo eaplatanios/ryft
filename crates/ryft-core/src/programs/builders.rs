@@ -888,8 +888,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, Shape,
+        Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::operations::{AddOperation, NegOperation};
@@ -902,7 +901,7 @@ mod tests {
     use crate::programs::regions::{OutputRegionProvenance, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
-    use crate::tests::TestRegionOperation;
+    use crate::tests::{TestArrayOperation, TestRegionOperation};
 
     use super::*;
 
@@ -982,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_program_builder() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(2.0f64));
@@ -1025,7 +1024,7 @@ mod tests {
         // `splice_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to
         // the provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is
         // dead (i.e., no instruction consumes it), and so only the two reachable instructions are rebuilt.
-        let mut outer = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut outer = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a0 = outer.add_input(ArrayType::scalar(DataType::F64));
         let a1 = outer.add_input(ArrayType::scalar(DataType::F64));
         let outputs = outer.splice_program(&program, &[a0, a1]).unwrap();
@@ -1041,14 +1040,14 @@ mod tests {
 
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)], None);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(42)));
     }
 
     #[test]
     fn test_program_builder_build_returns_error() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         builder.error = Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         assert!(matches!(
             builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
@@ -1058,7 +1057,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_invalid_input_count() {
-        let builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         assert!(matches!(
             builder.build::<Array, ()>(Vec::new(), Placeholder, ()),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -1067,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_invalid_output_count() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             builder.build::<Array, Array>(Vec::new(), Placeholder, Placeholder),
@@ -1077,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_malformed_atom_providers() {
-        let mut duplicate_input_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut duplicate_input_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = duplicate_input_builder.add_input(ArrayType::scalar(DataType::F64));
         duplicate_input_builder.input_ids.push(input);
         assert!(matches!(
@@ -1090,10 +1089,10 @@ mod tests {
                 if message == format!("region input atom {input} appears more than once")
         ));
 
-        let mut input_output_overlap_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut input_output_overlap_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = input_output_overlap_builder.add_input(ArrayType::scalar(DataType::F64));
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
-            ArrayOperation::Neg(NegOperation::new()),
+            TestArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![input],
             Vec::new(),
@@ -1108,17 +1107,17 @@ mod tests {
                 if message == format!("instruction output atom {input} is a region input")
         ));
 
-        let mut duplicate_output_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut duplicate_output_builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = duplicate_output_builder.add_input(ArrayType::scalar(DataType::F64));
         let output = duplicate_output_builder.add_variable(ArrayType::scalar(DataType::F64));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ArrayOperation::Neg(NegOperation::new()),
+            TestArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ArrayOperation::Neg(NegOperation::new()),
+            TestArrayOperation::Neg(NegOperation::new()),
             vec![input],
             vec![output],
             Vec::new(),
@@ -1665,7 +1664,7 @@ mod tests {
             Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
             Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
         ]);
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let negated =
             builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(nested.clone())).unwrap()[0];
@@ -1676,7 +1675,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let mut destination = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut destination = ProgramBuilder::<Array, TestArrayOperation>::new();
         let destination_input = destination.add_input(ArrayType::scalar(DataType::F64));
         let outputs = destination.splice_program(&program, &[destination_input]).unwrap();
         let relocated =

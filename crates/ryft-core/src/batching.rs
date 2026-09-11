@@ -2006,7 +2006,7 @@ mod tests {
     use crate::programs::{ProgramBuilder, Typed};
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue,
+        ProjectedProgramType, ProjectedProgramValue, TestArrayContext, TestArrayOperation,
     };
     use crate::tracing::Trace;
 
@@ -2401,9 +2401,7 @@ mod tests {
 
     #[test]
     fn test_batching_driver_align_batch_axis() -> Result<(), BatchingError> {
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-
-        let context = BatchingContext::<Parent, ArrayBatchingPolicy>::new(Parent::new(), 2);
+        let context = BatchingContext::<TestArrayContext, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
         let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?;
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
 
@@ -2443,8 +2441,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
-        let context =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 3);
         let outputs = AddOperation::new()
             .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
             .unwrap();
@@ -2464,8 +2461,7 @@ mod tests {
 
     #[test]
     fn test_batching_context() {
-        let context =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 4);
         assert!(context.parent().is_eager());
         assert_eq!(context.axis_extent(), &4);
         assert_eq!(context.axis_name(), None);
@@ -2479,12 +2475,9 @@ mod tests {
     #[test]
     fn test_batching_context_align_batched_program_outputs() {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let (_, source_program) =
-            EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![vector_type])
-                .unwrap();
+        let (_, source_program) = TestArrayContext::trace(|inputs: Vec<_>| Ok(inputs), vec![vector_type]).unwrap();
         let input_axes = [BatchAxis::new(1)];
-        let context =
-            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
 
         // A program whose natural output axes already match the required axes is returned without asking the driver
         // to replay it. Using the empty driver pins that fast path because any replay through it would fail.
@@ -2528,7 +2521,7 @@ mod tests {
         assert_eq!(aligned_program.input_types(), std::slice::from_ref(&axis_one_type));
         assert_eq!(aligned_program.output_types(), std::slice::from_ref(&axis_zero_type));
         assert_eq!(aligned_program.instructions().len(), 1);
-        assert!(matches!(aligned_program.instructions()[0].operation(), ArrayOperation::Transpose(_)));
+        assert!(matches!(aligned_program.instructions()[0].operation(), TestArrayOperation::Transpose(_)));
         assert_eq!(
             aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])]),
             Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]),
@@ -2713,7 +2706,7 @@ mod tests {
         }
 
         // Identity rule attesting to `add` alone, so one context exercises both the attested and the silent transition.
-        impl<C: Context<Type = ArrayType>> BatchableOperation<C, EvidenceBatching> for ArrayOperation<C::Value> {
+        impl<C: Context<Type = ArrayType>> BatchableOperation<C, EvidenceBatching> for TestArrayOperation {
             fn batch<D: BatchingDriver<C, EvidenceBatching>>(
                 &self,
                 _context: &BatchingContext<C, EvidenceBatching>,
@@ -2731,8 +2724,7 @@ mod tests {
             }
         }
 
-        type Parent = EagerContext<Array, ArrayOperation<Array>>;
-        let context = BatchingContext::<Parent, EvidenceBatching>::with_policy(Parent::new(), 2);
+        let context = BatchingContext::<TestArrayContext, EvidenceBatching>::with_policy(TestArrayContext::new(), 2);
         let input = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(1.0_f32)));
 
         // An attesting rule's evidence reaches the validation boundary, which accepts the transition.
@@ -2754,7 +2746,7 @@ mod tests {
     fn test_batch() {
         // A single `BatchAxis` specification broadcasts into the whole input and output parameter structures, so both
         // leaves of the pair are mapped on axis 0 without spelling out either structure.
-        let output: (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let output: (Array, Array) = TestArrayContext::new()
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (Array::vector(vec![1.0, 3.0]), Array::vector(vec![2.0, 4.0])),
@@ -2766,7 +2758,7 @@ mod tests {
         assert_eq!(output, (Array::vector(vec![3.0, 7.0]), Array::vector(vec![2.0, 12.0])));
 
         // With no mapped input and no explicit batch size, the batch size is unobservable.
-        let error = EagerContext::<Array, ArrayOperation<Array>>::new()
+        let error = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 Array::vector(vec![1.0, 2.0, 3.0]),

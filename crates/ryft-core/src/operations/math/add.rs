@@ -85,6 +85,7 @@ impl_capability_for_primitive!(@float f64);
 
 #[cfg(test)]
 mod tests {
+    use half::{bf16, f16};
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
@@ -93,6 +94,7 @@ mod tests {
         Array, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -234,6 +236,19 @@ mod tests {
                     in (%4, %5)
                 "},
             }],
+        );
+    }
+
+    #[test]
+    fn test_add_differentiation_low_precision() {
+        // Rank-zero arrays support both half-precision variants through the ordinary array operations.
+        assert_eq!(
+            differentiate_at(Array::scalar(bf16::from_f32(3.0))).jvp(Array::scalar(bf16::ONE), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(bf16::from_f32(6.0)), Array::scalar(bf16::from_f32(2.0)))),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(f16::from_f32(3.0))).jvp(Array::scalar(f16::ONE), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(f16::from_f32(6.0)), Array::scalar(f16::from_f32(2.0)))),
         );
     }
 

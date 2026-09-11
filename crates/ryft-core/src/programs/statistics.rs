@@ -289,10 +289,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::constants::ConstantOperation;
-    use crate::operations::{ADD_OPERATION_NAME, Sin};
+    use crate::operations::{ADD_OPERATION_NAME, Neg};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::EffectClass;
@@ -310,12 +310,12 @@ mod tests {
 
     #[test]
     fn test_statistics_scalar_program_counts_and_depth() {
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (_, program): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) = domain
+        let domain = EagerContext::<Array, TestArrayOperation>::new();
+        let (_, program): (Array, Program<Array, TestArrayOperation, Array, Array>) = domain
             .interpret_and_trace(
                 |x| {
                     let with_constant = x.clone() + x.context().constant(Array::scalar(1.0));
-                    with_constant.sin()
+                    with_constant.neg()
                 },
                 Array::scalar(2.0),
             )
@@ -330,7 +330,7 @@ mod tests {
                 output_count: 1,
                 constant_count: 1,
                 instruction_count: 2,
-                operation_counts: BTreeMap::from([(ADD_OPERATION_NAME, 1usize), ("sin", 1usize)]),
+                operation_counts: BTreeMap::from([(ADD_OPERATION_NAME, 1usize), ("neg", 1usize)]),
                 maximum_output_dependency_depth: 2,
                 attached_regions: Vec::new(),
             },
@@ -396,12 +396,12 @@ mod tests {
 
     #[test]
     fn test_statistics_duplicate_outputs_only_affect_output_count() {
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (_, program): ((Array, Array), Program<Array, ArrayOperation<Array>, Array, (Array, Array)>) = domain
+        let domain = EagerContext::<Array, TestArrayOperation>::new();
+        let (_, program): ((Array, Array), Program<Array, TestArrayOperation, Array, (Array, Array)>) = domain
             .interpret_and_trace(
                 |x| {
-                    let sine = x.sin()?;
-                    Ok((sine.clone(), sine))
+                    let negated = x.neg()?;
+                    Ok((negated.clone(), negated))
                 },
                 Array::scalar(2.0),
             )
@@ -409,7 +409,7 @@ mod tests {
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().output_count(), 2);
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
-        assert_eq!(statistics.entry_region_statistics().operation_counts(), &BTreeMap::from([("sin", 1usize)]));
+        assert_eq!(statistics.entry_region_statistics().operation_counts(), &BTreeMap::from([("neg", 1usize)]));
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 

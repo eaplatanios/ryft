@@ -233,8 +233,10 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::{
-        AddOperation, ConstantOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
-        ReferenceReadOperation, ReferenceWriteOperation, ZeroLikeOperation, ZeroOperation,
+        AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
+        DivOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ReduceOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation, TransposeOperation,
+        ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -250,8 +252,10 @@ pub(crate) mod tests {
     /// Small ordinary array operation family for core tests. Each payload is a real operation, while malformed rules
     /// and arbitrary region interfaces remain explicit, separate protocol fixtures. Captures and interpretation need
     /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
-    /// operation types. This family deliberately has no region-bearing payloads and therefore needs no value type
-    /// parameter.
+    /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
+    /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require compare and
+    /// divide. These dependencies apply to the operation family even when a particular scalar test emits none of
+    /// those operations. This family has no region-bearing payloads and therefore needs no value type parameter.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
     pub(crate) enum TestArrayOperation {
@@ -263,6 +267,14 @@ pub(crate) mod tests {
         Neg(NegOperation<ArrayType>),
         Add(AddOperation<ArrayType>),
         Mul(MulOperation<ArrayType>),
+        ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+        Broadcast(BroadcastOperation),
+        Transpose(TransposeOperation),
+        Reshape(ReshapeOperation),
+        Reduce(ReduceOperation),
+        Reshard(ReshardOperation),
+        Compare(CompareOperation<ArrayType>),
+        Div(DivOperation<ArrayType>),
     }
 
     /// Eager array context with only the operations required by ordinary core protocol tests.
@@ -275,9 +287,11 @@ pub(crate) mod tests {
     /// universe explicit avoids treating a reference as an ordinary array or importing the complete production mixed
     /// operation catalog.
     #[derive(Clone, Debug, Operation)]
-    #[ryft(type = ArrayIrType, constant = ArrayIrValue<Array>)]
+    #[ryft(type = ArrayIrType, constant = ArrayIrValue<Array>, members(ArrayType))]
     pub(crate) enum TestArrayIrOperation {
         Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
+        #[ryft(projected(ArrayType))]
+        Array(Box<TestArrayOperation>),
         ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
         ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
     }

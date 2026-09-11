@@ -1062,14 +1062,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, Sin, ZeroLike, ZeroOperation};
+    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,
@@ -1125,24 +1125,21 @@ mod tests {
 
     #[test]
     fn test_context_interpret_and_trace() {
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let domain = TestArrayContext::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Array::scalar(2.0)).unwrap();
-        assert_eq!(output, Array::scalar(2.0 * 2.0 + 2.0f64.sin()));
-        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(3.0 * 3.0 + 3.0f64.sin())));
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0)).unwrap();
+        assert_eq!(output, Array::scalar(2.0 * 2.0 + (-2.0)));
+        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(3.0 * 3.0 + (-3.0))));
     }
 
     #[test]
     fn test_context_infer_output_type() {
-        let output_type = EagerContext::<Array, ArrayOperation<Array>>::infer_output_type(
-            |x| Ok(x.sin()?),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
+        let output_type =
+            TestArrayContext::infer_output_type(|x| Ok(-x.clone()), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
 
         // The free function infers output types at the abstract signature of example values.
-        let output_type = infer_output_type(|x| Ok(x.sin()?), Array::scalar(1.5)).unwrap();
+        let output_type = infer_output_type(|x| Ok(-x.clone()), Array::scalar(1.5)).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
     }
 
@@ -1561,18 +1558,18 @@ mod tests {
 
     #[test]
     fn test_tracing_context_interpret_and_trace() {
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let domain = TestArrayContext::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Array::scalar(2.0)).unwrap();
-        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + 2.0f64.sin()));
-        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.5f64 * 0.5f64 + 0.5f64.sin())));
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0)).unwrap();
+        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + (-2.0)));
+        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.5f64 * 0.5f64 + (-0.5))));
         assert_eq!(program.input_ids().len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = mul %0 %0
-                    %2:f64[] = sin %0
+                    %2:f64[] = neg %0
                     %3:f64[] = add %1 %2
                 in (%3)
             "}
@@ -1581,14 +1578,14 @@ mod tests {
 
         // Test using a function with a tuple argument.
         let (_, compiled) = domain
-            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()?), (Array::scalar(2.0), Array::scalar(3.0)))
+            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + -x.clone()), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
         assert_eq!(
             compiled.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %0 %1
-                    %3:f64[] = sin %0
+                    %3:f64[] = neg %0
                     %4:f64[] = add %2 %3
                 in (%4)
             "}
@@ -1599,7 +1596,7 @@ mod tests {
         let (output, program) = domain
             .interpret_and_trace(
                 |x| {
-                    let _ = x.sin()?;
+                    let _ = -x.clone();
                     Ok(x.clone() * x)
                 },
                 Array::scalar(2.0),
@@ -1717,22 +1714,19 @@ mod tests {
         // `trace` runs the closure once on tracer inputs standing in for the provided input types and finalizes
         // the staged flat program together with the closure's output structure.
         let (output_structure, program) = NestedTracingContext::trace(
-            EagerContext::<Array, ArrayOperation<Array>>::new(),
-            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].clone() * inputs[0].clone(), inputs[0].sin()?]),
+            TestArrayContext::new(),
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].clone() * inputs[0].clone(), -inputs[0].clone()]),
             vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
         assert_eq!(output_structure, vec![Placeholder, Placeholder]);
-        assert_eq!(
-            program.interpret(vec![Array::scalar(2.0)]),
-            Ok(vec![Array::scalar(4.0), Array::scalar(2.0f64.sin())])
-        );
+        assert_eq!(program.interpret(vec![Array::scalar(2.0)]), Ok(vec![Array::scalar(4.0), Array::scalar(-2.0)]));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = mul %0 %0
-                    %2:f64[] = sin %0
+                    %2:f64[] = neg %0
                 in (%1, %2)
             "}
             .trim_end(),
@@ -1742,7 +1736,7 @@ mod tests {
         let escaped_tracer = Rc::new(RefCell::new(None));
         assert!(matches!(
             NestedTracingContext::trace(
-                EagerContext::<Array, ArrayOperation<Array>>::new(),
+                TestArrayContext::new(),
                 |inputs: Vec<Tracer<_>>| {
                     *escaped_tracer.borrow_mut() = Some(inputs[0].clone());
                     Ok(inputs)
@@ -1755,7 +1749,7 @@ mod tests {
         // `trace_with_named_axes` seeds the nested context with axis bindings that named-axis readers resolve inside
         // the closure, while unseeded names keep delegating to the parent (an eager parent binds none).
         let (_, program) = NestedTracingContext::trace_with_named_axes(
-            EagerContext::<Array, ArrayOperation<Array>>::new(),
+            TestArrayContext::new(),
             |inputs: Vec<Tracer<_>>| {
                 assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: Some(4) }));
                 assert_eq!(inputs[0].context().named_axis("unbound"), None);

@@ -8,7 +8,9 @@ use crate::arrays::{
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::EagerContext;
-use crate::differentiation::{TranspositionContext, differentiate_at};
+use crate::differentiation::{
+    CotangentDestination, CotangentDestinationKind, CotangentSeed, TranspositionContext, differentiate_at,
+};
 use crate::macros::{check_operation_transposition, check_operation_type_inference};
 use crate::parameters::Placeholder;
 use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, ValueProjection};
@@ -1015,6 +1017,30 @@ fn test_dot_transposition() {
                 input_cotangents = [Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5])],
             },
         ],
+    );
+}
+
+#[test]
+fn test_dot_transposition_prunes_unrequested_pullback_gradient() {
+    let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+    let (_, pullback) = differentiate_at((left, right))
+        .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())))
+        .unwrap();
+    let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
+    let selected = pullback
+        .transposed_program(&[CotangentDestinationKind::Return, CotangentDestinationKind::Ignore])
+        .unwrap();
+    // The caller's request reaches the production linearization and reverse sweep. The ignored right gradient
+    // removes one whole dot product, rather than merely discarding its result after replay.
+    assert_eq!(both.instructions().iter().filter(|instruction| instruction.operation().name() == "dot").count(), 2);
+    assert_eq!(selected.instructions().iter().filter(|instruction| instruction.operation().name() == "dot").count(), 1);
+    assert_eq!(
+        pullback.apply_with_destinations(
+            CotangentSeed::Value(Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0])),
+            (CotangentDestination::Return, CotangentDestination::Ignore),
+        ),
+        Ok((Some(Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5])), None))
     );
 }
 

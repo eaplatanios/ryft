@@ -3864,7 +3864,7 @@ mod tests {
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::reverse::tests::transposition_statistics;
+    use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
         differentiate_at,
@@ -8738,6 +8738,256 @@ mod tests {
         assert_eq!(
             linearization.pullback().unwrap().interpret(vec![Array::matrix(3, 1, vec![2.0, 3.0, 4.0])]),
             Ok(vec![Array::matrix(3, 3, vec![2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0])]),
+        );
+    }
+
+    #[test]
+    fn test_scan_differentiation_pullback_reference_carry() {
+        // `f(r, xs) = scan { add_update(r, x_i); y_i = read(r) }` accumulates the scanned elements into the carried
+        // reference and reports the running state: `y_i = r + Σ_{j ≤ i} x_j`. Its pure equivalent is the prefix sum of
+        // `xs` shifted by the initial state, whose gradient under unit output cotangents is `x̄_j = length - j` and
+        // `r̄ = length`.
+        let body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let element = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
+                .unwrap();
+            let current =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![carry], None).unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![carry, current],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let function = move |(reference, elements): (
+            LinearizationTracer<EagerContext<TestIrValue, TestIrOperation>>,
+            LinearizationTracer<EagerContext<TestIrValue, TestIrOperation>>,
+        )| {
+            let context = reference.context().clone();
+            let mut outputs =
+                context.bind(ScanOperation::<TestIrValue>::new(1, 3), vec![body.clone()], &[reference, elements])?;
+            Ok(outputs.remove(1))
+        };
+        let reference = ArrayReference::new(Array::scalar(1.0_f32));
+        let (value, pullback) = differentiate_at((
+            ArrayIrValue::Reference(reference.clone()),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])),
+        ))
+        .vjp(function)
+        .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::vector(vec![2.0_f32, 4.0, 7.0])));
+        assert_eq!(reference.read(), Ok(Array::scalar(7.0_f32)));
+
+        // The destination starts at the zero post-state cotangent and ends holding the cotangent of the initial state.
+        let destination = ArrayReference::new(Array::scalar(0.0_f32));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))),
+                (
+                    CotangentDestination::Reference(ArrayIrValue::Reference(destination.clone())),
+                    CotangentDestination::Return,
+                ),
+            ),
+            Ok((None, Some(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 2.0, 1.0]))))),
+        );
+        assert_eq!(destination.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_scan_transposition_reference_carry_destinations() {
+        // `scan { add_update(r, x_i); y_i = read(r) }` over a reference carry: `y_i = r + Σ_{j ≤ i} x_j`, so with unit
+        // output cotangents `x̄_j = length - j` and the destination ends holding `Σ ȳ_i = length`. The reference carry
+        // is threaded through the reversed scan positionally and the body's view of it accumulates in place.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let element = body_builder.add_input(scalar_type.clone());
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
+            .unwrap();
+        let current =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![carry], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![carry, current],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let elements = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 3), vec![body], vec![reference, elements], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // The forwarded reference output shares the input's accumulator and has no cotangent slot, so the transposed
+        // program consumes `[ȳs, r̄]` and produces `[r̄, x̄s]`.
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.input_types(),
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+            ],
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]))
+            ],
+        );
+        let scan = transposed
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "scan")
+            .unwrap();
+        assert!(matches!(
+            scan.operation(),
+            TestIrOperation::Scan(operation) if operation.carry_count() == 1 && operation.reverse(),
+        ));
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![Array::vector(vec![1.0_f32, 1.0, 1.0])],
+                vec![Array::scalar(0.0_f32)],
+                vec![],
+            ),
+            vec![Array::vector(vec![3.0_f32, 2.0, 1.0]), Array::scalar(3.0_f32)],
+        );
+
+        // The same program with a view of the carry inside the body accumulates into the root's accumulator through
+        // the view: `add_update(r[1], x_i)` over `r: ref<f32[2]>` gives `x̄_i = r̄[1]`.
+        let vector_reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body_builder.add_input(vector_reference_type.clone());
+        let element = body_builder.add_input(scalar_type.clone());
+        let view = body_builder
+            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![carry], None)
+            .unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, element], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(vector_reference_type.clone());
+        let elements = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 3), vec![body], vec![reference, elements], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(transposed.input_types(), vec![vector_reference_type]);
+        assert_eq!(
+            run_transposed_with_destinations(&transposed, vec![], vec![Array::vector(vec![10.0_f32, 20.0])], vec![]),
+            vec![Array::vector(vec![20.0_f32, 20.0, 20.0]), Array::vector(vec![10.0_f32, 20.0])],
+        );
+    }
+
+    #[test]
+    fn test_scan_transposition_write_only_reference_carry_destinations() {
+        // `scan { write(r, x_i); y_i = x_i }` only stores into its reference carry. Under an `Ignore` destination for
+        // the reference no later instruction accumulated into its root and the body never reads it, so its state
+        // cotangent is provably zero: the body is transposed with an `Ignore` destination as well, the dead carry is
+        // dropped from the reversed scan, and the pullback stages no cotangent reference at all instead of allocating,
+        // zeroing, and freezing a dead accumulator around the reversed scan.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let element = body_builder.add_input(scalar_type.clone());
+        body_builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![carry, element], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![carry, element],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let elements = builder.add_input(stack_type.clone());
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 3), vec![body], vec![reference, elements], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let transposed = program
+            .transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
+            .unwrap();
+        assert_eq!(transposed.input_types(), vec![stack_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![stack_type.clone()]);
+        let names = transposed
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["scan"]);
+        assert!(matches!(
+            transposed.instructions()[0].operation(),
+            TestIrOperation::Scan(operation) if operation.carry_count() == 0 && operation.reverse(),
+        ));
+        assert_eq!(
+            run_transposed_with_destinations(&transposed, vec![Array::vector(vec![1.0_f32, 2.0, 3.0])], vec![], vec![]),
+            vec![Array::vector(vec![1.0_f32, 2.0, 3.0])],
+        );
+
+        // Under a `Reference` destination the carry's state cotangent is live, so the cotangent reference is threaded
+        // through the reversed scan as a carry and the body's store transposes against it.
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.input_types(),
+            vec![stack_type.clone(), ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), stack_type]
+        );
+        let names = transposed
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"reference_swap"), "{names:?}");
+        assert!(!names.contains(&"reference_new"), "{names:?}");
+        assert!(matches!(
+            transposed.instructions()[0].operation(),
+            TestIrOperation::Scan(operation) if operation.carry_count() == 1 && operation.reverse(),
+        ));
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![Array::vector(vec![1.0_f32, 2.0, 3.0])],
+                vec![Array::scalar(5.0_f32)],
+                vec![],
+            ),
+            vec![Array::vector(vec![1.0_f32, 2.0, 8.0]), Array::scalar(0.0_f32)],
         );
     }
 

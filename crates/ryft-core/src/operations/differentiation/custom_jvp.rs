@@ -684,12 +684,13 @@ mod tests {
         Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
     };
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::differentiation::{Differentiate, DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::differentiation::tests::{
-        ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
+        ReferenceRuleDifferentiationDriver, array_ir_identity_program, custom_jvp_regions_with_reference_state,
+        nested_custom_derivative_state_program,
     };
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::math::add::AddOperation;
@@ -1136,6 +1137,81 @@ mod tests {
         assert_abs_diff_eq!(primal.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom rule doubles the true derivative, proving it is in control.
         assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_with_local_reference_state() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let regions = custom_jvp_regions_with_reference_state(&scalar_type);
+
+        // A custom derivative rule may allocate and use local reference state: the rule is replayed directly when it
+        // consumes the active input, so its state executes like any other primitive operation of the identity rule.
+        let result = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().jvp(
+            {
+                let regions = regions.clone();
+                move |input: DifferentiationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>, ()| {
+                    let operation = ArrayIrOperation::CustomJvp(CustomJvpOperation::new());
+                    Ok(input.context().bind(operation, regions.clone(), std::slice::from_ref(&input))?.remove(0))
+                }
+            },
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            (),
+        );
+        assert_eq!(
+            result,
+            Ok((ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(1.0_f32)))),
+        );
+
+        // A lifted input has a structural zero tangent. The attached rule contains references, so binding still
+        // invokes it; its identity tangent evaluates to zero. This case checks the result, not whether replay is skipped.
+        let result = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().jvp(
+            move |input: DifferentiationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>, ()| {
+                let lifted = input.context().lift(ArrayIrValue::Array(Array::scalar(1.0_f32)))?;
+                let operation = ArrayIrOperation::CustomJvp(CustomJvpOperation::new());
+                Ok(input.context().bind(operation, regions.clone(), std::slice::from_ref(&lifted))?.remove(0))
+            },
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            (),
+        );
+        assert_eq!(
+            result,
+            Ok((ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(0.0_f32)))),
+        );
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_stages_local_reference_state() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let wrapped = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let regions = custom_jvp_regions_with_reference_state(&scalar_type)
+                .iter()
+                .map(|region| builder.import_region(region.entry_region_ref()))
+                .collect::<Vec<_>>();
+            let input = builder.add_input(scalar_type.clone());
+            let outputs = builder
+                .add_instruction(ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input], None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    outputs,
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        // The entry region is pure because the state lives in the dormant rule region. Forward mode replays that rule
+        // when it fires on the live tangent, so the fused program stages the rule's local allocation and read, which
+        // execute like any other primitive operations of the identity rule.
+        assert!(wrapped.effects().classes().is_empty());
+        let jvp = wrapped.jvp().unwrap();
+        assert!(jvp.entry_region_ref().contains_effect_in_closure(crate::programs::EffectClass::OrderedState));
+        let inputs = vec![ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(2.0_f32))];
+        assert_eq!(jvp.interpret(inputs.clone()), Ok(inputs));
     }
 
     #[test]

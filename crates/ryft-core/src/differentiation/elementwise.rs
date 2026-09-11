@@ -512,8 +512,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation, ReduceOperation,
-        SinOperation, TanhOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation, NegOperation,
+        ReduceOperation, TanhOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{MaybeZero, ProgramBuilder};
@@ -692,7 +692,7 @@ mod tests {
         let tangent_calls = Cell::new(0);
         let outputs = unary_elementwise_jvp(
             &context,
-            &SinOperation::<ArrayType>::new(),
+            &NegOperation::<ArrayType>::new(),
             &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
             |_, input| Ok(input.clone()),
             |_| {
@@ -708,7 +708,7 @@ mod tests {
         let primal_evaluations = Cell::new(0);
         let outputs = unary_elementwise_jvp(
             &context,
-            &SinOperation::<ArrayType>::new(),
+            &NegOperation::<ArrayType>::new(),
             &[DifferentiationDual::new(Array::scalar(2.0f64), Array::scalar(3.0f64)).unwrap()],
             |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
@@ -729,7 +729,7 @@ mod tests {
         let input_primal = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let outputs = unary_elementwise_jvp(
             &context,
-            &SinOperation::<ArrayType>::new(),
+            &NegOperation::<ArrayType>::new(),
             &[DifferentiationDual::new(input_primal.clone(), Array::scalar(3.0f32)).unwrap()],
             |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
@@ -771,7 +771,7 @@ mod tests {
         assert!(matches!(
             unary_elementwise_jvp(
                 &context,
-                &SinOperation::<ArrayType>::new(),
+                &NegOperation::<ArrayType>::new(),
                 &[],
                 |_, input: &Array| Ok(input.clone()),
                 |_| Ok(Array::scalar(1.0f64)),
