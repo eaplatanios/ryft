@@ -424,7 +424,10 @@ def is_forbidden_cpu_symbol(symbol: str) -> bool:
 
     Mach-O prefixes C symbols with one underscore, so a single leading underscore is ignored before matching the
     C-linkage names; mangled C++ names (`_Z...`) never match the prefixes and are only subject to the fragment rules.
+    MSVC string-literal symbols (`??_C@...`) are ignored because their contents do not define runtime entry points.
     """
+    if symbol.startswith("??_C@"):
+        return False
     name = symbol[1:] if symbol.startswith("_") and not symbol.startswith("_Z") else symbol
     if name in FORBIDDEN_CPU_SYMBOLS or name.startswith(FORBIDDEN_CPU_SYMBOL_PREFIXES):
         return True
@@ -1016,6 +1019,10 @@ class SymbolContractTests(unittest.TestCase):
         self.assertTrue(is_forbidden_cpu_symbol("cuTileCompileKernel"))
         self.assertTrue(is_forbidden_cpu_symbol("_ZN8tileiras7compileEv"))
         self.assertTrue(is_forbidden_cpu_symbol("xla_ffi_register_mosaic_gpu_v2"))
+        self.assertTrue(is_forbidden_cpu_symbol("?compile@tileiras@@YAXXZ"))
+
+        # MSVC encodes string contents in symbols; this exact literal appeared in the Windows CPU archive.
+        self.assertFalse(is_forbidden_cpu_symbol("??_C@_0O@GABHFABO@mosaic_gpu_v2?$AA@"))
 
         # The portable Mosaic GPU dialect bridge, serde pass, and unrelated CUDA-looking names stay allowed.
         self.assertFalse(is_forbidden_cpu_symbol("mlirMosaicGpuRegisterSerdePass"))

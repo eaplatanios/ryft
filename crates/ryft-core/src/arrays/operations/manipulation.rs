@@ -28,10 +28,10 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::{
-    Broadcast, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize,
-    DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicSlice, DynamicUpdateSlice, Gather,
-    GatherOperation, GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters,
-    Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
+    Broadcast, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, DimensionSize, DynamicBroadcast,
+    DynamicBroadcastOperation, DynamicReshape, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation,
+    GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters, Scatter,
+    ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -685,14 +685,6 @@ impl DynamicUpdateSlice for Array {
         let update_shape = update.r#type().static_shape().unwrap();
         let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
         Ok(self.clone().replace_block(update, starts.as_slice()))
-    }
-}
-
-impl ConvertElementType for Array {
-    /// Refer to the documentation of [`Array::converted_to`] for the conversion semantics this delegates to.
-    #[inline]
-    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        self.converted_to(data_type)
     }
 }
 
