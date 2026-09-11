@@ -124,6 +124,21 @@ pub trait ArrayElement: private::Codec {
         Self::from_real(value.re)
     }
 
+    /// Returns a zero value of this type, using `false` for Boolean elements and positive zero for each floating-point
+    /// component. Returns an error for types which cannot represent zero (e.g., [`f8e8m0fnu`]).
+    #[inline]
+    fn zero() -> Result<Self, ProgramError> {
+        Self::from_unsigned(0)
+    }
+
+    /// Returns a one value of this type, using `true` for Boolean elements and a zero imaginary component for complex
+    /// elements. Integer elements use the same two's-complement narrowing as [`from_unsigned`](Self::from_unsigned), so
+    /// [`i1`] uses its all-ones encoding, representing `-1`. The result is fallible to share the conversion contract.
+    #[inline]
+    fn one() -> Result<Self, ProgramError> {
+        Self::from_unsigned(1)
+    }
+
     /// Returns the identity used to initialize a minimum reduction (i.e., the largest integer, `true` for Boolean
     /// elements, or positive infinity for floating-point elements). Formats without infinity use their largest finite
     /// value. Complex elements use positive infinity in the real component and zero in the imaginary component.
@@ -1900,6 +1915,94 @@ mod tests {
         assert_eq!(Complex::<f64>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)),);
         assert_eq!(bool::from_complex(Complex::new(0.0, 2.0)), Ok(true));
         assert_eq!(bool::from_complex(Complex::new(0.0, 0.0)), Ok(false));
+    }
+
+    #[test]
+    fn test_array_element_zero() {
+        assert_eq!(bool::zero(), Ok(false));
+        assert_eq!(i1::zero(), Ok(i1::from_bits(0).unwrap()));
+        assert_eq!(i2::zero(), Ok(i2::from_bits(0).unwrap()));
+        assert_eq!(i4::zero(), Ok(i4::from_bits(0).unwrap()));
+        assert_eq!(u1::zero(), Ok(u1::from_bits(0).unwrap()));
+        assert_eq!(u2::zero(), Ok(u2::from_bits(0).unwrap()));
+        assert_eq!(u4::zero(), Ok(u4::from_bits(0).unwrap()));
+        assert_eq!(i8::zero(), Ok(0));
+        assert_eq!(i16::zero(), Ok(0));
+        assert_eq!(i32::zero(), Ok(0));
+        assert_eq!(i64::zero(), Ok(0));
+        assert_eq!(u8::zero(), Ok(0));
+        assert_eq!(u16::zero(), Ok(0));
+        assert_eq!(u32::zero(), Ok(0));
+        assert_eq!(u64::zero(), Ok(0));
+
+        // Check exact floating-point encodings, including positive zero.
+        assert_eq!(f4e2m1fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f6e2m3fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f6e3m2fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e3m4::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3fn::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e4m3b11fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e5m2::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f8e5m2fnuz::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(bf16::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f16::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f32::zero().unwrap().to_bits(), 0x0);
+        assert_eq!(f64::zero().unwrap().to_bits(), 0x0);
+        let complex = Complex::<f32>::zero().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x0);
+        assert_eq!(complex.im.to_bits(), 0);
+        let complex = Complex::<f64>::zero().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x0);
+        assert_eq!(complex.im.to_bits(), 0);
+        assert!(matches!(
+            f8e8m0fnu::zero(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_one() {
+        assert_eq!(bool::one(), Ok(true));
+        assert_eq!(i1::one(), Ok(i1::from_bits(1).unwrap()));
+        assert_eq!(i2::one(), Ok(i2::from_bits(1).unwrap()));
+        assert_eq!(i4::one(), Ok(i4::from_bits(1).unwrap()));
+        assert_eq!(u1::one(), Ok(u1::from_bits(1).unwrap()));
+        assert_eq!(u2::one(), Ok(u2::from_bits(1).unwrap()));
+        assert_eq!(u4::one(), Ok(u4::from_bits(1).unwrap()));
+        assert_eq!(i8::one(), Ok(1));
+        assert_eq!(i16::one(), Ok(1));
+        assert_eq!(i32::one(), Ok(1));
+        assert_eq!(i64::one(), Ok(1));
+        assert_eq!(u8::one(), Ok(1));
+        assert_eq!(u16::one(), Ok(1));
+        assert_eq!(u32::one(), Ok(1));
+        assert_eq!(u64::one(), Ok(1));
+
+        // Check exact floating-point encodings, including positive zero.
+        assert_eq!(f4e2m1fn::one().unwrap().to_bits(), 0x2);
+        assert_eq!(f6e2m3fn::one().unwrap().to_bits(), 0x8);
+        assert_eq!(f6e3m2fn::one().unwrap().to_bits(), 0xc);
+        assert_eq!(f8e3m4::one().unwrap().to_bits(), 0x30);
+        assert_eq!(f8e4m3::one().unwrap().to_bits(), 0x38);
+        assert_eq!(f8e4m3fn::one().unwrap().to_bits(), 0x38);
+        assert_eq!(f8e4m3fnuz::one().unwrap().to_bits(), 0x40);
+        assert_eq!(f8e4m3b11fnuz::one().unwrap().to_bits(), 0x58);
+        assert_eq!(f8e5m2::one().unwrap().to_bits(), 0x3c);
+        assert_eq!(f8e5m2fnuz::one().unwrap().to_bits(), 0x40);
+        assert_eq!(f8e8m0fnu::one().unwrap().to_bits(), 0x7f);
+        assert_eq!(bf16::one().unwrap().to_bits(), 0x3f80);
+        assert_eq!(f16::one().unwrap().to_bits(), 0x3c00);
+        assert_eq!(f32::one().unwrap().to_bits(), 0x3f800000);
+        assert_eq!(f64::one().unwrap().to_bits(), 0x3ff0000000000000);
+        let complex = Complex::<f32>::one().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x3f800000);
+        assert_eq!(complex.im.to_bits(), 0);
+        let complex = Complex::<f64>::one().unwrap();
+        assert_eq!(complex.re.to_bits(), 0x3ff0000000000000);
+        assert_eq!(complex.im.to_bits(), 0);
     }
 
     #[test]

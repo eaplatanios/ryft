@@ -40,13 +40,6 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 // one place per element family. They complement the value-level capabilities with the scalar arithmetic needed by
 // elementwise kernels and reductions; extrema selection and its identities are provided directly by ArrayElement.
 
-/// Element-level analogue of the [`Zero`](crate::operations::Zero) capability: the additive identity of one array
-/// element type. The extraction is fallible because `f8e8m0fnu` has no zero.
-trait ElementZero: ArrayElement {
-    /// Returns this element type's additive identity.
-    fn zero() -> Result<Self, ProgramError>;
-}
-
 /// Element-level analogue of the [`Add`](crate::operations::Add) capability, using the element type's ordinary
 /// arithmetic semantics (deterministic two's-complement wrapping for integers and round-to-nearest-even re-encoding
 /// for the low-precision floating-point formats).
@@ -169,13 +162,6 @@ trait ElementDivideByCount: ArrayElement {
 // Implements typed arithmetic for signed primitive integers with deterministic two's-complement wrapping.
 macro_rules! impl_array_arithmetic_for_signed_integer {
     ($type:ty) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(0)
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -272,13 +258,6 @@ macro_rules! impl_array_arithmetic_for_signed_integer {
 // Implements typed arithmetic for unsigned primitive integers with deterministic modular wrapping.
 macro_rules! impl_array_arithmetic_for_unsigned_integer {
     ($type:ty) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(0)
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -373,13 +352,6 @@ impl_array_arithmetic_for_unsigned_integer!(u64);
 // Implements modular arithmetic for a signed sub-byte integer's checked low-bit encoding.
 macro_rules! impl_array_arithmetic_for_signed_sub_byte_integer {
     ($type:ty) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(0).unwrap())
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -488,13 +460,6 @@ macro_rules! impl_array_arithmetic_for_signed_sub_byte_integer {
 // Implements modular arithmetic for an unsigned sub-byte integer's checked low-bit encoding.
 macro_rules! impl_array_arithmetic_for_unsigned_sub_byte_integer {
     ($type:ty) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(0).unwrap())
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -587,13 +552,6 @@ impl_array_arithmetic_for_unsigned_sub_byte_integer!(u4);
 // Implements arithmetic for a low-precision floating-point format through its exact f64 conversion contract.
 macro_rules! impl_array_arithmetic_for_low_precision_float {
     ($type:ty) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(0.0)?)
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -672,13 +630,6 @@ impl_array_arithmetic_for_low_precision_float!(f8e8m0fnu);
 // Implements ordinary arithmetic for a native or half-precision real floating-point type.
 macro_rules! impl_array_arithmetic_for_float {
     ($type:ty, $from_count:expr, $abs:expr) => {
-        impl ElementZero for $type {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok($from_count(0))
-            }
-        }
-
         impl ElementAdd for $type {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -787,13 +738,6 @@ macro_rules! divide_complex_array_element {
 // Implements complex arithmetic; division by a real count acts componentwise to avoid an unnecessary complex norm.
 macro_rules! impl_array_arithmetic_for_complex {
     ($component:ty) => {
-        impl ElementZero for Complex<$component> {
-            #[inline]
-            fn zero() -> Result<Self, ProgramError> {
-                Ok(Complex::new(0.0, 0.0))
-            }
-        }
-
         impl ElementAdd for Complex<$component> {
             #[inline]
             fn add(self, right: Self) -> Result<Self, ProgramError> {
@@ -1193,7 +1137,7 @@ impl Array {
     /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
     /// not finite, and then `log(sum(exp(x - safe_maximum))) + safe_maximum`. Every intermediate is held in the
     /// element's own encoding, so the result matches what the equivalent staged program computes.
-    fn log_sum_exp_elements<T: ElementZero + ElementAdd + ElementSub + ElementFloatMath>(
+    fn log_sum_exp_elements<T: ElementAdd + ElementSub + ElementFloatMath>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1249,7 +1193,7 @@ impl Array {
 
     /// Executes a typed sum or mean reduction, sharing the same wrapping addition and applying mean division in
     /// place after accumulation.
-    fn reduce_sum_or_mean_elements<T: ElementZero + ElementAdd + ElementDivideByCount>(
+    fn reduce_sum_or_mean_elements<T: ElementAdd + ElementDivideByCount>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1265,7 +1209,7 @@ impl Array {
     }
 
     /// Allocates an array whose logical elements are initialized to the additive identity.
-    fn zeroed<T: ElementZero>(output_type: ArrayType) -> Result<Self, ProgramError> {
+    fn zeroed<T: ArrayElement>(output_type: ArrayType) -> Result<Self, ProgramError> {
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         let zero = T::zero()?;
@@ -1279,7 +1223,7 @@ impl Array {
     /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
     /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
     /// group rather than the whole operand times the group count.
-    fn ragged_dot_elements<T: ElementZero + ElementAdd + ElementMul>(
+    fn ragged_dot_elements<T: ElementAdd + ElementMul>(
         &self,
         rhs: &Self,
         group_sizes: &Self,
@@ -1473,7 +1417,7 @@ impl Array {
         Ok(output)
     }
 
-    fn dot_elements<T: ElementZero + ElementAdd + ElementMul>(
+    fn dot_elements<T: ElementAdd + ElementMul>(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,

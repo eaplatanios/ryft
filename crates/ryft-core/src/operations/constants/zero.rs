@@ -183,8 +183,7 @@ impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
             }
             DataType::Zero => Array::new(r#type.clone(), Vec::new()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(0)?;
-                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+                Array::from_fn_elements(r#type.clone(), |_| Ok(Element::zero()?))
             }),
         }
     }

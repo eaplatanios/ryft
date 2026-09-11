@@ -170,8 +170,7 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
                 Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
             }
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(1)?;
-                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+                Array::from_fn_elements(r#type.clone(), |_| Ok(Element::one()?))
             }),
         }
     }
