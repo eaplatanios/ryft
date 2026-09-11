@@ -531,21 +531,24 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// outputs. Calls without this declaration retain the default ragged-input rejection. The contract deliberately
 /// supports one ragged axis per operand and one ragged batching level; differentiation remains governed by the same
 /// custom JVP/VJP wrappers as dense calls.
-/// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect)
-/// reports [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its
-/// execution order relative to other ordered effects; the lowered custom call is then also marked
-/// `has_side_effect = true` so the XLA compiler never elides or reorders it.
+/// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect) reports
+/// [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its execution
+/// order relative to other ordered I/O effects across every participating device; the lowered custom call is then
+/// also marked `has_side_effect = true`. [`with_effect_class`](Self::with_effect_class) selects a different
+/// contract: [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O executing on the
+/// same device, which is what permits the call to execute once per device inside `shard_map` bodies, and
+/// [`EffectClass::UnorderedIo`] keeps the call observable without any ordering dependency.
 ///
 /// # Backend Contract
 ///
 /// This operation is backend-independent by design, and this payload is the entire portable contract: a target
 /// name resolved in the executing backend's kernel registry, declared output types, typed configuration
-/// attributes, and an effect flag. A backend supports the operation by providing (1) a process- or client-level
-/// registry that resolves target names to executable kernels at execution time, (2) a calling convention that
-/// hands the kernel its input buffers, output buffers matching the declared output types, and the decoded
-/// attributes, and (3) an execution engine that honors [`EffectClass::OrderedIo`] for side-effecting calls. Backends
-/// that cannot execute foreign kernels (like the reference array backend) reject interpretation with a clear
-/// error instead of guessing.
+/// attributes, and an optional effect class. A backend supports the operation by providing (1) a process- or
+/// client-level registry that resolves target names to executable kernels at execution time, (2) a calling
+/// convention that hands the kernel its input buffers, output buffers matching the declared output types, and the
+/// decoded attributes, and (3) an execution engine that honors the declared effect class for side-effecting calls.
+/// Backends that cannot execute foreign kernels (like the reference array backend) reject interpretation with a
+/// clear error instead of guessing.
 ///
 /// Array layouts come from the canonical [`ArrayType`] descriptors of the operands and results. Portable flat-array
 /// buffer aliases are declared with [`CustomCallInputOutputAlias`]. Backend-specific vocabulary must never grow on
@@ -566,8 +569,8 @@ pub struct CustomCallOperation<T: Type> {
     /// Flat array input/output buffer aliases, in declaration order.
     input_output_aliases: Vec<CustomCallInputOutputAlias>,
 
-    /// Whether the call has observable side effects beyond its returned outputs.
-    has_side_effect: bool,
+    /// Observable effect of the call, or `None` for a pure call.
+    effect_class: Option<EffectClass>,
 
     /// Behavior requested when the batching transform maps one of this call's operands.
     batching: CustomCallBatching,
@@ -593,7 +596,7 @@ impl CustomCallOperation<ArrayType> {
             output_types,
             attributes: Vec::new(),
             input_output_aliases: Vec::new(),
-            has_side_effect: false,
+            effect_class: None,
             batching: CustomCallBatching::default(),
             ragged_contract: None,
             marker: PhantomData,
@@ -628,10 +631,25 @@ impl<T: Type> CustomCallOperation<T> {
         Ok(self)
     }
 
-    /// Returns a copy of this [`CustomCallOperation`] marked as having observable side effects.
+    /// Returns this call declaring [`EffectClass::OrderedIo`], replacing any earlier effect selection. This is the
+    /// strongest I/O contract: one execution order across every participating device, which restricts the program
+    /// to single-device placement. Refer to [`with_effect_class`](Self::with_effect_class) for the alternatives.
     #[inline]
-    pub fn with_side_effect(mut self) -> Self {
-        self.has_side_effect = true;
+    pub fn with_side_effect(self) -> Self {
+        self.with_effect_class(EffectClass::OrderedIo)
+    }
+
+    /// Returns this call declaring the provided observable effect class, replacing any earlier selection.
+    ///
+    /// Every class keeps the call alive through dead-code elimination and marks the lowered call `has_side_effect`.
+    /// The I/O classes differ in ordering scope: [`EffectClass::OrderedIo`] promises one order across devices,
+    /// [`EffectClass::DeviceOrderedIo`] promises program order only among the ordered I/O executing on the same
+    /// device and therefore permits the handler to run once per device (the handler must tolerate that
+    /// replication), and [`EffectClass::UnorderedIo`] promises no ordering. The effect class does not supply
+    /// batching or differentiation rules, and does not determine whether execution blocks the calling thread.
+    #[inline]
+    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
+        self.effect_class = Some(effect_class);
         self
     }
 
@@ -679,7 +697,13 @@ impl<T: Type> CustomCallOperation<T> {
     /// Returns whether the call has observable side effects beyond its returned outputs.
     #[inline]
     pub fn has_side_effect(&self) -> bool {
-        self.has_side_effect
+        self.effect_class.is_some()
+    }
+
+    /// Returns the observable [`EffectClass`] declared by this call, or `None` for a pure call.
+    #[inline]
+    pub fn effect_class(&self) -> Option<EffectClass> {
+        self.effect_class
     }
 
     /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one of this call's
@@ -706,7 +730,7 @@ impl<T: Type> CustomCallOperation<T> {
                 .collect::<Result<Vec<_>, _>>()?,
             attributes: self.attributes.clone(),
             input_output_aliases: self.input_output_aliases.clone(),
-            has_side_effect: self.has_side_effect,
+            effect_class: self.effect_class,
             batching: self.batching,
             ragged_contract: self.ragged_contract.as_ref().map(|contract| contract.renamed(renaming)).transpose()?,
             marker: PhantomData,
@@ -808,8 +832,11 @@ impl<T: Type> CustomCallOperation<T> {
             for alias in &self.input_output_aliases {
                 operation.field("input_output_alias", alias)?;
             }
-            if self.has_side_effect {
+            if let Some(effect_class) = self.effect_class {
                 operation.field("has_side_effect", true)?;
+                if effect_class != EffectClass::OrderedIo {
+                    operation.field("effect_class", effect_class)?;
+                }
             }
             if self.batching != CustomCallBatching::default() {
                 operation.field("batching", self.batching)?;
@@ -829,7 +856,7 @@ impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayIrType> {
             output_types: operation.output_types,
             attributes: operation.attributes,
             input_output_aliases: operation.input_output_aliases,
-            has_side_effect: operation.has_side_effect,
+            effect_class: operation.effect_class,
             batching: operation.batching,
             ragged_contract: operation.ragged_contract,
             marker: PhantomData,
@@ -844,7 +871,7 @@ impl From<CustomCallOperation<ArrayIrType>> for CustomCallOperation<ArrayType> {
             output_types: operation.output_types,
             attributes: operation.attributes,
             input_output_aliases: operation.input_output_aliases,
-            has_side_effect: operation.has_side_effect,
+            effect_class: operation.effect_class,
             batching: operation.batching,
             ragged_contract: operation.ragged_contract,
             marker: PhantomData,
@@ -1397,11 +1424,7 @@ impl Operation for CustomCallOperation<ArrayType> {
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Owned(Effects::explicit(if self.has_side_effect {
-            EffectClasses::single(EffectClass::OrderedIo)
-        } else {
-            EffectClasses::NONE
-        }))
+        Cow::Owned(Effects::explicit(self.effect_class.map(EffectClasses::single).unwrap_or(EffectClasses::NONE)))
     }
 
     fn rename_type_identities(
@@ -1463,11 +1486,7 @@ impl Operation for CustomCallOperation<ArrayIrType> {
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Owned(Effects::explicit(if self.has_side_effect {
-            EffectClasses::single(EffectClass::OrderedIo)
-        } else {
-            EffectClasses::NONE
-        }))
+        Cow::Owned(Effects::explicit(self.effect_class.map(EffectClasses::single).unwrap_or(EffectClasses::NONE)))
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -2208,6 +2227,45 @@ mod tests {
             Err(TypeError::invalid(
                 "`custom_call` expects 2 trailing output-extent dimensions but only 1 inputs were provided",
             )),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_operation_with_effect_class() {
+        let pure = CustomCallOperation::new("ryft.test.effect", Vec::new());
+        assert_eq!(pure.effect_class(), None);
+        assert!(!pure.has_side_effect());
+        assert!(pure.effects().is_pure());
+
+        // `with_side_effect` selects the global ordered class, which renders as the bare `has_side_effect` flag.
+        let ordered = pure.clone().with_side_effect();
+        assert_eq!(ordered.effect_class(), Some(EffectClass::OrderedIo));
+        assert_eq!(ordered.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(ordered.to_string(), "custom_call [target=ryft.test.effect, has_side_effect=true]");
+
+        // Other classes render explicitly and survive the type-universe conversions and identity renaming.
+        for effect_class in [EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo] {
+            let operation = pure.clone().with_effect_class(effect_class);
+            assert!(operation.has_side_effect());
+            assert_eq!(operation.effect_class(), Some(effect_class));
+            assert_eq!(operation.effects().classes(), EffectClasses::single(effect_class));
+            assert_eq!(
+                operation.to_string(),
+                format!("custom_call [target=ryft.test.effect, has_side_effect=true, effect_class={effect_class}]"),
+            );
+            let mixed = CustomCallOperation::<ArrayIrType>::from(operation.clone());
+            assert_eq!(mixed.effect_class(), Some(effect_class));
+            assert_eq!(CustomCallOperation::<ArrayType>::from(mixed).effect_class(), Some(effect_class));
+            assert_eq!(
+                operation.rename_type_identities(&TypeIdentityRenaming::default()).unwrap().effect_class(),
+                Some(effect_class),
+            );
+        }
+
+        // The last selection wins.
+        assert_eq!(
+            ordered.with_effect_class(EffectClass::UnorderedIo).with_side_effect().effect_class(),
+            Some(EffectClass::OrderedIo),
         );
     }
 
@@ -3114,6 +3172,27 @@ mod tests {
             broadcast.rename_type_identities(&TypeIdentityRenaming::default()).unwrap().batching(),
             CustomCallBatching::BroadcastAll,
         );
+    }
+
+    #[test]
+    fn test_custom_call_batches_sequentially_with_unordered_effects() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
+                    .with_effect_class(EffectClass::UnorderedIo)
+                    .with_batching(CustomCallBatching::Sequential { unroll: None });
+                Ok(CustomCall::custom_call(&operation, [&input])?.remove(0))
+            },
+            vector_type(),
+        )
+        .unwrap();
+        let (batched, output_axes) = program
+            .to_flat_program()
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
     }
 
     /// `Sequential` stages one carry-free-per-operand `scan` whose body performs exactly one unbatched call: the

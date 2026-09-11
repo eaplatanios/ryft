@@ -17,10 +17,21 @@ pub enum EffectClass {
     /// and the relative execution order of retained assertions must be preserved.
     OrderedAssertion,
 
-    /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other
-    /// [`OrderedIo`](Self::OrderedIo) effects is observable (e.g., interleaved printed output). Operations with this
-    /// effect must not be folded away or get eliminated, and their relative execution order must be preserved.
+    /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other ordered I/O
+    /// effects is observable (e.g., interleaved printed output) and forms one total order across every participating
+    /// device. Operations with this effect must not be folded away or get eliminated, and their relative execution
+    /// order must be preserved. Because a global order cannot be provided by devices that execute independently, a
+    /// program containing this effect must execute on a single device; backends reject multi-device placement of it.
+    /// Use [`DeviceOrderedIo`](Self::DeviceOrderedIo) when per-device order suffices.
     OrderedIo,
+
+    /// Observable input/output [`EffectClass`] whose execution order relative to other ordered I/O effects executing
+    /// on the same device is observable and must be preserved, while occurrences on different devices have no
+    /// promised relative order. Operations with this effect must not be folded away or get eliminated. Every device
+    /// participating in a multi-device execution runs its own copy of the effect and preserves program order among
+    /// the ordered I/O effects it executes, so this class is the one to declare for effects that tolerate replicated
+    /// per-device execution (e.g., inside `shard_map` operation bodies in the XLA backend).
+    DeviceOrderedIo,
 
     /// Observable input/output (e.g., printing) [`EffectClass`] whose execution order relative to other effects is not
     /// observable. Operations with this effect must not be folded away or get eliminated, but independent unordered-I/O
@@ -43,26 +54,51 @@ pub enum EffectClass {
 
 impl EffectClass {
     /// All declared effect classes, in bit order, backing [`EffectClasses`]'s [`IntoIterator`] implementation.
-    const ALL: [EffectClass; 4] =
-        [EffectClass::OrderedAssertion, EffectClass::OrderedIo, EffectClass::UnorderedIo, EffectClass::OrderedState];
+    const ALL: [EffectClass; 5] = [
+        EffectClass::OrderedAssertion,
+        EffectClass::OrderedIo,
+        EffectClass::DeviceOrderedIo,
+        EffectClass::UnorderedIo,
+        EffectClass::OrderedState,
+    ];
 
     /// Returns the bit representing this effect class inside an [`EffectClasses`] set.
     const fn bit(self) -> u8 {
         match self {
             EffectClass::OrderedAssertion => 1 << 0,
             EffectClass::OrderedIo => 1 << 1,
-            EffectClass::UnorderedIo => 1 << 2,
-            EffectClass::OrderedState => 1 << 3,
+            EffectClass::DeviceOrderedIo => 1 << 2,
+            EffectClass::UnorderedIo => 1 << 3,
+            EffectClass::OrderedState => 1 << 4,
         }
     }
 
-    /// Returns `true` if the execution order of this effect class relative to other effects of the same class is
-    /// observable and must be preserved.
+    /// Returns `true` if the execution order of this effect class relative to other effects of the same class
+    /// is observable and must be preserved. The ordered I/O classes (i.e., [`OrderedIo`](Self::OrderedIo) and
+    /// [`DeviceOrderedIo`](Self::DeviceOrderedIo)) additionally share one ordering relationship: on any one device,
+    /// their occurrences execute in program order relative to each other, and they differ only in whether that order
+    /// also spans devices.
     pub const fn is_ordered(self) -> bool {
         match self {
-            EffectClass::OrderedState | EffectClass::OrderedAssertion | EffectClass::OrderedIo => true,
+            EffectClass::OrderedState
+            | EffectClass::OrderedAssertion
+            | EffectClass::OrderedIo
+            | EffectClass::DeviceOrderedIo => true,
             EffectClass::UnorderedIo => false,
         }
+    }
+}
+
+impl Display for EffectClass {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            EffectClass::OrderedAssertion => "ordered_assertion",
+            EffectClass::OrderedIo => "ordered_io",
+            EffectClass::DeviceOrderedIo => "device_ordered_io",
+            EffectClass::UnorderedIo => "unordered_io",
+            EffectClass::OrderedState => "ordered_state",
+        })
     }
 }
 
@@ -740,8 +776,14 @@ mod tests {
         // A singleton set contains only its effect, and every ordered class reports observable ordering.
         let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
         let ordered_io = EffectClasses::single(EffectClass::OrderedIo);
+        let device_ordered_io = EffectClasses::single(EffectClass::DeviceOrderedIo);
         let unordered = EffectClasses::single(EffectClass::UnorderedIo);
         let ordered_state = EffectClasses::single(EffectClass::OrderedState);
+        assert!(!device_ordered_io.is_empty());
+        assert!(device_ordered_io.contains(EffectClass::DeviceOrderedIo));
+        assert!(!device_ordered_io.contains(EffectClass::OrderedIo));
+        assert!(device_ordered_io.is_ordered());
+        assert_eq!(device_ordered_io.into_iter().collect::<Vec<_>>(), vec![EffectClass::DeviceOrderedIo]);
         assert!(!assertion.is_empty());
         assert!(assertion.contains(EffectClass::OrderedAssertion));
         assert!(!assertion.contains(EffectClass::OrderedIo));
@@ -763,14 +805,15 @@ mod tests {
 
         // Union is commutative and idempotent, `NONE` is its identity element, and the combined set contains every
         // class and iterates in declaration order.
-        let all = assertion.union(ordered_io).union(unordered).union(ordered_state);
-        assert_eq!(all, unordered.union(ordered_io).union(assertion).union(ordered_state));
+        let all = assertion.union(ordered_io).union(device_ordered_io).union(unordered).union(ordered_state);
+        assert_eq!(all, unordered.union(device_ordered_io).union(ordered_io).union(assertion).union(ordered_state));
         assert_eq!(all.union(all), all);
         assert_eq!(all.union(EffectClasses::NONE), all);
         assert_eq!(EffectClasses::NONE.union(assertion), assertion);
         assert!(!all.is_empty());
         assert!(all.contains(EffectClass::OrderedAssertion));
         assert!(all.contains(EffectClass::OrderedIo));
+        assert!(all.contains(EffectClass::DeviceOrderedIo));
         assert!(all.contains(EffectClass::UnorderedIo));
         assert!(all.contains(EffectClass::OrderedState));
         assert!(all.is_ordered());
@@ -779,6 +822,7 @@ mod tests {
             vec![
                 EffectClass::OrderedAssertion,
                 EffectClass::OrderedIo,
+                EffectClass::DeviceOrderedIo,
                 EffectClass::UnorderedIo,
                 EffectClass::OrderedState
             ],
@@ -793,8 +837,20 @@ mod tests {
         let lookup = HashMap::from([(assertion, "assertion"), (ordered_io, "ordered I/O"), (all, "all")]);
         assert_eq!(lookup.get(&EffectClasses::single(EffectClass::OrderedAssertion)), Some(&"assertion"));
         assert_eq!(lookup.get(&EffectClasses::single(EffectClass::OrderedIo)), Some(&"ordered I/O"));
-        assert_eq!(lookup.get(&unordered.union(ordered_io).union(assertion).union(ordered_state)), Some(&"all"));
+        assert_eq!(
+            lookup.get(&unordered.union(ordered_io).union(device_ordered_io).union(assertion).union(ordered_state)),
+            Some(&"all"),
+        );
         assert_eq!(lookup.get(&unordered), None);
+    }
+
+    #[test]
+    fn test_effect_class_display() {
+        assert_eq!(EffectClass::OrderedAssertion.to_string(), "ordered_assertion");
+        assert_eq!(EffectClass::OrderedIo.to_string(), "ordered_io");
+        assert_eq!(EffectClass::DeviceOrderedIo.to_string(), "device_ordered_io");
+        assert_eq!(EffectClass::UnorderedIo.to_string(), "unordered_io");
+        assert_eq!(EffectClass::OrderedState.to_string(), "ordered_state");
     }
 
     #[test]

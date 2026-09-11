@@ -21,13 +21,16 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// [`jax.debug.print`](https://docs.jax.dev/en/latest/debugging/print_breakpoint.html). Refer to the documentation of
 /// [`Print`] for more information.
 ///
-/// This is ryft's first operation with observable effects: [`Operation::effects`] reports [`EffectClass::OrderedIo`], so
-/// program transforms never eliminate it as dead code (even when nothing consumes its output) and preserve its
-/// execution order relative to other ordered-I/O operations. Partial evaluation places it by input known-ness like
-/// any other operation — an all-known print folds into the known side (printing at partial-evaluation time under an
-/// eager known-side context, which is also what makes linearization print during the forward pass), while a
-/// mixed-input print residualizes. Differentiation passes the tangent through unchanged while re-printing the primal
-/// value, and transposition is the identity on the cotangent (adjoints are not printed).
+/// By default, [`Operation::effects`] reports [`EffectClass::OrderedIo`], so program transforms never eliminate it as
+/// dead code (even when nothing consumes its output) and preserve its execution order relative to other ordered-I/O
+/// operations across every participating device. [`with_effect_class`](Self::with_effect_class) selects a weaker
+/// contract instead: [`EffectClass::DeviceOrderedIo`] keeps program order only among the ordered I/O executing on
+/// the same device, which allows the print to run once per device inside `shard_map` bodies, and
+/// [`EffectClass::UnorderedIo`] retains the print without ordering it relative to other I/O. Partial evaluation
+/// places it by input known-ness like any other operation — an all-known print folds into the known side (printing
+/// at partial-evaluation time under an eager known-side context, which is also what makes linearization print during
+/// the forward pass), while a mixed-input print residualizes. Differentiation passes the tangent through unchanged
+/// while re-printing the primal value, and transposition is the identity on the cotangent (adjoints are not printed).
 ///
 /// Eager interpretation prints directly. The XLA backend lowers this operation to a StableHLO host-callback custom
 /// call (`@ryft.print`) threaded on a token chain that preserves ordered-I/O execution order within one dispatch,
@@ -41,21 +44,39 @@ pub struct PrintOperation<T: Type> {
     /// Label printed before the value.
     label: String,
 
+    /// Observable I/O effect class of this print.
+    effect_class: EffectClass,
+
     /// Type universe in which this operation is valid.
     marker: PhantomData<fn() -> T>,
 }
 
 impl<T: Type> PrintOperation<T> {
-    /// Creates a new [`PrintOperation`] with the provided label.
+    /// Creates a new [`PrintOperation`] with the provided label and the default [`EffectClass::OrderedIo`] effect.
     #[inline]
     pub fn new<L: Into<String>>(label: L) -> Self {
-        Self { label: label.into(), marker: PhantomData }
+        Self { label: label.into(), effect_class: EffectClass::OrderedIo, marker: PhantomData }
     }
 
     /// Returns the label carried by this [`PrintOperation`].
     #[inline]
     pub fn label(&self) -> &str {
         self.label.as_str()
+    }
+
+    /// Returns the [`EffectClass`] declared by this [`PrintOperation`].
+    #[inline]
+    pub fn effect_class(&self) -> EffectClass {
+        self.effect_class
+    }
+
+    /// Returns this print declaring the provided I/O effect class, replacing the default [`EffectClass::OrderedIo`].
+    /// Every class keeps the print observable; they differ only in ordering scope, as described in the type
+    /// documentation.
+    #[inline]
+    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
+        self.effect_class = effect_class;
+        self
     }
 }
 
@@ -85,12 +106,17 @@ impl<T: Type> Operation for PrintOperation<T> {
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)))
+        Cow::Owned(Effects::explicit(EffectClasses::single(self.effect_class)))
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, PRINT_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("label", &self.label))
+        OperationFormatter::new(formatter, indentation, PRINT_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("label", &self.label)?;
+            if self.effect_class != EffectClass::OrderedIo {
+                operation.field("effect_class", self.effect_class)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -131,11 +157,20 @@ impl_differentiable_elementwise_operation! {
 
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged
-/// operation reports [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
-/// relative to other prints.
+/// operation defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution
+/// order relative to other ordered prints.
 pub trait Print: Sized {
     /// Returns this value unchanged while printing it to standard error with `label`.
-    fn print(self, label: &str) -> Self;
+    fn print(self, label: &str) -> Self {
+        self.print_with_effect_class(label, EffectClass::OrderedIo)
+    }
+
+    /// Returns this value unchanged while printing it with the provided I/O [`EffectClass`].
+    ///
+    /// [`EffectClass::DeviceOrderedIo`] keeps the print ordered only relative to the ordered I/O on the same device,
+    /// and [`EffectClass::UnorderedIo`] lets it run independently of other prints while remaining observable. The
+    /// effect class does not determine whether a backend executes the call inline or asynchronously.
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self;
 }
 
 // Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
@@ -147,9 +182,9 @@ where
     V::DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>,
 {
     #[inline]
-    fn print(self, label: &str) -> Self {
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self {
         self.dispatch_domain()
-            .bind(PrintOperation::new(label), Vec::new(), std::slice::from_ref(&self))
+            .bind(PrintOperation::new(label).with_effect_class(effect_class), Vec::new(), std::slice::from_ref(&self))
             .expect("`print` operation failed")
             .remove(0)
     }
@@ -183,6 +218,39 @@ mod tests {
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(Operation::infer_output_types(&operation, &[scalar_type.clone()], &[]), Ok(vec![scalar_type]));
         assert_eq!(operation.to_string(), "print [label=x]");
+    }
+
+    #[test]
+    fn test_print_operation_with_effect_class() {
+        let operation = PrintOperation::<ArrayType>::new("x");
+        assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
+        for effect_class in [EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo] {
+            let operation = operation.clone().with_effect_class(effect_class);
+            assert_eq!(operation.effect_class(), effect_class);
+            assert_eq!(operation.effects().classes(), EffectClasses::single(effect_class));
+            assert_eq!(operation.to_string(), format!("print [label=x, effect_class={effect_class}]"));
+        }
+        let restored = operation.with_effect_class(EffectClass::UnorderedIo).with_effect_class(EffectClass::OrderedIo);
+        assert_eq!(restored.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(restored.to_string(), "print [label=x]");
+    }
+
+    #[test]
+    fn test_print_with_effect_class() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let _printed = x.clone().print_with_effect_class("x", EffectClass::UnorderedIo);
+                Ok(x.clone() * x)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        // An unused unordered print survives the primal partition, retaining its class through differentiation.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
     }
 
     #[test]
