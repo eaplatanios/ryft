@@ -271,7 +271,7 @@ mod tests {
         let value_42i64 = Value::i64(42);
         let value_m100i64: Value = (-100).into();
         let value_i64_list: Value = [3, 2, 2].into();
-        let value_3p14f32: Value = 3.14f32.into();
+        let value_3p14f32: Value = std::f32::consts::PI.into();
         let value_3p15f32 = Value::f32(3.15);
         let value_0f32 = Value::f32(0.0);
         let value_empty_string = Value::string("");
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(Value::i64_list([3, 2, 2]), value_i64_list);
         assert_ne!(Value::i64_list([3, 2, 1]), value_i64_list);
         assert_ne!(value_i64_list, value_0i64);
-        assert_eq!(value_3p14f32, Value::f32(3.14));
+        assert_eq!(value_3p14f32, Value::f32(std::f32::consts::PI));
         assert_ne!(value_3p14f32, value_3p15f32);
         assert_ne!(value_0f32, value_0i64);
         assert_ne!(value_0f32, value_empty_string);
@@ -320,12 +320,12 @@ mod tests {
         assert_eq!(format!("{}", Value::r#bool(true)), "true");
         assert_eq!(format!("{}", Value::i64(42)), "42");
         assert_eq!(format!("{}", Value::i64_list([1, 2, 3])), "[1, 2, 3]");
-        assert_eq!(format!("{}", Value::f32(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::f32(std::f32::consts::PI)), "3.1415927");
         assert_eq!(format!("{}", Value::string("hello")), "\"hello\"");
         assert_eq!(format!("{:?}", Value::r#bool(true)), "Bool(true)");
         assert_eq!(format!("{:?}", Value::i64(42)), "I64(42)");
         assert_eq!(format!("{:?}", Value::i64_list([1, 2, 3])), "I64List([1, 2, 3])");
-        assert_eq!(format!("{:?}", Value::f32(3.14)), "F32(3.14)");
+        assert_eq!(format!("{:?}", Value::f32(std::f32::consts::PI)), "F32(3.1415927)");
         assert_eq!(format!("{:?}", Value::string("hello")), "String(\"hello\")");
     }
 
