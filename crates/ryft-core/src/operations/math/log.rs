@@ -163,10 +163,12 @@ mod tests {
 
     #[test]
     fn test_log_complex_differentiation() {
+        // The analytic quotient and the scalar division algorithm may round their intermediate values differently.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_eq!(
-            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.log().unwrap()),
-            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / input)),
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.log().unwrap()).unwrap(),
+            Array::scalar(ComplexNumber::new(1.0, 0.0) / input),
+            epsilon = 1e-15,
         );
     }
 

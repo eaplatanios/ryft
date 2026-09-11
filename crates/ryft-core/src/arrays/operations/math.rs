@@ -1813,9 +1813,11 @@ mod tests {
             Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),
             epsilon = 1e-12,
         );
-        // Division normalizes large finite denominators when the direct norm-squared formula would overflow.
+        // Ratio-based division can still overflow when both denominator components are near the largest value.
         let large = Array::scalar(ComplexNumber::new(1e308f64, 1e308));
-        assert_abs_diff_eq!(large.div(&large).unwrap(), Array::scalar(ComplexNumber::new(1.0, 0.0)), epsilon = 1e-12,);
+        let quotient = large.div(&large).unwrap().elements::<ComplexNumber<f64>>().unwrap()[0];
+        assert!(quotient.re.is_nan());
+        assert_eq!(quotient.im.to_bits(), 0.0f64.to_bits());
     }
 
     #[test]

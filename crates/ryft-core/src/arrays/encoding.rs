@@ -184,8 +184,9 @@ pub trait ArrayElement: private::Codec {
 
     /// Divides this element by `rhs`. Integer division truncates toward zero and returns an error for a zero divisor
     /// or for signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination format's
-    /// rounding and representability rules. Complex division rescales finite operands when the direct quotient is
-    /// non-finite to avoid intermediate overflow. Boolean elements return an error.
+    /// rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
+    /// denominator, with explicit recovery for zero divisors and infinite operands when both result components would
+    /// otherwise be NaN. Intermediate overflow can still produce NaN components. Boolean elements return an error.
     fn div(self, rhs: Self) -> Result<Self, ProgramError>;
 
     /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return an error. The
@@ -1966,34 +1967,45 @@ macro_rules! impl_array_element_for_complex_types {
 
             #[inline]
             fn div(self, rhs: Self) -> Result<Self, ProgramError> {
-                // Normalize finite operands when direct division overflows to avoid squaring a large denominator.
-                let direct = self / rhs;
-                Ok(if direct.re.is_finite() && direct.im.is_finite()
-                    || !self.re.is_finite()
-                    || !self.im.is_finite()
-                    || !rhs.re.is_finite()
-                    || !rhs.im.is_finite()
-                    || rhs.re == 0.0 && rhs.im == 0.0
-                {
-                    direct
-                } else if rhs.im == 0.0 {
-                    Complex::new(self.re / rhs.re, self.im / rhs.re)
-                } else if rhs.re == 0.0 {
-                    Complex::new(self.im / rhs.im, -self.re / rhs.im)
+                // Smith's ratio-based formula avoids forming the denominator's squared magnitude. Keep the operation
+                // order aligned with XLA's `ElementalIrEmitter::EmitComplexDivide`, including its finite overflow
+                // behavior; an additional rescaling would change the results at extreme magnitudes.
+                let result = if rhs.re.abs() < rhs.im.abs() {
+                    let ratio = rhs.re / rhs.im;
+                    let denominator = rhs.im + ratio * rhs.re;
+                    Self::new((ratio * self.re + self.im) / denominator, (ratio * self.im - self.re) / denominator)
                 } else {
-                    let scale = rhs.re.abs().max(rhs.im.abs());
-                    let lhs = Complex::new(self.re / scale, self.im / scale);
-                    let rhs = Complex::new(rhs.re / scale, rhs.im / scale);
-                    if rhs.re.abs() >= rhs.im.abs() {
-                        let ratio = rhs.im / rhs.re;
-                        let denominator = rhs.re + rhs.im * ratio;
-                        Complex::new((lhs.re + lhs.im * ratio) / denominator, (lhs.im - lhs.re * ratio) / denominator)
-                    } else {
-                        let ratio = rhs.re / rhs.im;
-                        let denominator = rhs.im + rhs.re * ratio;
-                        Complex::new((lhs.re * ratio + lhs.im) / denominator, (lhs.im * ratio - lhs.re) / denominator)
+                    let ratio = rhs.im / rhs.re;
+                    let denominator = rhs.re + ratio * rhs.im;
+                    Self::new((ratio * self.im + self.re) / denominator, (self.im - ratio * self.re) / denominator)
+                };
+
+                // Recover exceptional cases only when both components are NaN. A single NaN component is part of
+                // the result and must not trigger recovery. The order below also determines how mixed NaN/Inf
+                // inputs and signed-zero denominators are handled.
+                if result.re.is_nan() && result.im.is_nan() {
+                    if rhs.re == 0.0 && rhs.im == 0.0 && (!self.re.is_nan() || !self.im.is_nan()) {
+                        let infinity = <$component>::INFINITY.copysign(rhs.re);
+                        return Ok(Self::new(infinity * self.re, infinity * self.im));
                     }
-                })
+                    if (self.re.is_infinite() || self.im.is_infinite()) && rhs.re.is_finite() && rhs.im.is_finite() {
+                        let real = (if self.re.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(self.re);
+                        let imaginary = (if self.im.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(self.im);
+                        return Ok(Self::new(
+                            <$component>::INFINITY * (real * rhs.re + imaginary * rhs.im),
+                            <$component>::INFINITY * (imaginary * rhs.re - real * rhs.im),
+                        ));
+                    }
+                    if (rhs.re.is_infinite() || rhs.im.is_infinite()) && self.re.is_finite() && self.im.is_finite() {
+                        let real = (if rhs.re.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(rhs.re);
+                        let imaginary = (if rhs.im.is_infinite() { 1.0 as $component } else { 0.0 }).copysign(rhs.im);
+                        return Ok(Self::new(
+                            0.0 * (self.re * real + self.im * imaginary),
+                            0.0 * (self.im * real - self.re * imaginary),
+                        ));
+                    }
+                }
+                Ok(result)
             }
 
             fn rem(self, _rhs: Self) -> Result<Self, ProgramError> {
@@ -2743,15 +2755,88 @@ mod tests {
             0x1,
         );
 
-        // A finite quotient remains finite when computing the denominator's squared norm would overflow.
-        assert_eq!(
-            ArrayElement::div(Complex::new(f32::MAX, f32::MAX), Complex::new(f32::MAX, f32::MAX)),
-            Ok(Complex::new(1.0, 0.0)),
-        );
-        assert_eq!(
-            ArrayElement::div(Complex::new(f64::MAX, f64::MAX), Complex::new(f64::MAX, f64::MAX)),
-            Ok(Complex::new(1.0, 0.0)),
-        );
+        // Large and small finite denominators avoid the overflow/underflow of the squared-magnitude formula.
+        // Expectations follow XLA's `ElementalIrEmitter::EmitComplexDivide`, including its remaining overflow cases.
+        let large = 2.0f32.powi(100);
+        let small = 2.0f32.powi(-100);
+        for (lhs, rhs, expected) in [
+            ((1.0, 0.0), (large, 0.0), (small, 0.0)),
+            ((1.0, 0.0), (0.0, large), (0.0, -small)),
+            ((1.0, 0.0), (small, 0.0), (large, 0.0)),
+            ((1.0, 0.0), (0.0, small), (0.0, -large)),
+            ((large, large), (large, large), (1.0, 0.0)),
+            ((small, small), (small, small), (1.0, 0.0)),
+            ((f32::MAX, f32::MAX), (f32::MAX, f32::MAX), (f32::NAN, 0.0)),
+            ((-0.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+            ((0.0, -0.0), (1.0, 0.0), (0.0, -0.0)),
+            ((1.0, 2.0), (0.0, 0.0), (f32::INFINITY, f32::INFINITY)),
+            ((1.0, 2.0), (-0.0, 0.0), (f32::NEG_INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 0.0), (0.0, 0.0), (f32::INFINITY, f32::NAN)),
+            ((0.0, 0.0), (0.0, 0.0), (f32::NAN, f32::NAN)),
+            ((f32::INFINITY, f32::INFINITY), (1.0, 0.0), (f32::INFINITY, f32::INFINITY)),
+            ((f32::INFINITY, 0.0), (1.0, 1.0), (f32::INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 2.0), (f32::INFINITY, f32::INFINITY), (0.0, 0.0)),
+            ((1.0, 2.0), (f32::NEG_INFINITY, f32::INFINITY), (0.0, -0.0)),
+            ((1.0, 2.0), (f32::INFINITY, 0.0), (0.0, 0.0)),
+            ((f32::INFINITY, f32::INFINITY), (f32::INFINITY, 0.0), (f32::NAN, f32::NAN)),
+            ((1.0, 2.0), (f32::NAN, 1.0), (f32::NAN, f32::NAN)),
+            ((f32::NAN, 2.0), (0.0, 0.0), (f32::NAN, f32::INFINITY)),
+            ((f32::INFINITY, f32::NAN), (1.0, 1.0), (f32::INFINITY, f32::NEG_INFINITY)),
+            ((1.0, 2.0), (f32::INFINITY, f32::NAN), (0.0, 0.0)),
+        ] {
+            // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
+            let actual = ArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            if expected.0.is_nan() {
+                assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.re.to_bits(), expected.0.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+            if expected.1.is_nan() {
+                assert!(actual.im.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.im.to_bits(), expected.1.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+        }
+        let large = 2.0f64.powi(700);
+        let small = 2.0f64.powi(-700);
+        for (lhs, rhs, expected) in [
+            ((1.0, 0.0), (large, 0.0), (small, 0.0)),
+            ((1.0, 0.0), (0.0, large), (0.0, -small)),
+            ((1.0, 0.0), (small, 0.0), (large, 0.0)),
+            ((1.0, 0.0), (0.0, small), (0.0, -large)),
+            ((large, large), (large, large), (1.0, 0.0)),
+            ((small, small), (small, small), (1.0, 0.0)),
+            ((f64::MAX, f64::MAX), (f64::MAX, f64::MAX), (f64::NAN, 0.0)),
+            ((-0.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+            ((0.0, -0.0), (1.0, 0.0), (0.0, -0.0)),
+            ((1.0, 2.0), (0.0, 0.0), (f64::INFINITY, f64::INFINITY)),
+            ((1.0, 2.0), (-0.0, 0.0), (f64::NEG_INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 0.0), (0.0, 0.0), (f64::INFINITY, f64::NAN)),
+            ((0.0, 0.0), (0.0, 0.0), (f64::NAN, f64::NAN)),
+            ((f64::INFINITY, f64::INFINITY), (1.0, 0.0), (f64::INFINITY, f64::INFINITY)),
+            ((f64::INFINITY, 0.0), (1.0, 1.0), (f64::INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 2.0), (f64::INFINITY, f64::INFINITY), (0.0, 0.0)),
+            ((1.0, 2.0), (f64::NEG_INFINITY, f64::INFINITY), (0.0, -0.0)),
+            ((1.0, 2.0), (f64::INFINITY, 0.0), (0.0, 0.0)),
+            ((f64::INFINITY, f64::INFINITY), (f64::INFINITY, 0.0), (f64::NAN, f64::NAN)),
+            ((1.0, 2.0), (f64::NAN, 1.0), (f64::NAN, f64::NAN)),
+            ((f64::NAN, 2.0), (0.0, 0.0), (f64::NAN, f64::INFINITY)),
+            ((f64::INFINITY, f64::NAN), (1.0, 1.0), (f64::INFINITY, f64::NEG_INFINITY)),
+            ((1.0, 2.0), (f64::INFINITY, f64::NAN), (0.0, 0.0)),
+        ] {
+            // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
+            let actual = ArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            if expected.0.is_nan() {
+                assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.re.to_bits(), expected.0.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+            if expected.1.is_nan() {
+                assert!(actual.im.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
+            } else {
+                assert_eq!(actual.im.to_bits(), expected.1.to_bits(), "{lhs:?} / {rhs:?}");
+            }
+        }
         assert!(matches!(
             ArrayElement::div(true, false),
             Err(ProgramError::Type(TypeError::Invalid { message }))
