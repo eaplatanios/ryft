@@ -357,6 +357,7 @@ impl BuildConfiguration {
                 println!("cargo::rustc-link-arg=-Wl,-rpath,{}", library_directory.display());
             }
             OperatingSystem::Windows => {
+                println!("cargo::rustc-link-lib=winhttp");
                 println!("cargo::rustc-link-arg=/DEBUG");
                 println!("cargo::rustc-link-search=native={}", library_directory.display());
                 println!("cargo::rustc-env=RUSTFLAGS=-C target-feature=+crt-static");
