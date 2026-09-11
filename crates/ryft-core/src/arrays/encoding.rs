@@ -134,6 +134,19 @@ pub trait ArrayElement: private::Codec {
     /// value. Complex elements use negative infinity in the real component and zero in the imaginary component.
     fn max_identity() -> Self;
 
+    /// Returns the smaller of `self` and `other`, preserving the selected operand's exact encoding. Integers use
+    /// their ordinary ordering, and Booleans order `false` below `true`. Real floating-point values propagate NaN
+    /// values (preferring `self` when both operands are NaN-valued), order negative zero below positive zero, and
+    /// preserve `self` on exact ties. Unlike the primitive floating-point `min` functions, a single NaN value is never
+    /// discarded. Complex values compare real components first, and then imaginary components when the real components
+    /// are equal. They select `other` on ties or when the deciding comparison is unordered because of a NaN.
+    fn min(&self, other: &Self) -> Self;
+
+    /// Returns the larger of `self` and `other`, preserving the selected operand's exact encoding. Uses the same
+    /// ordering, NaN value propagation, and tie-breaking rules as [`min`](Self::min), including the distinct rules
+    /// for complex values.
+    fn max(&self, other: &Self) -> Self;
+
     /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
     /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
     /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
@@ -1126,6 +1139,16 @@ impl ArrayElement for bool {
     }
 
     #[inline]
+    fn min(&self, other: &Self) -> Self {
+        Ord::min(*self, *other)
+    }
+
+    #[inline]
+    fn max(&self, other: &Self) -> Self {
+        Ord::max(*self, *other)
+    }
+
+    #[inline]
     fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
         Output::from_unsigned(u64::from(self))
     }
@@ -1163,6 +1186,16 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             #[inline]
             fn max_identity() -> Self {
                 Self::MIN
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
             }
 
             #[inline]
@@ -1207,6 +1240,16 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
             }
 
             #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_unsigned(u64::from(self.value()))
             }
@@ -1245,6 +1288,16 @@ macro_rules! impl_array_element_for_integer_types {
             #[inline]
             fn max_identity() -> Self {
                 Self::MIN
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                Ord::min(*self, *other)
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                Ord::max(*self, *other)
             }
 
             #[inline]
@@ -1287,6 +1340,32 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
             #[inline]
             fn max_identity() -> Self {
                 $max_identity
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let lhs = self.to_f64();
+                let rhs = other.to_f64();
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Greater {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let lhs = self.to_f64();
+                let rhs = other.to_f64();
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Less {
+                    *other
+                } else {
+                    *self
+                }
             }
 
             #[inline]
@@ -1339,6 +1418,32 @@ macro_rules! impl_array_element_for_floating_point_type {
             #[inline]
             fn max_identity() -> Self {
                 Self::NEG_INFINITY
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let lhs = $to_real(*self);
+                let rhs = $to_real(*other);
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Greater {
+                    *other
+                } else {
+                    *self
+                }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let lhs = $to_real(*self);
+                let rhs = $to_real(*other);
+                if lhs.is_nan() {
+                    *self
+                } else if rhs.is_nan() || lhs.total_cmp(&rhs) == Ordering::Less {
+                    *other
+                } else {
+                    *self
+                }
             }
 
             #[inline]
@@ -1414,6 +1519,18 @@ macro_rules! impl_array_element_for_complex_types {
             #[inline]
             fn max_identity() -> Self {
                 Self::new(<$component>::NEG_INFINITY, 0.0)
+            }
+
+            #[inline]
+            fn min(&self, other: &Self) -> Self {
+                let select_self = if self.re == other.re { self.im < other.im } else { self.re < other.re };
+                if select_self { *self } else { *other }
+            }
+
+            #[inline]
+            fn max(&self, other: &Self) -> Self {
+                let select_self = if self.re == other.re { self.im > other.im } else { self.re > other.re };
+                if select_self { *self } else { *other }
             }
 
             #[inline]
@@ -1875,6 +1992,66 @@ mod tests {
         let complex64 = Complex::<f64>::max_identity();
         assert_eq!(complex64.re, f64::NEG_INFINITY);
         assert_eq!(complex64.im.to_bits(), 0);
+    }
+
+    #[test]
+    fn test_array_element_min() {
+        // Ordered elements include Booleans and sub-byte integers.
+        assert_eq!(ArrayElement::min(&false, &true), false);
+        assert_eq!(ArrayElement::min(&-3i32, &2), -3);
+        assert_eq!(
+            ArrayElement::min(&i4::from_bits(13).unwrap(), &i4::from_bits(2).unwrap()),
+            i4::from_bits(13).unwrap(),
+        );
+        assert_eq!(ArrayElement::min(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0x00);
+
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either operand order.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let other_nan = f32::from_bits(0x7fc0_5678);
+        assert_eq!(ArrayElement::min(&nan, &1.0).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&1.0, &nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&nan, &other_nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::min(&-0.0f32, &0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::min(&0.0f32, &-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::min(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(-0.0).to_bits());
+
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select the other operand.
+        assert_eq!(ArrayElement::min(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 1.0));
+        assert_eq!(ArrayElement::min(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
+        assert_eq!(
+            ArrayElement::min(&Complex::new(1.0f32, -0.0), &Complex::new(1.0, 0.0)).im.to_bits(),
+            0.0f32.to_bits(),
+        );
+    }
+
+    #[test]
+    fn test_array_element_max() {
+        // Ordered elements include Booleans and sub-byte integers.
+        assert_eq!(ArrayElement::max(&false, &true), true);
+        assert_eq!(ArrayElement::max(&-3i32, &2), 2);
+        assert_eq!(
+            ArrayElement::max(&i4::from_bits(13).unwrap(), &i4::from_bits(2).unwrap()),
+            i4::from_bits(2).unwrap(),
+        );
+        assert_eq!(ArrayElement::max(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0xfe);
+
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either operand order.
+        let nan = f32::from_bits(0x7fc0_1234);
+        let other_nan = f32::from_bits(0x7fc0_5678);
+        assert_eq!(ArrayElement::max(&nan, &1.0).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&1.0, &nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&nan, &other_nan).to_bits(), nan.to_bits());
+        assert_eq!(ArrayElement::max(&-0.0f32, &0.0).to_bits(), (0.0f32).to_bits());
+        assert_eq!(ArrayElement::max(&0.0f32, &-0.0).to_bits(), (0.0f32).to_bits());
+        assert_eq!(ArrayElement::max(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(0.0).to_bits());
+
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select the other operand.
+        assert_eq!(ArrayElement::max(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 2.0));
+        assert_eq!(ArrayElement::max(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
+        assert_eq!(
+            ArrayElement::max(&Complex::new(1.0f32, -0.0), &Complex::new(1.0, 0.0)).im.to_bits(),
+            0.0f32.to_bits(),
+        );
     }
 
     #[test]
