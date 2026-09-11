@@ -81,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
 
+### Fixed
+
+- Omit array layouts for native `BufferType::Token` buffers in asynchronous host-to-device transfers.
+
 ### Removed
 
 - Removed the deprecated PJRT Host-Allocator and Triton extension wrappers, their FFI definitions, and associated APIs.

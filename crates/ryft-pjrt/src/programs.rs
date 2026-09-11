@@ -2934,17 +2934,80 @@ pub(crate) mod ffi {
 mod tests {
     use std::collections::HashMap;
     use std::mem::ManuallyDrop;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use indoc::indoc;
 
+    use crate::extensions::ffi::{
+        FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
+        FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    };
     use crate::extensions::multi_slice::{self, MultiSliceConfig, MultiSliceExtension};
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
-    use crate::{BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, slice_from_c_api};
+    use crate::{
+        BufferSpecification, BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error,
+        slice_from_c_api,
+    };
 
     use super::*;
+
+    /// One bounded gate shared only by this test's registered CPU handler.
+    struct NativeEffectGate {
+        /// Invocation order of the callbacks.
+        entered: mpsc::Sender<usize>,
+        /// Explicit release of the first callback; bounded to avoid stranding a scoped submitter.
+        release: Mutex<mpsc::Receiver<()>>,
+        /// Next invocation index.
+        invocation: AtomicUsize,
+    }
+
+    /// Handler registrations outlive clients, so their state contains no client or buffer handles.
+    static NATIVE_EFFECT_GATE: OnceLock<NativeEffectGate> = OnceLock::new();
+
+    /// Validates the native token ABI and holds the first effect until explicitly released.
+    fn invoke_native_effect(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+        if frame.input_count() != 1 || frame.output_count() != 1 {
+            return Err(FfiError::invalid_argument("native effect expects one input and one output"));
+        }
+        let FfiInput::Buffer { buffer: input } = frame.input(0)?;
+        let FfiOutput::Buffer { buffer: output } = frame.output(0)?;
+        if input.element_type() != FfiBufferType::Token || output.element_type() != FfiBufferType::Token {
+            return Err(FfiError::invalid_argument("native effect requires token input and output"));
+        }
+        let gate = NATIVE_EFFECT_GATE.get().ok_or_else(|| FfiError::internal("effect gate is not installed"))?;
+        let invocation = gate.invocation.fetch_add(1, Ordering::SeqCst);
+        gate.entered.send(invocation).map_err(|error| FfiError::internal(error.to_string()))?;
+        if invocation == 0 {
+            gate.release
+                .lock()
+                .map_err(|_| FfiError::internal("effect gate mutex poisoned"))?
+                .recv_timeout(Duration::from_secs(20))
+                .map_err(|error| FfiError::deadline_exceeded(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Exposes the test handler to XLA while reporting failures through the FFI error surface.
+    unsafe extern "C" fn native_effect(frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+        // XLA owns this frame during the callback. No buffer view or client-bound resource escapes the callback.
+        unsafe {
+            match FfiCallFrame::from_c_api(frame) {
+                Err(_) => std::ptr::null_mut(),
+                Ok(frame) if frame.register_metadata(FfiTypeId::default()) => std::ptr::null_mut(),
+                Ok(frame) if frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
+                Ok(frame) => match frame.api() {
+                    Err(_) => std::ptr::null_mut(),
+                    Ok(api) => match invoke_native_effect(&frame) {
+                        Ok(()) => std::ptr::null_mut(),
+                        Err(error) => error.to_c_api(api),
+                    },
+                },
+            }
+        }
+    }
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -3473,6 +3536,306 @@ mod tests {
             expected_output_bytes.extend_from_slice(&42i32.to_ne_bytes());
             expected_output_bytes.extend_from_slice(&(-42i32).to_ne_bytes());
             assert_eq!(output_bytes, expected_output_bytes);
+        });
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_with_native_token() {
+        let client = test_cpu_client();
+        let program = Program::Mlir {
+            bytecode: indoc! {"
+                module {
+                  func.func @main(%token: !stablehlo.token) -> !stablehlo.token {
+                    %result = stablehlo.after_all %token : !stablehlo.token
+                    return %result : !stablehlo.token
+                  }
+                }
+            "}
+            .as_bytes()
+            .to_vec(),
+        };
+        let executable = client.compile(&program, &test_compilation_options()).unwrap();
+        let initial_program = Program::Mlir {
+            bytecode: indoc! {"
+                module {
+                  func.func @main() -> !stablehlo.token {
+                    %result = stablehlo.after_all : !stablehlo.token
+                    return %result : !stablehlo.token
+                  }
+                }
+            "}
+            .as_bytes()
+            .to_vec(),
+        };
+        let initial = client.compile(&initial_program, &test_compilation_options()).unwrap();
+        let mut initial_outputs = initial
+            .execute(vec![ExecutionDeviceInputs::default()], vec![], 0, None, None, None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let token = initial_outputs.remove(0).outputs.remove(0);
+        assert_eq!(token.element_type(), Ok(BufferType::Token));
+        let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
+        let execution = executable
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .unwrap();
+        let mut outputs = execution.block_until_ready().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].outputs.len(), 1);
+        let token = outputs.remove(0).outputs.remove(0);
+        assert_eq!(token.element_type(), Ok(BufferType::Token));
+        assert_eq!(token.ready().unwrap().ready(), Ok(true));
+        let inputs = [ExecutionInput { buffer: Arc::new(token), donatable: false }];
+        let execution = executable
+            .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+            .unwrap();
+        assert_eq!(execution.block_until_ready().unwrap()[0].outputs[0].element_type(), Ok(BufferType::Token));
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_with_native_token_pending_predecessor() {
+        // Checks that pending native token carriers prevent a successor effect from overtaking its predecessor.
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        assert!(
+            NATIVE_EFFECT_GATE
+                .set(NativeEffectGate {
+                    entered: entered_sender,
+                    release: Mutex::new(release_receiver),
+                    invocation: AtomicUsize::new(0),
+                })
+                .is_ok()
+        );
+
+        let client = test_cpu_client();
+        eprintln!(
+            "native token proof: CPU platform {}, API {:?}",
+            client.platform_version().unwrap(),
+            test_cpu_plugin().api().version()
+        );
+        client
+            .register_ffi_handler(
+                "ryft.test.native_effect_hold",
+                client.platform_name().unwrap().as_ref(),
+                FfiHandler::from(native_effect as XLA_FFI_Handler),
+                FfiHandlerTraits::NONE,
+            )
+            .unwrap();
+        let program = Program::Mlir {
+            bytecode: indoc! {r#"
+                module {
+                  func.func @main(%carrier: !stablehlo.token) -> !stablehlo.token {
+                    %effect = stablehlo.custom_call @ryft.test.native_effect_hold(%carrier)
+                      {api_version = 4 : i32, backend_config = {}, has_side_effect = true}
+                      : (!stablehlo.token) -> !stablehlo.token
+                    return %effect : !stablehlo.token
+                  }
+                }
+            "#}
+            .as_bytes()
+            .to_vec(),
+        };
+        let executable = client.compile(&program, &test_compilation_options()).unwrap();
+        let devices = executable.addressable_devices().unwrap();
+        let memory = devices[0].default_memory().unwrap();
+        let manager = client
+            .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+            .unwrap();
+        let initial = manager.retrieve_buffer(0).unwrap();
+        assert_eq!(initial.ready().unwrap().ready(), Ok(false));
+
+        // Scoped submitters exercise the real client borrow. Input transfers complete before checking submission
+        // timeouts, and the held callback also has a deadline so failure unwinding cannot strand a scoped thread.
+        std::thread::scope(|threads| {
+            let (first_sender, first_receiver) = mpsc::channel();
+            let executable = &executable;
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: Arc::new(initial), donatable: false }];
+                first_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+
+            // A pending input gives the CPU a genuine scheduling dependency. Ready-input computations may run
+            // inline; the public execution contract does not require every submission to return asynchronously.
+            let first = first_receiver.recv_timeout(Duration::from_secs(5));
+            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            let first = first.expect("pending-input submission should return before input readiness").unwrap();
+            assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+            let (mut first_outputs, first_fence) = first.into_parts();
+            let carrier = Arc::new(first_outputs.remove(0).outputs.remove(0));
+            assert_eq!(carrier.ready().unwrap().ready(), Ok(false));
+            assert_eq!(first_fence.is_ready(), Ok(false));
+
+            let (second_sender, second_receiver) = mpsc::channel();
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: carrier, donatable: false }];
+                second_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+            let second = second_receiver.recv_timeout(Duration::from_secs(5));
+            let premature_effect = entered_receiver.recv_timeout(Duration::from_millis(100));
+            release_sender.send(()).unwrap();
+            let second = second.expect("dependent submission must return before predecessor completion").unwrap();
+            assert!(matches!(premature_effect, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+            first_fence.block_until_ready().unwrap();
+            second.fence().block_until_ready().unwrap();
+            let output = &second.output()[0].outputs[0];
+            assert_eq!(output.element_type().unwrap(), BufferType::Token);
+            assert_eq!(output.ready().unwrap().ready(), Ok(true));
+
+            // A failed predecessor must fail its successor without invoking the effect handler.
+            let manager = client
+                .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+                .unwrap();
+            let initial = manager.retrieve_buffer(0).unwrap();
+            let (failed_sender, failed_receiver) = mpsc::channel();
+            threads.spawn(move || {
+                let inputs = [ExecutionInput { buffer: Arc::new(initial), donatable: false }];
+                failed_sender
+                    .send(executable.execute(
+                        vec![ExecutionDeviceInputs::from(inputs.as_slice())],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+            });
+            let failed = failed_receiver.recv_timeout(Duration::from_secs(5));
+            assert_eq!(manager.set_error(0, Error::aborted("native token predecessor failure")), Ok(()));
+            let failed = failed.unwrap().unwrap();
+            let failure = failed.fence().block_until_ready();
+            assert!(matches!(
+                failure,
+                Err(Error::Internal { message, .. }) if message.contains("native token predecessor failure"),
+            ));
+            assert!(matches!(entered_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(NATIVE_EFFECT_GATE.get().unwrap().invocation.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn test_loaded_executable_drop_pending_effect() {
+        const CHILD_ENVIRONMENT: &str = "RYFT_TEST_PENDING_EFFECT_CLIENT_DROP";
+        if std::env::var_os(CHILD_ENVIRONMENT).is_none() {
+            // Plugin teardown behavior is isolated from the test runner, including native aborts and deadlocks.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "programs::tests::test_loaded_executable_drop_pending_effect", "--nocapture"])
+                .env(CHILD_ENVIRONMENT, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "pending-effect teardown subprocess failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("pending-effect teardown exceeded its 30-second deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        assert!(
+            NATIVE_EFFECT_GATE
+                .set(NativeEffectGate {
+                    entered: entered_sender,
+                    release: Mutex::new(release_receiver),
+                    invocation: AtomicUsize::new(0),
+                })
+                .is_ok()
+        );
+        let client = test_cpu_client();
+        client
+            .register_ffi_handler(
+                "ryft.test.native_effect_hold",
+                client.platform_name().unwrap().as_ref(),
+                FfiHandler::from(native_effect as XLA_FFI_Handler),
+                FfiHandlerTraits::NONE,
+            )
+            .unwrap();
+        let (dropped_sender, dropped_receiver) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let fence = {
+                let program = Program::Mlir {
+                    bytecode: indoc! {r#"
+                        module {
+                          func.func @main(%carrier: !stablehlo.token) -> !stablehlo.token {
+                            %effect = stablehlo.custom_call @ryft.test.native_effect_hold(%carrier)
+                              {api_version = 4 : i32, backend_config = {}, has_side_effect = true}
+                              : (!stablehlo.token) -> !stablehlo.token
+                            return %effect : !stablehlo.token
+                          }
+                        }
+                    "#}
+                    .as_bytes()
+                    .to_vec(),
+                };
+                let executable = client.compile(&program, &test_compilation_options()).unwrap();
+                let devices = client.addressable_devices().unwrap();
+                let memory = devices[0].default_memory().unwrap();
+                let manager = client
+                    .host_to_device_transfer_manager(vec![BufferSpecification::new(BufferType::Token, [])], memory)
+                    .unwrap();
+                let inputs =
+                    [ExecutionInput { buffer: Arc::new(manager.retrieve_buffer(0).unwrap()), donatable: false }];
+                let execution = executable
+                    .execute(vec![ExecutionDeviceInputs::from(inputs.as_slice())], vec![], 0, None, None, None, None)
+                    .unwrap();
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+                assert_eq!(entered_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+                let (outputs, fence) = execution.into_parts();
+                assert_eq!(fence.is_ready(), Ok(false));
+                drop(outputs);
+                fence
+            };
+
+            // This worker owns only channels. No client, buffer, or client-borrowing reservation escapes the scope.
+            let releaser = threads.spawn(move || {
+                let dropped_early = match dropped_receiver.recv_timeout(Duration::from_millis(200)) {
+                    Ok(()) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(error) => panic!("client-drop observer disconnected: {error}"),
+                };
+                release_sender.send(()).unwrap();
+                if !dropped_early {
+                    dropped_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                dropped_early
+            });
+
+            // Every client-borrowing owner has gone away, but the native callback is still held.
+            drop(client);
+            dropped_sender.send(()).unwrap();
+            let dropped_early = releaser.join().unwrap();
+            fence.block_until_ready().unwrap();
+            eprintln!("CPU client destruction returned before pending effect release: {dropped_early}");
         });
     }
 
