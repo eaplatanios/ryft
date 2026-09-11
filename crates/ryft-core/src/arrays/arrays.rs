@@ -29,18 +29,17 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 // TODO(eaplatanios): Review from here onwards.
 
 /// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
-/// of Ryft and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
+/// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
 /// over multidimensional arrays without depending on an optimized backend such as the Ryft XLA backend. Unit tests,
 /// documentation tests, and downstream crates can therefore interpret complete array programs eagerly and stage them
 /// through [`ArrayTracingContext`](crate::ArrayTracingContext).
 ///
-/// The payload is one shared immutable byte buffer whose physical placement is determined by the array's
-/// [`ArrayType`]. Missing layout metadata means dense row-major storage; explicit strided and tiled layouts determine
-/// the physical ordering, holes, and padding. [`Array::new`] validates the complete physical representation, while
-/// [`Array::from_elements`] and [`Array::from_logical_bytes`] construct it from logical row-major values through
-/// checked typed codecs that preserve exact element encodings. Cloning an array shares its payload without copying
-/// it. The per-family kernels in [`crate::arrays::operations`] own the element-level arithmetic, conversion, and
-/// shape semantics computed over these values.
+/// The payload is a shared immutable byte buffer whose physical placement is determined by the array's [`ArrayType`].
+/// Missing [`Layout`](crate::Layout) metadata implies a dense row-major storage while explicit strided and tiled
+/// layouts determine the physical ordering, as well as any potential "holes" and padding. [`Array::new`] validates the
+/// complete physical representation, while [`Array::from_elements`] and [`Array::from_logical_bytes`] construct it from
+/// logical row-major values through checked typed codecs that preserve exact element encodings. Cloning an array shares
+/// its payload without copying it.
 ///
 /// A production [`Array`] always carries a fully static [`ArrayType`]: every constructor that sizes or addresses a
 /// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
@@ -166,7 +165,7 @@ impl Array {
     pub fn from_f64s(r#type: ArrayType, values: Vec<f64>) -> Self {
         let data_type = r#type.data_type();
         if data_type.is_token() || data_type.is_zero() {
-            panic!("cannot convert f64 values to the {data_type} data type");
+            panic!("cannot convert `f64` values to the `{data_type}` data type");
         }
         dispatch_on_array_element_type!(data_type, |Element| {
             let elements = values
@@ -228,7 +227,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         if self.r#type.data_type() != Input::data_type() {
             return Err(TypeError::invalid(format!(
-                "cannot map elements of data type {} as {} values",
+                "cannot map elements of data type `{}` as `{}` values",
                 self.r#type.data_type(),
                 Input::data_type(),
             ))
@@ -236,7 +235,7 @@ impl Array {
         }
         if output_type.data_type() != Output::data_type() {
             return Err(TypeError::invalid(format!(
-                "cannot store mapped {} values in an array of element data type {}",
+                "cannot store mapped `{}` values in an array of element data type `{}`",
                 Output::data_type(),
                 output_type.data_type(),
             ))
@@ -282,7 +281,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
             return Err(TypeError::invalid(format!(
-                "binary element inputs must both have data type {}, got {} and {}",
+                "binary element inputs must both have data type `{}`, got `{}` and `{}`",
                 Input::data_type(),
                 self.r#type.data_type(),
                 rhs.r#type.data_type(),
@@ -292,7 +291,7 @@ impl Array {
 
         if output_type.data_type() != Output::data_type() {
             return Err(TypeError::invalid(format!(
-                "binary element output must have data type {}, got {}",
+                "binary element output must have data type `{}`, got `{}`",
                 Output::data_type(),
                 output_type.data_type(),
             ))
@@ -427,7 +426,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         if r#type.data_type() != T::data_type() {
             return Err(TypeError::invalid(format!(
-                "cannot store {} values in an array of element data type {}",
+                "cannot store `{}` values in an array of element data type `{}`",
                 T::data_type(),
                 r#type.data_type(),
             ))
@@ -463,7 +462,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         if output_type.data_type() != self.r#type.data_type() {
             return Err(TypeError::invalid(format!(
-                "cannot gather elements of data type {} into an array of element data type {}",
+                "cannot gather elements of data type `{}` into an array of element data type `{}`",
                 self.r#type.data_type(),
                 output_type.data_type(),
             ))
@@ -495,13 +494,15 @@ impl Array {
     pub fn to_f64s(&self) -> Vec<f64> {
         let data_type = self.r#type.data_type();
         if data_type.is_complex() {
-            panic!("cannot view an array of complex element data type {data_type} as f64 values");
+            panic!("cannot view an array of complex element data type `{data_type}` as `f64` values");
         }
         let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
         (0..addressing.element_count())
             .map(|index| {
                 Self::element_as_f64(data_type, &self.bytes[addressing.byte_range_for_flat_index(index)])
-                    .unwrap_or_else(|| panic!("cannot view an array of element data type {data_type} as f64 values"))
+                    .unwrap_or_else(|| {
+                        panic!("cannot view an array of element data type `{data_type}` as `f64` values")
+                    })
             })
             .collect()
     }
@@ -846,7 +847,7 @@ mod tests {
         assert!(matches!(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[1.0f32, 2.0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot encode f32 values as array elements of data type f64",
+                if message == "cannot encode `f32` values as array elements of data type `f64`",
         ));
         // The logical element count must match the static shape.
         assert!(matches!(
@@ -1141,7 +1142,7 @@ mod tests {
         assert!(matches!(
             integers.map_elements::<i64, i64>(ArrayType::new_static(DataType::I64, [3]), Ok),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot map elements of data type i32 as i64 values",
+                if message == "cannot map elements of data type `i32` as `i64` values",
         ));
         assert!(matches!(
             integers.map_elements::<i32, i32>(ArrayType::new_static(DataType::I32, [2]), Ok),
@@ -1172,7 +1173,7 @@ mod tests {
                 |left, right| Ok(left < right),
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "binary element inputs must both have data type i64, got i32 and i32",
+                if message == "binary element inputs must both have data type `i64`, got `i32` and `i32`",
         ));
         assert!(matches!(
             left.map_element_pairs::<i32, bool>(
@@ -1181,7 +1182,7 @@ mod tests {
                 |left, right| Ok(left < right),
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "binary element output must have data type bool, got i32",
+                if message == "binary element output must have data type `bool`, got `i32`",
         ));
         assert!(matches!(
             left.map_element_pairs::<i32, bool>(
@@ -1203,7 +1204,7 @@ mod tests {
         assert!(matches!(
             Array::from_fn_elements(ArrayType::new_static(DataType::U16, [1]), |_| Ok(0u32)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot store u32 values in an array of element data type u16",
+                if message == "cannot store `u32` values in an array of element data type `u16`",
         ));
     }
 
@@ -1227,7 +1228,7 @@ mod tests {
         assert!(matches!(
             integers.gather_elements(ArrayType::new_static(DataType::I64, [3]), |output_index| output_index),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot gather elements of data type i32 into an array of element data type i64",
+                if message == "cannot gather elements of data type `i32` into an array of element data type `i64`",
         ));
         assert!(matches!(
             integers.gather_elements(ArrayType::new_static(DataType::I32, [3]), |_| 3),
@@ -1255,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot view an array of complex element data type c128 as f64 values")]
+    #[should_panic(expected = "cannot view an array of complex element data type `c128` as `f64` values")]
     fn test_array_to_f64s_rejects_complex_arrays() {
         let real = Array::vector(vec![1.0, 2.0]);
         let imaginary = Array::vector(vec![3.0, 4.0]);

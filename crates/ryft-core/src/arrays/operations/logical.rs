@@ -30,7 +30,7 @@ impl Array {
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         if left_data_type != right_data_type || !(left_data_type.is_boolean() || left_data_type.is_integer()) {
             return Err(TypeError::invalid(format!(
-                "cannot apply `{operation}` to arrays of element data types {left_data_type} and {right_data_type}",
+                "cannot apply `{operation}` to arrays of element data types `{left_data_type}` and `{right_data_type}`",
             ))
             .into());
         }
@@ -84,7 +84,7 @@ impl Not for Array {
             data_type if data_type.is_integer() => u8::MAX,
             data_type => {
                 return Err(TypeError::invalid(format!(
-                    "cannot apply `{NOT_OPERATION_NAME}` to an array of element data type {data_type}"
+                    "cannot apply `{NOT_OPERATION_NAME}` to an array of element data type `{data_type}`"
                 ))
                 .into());
             }
@@ -205,7 +205,7 @@ mod tests {
         assert!(matches!(
             Array::vector(vec![1.0]).and(&Array::vector(vec![0.0])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot apply `and` to arrays of element data types f64 and f64",
+                if message == "cannot apply `and` to arrays of element data types `f64` and `f64`",
         ));
         // The `std::ops` sugar delegates to the fallible capabilities.
         assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]));

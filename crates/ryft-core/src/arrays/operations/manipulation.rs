@@ -16,7 +16,6 @@ use crate::arrays::encoding::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::ArrayIrOperation;
-use crate::arrays::operations::math::{ElementAdd, ElementMul};
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
@@ -282,7 +281,7 @@ impl Array {
             DataType::U16 => i64::from(u16::decode(bytes)),
             DataType::U32 => i64::from(u32::decode(bytes)),
             DataType::U64 => u64::decode(bytes) as i64,
-            data_type => unreachable!("cannot use an array of element data type {data_type} as indices"),
+            data_type => unreachable!("cannot use an array of element data type `{data_type}` as indices"),
         }
     }
 }
@@ -613,9 +612,9 @@ impl Scatter for Array {
                         let current_value = Element::decode(current);
                         let update_value = Element::decode(update);
                         let result = if operation.kind() == ScatterReductionKind::Add {
-                            <Element as ElementAdd>::add(current_value, update_value)?
+                            <Element as ArrayElement>::add(current_value, update_value)?
                         } else {
-                            <Element as ElementMul>::mul(current_value, update_value)?
+                            <Element as ArrayElement>::mul(current_value, update_value)?
                         };
                         result.encode(current);
                         Ok(())

@@ -38,7 +38,7 @@ define_elementwise_operation!(
         } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
             input_type
         } else {
-            return Err(TypeError::invalid(format!("cannot compute the absolute value of a value of data type {input_type}")));
+            return Err(TypeError::invalid(format!("cannot compute the absolute value of a value of data type `{input_type}`")));
         };
         Ok(vec![output_type])
     },
@@ -234,7 +234,7 @@ mod tests {
         );
 
         for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::I1, DataType::U32] {
-            let message = format!("cannot compute the absolute value of a value of data type {input_type}");
+            let message = format!("cannot compute the absolute value of a value of data type `{input_type}`");
             check_operation_type_inference!(
                 @elementwise @unary,
                 operation = AbsOperation,

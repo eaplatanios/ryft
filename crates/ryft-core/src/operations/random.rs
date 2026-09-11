@@ -172,7 +172,7 @@ fn validate_rng_bit_generator_types(
     }
     if !matches!(output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
         return Err(TypeError::invalid(format!(
-            "`{}` does not support output data type {}",
+            "`{}` does not support output data type `{}`",
             RNG_BIT_GENERATOR_OPERATION_NAME,
             output_type.data_type(),
         )));
@@ -590,7 +590,7 @@ where
             }
             data_type => {
                 return Err(
-                    TypeError::invalid(format!("`uniform` does not support output data type {data_type}")).into()
+                    TypeError::invalid(format!("`uniform` does not support output data type `{data_type}`")).into()
                 );
             }
         };
@@ -615,7 +615,7 @@ where
         let data_type = logits_type.data_type();
         if !matches!(data_type, DataType::F32 | DataType::F64) {
             return Err(
-                TypeError::invalid(format!("`categorical` does not support logits data type {data_type}")).into()
+                TypeError::invalid(format!("`categorical` does not support logits data type `{data_type}`")).into()
             );
         }
         let shape = Shape::new(logits_type.shape().dimensions().to_vec());
@@ -830,7 +830,7 @@ mod tests {
             operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type),
             cases = [{
                 input_types = [RandomAlgorithm::ThreeFry.state_type()],
-                error = "`rng_bit_generator` does not support output data type f32",
+                error = "`rng_bit_generator` does not support output data type `f32`",
             }],
         );
         for data_type in [DataType::U8, DataType::U16, DataType::U64] {

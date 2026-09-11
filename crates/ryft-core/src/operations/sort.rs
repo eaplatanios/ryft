@@ -144,7 +144,7 @@ impl Operation for SortOperation {
             let data_type = input_type.data_type();
             if data_type.is_token() || data_type.is_zero() || data_type.is_complex() {
                 return Err(TypeError::invalid(format!(
-                    "`{SORT_OPERATION_NAME}` does not support key data type {data_type}",
+                    "`{SORT_OPERATION_NAME}` does not support key data type `{data_type}`",
                 )));
             }
         }
@@ -673,7 +673,7 @@ mod tests {
                 },
                 {
                     input_types = [complex],
-                    error = "`sort` does not support key data type c64",
+                    error = "`sort` does not support key data type `c64`",
                 },
                 {
                     input_types = [vector_type(4), vector_type(3)],
@@ -709,7 +709,7 @@ mod tests {
                 },
                 {
                     input_types = [vector_type(4), complex],
-                    error = "`sort` does not support key data type c64",
+                    error = "`sort` does not support key data type `c64`",
                 },
                 {
                     input_types = [vector_type(4), vector_type(4), passenger.clone()],

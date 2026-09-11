@@ -38,59 +38,7 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // These contracts operate on decoded storage elements, keeping integer wrapping and low-precision re-encoding in
 // one place per element family. They complement the value-level capabilities with the scalar arithmetic needed by
-// elementwise kernels and reductions; extrema selection and its identities are provided directly by ArrayElement.
-
-/// Element-level analogue of the [`Add`](crate::operations::Add) capability, using the element type's ordinary
-/// arithmetic semantics (deterministic two's-complement wrapping for integers and round-to-nearest-even re-encoding
-/// for the low-precision floating-point formats).
-pub(crate) trait ElementAdd: ArrayElement {
-    /// Adds two elements.
-    fn add(self, right: Self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Sub`](crate::operations::Sub) capability, using the element type's ordinary
-/// arithmetic semantics.
-trait ElementSub: ArrayElement {
-    /// Subtracts `right` from this element.
-    fn sub(self, right: Self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Mul`](crate::operations::Mul) capability, using the element type's ordinary
-/// arithmetic semantics.
-pub(crate) trait ElementMul: ArrayElement {
-    /// Multiplies two elements.
-    fn mul(self, right: Self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Div`](crate::operations::Div) capability, including checked integer division
-/// failures.
-trait ElementDiv: ArrayElement {
-    /// Divides this element by `right`.
-    fn div(self, right: Self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Rem`](crate::operations::Rem) capability, including checked integer zero-divisor
-/// failures.
-trait ElementRem: ArrayElement {
-    /// Computes the truncating remainder of this element divided by `right`.
-    fn rem(self, right: Self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Neg`](crate::operations::Neg) capability.
-trait ElementNeg: ArrayElement {
-    /// Negates this element.
-    fn neg(self) -> Result<Self, ProgramError>;
-}
-
-/// Element-level analogue of the [`Abs`](crate::operations::Abs) capability. Complex magnitudes use a real output
-/// element type.
-trait ElementAbs: ArrayElement {
-    /// Element type produced by absolute value.
-    type Output: ArrayElement;
-
-    /// Computes this element's absolute value or complex magnitude.
-    fn abs(self) -> Result<Self::Output, ProgramError>;
-}
+// elementwise kernels and reductions; basic arithmetic, extrema, and identities are provided by ArrayElement.
 
 /// Floating-point math operations shared by real floating-point and complex array elements.
 trait ElementFloatMath: ArrayElement {
@@ -146,12 +94,6 @@ pub(crate) trait ElementRealFloatMath: ArrayElement {
     fn round(self) -> Result<Self, ProgramError>;
 }
 
-/// Sign extraction for signed-integer, floating-point, and complex array elements.
-trait ElementSign: ArrayElement {
-    /// Computes this element's sign according to [`Sign`](crate::operations::Sign) semantics.
-    fn sign(self) -> Result<Self, ProgramError>;
-}
-
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
 trait ElementDivideByCount: ArrayElement {
@@ -162,89 +104,19 @@ trait ElementDivideByCount: ArrayElement {
 // Implements typed arithmetic for signed primitive integers with deterministic two's-complement wrapping.
 macro_rules! impl_array_arithmetic_for_signed_integer {
     ($type:ty) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_add(right))
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_sub(right))
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_mul(right))
-            }
-        }
-
-        impl ElementDiv for $type {
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                if right == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type {} by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                if self == Self::MIN && right == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer scalar of data type {} by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / right)
-            }
-        }
-
-        impl ElementRem for $type {
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                if right == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self.wrapping_rem(right))
-            }
-        }
-
-        impl ElementNeg for $type {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_neg())
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            #[inline]
-            fn abs(self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_abs())
-            }
-        }
-
         impl ElementDivideByCount for $type {
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
                 let divisor = count as Self;
                 if divisor == 0 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type {} by zero",
+                        "cannot divide an integer array element of data type `{}` by zero",
                         Self::data_type(),
                     ))
                     .into());
                 }
                 if self == Self::MIN && divisor == -1 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer array element of data type {} by -1",
+                        "cannot divide the minimum integer array element of data type `{}` by -1",
                         Self::data_type(),
                     ))
                     .into());
@@ -258,78 +130,12 @@ macro_rules! impl_array_arithmetic_for_signed_integer {
 // Implements typed arithmetic for unsigned primitive integers with deterministic modular wrapping.
 macro_rules! impl_array_arithmetic_for_unsigned_integer {
     ($type:ty) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_add(right))
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_sub(right))
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_mul(right))
-            }
-        }
-
-        impl ElementDiv for $type {
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                if right == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type {} by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / right)
-            }
-        }
-
-        impl ElementRem for $type {
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                if right == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self % right)
-            }
-        }
-
-        impl ElementNeg for $type {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                Ok(self.wrapping_neg())
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            fn abs(self) -> Result<Self, ProgramError> {
-                Err(TypeError::invalid(format!(
-                    "cannot compute the absolute value of a scalar of data type {}",
-                    Self::data_type(),
-                ))
-                .into())
-            }
-        }
-
         impl ElementDivideByCount for $type {
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
                 let divisor = count as Self;
                 if divisor == 0 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type {} by zero",
+                        "cannot divide an integer array element of data type `{}` by zero",
                         Self::data_type(),
                     ))
                     .into());
@@ -352,101 +158,20 @@ impl_array_arithmetic_for_unsigned_integer!(u64);
 // Implements modular arithmetic for a signed sub-byte integer's checked low-bit encoding.
 macro_rules! impl_array_arithmetic_for_signed_sub_byte_integer {
     ($type:ty) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.to_bits().wrapping_add(right.to_bits()) & bit_mask).unwrap())
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.to_bits().wrapping_sub(right.to_bits()) & bit_mask).unwrap())
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.to_bits().wrapping_mul(right.to_bits()) & bit_mask).unwrap())
-            }
-        }
-
-        impl ElementDiv for $type {
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                if right.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type {} by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                if self == Self::MIN && right.value() == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer scalar of data type {} by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() / right.value()).unwrap())
-            }
-        }
-
-        impl ElementRem for $type {
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                if right.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.value().wrapping_rem(right.value()) as u8 & bit_mask).unwrap())
-            }
-        }
-
-        impl ElementNeg for $type {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.to_bits().wrapping_neg() & bit_mask).unwrap())
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            fn abs(self) -> Result<Self, ProgramError> {
-                if Self::data_type() == DataType::I1 {
-                    return Err(TypeError::invalid(
-                        "cannot compute the absolute value of a scalar of data type i1".to_string(),
-                    )
-                    .into());
-                }
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.value().wrapping_abs() as u8 & bit_mask).unwrap())
-            }
-        }
-
         impl ElementDivideByCount for $type {
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
                 let divisor = Self::from_bits(count as u8 & bit_mask).unwrap().value();
                 if divisor == 0 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type {} by zero",
+                        "cannot divide an integer array element of data type `{}` by zero",
                         Self::data_type(),
                     ))
                     .into());
                 }
                 if self == Self::MIN && divisor == -1 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer array element of data type {} by -1",
+                        "cannot divide the minimum integer array element of data type `{}` by -1",
                         Self::data_type(),
                     ))
                     .into());
@@ -460,78 +185,12 @@ macro_rules! impl_array_arithmetic_for_signed_sub_byte_integer {
 // Implements modular arithmetic for an unsigned sub-byte integer's checked low-bit encoding.
 macro_rules! impl_array_arithmetic_for_unsigned_sub_byte_integer {
     ($type:ty) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(self.to_bits().wrapping_add(right.to_bits()) & Self::MAX.to_bits()).unwrap())
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(self.to_bits().wrapping_sub(right.to_bits()) & Self::MAX.to_bits()).unwrap())
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(self.to_bits().wrapping_mul(right.to_bits()) & Self::MAX.to_bits()).unwrap())
-            }
-        }
-
-        impl ElementDiv for $type {
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                if right.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type {} by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() / right.value()).unwrap())
-            }
-        }
-
-        impl ElementRem for $type {
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                if right.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() % right.value()).unwrap())
-            }
-        }
-
-        impl ElementNeg for $type {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(self.to_bits().wrapping_neg() & Self::MAX.to_bits()).unwrap())
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            fn abs(self) -> Result<Self, ProgramError> {
-                Err(TypeError::invalid(format!(
-                    "cannot compute the absolute value of a scalar of data type {}",
-                    Self::data_type(),
-                ))
-                .into())
-            }
-        }
-
         impl ElementDivideByCount for $type {
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
                 let divisor = Self::from_bits(count as u8 & Self::MAX.to_bits()).unwrap().value();
                 if divisor == 0 {
                     return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type {} by zero",
+                        "cannot divide an integer array element of data type `{}` by zero",
                         Self::data_type(),
                     ))
                     .into());
@@ -552,59 +211,6 @@ impl_array_arithmetic_for_unsigned_sub_byte_integer!(u4);
 // Implements arithmetic for a low-precision floating-point format through its exact f64 conversion contract.
 macro_rules! impl_array_arithmetic_for_low_precision_float {
     ($type:ty) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() + right.to_f64())?)
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() - right.to_f64())?)
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() * right.to_f64())?)
-            }
-        }
-
-        impl ElementDiv for $type {
-            #[inline]
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() / right.to_f64())?)
-            }
-        }
-
-        impl ElementRem for $type {
-            #[inline]
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() % right.to_f64())?)
-            }
-        }
-
-        impl ElementNeg for $type {
-            fn neg(self) -> Result<Self, ProgramError> {
-                if Self::data_type() == DataType::F8E8M0FNU {
-                    return Err(TypeError::invalid("cannot negate a scalar of data type f8e8m0fnu".to_string()).into());
-                }
-                Ok(Self::from_f64(-self.to_f64())?)
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            #[inline]
-            fn abs(self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64().abs())?)
-            }
-        }
-
         impl ElementDivideByCount for $type {
             #[inline]
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
@@ -629,58 +235,7 @@ impl_array_arithmetic_for_low_precision_float!(f8e8m0fnu);
 
 // Implements ordinary arithmetic for a native or half-precision real floating-point type.
 macro_rules! impl_array_arithmetic_for_float {
-    ($type:ty, $from_count:expr, $abs:expr) => {
-        impl ElementAdd for $type {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self + right)
-            }
-        }
-
-        impl ElementSub for $type {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self - right)
-            }
-        }
-
-        impl ElementMul for $type {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self * right)
-            }
-        }
-
-        impl ElementDiv for $type {
-            #[inline]
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self / right)
-            }
-        }
-
-        impl ElementRem for $type {
-            #[inline]
-            fn rem(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self % right)
-            }
-        }
-
-        impl ElementNeg for $type {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                Ok(-self)
-            }
-        }
-
-        impl ElementAbs for $type {
-            type Output = Self;
-
-            #[inline]
-            fn abs(self) -> Result<Self, ProgramError> {
-                Ok($abs(self))
-            }
-        }
-
+    ($type:ty, $from_count:expr) => {
         impl ElementDivideByCount for $type {
             #[inline]
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
@@ -690,98 +245,14 @@ macro_rules! impl_array_arithmetic_for_float {
     };
 }
 
-impl_array_arithmetic_for_float!(bf16, |count: usize| bf16::from_f64(count as f64), |value: bf16| {
-    bf16::from_f32(value.to_f32().abs())
-});
-impl_array_arithmetic_for_float!(f16, |count: usize| f16::from_f64(count as f64), |value: f16| {
-    f16::from_f32(value.to_f32().abs())
-});
-impl_array_arithmetic_for_float!(f32, |count: usize| count as f32, f32::abs);
-impl_array_arithmetic_for_float!(f64, |count: usize| count as f64, f64::abs);
-
-// Divides finite complex elements after normalizing by the denominator's largest component. The quotient is unchanged,
-// while the normalized formula avoids overflow in the direct norm-squared implementation.
-macro_rules! divide_complex_array_element {
-    ($left:expr, $right:expr) => {{
-        let left = $left;
-        let right = $right;
-        let direct = left / right;
-        if direct.re.is_finite() && direct.im.is_finite()
-            || !left.re.is_finite()
-            || !left.im.is_finite()
-            || !right.re.is_finite()
-            || !right.im.is_finite()
-            || right.re == 0.0 && right.im == 0.0
-        {
-            direct
-        } else if right.im == 0.0 {
-            Complex::new(left.re / right.re, left.im / right.re)
-        } else if right.re == 0.0 {
-            Complex::new(left.im / right.im, -left.re / right.im)
-        } else {
-            let scale = right.re.abs().max(right.im.abs());
-            let left = Complex::new(left.re / scale, left.im / scale);
-            let right = Complex::new(right.re / scale, right.im / scale);
-            if right.re.abs() >= right.im.abs() {
-                let ratio = right.im / right.re;
-                let denominator = right.re + right.im * ratio;
-                Complex::new((left.re + left.im * ratio) / denominator, (left.im - left.re * ratio) / denominator)
-            } else {
-                let ratio = right.re / right.im;
-                let denominator = right.im + right.re * ratio;
-                Complex::new((left.re * ratio + left.im) / denominator, (left.im * ratio - left.re) / denominator)
-            }
-        }
-    }};
-}
+impl_array_arithmetic_for_float!(bf16, |count: usize| bf16::from_f64(count as f64));
+impl_array_arithmetic_for_float!(f16, |count: usize| f16::from_f64(count as f64));
+impl_array_arithmetic_for_float!(f32, |count: usize| count as f32);
+impl_array_arithmetic_for_float!(f64, |count: usize| count as f64);
 
 // Implements complex arithmetic; division by a real count acts componentwise to avoid an unnecessary complex norm.
 macro_rules! impl_array_arithmetic_for_complex {
     ($component:ty) => {
-        impl ElementAdd for Complex<$component> {
-            #[inline]
-            fn add(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self + right)
-            }
-        }
-
-        impl ElementSub for Complex<$component> {
-            #[inline]
-            fn sub(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self - right)
-            }
-        }
-
-        impl ElementMul for Complex<$component> {
-            #[inline]
-            fn mul(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(self * right)
-            }
-        }
-
-        impl ElementDiv for Complex<$component> {
-            #[inline]
-            fn div(self, right: Self) -> Result<Self, ProgramError> {
-                Ok(divide_complex_array_element!(self, right))
-            }
-        }
-
-        impl ElementNeg for Complex<$component> {
-            #[inline]
-            fn neg(self) -> Result<Self, ProgramError> {
-                Ok(-self)
-            }
-        }
-
-        impl ElementAbs for Complex<$component> {
-            type Output = $component;
-
-            #[inline]
-            fn abs(self) -> Result<Self::Output, ProgramError> {
-                Ok(self.norm())
-            }
-        }
-
         impl ElementDivideByCount for Complex<$component> {
             #[inline]
             fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
@@ -932,13 +403,7 @@ macro_rules! impl_array_math_for_real_float {
             }
         }
 
-        impl ElementSign for $type {
-            fn sign(self) -> Result<Self, ProgramError> {
-                let value = ($to_f64)(self);
-                if value.is_nan() || value == 0.0 { Ok(self) } else { ($from_f64)(value.signum()) }
-            }
-        }
-    };
+   };
 }
 
 // Instantiates real math for low-precision formats through their checked f64 conversion contracts.
@@ -994,7 +459,7 @@ macro_rules! impl_array_math_for_complex {
             fn atan2(self, x: Self) -> Result<Self, ProgramError> {
                 let imaginary_unit = Complex::new(0.0, 1.0);
                 let radius = (x * x + self * self).sqrt();
-                Ok(-imaginary_unit * divide_complex_array_element!(x + imaginary_unit * self, radius).ln())
+                Ok(-imaginary_unit * ArrayElement::div(x + imaginary_unit * self, radius)?.ln())
             }
 
             #[inline]
@@ -1032,46 +497,11 @@ macro_rules! impl_array_math_for_complex {
                 Ok(Complex::powc(self, exponent))
             }
         }
-
-        impl ElementSign for Complex<$component> {
-            fn sign(self) -> Result<Self, ProgramError> {
-                let norm = self.norm();
-                Ok(if norm == 0.0 { self } else { self / norm })
-            }
-        }
     };
 }
 
 impl_array_math_for_complex!(f32);
 impl_array_math_for_complex!(f64);
-
-// Implements sign extraction for primitive signed integers.
-macro_rules! impl_array_sign_for_signed_integer {
-    ($($type:ty),+ $(,)?) => {$(
-        impl ElementSign for $type {
-            #[inline]
-            fn sign(self) -> Result<Self, ProgramError> {
-                Ok(self.signum())
-            }
-        }
-    )+};
-}
-
-impl_array_sign_for_signed_integer!(i8, i16, i32, i64);
-
-// Implements sign extraction for checked signed sub-byte integers through their sign-extended values.
-macro_rules! impl_array_sign_for_signed_sub_byte_integer {
-    ($($type:ty),+ $(,)?) => {$(
-        impl ElementSign for $type {
-            #[inline]
-            fn sign(self) -> Result<Self, ProgramError> {
-                Ok(Self::new(self.value().signum()).unwrap())
-            }
-        }
-    )+};
-}
-
-impl_array_sign_for_signed_sub_byte_integer!(i1, i2, i4);
 
 impl Array {
     /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
@@ -1137,7 +567,7 @@ impl Array {
     /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
     /// not finite, and then `log(sum(exp(x - safe_maximum))) + safe_maximum`. Every intermediate is held in the
     /// element's own encoding, so the result matches what the equivalent staged program computes.
-    fn log_sum_exp_elements<T: ElementAdd + ElementSub + ElementFloatMath>(
+    fn log_sum_exp_elements<T: ElementFloatMath>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1193,7 +623,7 @@ impl Array {
 
     /// Executes a typed sum or mean reduction, sharing the same wrapping addition and applying mean division in
     /// place after accumulation.
-    fn reduce_sum_or_mean_elements<T: ElementAdd + ElementDivideByCount>(
+    fn reduce_sum_or_mean_elements<T: ElementDivideByCount>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1223,7 +653,7 @@ impl Array {
     /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
     /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
     /// group rather than the whole operand times the group count.
-    fn ragged_dot_elements<T: ElementAdd + ElementMul>(
+    fn ragged_dot_elements<T: ArrayElement>(
         &self,
         rhs: &Self,
         group_sizes: &Self,
@@ -1417,7 +847,7 @@ impl Array {
         Ok(output)
     }
 
-    fn dot_elements<T: ElementAdd + ElementMul>(
+    fn dot_elements<T: ArrayElement>(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
@@ -1519,13 +949,13 @@ impl Abs for Array {
             || input_type.is_complex())
         {
             return Err(TypeError::invalid(format!(
-                "cannot compute the absolute value of a scalar of data type {input_type}",
+                "cannot compute the absolute value of a scalar of data type `{input_type}`",
             ))
             .into());
         }
         dispatch_on_array_element_type!(@numeric input_type, |Element| {
-            self.map_elements::<Element, <Element as ElementAbs>::Output>(output_type, |value| {
-                <Element as ElementAbs>::abs(value)
+            self.map_elements::<Element, <Element as ArrayElement>::Magnitude>(output_type, |value| {
+                <Element as ArrayElement>::abs(value)
             })
         })
     }
@@ -1542,10 +972,10 @@ impl Neg for Array {
         }
         let data_type = self.r#type().data_type();
         if !data_type.is_numeric() {
-            return Err(TypeError::invalid(format!("cannot negate a scalar of data type {data_type}")).into());
+            return Err(TypeError::invalid(format!("cannot negate a scalar of data type `{data_type}`")).into());
         }
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ElementNeg>::neg)
+            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
         })
     }
 }
@@ -1564,7 +994,7 @@ impl_array_elementwise_operation!(
     operation = "add",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| ElementAdd::add(lhs, rhs),
+    |lhs, rhs| ArrayElement::add(lhs, rhs),
 );
 
 impl_array_elementwise_operation!(
@@ -1573,7 +1003,7 @@ impl_array_elementwise_operation!(
     operation = "sub",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| ElementSub::sub(lhs, rhs),
+    |lhs, rhs| ArrayElement::sub(lhs, rhs),
 );
 
 impl Mul for Array {
@@ -1591,7 +1021,7 @@ impl Mul for Array {
         let lhs = self.promoted_to(data_type)?;
         let rhs = rhs.promoted_to(data_type)?;
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, ElementMul::mul)
+            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, ArrayElement::mul)
         })
     }
 }
@@ -1602,7 +1032,7 @@ impl_array_elementwise_operation!(
     operation = "div",
     inputs = @numeric,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ElementDiv::div(lhs, rhs),
+    |lhs, rhs| ArrayElement::div(lhs, rhs),
 );
 
 impl std::ops::Add for Array {
@@ -1779,26 +1209,28 @@ impl Sign for Array {
         }
         let data_type = self.r#type().data_type();
         if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
-            return Err(
-                TypeError::invalid(format!("cannot compute the sign of a scalar of data type {}", data_type,)).into()
-            );
+            return Err(TypeError::invalid(format!(
+                "cannot compute the sign of a scalar of data type `{}`",
+                data_type,
+            ))
+            .into());
         }
         if data_type.is_signed() {
             dispatch_on_array_element_type!(@signed data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ElementSign>::sign(value)
+                    <Element as ArrayElement>::sign(value)
                 })
             })
         } else if data_type.is_complex() {
             dispatch_on_array_element_type!(@complex data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ElementSign>::sign(value)
+                    <Element as ArrayElement>::sign(value)
                 })
             })
         } else {
             dispatch_on_array_element_type!(@float data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ElementSign>::sign(value)
+                    <Element as ArrayElement>::sign(value)
                 })
             })
         }
@@ -1838,7 +1270,7 @@ impl_array_elementwise_operation!(
     operation = "rem",
     inputs = @numeric @real,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ElementRem::rem(lhs, rhs),
+    |lhs, rhs| ArrayElement::rem(lhs, rhs),
 );
 
 impl Dot for Array {
@@ -2117,12 +1549,12 @@ mod tests {
         assert!(matches!(
             Array::scalar(1i32).atan2(&Array::scalar(1.0f64)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`atan2` does not support input data type i32",
+                if message == "`atan2` does not support input data type `i32`",
         ));
         assert!(matches!(
             Array::scalar(2.0f64).pow(&Array::scalar(3i32)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`pow` does not support input data type i32",
+                if message == "`pow` does not support input data type `i32`",
         ));
 
         // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
@@ -2174,7 +1606,7 @@ mod tests {
         assert!(matches!(
             Array::scalar(1u8).sign(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute the sign of a scalar of data type u8",
+                if message == "cannot compute the sign of a scalar of data type `u8`",
         ));
     }
 
@@ -2411,18 +1843,18 @@ mod tests {
         assert!(matches!(
             Array::vector(vec![1i32]).div(&Array::vector(vec![0i32])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide an integer scalar of data type i32 by zero",
+                if message == "cannot divide an integer scalar of data type `i32` by zero",
         ));
         assert!(matches!(
             Array::vector(vec![i8::MIN]).div(&Array::vector(vec![-1i8])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide the minimum integer scalar of data type i8 by -1",
+                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
         ));
         assert!(matches!(
             Array::vector(vec![1u8]).rem(&Array::vector(vec![0u8])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message
-                    == "cannot compute the remainder of an integer scalar of data type u8 with a zero divisor",
+                    == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
         ));
     }
 }

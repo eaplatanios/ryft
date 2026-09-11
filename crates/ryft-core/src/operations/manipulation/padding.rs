@@ -1325,7 +1325,7 @@ fn validate_pad_inputs(
 ) -> Result<(), ProgramError> {
     if input.data_type() != padding_value.data_type() {
         return Err(TypeError::invalid(format!(
-            "`{}` input data type {} does not match padding value data type {}",
+            "`{}` input data type `{}` does not match padding value data type `{}`",
             PAD_OPERATION_NAME,
             input.data_type(),
             padding_value.data_type(),
@@ -1569,7 +1569,7 @@ mod tests {
                 },
                 {
                     input_types = [input_type.clone(), ArrayType::scalar(DataType::F32)],
-                    error = "`pad` input data type f64 does not match padding value data type f32",
+                    error = "`pad` input data type `f64` does not match padding value data type `f32`",
                 },
                 {
                     input_types = [input_type.clone(), input_type.clone()],

@@ -266,7 +266,7 @@ macro_rules! dispatch_on_array_element_type {
                     $body
                 }
             )+
-            other => unreachable!("unsupported element data type {other} for this dispatch"),
+            other => unreachable!("unsupported element data type `{other}` for this dispatch"),
         }
     };
 }
@@ -663,13 +663,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unsupported element data type c64 for this dispatch")]
+    #[should_panic(expected = "unsupported element data type `c64` for this dispatch")]
     fn test_dispatch_on_array_element_type_rejects_out_of_class_data_types() {
         dispatch_on_array_element_type!(@real DataType::C64, |Element| element_data_type::<Element>());
     }
 
     #[test]
-    #[should_panic(expected = "unsupported element data type token for this dispatch")]
+    #[should_panic(expected = "unsupported element data type `token` for this dispatch")]
     fn test_dispatch_on_array_element_type_rejects_payload_free_data_types() {
         dispatch_on_array_element_type!(DataType::Token, |Element| element_data_type::<Element>());
     }
@@ -714,7 +714,7 @@ mod tests {
         assert!(matches!(
             Array::scalar(1i32).float_identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`float_identity` does not support input data type i32",
+                if message == "`float_identity` does not support input data type `i32`",
         ));
         Ok(())
     }
@@ -741,7 +741,7 @@ mod tests {
         assert!(matches!(
             Array::scalar(Complex::new(1f32, 2.0)).real_float_identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`real_float_identity` does not support input data type c64",
+                if message == "`real_float_identity` does not support input data type `c64`",
         ));
 
         // Empty operands cannot bypass validation of the declared input class.
@@ -749,12 +749,12 @@ mod tests {
         assert!(matches!(
             input.real_float_identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`real_float_identity` does not support input data type bool",
+                if message == "`real_float_identity` does not support input data type `bool`",
         ));
         assert!(matches!(
             input.identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`identity` does not support input data type bool",
+                if message == "`identity` does not support input data type `bool`",
         ));
         Ok(())
     }
@@ -845,14 +845,14 @@ mod tests {
         assert!(matches!(
             output,
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`min` does not support input data type bool",
+                if message == "`min` does not support input data type `bool`",
         ));
 
         let output = input.real_minimum(&input);
         assert!(matches!(
             output,
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`min` does not support input data type bool",
+                if message == "`min` does not support input data type `bool`",
         ));
 
         let input = Array::from_elements(ArrayType::new_static(DataType::C64, [0]), &[] as &[Complex<f32>])?;
@@ -860,7 +860,7 @@ mod tests {
         assert!(matches!(
             output,
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`min` does not support input data type c64",
+                if message == "`min` does not support input data type `c64`",
         ));
         Ok(())
     }

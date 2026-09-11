@@ -62,7 +62,7 @@ impl Array {
             // comparison API reaches this kernel without it.
             if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual) {
                 return Err(TypeError::invalid(format!(
-                    "cannot apply an ordered comparison to unordered complex scalars of data type {data_type}",
+                    "cannot apply an ordered comparison to unordered complex scalars of data type `{data_type}`",
                 ))
                 .into());
             }
@@ -109,7 +109,7 @@ impl Compare for Array {
             return Err(TypeError::invalid("cannot compare token scalars".to_string()).into());
         }
         if target == DataType::Zero {
-            return Err(TypeError::invalid("cannot compare scalars of data types zero and zero".to_string()).into());
+            return Err(TypeError::invalid("cannot compare scalars of data types `zero` and `zero`".to_string()).into());
         }
 
         // `broadcast_promoted` converts only mismatched inputs, so equal-typed inputs retain their exact physical
@@ -168,7 +168,7 @@ mod tests {
         assert!(matches!(
             complex.compare(&complex, ComparisonDirection::LessThan),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot apply an ordered comparison to unordered complex scalars of data type c64",
+                if message == "cannot apply an ordered comparison to unordered complex scalars of data type `c64`",
         ));
 
         // Empty payload-free comparisons are vacuous because they evaluate no unsupported element comparison; a

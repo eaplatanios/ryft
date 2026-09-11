@@ -61,7 +61,7 @@ impl Operation for SelectOperation<DataType> {
         check_count!("input", input_types, 3, TypeError);
         if !input_types[0].is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{}` condition data type {} is not {}",
+                "`{}` condition data type `{}` is not `{}`",
                 SELECT_OPERATION_NAME,
                 input_types[0],
                 DataType::Boolean,
@@ -124,7 +124,7 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
         if !condition.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{}` condition data type {} is not {}",
+                "`{}` condition data type `{}` is not `{}`",
                 SELECT_OPERATION_NAME,
                 condition.data_type(),
                 DataType::Boolean,
@@ -408,7 +408,7 @@ mod tests {
                 },
                 {
                     input_types = [branch_type.clone(), branch_type.clone(), branch_type.clone()],
-                    error = "`select` condition data type f64 is not bool",
+                    error = "`select` condition data type `f64` is not `bool`",
                 },
                 {
                     input_types = [

@@ -30,7 +30,7 @@ impl crate::operations::complex::Complex for Array {
             DataType::F64 => DataType::C128,
             other => {
                 return Err(TypeError::invalid(format!(
-                    "cannot construct a complex value from parts of data type {other}",
+                    "cannot construct a complex value from parts of data type `{other}`",
                 ))
                 .into());
             }
@@ -57,7 +57,7 @@ impl Conjugate for Array {
             DataType::C128 => {
                 self.map_elements::<Complex<f64>, Complex<f64>>(self.r#type().into_owned(), |value| Ok(value.conj()))
             }
-            other => Err(TypeError::invalid(format!("cannot conjugate a scalar of data type {other}")).into()),
+            other => Err(TypeError::invalid(format!("cannot conjugate a scalar of data type `{other}`")).into()),
         }
     }
 }
@@ -76,7 +76,8 @@ impl Real for Array {
                     Ok(value.re)
                 }),
             other => {
-                Err(TypeError::invalid(format!("cannot extract the real part of a scalar of data type {other}")).into())
+                Err(TypeError::invalid(format!("cannot extract the real part of a scalar of data type `{other}`"))
+                    .into())
             }
         }
     }
@@ -95,10 +96,10 @@ impl Imaginary for Array {
                 .map_elements::<Complex<f64>, f64>(self.r#type().into_owned().with_data_type(DataType::F64), |value| {
                     Ok(value.im)
                 }),
-            other => {
-                Err(TypeError::invalid(format!("cannot extract the imaginary part of a scalar of data type {other}",))
-                    .into())
-            }
+            other => Err(TypeError::invalid(format!(
+                "cannot extract the imaginary part of a scalar of data type `{other}`",
+            ))
+            .into()),
         }
     }
 }

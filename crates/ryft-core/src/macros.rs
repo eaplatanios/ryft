@@ -132,7 +132,7 @@ macro_rules! check_types {
         if let Some(input_type) = types.iter().find(|input_type| {
             !$crate::check_types!(@matches_data_type input_type; $(@$selector)+)
         }) {
-            return Err($crate::TypeError::invalid(format!("`{descriptor}` does not support input data type {input_type}"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` does not support input data type `{input_type}`"))
             .into());
         }
     }};
@@ -3213,7 +3213,7 @@ macro_rules! define_tracer_operator {
 ///         },
 ///         {
 ///             input_data_types = [DataType::Boolean, DataType::Boolean],
-///             error = "`add` does not support input data type bool",
+///             error = "`add` does not support input data type `bool`",
 ///         },
 ///     ],
 /// );
@@ -5326,38 +5326,38 @@ mod tests {
         for r#type in [DataType::Boolean, DataType::Token, DataType::Zero] {
             assert_eq!(
                 check_numeric(&[DataType::F32, r#type]),
-                Err(TypeError::invalid(format!("`test` does not support input data type {type}", type = r#type))),
+                Err(TypeError::invalid(format!("`test` does not support input data type `{type}`", type = r#type))),
             );
         }
         assert_eq!(check_real(&[DataType::I64, DataType::F32]), Ok(()));
         assert_eq!(
             check_real(&[DataType::C64]),
-            Err(TypeError::invalid("`test` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `c64`".to_string())),
         );
         assert_eq!(check_float(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
         assert_eq!(
             check_float(&[DataType::I64]),
-            Err(TypeError::invalid("`test` does not support input data type i64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `i64`".to_string())),
         );
         assert_eq!(check_numeric_then_real(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_numeric(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(
             check_numeric_then_real(&[DataType::C128]),
-            Err(TypeError::invalid("`test` does not support input data type c128".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `c128`".to_string())),
         );
         assert_eq!(
             check_numeric_then_real(&[DataType::Boolean]),
-            Err(TypeError::invalid("`test` does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `bool`".to_string())),
         );
         assert_eq!(check_float_then_real(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_float(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(
             check_float_then_real(&[DataType::C64]),
-            Err(TypeError::invalid("`test` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `c64`".to_string())),
         );
         assert_eq!(
             check_float_then_real(&[DataType::I64]),
-            Err(TypeError::invalid("`test` does not support input data type i64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type `i64`".to_string())),
         );
     }
 
@@ -5537,12 +5537,12 @@ mod tests {
         );
         assert_eq!(
             data_operation.infer_output_types(&[DataType::Boolean], &[]),
-            Err(TypeError::invalid("`test_unary` does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type `bool`".to_string())),
         );
         assert_eq!(data_operation.infer_output_types(&[DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
             data_operation.infer_output_types(&[DataType::C64], &[]),
-            Err(TypeError::invalid("`test_unary` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type `c64`".to_string())),
         );
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::F32)], &[]),
@@ -5555,7 +5555,7 @@ mod tests {
         );
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
-            Err(TypeError::invalid("`test_unary` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type `c64`".to_string())),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
@@ -5609,12 +5609,12 @@ mod tests {
         );
         assert_eq!(
             data_operation.infer_output_types(&[DataType::Boolean, DataType::Boolean], &[]),
-            Err(TypeError::invalid("`test_binary` does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type `bool`".to_string())),
         );
         assert_eq!(data_operation.infer_output_types(&[DataType::I64, DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
             data_operation.infer_output_types(&[DataType::C64, DataType::C64], &[]),
-            Err(TypeError::invalid("`test_binary` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type `c64`".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
@@ -5628,7 +5628,7 @@ mod tests {
                 &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
                 &[],
             ),
-            Err(TypeError::invalid("`test_binary` does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type `c64`".to_string())),
         );
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
@@ -6577,7 +6577,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::Boolean],
-                    error = "cannot compute the absolute value of a value of data type bool",
+                    error = "cannot compute the absolute value of a value of data type `bool`",
                 },
             ],
         );
@@ -6592,7 +6592,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`add` does not support input data type bool",
+                    error = "`add` does not support input data type `bool`",
                 },
             ],
         );
@@ -6611,7 +6611,7 @@ mod tests {
                 },
                 {
                     input_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`add` does not support input data type bool",
+                    error = "`add` does not support input data type `bool`",
                 },
             ],
         );

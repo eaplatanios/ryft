@@ -724,7 +724,7 @@ impl Scatter for ArrayType {
         }
         if updates.data_type() != operand.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` updates data type {} does not match operand data type {}",
+                "`{SCATTER_OPERATION_NAME}` updates data type `{}` does not match operand data type `{}`",
                 updates.data_type(),
                 operand.data_type(),
             ))
@@ -1037,7 +1037,7 @@ mod tests {
                 },
                 {
                     input_types = [operand.clone(), indices.clone(), indices_type(vec![2, 2])],
-                    error = "`scatter` updates data type i32 does not match operand data type f32",
+                    error = "`scatter` updates data type `i32` does not match operand data type `f32`",
                 },
                 {
                     input_types = [operand.clone(), float_type(vec![2, 1]), updates.clone()],

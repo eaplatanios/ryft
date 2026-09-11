@@ -79,6 +79,10 @@ use crate::programs::{ProgramError, TypeError};
 /// source at four constructors plus one routing per element type instead of one body per ordered pair, which for the
 /// 32 element types below is 160 entry points instead of 1,024 pairwise bodies.
 pub trait ArrayElement: private::Codec {
+    /// Element type returned by [`abs`](Self::abs). Complex elements use their real component type,
+    /// and all other elements use `Self`, including types for which absolute value is not supported.
+    type Magnitude: ArrayElement;
+
     /// Returns the [`DataType`] represented by this element type.
     #[inline]
     fn data_type() -> DataType {
@@ -161,6 +165,45 @@ pub trait ArrayElement: private::Codec {
     /// ordering, NaN value propagation, and tie-breaking rules as [`min`](Self::min), including the distinct rules
     /// for complex values.
     fn max(&self, other: &Self) -> Self;
+
+    /// Negates this element. Integers wrap in their declared bit width, including unsigned integers and the minimum
+    /// signed value. Floating-point results use the element format's rounding and representability rules. Boolean
+    /// elements use logical negation, flipping `true` and `false`. Elements of type [`f8e8m0fnu`] return an error.
+    fn neg(self) -> Result<Self, ProgramError>;
+
+    /// Adds `rhs` to this element. Integers wrap in their declared bit width. Floating-point and complex elements use
+    /// their ordinary arithmetic, with low-precision results rounded to the destination format. Returns an error for
+    /// Boolean elements or unrepresentable low-precision results.
+    fn add(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Subtracts `rhs` from this element, with the same wrapping, rounding, and error rules as [`add`](Self::add).
+    fn sub(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Multiplies this element by `rhs`, with the same wrapping, rounding, and error rules as [`add`](Self::add).
+    fn mul(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Divides this element by `rhs`. Integer division truncates toward zero and returns an error for a zero divisor
+    /// or for signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination format's
+    /// rounding and representability rules. Complex division rescales finite operands when the direct quotient is
+    /// non-finite to avoid intermediate overflow. Boolean elements return an error.
+    fn div(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return an error. The
+    /// minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
+    /// destination format's rounding and representability rules. Boolean and complex elements return an error.
+    fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
+
+    /// Returns this element's absolute value or complex magnitude. Signed integers wrap in their declared bit width,
+    /// so the minimum signed value remains negative. Real floating-point values clear the sign, and complex values
+    /// return their Euclidean magnitude in [`Magnitude`](Self::Magnitude). Returns an error for Boolean, unsigned
+    /// integer, and [`i1`] elements, or a result that the element format cannot represent.
+    fn abs(self) -> Result<Self::Magnitude, ProgramError>;
+
+    /// Returns the sign of this element. Signed integers produce `-1`, `0`, or `1`. Real floating-point values preserve
+    /// zeros and NaNs, including their exact encodings, and otherwise produce `-1` or `1`. Complex values preserve zero
+    /// and otherwise divide by their Euclidean magnitude, using ordinary floating-point arithmetic for infinite and NaN
+    /// components. Boolean and unsigned integer elements return an error.
+    fn sign(self) -> Result<Self, ProgramError>;
 
     /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
     /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
@@ -666,7 +709,7 @@ impl LowPrecisionFloatingPointFormat {
         match value.classify() {
             FpCategory::Nan => self
                 .nan_bits(negative)
-                .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type))),
+                .ok_or_else(|| TypeError::invalid(format!("data type `{}` cannot represent NaN", self.data_type))),
             FpCategory::Zero if exponent_only => {
                 Err(TypeError::invalid(format!("data type `{}` cannot represent zero", self.data_type)))
             }
@@ -1123,6 +1166,8 @@ impl private::Codec for Complex<f64> {
 // The Boolean element type carries `false` as `0` and `true` as `1`, and reads back as "the value is nonzero" from
 // every category. Complex sources are true when either component is nonzero, so the imaginary part is not discarded.
 impl ArrayElement for bool {
+    type Magnitude = Self;
+
     #[inline]
     fn from_signed(value: i64) -> Result<Self, ProgramError> {
         Ok(value != 0)
@@ -1164,6 +1209,49 @@ impl ArrayElement for bool {
     }
 
     #[inline]
+    fn neg(self) -> Result<Self, ProgramError> {
+        Ok(!self)
+    }
+
+    fn add(self, _rhs: Self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute `add` for an element of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    fn sub(self, _rhs: Self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute `sub` for an element of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    fn mul(self, _rhs: Self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute `mul` for an element of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    fn div(self, _rhs: Self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute `div` for an element of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    fn rem(self, _rhs: Self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute `rem` for an element of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+        Err(TypeError::invalid(format!(
+            "cannot compute the absolute value of a scalar of data type `{}`",
+            DataType::Boolean,
+        ))
+        .into())
+    }
+
+    fn sign(self) -> Result<Self, ProgramError> {
+        Err(TypeError::invalid(format!("cannot compute the sign of a scalar of data type `{}`", DataType::Boolean))
+            .into())
+    }
+
+    #[inline]
     fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
         Output::from_unsigned(u64::from(self))
     }
@@ -1175,6 +1263,8 @@ impl ArrayElement for bool {
 macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
+            type Magnitude = Self;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
@@ -1214,6 +1304,76 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             }
 
             #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_neg() & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_sub(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.to_bits().wrapping_mul(rhs.to_bits()) & bit_mask).unwrap())
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide an integer scalar of data type `{}` by zero",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                if self == Self::MIN && rhs.value() == -1 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide the minimum integer scalar of data type `{}` by -1",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(Self::new(self.value() / rhs.value()).unwrap())
+            }
+
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_rem(rhs.value()) as u8 & bit_mask).unwrap())
+            }
+
+            fn abs(self) -> Result<Self, ProgramError> {
+                if Self::data_type() == DataType::I1 {
+                    return Err(TypeError::invalid(
+                        "cannot compute the absolute value of a scalar of data type `i1`".to_string(),
+                    )
+                    .into());
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_abs() as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(Self::new(self.value().signum()).unwrap())
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_signed(i64::from(self.value()))
             }
@@ -1229,6 +1389,8 @@ impl_array_element_for_signed_sub_byte_integer_types!(i1, i2, i4);
 macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
+            type Magnitude = Self;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
@@ -1262,6 +1424,64 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
             #[inline]
             fn max(&self, other: &Self) -> Self {
                 Ord::max(*self, *other)
+            }
+
+            #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_neg() & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_sub(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(self.to_bits().wrapping_mul(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide an integer scalar of data type `{}` by zero",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(Self::new(self.value() / rhs.value()).unwrap())
+            }
+
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(Self::new(self.value() % rhs.value()).unwrap())
+            }
+
+            fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+                Err(TypeError::invalid(format!(
+                    "cannot compute the absolute value of a scalar of data type `{}`",
+                    Self::data_type(),
+                ))
+                .into())
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                Err(TypeError::invalid(format!(
+                    "cannot compute the sign of a scalar of data type `{}`",
+                    Self::data_type(),
+                ))
+                .into())
             }
 
             #[inline]
@@ -1275,11 +1495,13 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
 impl_array_element_for_unsigned_sub_byte_integer_types!(u1, u2, u4);
 
 // Implements the interchange contract for native integer element types. Conversions into them use Rust's `as`
-// semantics, which are also the reference backend's C-style narrowing and truncation contract, while conversions out
-// of them widen exactly into `$carrier`, the carrier of the `$route` category.
+// semantics, which are also the reference backend's C-style narrowing and truncation contract, while conversions
+// out of them widen exactly into `$carrier`, the carrier of the `$route` category.
 macro_rules! impl_array_element_for_integer_types {
-    ($carrier:ty, $route:ident, $($type:ty),+ $(,)?) => {$(
+    ($kind:ident, $carrier:ty, $route:ident, $($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
+            type Magnitude = Self;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(value as Self)
@@ -1316,15 +1538,95 @@ macro_rules! impl_array_element_for_integer_types {
             }
 
             #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_neg())
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_add(rhs))
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_sub(rhs))
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_mul(rhs))
+            }
+
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide an integer scalar of data type `{}` by zero",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                if self.checked_div(rhs).is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide the minimum integer scalar of data type `{}` by -1",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(self / rhs)
+            }
+
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(self.wrapping_rem(rhs))
+            }
+
+            impl_array_element_for_integer_types!(@$kind);
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::$route(self as $carrier)
             }
         }
     )+};
+
+    // Implements signed integer magnitude and sign with the primitive wrapping contract.
+    (@signed) => {
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok(self.wrapping_abs())
+            }
+
+            #[inline]
+            fn sign(self) -> Result<Self, ProgramError> {
+                Ok(self.signum())
+            }
+    };
+
+    // Rejects magnitude and sign for unsigned integer elements.
+    (@unsigned) => {
+        fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+            Err(TypeError::invalid(format!(
+                "cannot compute the absolute value of a scalar of data type `{}`",
+                Self::data_type(),
+            ))
+            .into())
+        }
+
+        fn sign(self) -> Result<Self, ProgramError> {
+            Err(TypeError::invalid(format!("cannot compute the sign of a scalar of data type `{}`", Self::data_type()))
+                .into())
+        }
+    };
 }
 
-impl_array_element_for_integer_types!(i64, from_signed, i8, i16, i32, i64);
-impl_array_element_for_integer_types!(u64, from_unsigned, u8, u16, u32, u64);
+impl_array_element_for_integer_types!(signed, i64, from_signed, i8, i16, i32, i64);
+impl_array_element_for_integer_types!(unsigned, u64, from_unsigned, u8, u16, u32, u64);
 
 // Implements the interchange contract for the low-precision floating-point element types. Conversions into them go
 // through each format's own checked rounding contract, which is also where an unrepresentable value (such as zero in
@@ -1332,6 +1634,8 @@ impl_array_element_for_integer_types!(u64, from_unsigned, u8, u16, u32, u64);
 macro_rules! impl_array_element_for_low_precision_floating_point_types {
     ($($type:ty => ($min_identity:expr, $max_identity:expr)),+ $(,)?) => {$(
         impl ArrayElement for $type {
+            type Magnitude = Self;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::from_f64(value as f64)?)
@@ -1383,6 +1687,50 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
                 }
             }
 
+            fn neg(self) -> Result<Self, ProgramError> {
+                if Self::data_type() == DataType::F8E8M0FNU {
+                    return Err(TypeError::invalid(
+                        "cannot negate a scalar of data type `f8e8m0fnu`".to_string(),
+                    ).into());
+                }
+                Ok(Self::from_f64(-self.to_f64())?)
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() + rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() - rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() * rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() / rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() % rhs.to_f64())?)
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64().abs())?)
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let value = self.to_f64();
+                if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
+            }
+
             #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_real(self.to_f64())
@@ -1408,8 +1756,10 @@ impl_array_element_for_low_precision_floating_point_types!(
 // Implements the interchange contract for the native and half-precision real floating-point element types,
 // whose widening into `f64` (i.e., `$to_real`) is exact for every one of them.
 macro_rules! impl_array_element_for_floating_point_type {
-    ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr, $to_real:expr $(,)?) => {
+    ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr, $to_real:expr, $abs:expr $(,)?) => {
         impl ArrayElement for $type {
+            type Magnitude = Self;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok($from_signed(value))
@@ -1462,6 +1812,46 @@ macro_rules! impl_array_element_for_floating_point_type {
             }
 
             #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(-self)
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self + rhs)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self - rhs)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self * rhs)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self / rhs)
+            }
+
+            #[inline]
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self % rhs)
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self, ProgramError> {
+                Ok($abs(self))
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let value = $to_real(self);
+                if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_real($to_real(self))
             }
@@ -1475,6 +1865,7 @@ impl_array_element_for_floating_point_type!(
     |value: u64| bf16::from_f64(value as f64),
     bf16::from_f64,
     bf16::to_f64,
+    |value: bf16| bf16::from_f32(value.to_f32().abs()),
 );
 
 impl_array_element_for_floating_point_type!(
@@ -1483,6 +1874,7 @@ impl_array_element_for_floating_point_type!(
     |value: u64| f16::from_f64(value as f64),
     f16::from_f64,
     f16::to_f64,
+    |value: f16| f16::from_f32(value.to_f32().abs()),
 );
 
 impl_array_element_for_floating_point_type!(
@@ -1491,6 +1883,7 @@ impl_array_element_for_floating_point_type!(
     |value: u64| value as f32,
     |value: f64| value as f32,
     f64::from,
+    f32::abs,
 );
 
 impl_array_element_for_floating_point_type!(
@@ -1499,6 +1892,7 @@ impl_array_element_for_floating_point_type!(
     |value: u64| value as f64,
     |value| value,
     |value| value,
+    f64::abs,
 );
 
 // Implements the interchange contract for the complex element types, which place a real source in the real component
@@ -1506,6 +1900,8 @@ impl_array_element_for_floating_point_type!(
 macro_rules! impl_array_element_for_complex_types {
     ($($component:ty),+ $(,)?) => {$(
         impl ArrayElement for Complex<$component> {
+            type Magnitude = $component;
+
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::new(value as $component, 0.0))
@@ -1549,6 +1945,76 @@ macro_rules! impl_array_element_for_complex_types {
             }
 
             #[inline]
+            fn neg(self) -> Result<Self, ProgramError> {
+                Ok(-self)
+            }
+
+            #[inline]
+            fn add(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self + rhs)
+            }
+
+            #[inline]
+            fn sub(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self - rhs)
+            }
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self * rhs)
+            }
+
+            #[inline]
+            fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                // Normalize finite operands when direct division overflows to avoid squaring a large denominator.
+                let direct = self / rhs;
+                Ok(if direct.re.is_finite() && direct.im.is_finite()
+                    || !self.re.is_finite()
+                    || !self.im.is_finite()
+                    || !rhs.re.is_finite()
+                    || !rhs.im.is_finite()
+                    || rhs.re == 0.0 && rhs.im == 0.0
+                {
+                    direct
+                } else if rhs.im == 0.0 {
+                    Complex::new(self.re / rhs.re, self.im / rhs.re)
+                } else if rhs.re == 0.0 {
+                    Complex::new(self.im / rhs.im, -self.re / rhs.im)
+                } else {
+                    let scale = rhs.re.abs().max(rhs.im.abs());
+                    let lhs = Complex::new(self.re / scale, self.im / scale);
+                    let rhs = Complex::new(rhs.re / scale, rhs.im / scale);
+                    if rhs.re.abs() >= rhs.im.abs() {
+                        let ratio = rhs.im / rhs.re;
+                        let denominator = rhs.re + rhs.im * ratio;
+                        Complex::new((lhs.re + lhs.im * ratio) / denominator, (lhs.im - lhs.re * ratio) / denominator)
+                    } else {
+                        let ratio = rhs.re / rhs.im;
+                        let denominator = rhs.im + rhs.re * ratio;
+                        Complex::new((lhs.re * ratio + lhs.im) / denominator, (lhs.im * ratio - lhs.re) / denominator)
+                    }
+                })
+            }
+
+            fn rem(self, _rhs: Self) -> Result<Self, ProgramError> {
+                Err(TypeError::invalid(format!(
+                    "cannot compute `rem` for an element of data type `{}`",
+                    Self::data_type(),
+                ))
+                .into())
+            }
+
+            #[inline]
+            fn abs(self) -> Result<Self::Magnitude, ProgramError> {
+                Ok(self.norm())
+            }
+
+            fn sign(self) -> Result<Self, ProgramError> {
+                let norm = self.norm();
+                Ok(if norm == 0.0 { self } else { self / norm })
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_complex(Complex::new(self.re as f64, self.im as f64))
             }
@@ -1572,7 +2038,7 @@ impl_array_element_for_complex_types!(f32, f64);
 pub fn encode_elements<T: ArrayElement>(r#type: &ArrayType, elements: &[T]) -> Result<Vec<u8>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
         return Err(TypeError::invalid(format!(
-            "cannot encode {} values as array elements of data type {}",
+            "cannot encode `{}` values as array elements of data type `{}`",
             T::DATA_TYPE,
             r#type.data_type(),
         ))
@@ -1659,7 +2125,7 @@ pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<T>, ProgramError> {
     if r#type.data_type() != T::DATA_TYPE {
         return Err(TypeError::invalid(format!(
-            "cannot decode array elements of data type {} as {} values",
+            "cannot decode array elements of data type `{}` as `{}` values",
             r#type.data_type(),
             T::DATA_TYPE,
         ))
@@ -1886,7 +2352,7 @@ mod tests {
         assert!(matches!(
             f4e2m1fn::from_real(f64::NAN),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type f4e2m1fn cannot represent NaN",
+                if message == "data type `f4e2m1fn` cannot represent NaN",
         ));
         assert!(matches!(
             f8e8m0fnu::from_real(0.0),
@@ -2155,6 +2621,180 @@ mod tests {
             ArrayElement::max(&Complex::new(1.0f32, -0.0), &Complex::new(1.0, 0.0)).im.to_bits(),
             0.0f32.to_bits(),
         );
+    }
+
+    #[test]
+    fn test_array_element_neg() {
+        assert_eq!(ArrayElement::neg(false), Ok(true));
+        assert_eq!(ArrayElement::neg(true), Ok(false));
+
+        // Integer negation wraps in the declared width, including unsigned and one-bit elements.
+        assert_eq!(ArrayElement::neg(i8::MIN), Ok(i8::MIN));
+        assert_eq!(ArrayElement::neg(1u64), Ok(u64::MAX));
+        assert_eq!(ArrayElement::neg(i1::MIN), Ok(i1::MIN));
+        assert_eq!(ArrayElement::neg(i4::new(3).unwrap()), Ok(i4::new(-3).unwrap()));
+        assert_eq!(ArrayElement::neg(u2::new(1).unwrap()), Ok(u2::MAX));
+        assert_eq!(ArrayElement::neg(0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(ArrayElement::neg(f16::from_f32(1.5)), Ok(f16::from_f32(-1.5)));
+        assert_eq!(ArrayElement::neg(f4e2m1fn::from_f64(1.5).unwrap()).unwrap().to_bits(), 0xb);
+        assert_eq!(ArrayElement::neg(Complex::new(1.0f64, -2.0)), Ok(Complex::new(-1.0, 2.0)));
+        assert!(matches!(
+            ArrayElement::neg(f8e8m0fnu::one().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot negate a scalar of data type `f8e8m0fnu`",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_add() {
+        assert_eq!(ArrayElement::add(i64::MAX, 1), Ok(i64::MIN));
+        assert_eq!(ArrayElement::add(u8::MAX, 1), Ok(0));
+        assert_eq!(ArrayElement::add(i4::MAX, i4::one().unwrap()), Ok(i4::MIN));
+        assert_eq!(ArrayElement::add(u1::MAX, u1::MAX), Ok(u1::MIN));
+        assert_eq!(ArrayElement::add(1.5f64, 2.0), Ok(3.5));
+        assert_eq!(ArrayElement::add(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(4.0, -2.0)));
+
+        // Half and sub-byte floating-point sums round ties to the even destination encoding.
+        assert_eq!(ArrayElement::add(bf16::ONE, bf16::from_f32(1.0 / 256.0)).unwrap().to_bits(), 0x3f80);
+        assert_eq!(
+            ArrayElement::add(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::one().unwrap()).unwrap().to_bits(),
+            0x4,
+        );
+        assert!(matches!(
+            ArrayElement::add(true, false),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `add` for an element of data type `bool`",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_sub() {
+        assert_eq!(ArrayElement::sub(i16::MIN, 1), Ok(i16::MAX));
+        assert_eq!(ArrayElement::sub(0u32, 1), Ok(u32::MAX));
+        assert_eq!(ArrayElement::sub(i2::MIN, i2::one().unwrap()), Ok(i2::MAX));
+        assert_eq!(ArrayElement::sub(u4::MIN, u4::one().unwrap()), Ok(u4::MAX));
+        assert_eq!(ArrayElement::sub(1.5f32, 2.0), Ok(-0.5));
+        assert_eq!(ArrayElement::sub(Complex::new(1.0f64, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(-2.0, 6.0)));
+        assert_eq!(
+            ArrayElement::sub(f4e2m1fn::from_f64(3.0).unwrap(), f4e2m1fn::from_f64(0.5).unwrap())
+                .unwrap()
+                .to_bits(),
+            0x4,
+        );
+        assert!(matches!(
+            ArrayElement::sub(f8e8m0fnu::one().unwrap(), f8e8m0fnu::one().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+        assert!(matches!(
+            ArrayElement::sub(true, false),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `sub` for an element of data type `bool`",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_mul() {
+        assert_eq!(ArrayElement::mul(i32::MAX, 2), Ok(-2));
+        assert_eq!(ArrayElement::mul(u16::MAX, 2), Ok(u16::MAX - 1));
+        assert_eq!(ArrayElement::mul(i4::new(3).unwrap(), i4::new(3).unwrap()), Ok(i4::new(-7).unwrap()));
+        assert_eq!(ArrayElement::mul(u2::MAX, u2::MAX), Ok(u2::one().unwrap()));
+        assert_eq!(ArrayElement::mul(1.5f64, 2.0), Ok(3.0));
+        assert_eq!(ArrayElement::mul(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(11.0, 2.0)));
+        assert_eq!(
+            ArrayElement::mul(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::from_f64(1.5).unwrap())
+                .unwrap()
+                .to_bits(),
+            0x4,
+        );
+        assert!(matches!(
+            ArrayElement::mul(true, false),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `mul` for an element of data type `bool`",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_div() {
+        // Integer division truncates toward zero and rejects both zero divisors and signed overflow.
+        assert_eq!(ArrayElement::div(-7i32, 2), Ok(-3));
+        assert_eq!(ArrayElement::div(7u64, 2), Ok(3));
+        assert_eq!(ArrayElement::div(i4::new(-7).unwrap(), i4::new(2).unwrap()), Ok(i4::new(-3).unwrap()));
+        assert_eq!(ArrayElement::div(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::new(3).unwrap()));
+        assert!(matches!(
+            ArrayElement::div(1u8, 0),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot divide an integer scalar of data type `u8` by zero",
+        ));
+        assert!(matches!(
+            ArrayElement::div(i8::MIN, -1),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
+        ));
+        assert!(matches!(
+            ArrayElement::div(i1::MIN, i1::MIN),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot divide the minimum integer scalar of data type `i1` by -1",
+        ));
+        assert_eq!(ArrayElement::div(1.0f32, 0.0), Ok(f32::INFINITY));
+        assert_eq!(ArrayElement::div(f16::from_f32(3.0), f16::from_f32(2.0)), Ok(f16::from_f32(1.5)));
+        assert_eq!(
+            ArrayElement::div(f4e2m1fn::one().unwrap(), f4e2m1fn::from_f64(3.0).unwrap()).unwrap().to_bits(),
+            0x1,
+        );
+
+        // A finite quotient remains finite when computing the denominator's squared norm would overflow.
+        assert_eq!(
+            ArrayElement::div(Complex::new(f32::MAX, f32::MAX), Complex::new(f32::MAX, f32::MAX)),
+            Ok(Complex::new(1.0, 0.0)),
+        );
+        assert_eq!(
+            ArrayElement::div(Complex::new(f64::MAX, f64::MAX), Complex::new(f64::MAX, f64::MAX)),
+            Ok(Complex::new(1.0, 0.0)),
+        );
+        assert!(matches!(
+            ArrayElement::div(true, false),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `div` for an element of data type `bool`",
+        ));
+    }
+
+    #[test]
+    fn test_array_element_rem() {
+        // Remainders follow the dividend's sign; the signed minimum divided by -1 has remainder zero.
+        assert_eq!(ArrayElement::rem(-7i64, 2), Ok(-1));
+        assert_eq!(ArrayElement::rem(i64::MIN, -1), Ok(0));
+        assert_eq!(ArrayElement::rem(7u32, 2), Ok(1));
+        assert_eq!(ArrayElement::rem(i4::MIN, i4::new(-1).unwrap()), Ok(i4::zero().unwrap()));
+        assert_eq!(ArrayElement::rem(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::one().unwrap()));
+        assert_eq!(ArrayElement::rem(-3.5f64, 2.0), Ok(-1.5));
+        assert_eq!(ArrayElement::rem(-0.0f32, 2.0).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(
+            ArrayElement::rem(f4e2m1fn::from_f64(-3.0).unwrap(), f4e2m1fn::from_f64(2.0).unwrap())
+                .unwrap()
+                .to_bits(),
+            0xa,
+        );
+        assert!(matches!(
+            ArrayElement::rem(1i32, 0),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute the remainder of an integer scalar of data type `i32` with a zero divisor",
+        ));
+        assert!(matches!(
+            ArrayElement::rem(f4e2m1fn::one().unwrap(), f4e2m1fn::zero().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
+        assert!(matches!(
+            ArrayElement::rem(Complex::new(1.0f32, 2.0), Complex::new(3.0, 4.0)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `rem` for an element of data type `c64`",
+        ));
+        assert!(matches!(
+            ArrayElement::rem(true, false),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute `rem` for an element of data type `bool`",
+        ));
     }
 
     #[test]
@@ -2483,7 +3123,7 @@ mod tests {
         assert_eq!(f6e3m2fn::from_f64(-1e-30).map(f6e3m2fn::to_bits), Ok(0x20));
         assert!(matches!(
             f4e2m1fn::from_f64(f64::NAN),
-            Err(TypeError::Invalid { message }) if message == "data type f4e2m1fn cannot represent NaN",
+            Err(TypeError::Invalid { message }) if message == "data type `f4e2m1fn` cannot represent NaN",
         ));
         assert_eq!(f6e2m3fn::from_f64(100.0).map(f6e2m3fn::to_f64), Ok(7.5));
         assert_eq!(f6e2m3fn::from_f64(7.75).map(f6e2m3fn::to_bits), Ok(0x1f));
@@ -2492,7 +3132,7 @@ mod tests {
         assert_eq!(f6e2m3fn::from_f64(1.0625).map(f6e2m3fn::to_bits), Ok(0x08));
         assert!(matches!(
             f6e2m3fn::from_f32(f32::NAN),
-            Err(TypeError::Invalid { message }) if message == "data type f6e2m3fn cannot represent NaN",
+            Err(TypeError::Invalid { message }) if message == "data type `f6e2m3fn` cannot represent NaN",
         ));
         assert_eq!(f6e3m2fn::from_f64(100.0).map(f6e3m2fn::to_f64), Ok(28.0));
         assert_eq!(f6e3m2fn::from_f64(30.0).map(f6e3m2fn::to_bits), Ok(0x1f));
@@ -2501,7 +3141,7 @@ mod tests {
         assert_eq!(f6e3m2fn::from_f64(1.125).map(f6e3m2fn::to_bits), Ok(0x0c));
         assert!(matches!(
             f6e3m2fn::from_f64(f64::NAN),
-            Err(TypeError::Invalid { message }) if message == "data type f6e3m2fn cannot represent NaN",
+            Err(TypeError::Invalid { message }) if message == "data type `f6e3m2fn` cannot represent NaN",
         ));
 
         // Rounding ties choose the even encoding, which at the overflow boundary can be either the largest finite
@@ -2794,7 +3434,7 @@ mod tests {
         assert!(matches!(
             encode_elements(&booleans, &[0u8, 1]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot encode u8 values as array elements of data type bool",
+                if message == "cannot encode `u8` values as array elements of data type `bool`",
         ));
         assert!(matches!(
             encode_elements(&booleans, &[true]),

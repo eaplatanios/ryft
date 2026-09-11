@@ -87,7 +87,7 @@ impl RngBitGenerator for Array {
         let data_type = output_type.data_type();
         if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
             return Err(TypeError::invalid(format!(
-                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support output data type {data_type}",
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support output data type `{data_type}`",
             ))
             .into());
         }

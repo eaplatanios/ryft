@@ -179,7 +179,7 @@ fn fmha_eligibility(
         return Ok(FmhaEligibility::Ineligible("the target platform is not CUDA"));
     }
     if !matches!(input_types[0].data_type(), DataType::BF16 | DataType::F16) {
-        return Ok(FmhaEligibility::Ineligible("the operand data type is not f16 or bf16"));
+        return Ok(FmhaEligibility::Ineligible("the operand data type is not `f16` or `bf16`"));
     }
     let [_, _, _, head_dimension] = attention_dimensions(&input_types[0])?;
     let Some(head_dimension) = head_dimension.value() else {

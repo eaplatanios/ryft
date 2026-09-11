@@ -90,7 +90,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "`sqrt` does not support input data type i32",
+                    error = "`sqrt` does not support input data type `i32`",
                 },
             ],
         );

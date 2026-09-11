@@ -167,7 +167,7 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         match r#type.data_type() {
             DataType::Token | DataType::Zero => {
-                Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
+                Err(TypeError::invalid(format!("data type `{}` cannot represent one", r#type.data_type())).into())
             }
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
                 Array::from_fn_elements(r#type.clone(), |_| Ok(Element::one()?))
@@ -353,7 +353,7 @@ mod tests {
         for data_type in [DataType::Token, DataType::Zero] {
             assert_eq!(
                 context.one(&ArrayType::scalar(data_type)),
-                Err(ProgramError::Type(TypeError::invalid(format!("data type {data_type} cannot represent one",)))),
+                Err(ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent one",)))),
             );
         }
         let dynamic_type = ArrayType::new(

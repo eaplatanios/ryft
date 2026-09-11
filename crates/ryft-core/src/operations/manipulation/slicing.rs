@@ -1379,7 +1379,7 @@ impl UpdateSlice for ArrayType {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{}` input data type {} does not match update data type {}",
+                "`{}` input data type `{}` does not match update data type `{}`",
                 UPDATE_SLICE_OPERATION_NAME,
                 self.data_type(),
                 update.data_type(),
@@ -2514,7 +2514,7 @@ impl DynamicUpdateSlice for ArrayType {
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{}` input data type {} does not match update data type {}",
+                "`{}` input data type `{}` does not match update data type `{}`",
                 DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 self.data_type(),
                 update.data_type(),
@@ -2976,7 +2976,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "`dynamic_update_slice` input data type f64 does not match update data type f32".to_string()
+                "`dynamic_update_slice` input data type `f64` does not match update data type `f32`".to_string()
             )),
         );
         assert_eq!(
@@ -3852,7 +3852,7 @@ mod tests {
                         input_type.clone(),
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
                     ],
-                    error = "`update_slice` input data type f64 does not match update data type f32",
+                    error = "`update_slice` input data type `f64` does not match update data type `f32`",
                 },
             ],
         );

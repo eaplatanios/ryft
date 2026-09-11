@@ -163,7 +163,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`max` does not support input data type bool",
+                    error = "`max` does not support input data type `bool`",
                 },
             ],
         );

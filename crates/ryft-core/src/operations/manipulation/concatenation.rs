@@ -1052,8 +1052,8 @@ fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<O
     for (index, operand) in inputs.iter().enumerate() {
         if operand.data_type() != first.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{}` operands must share one data type but operand {} has data type {} \
-                and operand 0 has data type {}",
+                "`{}` operands must share one data type but operand {} has data type `{}` \
+                and operand 0 has data type `{}`",
                 CONCATENATE_OPERATION_NAME,
                 index,
                 operand.data_type(),
@@ -1464,8 +1464,8 @@ mod tests {
                         first_type.clone(),
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
                     ],
-                    error = "`concatenate` operands must share one data type but operand 1 has data type f32 and \
-                        operand 0 has data type f64",
+                    error = "`concatenate` operands must share one data type but operand 1 has data type `f32` and \
+                        operand 0 has data type `f64`",
                 },
                 {
                     type = ArrayType,

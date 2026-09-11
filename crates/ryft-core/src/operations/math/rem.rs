@@ -141,11 +141,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "`rem` does not support input data type c64",
+                    error = "`rem` does not support input data type `c64`",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`rem` does not support input data type bool",
+                    error = "`rem` does not support input data type `bool`",
                 },
             ],
         );

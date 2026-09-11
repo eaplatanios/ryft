@@ -21,7 +21,7 @@ define_elementwise_operation!(
         let input_type = input_types[0];
         if input_type == DataType::F8E8M0FNU {
             return Err(TypeError::invalid(format!(
-                "`{NEG_OPERATION_NAME}` does not support input data type f8e8m0fnu",
+                "`{NEG_OPERATION_NAME}` does not support input data type `f8e8m0fnu`",
             )));
         }
         Ok(vec![input_type])
@@ -116,7 +116,7 @@ mod tests {
             }],
         );
         for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::F8E8M0FNU] {
-            let message = format!("`{NEG_OPERATION_NAME}` does not support input data type {input_type}");
+            let message = format!("`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`");
             check_operation_type_inference!(
                 @elementwise @unary,
                 operation = NegOperation,

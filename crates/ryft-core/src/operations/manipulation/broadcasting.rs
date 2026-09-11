@@ -370,7 +370,7 @@ impl Broadcast for ArrayType {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != output_type.data_type() {
             return Err(TypeError::invalid(format!(
-                "broadcasting input data type {} does not match output data type {}",
+                "broadcasting input data type `{}` does not match output data type `{}`",
                 self.data_type(),
                 output_type.data_type(),
             ))
@@ -1333,7 +1333,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))],
-                    error = "broadcasting input data type f32 does not match output data type f64",
+                    error = "broadcasting input data type `f32` does not match output data type `f64`",
                 },
                 {
                     input_types = [output_type.clone()],

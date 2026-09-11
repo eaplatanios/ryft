@@ -146,13 +146,13 @@ pub(super) fn validated_attention_operands(
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` requires floating-point operands but got data type {data_type}"
+            "`{operation_name}` requires floating-point operands but got data type `{data_type}`"
         )));
     }
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
         if input_type.data_type() != data_type {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} data type {} does not match the query data type {data_type}",
+                "`{operation_name}` {descriptor} data type `{}` does not match the query data type `{data_type}`",
                 input_type.data_type(),
             )));
         }
@@ -229,13 +229,13 @@ pub(super) fn validated_attention_operands(
         if let Some(expected_data_type) = expected_data_type {
             if operand_type.data_type() != expected_data_type {
                 return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} must have data type {expected_data_type} but got {}",
+                    "`{operation_name}` {descriptor} must have data type `{expected_data_type}` but got `{}`",
                     operand_type.data_type(),
                 )));
             }
         } else if !operand_type.data_type().is_numeric() && !operand_type.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` bias must have a numeric or Boolean data type but got {}",
+                "`{operation_name}` bias must have a numeric or Boolean data type but got `{}`",
                 operand_type.data_type(),
             )));
         }
@@ -295,7 +295,7 @@ pub(super) fn validated_sequence_length_operands(
         };
         if value_type.data_type() != DataType::I32 {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} must have data type i32 but got {}",
+                "`{operation_name}` {descriptor} must have data type `i32` but got `{}`",
                 value_type.data_type(),
             )));
         }

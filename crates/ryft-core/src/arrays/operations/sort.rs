@@ -105,7 +105,7 @@ impl Sort for Array {
                 let data_type = key.r#type().data_type();
                 let unsupported = || {
                     ProgramError::from(TypeError::invalid(format!(
-                        "`{SORT_OPERATION_NAME}` does not support key data type {data_type}",
+                        "`{SORT_OPERATION_NAME}` does not support key data type `{data_type}`",
                     )))
                 };
                 let addressing = ArrayAddressing::new(key.r#type().into_owned())?;

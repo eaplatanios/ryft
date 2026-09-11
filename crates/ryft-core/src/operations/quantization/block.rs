@@ -88,7 +88,7 @@ where
             DataType::F8E5M2 => (57344.0, 15.0),
             element_type => {
                 return Err(TypeError::invalid(format!(
-                    "`block_quantize` does not support element data type {element_type}"
+                    "`block_quantize` does not support element data type `{element_type}`"
                 ))
                 .into());
             }
@@ -153,7 +153,7 @@ where
             }
             scale_type => {
                 return Err(TypeError::invalid(format!(
-                    "`block_quantize` does not support scale data type {scale_type}"
+                    "`block_quantize` does not support scale data type `{scale_type}`"
                 ))
                 .into());
             }
@@ -232,11 +232,11 @@ mod tests {
         ));
         assert!(matches!(
             input.block_quantize(4, DataType::F16, DataType::F8E4M3FN),
-            Err(error) if error.to_string().contains("`block_quantize` does not support element data type f16"),
+            Err(error) if error.to_string().contains("`block_quantize` does not support element data type `f16`"),
         ));
         assert!(matches!(
             input.block_quantize(4, DataType::F4E2M1FN, DataType::F16),
-            Err(error) if error.to_string().contains("`block_quantize` does not support scale data type f16"),
+            Err(error) if error.to_string().contains("`block_quantize` does not support scale data type `f16`"),
         ));
         let integer_input =
             Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(8)])), vec![1.0; 8]);

@@ -10,7 +10,7 @@
 use crate::arrays::arrays::Array;
 use crate::arrays::encoding::ArrayElement;
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::math::{ElementAdd, ElementMul, ElementRealFloatMath};
+use crate::arrays::operations::math::ElementRealFloatMath;
 use crate::arrays::types::data::DataType;
 use crate::operations::cumulative::cumulative_log_sum_exp::cumulative_log_sum_exp_abstract;
 use crate::operations::cumulative::cumulative_max::cumulative_max_abstract;
@@ -46,8 +46,8 @@ impl Array {
             let elements = self.elements::<Element>()?;
             let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
                 match multiply {
-                    true => <Element as ElementMul>::mul(left, right),
-                    false => <Element as ElementAdd>::add(left, right),
+                    true => <Element as ArrayElement>::mul(left, right),
+                    false => <Element as ArrayElement>::add(left, right),
                 }
             })?;
             Self::from_elements(output_type, scanned.as_slice())

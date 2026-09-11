@@ -465,7 +465,7 @@ fn test_dot_accumulation_type() {
         operation = narrowing,
         cases = [{
             input_types = [f32_operand.clone(), f32_operand],
-            error = "`dot` operand data type f32 cannot accumulate at data type f16",
+            error = "`dot` operand data type `f32` cannot accumulate at data type `f16`",
         }],
     );
     let mesh = test_mesh();

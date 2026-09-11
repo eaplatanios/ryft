@@ -216,7 +216,7 @@ pub(crate) fn dot_abstract(
         }
         if !accumulation_type_is_compatible(lhs.data_type(), accumulation_type) {
             return Err(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` operand data type {} cannot accumulate at data type {accumulation_type}",
+                "`{DOT_OPERATION_NAME}` operand data type `{}` cannot accumulate at data type `{accumulation_type}`",
                 lhs.data_type(),
             )));
         }
