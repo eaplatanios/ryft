@@ -2926,9 +2926,12 @@ impl<'c> XlaDomain<'c> {
         signature: &XlaExecutableSignature,
         platform_name: &str,
     ) -> Result<(), XlaDomainError> {
-        // CPU I/O uses the shared registered-handler surface. Register the built-in print target at compilation
-        // and reload, so ordinary eager printing needs no separate process-global initialization by the caller.
-        if (signature.has_ordered_io() || signature.has_unordered_io()) && platform_name.eq_ignore_ascii_case("cpu") {
+        // I/O uses the shared registered-handler surface. Register the built-in print target at compilation and
+        // reload on the platforms whose handler exists (CPU, and CUDA with a `cuda-*` feature), so ordinary eager
+        // printing needs no separate process-global initialization by the caller.
+        let has_print_handler = platform_name.eq_ignore_ascii_case("cpu")
+            || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
+        if (signature.has_ordered_io() || signature.has_unordered_io()) && has_print_handler {
             super::debugging::ensure_print_handler_registered(self.client()?)?;
         }
         if !signature.requires_assertion_handler() {
@@ -12317,7 +12320,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        assert_xla_session_array_ordered_effects(&client);
+        assert_xla_session_array_ordered_effects(&client, true);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -12333,70 +12336,70 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        assert_xla_session_array_ordered_effects(&client);
+        assert_xla_session_array_ordered_effects(&client, false);
     }
 
-    /// Submits two prints behind an outstanding predecessor token on one device of `client`, verifies that both stay
-    /// pending until the predecessor completes, and checks that they then print in submission order.
-    fn assert_xla_session_array_ordered_effects(client: &Client<'_>) {
+    /// Submits two prints through one session on one device of `client` and checks that they print in submission
+    /// order. With `hold_predecessor`, the two prints are additionally submitted behind an outstanding predecessor token
+    /// (a not-yet-transferred host-to-device token buffer) and must stay pending until it is released. That fixture
+    /// only works on plugins that submit executables without waiting for unrecorded input definition events on the
+    /// host (the CPU plugin); the CUDA plugin blocks the submitting thread until every input event is recorded, so
+    /// there the chain is proven through submission order and barrier completion alone.
+    fn assert_xla_session_array_ordered_effects(client: &Client<'_>, hold_predecessor: bool) {
         use crate::experimental::debugging::with_captured_prints;
         use ryft_core::Print;
 
         let mesh = domain_mesh(client, "x", 1);
-        let session = Arc::new(XlaSession::new(&client));
+        let session = Arc::new(XlaSession::new(client));
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
         let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
-        let manager = client
-            .host_to_device_transfer_manager(
-                vec![BufferSpecification::new(BufferType::Token, [])],
-                client.addressable_devices().unwrap()[0].default_memory().unwrap(),
-            )
-            .unwrap();
         // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
-        let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-        predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-        predecessor.submission.completion.complete(Ok(()));
-        predecessor.published = true;
+        let manager = hold_predecessor.then(|| {
+            let manager = client
+                .host_to_device_transfer_manager(
+                    vec![BufferSpecification::new(BufferType::Token, [])],
+                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+                )
+                .unwrap();
+            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            predecessor.submission.completion.complete(Ok(()));
+            predecessor.published = true;
+            manager
+        });
+        let tail_pending = || {
+            !session
+                .default_effect_scope
+                .state
+                .lock()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .carrier()
+                .unwrap()
+                .unwrap()[0]
+                .ready()
+                .unwrap()
+                .ready()
+                .unwrap()
+        };
         let ((first_pending, second_pending), lines) = with_captured_prints(|| {
             drop(first.print("first"));
-            let first_pending = !session
-                .default_effect_scope
-                .state
-                .lock()
-                .unwrap()
-                .tail
-                .as_ref()
-                .unwrap()
-                .carrier()
-                .unwrap()
-                .unwrap()[0]
-                .ready()
-                .unwrap()
-                .ready()
-                .unwrap();
+            let first_pending = tail_pending();
             drop(second.print("second"));
-            let second_pending = !session
-                .default_effect_scope
-                .state
-                .lock()
-                .unwrap()
-                .tail
-                .as_ref()
-                .unwrap()
-                .carrier()
-                .unwrap()
-                .unwrap()[0]
-                .ready()
-                .unwrap()
-                .ready()
-                .unwrap();
-            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            let second_pending = tail_pending();
+            if let Some(manager) = &manager {
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            }
             session.effects_barrier().unwrap();
             (first_pending, second_pending)
         });
-        assert!(first_pending);
-        assert!(second_pending);
+        if hold_predecessor {
+            assert!(first_pending);
+            assert!(second_pending);
+        }
         assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
         assert_eq!(session.compilation_context().cache_size(), 2);
     }
@@ -12407,7 +12410,7 @@ mod tests {
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client);
+        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client, true);
     }
 
     #[cfg(feature = "cuda-13")]
@@ -12421,13 +12424,15 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client);
+        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client, false);
     }
 
     /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its
-    /// corruption detection, then executes the compiled, restored, and unordered programs behind an outstanding
-    /// predecessor token and verifies the ordered prints fire twice and the unordered print once.
-    fn assert_xla_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>) {
+    /// corruption detection, then executes the compiled, restored, and unordered programs and verifies the ordered
+    /// prints fire twice and the unordered print once. With `hold_predecessor`, the executions are submitted behind
+    /// an outstanding predecessor token that is released only afterwards; refer to
+    /// [`assert_xla_session_array_ordered_effects`] for why that fixture is CPU-only.
+    fn assert_xla_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>, hold_predecessor: bool) {
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let mesh = domain_mesh(client, "x", 1);
@@ -12477,21 +12482,26 @@ mod tests {
         let unordered = domain.compile_xla_program(&lowered).unwrap();
         assert!(unordered.signature.has_unordered_io());
         assert!(!unordered.signature.has_ordered_io());
-        let manager = client
-            .host_to_device_transfer_manager(
-                vec![BufferSpecification::new(BufferType::Token, [])],
-                client.addressable_devices().unwrap()[0].default_memory().unwrap(),
-            )
-            .unwrap();
-        let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
-        predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
-        predecessor.submission.completion.complete(Ok(()));
-        predecessor.published = true;
+        let manager = hold_predecessor.then(|| {
+            let manager = client
+                .host_to_device_transfer_manager(
+                    vec![BufferSpecification::new(BufferType::Token, [])],
+                    client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+                )
+                .unwrap();
+            let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+            predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+            predecessor.submission.completion.complete(Ok(()));
+            predecessor.published = true;
+            manager
+        });
         let ((), lines) = with_captured_prints(|| {
             assert!(domain.execute_xla_program(&compiled, vec![input.clone()]).unwrap().is_empty());
             assert!(domain.execute_xla_program(&restored, vec![input.clone()]).unwrap().is_empty());
             let independent = domain.execute_compiled_async(&unordered, vec![input]).unwrap();
-            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            if let Some(manager) = &manager {
+                manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            }
             independent.fence().block_until_ready().unwrap();
             domain.effects_barrier().unwrap();
         });
