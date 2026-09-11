@@ -606,18 +606,34 @@ impl BuildConfiguration {
             }
 
             // Create a directory for the extracted files.
-            fs::create_dir_all(&extracted_path)?;
+            fs::create_dir_all(&extracted_path)
+                .with_context(|| format!("failed to create extraction directory `{}`", extracted_path.display()))?;
 
             // Extract the artifact archive.
             if extension == Some("gz") {
-                let tar_gz = File::open(artifact_path)?;
+                let tar_gz = File::open(&artifact_path)
+                    .with_context(|| format!("failed to open artifact archive `{}`", artifact_path.display()))?;
                 let tar = flate2::read::GzDecoder::new(tar_gz);
                 let mut archive = tar::Archive::new(tar);
-                archive.unpack(&extracted_path)?;
+                archive.unpack(&extracted_path).with_context(|| {
+                    format!(
+                        "failed to extract artifact archive `{}` into `{}`",
+                        artifact_path.display(),
+                        extracted_path.display(),
+                    )
+                })?;
             } else if extension == Some("whl") {
-                let archive_file = File::open(artifact_path)?;
-                let mut archive = ZipArchive::new(archive_file)?;
-                archive.extract(&extracted_path)?;
+                let archive_file = File::open(&artifact_path)
+                    .with_context(|| format!("failed to open artifact archive `{}`", artifact_path.display()))?;
+                let mut archive = ZipArchive::new(archive_file)
+                    .with_context(|| format!("failed to read wheel archive `{}`", artifact_path.display()))?;
+                archive.extract(&extracted_path).with_context(|| {
+                    format!(
+                        "failed to extract artifact archive `{}` into `{}`",
+                        artifact_path.display(),
+                        extracted_path.display(),
+                    )
+                })?;
             }
 
             // Make any file renames that are necessary for downstream code to function as expected.

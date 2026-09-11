@@ -224,10 +224,11 @@ jobs:
         working-directory: ./ryft/crates/ryft-xla-sys
         shell: bash
         env:
-          NATIVE_ARCHIVE: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
         run: |
           # Check the exact upload artifact without asking Bazel to rebuild its native dependencies.
-          python tests/archive_contract_test.py "$NATIVE_ARCHIVE"
+          python tests/archive_contract_test.py "$RYFT_XLA_SYS_ARCHIVE"
           bazel test --config=${{ matrix.config.platform }} --test_output=errors \
             //:ryft-xla-sys-archive-reproducibility-test
 
@@ -237,7 +238,7 @@ jobs:
         shell: bash
         env:
           RYFT_XLA_SYS_ARCHIVE: >-
-            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/bazel-bin/ryft-xla-sys-archive.tar.gz
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
         run: |
           # GNU ld can overflow AArch64 branch relocations when linking the whole native archive.
           if [[ "${{ matrix.config.os }}" == "linux" && "${{ matrix.config.architecture }}" == "arm64" ]]; then
@@ -251,10 +252,13 @@ jobs:
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
         shell: bash
+        env:
+          RYFT_XLA_SYS_ARCHIVE: >-
+            ${{ github.workspace }}/ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           python tests/symbol_contract_test.py \
-            --archive bazel-bin/ryft-xla-sys-archive.tar.gz \
+            --archive "$RYFT_XLA_SYS_ARCHIVE" \
             --jax-root "$OUTPUT_BASE/external/jax" \
             --xla-root "$OUTPUT_BASE/external/xla" \
             --llvm-root "$OUTPUT_BASE/external/llvm-project" \
