@@ -14036,7 +14036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_max_with_minimum_identity() {
+    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_max_with_min_identity() {
         assert_eq!(
             lowered_reduce_module(DataType::I32, ReductionKind::Max, vec![0], vec![4]).unwrap(),
             indoc! {r#"
@@ -14087,7 +14087,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_u8_reduce_min_with_maximum_identity() {
+    fn test_to_mlir_module_for_plain_program_lowers_u8_reduce_min_with_max_identity() {
         assert_eq!(
             lowered_reduce_module(DataType::U8, ReductionKind::Min, vec![0], vec![4]).unwrap(),
             indoc! {r#"
@@ -14103,7 +14103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_u64_reduce_min_with_maximum_identity() {
+    fn test_to_mlir_module_for_plain_program_lowers_u64_reduce_min_with_max_identity() {
         assert_eq!(
             lowered_reduce_module(DataType::U64, ReductionKind::Min, vec![0], vec![4]).unwrap(),
             indoc! {r#"

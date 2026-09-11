@@ -30,7 +30,7 @@ use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_su
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
     Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Log1p, LogAddExp, LogSumExp, Logistic, Max, Min, Mul, Neg, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot,
+    Log1p, LogAddExp, LogSumExp, Logistic, Mul, Neg, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot,
     RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReductionKind, Rem, Reshape, Round, Rsqrt,
     Sign, Sin, Slice, Sqrt, Sub, Tanh,
 };
@@ -38,13 +38,10 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
-// The value-level capability traits such as `Add` and `Mul` deliberately cannot serve the element layer: they are
-// blanket-implemented for every `Value` by dispatching the corresponding operation, so coherence rejects concrete
-// implementations for element types, and their contract (including element type promotion) is the program-level
-// operation semantics that the kernels below implement rather than consume. The element-level analogues below
-// therefore mirror that vocabulary in narrow capability groups. Operations with the same supported element class and
-// conversion strategy share one trait, while integer wrapping, low-precision re-encoding, and count conversion stay
-// defined in one place per element family.
+// These contracts operate on decoded storage elements, keeping integer wrapping, low-precision re-encoding, and
+// reduction identities in one place per element family. Some overlap with existing value-level capabilities, while
+// others have broader kernel-specific semantics: extrema also support Boolean and lexicographic complex reductions,
+// although the public `Min` and `Max` array operations accept only real numeric operands.
 
 /// Element-level analogue of the [`Zero`](crate::operations::Zero) capability: the additive identity of one array
 /// element type. The extraction is fallible because `f8e8m0fnu` has no zero.
@@ -1135,16 +1132,10 @@ macro_rules! impl_array_sign_for_signed_sub_byte_integer {
 
 impl_array_sign_for_signed_sub_byte_integer!(i1, i2, i4);
 
-/// Element-level minimum and maximum contract shared by reduction and scatter. The identities and selection rules
+/// Element-level minimum and maximum selection contract shared by reduction and scatter. The selection rules
 /// follow JAX's `lax` extrema: Booleans order `false < true`, floating-point extrema propagate NaNs and order `-0`
 /// below `+0`, and complex values compare lexicographically by `(real, imaginary)`.
 pub(crate) trait ElementExtremum: ArrayElement {
-    /// Returns the identity for a maximum reduction.
-    fn maximum_identity() -> Self;
-
-    /// Returns the identity for a minimum reduction.
-    fn minimum_identity() -> Self;
-
     /// Returns the maximum of `self` and `right`.
     fn maximum(self, right: Self) -> Self;
 
@@ -1152,20 +1143,10 @@ pub(crate) trait ElementExtremum: ArrayElement {
     fn minimum(self, right: Self) -> Self;
 }
 
-// Implements extrema for totally ordered element types whose Rust bounds are also the JAX reduction identities.
+// Implements extrema for totally ordered element types using their ordinary comparison semantics.
 macro_rules! impl_array_extrema_for_ordered_element {
-    ($type:ty, $minimum:expr, $maximum:expr) => {
+    ($type:ty) => {
         impl ElementExtremum for $type {
-            #[inline]
-            fn maximum_identity() -> Self {
-                $minimum
-            }
-
-            #[inline]
-            fn minimum_identity() -> Self {
-                $maximum
-            }
-
             #[inline]
             fn maximum(self, right: Self) -> Self {
                 self.max(right)
@@ -1179,21 +1160,21 @@ macro_rules! impl_array_extrema_for_ordered_element {
     };
 }
 
-impl_array_extrema_for_ordered_element!(bool, false, true);
-impl_array_extrema_for_ordered_element!(i1, i1::MIN, i1::MAX);
-impl_array_extrema_for_ordered_element!(i2, i2::MIN, i2::MAX);
-impl_array_extrema_for_ordered_element!(i4, i4::MIN, i4::MAX);
-impl_array_extrema_for_ordered_element!(i8, i8::MIN, i8::MAX);
-impl_array_extrema_for_ordered_element!(i16, i16::MIN, i16::MAX);
-impl_array_extrema_for_ordered_element!(i32, i32::MIN, i32::MAX);
-impl_array_extrema_for_ordered_element!(i64, i64::MIN, i64::MAX);
-impl_array_extrema_for_ordered_element!(u1, u1::MIN, u1::MAX);
-impl_array_extrema_for_ordered_element!(u2, u2::MIN, u2::MAX);
-impl_array_extrema_for_ordered_element!(u4, u4::MIN, u4::MAX);
-impl_array_extrema_for_ordered_element!(u8, u8::MIN, u8::MAX);
-impl_array_extrema_for_ordered_element!(u16, u16::MIN, u16::MAX);
-impl_array_extrema_for_ordered_element!(u32, u32::MIN, u32::MAX);
-impl_array_extrema_for_ordered_element!(u64, u64::MIN, u64::MAX);
+impl_array_extrema_for_ordered_element!(bool);
+impl_array_extrema_for_ordered_element!(i1);
+impl_array_extrema_for_ordered_element!(i2);
+impl_array_extrema_for_ordered_element!(i4);
+impl_array_extrema_for_ordered_element!(i8);
+impl_array_extrema_for_ordered_element!(i16);
+impl_array_extrema_for_ordered_element!(i32);
+impl_array_extrema_for_ordered_element!(i64);
+impl_array_extrema_for_ordered_element!(u1);
+impl_array_extrema_for_ordered_element!(u2);
+impl_array_extrema_for_ordered_element!(u4);
+impl_array_extrema_for_ordered_element!(u8);
+impl_array_extrema_for_ordered_element!(u16);
+impl_array_extrema_for_ordered_element!(u32);
+impl_array_extrema_for_ordered_element!(u64);
 
 /// Selects the larger floating-point element with NaN propagation and `-0` ordered below `+0`. Exact ties preserve
 /// `left`, including its original encoding.
@@ -1225,18 +1206,8 @@ fn minimum_float_element<T: Copy>(left: T, right: T, to_f64: impl Fn(T) -> f64) 
 
 // Implements floating-point extrema while retaining the selected operand's exact encoding.
 macro_rules! impl_array_extrema_for_float {
-    ($type:ty, $minimum:expr, $maximum:expr, $to_f64:expr $(,)?) => {
+    ($type:ty, $to_f64:expr $(,)?) => {
         impl ElementExtremum for $type {
-            #[inline]
-            fn maximum_identity() -> Self {
-                $minimum
-            }
-
-            #[inline]
-            fn minimum_identity() -> Self {
-                $maximum
-            }
-
             #[inline]
             fn maximum(self, right: Self) -> Self {
                 maximum_float_element(self, right, $to_f64)
@@ -1250,21 +1221,21 @@ macro_rules! impl_array_extrema_for_float {
     };
 }
 
-impl_array_extrema_for_float!(f4e2m1fn, f4e2m1fn::MIN, f4e2m1fn::MAX, f4e2m1fn::to_f64);
-impl_array_extrema_for_float!(f6e2m3fn, f6e2m3fn::MIN, f6e2m3fn::MAX, f6e2m3fn::to_f64);
-impl_array_extrema_for_float!(f6e3m2fn, f6e3m2fn::MIN, f6e3m2fn::MAX, f6e3m2fn::to_f64);
-impl_array_extrema_for_float!(f8e3m4, f8e3m4::NEG_INFINITY, f8e3m4::INFINITY, f8e3m4::to_f64);
-impl_array_extrema_for_float!(f8e4m3, f8e4m3::NEG_INFINITY, f8e4m3::INFINITY, f8e4m3::to_f64);
-impl_array_extrema_for_float!(f8e4m3fn, f8e4m3fn::MIN, f8e4m3fn::MAX, f8e4m3fn::to_f64);
-impl_array_extrema_for_float!(f8e4m3fnuz, f8e4m3fnuz::MIN, f8e4m3fnuz::MAX, f8e4m3fnuz::to_f64);
-impl_array_extrema_for_float!(f8e4m3b11fnuz, f8e4m3b11fnuz::MIN, f8e4m3b11fnuz::MAX, f8e4m3b11fnuz::to_f64,);
-impl_array_extrema_for_float!(f8e5m2, f8e5m2::NEG_INFINITY, f8e5m2::INFINITY, f8e5m2::to_f64);
-impl_array_extrema_for_float!(f8e5m2fnuz, f8e5m2fnuz::MIN, f8e5m2fnuz::MAX, f8e5m2fnuz::to_f64);
-impl_array_extrema_for_float!(f8e8m0fnu, f8e8m0fnu::MIN, f8e8m0fnu::MAX, f8e8m0fnu::to_f64);
-impl_array_extrema_for_float!(bf16, bf16::NEG_INFINITY, bf16::INFINITY, bf16::to_f64);
-impl_array_extrema_for_float!(f16, f16::NEG_INFINITY, f16::INFINITY, f16::to_f64);
-impl_array_extrema_for_float!(f32, f32::NEG_INFINITY, f32::INFINITY, f64::from);
-impl_array_extrema_for_float!(f64, f64::NEG_INFINITY, f64::INFINITY, |value| value);
+impl_array_extrema_for_float!(f4e2m1fn, f4e2m1fn::to_f64);
+impl_array_extrema_for_float!(f6e2m3fn, f6e2m3fn::to_f64);
+impl_array_extrema_for_float!(f6e3m2fn, f6e3m2fn::to_f64);
+impl_array_extrema_for_float!(f8e3m4, f8e3m4::to_f64);
+impl_array_extrema_for_float!(f8e4m3, f8e4m3::to_f64);
+impl_array_extrema_for_float!(f8e4m3fn, f8e4m3fn::to_f64);
+impl_array_extrema_for_float!(f8e4m3fnuz, f8e4m3fnuz::to_f64);
+impl_array_extrema_for_float!(f8e4m3b11fnuz, f8e4m3b11fnuz::to_f64,);
+impl_array_extrema_for_float!(f8e5m2, f8e5m2::to_f64);
+impl_array_extrema_for_float!(f8e5m2fnuz, f8e5m2fnuz::to_f64);
+impl_array_extrema_for_float!(f8e8m0fnu, f8e8m0fnu::to_f64);
+impl_array_extrema_for_float!(bf16, bf16::to_f64);
+impl_array_extrema_for_float!(f16, f16::to_f64);
+impl_array_extrema_for_float!(f32, f64::from);
+impl_array_extrema_for_float!(f64, |value| value);
 
 // Implements JAX's lexicographic complex extrema. Ordinary floating-point comparisons intentionally make every NaN
 // comparison false, so an unordered real or imaginary component selects `right`, exactly like JAX's compare/select
@@ -1272,16 +1243,6 @@ impl_array_extrema_for_float!(f64, f64::NEG_INFINITY, f64::INFINITY, |value| val
 macro_rules! impl_array_extrema_for_complex {
     ($component:ty) => {
         impl ElementExtremum for Complex<$component> {
-            #[inline]
-            fn maximum_identity() -> Self {
-                Complex::new(<$component>::NEG_INFINITY, 0.0)
-            }
-
-            #[inline]
-            fn minimum_identity() -> Self {
-                Complex::new(<$component>::INFINITY, 0.0)
-            }
-
             #[inline]
             fn maximum(self, right: Self) -> Self {
                 let select_left = if self.re == right.re { self.im > right.im } else { self.re > right.re };
@@ -1372,10 +1333,9 @@ impl Array {
         debug_assert_eq!(self.r#type().data_type(), T::data_type());
         debug_assert_eq!(output_type.data_type(), T::data_type());
         let zero = T::zero()?;
-        let mut maximums =
-            self.reduce_elements::<T>(output_type.clone(), axes, T::maximum_identity(), |left, right| {
-                Ok(left.maximum(right))
-            })?;
+        let mut maximums = self.reduce_elements::<T>(output_type.clone(), axes, T::max_identity(), |left, right| {
+            Ok(left.maximum(right))
+        })?;
         maximums.map_elements_in_place::<T>(|value| {
             Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
         })?;
@@ -1847,36 +1807,6 @@ macro_rules! impl_array_binary_arithmetic {
             }
         }
     };
-
-    // Generates a real-only extremum capability that selects and preserves one operand's exact element encoding.
-    (@extremum $trait:ident, $method:ident, $element_method:ident, $noun:literal) => {
-        impl $trait for Array {
-            fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                if Self::element_count(&output_type) == 0 {
-                    let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-                }
-                if !self.r#type().data_type().is_real() || !right.r#type().data_type().is_real() {
-                    return Err(TypeError::invalid(format!(
-                        concat!("cannot compute the ", $noun, " of scalars of data types {} and {}"),
-                        self.r#type().data_type(),
-                        right.r#type().data_type(),
-                    ))
-                    .into());
-                }
-                let data_type = output_type.data_type();
-                let left = self.promoted_to(data_type)?;
-                let right = right.promoted_to(data_type)?;
-                dispatch_on_array_element_type!(@real data_type, |Element| {
-                    left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                        Ok(<Element as ElementExtremum>::$element_method(left, right))
-                    })
-                })
-            }
-        }
-    };
 }
 
 impl_array_binary_arithmetic!(@numeric Add, add, ElementAdd);
@@ -2121,8 +2051,6 @@ impl_array_unary_math!(@real_float Floor, floor, "cannot compute the floor of a 
 impl_array_unary_math!(@real_float Ceil, ceil, "cannot compute the ceiling of a scalar of data type {}");
 impl_array_unary_math!(@real_float Round, round, "cannot round a scalar of data type {}");
 
-impl_array_binary_arithmetic!(@extremum Max, max, maximum, "maximum");
-impl_array_binary_arithmetic!(@extremum Min, min, minimum, "minimum");
 impl_array_binary_arithmetic!(@real Rem, rem, ElementRem, "remainder");
 
 impl Dot for Array {
@@ -2190,9 +2118,9 @@ impl Reduce for Array {
             ReductionKind::Max | ReductionKind::Min => {
                 dispatch_on_array_element_type!(data_type, |Element| {
                     let identity = if kind == ReductionKind::Max {
-                        <Element as ElementExtremum>::maximum_identity()
+                        <Element as ArrayElement>::max_identity()
                     } else {
-                        <Element as ElementExtremum>::minimum_identity()
+                        <Element as ArrayElement>::min_identity()
                     };
                     self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
                         Ok(if kind == ReductionKind::Max {
@@ -2323,20 +2251,6 @@ mod tests {
         let magnitude = complex.abs().unwrap();
         assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
         assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]), epsilon = 1e-12);
-        // Elementwise extrema retain the selected operand's NaN payload and IEEE signed-zero encoding.
-        let nan = f32::from_bits(0x7fc0_1234);
-        assert_eq!(
-            Array::scalar(nan).max(&Array::scalar(1.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
-            nan.to_bits(),
-        );
-        assert_eq!(
-            Array::scalar(-0.0f32).max(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
-            0.0f32.to_bits(),
-        );
-        assert_eq!(
-            Array::scalar(-0.0f32).min(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
-            (-0.0f32).to_bits(),
-        );
     }
 
     #[test]

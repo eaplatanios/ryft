@@ -124,6 +124,16 @@ pub trait ArrayElement: private::Codec {
         Self::from_real(value.re)
     }
 
+    /// Returns the identity used to initialize a minimum reduction (i.e., the largest integer, `true` for Boolean
+    /// elements, or positive infinity for floating-point elements). Formats without infinity use their largest finite
+    /// value. Complex elements use positive infinity in the real component and zero in the imaginary component.
+    fn min_identity() -> Self;
+
+    /// Returns the identity used to initialize a maximum reduction (i.e., the smallest integer, `false` for Boolean
+    /// elements, or negative infinity for floating-point elements). Formats without infinity use their smallest finite
+    /// value. Complex elements use negative infinity in the real component and zero in the imaginary component.
+    fn max_identity() -> Self;
+
     /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
     /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
     /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
@@ -1106,6 +1116,16 @@ impl ArrayElement for bool {
     }
 
     #[inline]
+    fn min_identity() -> Self {
+        true
+    }
+
+    #[inline]
+    fn max_identity() -> Self {
+        false
+    }
+
+    #[inline]
     fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
         Output::from_unsigned(u64::from(self))
     }
@@ -1133,6 +1153,16 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             fn from_real(value: f64) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
                 Ok(Self::from_bits(value as i8 as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
             }
 
             #[inline]
@@ -1167,6 +1197,16 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
             }
 
             #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_unsigned(u64::from(self.value()))
             }
@@ -1198,6 +1238,16 @@ macro_rules! impl_array_element_for_integer_types {
             }
 
             #[inline]
+            fn min_identity() -> Self {
+                Self::MAX
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::MIN
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::$route(self as $carrier)
             }
@@ -1212,7 +1262,7 @@ impl_array_element_for_integer_types!(u64, from_unsigned, u8, u16, u32, u64);
 // through each format's own checked rounding contract, which is also where an unrepresentable value (such as zero in
 // `f8e8m0fnu`) is rejected, and conversions out of them widen exactly into `f64`.
 macro_rules! impl_array_element_for_low_precision_floating_point_types {
-    ($($type:ty),+ $(,)?) => {$(
+    ($($type:ty => ($min_identity:expr, $max_identity:expr)),+ $(,)?) => {$(
         impl ArrayElement for $type {
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
@@ -1230,6 +1280,16 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
             }
 
             #[inline]
+            fn min_identity() -> Self {
+                $min_identity
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                $max_identity
+            }
+
+            #[inline]
             fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
                 Output::from_real(self.to_f64())
             }
@@ -1238,17 +1298,17 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
 }
 
 impl_array_element_for_low_precision_floating_point_types!(
-    f4e2m1fn,
-    f6e2m3fn,
-    f6e3m2fn,
-    f8e3m4,
-    f8e4m3,
-    f8e4m3fn,
-    f8e4m3fnuz,
-    f8e4m3b11fnuz,
-    f8e5m2,
-    f8e5m2fnuz,
-    f8e8m0fnu,
+    f4e2m1fn => (f4e2m1fn::MAX, f4e2m1fn::MIN),
+    f6e2m3fn => (f6e2m3fn::MAX, f6e2m3fn::MIN),
+    f6e3m2fn => (f6e3m2fn::MAX, f6e3m2fn::MIN),
+    f8e3m4 => (f8e3m4::INFINITY, f8e3m4::NEG_INFINITY),
+    f8e4m3 => (f8e4m3::INFINITY, f8e4m3::NEG_INFINITY),
+    f8e4m3fn => (f8e4m3fn::MAX, f8e4m3fn::MIN),
+    f8e4m3fnuz => (f8e4m3fnuz::MAX, f8e4m3fnuz::MIN),
+    f8e4m3b11fnuz => (f8e4m3b11fnuz::MAX, f8e4m3b11fnuz::MIN),
+    f8e5m2 => (f8e5m2::INFINITY, f8e5m2::NEG_INFINITY),
+    f8e5m2fnuz => (f8e5m2fnuz::MAX, f8e5m2fnuz::MIN),
+    f8e8m0fnu => (f8e8m0fnu::MAX, f8e8m0fnu::MIN),
 );
 
 // Implements the interchange contract for the native and half-precision real floating-point element types,
@@ -1269,6 +1329,16 @@ macro_rules! impl_array_element_for_floating_point_type {
             #[inline]
             fn from_real(value: f64) -> Result<Self, ProgramError> {
                 Ok($from_real(value))
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::INFINITY
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::NEG_INFINITY
             }
 
             #[inline]
@@ -1334,6 +1404,16 @@ macro_rules! impl_array_element_for_complex_types {
             #[inline]
             fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
                 Ok(Self::new(value.re as $component, value.im as $component))
+            }
+
+            #[inline]
+            fn min_identity() -> Self {
+                Self::new(<$component>::INFINITY, 0.0)
+            }
+
+            #[inline]
+            fn max_identity() -> Self {
+                Self::new(<$component>::NEG_INFINITY, 0.0)
             }
 
             #[inline]
@@ -1703,6 +1783,98 @@ mod tests {
         assert_eq!(Complex::<f64>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)),);
         assert_eq!(bool::from_complex(Complex::new(0.0, 2.0)), Ok(true));
         assert_eq!(bool::from_complex(Complex::new(0.0, 0.0)), Ok(false));
+    }
+
+    #[test]
+    fn test_array_element_min_identity() {
+        // Minimum reductions start from the upper bound, including `true` for Boolean conjunction.
+        assert_eq!(bool::min_identity(), true);
+        assert_eq!(i1::min_identity(), i1::MAX);
+        assert_eq!(i2::min_identity(), i2::MAX);
+        assert_eq!(i4::min_identity(), i4::MAX);
+        assert_eq!(i8::min_identity(), i8::MAX);
+        assert_eq!(i16::min_identity(), i16::MAX);
+        assert_eq!(i32::min_identity(), i32::MAX);
+        assert_eq!(i64::min_identity(), i64::MAX);
+        assert_eq!(u1::min_identity(), u1::MAX);
+        assert_eq!(u2::min_identity(), u2::MAX);
+        assert_eq!(u4::min_identity(), u4::MAX);
+        assert_eq!(u8::min_identity(), u8::MAX);
+        assert_eq!(u16::min_identity(), u16::MAX);
+        assert_eq!(u32::min_identity(), u32::MAX);
+        assert_eq!(u64::min_identity(), u64::MAX);
+
+        // Floating-point formats use positive infinity when available and their largest finite encoding otherwise.
+        assert_eq!(f4e2m1fn::min_identity().to_bits(), 0x07);
+        assert_eq!(f6e2m3fn::min_identity().to_bits(), 0x1f);
+        assert_eq!(f6e3m2fn::min_identity().to_bits(), 0x1f);
+        assert_eq!(f8e3m4::min_identity().to_bits(), 0x70);
+        assert_eq!(f8e4m3::min_identity().to_bits(), 0x78);
+        assert_eq!(f8e4m3fn::min_identity().to_bits(), 0x7e);
+        assert_eq!(f8e4m3fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e4m3b11fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e5m2::min_identity().to_bits(), 0x7c);
+        assert_eq!(f8e5m2fnuz::min_identity().to_bits(), 0x7f);
+        assert_eq!(f8e8m0fnu::min_identity().to_bits(), 0xfe);
+        assert_eq!(bf16::min_identity().to_bits(), 0x7f80);
+        assert_eq!(f16::min_identity().to_bits(), 0x7c00);
+        assert_eq!(f32::min_identity(), f32::INFINITY);
+        assert_eq!(f64::min_identity(), f64::INFINITY);
+
+        // Complex identities place infinity in the real component and positive zero in the imaginary component.
+        let complex32 = Complex::<f32>::min_identity();
+        assert_eq!(complex32.re, f32::INFINITY);
+        assert_eq!(complex32.im.to_bits(), 0);
+        let complex64 = Complex::<f64>::min_identity();
+        assert_eq!(complex64.re, f64::INFINITY);
+        assert_eq!(complex64.im.to_bits(), 0);
+    }
+
+    #[test]
+    fn test_array_element_max_identity() {
+        // Maximum reductions start from the lower bound, including `false` for Boolean disjunction.
+        assert_eq!(bool::max_identity(), false);
+        assert_eq!(i1::max_identity(), i1::MIN);
+        assert_eq!(i2::max_identity(), i2::MIN);
+        assert_eq!(i4::max_identity(), i4::MIN);
+        assert_eq!(i8::max_identity(), i8::MIN);
+        assert_eq!(i16::max_identity(), i16::MIN);
+        assert_eq!(i32::max_identity(), i32::MIN);
+        assert_eq!(i64::max_identity(), i64::MIN);
+        assert_eq!(u1::max_identity(), u1::MIN);
+        assert_eq!(u2::max_identity(), u2::MIN);
+        assert_eq!(u4::max_identity(), u4::MIN);
+        assert_eq!(u8::max_identity(), u8::MIN);
+        assert_eq!(u16::max_identity(), u16::MIN);
+        assert_eq!(u32::max_identity(), u32::MIN);
+        assert_eq!(u64::max_identity(), u64::MIN);
+
+        // Signed floating-point formats use negative infinity or their lowest finite encoding.
+        assert_eq!(f4e2m1fn::max_identity().to_bits(), 0x0f);
+        assert_eq!(f6e2m3fn::max_identity().to_bits(), 0x3f);
+        assert_eq!(f6e3m2fn::max_identity().to_bits(), 0x3f);
+        assert_eq!(f8e3m4::max_identity().to_bits(), 0xf0);
+        assert_eq!(f8e4m3::max_identity().to_bits(), 0xf8);
+        assert_eq!(f8e4m3fn::max_identity().to_bits(), 0xfe);
+        assert_eq!(f8e4m3fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(f8e4m3b11fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(f8e5m2::max_identity().to_bits(), 0xfc);
+        assert_eq!(f8e5m2fnuz::max_identity().to_bits(), 0xff);
+        assert_eq!(bf16::max_identity().to_bits(), 0xff80);
+        assert_eq!(f16::max_identity().to_bits(), 0xfc00);
+        assert_eq!(f32::max_identity(), f32::NEG_INFINITY);
+        assert_eq!(f64::max_identity(), f64::NEG_INFINITY);
+
+        // The positive-only format has neither zero nor negative values; its lower bound is 2^-127.
+        assert_eq!(f8e8m0fnu::max_identity().to_bits(), 0x00);
+        assert_eq!(f8e8m0fnu::max_identity().to_f64(), 2f64.powi(-127));
+
+        let complex32 = Complex::<f32>::max_identity();
+        assert_eq!(complex32.re, f32::NEG_INFINITY);
+        assert_eq!(complex32.im.to_bits(), 0);
+        let complex64 = Complex::<f64>::max_identity();
+        assert_eq!(complex64.re, f64::NEG_INFINITY);
+        assert_eq!(complex64.im.to_bits(), 0);
     }
 
     #[test]
