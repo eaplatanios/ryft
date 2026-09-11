@@ -1,6 +1,6 @@
 //! Reference [`Array`] kernels for the mathematics operation family contracts.
 //!
-//! Kernels use the scalar arithmetic contracts in [`crate::arrays::encoding`], decode operands through their
+//! Kernels use the scalar arithmetic contracts in [`crate::arrays::elements`], decode operands through their
 //! physical addressing, and materialize owned results. Element data type promotion and broadcasting follow the
 //! corresponding operations' type-inference rules. Reduction-specific accumulation remains local to this module.
 
@@ -11,7 +11,7 @@ use num_complex::Complex;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{
+use crate::arrays::elements::{
     ArrayElement, FloatingPointArrayElement, NumericArrayElement, RealArrayElement, RealFloatingPointArrayElement,
     f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
     i1, i2, i4, u1, u2, u4,
@@ -1090,7 +1090,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::encoding::{f8e4m3fn, f8e8m0fnu, i2, i4};
+    use crate::arrays::elements::{f8e4m3fn, f8e8m0fnu, i2, i4};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::arrays::ArrayType;

@@ -153,8 +153,8 @@ impl ArrayAddressing {
 
     /// Returns the number of bytes used by each logical element. Every [`DataType`] occupies a whole number of bytes:
     /// sub-byte types such as [`DataType::I4`] store one element per byte, holding the value in the low bits with the
-    /// unused high bits set to zero, matching the checked element types in [`encoding`](crate::arrays::encoding)
-    /// (e.g., [`i4`](crate::arrays::encoding::i4) and [`f4e2m1fn`](crate::arrays::encoding::f4e2m1fn)). This unpacked
+    /// unused high bits set to zero, matching the checked element types in [`elements`](crate::arrays::elements)
+    /// (e.g., [`i4`](crate::arrays::elements::i4) and [`f4e2m1fn`](crate::arrays::elements::f4e2m1fn)). This unpacked
     /// representation is the padded sub-byte layout of [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html),
     /// which NumPy and JAX also use. XLA and DLPack's packed default store two 4-bit elements per byte instead, and
     /// so sub-byte buffers are repacked once where they cross a boundary that expects packing.

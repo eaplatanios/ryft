@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::arrays::addressing::{ArrayAddressing, ArraySliceAxis};
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{ArrayElement, NumericArrayElement, i1, i2, i4, u1, u2, u4};
+use crate::arrays::elements::{ArrayElement, NumericArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::ArrayIrOperation;
@@ -696,7 +696,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::encoding::i4;
+    use crate::arrays::elements::i4;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};

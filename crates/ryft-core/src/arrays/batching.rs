@@ -20,7 +20,7 @@ use ryft_macros::Parameter;
 use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
-use crate::arrays::encoding::ArrayElement;
+use crate::arrays::elements::ArrayElement;
 use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
 use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
 use crate::axes::Axis;

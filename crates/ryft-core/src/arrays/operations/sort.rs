@@ -6,7 +6,7 @@
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{ArrayElement, i1, i2, i4, u1, u2, u4};
+use crate::arrays::elements::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::operations::sort::{

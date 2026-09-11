@@ -157,7 +157,7 @@ impl std::ops::BitXor for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::encoding::{i2, u4};
+    use crate::arrays::elements::{i2, u4};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;

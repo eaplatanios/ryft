@@ -8,7 +8,7 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{ArrayElement, NumericArrayElement, RealFloatingPointArrayElement};
+use crate::arrays::elements::{ArrayElement, NumericArrayElement, RealFloatingPointArrayElement};
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::types::data::DataType;
 use crate::operations::cumulative::cumulative_log_sum_exp::cumulative_log_sum_exp_abstract;

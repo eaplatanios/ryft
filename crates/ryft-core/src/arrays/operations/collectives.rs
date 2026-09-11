@@ -7,7 +7,7 @@
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{i1, i2, i4, u1, u2, u4};
+use crate::arrays::elements::{i1, i2, i4, u1, u2, u4};
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;

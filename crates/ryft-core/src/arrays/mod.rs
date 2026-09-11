@@ -4,7 +4,7 @@ pub mod batching;
 pub mod broadcasting;
 pub mod differentiation;
 pub mod dimensions;
-pub mod encoding;
+pub mod elements;
 pub mod ir;
 pub mod macros;
 pub mod operations;
@@ -22,7 +22,7 @@ pub use batching::{
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};
 pub use dimensions::DimensionValue;
-pub use encoding::{
+pub use elements::{
     ArrayElement, Complex, FloatingPointArrayElement, NumericArrayElement, RealArrayElement,
     RealFloatingPointArrayElement, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,
     f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,

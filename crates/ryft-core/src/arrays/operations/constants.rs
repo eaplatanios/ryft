@@ -219,7 +219,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::encoding::{i4, u4};
+    use crate::arrays::elements::{i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::references::ArrayReference;

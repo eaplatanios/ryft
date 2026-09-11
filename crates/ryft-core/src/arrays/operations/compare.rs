@@ -124,7 +124,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::encoding::{f8e5m2, i2};
+    use crate::arrays::elements::{f8e5m2, i2};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;
