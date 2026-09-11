@@ -76,7 +76,10 @@ impl<T: ElementType> Operation for ConvertElementTypeOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         if input_types[0].element_type().is_token() || self.data_type.is_token() {
-            return Err(TypeError::invalid("cannot convert values to or from the token data type"));
+            return Err(TypeError::invalid(format!(
+                "cannot convert values to or from the `{}` data type",
+                DataType::Token,
+            )));
         }
         Ok(vec![input_types[0].with_element_type(self.data_type)])
     }
