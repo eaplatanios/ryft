@@ -37,11 +37,11 @@ impl crate::operations::complex::Complex for Array {
         };
         let output_type = self.r#type().into_owned().with_data_type(data_type);
         if data_type == DataType::C64 {
-            self.binary_elements::<f32, Complex<f32>>(imaginary, output_type, |real, imaginary| {
+            self.map_element_pairs::<f32, Complex<f32>>(imaginary, output_type, |real, imaginary| {
                 Ok(Complex::new(real, imaginary))
             })
         } else {
-            self.binary_elements::<f64, Complex<f64>>(imaginary, output_type, |real, imaginary| {
+            self.map_element_pairs::<f64, Complex<f64>>(imaginary, output_type, |real, imaginary| {
                 Ok(Complex::new(real, imaginary))
             })
         }

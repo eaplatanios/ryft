@@ -68,13 +68,13 @@ impl Array {
             }
             let equal = matches!(direction, ComparisonDirection::Equal);
             return dispatch_on_array_element_type!(@complex data_type, |Element| {
-                self.binary_elements::<Element, bool>(rhs, output_type, |left, right| {
+                self.map_element_pairs::<Element, bool>(rhs, output_type, |left, right| {
                     Ok(if equal { left == right } else { left != right })
                 })
             });
         }
         dispatch_on_array_element_type!(@ordered data_type, |Element| {
-            self.binary_elements::<Element, bool>(rhs, output_type, |left, right| {
+            self.map_element_pairs::<Element, bool>(rhs, output_type, |left, right| {
                 // An unordered pair (a comparison involving a floating-point NaN) satisfies only `NotEqual`.
                 let ordering = left.partial_cmp(&right);
                 Ok(match direction {

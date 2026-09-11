@@ -281,10 +281,11 @@ macro_rules! dispatch_on_array_element_type {
 /// concrete Rust element type selected by [`dispatch_on_array_element_type!`]. Its result has that same element type,
 /// inferred from the generated traversal; no caller-visible type binding is needed.
 ///
-/// Empty results undergo all input and metadata checks, but skip operand conversion and scalar evaluation.
-/// The result buffer follows the inferred layout, including zero-initialized padding. Non-empty results use
-/// [`Array::map_elements`](crate::Array::map_elements) or [`Array::binary_elements`](crate::Array::binary_elements)
-/// to traverse operands directly through their storage layouts. Scalar errors are propagated without modification.
+/// Empty results undergo all input and metadata checks, but skip operand conversion and scalar
+/// evaluation. The result buffer follows the inferred layout, including zero-initialized padding.
+/// Non-empty results use [`Array::map_elements`](crate::Array::map_elements) or
+/// [`Array::map_element_pairs`](crate::Array::map_element_pairs) to traverse operands directly
+/// through their storage layouts. Scalar errors are propagated without modification.
 ///
 /// Unsupported input types and metadata, incompatible broadcast shapes, failed conversions, and scalar errors
 /// are returned as [`ProgramError`](crate::ProgramError). Validation precedes broadcasting, even for empty results.
@@ -332,7 +333,7 @@ macro_rules! dispatch_on_array_element_type {
 ///     @unary
 ///     Nonnegative, nonnegative,
 ///     operation = "nonnegative",
-///     inputs = @real,
+///     inputs = @numeric @real,
 ///     checks = [@no_unreduced],
 ///     |input| Ok(ArrayElement::max(&input, &ArrayElement::from_signed(0)?)),
 /// );
@@ -348,38 +349,57 @@ macro_rules! dispatch_on_array_element_type {
 ///   - `$capability`: Capability trait path.
 ///   - `$method`: Name of its function to implement.
 ///   - `operation = $operation`: Name used in diagnostics, such as `"min"`.
-///   - `inputs = @$class`: `@numeric` accepts integers, real floating-point values, and complex values.
-///     `@real` accepts integers and real floating-point values. `@float` accepts real floating-point and complex
-///     values. `@real_float` accepts only real floating-point values. All classes reject Booleans, even for empty
-///     arrays.
+///   - `inputs = $(@selector)+`: Composable predicates over numeric elements, using the same intersection rules as
+///     [`check_types!`](crate::check_types). `@numeric` accepts all numeric types, `@float` excludes integers, and
+///     `@real` excludes complex values. For example, `@float @real` accepts only real floating-point values and
+///     `@numeric @real` also accepts integers. Order and repetition do not change the accepted types. This macro's
+///     numeric base universe always excludes Booleans and payload-free types, including for empty arrays.
 ///   - `checks = $checks`: Ordered list of array metadata checks from [`check_types!`](crate::check_types), typically
 ///     `@no_unreduced`, `@same_unreduced_axes`, or `@same_reduced_axes`. An empty list applies no additional checks.
 ///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar operands, followed by an expression returning
 ///     their element type wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
 #[macro_export]
 macro_rules! impl_array_elementwise_operation {
-    // Validates the numeric dispatch class, excluding Booleans.
-    (@validate @numeric, $operation:expr, $types:expr $(,)?) => {
-        $crate::macros::check_types!(@numeric, $operation, $types)
+    // Intersect selectors for dispatch. Numeric is the base universe; float and real each narrow it independently.
+    (@dispatch [$(@$selector:ident)+] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [numeric complex] [$(@$selector)+] $data_type, |$element| $body,
+        )
     };
 
-    // Refines numeric inputs to real values; `check_types!` treats `@real` alone only as a complex exclusion.
-    (@validate @real, $operation:expr, $types:expr $(,)?) => {
-        $crate::macros::check_types!(@numeric @real, $operation, $types)
+    // Numeric does not widen a class already restricted by another selector.
+    (@select [$base:ident $kind:ident] [@numeric $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [$base $kind] [$($rest)*] $data_type, |$element| $body,
+        )
     };
 
-    // Accepts real floating-point and complex values, matching the float capability contract.
-    (@validate @float, $operation:expr, $types:expr $(,)?) => {
-        $crate::macros::check_types!(@float, $operation, $types)
+    // Float removes integers while preserving any existing real-only restriction.
+    (@select [$base:ident $kind:ident] [@float $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [float $kind] [$($rest)*] $data_type, |$element| $body,
+        )
     };
 
-    // Restricts floating-point capabilities to real elements.
-    (@validate @real_float, $operation:expr, $types:expr $(,)?) => {
-        $crate::macros::check_types!(@float @real, $operation, $types)
+    // Real removes complex values without changing whether integers are accepted.
+    (@select [$base:ident $kind:ident] [@real $($rest:tt)*] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::impl_array_elementwise_operation!(
+            @select [$base real] [$($rest)*] $data_type, |$element| $body,
+        )
     };
 
-    // The float capability class includes complex values, while the storage dispatcher separates those classes.
-    (@dispatch @float $data_type:expr, |$element:ident| $body:expr) => {{
+    // The numeric class includes integers, real floating-point values, and complex values.
+    (@select [numeric complex] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@numeric $data_type, |$element| $body)
+    };
+
+    // The real numeric class excludes complex values.
+    (@select [numeric real] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@real $data_type, |$element| $body)
+    };
+
+    // Float capabilities include complex values, while the storage dispatcher separates those classes.
+    (@select [float complex] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {{
         let data_type = $data_type;
         if data_type.is_complex() {
             $crate::arrays::macros::dispatch_on_array_element_type!(@complex data_type, |$element| $body)
@@ -388,14 +408,9 @@ macro_rules! impl_array_elementwise_operation {
         }
     }};
 
-    // Maps the real-only float capability to the storage dispatcher's float class.
-    (@dispatch @real_float $data_type:expr, |$element:ident| $body:expr) => {
+    // Intersecting float with real maps to the storage dispatcher's real floating-point class.
+    (@select [float real] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@float $data_type, |$element| $body)
-    };
-
-    // Numeric and real capability classes share the storage dispatcher's names.
-    (@dispatch @$class:ident $data_type:expr, |$element:ident| $body:expr) => {
-        $crate::arrays::macros::dispatch_on_array_element_type!(@$class $data_type, |$element| $body)
     };
 
     // Generates a unary capability preserving the input element type, shape, and layout.
@@ -403,7 +418,7 @@ macro_rules! impl_array_elementwise_operation {
         @unary
         $capability:path, $method:ident,
         operation = $operation:expr,
-        inputs = @$class:ident,
+        inputs = $(@$selector:ident)+,
         checks = [$(@$check:ident),* $(,)?],
         |$input_element:ident| $body:expr $(,)?
     ) => {
@@ -415,16 +430,16 @@ macro_rules! impl_array_elementwise_operation {
                 let data_type = input_type.data_type();
 
                 // Validate before traversal so empty arrays satisfy the same contract as non-empty arrays.
-                $crate::arrays::macros::impl_array_elementwise_operation!(
-                    @validate @$class, operation, [data_type],
-                );
+                $crate::macros::check_types!(@numeric $(@$selector)+, operation, [data_type]);
                 $($crate::macros::check_types!(@$check, operation, [input_type.as_ref()]);)*
 
                 // The mapped output retains the input layout. Empty traversal allocates storage without evaluating
                 // the scalar calculation. Non-empty traversal decodes and re-encodes each element in its own type.
-                $crate::arrays::macros::impl_array_elementwise_operation!(@dispatch @$class data_type, |Element| {
-                    self.map_elements::<Element, Element>(input_type.into_owned(), |$input_element| $body)
-                })
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @dispatch [$(@$selector)+] data_type, |Element| {
+                        self.map_elements::<Element, Element>(input_type.into_owned(), |$input_element| $body)
+                    },
+                )
             }
         }
     };
@@ -434,7 +449,7 @@ macro_rules! impl_array_elementwise_operation {
         @binary
         $capability:path, $method:ident,
         operation = $operation:expr,
-        inputs = @$class:ident,
+        inputs = $(@$selector:ident)+,
         checks = [$(@$check:ident),* $(,)?],
         |$lhs_element:ident, $rhs_element:ident| $body:expr $(,)?
     ) => {
@@ -450,9 +465,8 @@ macro_rules! impl_array_elementwise_operation {
 
                 // Validate the original inputs before promotion or the empty result shortcut, so neither can
                 // hide an unsupported input type or invalid reduction metadata.
-                $crate::arrays::macros::impl_array_elementwise_operation!(
-                    @validate @$class, operation,
-                    [lhs_type.data_type(), rhs_type.data_type()],
+                $crate::macros::check_types!(
+                    @numeric $(@$selector)+, operation, [lhs_type.data_type(), rhs_type.data_type()],
                 );
                 $($crate::macros::check_types!(@$check, operation, [lhs_type.as_ref(), rhs_type.as_ref()]);)*
 
@@ -475,9 +489,11 @@ macro_rules! impl_array_elementwise_operation {
 
                 // Instantiate the scalar calculation for the selected Rust element type. The shared traversal
                 // decodes addressed inputs and encodes each result directly into the output buffer.
-                $crate::arrays::macros::impl_array_elementwise_operation!(@dispatch @$class data_type, |Element| {
-                    lhs.binary_elements::<Element, Element>(&rhs, output_type, |$lhs_element, $rhs_element| $body)
-                })
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @dispatch [$(@$selector)+] data_type, |Element| {
+                        lhs.map_element_pairs::<Element, Element>(&rhs, output_type, |$lhs_element, $rhs_element| $body)
+                    },
+                )
             }
         }
     };
@@ -682,7 +698,7 @@ mod tests {
             @unary
             TestFloatIdentity, float_identity,
             operation = "float_identity",
-            inputs = @float,
+            inputs = @float @numeric,
             checks = [],
             |input| Ok(input),
         );
@@ -711,11 +727,12 @@ mod tests {
             fn real_float_identity(&self) -> Result<Self, ProgramError>;
         }
 
+        // Selector intersections are independent of order and tolerate repeated refinements.
         impl_array_elementwise_operation!(
             @unary
             TestRealFloatIdentity, real_float_identity,
             operation = "real_float_identity",
-            inputs = @real_float,
+            inputs = @real @numeric @float @real,
             checks = [],
             |input| Ok(input),
         );
@@ -817,7 +834,7 @@ mod tests {
             @binary
             TestRealMinimum, real_minimum,
             operation = "min",
-            inputs = @real,
+            inputs = @numeric @real,
             checks = [@no_unreduced, @same_reduced_axes],
             |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
         );
@@ -881,7 +898,7 @@ mod tests {
             @binary
             TestFailingOperation, fail,
             operation = "min",
-            inputs = @real,
+            inputs = @numeric @real,
             checks = [@no_unreduced, @same_reduced_axes],
             |_lhs, _rhs| Err(ProgramError::InvalidArgument {
                 message: "scalar kernel must not run".to_string(),
@@ -909,7 +926,7 @@ mod tests {
             @binary
             TestFailingOperation, fail,
             operation = "min",
-            inputs = @real,
+            inputs = @numeric @real,
             checks = [@no_unreduced, @same_reduced_axes],
             |_lhs, _rhs| Err(ProgramError::InvalidArgument {
                 message: "scalar kernel failed".to_string(),

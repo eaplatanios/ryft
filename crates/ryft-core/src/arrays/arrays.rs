@@ -21,6 +21,7 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
+use crate::macros::impl_array_elementwise_operation;
 use crate::operations::{ElementType, Max, Min};
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
@@ -446,15 +447,57 @@ impl Array {
 
     /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
     /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
-    pub(crate) fn binary_elements<Input: ArrayElement, Output: ArrayElement>(
+    /// Both operands must already have `Input`'s element type as this function does not promote or convert operands.
+    /// The output must have `Output`'s element type and the fully static broadcast shape of the operands. Invalid
+    /// element types, shapes, or layouts return an error. Empty outputs do not invoke `function`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `rhs`: Right operand, whose shape must broadcast with this array's shape.
+    ///   - `output_type`: Result type, including its element type, broadcast shape, and storage layout.
+    ///     Operation-specific sharding and reduction metadata constraints must be checked by the caller.
+    ///   - `function`: Scalar calculation over decoded operands. Its errors are propagated unchanged.
+    pub fn map_element_pairs<Input: ArrayElement, Output: ArrayElement>(
         &self,
         rhs: &Self,
         output_type: ArrayType,
         function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
     ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type.data_type(), Input::data_type());
-        debug_assert_eq!(rhs.r#type.data_type(), Input::data_type());
-        debug_assert_eq!(output_type.data_type(), Output::data_type());
+        if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
+            return Err(TypeError::invalid(format!(
+                "binary element inputs must both have data type {}, got {} and {}",
+                Input::data_type(),
+                self.r#type.data_type(),
+                rhs.r#type.data_type(),
+            ))
+            .into());
+        }
+
+        if output_type.data_type() != Output::data_type() {
+            return Err(TypeError::invalid(format!(
+                "binary element output must have data type {}, got {}",
+                Output::data_type(),
+                output_type.data_type(),
+            ))
+            .into());
+        }
+
+        Self::materialized_element_count(&output_type)?;
+
+        let broadcast_shape = self
+            .r#type
+            .shape()
+            .broadcast(rhs.r#type.shape())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if output_type.shape() != &broadcast_shape {
+            return Err(TypeError::invalid(format!(
+                "binary element output shape must be {}, got {}",
+                broadcast_shape,
+                output_type.shape(),
+            ))
+            .into());
+        }
+
         let output_shape = output_type.static_shape().unwrap();
         let left_shape = self.r#type.static_shape().unwrap();
         let right_shape = rhs.r#type.static_shape().unwrap();
@@ -766,59 +809,23 @@ impl Concretizable<i128> for Array {
     }
 }
 
-impl Min for Array {
-    fn min(&self, right: &Self) -> Result<Self, ProgramError> {
-        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if Self::element_count(&output_type) == 0 {
-            let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-        }
-        if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
-            return Err(TypeError::invalid(format!(
-                "cannot compute the minimum of scalars of data types {} and {}",
-                self.r#type().data_type(),
-                right.r#type().data_type(),
-            ))
-            .into());
-        }
-        let data_type = output_type.data_type();
-        let left = self.promoted_to(data_type)?;
-        let right = right.promoted_to(data_type)?;
-        dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                Ok(ArrayElement::min(&left, &right))
-            })
-        })
-    }
-}
+impl_array_elementwise_operation!(
+    @binary
+    Min, min,
+    operation = "min",
+    inputs = @numeric,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
+);
 
-impl Max for Array {
-    fn max(&self, right: &Self) -> Result<Self, ProgramError> {
-        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if Self::element_count(&output_type) == 0 {
-            let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-        }
-        if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
-            return Err(TypeError::invalid(format!(
-                "cannot compute the maximum of scalars of data types {} and {}",
-                self.r#type().data_type(),
-                right.r#type().data_type(),
-            ))
-            .into());
-        }
-        let data_type = output_type.data_type();
-        let left = self.promoted_to(data_type)?;
-        let right = right.promoted_to(data_type)?;
-        dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                Ok(ArrayElement::max(&left, &right))
-            })
-        })
-    }
-}
+impl_array_elementwise_operation!(
+    @binary
+    Max, max,
+    operation = "max",
+    inputs = @numeric,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| Ok(ArrayElement::max(&lhs, &rhs)),
+);
 
 #[cfg(test)]
 mod tests {
@@ -1201,6 +1208,50 @@ mod tests {
             integers.gather_elements(ArrayType::new_static(DataType::I32, [3]), |_| 3),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "gather index 3 is out of bounds for 3 elements",
+        ));
+    }
+
+    #[test]
+    fn test_array_map_element_pairs() {
+        let left = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1i32, 3]).unwrap();
+        let right = Array::vector(vec![0i32, 2, 4]);
+
+        // Broadcasting preserves the input element type while allowing a different output element type.
+        let comparisons = left
+            .map_element_pairs::<i32, bool>(&right, ArrayType::new_static(DataType::Boolean, [2, 3]), |left, right| {
+                Ok(left < right)
+            })
+            .unwrap();
+        assert_eq!(comparisons.r#type().as_ref(), &ArrayType::new_static(DataType::Boolean, [2, 3]));
+        assert_eq!(comparisons.elements::<bool>(), Ok(vec![false, true, true, false, false, true]));
+
+        // Callers must supply the actual input codec, output codec, and broadcast shape.
+        assert!(matches!(
+            left.map_element_pairs::<i64, bool>(
+                &right,
+                ArrayType::new_static(DataType::Boolean, [2, 3]),
+                |left, right| Ok(left < right),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "binary element inputs must both have data type i64, got i32 and i32",
+        ));
+        assert!(matches!(
+            left.map_element_pairs::<i32, bool>(
+                &right,
+                ArrayType::new_static(DataType::I32, [2, 3]),
+                |left, right| Ok(left < right),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "binary element output must have data type bool, got i32",
+        ));
+        assert!(matches!(
+            left.map_element_pairs::<i32, bool>(
+                &right,
+                ArrayType::new_static(DataType::Boolean, [3, 2]),
+                |left, right| Ok(left < right),
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "binary element output shape must be [2, 3], got [3, 2]",
         ));
     }
 

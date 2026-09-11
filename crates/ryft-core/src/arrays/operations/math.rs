@@ -13,7 +13,6 @@ use num_complex::Complex;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
-use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::encoding::{
     ArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
     f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
@@ -23,13 +22,13 @@ use crate::arrays::operations::collectives::decode_nonnegative_integer_metadata;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
-use crate::macros::check_types;
+use crate::macros::impl_array_elementwise_operation;
 use crate::operations::math::erf::erf_f64;
 use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_sum_exp_data_type};
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
     Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Log1p, LogAddExp, LogSumExp, Logistic, Mul, Neg, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot,
+    Log1p, LogAddExp, LogSumExp, Logistic, Mul, MulOperation, Neg, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot,
     RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReductionKind, Rem, Reshape, Round, Rsqrt,
     Sign, Sin, Slice, Sqrt, Sub, Tanh,
 };
@@ -37,10 +36,9 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
-// These contracts operate on decoded storage elements, keeping integer wrapping, low-precision re-encoding, and
-// reduction identities in one place per element family. Some overlap with existing value-level capabilities, while
-// others have broader kernel-specific semantics: extrema also support Boolean and lexicographic complex reductions,
-// although the public `Min` and `Max` array operations accept only real numeric operands.
+// These contracts operate on decoded storage elements, keeping integer wrapping and low-precision re-encoding in
+// one place per element family. They complement the value-level capabilities with the scalar arithmetic needed by
+// elementwise kernels and reductions; extrema selection and its identities are provided directly by ArrayElement.
 
 /// Element-level analogue of the [`Zero`](crate::operations::Zero) capability: the additive identity of one array
 /// element type. The extraction is fallible because `f8e8m0fnu` has no zero.
@@ -1616,73 +1614,52 @@ impl std::ops::Neg for Array {
     }
 }
 
-macro_rules! impl_array_binary_arithmetic {
-    // Generates one numeric binary capability over the shared promotion, broadcasting, and typed-codec path.
-    (@numeric $trait:ident, $method:ident, $element_trait:ident) => {
-        impl $trait for Array {
-            fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                if Self::element_count(&output_type) == 0 {
-                    let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-                }
-                if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
-                    return Err(TypeError::invalid(format!(
-                        "cannot apply `{}` to scalars of data types {} and {}",
-                        stringify!($method),
-                        self.r#type().data_type(),
-                        right.r#type().data_type(),
-                    ))
-                    .into());
-                }
-                let data_type = output_type.data_type();
-                let left = self.promoted_to(data_type)?;
-                let right = right.promoted_to(data_type)?;
-                dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                        <Element as $element_trait>::$method(left, right)
-                    })
-                })
-            }
-        }
-    };
+impl_array_elementwise_operation!(
+    @binary
+    Add, add,
+    operation = "add",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |lhs, rhs| ElementAdd::add(lhs, rhs),
+);
 
-    // Generates a real-only binary capability whose invalid-type diagnostic uses a descriptive operation noun.
-    (@real $trait:ident, $method:ident, $element_trait:ident, $noun:literal) => {
-        impl $trait for Array {
-            fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                if Self::element_count(&output_type) == 0 {
-                    let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-                }
-                if !self.r#type().data_type().is_real() || !right.r#type().data_type().is_real() {
-                    return Err(TypeError::invalid(format!(
-                        concat!("cannot compute the ", $noun, " of scalars of data types {} and {}"),
-                        self.r#type().data_type(),
-                        right.r#type().data_type(),
-                    ))
-                    .into());
-                }
-                let data_type = output_type.data_type();
-                let left = self.promoted_to(data_type)?;
-                let right = right.promoted_to(data_type)?;
-                dispatch_on_array_element_type!(@real data_type, |Element| {
-                    left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                        <Element as $element_trait>::$method(left, right)
-                    })
-                })
-            }
+impl_array_elementwise_operation!(
+    @binary
+    Sub, sub,
+    operation = "sub",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |lhs, rhs| ElementSub::sub(lhs, rhs),
+);
+
+impl Mul for Array {
+    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        // Multiplication combines reduction states bilinearly rather than requiring congruent operand metadata.
+        // Use the operation's inference before evaluating elements so empty inputs obey the same contract.
+        let mut output_types = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
+        let output_type = output_types.remove(0);
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
-    };
+        let data_type = output_type.data_type();
+        let lhs = self.promoted_to(data_type)?;
+        let rhs = rhs.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, ElementMul::mul)
+        })
+    }
 }
 
-impl_array_binary_arithmetic!(@numeric Add, add, ElementAdd);
-impl_array_binary_arithmetic!(@numeric Sub, sub, ElementSub);
-impl_array_binary_arithmetic!(@numeric Mul, mul, ElementMul);
-impl_array_binary_arithmetic!(@numeric Div, div, ElementDiv);
+impl_array_elementwise_operation!(
+    @binary
+    Div, div,
+    operation = "div",
+    inputs = @numeric,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| ElementDiv::div(lhs, rhs),
+);
 
 impl std::ops::Add for Array {
     type Output = Self;
@@ -1730,198 +1707,195 @@ impl std::ops::Div for Array {
     }
 }
 
-macro_rules! impl_array_unary_math {
-    // Generates a unary operation supported by both real floating-point and complex elements.
-    (@float_math $trait:ident, $method:ident, $noun:literal) => {
-        impl $trait for Array {
-            fn $method(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(self.r#type().as_ref()) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(
-                        self.r#type().into_owned(),
-                        Arc::new(vec![0; addressing.storage_byte_len()]),
-                    ));
-                }
-                let data_type = self.r#type().data_type();
-                if !data_type.is_floating_point() && !data_type.is_complex() {
-                    return Err(TypeError::invalid(format!(
-                        concat!("cannot compute the ", $noun, " of a scalar of data type {}"),
-                        data_type,
-                    ))
-                    .into());
-                }
-                if data_type.is_complex() {
-                    dispatch_on_array_element_type!(@complex data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                            <Element as ElementFloatMath>::$method(value)
-                        })
-                    })
-                } else {
-                    dispatch_on_array_element_type!(@float data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                            <Element as ElementFloatMath>::$method(value)
-                        })
-                    })
-                }
-            }
-        }
-    };
+impl_array_elementwise_operation!(
+    @unary
+    Sin, sin,
+    operation = "sin",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::sin(input),
+);
 
-    // Generates a unary operation supported only by real floating-point elements.
-    (@real_float $trait:ident, $method:ident, $error:literal) => {
-        impl $trait for Array {
-            fn $method(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(self.r#type().as_ref()) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(
-                        self.r#type().into_owned(),
-                        Arc::new(vec![0; addressing.storage_byte_len()]),
-                    ));
-                }
-                let data_type = self.r#type().data_type();
-                if !data_type.is_floating_point() {
-                    return Err(TypeError::invalid(format!($error, data_type)).into());
-                }
-                dispatch_on_array_element_type!(@float data_type, |Element| {
-                    self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                        <Element as ElementRealFloatMath>::$method(value)
-                    })
+impl_array_elementwise_operation!(
+    @unary
+    Cos, cos,
+    operation = "cos",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::cos(input),
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Atan2, atan2,
+    operation = "atan2",
+    inputs = @float,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| ElementFloatMath::atan2(lhs, rhs),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Exp, exp,
+    operation = "exp",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::exp(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Log, log,
+    operation = "log",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::log(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Log1p, log1p,
+    operation = "log1p",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| ElementRealFloatMath::log1p(input),
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    LogAddExp, log_add_exp,
+    operation = "log_add_exp",
+    inputs = @float @real,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| ElementRealFloatMath::log_add_exp(lhs, rhs),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Sqrt, sqrt,
+    operation = "sqrt",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::sqrt(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Rsqrt, rsqrt,
+    operation = "rsqrt",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::rsqrt(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Tanh, tanh,
+    operation = "tanh",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::tanh(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Logistic, logistic,
+    operation = "logistic",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| ElementFloatMath::logistic(input),
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Erf, erf,
+    operation = "erf",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| ElementRealFloatMath::erf(input),
+);
+
+impl_array_elementwise_operation!(
+    @binary
+    Pow, pow,
+    operation = "pow",
+    inputs = @float,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| ElementFloatMath::pow(lhs, rhs),
+);
+
+impl Sign for Array {
+    fn sign(&self) -> Result<Self, ProgramError> {
+        if Self::element_count(self.r#type().as_ref()) == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
+            return Err(
+                TypeError::invalid(format!("cannot compute the sign of a scalar of data type {}", data_type,)).into()
+            );
+        }
+        if data_type.is_signed() {
+            dispatch_on_array_element_type!(@signed data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as ElementSign>::sign(value)
                 })
-            }
+            })
+        } else if data_type.is_complex() {
+            dispatch_on_array_element_type!(@complex data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as ElementSign>::sign(value)
+                })
+            })
+        } else {
+            dispatch_on_array_element_type!(@float data_type, |Element| {
+                self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
+                    <Element as ElementSign>::sign(value)
+                })
+            })
         }
-    };
-
-    // Generates sign extraction over its disjoint signed-integer, floating-point, and complex element classes.
-    (@sign) => {
-        impl Sign for Array {
-            fn sign(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(self.r#type().as_ref()) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(
-                        self.r#type().into_owned(),
-                        Arc::new(vec![0; addressing.storage_byte_len()]),
-                    ));
-                }
-                let data_type = self.r#type().data_type();
-                if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the sign of a scalar of data type {}",
-                        data_type,
-                    ))
-                    .into());
-                }
-                if data_type.is_signed() {
-                    dispatch_on_array_element_type!(@signed data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                            <Element as ElementSign>::sign(value)
-                        })
-                    })
-                } else if data_type.is_complex() {
-                    dispatch_on_array_element_type!(@complex data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                            <Element as ElementSign>::sign(value)
-                        })
-                    })
-                } else {
-                    dispatch_on_array_element_type!(@float data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                            <Element as ElementSign>::sign(value)
-                        })
-                    })
-                }
-            }
-        }
-    };
+    }
 }
 
-macro_rules! impl_array_binary_float_math {
-    // Public form: a binary operation supported by both real floating-point and complex elements.
-    ($trait:ident, $method:ident, $argument:ident) => {
-        impl_array_binary_float_math! {
-            @kernel $trait, $method, $argument,
-            element_types = (@float),
-            evaluate = |data_type, left, right, output_type| {
-                if data_type.is_complex() {
-                    dispatch_on_array_element_type!(@complex data_type, |Element| {
-                        left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                            <Element as ElementFloatMath>::$method(left, right)
-                        })
-                    })
-                } else {
-                    dispatch_on_array_element_type!(@float data_type, |Element| {
-                        left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                            <Element as ElementFloatMath>::$method(left, right)
-                        })
-                    })
-                }
-            },
-        }
-    };
+impl_array_elementwise_operation!(
+    @unary
+    Floor, floor,
+    operation = "floor",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| ElementRealFloatMath::floor(input),
+);
 
-    // Public form: a binary operation supported only by real floating-point elements.
-    (@real_float $trait:ident, $method:ident, $argument:ident) => {
-        impl_array_binary_float_math! {
-            @kernel $trait, $method, $argument,
-            element_types = (@float @real),
-            evaluate = |data_type, left, right, output_type| {
-                dispatch_on_array_element_type!(@float data_type, |Element| {
-                    left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
-                        <Element as ElementRealFloatMath>::$method(left, right)
-                    })
-                })
-            },
-        }
-    };
+impl_array_elementwise_operation!(
+    @unary
+    Ceil, ceil,
+    operation = "ceil",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| ElementRealFloatMath::ceil(input),
+);
 
-    // Internal branch: the prologue every binary floating-point kernel shares. It broadcasts the operand types, takes
-    // the empty-result shortcut, validates both element data types against the requested `check_types!` selector, and
-    // promotes both operands into the result's element type, then hands those bindings to the caller's element-level
-    // evaluation. The four binding names come from the invoking branch so that they are visible inside its own
-    // `evaluate` block.
-    (
-        @kernel $trait:ident, $method:ident, $argument:ident,
-        element_types = ($($element_types:tt)*),
-        evaluate = |$data_type:ident, $left:ident, $right:ident, $output_type:ident| $evaluate:block $(,)?
-    ) => {
-        impl $trait for Array {
-            fn $method(&self, $argument: &Self) -> Result<Self, ProgramError> {
-                let $output_type = Broadcastable::broadcast(self.r#type().as_ref(), $argument.r#type().as_ref())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                if Self::element_count(&$output_type) == 0 {
-                    let addressing = ArrayAddressing::new($output_type.clone())?;
-                    return Ok(Self::new_unchecked($output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-                }
-                let left_type = self.r#type().data_type();
-                let right_type = $argument.r#type().data_type();
-                check_types!($($element_types)*, stringify!($method), [left_type, right_type]);
-                let $data_type = $output_type.data_type();
-                let $left = self.promoted_to($data_type)?;
-                let $right = $argument.promoted_to($data_type)?;
-                $evaluate
-            }
-        }
-    };
-}
+impl_array_elementwise_operation!(
+    @unary
+    Round, round,
+    operation = "round",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| ElementRealFloatMath::round(input),
+);
 
-impl_array_unary_math!(@float_math Sin, sin, "sine");
-impl_array_unary_math!(@float_math Cos, cos, "cosine");
-impl_array_binary_float_math!(Atan2, atan2, x);
-impl_array_unary_math!(@float_math Exp, exp, "exponential");
-impl_array_unary_math!(@float_math Log, log, "logarithm");
-impl_array_unary_math!(@real_float Log1p, log1p, "cannot compute `log1p` of a scalar of data type {}");
-impl_array_binary_float_math!(@real_float LogAddExp, log_add_exp, other);
-impl_array_unary_math!(@float_math Sqrt, sqrt, "square root");
-impl_array_unary_math!(@float_math Rsqrt, rsqrt, "reciprocal square root");
-impl_array_unary_math!(@float_math Tanh, tanh, "hyperbolic tangent");
-impl_array_unary_math!(@float_math Logistic, logistic, "logistic");
-impl_array_unary_math!(@real_float Erf, erf, "cannot compute the error function of a scalar of data type {}");
-impl_array_binary_float_math!(Pow, pow, exponent);
-impl_array_unary_math!(@sign);
-impl_array_unary_math!(@real_float Floor, floor, "cannot compute the floor of a scalar of data type {}");
-impl_array_unary_math!(@real_float Ceil, ceil, "cannot compute the ceiling of a scalar of data type {}");
-impl_array_unary_math!(@real_float Round, round, "cannot round a scalar of data type {}");
-
-impl_array_binary_arithmetic!(@real Rem, rem, ElementRem, "remainder");
+impl_array_elementwise_operation!(
+    @binary
+    Rem, rem,
+    operation = "rem",
+    inputs = @numeric @real,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| ElementRem::rem(lhs, rhs),
+);
 
 impl Dot for Array {
     /// Computes an accumulation-typed dot by upcasting both operands to `accumulation_type` and delegating to the
@@ -2036,6 +2010,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::encoding::{f8e4m3fn, f8e8m0fnu, i2, i4};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::operations::complex::Complex;
@@ -2076,6 +2052,39 @@ mod tests {
         // Integer arithmetic wraps deterministically, matching the scalar reference backend.
         let wrapped = Array::vector(vec![255u8]).add(&Array::vector(vec![1u8])).unwrap();
         assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
+    }
+
+    #[test]
+    fn test_array_mul_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
+        let partial_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let lhs = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
+        let rhs = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
+        let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
+
+        // A partial sum times an operand reduced over the same mesh axes remains a partial sum in either order.
+        assert_eq!(lhs.mul(&rhs), Ok(expected.clone()));
+        assert_eq!(rhs.mul(&lhs), Ok(expected));
+
+        // Multiplying two partial sums is invalid, including when no scalar evaluation would occur.
+        assert!(matches!(
+            lhs.mul(&lhs),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two operands that are both unreduced",
+        ));
+        let empty_type = lhs.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
+        let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
+        assert!(matches!(
+            empty.mul(&empty),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two operands that are both unreduced",
+        ));
     }
 
     #[test]
