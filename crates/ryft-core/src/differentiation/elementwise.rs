@@ -41,8 +41,20 @@ pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T>
     ///     whenever the alignment cannot introduce a runtime extent.
     fn align_tangent(&self, target: &T, exemplar: &Self) -> Result<Self, DifferentiationError>;
 
-    /// "Un-aligns" this cotangent [`Value`] from `target` back to this [`Value`]'s type by applying the adjoint
-    /// of the implicit conversion and broadcast.
+    /// Maps this cotangent [`Value`], which has the type of an implicitly broadcasting elementwise result, back to
+    /// the type `target` of one of that result's operands, returning the cotangent of that operand.
+    ///
+    /// This is the adjoint of the linear map that [`align_tangent`](Self::align_tangent) applies when it takes an
+    /// operand of type `target` to the result type. Every contribution that the implicit broadcast spread over axes
+    /// the operand does not have (i.e., the leading axes of this [`Value`] beyond `target`'s rank, and any axis that
+    /// `target` holds at unit extent) is summed back onto the operand's axes, the element type is converted back to
+    /// `target`'s, and a differing sharding is resharded back. The result has exactly type `target`. This [`Value`]
+    /// must have at least `target`'s rank, since an operand never has more axes than the result.
+    ///
+    /// # Parameters
+    ///
+    ///   - `target`: [`Type`](crate::Type) of the operand whose cotangent is being recovered (i.e., the type that
+    ///     [`align_tangent`](Self::align_tangent) converted and broadcast _from_).
     fn unalign_cotangent(&self, target: &T) -> Result<Self, DifferentiationError>;
 }
 
