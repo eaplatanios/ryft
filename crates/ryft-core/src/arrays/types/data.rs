@@ -1097,6 +1097,220 @@ impl DataType {
             Self::C128 => 33,
         }
     }
+
+    /// Returns `true` if this [`DataType`] represents an effect-ordering token (i.e., if it is [`DataType::Token`]).
+    pub const fn is_token(self) -> bool {
+        matches!(self, Self::Token)
+    }
+
+    /// Returns `true` if this [`DataType`] represents the zero-information differential space
+    /// (i.e., if it is [`DataType::Zero`]).
+    pub const fn is_zero(self) -> bool {
+        matches!(self, Self::Zero)
+    }
+
+    /// Returns `true` if this [`DataType`] represents Boolean values (i.e., if it is [`DataType::Boolean`]).
+    pub const fn is_boolean(self) -> bool {
+        matches!(self, Self::Boolean)
+    }
+
+    /// Returns `true` if this [`DataType`] represents a signed integer.
+    pub const fn is_signed(self) -> bool {
+        matches!(self, Self::I1 | Self::I2 | Self::I4 | Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
+    /// Returns `true` if this [`DataType`] represents an unsigned integer.
+    pub const fn is_unsigned(self) -> bool {
+        matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64)
+    }
+
+    /// Returns `true` if this [`DataType`] represents a signed or unsigned integer.
+    pub const fn is_integer(self) -> bool {
+        self.is_signed() || self.is_unsigned()
+    }
+
+    /// Returns `true` if this [`DataType`] represents a real floating-point value.
+    pub const fn is_floating_point(self) -> bool {
+        matches!(
+            self,
+            Self::F4E2M1FN
+                | Self::F6E2M3FN
+                | Self::F6E3M2FN
+                | Self::F8E3M4
+                | Self::F8E4M3
+                | Self::F8E4M3FN
+                | Self::F8E4M3FNUZ
+                | Self::F8E4M3B11FNUZ
+                | Self::F8E5M2
+                | Self::F8E5M2FNUZ
+                | Self::F8E8M0FNU
+                | Self::BF16
+                | Self::F16
+                | Self::F32
+                | Self::F64
+        )
+    }
+
+    /// Returns `true` if this [`DataType`] represents a complex value.
+    pub const fn is_complex(self) -> bool {
+        matches!(self, Self::C64 | Self::C128)
+    }
+
+    /// Returns `true` if this [`DataType`] represents a real numeric value. This includes integer and floating-point
+    /// types, but excludes [`DataType::Token`], [`DataType::Zero`], [`DataType::Boolean`], and complex types.
+    pub const fn is_real(self) -> bool {
+        self.is_integer() || self.is_floating_point()
+    }
+
+    /// Returns `true` if this [`DataType`] represents a numeric value. This includes integer, floating-point, and
+    /// complex types, but excludes [`DataType::Token`], [`DataType::Zero`], and [`DataType::Boolean`].
+    pub const fn is_numeric(self) -> bool {
+        self.is_real() || self.is_complex()
+    }
+
+    /// Returns the promoted [`DataType`] for the provided data types, which is defined as the least upper bound of
+    /// the input [`DataType`]s in the type promotion lattice described in the documentation of [`DataType`]. In other
+    /// words, it returns the _smallest_ [`DataType`] that every input type can be promoted to, automatically. Note
+    /// that the returned type is not required to be one of the inputs. For example, combining [`DataType::I64`] with
+    /// [`DataType::U64`] yields [`DataType::F64`] because there is no wider integer type that can represent both.
+    /// This operation is order-invariant, meaning that it returns the same result irrespective of the order in which
+    /// the input data types are provided.
+    ///
+    /// This function returns [`DataTypeError::EmptyPromotionInput`] when `data_types` is empty and
+    /// [`DataTypeError::InvalidPromotion`] when the provided types are incompatible in terms of type promotion.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::arrays::DataType;
+    ///
+    /// assert_eq!(DataType::promoted(&[DataType::Boolean]), Ok(DataType::Boolean));
+    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::U16]), Ok(DataType::U16));
+    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::F32]), Ok(DataType::F32));
+    /// assert_eq!(DataType::promoted(&[DataType::F32, DataType::U16]), Ok(DataType::F32));
+    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::U16, DataType::F32]), Ok(DataType::F32));
+    /// assert_eq!(DataType::promoted(&[DataType::I64, DataType::U64]), Ok(DataType::F64));
+    /// ```
+    #[inline]
+    pub fn promoted(data_types: &[Self]) -> Result<Self, DataTypeError> {
+        let Some((head, tail)) = data_types.split_first() else {
+            return Err(DataTypeError::EmptyPromotionInput { backtrace: Backtrace::capture().to_string() });
+        };
+        tail.iter().try_fold(*head, |x, y| {
+            DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS[x.index()][y.index()].ok_or_else(|| {
+                DataTypeError::InvalidPromotion {
+                    message: format!("cannot promote types `{x}` and `{y}` to a common type"),
+                    backtrace: Backtrace::capture().to_string(),
+                }
+            })
+        })
+    }
+
+    /// Promotes this [`DataType`] to the provided [`DataType`]. This function returns
+    /// [`DataTypeError::InvalidPromotion`] when the promotion is not allowed. Refer to the documentation
+    /// of [`DataType`] for more information on type promotions and the rules that govern them.
+    #[inline]
+    pub fn promote_to(self, other: DataType) -> Result<DataType, DataTypeError> {
+        if self.is_promotable_to(other) {
+            Ok(other)
+        } else {
+            Err(DataTypeError::InvalidPromotion {
+                message: format!("cannot promote type `{self}` to type `{other}`"),
+                backtrace: Backtrace::capture().to_string(),
+            })
+        }
+    }
+
+    /// Returns `true` if this [`DataType`] can be promoted to the provided [`DataType`]. Note that this function will
+    /// always return `true` when `self == other`. Refer to the documentation of [`DataType`] for more information on
+    /// type promotions and the rules that govern them.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::arrays::DataType;
+    ///
+    /// assert!(DataType::I32.is_promotable_to(DataType::F64));
+    /// assert!(DataType::F32.is_promotable_to(DataType::C64));
+    /// assert!(!DataType::F64.is_promotable_to(DataType::I32));
+    /// ```
+    #[inline]
+    pub fn is_promotable_to(self, other: Self) -> bool {
+        DATA_TYPE_PROMOTION_UPPER_BOUNDS_BITMASKS[self.index()] & DataTypePromotionNode::DataType(other).bitmask() != 0
+    }
+}
+
+impl Display for DataType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            DataType::Token => "token",
+            DataType::Zero => "zero",
+            DataType::Boolean => "bool",
+            DataType::I1 => "i1",
+            DataType::I2 => "i2",
+            DataType::I4 => "i4",
+            DataType::I8 => "i8",
+            DataType::I16 => "i16",
+            DataType::I32 => "i32",
+            DataType::I64 => "i64",
+            DataType::U1 => "u1",
+            DataType::U2 => "u2",
+            DataType::U4 => "u4",
+            DataType::U8 => "u8",
+            DataType::U16 => "u16",
+            DataType::U32 => "u32",
+            DataType::U64 => "u64",
+            DataType::F4E2M1FN => "f4e2m1fn",
+            DataType::F6E3M2FN => "f6e3m2fn",
+            DataType::F6E2M3FN => "f6e2m3fn",
+            DataType::F8E3M4 => "f8e3m4",
+            DataType::F8E4M3 => "f8e4m3",
+            DataType::F8E4M3FN => "f8e4m3fn",
+            DataType::F8E4M3FNUZ => "f8e4m3fnuz",
+            DataType::F8E4M3B11FNUZ => "f8e4m3b11fnuz",
+            DataType::F8E5M2 => "f8e5m2",
+            DataType::F8E5M2FNUZ => "f8e5m2fnuz",
+            DataType::F8E8M0FNU => "f8e8m0fnu",
+            DataType::BF16 => "bf16",
+            DataType::F16 => "f16",
+            DataType::F32 => "f32",
+            DataType::F64 => "f64",
+            DataType::C64 => "c64",
+            DataType::C128 => "c128",
+        })
+    }
+}
+
+impl Type for DataType {
+    type Identity = NoIdentity;
+    type Refinements = ();
+
+    #[inline]
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        // Note that this compatibility relationship is not quite a subtyping relationship in that certain type
+        // promotions can result in loss of information for values of those types (e.g., `DataType::U64` to
+        // `DataType::F64`). However, it is intended to make ergonomics better for when working with `ryft`
+        // for scientific applications.
+        self.is_promotable_to(*other)
+    }
+
+    #[inline]
+    fn is_refined_by(&self, other: &Self) -> bool {
+        // This relation is simply data type equality. For example, `f32` is not refined by `f16`. However, `f16`
+        // is *compatible* with `f32` (i.e., `f16` values can be promoted to `f32` values). This compatibility
+        // relationship is exposed via `Type::is_compatible_with` instead of this function.
+        self == other
+    }
+
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn is_complex(&self) -> bool {
+        DataType::is_complex(*self)
+    }
 }
 
 /// Node in the [`DataType`] promotion lattice. Refer to the documentation of [`DataType`] for more information
@@ -1331,222 +1545,6 @@ static DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS: [[Option<DataType>; DataType::COU
     }
     least_upper_bounds
 };
-
-impl DataType {
-    /// Returns `true` if this [`DataType`] represents an effect-ordering token (i.e., if it is [`DataType::Token`]).
-    pub const fn is_token(self) -> bool {
-        matches!(self, Self::Token)
-    }
-
-    /// Returns `true` if this [`DataType`] represents the zero-information differential space
-    /// (i.e., if it is [`DataType::Zero`]).
-    pub const fn is_zero(self) -> bool {
-        matches!(self, Self::Zero)
-    }
-
-    /// Returns `true` if this [`DataType`] represents Boolean values (i.e., if it is [`DataType::Boolean`]).
-    pub const fn is_boolean(self) -> bool {
-        matches!(self, Self::Boolean)
-    }
-
-    /// Returns `true` if this [`DataType`] represents a signed integer.
-    pub const fn is_signed(self) -> bool {
-        matches!(self, Self::I1 | Self::I2 | Self::I4 | Self::I8 | Self::I16 | Self::I32 | Self::I64)
-    }
-
-    /// Returns `true` if this [`DataType`] represents an unsigned integer.
-    pub const fn is_unsigned(self) -> bool {
-        matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64)
-    }
-
-    /// Returns `true` if this [`DataType`] represents a signed or unsigned integer.
-    pub const fn is_integer(self) -> bool {
-        self.is_signed() || self.is_unsigned()
-    }
-
-    /// Returns `true` if this [`DataType`] represents a real floating-point value.
-    pub const fn is_floating_point(self) -> bool {
-        matches!(
-            self,
-            Self::F4E2M1FN
-                | Self::F6E2M3FN
-                | Self::F6E3M2FN
-                | Self::F8E3M4
-                | Self::F8E4M3
-                | Self::F8E4M3FN
-                | Self::F8E4M3FNUZ
-                | Self::F8E4M3B11FNUZ
-                | Self::F8E5M2
-                | Self::F8E5M2FNUZ
-                | Self::F8E8M0FNU
-                | Self::BF16
-                | Self::F16
-                | Self::F32
-                | Self::F64
-        )
-    }
-
-    /// Returns `true` if this [`DataType`] represents a complex value.
-    pub const fn is_complex(self) -> bool {
-        matches!(self, Self::C64 | Self::C128)
-    }
-
-    /// Returns `true` if this [`DataType`] represents a real numeric value. This includes integer and floating-point
-    /// types, but excludes [`DataType::Token`], [`DataType::Zero`], [`DataType::Boolean`], and complex types.
-    pub const fn is_real(self) -> bool {
-        self.is_integer() || self.is_floating_point()
-    }
-
-    /// Returns `true` if this [`DataType`] represents a numeric value. This includes integer, floating-point, and
-    /// complex types, but excludes [`DataType::Token`], [`DataType::Zero`], and [`DataType::Boolean`].
-    pub const fn is_numeric(self) -> bool {
-        self.is_real() || self.is_complex()
-    }
-
-    /// Returns the promoted [`DataType`] for the provided data types, which is defined as the least upper bound of
-    /// the input [`DataType`]s in the type promotion lattice described in the documentation of [`DataType`]. In other
-    /// words, it returns the _smallest_ [`DataType`] that every input type can be promoted to, automatically. Note
-    /// that the returned type is not required to be one of the inputs. For example, combining [`DataType::I64`] with
-    /// [`DataType::U64`] yields [`DataType::F64`] because there is no wider integer type that can represent both.
-    /// This operation is order-invariant, meaning that it returns the same result irrespective of the order in which
-    /// the input data types are provided.
-    ///
-    /// This function returns [`DataTypeError::EmptyPromotionInput`] when `data_types` is empty and
-    /// [`DataTypeError::InvalidPromotion`] when the provided types are incompatible in terms of type promotion.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::arrays::DataType;
-    ///
-    /// assert_eq!(DataType::promoted(&[DataType::Boolean]), Ok(DataType::Boolean));
-    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::U16]), Ok(DataType::U16));
-    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::F32]), Ok(DataType::F32));
-    /// assert_eq!(DataType::promoted(&[DataType::F32, DataType::U16]), Ok(DataType::F32));
-    /// assert_eq!(DataType::promoted(&[DataType::Boolean, DataType::U16, DataType::F32]), Ok(DataType::F32));
-    /// assert_eq!(DataType::promoted(&[DataType::I64, DataType::U64]), Ok(DataType::F64));
-    /// ```
-    #[inline]
-    pub fn promoted(data_types: &[Self]) -> Result<Self, DataTypeError> {
-        let Some((head, tail)) = data_types.split_first() else {
-            return Err(DataTypeError::EmptyPromotionInput { backtrace: Backtrace::capture().to_string() });
-        };
-        tail.iter().try_fold(*head, |x, y| {
-            DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS[x.index()][y.index()].ok_or_else(|| {
-                DataTypeError::InvalidPromotion {
-                    message: format!("cannot promote types `{x}` and `{y}` to a common type"),
-                    backtrace: Backtrace::capture().to_string(),
-                }
-            })
-        })
-    }
-
-    /// Promotes this [`DataType`] to the provided [`DataType`]. This function returns
-    /// [`DataTypeError::InvalidPromotion`] when the promotion is not allowed. Refer to the documentation
-    /// of [`DataType`] for more information on type promotions and the rules that govern them.
-    #[inline]
-    pub fn promote_to(self, other: DataType) -> Result<DataType, DataTypeError> {
-        if self.is_promotable_to(other) {
-            Ok(other)
-        } else {
-            Err(DataTypeError::InvalidPromotion {
-                message: format!("cannot promote type `{self}` to type `{other}`"),
-                backtrace: Backtrace::capture().to_string(),
-            })
-        }
-    }
-
-    /// Returns `true` if this [`DataType`] can be promoted to the provided [`DataType`]. Note that this function will
-    /// always return `true` when `self == other`. Refer to the documentation of [`DataType`] for more information on
-    /// type promotions and the rules that govern them.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::arrays::DataType;
-    ///
-    /// assert!(DataType::I32.is_promotable_to(DataType::F64));
-    /// assert!(DataType::F32.is_promotable_to(DataType::C64));
-    /// assert!(!DataType::F64.is_promotable_to(DataType::I32));
-    /// ```
-    #[inline]
-    pub fn is_promotable_to(self, other: Self) -> bool {
-        DATA_TYPE_PROMOTION_UPPER_BOUNDS_BITMASKS[self.index()] & DataTypePromotionNode::DataType(other).bitmask() != 0
-    }
-}
-
-impl Display for DataType {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            DataType::Token => "token",
-            DataType::Zero => "zero",
-            DataType::Boolean => "bool",
-            DataType::I1 => "i1",
-            DataType::I2 => "i2",
-            DataType::I4 => "i4",
-            DataType::I8 => "i8",
-            DataType::I16 => "i16",
-            DataType::I32 => "i32",
-            DataType::I64 => "i64",
-            DataType::U1 => "u1",
-            DataType::U2 => "u2",
-            DataType::U4 => "u4",
-            DataType::U8 => "u8",
-            DataType::U16 => "u16",
-            DataType::U32 => "u32",
-            DataType::U64 => "u64",
-            DataType::F4E2M1FN => "f4e2m1fn",
-            DataType::F6E3M2FN => "f6e3m2fn",
-            DataType::F6E2M3FN => "f6e2m3fn",
-            DataType::F8E3M4 => "f8e3m4",
-            DataType::F8E4M3 => "f8e4m3",
-            DataType::F8E4M3FN => "f8e4m3fn",
-            DataType::F8E4M3FNUZ => "f8e4m3fnuz",
-            DataType::F8E4M3B11FNUZ => "f8e4m3b11fnuz",
-            DataType::F8E5M2 => "f8e5m2",
-            DataType::F8E5M2FNUZ => "f8e5m2fnuz",
-            DataType::F8E8M0FNU => "f8e8m0fnu",
-            DataType::BF16 => "bf16",
-            DataType::F16 => "f16",
-            DataType::F32 => "f32",
-            DataType::F64 => "f64",
-            DataType::C64 => "c64",
-            DataType::C128 => "c128",
-        })
-    }
-}
-
-impl Type for DataType {
-    type Identity = NoIdentity;
-    type Refinements = ();
-
-    #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
-        // Note that this compatibility relationship is not quite a subtyping relationship in that certain type
-        // promotions can result in loss of information for values of those types (e.g., `DataType::U64` to
-        // `DataType::F64`). However, it is intended to make ergonomics better for when working with `ryft`
-        // for scientific applications.
-        self.is_promotable_to(*other)
-    }
-
-    #[inline]
-    fn is_refined_by(&self, other: &Self) -> bool {
-        // This relation is simply data type equality. For example, `f32` is not refined by `f16`. However, `f16`
-        // is *compatible* with `f32` (i.e., `f16` values can be promoted to `f32` values). This compatibility
-        // relationship is exposed via `Type::is_compatible_with` instead of this function.
-        self == other
-    }
-
-    #[inline]
-    fn is_scalar(&self) -> bool {
-        true
-    }
-
-    #[inline]
-    fn is_complex(&self) -> bool {
-        DataType::is_complex(*self)
-    }
-}
 
 #[cfg(test)]
 mod tests {
