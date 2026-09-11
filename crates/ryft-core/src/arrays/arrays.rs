@@ -8,8 +8,6 @@ use num_complex::Complex;
 
 use ryft_macros::Parameter;
 
-// TODO(eaplatanios): Review from here onwards.
-
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::encoding::{
@@ -23,15 +21,17 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
-use crate::operations::ElementType;
+use crate::operations::{ElementType, Max, Min};
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 
-/// Dense multidimensional [`Value`] whose [`Type`](crate::programs::Type) is an [`ArrayType`]. It is the reference
-/// array value of Ryft: it exists primarily to exercise the tracing, transformation, and interpretation machinery
-/// with programs over multidimensional arrays without depending on an optimized backend such as `ryft-xla`. Unit
-/// tests, documentation tests, and downstream crates can therefore interpret complete array programs eagerly and
-/// stage them through [`ArrayTracingContext`](crate::arrays::ArrayTracingContext).
+// TODO(eaplatanios): Review from here onwards.
+
+/// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
+/// of Ryft and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
+/// over multidimensional arrays without depending on an optimized backend such as the Ryft XLA backend. Unit tests,
+/// documentation tests, and downstream crates can therefore interpret complete array programs eagerly and stage them
+/// through [`ArrayTracingContext`](crate::ArrayTracingContext).
 ///
 /// The payload is one shared immutable byte buffer whose physical placement is determined by the array's
 /// [`ArrayType`]. Missing layout metadata means dense row-major storage; explicit strided and tiled layouts determine
@@ -766,6 +766,60 @@ impl Concretizable<i128> for Array {
     }
 }
 
+impl Min for Array {
+    fn min(&self, right: &Self) -> Result<Self, ProgramError> {
+        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "cannot compute the minimum of scalars of data types {} and {}",
+                self.r#type().data_type(),
+                right.r#type().data_type(),
+            ))
+            .into());
+        }
+        let data_type = output_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
+                Ok(ArrayElement::min(&left, &right))
+            })
+        })
+    }
+}
+
+impl Max for Array {
+    fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "cannot compute the maximum of scalars of data types {} and {}",
+                self.r#type().data_type(),
+                right.r#type().data_type(),
+            ))
+            .into());
+        }
+        let data_type = output_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
+                Ok(ArrayElement::max(&left, &right))
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1271,6 +1325,29 @@ mod tests {
             Err(ProgramError::Concretization {
                 message: "cannot extract a concrete integer from `f32[]`; expected a scalar integer".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn test_array_min() {
+        // Minimum preserves the selected operand's IEEE signed-zero encoding.
+        assert_eq!(
+            Array::scalar(-0.0f32).min(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            (-0.0f32).to_bits(),
+        );
+    }
+
+    #[test]
+    fn test_array_max() {
+        // Elementwise extrema retain the selected operand's NaN payload and IEEE signed-zero encoding.
+        let nan = f32::from_bits(0x7fc0_1234);
+        assert_eq!(
+            Array::scalar(nan).max(&Array::scalar(1.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            nan.to_bits(),
+        );
+        assert_eq!(
+            Array::scalar(-0.0f32).max(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            0.0f32.to_bits(),
         );
     }
 }

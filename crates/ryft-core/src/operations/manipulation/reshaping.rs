@@ -1389,9 +1389,7 @@ mod tests {
         // The optional dimensions permutation is applied before the row-major reshape.
         assert_eq!(
             input.reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`transpose` permutation has length 2 but input has rank 1".to_string()
-            ))),
+            Err(ProgramError::Type(TypeError::invalid("permutation has length 2 but input has rank 1".to_string()))),
         );
         assert_eq!(
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
