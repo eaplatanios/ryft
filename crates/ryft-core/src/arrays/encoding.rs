@@ -222,6 +222,90 @@ pub trait RealArrayElement: NumericArrayElement {
     fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
 }
 
+/// [`NumericArrayElement`] type that supports transcendental arithmetic operations on real floating-point and complex
+/// values. Integer and Boolean elements do not implement this trait. Native real elements compute in their own
+/// precision, half-precision elements compute in `f32`, and smaller formats compute in `f64` with results rounded back
+/// to the original element format. The error function uses a separate double-precision approximation. Complex functions
+/// use their component precision and principal branches where applicable. Results remain fallible because some formats
+/// cannot represent zero or NaN.
+pub trait FloatingPointArrayElement: NumericArrayElement {
+    /// Computes the sine, with real arguments measured in radians. Complex arguments use the analytic continuation;
+    /// purely imaginary arguments retain a zero real component even when the imaginary component overflows.
+    fn sin(self) -> Result<Self, ProgramError>;
+
+    /// Computes the cosine, with real arguments measured in radians. Complex arguments use the analytic continuation;
+    /// purely imaginary arguments retain a zero imaginary component even when the real component overflows.
+    fn cos(self) -> Result<Self, ProgramError>;
+
+    /// Computes the four-quadrant angle `atan2(self, x)` in radians for real elements, using signed zeros to select
+    /// the axis and branch. For complex elements, evaluates `-i * log((x + i * self) / sqrt(x*x + self*self))`
+    /// with principal logarithm and square root branches.
+    ///
+    /// # Parameters
+    ///
+    ///   - `x`: Horizontal coordinate for real inputs, or the second operand of the complex continuation.
+    fn atan2(self, x: Self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural exponential. Real overflow and underflow follow the destination format's conversion
+    /// rules. Complex elements compute `exp(real) * (cos(imaginary) + i * sin(imaginary))`.
+    fn exp(self) -> Result<Self, ProgramError>;
+
+    /// Computes the natural logarithm. Real zero produces negative infinity and negative inputs produce NaN when
+    /// representable. Complex elements use the principal logarithm, with a branch cut along the negative real axis.
+    fn log(self) -> Result<Self, ProgramError>;
+
+    /// Computes the principal square root. Negative real inputs produce NaN when representable. Complex inputs use
+    /// the principal branch and retain the imaginary component's sign on the negative real axis.
+    fn sqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the reciprocal of the principal square root, with the same branch as [`sqrt`](Self::sqrt).
+    /// Real zero produces a signed infinity before conversion to the destination format.
+    fn rsqrt(self) -> Result<Self, ProgramError>;
+
+    /// Computes the hyperbolic tangent, using its analytic continuation for complex elements.
+    fn tanh(self) -> Result<Self, ProgramError>;
+
+    /// Computes the logistic function `1 / (1 + exp(-self))`, extended to complex elements by the same expression.
+    /// Intermediate exponentials use the working precision described by this trait; the result is then converted
+    /// to the destination format, which can fail when the format cannot represent zero or NaN.
+    fn logistic(self) -> Result<Self, ProgramError>;
+
+    /// Raises this element to `exponent`. Real inputs use real floating-point power semantics. Complex inputs use
+    /// the principal complex power, whose branch is determined by the principal logarithm.
+    fn pow(self, exponent: Self) -> Result<Self, ProgramError>;
+}
+
+/// [`NumericArrayElement`] type that supports functions specific to real-valued floating-point elements. This trait
+/// combines [`FloatingPointArrayElement`] with [`RealArrayElement`], excluding both complex elements and integers.
+/// Except for [`erf`](Self::erf), functions use the working precision and result conversion described by
+/// [`FloatingPointArrayElement`].
+pub trait RealFloatingPointArrayElement: FloatingPointArrayElement + RealArrayElement {
+    /// Computes the Gauss error function `2 / sqrt(pi) * integral_0^self exp(-t*t) dt`. Uses a double-precision
+    /// rational approximation before converting to the destination format. Preserves signed zero and maps
+    /// negative and positive infinity to `-1` and `1`, respectively.
+    fn erf(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(1 + self)` without first rounding `1 + self`, preserving accuracy near zero. Inputs below
+    /// `-1` produce NaN and `-1` produces negative infinity before conversion to the destination format.
+    fn log1p(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(exp(self) + exp(other))` without forming the potentially overflowing exponentials. Equal-sign
+    /// infinities return that infinity, opposite-sign infinities return positive infinity, and NaNs propagate,
+    /// subject to the destination format's representability rules.
+    fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
+
+    /// Rounds toward negative infinity, preserving already integral values, signed zeros, infinities, and NaNs
+    /// subject to conversion back to the destination format.
+    fn floor(self) -> Result<Self, ProgramError>;
+
+    /// Rounds toward positive infinity, with the same conversion behavior as [`floor`](Self::floor).
+    fn ceil(self) -> Result<Self, ProgramError>;
+
+    /// Rounds to the nearest integer, resolving exact half-way cases toward the even integer. Preserves signed
+    /// zero when the rounded value is zero, subject to the destination format's representation.
+    fn round(self) -> Result<Self, ProgramError>;
+}
+
 mod private {
     use crate::arrays::types::data::DataType;
 
@@ -1607,6 +1691,212 @@ macro_rules! impl_array_element_for_integer_types {
 impl_array_element_for_integer_types!(signed, i64, from_signed, i8, i16, i32, i64);
 impl_array_element_for_integer_types!(unsigned, u64, from_unsigned, u8, u16, u32, u64);
 
+// Implements the real floating-point math families through the working precision and exact re-encoding contract of
+// each element family. Half precision uses `f32`, native primitive types use themselves, and low-precision formats
+// use `f64`, matching the scalar reference semantics.
+macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
+    // Implements a low-precision format through its checked `f64` conversion contract.
+    (@low $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            f64,
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+            |value: $type| value.to_f64(),
+            |value| Ok(<$type>::from_f64(value)?),
+        );
+    };
+
+    // Implements a half-precision format through its native `f32` arithmetic and `f64` error-function path.
+    (@half $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            f32,
+            <$type>::to_f32,
+            |value| Ok(<$type>::from_f32(value)),
+            <$type>::to_f64,
+            |value| Ok(<$type>::from_f64(value)),
+        );
+    };
+
+    // Implements a native floating-point type without changing working precision.
+    (@native $type:ty) => {
+        impl_floating_point_array_element_for_real_floating_point_types!(@impl
+            $type,
+            $type,
+            |value| value,
+            Ok,
+            |value: $type| value as f64,
+            |value| Ok(value as $type),
+        );
+    };
+
+    // Generates the implementations after the element family's conversion functions have been selected.
+    (@impl $type:ty, $work:ty, $decode:expr, $encode:expr, $to_f64:expr, $from_f64:expr $(,)?) => {
+        impl FloatingPointArrayElement for $type {
+            #[inline]
+            fn sin(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sin(($decode)(self)))
+            }
+
+            #[inline]
+            fn cos(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::cos(($decode)(self)))
+            }
+
+            #[inline]
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::atan2(($decode)(self), ($decode)(x)))
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::exp(($decode)(self)))
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ln(($decode)(self)))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::sqrt(($decode)(self)))
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::recip(<$work>::sqrt(($decode)(self))))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::tanh(($decode)(self)))
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::recip(<$work>::exp(-($decode)(self)) + 1.0))
+            }
+
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::powf(($decode)(self), ($decode)(exponent)))
+            }
+        }
+
+        impl RealFloatingPointArrayElement for $type {
+            #[inline]
+            fn erf(self) -> Result<Self, ProgramError> {
+                ($from_f64)(erf_f64(($to_f64)(self)))
+            }
+
+            #[inline]
+            fn log1p(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ln_1p(($decode)(self)))
+            }
+
+            fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
+                // The pinned `select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))` construction. The
+                // difference is NaN exactly when it is undefined (same-sign infinities) or when an operand is NaN,
+                // which is what routes those cases through the saturating sum.
+                let left = ($decode)(self);
+                let right = ($decode)(other);
+                let delta = left - right;
+                ($encode)(if <$work>::is_nan(delta) {
+                    left + right
+                } else {
+                    <$work>::max(left, right) + <$work>::ln_1p(<$work>::exp(-<$work>::abs(delta)))
+                })
+            }
+
+            #[inline]
+            fn floor(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::floor(($decode)(self)))
+            }
+
+            #[inline]
+            fn ceil(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ceil(($decode)(self)))
+            }
+
+            #[inline]
+            fn round(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::round_ties_even(($decode)(self)))
+            }
+        }
+    };
+}
+
+// Implements the analytic continuations shared by complex element types. Sine and cosine use `expm1`-based
+// hyperbolic components so purely imaginary extreme inputs preserve their non-NaN real/imaginary zero component.
+macro_rules! impl_floating_point_array_element_for_complex_floating_point_types {
+    ($component:ty) => {
+        impl FloatingPointArrayElement for Complex<$component> {
+            fn sin(self) -> Result<Self, ProgramError> {
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let imaginary = self.re.cos() * sinh_imaginary;
+                Ok(Complex::new(if self.re == 0.0 { 0.0 } else { self.re.sin() * cosh_imaginary }, imaginary))
+            }
+
+            fn cos(self) -> Result<Self, ProgramError> {
+                let expm1_imaginary = self.im.exp_m1();
+                let expm1_negative_imaginary = (-self.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                Ok(Complex::new(
+                    self.re.cos() * cosh_imaginary,
+                    if self.re == 0.0 { 0.0 } else { -self.re.sin() * sinh_imaginary },
+                ))
+            }
+
+            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + self * self).sqrt();
+                Ok(-imaginary_unit * NumericArrayElement::div(x + imaginary_unit * self, radius)?.ln())
+            }
+
+            #[inline]
+            fn exp(self) -> Result<Self, ProgramError> {
+                Ok(Complex::exp(self))
+            }
+
+            #[inline]
+            fn log(self) -> Result<Self, ProgramError> {
+                Ok(Complex::ln(self))
+            }
+
+            #[inline]
+            fn sqrt(self) -> Result<Self, ProgramError> {
+                Ok(Complex::sqrt(self))
+            }
+
+            #[inline]
+            fn rsqrt(self) -> Result<Self, ProgramError> {
+                Ok(Complex::inv(&Complex::sqrt(self)))
+            }
+
+            #[inline]
+            fn tanh(self) -> Result<Self, ProgramError> {
+                Ok(Complex::tanh(self))
+            }
+
+            #[inline]
+            fn logistic(self) -> Result<Self, ProgramError> {
+                Ok(Complex::inv(&(Complex::exp(-self) + 1.0)))
+            }
+
+            #[inline]
+            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
+                Ok(Complex::powc(self, exponent))
+            }
+        }
+    };
+}
+
 // Implements the interchange contract for the low-precision floating-point element types. Conversions into them go
 // through each format's own checked rounding contract, which is also where an unrepresentable value (such as zero in
 // `f8e8m0fnu`) is rejected, and conversions out of them widen exactly into `f64`.
@@ -1719,6 +2009,8 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
                 Ok(Self::from_f64(self.to_f64() % rhs.to_f64())?)
             }
         }
+
+        impl_floating_point_array_element_for_real_floating_point_types!(@low $type);
     )+};
 }
 
@@ -1739,7 +2031,14 @@ impl_array_element_for_low_precision_floating_point_types!(
 // Implements the interchange contract for the native and half-precision real floating-point element types,
 // whose widening into `f64` (i.e., `$to_real`) is exact for every one of them.
 macro_rules! impl_array_element_for_floating_point_type {
-    ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr, $to_real:expr, $abs:expr $(,)?) => {
+    (
+        $precision:ident,
+        $type:ty, $from_signed:expr,
+        $from_unsigned:expr,
+        $from_real:expr,
+        $to_real:expr,
+        $abs:expr $(,)?
+    ) => {
         impl ArrayElement for $type {
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
@@ -1843,10 +2142,13 @@ macro_rules! impl_array_element_for_floating_point_type {
                 Ok(self % rhs)
             }
         }
+
+        impl_floating_point_array_element_for_real_floating_point_types!(@$precision $type);
     };
 }
 
 impl_array_element_for_floating_point_type!(
+    half,
     bf16,
     |value: i64| bf16::from_f64(value as f64),
     |value: u64| bf16::from_f64(value as f64),
@@ -1856,6 +2158,7 @@ impl_array_element_for_floating_point_type!(
 );
 
 impl_array_element_for_floating_point_type!(
+    half,
     f16,
     |value: i64| f16::from_f64(value as f64),
     |value: u64| f16::from_f64(value as f64),
@@ -1865,6 +2168,7 @@ impl_array_element_for_floating_point_type!(
 );
 
 impl_array_element_for_floating_point_type!(
+    native,
     f32,
     |value: i64| value as f32,
     |value: u64| value as f32,
@@ -1874,6 +2178,7 @@ impl_array_element_for_floating_point_type!(
 );
 
 impl_array_element_for_floating_point_type!(
+    native,
     f64,
     |value: i64| value as f64,
     |value: u64| value as f64,
@@ -2011,10 +2316,167 @@ macro_rules! impl_array_element_for_complex_types {
                 Ok(if norm == 0.0 { self } else { self / norm })
             }
         }
+
+        impl_floating_point_array_element_for_complex_floating_point_types!($component);
     )+};
 }
 
 impl_array_element_for_complex_types!(f32, f64);
+
+/// Computes the Gauss error function `erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt` in double precision. This is the rational
+/// Chebyshev approximation from FDLIBM 5.3 (i.e., `s_erf.c`, developed at SunSoft and also used by musl), split by
+/// argument magnitude: a short odd series below `2⁻²⁸`, a primary rational approximation on `|x| < 0.84375`, a rational
+/// correction around `erf(1)` on `[0.84375, 1.25)`, two rational tail regimes evaluated through the complementary
+/// function `1 − erfc(x)` on `[1.25, 6)`, and saturation to `±1` for `|x| ≥ 6` (where `1 − erf(|x|) < 2⁻⁵⁶` is not
+/// representable next to one). The expected accuracy is about 1 ulp in double precision. NaN inputs propagate and the
+/// sign symmetry `erf(−x) = −erf(x)` is exact, including for signed zeros. All polynomial coefficient arrays below list
+/// the FDLIBM constants from the highest-degree term down to the constant term.
+fn erf_f64(x: f64) -> f64 {
+    /// `erf(1)` rounded toward zero, used as the base value of the `[0.84375, 1.25)` regime.
+    const ERX: f64 = 8.450629115104675e-01;
+
+    /// Coefficient of the short odd series below `2⁻²⁸`, equal to `8 · (2/√π − 1)`.
+    const EFX8: f64 = 1.0270333367641007;
+
+    /// Numerator coefficients of the primary regime `erf(x) = x + x · PP(x²)/QQ(x²)` on `|x| < 0.84375`.
+    const PP: [f64; 5] = [
+        -2.3763016656650163e-05,
+        -0.005770270296489442,
+        -0.02848174957559851,
+        -0.3250421072470015,
+        0.12837916709551256,
+    ];
+
+    /// Denominator coefficients of the primary regime on `|x| < 0.84375`.
+    const QQ: [f64; 6] = [
+        -3.960228278775368e-06,
+        0.00013249473800432164,
+        0.005081306281875766,
+        0.0650222499887673,
+        0.39791722395915535,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the regime `erf(x) = sign(x) · (ERX + PA(|x|−1)/QA(|x|−1))` on `[0.84375, 1.25)`.
+    #[allow(clippy::approx_constant, reason = "the fitted coefficient near 1/π is not the mathematical constant")]
+    const PA: [f64; 7] = [
+        -0.002166375594868791,
+        0.035478304325618236,
+        -0.11089469428239668,
+        0.31834661990116175,
+        -0.3722078760357013,
+        0.41485611868374833,
+        -0.0023621185607526594,
+    ];
+
+    /// Denominator coefficients of the `[0.84375, 1.25)` regime.
+    const QA: [f64; 7] = [
+        0.011984499846799107,
+        0.01363708391202905,
+        0.12617121980876164,
+        0.07182865441419627,
+        0.540397917702171,
+        0.10642088040084423,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the complementary-function tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+    const RA: [f64; 8] = [
+        -9.814329344169145,
+        -81.2874355063066,
+        -184.60509290671104,
+        -162.39666946257347,
+        -62.375332450326006,
+        -10.558626225323291,
+        -0.6938585727071818,
+        -0.009864944034847148,
+    ];
+
+    /// Denominator coefficients of the complementary-function tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+    const SA: [f64; 9] = [
+        -0.0604244152148581,
+        6.570249770319282,
+        108.63500554177944,
+        429.00814002756783,
+        645.3872717332679,
+        434.56587747522923,
+        137.65775414351904,
+        19.651271667439257,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the complementary-function tail on `[1/0.35, 6)`, in the variable `1/x²`.
+    const RB: [f64; 7] = [
+        -483.5191916086514,
+        -1025.0951316110772,
+        -637.5664433683896,
+        -160.63638485582192,
+        -17.757954917754752,
+        -0.799283237680523,
+        -0.0098649429247001,
+    ];
+
+    /// Denominator coefficients of the complementary-function tail on `[1/0.35, 6)`, in the variable `1/x²`.
+    const SB: [f64; 8] = [
+        -22.44095244658582,
+        474.52854120695537,
+        2553.0504064331644,
+        3199.8582195085955,
+        1536.729586084437,
+        325.7925129965739,
+        30.33806074348246,
+        1.0,
+    ];
+
+    /// Evaluates a polynomial at `x` with the provided coefficients ordered from the highest-degree term down to the
+    /// constant term, using Horner's scheme.
+    fn evaluate_polynomial(x: f64, coefficients: &[f64]) -> f64 {
+        coefficients.iter().fold(0.0, |accumulator, coefficient| accumulator * x + coefficient)
+    }
+
+    if x.is_nan() {
+        return x;
+    }
+
+    let negative = x.is_sign_negative();
+    let magnitude = x.abs();
+
+    if magnitude < 0.84375 {
+        if magnitude < 3.725290298461914e-09 {
+            // For |x| < 2⁻²⁸ the series truncates to its leading odd term `x · 2/√π`, evaluated in a
+            // scaled form that avoids intermediate underflow and preserves signed zeros.
+            return 0.125 * (8.0 * x + EFX8 * x);
+        }
+        let squared = x * x;
+        return x + x * (evaluate_polynomial(squared, &PP) / evaluate_polynomial(squared, &QQ));
+    }
+
+    if magnitude < 1.25 {
+        let shifted = magnitude - 1.0;
+        let correction = evaluate_polynomial(shifted, &PA) / evaluate_polynomial(shifted, &QA);
+        return if negative { -ERX - correction } else { ERX + correction };
+    }
+
+    if magnitude >= 6.0 {
+        // Covers |x| ≥ 6 and infinities: 1 − erf(6) < 2⁻⁵⁶ already rounds to zero next to one.
+        return if negative { -1.0 } else { 1.0 };
+    }
+
+    // On [1.25, 6) the error function is evaluated through its complement as `erf(x) = sign(x) · (1 − erfc(|x|))`
+    // with `erfc(y) = exp(−z² − 0.5625) · exp((z − y)(z + y) + R(1/y²)/S(1/y²)) / y`, where `z` is `y` with the low
+    // half of its mantissa cleared so that `z²` is exact and the argument reduction stays accurate.
+    let inverse_squared = 1.0 / (magnitude * magnitude);
+    let quotient = if magnitude < 1.0 / 0.35 {
+        evaluate_polynomial(inverse_squared, &RA) / evaluate_polynomial(inverse_squared, &SA)
+    } else {
+        evaluate_polynomial(inverse_squared, &RB) / evaluate_polynomial(inverse_squared, &SB)
+    };
+    let truncated = f64::from_bits(magnitude.to_bits() & 0xffff_ffff_0000_0000);
+    let complement = (-truncated * truncated - 0.5625).exp()
+        * ((truncated - magnitude) * (truncated + magnitude) + quotient).exp()
+        / magnitude;
+    if negative { complement - 1.0 } else { 1.0 - complement }
+}
 
 /// Encodes `elements`, provided in logical row-major order, into a new physical storage buffer for `r#type`. A missing
 /// [`Layout`](crate::arrays::Layout) means dense row-major storage, while explicit strided and tiled layouts determine
@@ -2251,6 +2713,7 @@ fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> 
 mod tests {
     use std::collections::HashMap;
 
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::types::dimensions::{Dimension, Shape};
@@ -2843,6 +3306,194 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "data type `f4e2m1fn` cannot represent NaN",
         ));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sin() {
+        assert_eq!(FloatingPointArrayElement::sin(0.0f64), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::sin(std::f64::consts::FRAC_PI_2), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::sin(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(FloatingPointArrayElement::sin(f16::ZERO), Ok(f16::ZERO));
+        assert!(FloatingPointArrayElement::sin(f64::INFINITY).unwrap().is_nan());
+        // Purely imaginary inputs retain a zero real component even when the imaginary result overflows.
+        assert_eq!(FloatingPointArrayElement::sin(Complex::new(0.0f64, 1000.0)), Ok(Complex::new(0.0, f64::INFINITY)),);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_cos() {
+        assert_eq!(FloatingPointArrayElement::cos(0.0f32), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::cos(std::f64::consts::PI), Ok(-1.0));
+        assert_eq!(FloatingPointArrayElement::cos(bf16::ZERO), Ok(bf16::ONE));
+        assert_eq!(FloatingPointArrayElement::cos(f4e2m1fn::zero().unwrap()), f4e2m1fn::one());
+        assert!(FloatingPointArrayElement::cos(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::cos(Complex::new(0.0f32, 1000.0)), Ok(Complex::new(f32::INFINITY, 0.0)),);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_atan2() {
+        assert_eq!(FloatingPointArrayElement::atan2(1.0f64, 0.0), Ok(std::f64::consts::FRAC_PI_2));
+        assert_abs_diff_eq!(
+            FloatingPointArrayElement::atan2(-0.0f32, -1.0).unwrap(),
+            -std::f32::consts::PI,
+            epsilon = f32::EPSILON * 2.0,
+        );
+        assert!(FloatingPointArrayElement::atan2(f64::NAN, 1.0).unwrap().is_nan());
+        let result = FloatingPointArrayElement::atan2(Complex::new(1.0f64, 0.0), Complex::new(0.0, 0.0)).unwrap();
+        assert_eq!(result.re, std::f64::consts::FRAC_PI_2);
+        assert_eq!(result.im, 0.0);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_exp() {
+        assert_eq!(FloatingPointArrayElement::exp(0.0f64), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::exp(f16::ZERO), Ok(f16::ONE));
+        assert_eq!(FloatingPointArrayElement::exp(f4e2m1fn::one().unwrap()).unwrap().to_bits(), 0x5);
+        assert_eq!(FloatingPointArrayElement::exp(f32::NEG_INFINITY), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::exp(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(FloatingPointArrayElement::exp(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::exp(Complex::new(0.0f32, 0.0)), Ok(Complex::new(1.0, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_log() {
+        assert_eq!(FloatingPointArrayElement::log(1.0f32), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::log(0.0f64), Ok(f64::NEG_INFINITY));
+        assert!(FloatingPointArrayElement::log(-1.0f64).unwrap().is_nan());
+        assert_eq!(
+            FloatingPointArrayElement::log(Complex::new(-1.0f64, 0.0)),
+            Ok(Complex::new(0.0, std::f64::consts::PI)),
+        );
+        // Exponent-only formats cannot encode the logarithm of one.
+        assert!(matches!(
+            FloatingPointArrayElement::log(f8e8m0fnu::one().unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_sqrt() {
+        assert_eq!(FloatingPointArrayElement::sqrt(4.0f64), Ok(2.0));
+        assert_eq!(FloatingPointArrayElement::sqrt(f16::from_f32(4.0)), Ok(f16::from_f32(2.0)));
+        assert_eq!(FloatingPointArrayElement::sqrt(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert!(FloatingPointArrayElement::sqrt(-1.0f64).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::sqrt(Complex::new(-4.0f32, 0.0)), Ok(Complex::new(0.0, 2.0)));
+        assert!(matches!(
+            FloatingPointArrayElement::sqrt(f4e2m1fn::from_f64(-1.0).unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_rsqrt() {
+        assert_eq!(FloatingPointArrayElement::rsqrt(4.0f32), Ok(0.5));
+        assert_eq!(FloatingPointArrayElement::rsqrt(0.0f64), Ok(f64::INFINITY));
+        assert_eq!(FloatingPointArrayElement::rsqrt(-0.0f64), Ok(f64::NEG_INFINITY));
+        assert_eq!(FloatingPointArrayElement::rsqrt(f64::INFINITY), Ok(0.0));
+        assert!(FloatingPointArrayElement::rsqrt(-1.0f32).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::rsqrt(Complex::new(-4.0f64, 0.0)), Ok(Complex::new(0.0, -0.5)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_tanh() {
+        assert_eq!(FloatingPointArrayElement::tanh(0.0f32), Ok(0.0));
+        assert_eq!(FloatingPointArrayElement::tanh(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(FloatingPointArrayElement::tanh(f64::INFINITY), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::tanh(f32::NEG_INFINITY), Ok(-1.0));
+        assert!(FloatingPointArrayElement::tanh(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(0.0f32, 0.0)), Ok(Complex::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_logistic() {
+        assert_eq!(FloatingPointArrayElement::logistic(0.0f64), Ok(0.5));
+        assert_eq!(FloatingPointArrayElement::logistic(bf16::ZERO), Ok(bf16::from_f32(0.5)));
+        assert_eq!(FloatingPointArrayElement::logistic(f32::INFINITY), Ok(1.0));
+        assert_eq!(FloatingPointArrayElement::logistic(f64::NEG_INFINITY), Ok(0.0));
+        assert!(FloatingPointArrayElement::logistic(f64::NAN).unwrap().is_nan());
+        assert_eq!(FloatingPointArrayElement::logistic(Complex::new(0.0f64, 0.0)), Ok(Complex::new(0.5, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_pow() {
+        assert_eq!(FloatingPointArrayElement::pow(2.0f64, 3.0), Ok(8.0));
+        assert_eq!(FloatingPointArrayElement::pow(-2.0f32, 3.0), Ok(-8.0));
+        assert_eq!(FloatingPointArrayElement::pow(0.0f64, -1.0), Ok(f64::INFINITY));
+        assert!(FloatingPointArrayElement::pow(-1.0f64, 0.5).unwrap().is_nan());
+        let result = FloatingPointArrayElement::pow(Complex::new(-1.0f64, 0.0), Complex::new(0.5, 0.0)).unwrap();
+        assert_abs_diff_eq!(result.re, 0.0, epsilon = 1e-15);
+        assert_eq!(result.im, 1.0);
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_erf() {
+        assert_eq!(RealFloatingPointArrayElement::erf(0.0f64), Ok(0.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!((RealFloatingPointArrayElement::erf(0.5f64).unwrap() - 0.5204998778130465).abs() < 1e-15);
+        assert!((RealFloatingPointArrayElement::erf(2.0f64).unwrap() - 0.9953222650189527).abs() < 1e-15);
+        assert!((RealFloatingPointArrayElement::erf(1.0f64).unwrap() - 0.8427007929497149).abs() < 1e-15);
+        assert_abs_diff_eq!(RealFloatingPointArrayElement::erf(-1.0f32).unwrap(), -0.8427008, epsilon = 1e-7);
+        assert_eq!(RealFloatingPointArrayElement::erf(f64::INFINITY), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(f64::NEG_INFINITY), Ok(-1.0));
+        assert!(RealFloatingPointArrayElement::erf(f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_log1p() {
+        // Small arguments retain information that forming 1 + x would lose.
+        assert_eq!(RealFloatingPointArrayElement::log1p(1e-20f64), Ok(1e-20));
+        assert_eq!(RealFloatingPointArrayElement::log1p(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::log1p(-1.0f64), Ok(f64::NEG_INFINITY));
+        assert!(RealFloatingPointArrayElement::log1p(-2.0f64).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::log1p(f64::INFINITY), Ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_log_add_exp() {
+        assert_eq!(RealFloatingPointArrayElement::log_add_exp(0.0f64, 0.0), Ok(std::f64::consts::LN_2));
+        assert_eq!(RealFloatingPointArrayElement::log_add_exp(1000.0f64, -1000.0), Ok(1000.0));
+        assert_eq!(RealFloatingPointArrayElement::log_add_exp(f64::INFINITY, f64::INFINITY), Ok(f64::INFINITY));
+        assert_eq!(
+            RealFloatingPointArrayElement::log_add_exp(f64::NEG_INFINITY, f64::NEG_INFINITY),
+            Ok(f64::NEG_INFINITY),
+        );
+        assert_eq!(RealFloatingPointArrayElement::log_add_exp(f32::NEG_INFINITY, 2.0), Ok(2.0));
+        assert!(RealFloatingPointArrayElement::log_add_exp(f64::NAN, 1.0).unwrap().is_nan());
+        assert!(RealFloatingPointArrayElement::log_add_exp(1.0f64, f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_floor() {
+        assert_eq!(RealFloatingPointArrayElement::floor(1.5f64), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::floor(-1.5f32), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::floor(f16::from_f32(-1.5)), Ok(f16::from_f32(-2.0)));
+        assert_eq!(RealFloatingPointArrayElement::floor(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::floor(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(RealFloatingPointArrayElement::floor(f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_ceil() {
+        assert_eq!(RealFloatingPointArrayElement::ceil(1.5f32), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::ceil(-1.5f64), Ok(-1.0));
+        assert_eq!(RealFloatingPointArrayElement::ceil(bf16::from_f32(1.5)), Ok(bf16::from_f32(2.0)));
+        assert_eq!(RealFloatingPointArrayElement::ceil(-0.5f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::ceil(f64::NEG_INFINITY), Ok(f64::NEG_INFINITY));
+        assert!(RealFloatingPointArrayElement::ceil(f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_real_floating_point_array_element_round() {
+        // Ties choose the even integer in both directions, retaining negative zero.
+        assert_eq!(RealFloatingPointArrayElement::round(1.5f64), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(2.5f32), Ok(2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-1.5f64), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-2.5f32), Ok(-2.0));
+        assert_eq!(RealFloatingPointArrayElement::round(-0.5f64).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::round(f4e2m1fn::from_f64(1.5).unwrap()).unwrap().to_bits(), 0x4);
+        assert_eq!(RealFloatingPointArrayElement::round(f64::INFINITY), Ok(f64::INFINITY));
+        assert!(RealFloatingPointArrayElement::round(f64::NAN).unwrap().is_nan());
     }
 
     #[test]

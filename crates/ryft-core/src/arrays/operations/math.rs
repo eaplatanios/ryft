@@ -1,10 +1,8 @@
 //! Reference [`Array`] kernels for the mathematics operation family contracts.
 //!
-//! This module owns the element-level arithmetic contracts of the reference backend — the per-element analogues of
-//! the value-level capabilities, together with their per-data-type instantiations — and the kernels built on them.
-//! Each kernel decodes its operands through their physical addressing and materializes one owned result. Element data
-//! type promotion and NumPy-style broadcasting follow the corresponding operations' type-inference rules, so the
-//! eager results match what a staged program computes.
+//! Kernels use the scalar arithmetic contracts in [`crate::arrays::encoding`], decode operands through their
+//! physical addressing, and materialize owned results. Element data type promotion and broadcasting follow the
+//! corresponding operations' type-inference rules. Reduction-specific accumulation remains local to this module.
 
 use std::sync::Arc;
 
@@ -14,8 +12,9 @@ use num_complex::Complex;
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::encoding::{
-    ArrayElement, NumericArrayElement, RealArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz,
-    f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    ArrayElement, FloatingPointArrayElement, NumericArrayElement, RealArrayElement, RealFloatingPointArrayElement,
+    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
+    i1, i2, i4, u1, u2, u4,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::collectives::decode_nonnegative_integer_metadata;
@@ -23,7 +22,6 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::macros::impl_array_elementwise_operation;
-use crate::operations::math::erf::erf_f64;
 use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_sum_exp_data_type};
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
@@ -35,65 +33,6 @@ use crate::operations::{
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
-
-// These contracts operate on decoded storage elements, keeping integer wrapping and low-precision re-encoding in
-// one place per element family. They complement the value-level capabilities with the scalar arithmetic needed by
-// elementwise kernels and reductions; basic arithmetic is provided by NumericArrayElement and RealArrayElement,
-// while extrema and identities are provided by ArrayElement.
-
-/// Floating-point math operations shared by real floating-point and complex array elements.
-trait ElementFloatMath: NumericArrayElement {
-    /// Computes the sine of this element.
-    fn sin(self) -> Result<Self, ProgramError>;
-
-    /// Computes the cosine of this element.
-    fn cos(self) -> Result<Self, ProgramError>;
-
-    /// Computes `atan2(self, x)`.
-    fn atan2(self, x: Self) -> Result<Self, ProgramError>;
-
-    /// Computes the natural exponential of this element.
-    fn exp(self) -> Result<Self, ProgramError>;
-
-    /// Computes the natural logarithm of this element.
-    fn log(self) -> Result<Self, ProgramError>;
-
-    /// Computes the principal square root of this element.
-    fn sqrt(self) -> Result<Self, ProgramError>;
-
-    /// Computes the reciprocal of the principal square root of this element.
-    fn rsqrt(self) -> Result<Self, ProgramError>;
-
-    /// Computes the hyperbolic tangent of this element.
-    fn tanh(self) -> Result<Self, ProgramError>;
-
-    /// Computes `1 / (1 + exp(-self))`.
-    fn logistic(self) -> Result<Self, ProgramError>;
-
-    /// Raises this element to `exponent`.
-    fn pow(self, exponent: Self) -> Result<Self, ProgramError>;
-}
-
-/// Operations supported only by real floating-point array elements.
-pub(crate) trait ElementRealFloatMath: RealArrayElement {
-    /// Computes the Gauss error function of this element.
-    fn erf(self) -> Result<Self, ProgramError>;
-
-    /// Computes `log(1 + self)` without forming `1 + self`.
-    fn log1p(self) -> Result<Self, ProgramError>;
-
-    /// Computes `log(exp(self) + exp(other))` without forming either exponential.
-    fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
-
-    /// Rounds this element toward negative infinity.
-    fn floor(self) -> Result<Self, ProgramError>;
-
-    /// Rounds this element toward positive infinity.
-    fn ceil(self) -> Result<Self, ProgramError>;
-
-    /// Rounds this element to the nearest integer, resolving ties toward the nearest even integer.
-    fn round(self) -> Result<Self, ProgramError>;
-}
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
@@ -269,241 +208,6 @@ macro_rules! impl_array_arithmetic_for_complex {
 impl_array_arithmetic_for_complex!(f32);
 impl_array_arithmetic_for_complex!(f64);
 
-// Implements the real floating-point math families through the working precision and exact re-encoding contract of
-// each element family. Half precision uses `f32`, native primitive types use themselves, and low-precision formats
-// use `f64`, matching the scalar reference semantics.
-macro_rules! impl_array_math_for_real_float {
-    // Implements a low-precision format through its checked `f64` conversion contract.
-    (@low $type:ty) => {
-        impl_array_math_for_real_float!(@impl
-            $type,
-            f64,
-            |value: $type| value.to_f64(),
-            |value| Ok(<$type>::from_f64(value)?),
-            |value: $type| value.to_f64(),
-            |value| Ok(<$type>::from_f64(value)?),
-        );
-    };
-
-    // Implements a half-precision format through its native `f32` arithmetic and `f64` error-function path.
-    (@half $type:ty) => {
-        impl_array_math_for_real_float!(@impl
-            $type,
-            f32,
-            <$type>::to_f32,
-            |value| Ok(<$type>::from_f32(value)),
-            <$type>::to_f64,
-            |value| Ok(<$type>::from_f64(value)),
-        );
-    };
-
-    // Implements a native floating-point type without changing working precision.
-    (@native $type:ty) => {
-        impl_array_math_for_real_float!(@impl
-            $type,
-            $type,
-            |value| value,
-            Ok,
-            |value: $type| value as f64,
-            |value| Ok(value as $type),
-        );
-    };
-
-    // Generates the implementations after the element family's conversion functions have been selected.
-    (@impl $type:ty, $work:ty, $decode:expr, $encode:expr, $to_f64:expr, $from_f64:expr $(,)?) => {
-        impl ElementFloatMath for $type {
-            #[inline]
-            fn sin(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::sin(($decode)(self)))
-            }
-
-            #[inline]
-            fn cos(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::cos(($decode)(self)))
-            }
-
-            #[inline]
-            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::atan2(($decode)(self), ($decode)(x)))
-            }
-
-            #[inline]
-            fn exp(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::exp(($decode)(self)))
-            }
-
-            #[inline]
-            fn log(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::ln(($decode)(self)))
-            }
-
-            #[inline]
-            fn sqrt(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::sqrt(($decode)(self)))
-            }
-
-            #[inline]
-            fn rsqrt(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::recip(<$work>::sqrt(($decode)(self))))
-            }
-
-            #[inline]
-            fn tanh(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::tanh(($decode)(self)))
-            }
-
-            #[inline]
-            fn logistic(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::recip(<$work>::exp(-($decode)(self)) + 1.0))
-            }
-
-            #[inline]
-            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::powf(($decode)(self), ($decode)(exponent)))
-            }
-        }
-
-        impl ElementRealFloatMath for $type {
-            #[inline]
-            fn erf(self) -> Result<Self, ProgramError> {
-                ($from_f64)(erf_f64(($to_f64)(self)))
-            }
-
-            #[inline]
-            fn log1p(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::ln_1p(($decode)(self)))
-            }
-
-            fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
-                // The pinned `select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))` construction. The
-                // difference is NaN exactly when it is undefined (same-sign infinities) or when an operand is NaN,
-                // which is what routes those cases through the saturating sum.
-                let left = ($decode)(self);
-                let right = ($decode)(other);
-                let delta = left - right;
-                ($encode)(if <$work>::is_nan(delta) {
-                    left + right
-                } else {
-                    <$work>::max(left, right) + <$work>::ln_1p(<$work>::exp(-<$work>::abs(delta)))
-                })
-            }
-
-            #[inline]
-            fn floor(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::floor(($decode)(self)))
-            }
-
-            #[inline]
-            fn ceil(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::ceil(($decode)(self)))
-            }
-
-            #[inline]
-            fn round(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::round_ties_even(($decode)(self)))
-            }
-        }
-
-   };
-}
-
-// Instantiates real math for low-precision formats through their checked f64 conversion contracts.
-macro_rules! impl_array_math_for_low_precision_float {
-    ($($type:ty),+ $(,)?) => {$(
-        impl_array_math_for_real_float!(@low $type);
-    )+};
-}
-
-impl_array_math_for_low_precision_float!(
-    f4e2m1fn,
-    f6e2m3fn,
-    f6e3m2fn,
-    f8e3m4,
-    f8e4m3,
-    f8e4m3fn,
-    f8e4m3fnuz,
-    f8e4m3b11fnuz,
-    f8e5m2,
-    f8e5m2fnuz,
-    f8e8m0fnu,
-);
-impl_array_math_for_real_float!(@half bf16);
-impl_array_math_for_real_float!(@half f16);
-impl_array_math_for_real_float!(@native f32);
-impl_array_math_for_real_float!(@native f64);
-
-// Implements the analytic continuations shared by complex element types. Sine and cosine use `expm1`-based
-// hyperbolic components so purely imaginary extreme inputs preserve their non-NaN real/imaginary zero component.
-macro_rules! impl_array_math_for_complex {
-    ($component:ty) => {
-        impl ElementFloatMath for Complex<$component> {
-            fn sin(self) -> Result<Self, ProgramError> {
-                let expm1_imaginary = self.im.exp_m1();
-                let expm1_negative_imaginary = (-self.im).exp_m1();
-                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
-                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
-                let imaginary = self.re.cos() * sinh_imaginary;
-                Ok(Complex::new(if self.re == 0.0 { 0.0 } else { self.re.sin() * cosh_imaginary }, imaginary))
-            }
-
-            fn cos(self) -> Result<Self, ProgramError> {
-                let expm1_imaginary = self.im.exp_m1();
-                let expm1_negative_imaginary = (-self.im).exp_m1();
-                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
-                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
-                Ok(Complex::new(
-                    self.re.cos() * cosh_imaginary,
-                    if self.re == 0.0 { 0.0 } else { -self.re.sin() * sinh_imaginary },
-                ))
-            }
-
-            fn atan2(self, x: Self) -> Result<Self, ProgramError> {
-                let imaginary_unit = Complex::new(0.0, 1.0);
-                let radius = (x * x + self * self).sqrt();
-                Ok(-imaginary_unit * NumericArrayElement::div(x + imaginary_unit * self, radius)?.ln())
-            }
-
-            #[inline]
-            fn exp(self) -> Result<Self, ProgramError> {
-                Ok(Complex::exp(self))
-            }
-
-            #[inline]
-            fn log(self) -> Result<Self, ProgramError> {
-                Ok(Complex::ln(self))
-            }
-
-            #[inline]
-            fn sqrt(self) -> Result<Self, ProgramError> {
-                Ok(Complex::sqrt(self))
-            }
-
-            #[inline]
-            fn rsqrt(self) -> Result<Self, ProgramError> {
-                Ok(Complex::inv(&Complex::sqrt(self)))
-            }
-
-            #[inline]
-            fn tanh(self) -> Result<Self, ProgramError> {
-                Ok(Complex::tanh(self))
-            }
-
-            #[inline]
-            fn logistic(self) -> Result<Self, ProgramError> {
-                Ok(Complex::inv(&(Complex::exp(-self) + 1.0)))
-            }
-
-            #[inline]
-            fn pow(self, exponent: Self) -> Result<Self, ProgramError> {
-                Ok(Complex::powc(self, exponent))
-            }
-        }
-    };
-}
-
-impl_array_math_for_complex!(f32);
-impl_array_math_for_complex!(f64);
-
 impl Array {
     /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
     /// and uniquely owned output buffers are mutated without another payload allocation.
@@ -568,7 +272,7 @@ impl Array {
     /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
     /// not finite, and then `log(sum(exp(x - safe_maximum))) + safe_maximum`. Every intermediate is held in the
     /// element's own encoding, so the result matches what the equivalent staged program computes.
-    fn log_sum_exp_elements<T: ElementFloatMath>(
+    fn log_sum_exp_elements<T: FloatingPointArrayElement>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1088,7 +792,7 @@ impl_array_elementwise_operation!(
     operation = "sin",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::sin(input),
+    |input| FloatingPointArrayElement::sin(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1097,7 +801,7 @@ impl_array_elementwise_operation!(
     operation = "cos",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::cos(input),
+    |input| FloatingPointArrayElement::cos(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1106,7 +810,7 @@ impl_array_elementwise_operation!(
     operation = "atan2",
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ElementFloatMath::atan2(lhs, rhs),
+    |lhs, rhs| FloatingPointArrayElement::atan2(lhs, rhs),
 );
 
 impl_array_elementwise_operation!(
@@ -1115,7 +819,7 @@ impl_array_elementwise_operation!(
     operation = "exp",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::exp(input),
+    |input| FloatingPointArrayElement::exp(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1124,7 +828,7 @@ impl_array_elementwise_operation!(
     operation = "log",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::log(input),
+    |input| FloatingPointArrayElement::log(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1133,7 +837,7 @@ impl_array_elementwise_operation!(
     operation = "log1p",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| ElementRealFloatMath::log1p(input),
+    |input| RealFloatingPointArrayElement::log1p(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1142,7 +846,7 @@ impl_array_elementwise_operation!(
     operation = "log_add_exp",
     inputs = @float @real,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ElementRealFloatMath::log_add_exp(lhs, rhs),
+    |lhs, rhs| RealFloatingPointArrayElement::log_add_exp(lhs, rhs),
 );
 
 impl_array_elementwise_operation!(
@@ -1151,7 +855,7 @@ impl_array_elementwise_operation!(
     operation = "sqrt",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::sqrt(input),
+    |input| FloatingPointArrayElement::sqrt(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1160,7 +864,7 @@ impl_array_elementwise_operation!(
     operation = "rsqrt",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::rsqrt(input),
+    |input| FloatingPointArrayElement::rsqrt(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1169,7 +873,7 @@ impl_array_elementwise_operation!(
     operation = "tanh",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::tanh(input),
+    |input| FloatingPointArrayElement::tanh(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1178,7 +882,7 @@ impl_array_elementwise_operation!(
     operation = "logistic",
     inputs = @float,
     checks = [@no_unreduced],
-    |input| ElementFloatMath::logistic(input),
+    |input| FloatingPointArrayElement::logistic(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1187,7 +891,7 @@ impl_array_elementwise_operation!(
     operation = "erf",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| ElementRealFloatMath::erf(input),
+    |input| RealFloatingPointArrayElement::erf(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1196,7 +900,7 @@ impl_array_elementwise_operation!(
     operation = "pow",
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ElementFloatMath::pow(lhs, rhs),
+    |lhs, rhs| FloatingPointArrayElement::pow(lhs, rhs),
 );
 
 impl Sign for Array {
@@ -1244,7 +948,7 @@ impl_array_elementwise_operation!(
     operation = "floor",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| ElementRealFloatMath::floor(input),
+    |input| RealFloatingPointArrayElement::floor(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1253,7 +957,7 @@ impl_array_elementwise_operation!(
     operation = "ceil",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| ElementRealFloatMath::ceil(input),
+    |input| RealFloatingPointArrayElement::ceil(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1262,7 +966,7 @@ impl_array_elementwise_operation!(
     operation = "round",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| ElementRealFloatMath::round(input),
+    |input| RealFloatingPointArrayElement::round(input),
 );
 
 impl_array_elementwise_operation!(
@@ -1392,7 +1096,6 @@ mod tests {
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::operations::complex::Complex;
-    use crate::operations::math::erf::erf_f64;
     use crate::programs::Typed;
 
     use super::*;
@@ -1579,7 +1282,7 @@ mod tests {
         assert_eq!(Array::vector(vec![1.0f64, 4.0]).rsqrt().unwrap(), Array::vector(vec![1.0, 0.5]));
         assert_abs_diff_eq!(
             Array::vector(vec![-1.0f64, 0.0, 1.0]).erf().unwrap(),
-            Array::vector(vec![erf_f64(-1.0), 0.0, erf_f64(1.0)]),
+            Array::vector(vec![-0.8427007929497149, 0.0, 0.8427007929497149]),
             epsilon = 1e-12,
         );
 

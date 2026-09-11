@@ -8,9 +8,8 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::{ArrayElement, NumericArrayElement};
+use crate::arrays::encoding::{ArrayElement, NumericArrayElement, RealFloatingPointArrayElement};
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::math::ElementRealFloatMath;
 use crate::arrays::types::data::DataType;
 use crate::operations::cumulative::cumulative_log_sum_exp::cumulative_log_sum_exp_abstract;
 use crate::operations::cumulative::cumulative_max::cumulative_max_abstract;
@@ -100,7 +99,7 @@ impl Array {
                 &shape,
                 axis,
                 reverse,
-                <Element as ElementRealFloatMath>::log_add_exp,
+                <Element as RealFloatingPointArrayElement>::log_add_exp,
             )?;
             Self::from_elements(output_type, scanned.as_slice())
         })

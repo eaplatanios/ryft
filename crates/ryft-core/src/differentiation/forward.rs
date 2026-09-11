@@ -1,4 +1,5 @@
-use Rc;
+use std::rc::Rc;
+
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
