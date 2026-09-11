@@ -212,9 +212,9 @@ impl Array {
     ///
     /// # Parameters
     ///
-    ///   - `output_type`: static array type of the result. Its [`DataType`] must be represented by `Output` and its
+    ///   - `output_type`: Static array type of the result. Its [`DataType`] must be represented by `Output` and its
     ///     logical element count must equal this array's (elementwise kernels typically preserve the shape).
-    ///   - `function`: elementwise function applied to each decoded `Input` element.
+    ///   - `function`: Elementwise function applied to each decoded `Input` element.
     ///
     /// # Errors
     ///
@@ -258,6 +258,82 @@ impl Array {
             let input = Input::decode(&self.bytes[input_addressing.byte_range_for_flat_index(element)]);
             let output = function(input)?;
             output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(element)]);
+        }
+        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+    }
+
+    /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
+    /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
+    /// Both inputs must already have `Input`'s element type as this function does not promote or convert inputs.
+    /// The output must have `Output`'s element type and the fully static broadcast shape of the inputs. Invalid
+    /// element types, shapes, or layouts return an error. Empty outputs do not invoke `function`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `rhs`: Right input, whose shape must broadcast with this array's shape.
+    ///   - `output_type`: Result type, including its element type, broadcast shape, and storage layout.
+    ///     Operation-specific sharding and reduction metadata constraints must be checked by the caller.
+    ///   - `function`: Function applied to each decoded pair of `Input` elements.
+    pub fn map_element_pairs<Input: ArrayElement, Output: ArrayElement>(
+        &self,
+        rhs: &Self,
+        output_type: ArrayType,
+        function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
+            return Err(TypeError::invalid(format!(
+                "binary element inputs must both have data type {}, got {} and {}",
+                Input::data_type(),
+                self.r#type.data_type(),
+                rhs.r#type.data_type(),
+            ))
+            .into());
+        }
+
+        if output_type.data_type() != Output::data_type() {
+            return Err(TypeError::invalid(format!(
+                "binary element output must have data type {}, got {}",
+                Output::data_type(),
+                output_type.data_type(),
+            ))
+            .into());
+        }
+
+        Self::materialized_element_count(&output_type)?;
+
+        let broadcast_shape = self
+            .r#type
+            .shape()
+            .broadcast(rhs.r#type.shape())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        if output_type.shape() != &broadcast_shape {
+            return Err(TypeError::invalid(format!(
+                "binary element output shape must be {}, got {}",
+                broadcast_shape,
+                output_type.shape(),
+            ))
+            .into());
+        }
+
+        let output_shape = output_type.static_shape().unwrap();
+        let lhs_shape = self.r#type.static_shape().unwrap();
+        let rhs_shape = rhs.r#type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let lhs_strides = lhs_shape.row_major_strides();
+        let rhs_strides = rhs_shape.row_major_strides();
+        let lhs_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let rhs_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
+        for output_index in 0..output_addressing.element_count() {
+            let lhs_index =
+                Self::broadcast_index(output_index, &output_shape, &output_strides, &lhs_shape, &lhs_strides);
+            let rhs_index =
+                Self::broadcast_index(output_index, &output_shape, &output_strides, &rhs_shape, &rhs_strides);
+            let left = Input::decode(&self.bytes[lhs_addressing.byte_range_for_flat_index(lhs_index)]);
+            let right = Input::decode(&rhs.bytes[rhs_addressing.byte_range_for_flat_index(rhs_index)]);
+            let output = function(left, right)?;
+            output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(output_index)]);
         }
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
@@ -443,82 +519,6 @@ impl Array {
         r#type.element_count().map_err(|error| TypeError::invalid(error.to_string()))?.ok_or_else(|| {
             TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
         })
-    }
-
-    /// Applies a typed binary element function with NumPy-style broadcasting directly over addressed storage. Inputs
-    /// and outputs use their sealed codecs one element at a time, so the only payload allocation is the result buffer.
-    /// Both operands must already have `Input`'s element type as this function does not promote or convert operands.
-    /// The output must have `Output`'s element type and the fully static broadcast shape of the operands. Invalid
-    /// element types, shapes, or layouts return an error. Empty outputs do not invoke `function`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `rhs`: Right operand, whose shape must broadcast with this array's shape.
-    ///   - `output_type`: Result type, including its element type, broadcast shape, and storage layout.
-    ///     Operation-specific sharding and reduction metadata constraints must be checked by the caller.
-    ///   - `function`: Scalar calculation over decoded operands. Its errors are propagated unchanged.
-    pub fn map_element_pairs<Input: ArrayElement, Output: ArrayElement>(
-        &self,
-        rhs: &Self,
-        output_type: ArrayType,
-        function: impl Fn(Input, Input) -> Result<Output, ProgramError>,
-    ) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() != Input::data_type() || rhs.r#type.data_type() != Input::data_type() {
-            return Err(TypeError::invalid(format!(
-                "binary element inputs must both have data type {}, got {} and {}",
-                Input::data_type(),
-                self.r#type.data_type(),
-                rhs.r#type.data_type(),
-            ))
-            .into());
-        }
-
-        if output_type.data_type() != Output::data_type() {
-            return Err(TypeError::invalid(format!(
-                "binary element output must have data type {}, got {}",
-                Output::data_type(),
-                output_type.data_type(),
-            ))
-            .into());
-        }
-
-        Self::materialized_element_count(&output_type)?;
-
-        let broadcast_shape = self
-            .r#type
-            .shape()
-            .broadcast(rhs.r#type.shape())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if output_type.shape() != &broadcast_shape {
-            return Err(TypeError::invalid(format!(
-                "binary element output shape must be {}, got {}",
-                broadcast_shape,
-                output_type.shape(),
-            ))
-            .into());
-        }
-
-        let output_shape = output_type.static_shape().unwrap();
-        let left_shape = self.r#type.static_shape().unwrap();
-        let right_shape = rhs.r#type.static_shape().unwrap();
-        let output_strides = output_shape.row_major_strides();
-        let left_strides = left_shape.row_major_strides();
-        let right_strides = right_shape.row_major_strides();
-        let left_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let right_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
-        for output_index in 0..output_addressing.element_count() {
-            let left_index =
-                Self::broadcast_index(output_index, &output_shape, &output_strides, &left_shape, &left_strides);
-            let right_index =
-                Self::broadcast_index(output_index, &output_shape, &output_strides, &right_shape, &right_strides);
-            let left = Input::decode(&self.bytes[left_addressing.byte_range_for_flat_index(left_index)]);
-            let right = Input::decode(&rhs.bytes[right_addressing.byte_range_for_flat_index(right_index)]);
-            let output = function(left, right)?;
-            output.encode(&mut output_bytes[output_addressing.byte_range_for_flat_index(output_index)]);
-        }
-        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
     /// Compares two arrays of the same type elementwise using their typed value semantics rather than their physical
@@ -1129,33 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_f64s() {
-        assert_eq!(Array::vector(vec![1.5, 2.5]).to_f64s(), vec![1.5, 2.5]);
-        assert_eq!(Array::vector(vec![true, false]).to_f64s(), vec![1.0, 0.0]);
-        assert_eq!(Array::vector(vec![1i32, -2]).to_f64s(), vec![1.0, -2.0]);
-        assert_eq!(
-            Array::from_elements(
-                ArrayType::new_static(DataType::I4, [2]),
-                &[i4::new(-8).unwrap(), i4::new(7).unwrap()],
-            )
-            .unwrap()
-            .to_f64s(),
-            vec![-8.0, 7.0],
-        );
-        // Low-precision floating-point elements decode to the exact values they denote.
-        assert_eq!(Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![1.5]).to_f64s(), vec![1.5]);
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot view an array of complex element data type c128 as f64 values")]
-    fn test_array_to_f64s_rejects_complex_arrays() {
-        let real = Array::vector(vec![1.0, 2.0]);
-        let imaginary = Array::vector(vec![3.0, 4.0]);
-        let _ = real.complex(&imaginary).unwrap().to_f64s();
-    }
-
-    #[test]
-    fn test_array_element_combinators() {
+    fn test_array_map_elements() {
         // `map_elements` applies a typed elementwise function, allowing input and output element types to differ.
         let integers = Array::vector(vec![1i32, -2, 3]);
         let doubled = integers.map_elements::<i32, i32>(integers.r#type().into_owned(), |value| Ok(value * 2)).unwrap();
@@ -1173,41 +1147,6 @@ mod tests {
             integers.map_elements::<i32, i32>(ArrayType::new_static(DataType::I32, [2]), Ok),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot map 3 logical elements onto array type i32[2] with 2 logical elements",
-        ));
-
-        // `from_fn_elements` constructs an array from its flat logical row-major element indices.
-        let iota =
-            Array::from_fn_elements(ArrayType::new_static(DataType::U16, [2, 2]), |index| Ok(index as u16)).unwrap();
-        assert_eq!(iota.elements::<u16>(), Ok(vec![0, 1, 2, 3]));
-        assert!(matches!(
-            Array::from_fn_elements(ArrayType::new_static(DataType::U16, [1]), |_| Ok(0u32)),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot store u32 values in an array of element data type u16",
-        ));
-
-        // `gather_elements` copies whole element encodings through a flat index mapping without decoding them, so it
-        // serves reversal, repetition, and selection over any element data type, including sub-byte ones.
-        let reversed =
-            integers.gather_elements(integers.r#type().into_owned(), |output_index| 2 - output_index).unwrap();
-        assert_eq!(reversed.elements::<i32>(), Ok(vec![3, -2, 1]));
-        let repeated = integers.gather_elements(ArrayType::new_static(DataType::I32, [4]), |_| 1).unwrap();
-        assert_eq!(repeated.elements::<i32>(), Ok(vec![-2, -2, -2, -2]));
-        let narrow = Array::from_elements(
-            ArrayType::new_static(DataType::I4, [2]),
-            &[i4::new(-8).unwrap(), i4::new(7).unwrap()],
-        )
-        .unwrap();
-        let swapped = narrow.gather_elements(narrow.r#type().into_owned(), |output_index| 1 - output_index).unwrap();
-        assert_eq!(swapped.storage_bytes(), [0x07, 0x08]);
-        assert!(matches!(
-            integers.gather_elements(ArrayType::new_static(DataType::I64, [3]), |output_index| output_index),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot gather elements of data type i32 into an array of element data type i64",
-        ));
-        assert!(matches!(
-            integers.gather_elements(ArrayType::new_static(DataType::I32, [3]), |_| 3),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "gather index 3 is out of bounds for 3 elements",
         ));
     }
 
@@ -1253,6 +1192,74 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "binary element output shape must be [2, 3], got [3, 2]",
         ));
+    }
+
+    #[test]
+    fn test_array_from_fn_elements() {
+        // `from_fn_elements` constructs an array from its flat logical row-major element indices.
+        let iota =
+            Array::from_fn_elements(ArrayType::new_static(DataType::U16, [2, 2]), |index| Ok(index as u16)).unwrap();
+        assert_eq!(iota.elements::<u16>(), Ok(vec![0, 1, 2, 3]));
+        assert!(matches!(
+            Array::from_fn_elements(ArrayType::new_static(DataType::U16, [1]), |_| Ok(0u32)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot store u32 values in an array of element data type u16",
+        ));
+    }
+
+    #[test]
+    fn test_array_gather_elements() {
+        let integers = Array::vector(vec![1i32, -2, 3]);
+        // `gather_elements` copies whole element encodings through a flat index mapping without decoding them, so it
+        // serves reversal, repetition, and selection over any element data type, including sub-byte ones.
+        let reversed =
+            integers.gather_elements(integers.r#type().into_owned(), |output_index| 2 - output_index).unwrap();
+        assert_eq!(reversed.elements::<i32>(), Ok(vec![3, -2, 1]));
+        let repeated = integers.gather_elements(ArrayType::new_static(DataType::I32, [4]), |_| 1).unwrap();
+        assert_eq!(repeated.elements::<i32>(), Ok(vec![-2, -2, -2, -2]));
+        let narrow = Array::from_elements(
+            ArrayType::new_static(DataType::I4, [2]),
+            &[i4::new(-8).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        let swapped = narrow.gather_elements(narrow.r#type().into_owned(), |output_index| 1 - output_index).unwrap();
+        assert_eq!(swapped.storage_bytes(), [0x07, 0x08]);
+        assert!(matches!(
+            integers.gather_elements(ArrayType::new_static(DataType::I64, [3]), |output_index| output_index),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot gather elements of data type i32 into an array of element data type i64",
+        ));
+        assert!(matches!(
+            integers.gather_elements(ArrayType::new_static(DataType::I32, [3]), |_| 3),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "gather index 3 is out of bounds for 3 elements",
+        ));
+    }
+
+    #[test]
+    fn test_array_to_f64s() {
+        assert_eq!(Array::vector(vec![1.5, 2.5]).to_f64s(), vec![1.5, 2.5]);
+        assert_eq!(Array::vector(vec![true, false]).to_f64s(), vec![1.0, 0.0]);
+        assert_eq!(Array::vector(vec![1i32, -2]).to_f64s(), vec![1.0, -2.0]);
+        assert_eq!(
+            Array::from_elements(
+                ArrayType::new_static(DataType::I4, [2]),
+                &[i4::new(-8).unwrap(), i4::new(7).unwrap()],
+            )
+            .unwrap()
+            .to_f64s(),
+            vec![-8.0, 7.0],
+        );
+        // Low-precision floating-point elements decode to the exact values they denote.
+        assert_eq!(Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![1.5]).to_f64s(), vec![1.5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot view an array of complex element data type c128 as f64 values")]
+    fn test_array_to_f64s_rejects_complex_arrays() {
+        let real = Array::vector(vec![1.0, 2.0]);
+        let imaginary = Array::vector(vec![3.0, 4.0]);
+        let _ = real.complex(&imaginary).unwrap().to_f64s();
     }
 
     #[test]
