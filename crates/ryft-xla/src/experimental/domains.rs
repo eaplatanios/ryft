@@ -5816,7 +5816,14 @@ impl<'c> XlaDomain<'c> {
         let addressable_device_count = arguments.addressable_device_ids().len();
         let ordered = program.signature.has_ordered_io();
         if ordered {
-            if !program.platform_name.eq_ignore_ascii_case("cpu") {
+            // Native ordered-I/O token transport is proven on these platforms: CPU through this module's CPU tests
+            // and CUDA through their `*_on_cuda` siblings (run with the `cuda-13` feature on a CUDA device). Other
+            // plugins are rejected until their transport is verified the same way.
+            const VERIFIED_ORDERED_IO_PLATFORMS: [&str; 2] = ["cpu", "cuda"];
+            if !VERIFIED_ORDERED_IO_PLATFORMS
+                .iter()
+                .any(|platform| program.platform_name.eq_ignore_ascii_case(platform))
+            {
                 return Err(XlaDomainError::EffectScope {
                     reason: format!(
                         "native ordered I/O transport is not yet verified on platform `{}`",
@@ -12306,14 +12313,36 @@ mod tests {
 
     #[test]
     fn test_xla_session_array_ordered_effects() {
-        use crate::experimental::debugging::with_captured_prints;
-        use ryft_core::Print;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
+        assert_xla_session_array_ordered_effects(&client);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_xla_session_array_ordered_effects_on_cuda() {
+        // The second-plugin transport proof: native tokens created through the async host-to-device transfer path
+        // gate CUDA executions, and the CUDA print handler observes device values in submission order.
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_xla_session_array_ordered_effects(&client);
+    }
+
+    /// Submits two prints behind an outstanding predecessor token on one device of `client`, verifies that both stay
+    /// pending until the predecessor completes, and checks that they then print in submission order.
+    fn assert_xla_session_array_ordered_effects(client: &Client<'_>) {
+        use crate::experimental::debugging::with_captured_prints;
+        use ryft_core::Print;
+
+        let mesh = domain_mesh(client, "x", 1);
         let session = Arc::new(XlaSession::new(&client));
         let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
         let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
@@ -12374,17 +12403,38 @@ mod tests {
 
     #[test]
     fn test_xla_domain_effect_metadata_reload_and_unordered_completion() {
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let session = Arc::new(XlaSession::new(&client));
+        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_xla_domain_effect_metadata_reload_and_unordered_completion_on_cuda() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_xla_domain_effect_metadata_reload_and_unordered_completion(&client);
+    }
+
+    /// Compiles ordered and unordered prints on `client`, checks the persisted effect metadata roundtrip and its
+    /// corruption detection, then executes the compiled, restored, and unordered programs behind an outstanding
+    /// predecessor token and verifies the ordered prints fire twice and the unordered print once.
+    fn assert_xla_domain_effect_metadata_reload_and_unordered_completion(client: &Client<'_>) {
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Arc::new(XlaSession::new(client));
         let domain = session.domain();
-        ensure_print_handler_registered(&client).unwrap();
-        let input = f64_vector(&client, &mesh, &[3.0]);
+        ensure_print_handler_registered(client).unwrap();
+        let input = f64_vector(client, &mesh, &[3.0]);
         let mut builder = XlaProgramBuilder::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder.add_instruction(PrintOperation::new("ordered"), Vec::new(), vec![argument], None).unwrap();
@@ -12572,17 +12622,37 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_print_effect() {
-        use ryft_core::PrintOperation;
-
-        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = array_domain(&client);
-        assert_eq!(ensure_print_handler_registered(&client), Ok(()));
+        assert_eager_bind_executes_print_effect(&client);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_eager_bind_executes_print_effect_on_cuda() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eager_bind_executes_print_effect(&client);
+    }
+
+    /// Eagerly binds one `print` on `client` and verifies that the handler fires once with the device value and that
+    /// the payload passes through unchanged.
+    fn assert_eager_bind_executes_print_effect(client: &Client<'_>) {
+        use ryft_core::PrintOperation;
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let mesh = domain_mesh(client, "x", 1);
+        let domain = array_domain(client);
+        assert_eq!(ensure_print_handler_registered(client), Ok(()));
 
         // The effectful `print` rides the compiled per-operation program as a token-threaded `@ryft.print` custom
         // call: eagerly binding it fires the host callback once and passes the payload through unchanged.
@@ -12590,7 +12660,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let input =
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes::<f64>(&[1.5, 2.5]).as_slice())
+            Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f64>(&[1.5, 2.5]).as_slice())
                 .unwrap();
         let (outputs, lines) =
             with_captured_prints(|| domain.bind(PrintOperation::new("x"), Vec::new(), &[input]).unwrap());

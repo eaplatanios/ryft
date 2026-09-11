@@ -173,9 +173,11 @@ unsafe fn assertion_handler_for_memory(
     }
 }
 
-/// Copies `byte_count` bytes from one CUDA device allocation into host memory and waits for completion.
+/// Copies `byte_count` bytes from one CUDA device allocation into host memory and waits for completion. The copy is
+/// enqueued on the invoking FFI call's `stream`, so it observes every device write ordered before the custom call.
+/// This is shared by the CUDA assertion handler and the CUDA print handler in [`super::debugging`].
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-fn copy_cuda_bytes(
+pub(crate) fn copy_cuda_bytes(
     source: *mut std::ffi::c_void,
     destination: *mut std::ffi::c_void,
     byte_count: usize,
@@ -183,12 +185,14 @@ fn copy_cuda_bytes(
 ) -> Result<(), FfiError> {
     let copy_result = unsafe { cuMemcpyDtoHAsync_v2(destination, source as usize as u64, byte_count, stream) };
     if copy_result != CUDA_SUCCESS {
-        return Err(FfiError::internal(format!("CUDA assertion operand copy failed with driver error {copy_result}",)));
+        return Err(FfiError::internal(format!(
+            "CUDA device-to-host operand copy failed with driver error {copy_result}"
+        )));
     }
     let synchronize_result = unsafe { cuStreamSynchronize(stream) };
     if synchronize_result != CUDA_SUCCESS {
         return Err(FfiError::internal(format!(
-            "CUDA assertion operand synchronization failed with driver error {synchronize_result}",
+            "CUDA operand copy stream synchronization failed with driver error {synchronize_result}",
         )));
     }
     Ok(())

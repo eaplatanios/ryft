@@ -1,10 +1,16 @@
+use std::borrow::Cow;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_pjrt::extensions::ffi::FfiStream;
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::{Client, Error};
+
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use super::assertions::copy_cuda_bytes;
 
 /// Name of the XLA custom call target that implements the host-callback side of `print` lowering.
 ///
@@ -95,27 +101,76 @@ pub fn with_captured_prints<R, F: FnOnce() -> R>(body: F) -> (R, Vec<String>) {
 /// target name is rejected by the runtime. The registration outcome (including a failure, e.g., when the
 /// plugin does not provide the FFI extension) is cached for the lifetime of the process.
 ///
-/// The handler dereferences its operand buffers on the host, so in its current form it must only be registered
-/// with CPU clients. The handler is registered for the platform reported by the provided client (e.g., `"cpu"`
-/// for the built-in CPU plugin, which the XLA runtime canonicalizes to its `"Host"` platform).
+/// The handler is selected by the platform reported by the provided client. The CPU handler (platform `"cpu"`,
+/// which the XLA runtime canonicalizes to its `"Host"` platform) renders its operand buffer directly from host
+/// memory. With a `cuda-*` feature enabled, the CUDA handler (platform `"cuda"`) first copies the operand through
+/// the invocation's CUDA stream, so the printed value reflects every device write ordered before the call, and the
+/// call completes only after that device work has finished. Other platforms are rejected with an unimplemented
+/// error, because the handler has no way to read their buffers.
 pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error> {
-    static PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
-    PRINT_HANDLER_REGISTRATION
-        .get_or_init(|| {
-            let platform_name = client.platform_name()?.into_owned();
-            client.register_ffi_handler(
-                PRINT_CUSTOM_CALL_TARGET,
-                platform_name,
-                FfiHandler::from(print_handler as XLA_FFI_Handler),
-                FfiHandlerTraits::NONE,
-            )
-        })
-        .clone()
+    let platform_name = client.platform_name()?.into_owned();
+    if platform_name.eq_ignore_ascii_case("cpu") {
+        static CPU_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        return CPU_PRINT_HANDLER_REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    PRINT_CUSTOM_CALL_TARGET,
+                    platform_name,
+                    FfiHandler::from(print_handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone();
+    }
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    if platform_name.eq_ignore_ascii_case("cuda") {
+        static CUDA_PRINT_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        return CUDA_PRINT_HANDLER_REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    PRINT_CUSTOM_CALL_TARGET,
+                    platform_name,
+                    FfiHandler::from(cuda_print_handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone();
+    }
+    Err(Error::unimplemented(format!(
+        "the `{PRINT_CUSTOM_CALL_TARGET}` handler cannot read operand buffers of the `{platform_name}` platform"
+    )))
 }
 
-/// XLA FFI handler for [`PRINT_CUSTOM_CALL_TARGET`] custom calls. Refer to the documentation of
-/// [`PRINT_CUSTOM_CALL_TARGET`] for the calling convention that this handler decodes.
+/// Memory location of the value buffer passed to one print callback.
+#[derive(Copy, Clone)]
+enum PrintBufferMemory {
+    /// CPU buffer that the callback can read directly.
+    Host,
+
+    /// CUDA device buffer read back through the invocation's stream.
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    Cuda(FfiStream),
+}
+
+/// XLA FFI handler for [`PRINT_CUSTOM_CALL_TARGET`] custom calls whose operands live in host memory. Refer to the
+/// documentation of [`PRINT_CUSTOM_CALL_TARGET`] for the calling convention that this handler decodes.
 unsafe extern "C" fn print_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+    unsafe { print_handler_for_memory(call_frame, |_| Ok(PrintBufferMemory::Host)) }
+}
+
+/// XLA FFI handler for [`PRINT_CUSTOM_CALL_TARGET`] custom calls whose operands live in CUDA device memory.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+unsafe extern "C" fn cuda_print_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+    unsafe {
+        print_handler_for_memory(call_frame, |call_frame| Ok(PrintBufferMemory::Cuda(call_frame.context()?.stream()?)))
+    }
+}
+
+/// Decodes one XLA FFI invocation and prints it using the memory location returned by `memory`.
+unsafe fn print_handler_for_memory(
+    call_frame: *mut XLA_FFI_CallFrame,
+    memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<PrintBufferMemory, FfiError>,
+) -> *mut XLA_FFI_Error {
     let _callback_guard = super::domains::EffectCallbackGuard::enter();
     // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
     // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and `handle_print_call_frame`.
@@ -126,7 +181,7 @@ unsafe extern "C" fn print_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut X
             Ok(call_frame) if call_frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
             Ok(call_frame) => match call_frame.api() {
                 Err(_) => std::ptr::null_mut(),
-                Ok(api) => match handle_print_call_frame(&call_frame) {
+                Ok(api) => match memory(&call_frame).and_then(|memory| handle_print_call_frame(&call_frame, memory)) {
                     Ok(()) => std::ptr::null_mut(),
                     Err(error) => error.to_c_api(api),
                 },
@@ -137,7 +192,7 @@ unsafe extern "C" fn print_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut X
 
 /// Decodes a [`PRINT_CUSTOM_CALL_TARGET`] call frame, writes one `"<label>: <rendered value>"` line to the
 /// process-global print sink, and fills any non-token result buffers.
-fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>, memory: PrintBufferMemory) -> Result<(), FfiError> {
     let label = decode_label(call_frame)?;
     let mut value = None;
     for input in call_frame.inputs() {
@@ -152,8 +207,8 @@ fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError
             "expected the `{PRINT_CUSTOM_CALL_TARGET}` custom call to have one non-token input buffer"
         )));
     };
-    emit_print_line(format!("{label}: {}", render_buffer(&value)?));
-    copy_value_to_outputs(call_frame, &value)
+    emit_print_line(format!("{label}: {}", render_buffer(&value, memory)?));
+    copy_value_to_outputs(call_frame, &value, memory)
 }
 
 /// Decodes the [`PRINT_LABEL_ATTRIBUTE`] string attribute of a [`PRINT_CUSTOM_CALL_TARGET`] call frame.
@@ -211,31 +266,51 @@ fn element_size_in_bytes(element_type: FfiBufferType) -> Option<usize> {
     }
 }
 
-/// Renders the provided [`FfiBuffer`] as a human-readable string. `f64` buffers are rendered numerically:
-/// rank-0 buffers as a bare scalar (e.g., `3.5`) and higher-rank buffers as a flat row-major list (e.g.,
-/// `[1.5, 2.5]`). All other element types fall back to a `<type>[<dimensions>] 0x<bytes>` hexadecimal
-/// rendering, truncated to [`MAX_RENDERED_FALLBACK_BYTES`] bytes.
-fn render_buffer(buffer: &FfiBuffer<'_>) -> Result<String, FfiError> {
-    let element_type = buffer.element_type();
-    let count = element_count(buffer);
+/// Returns the leading `byte_count` bytes of the provided [`FfiBuffer`]: borrowed in place for host buffers and
+/// copied through the invocation's stream for CUDA device buffers.
+fn leading_bytes<'b>(
+    buffer: &'b FfiBuffer<'_>,
+    memory: PrintBufferMemory,
+    byte_count: usize,
+) -> Result<Cow<'b, [u8]>, FfiError> {
     // SAFETY: The data pointer is provided by the XLA runtime and is valid for the duration of the handler
-    // invocation. It is only dereferenced after checking that it is non-null and only for `count` elements,
-    // which the runtime guarantees are backed by the buffer allocation.
+    // invocation. It is only dereferenced after checking that it is non-null and only for `byte_count` bytes, which
+    // the callers bound by the element count and size that the runtime guarantees the allocation holds.
     let data = unsafe { buffer.data() };
-    if count > 0 && data.is_null() {
+    if byte_count > 0 && data.is_null() {
         return Err(FfiError::internal(format!(
             "encountered null data pointer for a non-empty `{PRINT_CUSTOM_CALL_TARGET}` input buffer"
         )));
     }
+    match memory {
+        PrintBufferMemory::Host => {
+            Ok(Cow::Borrowed(unsafe { std::slice::from_raw_parts(data as *const u8, byte_count) }))
+        }
+        #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+        PrintBufferMemory::Cuda(stream) => {
+            let mut bytes = vec![0u8; byte_count];
+            if byte_count > 0 {
+                copy_cuda_bytes(data, bytes.as_mut_ptr().cast(), byte_count, stream)?;
+            }
+            Ok(Cow::Owned(bytes))
+        }
+    }
+}
+
+/// Renders the provided [`FfiBuffer`] as a human-readable string. `f64` buffers are rendered numerically:
+/// rank-0 buffers as a bare scalar (e.g., `3.5`) and higher-rank buffers as a flat row-major list (e.g.,
+/// `[1.5, 2.5]`). All other element types fall back to a `<type>[<dimensions>] 0x<bytes>` hexadecimal
+/// rendering, truncated to [`MAX_RENDERED_FALLBACK_BYTES`] bytes.
+fn render_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<String, FfiError> {
+    let element_type = buffer.element_type();
+    let count = element_count(buffer);
     if element_type == FfiBufferType::F64 {
-        // SAFETY: The buffer element type is F64 and so its allocation holds `count` contiguous `f64` values.
-        let values = unsafe { std::slice::from_raw_parts(data as *const f64, count) };
-        return if buffer.rank() == 0 {
-            Ok(format!("{:?}", values[0]))
-        } else {
-            let values = values.iter().map(|value| format!("{value:?}")).collect::<Vec<_>>();
-            Ok(format!("[{}]", values.join(", ")))
-        };
+        let bytes = leading_bytes(buffer, memory, count * size_of::<f64>())?;
+        let values = bytes
+            .chunks_exact(size_of::<f64>())
+            .map(|chunk| format!("{:?}", f64::from_ne_bytes(chunk.try_into().unwrap())))
+            .collect::<Vec<_>>();
+        return if buffer.rank() == 0 { Ok(values[0].clone()) } else { Ok(format!("[{}]", values.join(", "))) };
     }
     let dimensions = buffer.dimensions().iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>();
     let dimensions = dimensions.join(",");
@@ -243,9 +318,7 @@ fn render_buffer(buffer: &FfiBuffer<'_>) -> Result<String, FfiError> {
         Some(element_size) if count > 0 => {
             let byte_count = count * element_size;
             let rendered_byte_count = byte_count.min(MAX_RENDERED_FALLBACK_BYTES);
-            // SAFETY: The buffer allocation holds `byte_count` bytes, of which we read the leading
-            // `rendered_byte_count`.
-            let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, rendered_byte_count) };
+            let bytes = leading_bytes(buffer, memory, rendered_byte_count)?;
             let rendered_bytes = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
             let ellipsis = if byte_count > rendered_byte_count { "…" } else { "" };
             Ok(format!("{element_type}[{dimensions}] 0x{rendered_bytes}{ellipsis}"))
@@ -256,12 +329,26 @@ fn render_buffer(buffer: &FfiBuffer<'_>) -> Result<String, FfiError> {
 
 /// Copies the printed `value` buffer into every non-token output buffer of the provided call frame. In the v1
 /// calling convention the only result is a token (which carries no data and is skipped), so this is a no-op,
-/// but it keeps value-passthrough result shapes working if a future lowering adds them.
-fn copy_value_to_outputs(call_frame: &FfiCallFrame<'_>, value: &FfiBuffer<'_>) -> Result<(), FfiError> {
+/// but it keeps value-passthrough result shapes working if a future lowering adds them. Only host buffers can be
+/// copied; a CUDA device passthrough would need a device-to-device copy that no current lowering requires.
+fn copy_value_to_outputs(
+    call_frame: &FfiCallFrame<'_>,
+    value: &FfiBuffer<'_>,
+    memory: PrintBufferMemory,
+) -> Result<(), FfiError> {
     for output in call_frame.outputs() {
         let FfiOutput::Buffer { buffer: output } = output?;
         if output.element_type() == FfiBufferType::Token {
             continue;
+        }
+        match memory {
+            PrintBufferMemory::Host => {}
+            #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+            PrintBufferMemory::Cuda(_) => {
+                return Err(FfiError::unimplemented(format!(
+                    "the `{PRINT_CUSTOM_CALL_TARGET}` custom call cannot copy its value to a CUDA device output buffer"
+                )));
+            }
         }
         if output.element_type() != value.element_type() || output.dimensions() != value.dimensions() {
             return Err(FfiError::invalid_argument(format!(
