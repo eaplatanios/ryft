@@ -271,19 +271,20 @@ macro_rules! dispatch_on_array_element_type {
     };
 }
 
-/// Implements a binary elementwise capability for [`Array`](crate::Array).
+/// Implements a unary or binary elementwise capability for [`Array`](crate::Array).
 ///
-/// Generates `impl Capability for Array` with a function of the form `fn function(&self, rhs: &Self) -> Result<Self,
-/// ProgramError>`. The generated function checks the operation's input contract and determines the common element type
-/// and broadcast shape. Inputs already using the common element type remain borrowed. Other inputs are converted before
-/// the scalar calculation runs. The calculation receives decoded values of the concrete Rust element type selected by
-/// [`dispatch_on_array_element_type!`]. Its result has that same element type, inferred from the generated traversal;
-/// no caller-visible type binding is needed.
+/// Generates `impl Capability for Array`. `@unary` implements `fn function(&self) -> Result<Self, ProgramError>` and
+/// `@binary` implements `fn function(&self, rhs: &Self) -> Result<Self, ProgramError>`. Both forms validate the input
+/// contract before evaluating elements. Unary operations preserve the input type and layout while binary operations
+/// determine the common element type and broadcast shape. Inputs already using the common element type remain borrowed.
+/// Other inputs are converted before the scalar calculation runs. The calculation receives decoded values of the
+/// concrete Rust element type selected by [`dispatch_on_array_element_type!`]. Its result has that same element type,
+/// inferred from the generated traversal; no caller-visible type binding is needed.
 ///
 /// Empty results undergo all input and metadata checks, but skip operand conversion and scalar evaluation.
 /// The result buffer follows the inferred layout, including zero-initialized padding. Non-empty results use
-/// [`Array::binary_elements`](crate::Array::binary_elements) to traverse broadcast operands directly through
-/// their storage layouts. The scalar calculation may return an error, which is propagated without modification.
+/// [`Array::map_elements`](crate::Array::map_elements) or [`Array::binary_elements`](crate::Array::binary_elements)
+/// to traverse operands directly through their storage layouts. Scalar errors are propagated without modification.
 ///
 /// Unsupported input types and metadata, incompatible broadcast shapes, failed conversions, and scalar errors
 /// are returned as [`ProgramError`](crate::ProgramError). Validation precedes broadcasting, even for empty results.
@@ -298,12 +299,13 @@ macro_rules! dispatch_on_array_element_type {
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArrayElement, ProgramError};
-/// # use ryft_core::arrays::macros::impl_array_binary_elementwise_operation;
+/// # use ryft_core::arrays::macros::impl_array_elementwise_operation;
 /// trait Minimum: Sized {
 ///     fn minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
 /// }
 ///
-/// impl_array_binary_elementwise_operation!(
+/// impl_array_elementwise_operation!(
+///     @binary
 ///     Minimum, minimum,
 ///     operation = "minimum",
 ///     inputs = @numeric,
@@ -316,41 +318,46 @@ macro_rules! dispatch_on_array_element_type {
 /// # Ok::<(), ProgramError>(())
 /// ```
 ///
-/// A real-only capability can reuse the same execution path. Here mixed `i16` and `i32` inputs promote to `i32`:
+/// Unary operations keep the input type and layout and receive one decoded scalar. This local capability
+/// uses the [`ArrayElement`](crate::arrays::ArrayElement) contract for a calculation over real elements:
 ///
-/// ```rust
+/// ```
 /// # use ryft_core::{Array, ArrayElement, ProgramError};
-/// # use ryft_core::arrays::macros::impl_array_binary_elementwise_operation;
-/// trait Maximum: Sized {
-///     fn maximum(&self, rhs: &Self) -> Result<Self, ProgramError>;
+/// # use ryft_core::arrays::macros::impl_array_elementwise_operation;
+/// trait Nonnegative: Sized {
+///     fn nonnegative(&self) -> Result<Self, ProgramError>;
 /// }
 ///
-/// impl_array_binary_elementwise_operation!(
-///     Maximum, maximum,
-///     operation = "maximum",
+/// impl_array_elementwise_operation!(
+///     @unary
+///     Nonnegative, nonnegative,
+///     operation = "nonnegative",
 ///     inputs = @real,
-///     checks = [@no_unreduced, @same_reduced_axes],
-///     |lhs, rhs| Ok(ArrayElement::max(&lhs, &rhs)),
+///     checks = [@no_unreduced],
+///     |input| Ok(ArrayElement::max(&input, &ArrayElement::from_signed(0)?)),
 /// );
 ///
-/// let result = Array::vector(vec![1i16, 5]).maximum(&Array::scalar(3i32))?;
-/// assert_eq!(result.elements::<i32>()?, vec![3, 5]);
+/// let result = Array::vector(vec![-2i32, 1, 5]).nonnegative()?;
+/// assert_eq!(result.elements::<i32>()?, vec![0, 1, 5]);
 /// # Ok::<(), ProgramError>(())
 /// ```
 ///
 /// # Parameters
 ///
+///   - `@unary` or `@binary`: Number of operands accepted by the generated function.
 ///   - `$capability`: Capability trait path.
-///   - `$method`: Name of its binary function to implement.
+///   - `$method`: Name of its function to implement.
 ///   - `operation = $operation`: Name used in diagnostics, such as `"min"`.
 ///   - `inputs = @$class`: `@numeric` accepts integers, real floating-point values, and complex values.
-///     `@real` accepts integers and real floating-point values. Both reject Booleans, including for empty arrays.
+///     `@real` accepts integers and real floating-point values. `@float` accepts real floating-point and complex
+///     values. `@real_float` accepts only real floating-point values. All classes reject Booleans, even for empty
+///     arrays.
 ///   - `checks = $checks`: Ordered list of array metadata checks from [`check_types!`](crate::check_types), typically
 ///     `@no_unreduced`, `@same_unreduced_axes`, or `@same_reduced_axes`. An empty list applies no additional checks.
-///   - `|lhs, rhs| body`: Names for decoded scalar operands, followed by an expression returning their element type
-///     wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
+///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar operands, followed by an expression returning
+///     their element type wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
 #[macro_export]
-macro_rules! impl_array_binary_elementwise_operation {
+macro_rules! impl_array_elementwise_operation {
     // Validates the numeric dispatch class, excluding Booleans.
     (@validate @numeric, $operation:expr, $types:expr $(,)?) => {
         $crate::macros::check_types!(@numeric, $operation, $types)
@@ -361,8 +368,70 @@ macro_rules! impl_array_binary_elementwise_operation {
         $crate::macros::check_types!(@numeric @real, $operation, $types)
     };
 
+    // Accepts real floating-point and complex values, matching the float capability contract.
+    (@validate @float, $operation:expr, $types:expr $(,)?) => {
+        $crate::macros::check_types!(@float, $operation, $types)
+    };
+
+    // Restricts floating-point capabilities to real elements.
+    (@validate @real_float, $operation:expr, $types:expr $(,)?) => {
+        $crate::macros::check_types!(@float @real, $operation, $types)
+    };
+
+    // The float capability class includes complex values, while the storage dispatcher separates those classes.
+    (@dispatch @float $data_type:expr, |$element:ident| $body:expr) => {{
+        let data_type = $data_type;
+        if data_type.is_complex() {
+            $crate::arrays::macros::dispatch_on_array_element_type!(@complex data_type, |$element| $body)
+        } else {
+            $crate::arrays::macros::dispatch_on_array_element_type!(@float data_type, |$element| $body)
+        }
+    }};
+
+    // Maps the real-only float capability to the storage dispatcher's float class.
+    (@dispatch @real_float $data_type:expr, |$element:ident| $body:expr) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@float $data_type, |$element| $body)
+    };
+
+    // Numeric and real capability classes share the storage dispatcher's names.
+    (@dispatch @$class:ident $data_type:expr, |$element:ident| $body:expr) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@$class $data_type, |$element| $body)
+    };
+
+    // Generates a unary capability preserving the input element type, shape, and layout.
+    (
+        @unary
+        $capability:path, $method:ident,
+        operation = $operation:expr,
+        inputs = @$class:ident,
+        checks = [$(@$check:ident),* $(,)?],
+        |$input_element:ident| $body:expr $(,)?
+    ) => {
+        impl $capability for $crate::arrays::Array {
+            fn $method(&self) -> Result<Self, $crate::programs::ProgramError> {
+                use $crate::programs::Typed as _;
+                let operation = $operation;
+                let input_type = self.r#type();
+                let data_type = input_type.data_type();
+
+                // Validate before traversal so empty arrays satisfy the same contract as non-empty arrays.
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @validate @$class, operation, [data_type],
+                );
+                $($crate::macros::check_types!(@$check, operation, [input_type.as_ref()]);)*
+
+                // The mapped output retains the input layout. Empty traversal allocates storage without evaluating
+                // the scalar calculation. Non-empty traversal decodes and re-encodes each element in its own type.
+                $crate::arrays::macros::impl_array_elementwise_operation!(@dispatch @$class data_type, |Element| {
+                    self.map_elements::<Element, Element>(input_type.into_owned(), |$input_element| $body)
+                })
+            }
+        }
+    };
+
     // Generates a capability implementation with validated promotion, broadcasting, and a fallible scalar kernel.
     (
+        @binary
         $capability:path, $method:ident,
         operation = $operation:expr,
         inputs = @$class:ident,
@@ -381,7 +450,7 @@ macro_rules! impl_array_binary_elementwise_operation {
 
                 // Validate the original inputs before promotion or the empty result shortcut, so neither can
                 // hide an unsupported input type or invalid reduction metadata.
-                $crate::arrays::macros::impl_array_binary_elementwise_operation!(
+                $crate::arrays::macros::impl_array_elementwise_operation!(
                     @validate @$class, operation,
                     [lhs_type.data_type(), rhs_type.data_type()],
                 );
@@ -406,7 +475,7 @@ macro_rules! impl_array_binary_elementwise_operation {
 
                 // Instantiate the scalar calculation for the selected Rust element type. The shared traversal
                 // decodes addressed inputs and encodes each result directly into the output buffer.
-                $crate::arrays::macros::dispatch_on_array_element_type!(@$class data_type, |Element| {
+                $crate::arrays::macros::impl_array_elementwise_operation!(@dispatch @$class data_type, |Element| {
                     lhs.binary_elements::<Element, Element>(&rhs, output_type, |$lhs_element, $rhs_element| $body)
                 })
             }
@@ -414,7 +483,7 @@ macro_rules! impl_array_binary_elementwise_operation {
     };
 }
 
-pub use crate::{dispatch_on_array_element_type, impl_array_binary_elementwise_operation};
+pub use crate::{dispatch_on_array_element_type, impl_array_elementwise_operation};
 
 #[cfg(test)]
 mod tests {
@@ -425,7 +494,23 @@ mod tests {
     use crate::arrays::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
+    use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::{ProgramError, TypeError, Typed};
+
+    /// Numeric identity used to test generated unary implementations.
+    trait TestIdentity: Sized {
+        /// Returns an array with unchanged element values and metadata.
+        fn identity(&self) -> Result<Self, ProgramError>;
+    }
+
+    impl_array_elementwise_operation!(
+        @unary
+        TestIdentity, identity,
+        operation = "identity",
+        inputs = @numeric,
+        checks = [@no_unreduced],
+        |input| Ok(input),
+    );
 
     /// Numeric minimum used to test generated array implementations.
     trait TestMinimum: Sized {
@@ -433,7 +518,8 @@ mod tests {
         fn minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
     }
 
-    impl_array_binary_elementwise_operation!(
+    impl_array_elementwise_operation!(
+        @binary
         TestMinimum, minimum,
         operation = "min",
         inputs = @numeric,
@@ -573,7 +659,143 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_array_binary_elementwise_operation() -> Result<(), ProgramError> {
+    fn test_impl_array_elementwise_operation_unary() -> Result<(), ProgramError> {
+        // Logical traversal preserves nondefault layout metadata and element ordering.
+        let input_type =
+            ArrayType::new_static(DataType::I32, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
+        let input = Array::from_elements(input_type.clone(), &[1i32, 2, 3, 4])?;
+        let output = input.identity()?;
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.elements::<i32>()?, vec![1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_unary_float() -> Result<(), ProgramError> {
+        /// Identity restricted to floating-point and complex inputs.
+        trait TestFloatIdentity: Sized {
+            /// Preserves each floating-point or complex element.
+            fn float_identity(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestFloatIdentity, float_identity,
+            operation = "float_identity",
+            inputs = @float,
+            checks = [],
+            |input| Ok(input),
+        );
+
+        // The floating-point class includes complex values without discarding imaginary components.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::C64, [2]),
+            &[Complex::new(1f32, -2.0), Complex::new(3.0, 4.0)],
+        )?;
+        assert_eq!(input.float_identity()?, input);
+        let input = Array::scalar(-0f32);
+        assert_eq!(input.float_identity()?.elements::<f32>()?[0].to_bits(), (-0f32).to_bits());
+        assert!(matches!(
+            Array::scalar(1i32).float_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`float_identity` does not support input data type i32",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_unary_real_float() -> Result<(), ProgramError> {
+        /// Identity restricted to real floating-point inputs.
+        trait TestRealFloatIdentity: Sized {
+            /// Preserves each real floating-point element.
+            fn real_float_identity(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestRealFloatIdentity, real_float_identity,
+            operation = "real_float_identity",
+            inputs = @real_float,
+            checks = [],
+            |input| Ok(input),
+        );
+
+        assert_eq!(Array::scalar(2f32).real_float_identity()?, Array::scalar(2f32));
+        assert!(matches!(
+            Array::scalar(Complex::new(1f32, 2.0)).real_float_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`real_float_identity` does not support input data type c64",
+        ));
+
+        // Empty operands cannot bypass validation of the declared input class.
+        let input = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool])?;
+        assert!(matches!(
+            input.real_float_identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`real_float_identity` does not support input data type bool",
+        ));
+        assert!(matches!(
+            input.identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`identity` does not support input data type bool",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_unary_empty_invalid_metadata() -> Result<(), ProgramError> {
+        // Validate reduction metadata before skipping evaluation of an empty buffer.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::Replicated])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::F32, [0]).with_sharding(sharding).unwrap(),
+            &[] as &[f32],
+        )?;
+        assert!(matches!(
+            input.identity(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`identity` does not support unreduced operands",
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_unary_scalar_error() -> Result<(), ProgramError> {
+        /// Operation whose scalar kernel always fails.
+        trait TestFailingUnaryOperation: Sized {
+            /// Reports an error whenever an element is evaluated.
+            fn fail(&self) -> Result<Self, ProgramError>;
+        }
+
+        impl_array_elementwise_operation!(
+            @unary
+            TestFailingUnaryOperation, fail,
+            operation = "fail",
+            inputs = @numeric,
+            checks = [],
+            |_input| Err(ProgramError::InvalidArgument {
+                message: "scalar kernel failed".to_string(),
+            }),
+        );
+
+        assert!(matches!(
+            Array::scalar(1i32).fail(),
+            Err(ProgramError::InvalidArgument { message }) if message == "scalar kernel failed",
+        ));
+
+        // Empty output construction succeeds without invoking the fallible scalar calculation.
+        let input = Array::from_elements(ArrayType::new_static(DataType::I32, [0]), &[] as &[i32])?;
+        let output = input.fail()?;
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output.elements::<i32>()?, Vec::<i32>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn test_impl_array_elementwise_operation_binary() -> Result<(), ProgramError> {
         // Promotion and broadcasting happen before the scalar kernel receives its operands.
         let lhs = Array::from_elements(ArrayType::new_static(DataType::I16, [2, 1]), &[2i16, 5])?;
         let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3]), &[1i32, 3, 6])?;
@@ -584,14 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_array_binary_elementwise_operation_empty_invalid_data_type() -> Result<(), ProgramError> {
+    fn test_impl_array_elementwise_operation_binary_empty_invalid_data_type() -> Result<(), ProgramError> {
         /// Real minimum used to verify input-class validation.
         trait TestRealMinimum: Sized {
             /// Computes the elementwise minimum of real operands.
             fn real_minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
         }
 
-        impl_array_binary_elementwise_operation!(
+        impl_array_elementwise_operation!(
+            @binary
             TestRealMinimum, real_minimum,
             operation = "min",
             inputs = @real,
@@ -599,7 +822,7 @@ mod tests {
             |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
         );
 
-        // Empty operands must satisfy the same input contract as nonempty operands.
+        // Empty inputs must satisfy the same input contract as non-empty inputs.
         let input = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool])?;
         let output = input.minimum(&input);
         assert!(matches!(
@@ -626,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_array_binary_elementwise_operation_empty_invalid_metadata() -> Result<(), ProgramError> {
+    fn test_impl_array_elementwise_operation_binary_empty_invalid_metadata() -> Result<(), ProgramError> {
         // Unreduced values are rejected even when their buffers have no elements.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::Replicated])
@@ -647,14 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_array_binary_elementwise_operation_empty_output() -> Result<(), ProgramError> {
+    fn test_impl_array_elementwise_operation_binary_empty_output() -> Result<(), ProgramError> {
         /// Operation whose scalar kernel always fails.
         trait TestFailingOperation: Sized {
             /// Reports a scalar error whenever an element is evaluated.
             fn fail(&self, rhs: &Self) -> Result<Self, ProgramError>;
         }
 
-        impl_array_binary_elementwise_operation!(
+        impl_array_elementwise_operation!(
+            @binary
             TestFailingOperation, fail,
             operation = "min",
             inputs = @real,
@@ -674,14 +898,15 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_array_binary_elementwise_operation_scalar_error() {
+    fn test_impl_array_elementwise_operation_binary_scalar_error() {
         /// Operation whose scalar kernel always fails.
         trait TestFailingOperation: Sized {
             /// Reports a scalar error whenever an element is evaluated.
             fn fail(&self, rhs: &Self) -> Result<Self, ProgramError>;
         }
 
-        impl_array_binary_elementwise_operation!(
+        impl_array_elementwise_operation!(
+            @binary
             TestFailingOperation, fail,
             operation = "min",
             inputs = @real,
