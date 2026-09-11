@@ -1913,7 +1913,7 @@ mod tests {
 
     type TestArrayValue = ArrayIrValue<Array>;
 
-    type TestArrayOperation = ArrayIrOperation<Array>;
+    type TestArrayIrOperation = ArrayIrOperation<Array>;
 
     /// Minimal generic operation universe: the flat reference language, call-like operations with inherited or fresh
     /// capture scopes and optional dormant rules, while-, condition-, and scan-like operations (the scan views its
@@ -3585,7 +3585,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type: ArrayIrType = ReferenceType::new(scalar_type.clone()).into();
         let make_branch = || {
-            let mut branch = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+            let mut branch = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
             let reference = branch.add_input(reference_type.clone());
             branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
             branch
@@ -3596,7 +3596,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
         let true_branch = builder.import_region(make_branch().entry_region_ref());
         let false_branch = builder.import_region(make_branch().entry_region_ref());
         let captured = builder.add_input(ReferenceType::new(matrix_type).into());
@@ -3678,7 +3678,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type: ArrayIrType = ReferenceType::new(scalar_type.clone()).into();
         let make_condition = |mutating: bool| {
-            let mut condition = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+            let mut condition = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
             let counter = condition.add_input(scalar_type.clone().into());
             let reference = condition.add_input(reference_type.clone());
             let limit = if mutating {
@@ -3706,7 +3706,7 @@ mod tests {
                 .unwrap()
         };
         let make_body = || {
-            let mut body = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+            let mut body = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
             let counter = body.add_input(scalar_type.clone().into());
             let reference = body.add_input(reference_type.clone());
             let step = body.add_constant(TestArrayValue::Array(Array::scalar(1.0f32)));
@@ -3724,11 +3724,11 @@ mod tests {
         };
         let make_loop = |condition: Program<
             TestArrayValue,
-            TestArrayOperation,
+            TestArrayIrOperation,
             Vec<TestArrayValue>,
             Vec<TestArrayValue>,
         >| {
-            let mut builder = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+            let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
             let condition = builder.import_region(condition.entry_region_ref());
             let body = builder.import_region(make_body().entry_region_ref());
             let counter = builder.add_input(scalar_type.clone().into());
@@ -3787,14 +3787,14 @@ mod tests {
     fn test_reference_analysis_new_rejects_swapped_array_reference_carries() {
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
         // A body that exchanges two carried references violates the positional identity constraint.
-        let mut condition = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+        let mut condition = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
         condition.add_input(reference_type.clone());
         condition.add_input(reference_type.clone());
         let predicate = condition.add_constant(TestArrayValue::Array(Array::scalar(false)));
         let condition = condition
             .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut body = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+        let mut body = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
         let first = body.add_input(reference_type.clone());
         let second = body.add_input(reference_type.clone());
         let body = body
@@ -3804,7 +3804,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let first = builder.add_input(reference_type.clone());
@@ -4483,7 +4483,7 @@ mod tests {
         }
 
         let reference = ArrayReference::new(Array::scalar(2.0_f32));
-        let mut builder = ProgramBuilder::<ReferenceConstant, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<ReferenceConstant, TestArrayIrOperation>::new();
         let first = builder.add_constant(ReferenceConstant(ArrayIrValue::Reference(reference.clone())));
         let second = builder.add_constant(ReferenceConstant(ArrayIrValue::Reference(reference)));
         let program = builder

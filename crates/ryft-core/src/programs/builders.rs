@@ -1180,44 +1180,12 @@ mod tests {
 
     #[test]
     fn test_program_builder_type_identity_instantiation_cache_preserves_live_identities() {
-        #[derive(Clone)]
-        struct ArrayIdentityOperation;
-
-        impl Operation for ArrayIdentityOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "array_identity"
-            }
-
-            fn region_slots(&self) -> &'static [RegionSlot] {
-                const { &[RegionSlot::computation("body")] }
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                let [region_interface] = region_interfaces else {
-                    return Err(TypeError::invalid(format!(
-                        "array identity expects 1 attached region but got {}",
-                        region_interfaces.len(),
-                    )));
-                };
-                if region_interface.input_types() != input_types {
-                    return Err(TypeError::invalid("array identity region input types do not match its operand types"));
-                }
-                Ok(region_interface.output_types().to_vec())
-            }
-        }
-
         let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
         let formal_first = DimensionVariable::new("formal_first", bounds);
         let formal_second = DimensionVariable::new("formal_second", bounds);
         let array_type =
             |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let mut callee_builder = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let mut callee_builder = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
         let first_input = callee_builder.add_input(array_type(formal_first.clone()));
         let second_input = callee_builder.add_input(array_type(formal_second.clone()));
         let callee = Arc::new(
@@ -1232,7 +1200,7 @@ mod tests {
 
         // Repeated exact instantiations share, but otherwise-identical callers with separately created identities
         // remain distinct because each imported region retains those live identities in its boundary.
-        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let mut destination = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
         let caller_a = DimensionVariable::new("caller_a", bounds);
         let caller_b = DimensionVariable::new("caller_b", bounds);
         let caller_c = DimensionVariable::new("caller_c", bounds);
@@ -1249,7 +1217,8 @@ mod tests {
             .cloned()
             .map(|input_type| destination.add_input(input_type))
             .collect::<Vec<_>>();
-        let outputs = destination.add_instruction(ArrayIdentityOperation, vec![second], inputs, None).unwrap().to_vec();
+        let outputs =
+            destination.add_instruction(TestRegionOperation::Call, vec![second], inputs, None).unwrap().to_vec();
         assert_eq!(
             outputs
                 .iter()
@@ -1260,7 +1229,7 @@ mod tests {
 
         // A type-identity instantiation reuses the plain callee, while a permutation of overlapping identities
         // does not.
-        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let mut destination = ProgramBuilder::<ArrayType, TestRegionOperation>::new();
         let plain = destination.intern_callee(&callee, None).unwrap();
         let direct = destination
             .intern_callee(&callee, Some(&[array_type(formal_first.clone()), array_type(formal_second.clone())]))

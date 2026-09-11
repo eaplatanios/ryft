@@ -1074,16 +1074,14 @@ mod tests {
     use crate::programs::{
         AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,
     };
+    use crate::tests::{TestArrayContext, TestArrayOperation};
 
     use super::*;
 
     #[test]
     fn test_trace() {
-        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| Ok(x.clone() * x),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
+        let (output_type, program) =
+            TestArrayContext::trace(|x| Ok(x.clone() * x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
         assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(9.0)));
 
@@ -1102,8 +1100,7 @@ mod tests {
     #[test]
     fn test_context_trace_rejects_captures_registered_into_its_discarded_capture_table() {
         /// Capturing trace universe whose staged constants are capture references into a runtime `Array` table.
-        type CapturingTrace =
-            TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
+        type CapturingTrace = TracingContext<CaptureReference<ArrayType>, TestArrayOperation, Array>;
 
         /// Stages `x + capture#0` with the capture registered through the trace's own context.
         fn capturing_body(x: Tracer<CapturingTrace>) -> Result<Vec<Tracer<CapturingTrace>>, ProgramError> {
@@ -1162,7 +1159,7 @@ mod tests {
     #[test]
     fn test_tracer() {
         // Test handles, atom lookup, cloning, typing, and rendering.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer = tracing_context.tracer(atom, None);
@@ -1214,7 +1211,7 @@ mod tests {
         );
 
         // Test staging a unary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let tracer = tracing_context.tracer(atom, None);
@@ -1235,7 +1232,7 @@ mod tests {
         );
 
         // Test staging a binary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
@@ -1261,8 +1258,8 @@ mod tests {
         );
 
         // Test that binary operations poison the result when inputs belong to different builders.
-        let context_a = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
-        let context_b = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let context_a = DomainTracingContext::<TestArrayContext>::new();
+        let context_b = DomainTracingContext::<TestArrayContext>::new();
         let builder_a = context_a.builder().clone();
         let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
@@ -1276,6 +1273,8 @@ mod tests {
 
     #[test]
     fn test_tracer_unary_records_invalid_output_count_and_returns_poisoned_tracer() {
+        // The unary tracer must reject this deliberately empty output signature; ordinary array operations
+        // cannot replace this sentinel without losing the invalid-output contract.
         #[derive(Copy, Clone, Debug)]
         struct NoOutputOperation;
 
@@ -1323,10 +1322,10 @@ mod tests {
 
     #[test]
     fn test_tracing_context() {
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let domain = TestArrayContext::new();
 
         // Test construction, cloning, and debug formatting.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let cloned_context = tracing_context.clone();
         assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
@@ -1355,7 +1354,7 @@ mod tests {
         );
 
         // Test constructing tracers from builder-owned and explicitly cached types.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let atom = tracing_context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let builder_typed = tracing_context.tracer(atom, None);
         let cached_typed = tracing_context.tracer(atom, Some(ArrayType::scalar(DataType::F64)));
@@ -1363,7 +1362,7 @@ mod tests {
         assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
 
         // Test that only the first recorded builder error is retained.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
@@ -1372,7 +1371,7 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
         // Test staging a valid operation through the context.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
@@ -1400,8 +1399,8 @@ mod tests {
         );
 
         // Test rejecting inputs that belong to a different program builder.
-        let context_a = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
-        let context_b = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let context_a = DomainTracingContext::<TestArrayContext>::new();
+        let context_b = DomainTracingContext::<TestArrayContext>::new();
         let builder_a = context_a.builder().clone();
         let atom_a = builder_a.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let atom_b = context_b.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
@@ -1414,7 +1413,7 @@ mod tests {
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
 
         // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
@@ -1432,7 +1431,7 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
 
         // Test propagating abstract-evaluation errors and recording them on the builder.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F8E3M4));
         let rhs_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F32));
@@ -1451,7 +1450,7 @@ mod tests {
         ));
 
         // Test staging program constants through the context without requiring the context itself to be a domain.
-        let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let tracing_context = DomainTracingContext::<TestArrayContext>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context.constant(
             domain
@@ -1519,11 +1518,9 @@ mod tests {
 
     #[test]
     fn test_tracing_context_trace() {
-        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| Ok(x.clone() * x.clone() + x.one_like()?),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
+        let (output_type, program) =
+            TestArrayContext::trace(|x| Ok(x.clone() * x.clone() + x.one_like()?), ArrayType::scalar(DataType::F64))
+                .unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
         assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(10.0)));
         assert_eq!(
@@ -1541,7 +1538,7 @@ mod tests {
         // Test using an escaped `ProgramBuilder`.
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
-            EagerContext::<Array, ArrayOperation<Array>>::trace(
+            TestArrayContext::trace(
                 |x| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
@@ -1553,7 +1550,7 @@ mod tests {
 
         // Test that `TypeError`s are returned in certain cases.
         assert!(matches!(
-            EagerContext::<Array, ArrayOperation<Array>>::trace(
+            TestArrayContext::trace(
                 |inputs| Ok(inputs.0 + inputs.1),
                 (ArrayType::scalar(DataType::F8E3M4), ArrayType::scalar(DataType::F32)),
             ),
@@ -1642,7 +1639,7 @@ mod tests {
         // the same shared scope state: the multiplication staged inside the scope carries it, while the addition staged
         // outside it stays unknown.
         let scope = ProvenanceScope::new("labeled");
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, program) = TestArrayContext::trace(
             |x| {
                 let context = x.context().clone();
                 let scoped = context.invoke_with_provenance_scope(scope.clone(), || {
@@ -1662,8 +1659,8 @@ mod tests {
         assert_eq!(provenances, vec![Provenance::scope(scope.clone(), Provenance::unknown()), Provenance::unknown()]);
 
         // Independent traces own independent states, so scopes never leak across traces or leave residue behind.
-        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let first = TracingContext::<Array, TestArrayOperation>::new();
+        let second = TracingContext::<Array, TestArrayOperation>::new();
         first.invoke_with_provenance_scope(scope.clone(), || {
             assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
             assert_eq!(second.provenance(), Provenance::unknown());
@@ -1673,9 +1670,9 @@ mod tests {
 
     #[test]
     fn test_nested_tracing_context() {
-        // A nested trace over an eager `EagerContext<Array, ArrayOperation<Array>>` parent stages its own independent
+        // A nested trace over an eager `TestArrayContext` parent stages its own independent
         // primal program and, like the root `TracingContext`, shares that program's builder across cloned contexts.
-        let nested = NestedTracingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let nested = NestedTracingContext::new(TestArrayContext::new());
         let builder = nested.builder().clone();
         let cloned_context = nested.clone();
         assert!(Rc::ptr_eq(nested.builder(), &builder));
@@ -1777,7 +1774,7 @@ mod tests {
         // state for the nested program, so nested scopes fold over the seed without affecting the parent.
         let outer_scope = ProvenanceScope::new("outer");
         let nested_scope = ProvenanceScope::new("nested");
-        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let parent = TracingContext::<Array, TestArrayOperation>::new();
         parent.invoke_with_provenance_scope(outer_scope.clone(), || {
             let seed = parent.provenance();
             let nested = NestedTracingContext::new(parent.clone());
@@ -1802,8 +1799,7 @@ mod tests {
     fn test_program_specialize() {
         let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let (_, program) =
-            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| Ok(x.clone() * x), dynamic_type.clone()).unwrap();
+        let (_, program) = TestArrayContext::trace(|x| Ok(x.clone() * x), dynamic_type.clone()).unwrap();
 
         // Equal input types take the fast path and return the program unchanged.
         let unchanged = program.clone().specialize(std::slice::from_ref(&dynamic_type)).unwrap();

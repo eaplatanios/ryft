@@ -2666,30 +2666,11 @@ mod tests {
 
     #[test]
     fn test_replay_region_driver_instantiation_cache_preserves_live_type_identities() {
-        #[derive(Clone)]
-        struct ArrayIdentityOperation;
-
-        impl Operation for ArrayIdentityOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "array_identity"
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                Ok(input_types.to_vec())
-            }
-        }
-
         let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
         let array_type =
             |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let formal = DimensionVariable::new("formal", bounds);
-        let mut source_builder = ProgramBuilder::<Array, ArrayIdentityOperation>::new();
+        let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = source_builder.add_input(array_type(formal));
         let source = source_builder
             .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])

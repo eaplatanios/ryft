@@ -3288,10 +3288,6 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, ArrayType,
         DataType, Dimension, DimensionBounds, DimensionVariable, ReferenceSliceOperation, Shape,
     };
-    use crate::contexts::tests::{
-        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue,
-    };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::operations::differentiation::tests::custom_jvp_regions_with_reference_state;
@@ -3305,6 +3301,10 @@ mod tests {
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
         Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, RegionId,
+    };
+    use crate::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
+        ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::tracing::{NestedTracingContext, Trace};
 

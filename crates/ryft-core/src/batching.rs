@@ -2001,13 +2001,13 @@ mod tests {
         DimensionVariable, Shape, ShardingDimension, StaticArrayExtentBatchingPolicy,
     };
     use crate::contexts::EagerContext;
-    use crate::contexts::tests::{
-        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
-        ProjectedProgramType, ProjectedProgramValue,
-    };
     use crate::operations::{AddOperation, NegOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, Typed};
+    use crate::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
+        ProjectedProgramType, ProjectedProgramValue,
+    };
     use crate::tracing::Trace;
 
     use super::*;

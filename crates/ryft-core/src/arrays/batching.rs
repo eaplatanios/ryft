@@ -4016,7 +4016,6 @@ mod tests {
         EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope, ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
-    use crate::tests::test_condition_program;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
@@ -9024,46 +9023,6 @@ mod tests {
         ];
         assert_eq!(direct.interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(discharged.interpret(inputs), Ok(expected));
-
-        // Discharge across a condition: the mapped predicate turns the condition into a select over both discharged
-        // branch states while the batched program stays pure and reference-free.
-        let program = test_condition_program();
-
-        let axis_extent = DimensionValue::constant(2).unwrap();
-        let batched = program
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .batched_with_threaded_extent(
-                axis_extent.r#type().into_owned(),
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0), BatchAxis::new(0)],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap();
-        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(0)]);
-        let (batched, _) = batched.into_parts();
-        assert!(batched.effects().classes().is_empty());
-        assert!(batched.regions().iter().flat_map(|region| region.atoms()).all(|atom| !atom.r#type().is_reference()));
-
-        // Mixed predicates pin that each batch item selects its own branch's state: the accumulating true branch
-        // yields `4 + 1` for both outputs, while the overwriting false branch yields the pre-swap `7` snapshot and
-        // the replacement `9` as the final state.
-        assert_eq!(
-            batched
-                .interpret(vec![
-                    ArrayIrValue::Dimension(axis_extent.clone()),
-                    ArrayIrValue::Array(Array::vector(vec![true, false])),
-                    ArrayIrValue::Array(Array::vector(vec![4.0_f32, 7.0])),
-                ])
-                .unwrap(),
-            vec![
-                ArrayIrValue::Dimension(axis_extent),
-                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 7.0])),
-                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 9.0])),
-            ],
-        );
     }
 
     #[test]

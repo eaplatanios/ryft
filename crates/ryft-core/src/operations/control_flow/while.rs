@@ -2798,6 +2798,7 @@ mod tests {
     use crate::operations::constants::one::One;
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
     use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
+    use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::div::DivOperation;
@@ -2812,7 +2813,6 @@ mod tests {
         EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
         ReferenceRoot, ReferenceSource, ReferenceType,
     };
-    use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
     use super::*;

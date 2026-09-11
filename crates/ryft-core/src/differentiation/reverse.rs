@@ -3687,10 +3687,6 @@ pub(crate) mod tests {
         Dimension, DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
     use crate::batching::{BatchAxis, batch};
-    use crate::contexts::tests::{
-        ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
-        ProjectedProgramValue,
-    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::LinearizationTracer;
     use crate::differentiation::{Differentiate, differentiate_at};
@@ -3710,6 +3706,10 @@ pub(crate) mod tests {
         Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
+    use crate::tests::{
+        ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
+        ProjectedProgramValue,
+    };
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;

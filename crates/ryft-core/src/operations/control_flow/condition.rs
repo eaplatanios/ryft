@@ -1688,6 +1688,7 @@ mod tests {
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::div::DivOperation;
     use crate::operations::math::mul::MulOperation;
@@ -1701,13 +1702,82 @@ mod tests {
         EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult, ReferenceSource,
         ReferenceType, TypeError,
     };
-    use crate::tests::{CountingBatchingDriver, test_condition_program};
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
 
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
+
+    /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary,
+    /// shared by tests comparing direct reference transforms with explicit discharge. The program takes a Boolean
+    /// predicate and an `f32[]` initial value, allocates one local reference from that initial value, and passes the
+    /// reference into a condition whose branches access it with unequal modes. The `true` branch accumulates `1.0` and
+    /// reads the reference, while the `false` branch swaps in `9.0` and yields the replaced value. Its two outputs are
+    /// the condition's snapshot followed by the frozen final state, so a discharged program must thread identical state
+    /// through both branches and keep both public outputs interpretable. On `[true, 4.0]` the outputs are `[5.0, 5.0]`,
+    /// and on `[false, 4.0]` they are `[4.0, 9.0]`.
+    fn test_condition_program()
+    -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let update = true_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        true_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let snapshot = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = false_builder.add_input(reference_type.into());
+        let replacement = false_builder.add_constant(ArrayIrValue::Array(Array::scalar(9.0_f32)));
+        let snapshot = false_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap()
+    }
 
     /// Builds a single-input flat program that maps its scalar `f64` input through `operation`.
     fn scalar_branch(
@@ -3987,6 +4057,49 @@ mod tests {
             assert_eq!(value, Array::scalar(expected_value));
             assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
         }
+    }
+
+    #[test]
+    fn test_condition_batching_after_local_reference_discharge() {
+        // Discharge across a condition: the mapped predicate turns the condition into a select over both discharged
+        // branch states while the batched program stays pure and reference-free.
+        let program = test_condition_program();
+
+        let axis_extent = DimensionValue::constant(2).unwrap();
+        let batched = program
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .batched_with_threaded_extent(
+                axis_extent.r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::new(0), BatchAxis::new(0)]);
+        let (batched, _) = batched.into_parts();
+        assert!(batched.effects().classes().is_empty());
+        assert!(batched.regions().iter().flat_map(|region| region.atoms()).all(|atom| !atom.r#type().is_reference()));
+
+        // Mixed predicates pin that each batch item selects its own branch's state: the accumulating true branch
+        // yields `4 + 1` for both outputs, while the overwriting false branch yields the pre-swap `7` snapshot and
+        // the replacement `9` as the final state.
+        assert_eq!(
+            batched
+                .interpret(vec![
+                    ArrayIrValue::Dimension(axis_extent.clone()),
+                    ArrayIrValue::Array(Array::vector(vec![true, false])),
+                    ArrayIrValue::Array(Array::vector(vec![4.0_f32, 7.0])),
+                ])
+                .unwrap(),
+            vec![
+                ArrayIrValue::Dimension(axis_extent),
+                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 7.0])),
+                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 9.0])),
+            ],
+        );
     }
 
     #[test]

@@ -3872,6 +3872,7 @@ mod tests {
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
     use crate::operations::math::add::AddOperation;
@@ -3886,7 +3887,6 @@ mod tests {
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceAliasKind, ReferenceSource, ReferenceType,
     };
-    use crate::tests::CountingBatchingDriver;
     use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;

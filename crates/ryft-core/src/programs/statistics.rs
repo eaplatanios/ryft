@@ -297,7 +297,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::EffectClass;
     use crate::programs::regions::RegionSlot;
-    use crate::tests::TestRegionOperation;
+    use crate::tests::{TestArrayOperation, TestRegionOperation};
 
     use super::*;
 
@@ -354,10 +354,10 @@ mod tests {
 
     #[test]
     fn test_statistics_zero_input_instruction_output_has_depth_one() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let produced =
             builder.add_instruction(ConstantOperation::new(Array::scalar(1.0)), vec![], vec![], None).unwrap()[0];
-        let program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> =
+        let program: Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);

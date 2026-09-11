@@ -217,32 +217,524 @@ pub use tracing_v2::rematerialization::{REMATERIALIZE_OPERATION_NAME, Rematerial
 pub(crate) mod tests {
     use std::any::TypeId;
     use std::borrow::Cow;
-    use std::cell::Cell;
-
     use std::convert::Infallible;
-    use std::fmt::Debug;
+    use std::fmt::{Debug, Display};
     use std::sync::{Arc, Weak};
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
-    use crate::axes::Axis;
-    use crate::batching::{
-        BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
-        RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    use ryft_macros::Operation;
+
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayType};
+    use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::{
+        CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+        DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
+        TranspositionContext, TranspositionDriver,
     };
-    use crate::contexts::Context;
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::{
-        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSwapOperation,
+        AddOperation, ConstantOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, ZeroLikeOperation, ZeroOperation,
     };
-    use crate::parameters::{Parameter, Placeholder};
+    use crate::parameters::Parameter;
+    use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, Operation, Program, ProgramBuilder, ReferenceType, Region, RegionDriver,
-        RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
+        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, Operation, OperationProjection, Program,
+        ProgramError, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type, TypeError,
+        Typed, Value, ValueProjection,
     };
-
     use crate::specialization::SpecializationCacheStatistics;
+    use crate::tracing::{Tracer, TracingContext};
+
+    /// Small ordinary array operation family for core tests. Each payload is a real operation, while malformed rules
+    /// and arbitrary region interfaces remain explicit, separate protocol fixtures. Captures and interpretation need
+    /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
+    /// operation types. This family deliberately has no region-bearing payloads and therefore needs no value type
+    /// parameter.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
+    pub(crate) enum TestArrayOperation {
+        Constant(ConstantOperation<Array>),
+        Zero(ZeroOperation<ArrayType>),
+        One(OneOperation<ArrayType>),
+        ZeroLike(ZeroLikeOperation<ArrayType>),
+        OneLike(OneLikeOperation<ArrayType>),
+        Neg(NegOperation<ArrayType>),
+        Add(AddOperation<ArrayType>),
+        Mul(MulOperation<ArrayType>),
+    }
+
+    /// Eager array context with only the operations required by ordinary core protocol tests.
+    pub(crate) type TestArrayContext = EagerContext<Array, TestArrayOperation>;
+
+    /// Staging context for the same ordinary array family, used to replay residual programs into an outer trace.
+    pub(crate) type TestArrayTracingContext = TracingContext<Array, TestArrayOperation>;
+
+    /// Small reference-capable family for mixed Intermediate Representation (IR) boundary tests. Keeping its type
+    /// universe explicit avoids treating a reference as an ordinary array or importing the complete production mixed
+    /// operation catalog.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type = ArrayIrType, constant = ArrayIrValue<Array>)]
+    pub(crate) enum TestArrayIrOperation {
+        Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
+        ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
+        ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
+    }
+
+    /// Eager context for mixed array/reference boundary tests using the small mixed operation family.
+    pub(crate) type TestArrayIrContext = EagerContext<ArrayIrValue<Array>, TestArrayIrOperation>;
+
+    /// Test-only homogeneous member type used by the generic projected-context fixtures.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ProjectedMemberType<const MEMBER: u8>;
+
+    impl<const MEMBER: u8> Display for ProjectedMemberType<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "member_{MEMBER}")
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberType<MEMBER> {}
+
+    impl<const MEMBER: u8> Type for ProjectedMemberType<MEMBER> {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl<const MEMBER: u8> DifferentiableType for ProjectedMemberType<MEMBER> {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+    }
+
+    /// Test-only concrete value for one homogeneous projected member.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ProjectedMemberValue<const MEMBER: u8>(pub(crate) usize);
+
+    impl<const MEMBER: u8> Display for ProjectedMemberValue<MEMBER> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.0)
+        }
+    }
+
+    impl<const MEMBER: u8> Parameter for ProjectedMemberValue<MEMBER> {}
+
+    impl<const MEMBER: u8> Typed for ProjectedMemberValue<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(ProjectedMemberType)
+        }
+    }
+
+    impl<const MEMBER: u8> Value for ProjectedMemberValue<MEMBER> {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            EagerContext::new()
+        }
+    }
+
+    /// Test-only composite storage type with three distinct member kinds.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramType {
+        /// First member kind, used by the ordinary projection tests.
+        First(ProjectedMemberType<0>),
+
+        /// Second member kind, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberType<1>),
+
+        /// Third member kind, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberType<2>),
+    }
+
+    impl Display for ProjectedProgramType {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(r#type) => Display::fmt(r#type, formatter),
+                Self::Second(r#type) => Display::fmt(r#type, formatter),
+                Self::Third(r#type) => Display::fmt(r#type, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramType {}
+
+    impl Type for ProjectedProgramType {
+        type Identity = NoIdentity;
+        type Refinements = ();
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            true
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl DifferentiableType for ProjectedProgramType {
+        fn is_zero_space(&self) -> bool {
+            false
+        }
+
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
+        }
+    }
+
+    /// Test-only composite storage value mirroring [`ProjectedProgramType`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramValue {
+        /// First member value, used by the ordinary projection tests.
+        First(ProjectedMemberValue<0>),
+
+        /// Second member value, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberValue<1>),
+
+        /// Third member value, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberValue<2>),
+    }
+
+    impl Display for ProjectedProgramValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::First(value) => Display::fmt(value, formatter),
+                Self::Second(value) => Display::fmt(value, formatter),
+                Self::Third(value) => Display::fmt(value, formatter),
+            }
+        }
+    }
+
+    impl Parameter for ProjectedProgramValue {}
+
+    impl Typed for ProjectedProgramValue {
+        type Type = ProjectedProgramType;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Owned(match self {
+                Self::First(_) => ProjectedProgramType::First(ProjectedMemberType),
+                Self::Second(_) => ProjectedProgramType::Second(ProjectedMemberType),
+                Self::Third(_) => ProjectedProgramType::Third(ProjectedMemberType),
+            })
+        }
+    }
+
+    impl Value for ProjectedProgramValue {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            EagerContext::new()
+        }
+    }
+
+    /// Implements type/value conversion and projection for one named member of the test composite family.
+    macro_rules! impl_projected_test_member {
+        ($member:literal, $variant:ident) => {
+            impl From<ProjectedMemberType<$member>> for ProjectedProgramType {
+                fn from(r#type: ProjectedMemberType<$member>) -> Self {
+                    Self::$variant(r#type)
+                }
+            }
+
+            impl<'t> TryFrom<&'t ProjectedProgramType> for &'t ProjectedMemberType<$member> {
+                type Error = TypeError;
+
+                fn try_from(r#type: &'t ProjectedProgramType) -> Result<Self, Self::Error> {
+                    match r#type {
+                        ProjectedProgramType::$variant(r#type) => Ok(r#type),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, r#type))),
+                    }
+                }
+            }
+
+            impl ValueProjection<ProjectedMemberType<$member>> for ProjectedProgramValue {
+                type Projected = ProjectedMemberValue<$member>;
+                type ProjectedRef<'v>
+                    = &'v ProjectedMemberValue<$member>
+                where
+                    Self: 'v;
+
+                fn from_projected(value: Self::Projected) -> Self {
+                    Self::$variant(value)
+                }
+
+                fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+                where
+                    ProjectedMemberType<$member>: 'v,
+                {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
+                    }
+                }
+
+                fn into_projected(self) -> Result<Self::Projected, TypeError> {
+                    match self {
+                        Self::$variant(value) => Ok(value),
+                        _ => Err(TypeError::invalid(format!("expected member {} but got {}", $member, self.r#type()))),
+                    }
+                }
+            }
+
+            impl From<ProjectedMemberOperation<$member>> for ProjectedProgramOperation {
+                fn from(operation: ProjectedMemberOperation<$member>) -> Self {
+                    Self::$variant(operation)
+                }
+            }
+
+            impl OperationProjection<ProjectedMemberType<$member>> for ProjectedProgramOperation {
+                type Projected = ProjectedMemberOperation<$member>;
+            }
+        };
+    }
+
+    impl_projected_test_member!(0, First);
+    impl_projected_test_member!(1, Second);
+    impl_projected_test_member!(2, Third);
+
+    /// Test-only homogeneous identity and addition operations for one projected member kind.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedMemberOperation<const MEMBER: u8> {
+        /// Preserves one value.
+        Identity,
+
+        /// Adds two values in the same member family.
+        Add,
+    }
+
+    impl<const MEMBER: u8> From<AddOperation<ProjectedMemberType<MEMBER>>> for ProjectedMemberOperation<MEMBER> {
+        fn from(_: AddOperation<ProjectedMemberType<MEMBER>>) -> Self {
+            Self::Add
+        }
+    }
+
+    impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
+        type Type = ProjectedMemberType<MEMBER>;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Identity => "projected_member",
+                Self::Add => "add",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ProjectedMemberType<MEMBER>],
+            _region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
+        ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
+            check_count!("input", input_types, if matches!(self, Self::Identity) { 1 } else { 2 }, TypeError);
+            Ok(vec![ProjectedMemberType])
+        }
+    }
+
+    impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>, Operation: From<Self>>>
+        DifferentiableOperation<C> for ProjectedMemberOperation<MEMBER>
+    {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.primal().bind(self.clone(), Vec::new(), &primals)?.remove(0);
+            let tangent = if matches!(self, Self::Identity) {
+                inputs[0].tangent().clone()
+            } else {
+                match (inputs[0].tangent(), inputs[1].tangent()) {
+                    (MaybeZero::Zero(_), tangent) | (tangent, MaybeZero::Zero(_)) => tangent.clone(),
+                    (MaybeZero::Value(left), MaybeZero::Value(right)) => MaybeZero::Value(
+                        context.tangent().bind(self.clone(), Vec::new(), &[left.clone(), right.clone()])?.remove(0),
+                    ),
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    }
+
+    impl<
+        const MEMBER: u8,
+        V: Value<Type = ProjectedMemberType<MEMBER>>,
+        O: Operation<Type = ProjectedMemberType<MEMBER>> + From<AddOperation<ProjectedMemberType<MEMBER>>>,
+    > TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
+    {
+        fn transpose<D: TranspositionDriver<V, O>>(
+            &self,
+            context: &mut TranspositionContext<V, O>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
+            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            for accumulator in accumulators {
+                accumulator.accumulate(context, outputs[0].clone())?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Test-only composite operation family embedding all three member families.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum ProjectedProgramOperation {
+        /// First member operation, used by the ordinary projection tests.
+        First(ProjectedMemberOperation<0>),
+
+        /// Second member operation, which exercises the additional-member extensibility gate.
+        Second(ProjectedMemberOperation<1>),
+
+        /// Third member operation, used by transform tests to prove that generic machinery is member-kind-agnostic.
+        Third(ProjectedMemberOperation<2>),
+
+        /// Adds two values of the same composite member type.
+        Add,
+    }
+
+    impl From<AddOperation<ProjectedProgramType>> for ProjectedProgramOperation {
+        fn from(_: AddOperation<ProjectedProgramType>) -> Self {
+            Self::Add
+        }
+    }
+
+    impl ProjectedProgramOperation {
+        /// Delegates composite inference to one member operation. Fixture operations declare no region slots,
+        /// so staging rejects attached regions before inference and the member sees none.
+        fn infer_member<const MEMBER: u8>(
+            operation: &ProjectedMemberOperation<MEMBER>,
+            input_types: &[ProjectedProgramType],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError>
+        where
+            for<'t> &'t ProjectedMemberType<MEMBER>: TryFrom<&'t ProjectedProgramType, Error = TypeError>,
+            ProjectedProgramType: From<ProjectedMemberType<MEMBER>>,
+        {
+            let input_types = input_types
+                .iter()
+                .map(|r#type| <&ProjectedMemberType<MEMBER>>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            operation
+                .infer_output_types(input_types.as_slice(), &[])
+                .map(|types| types.into_iter().map(Into::into).collect())
+        }
+    }
+
+    impl Operation for ProjectedProgramOperation {
+        type Type = ProjectedProgramType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::First(operation) => operation.name(),
+                Self::Second(operation) => operation.name(),
+                Self::Third(operation) => operation.name(),
+                Self::Add => "add",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ProjectedProgramType],
+            _region_interfaces: &[RegionInterface<ProjectedProgramType>],
+        ) -> Result<Vec<ProjectedProgramType>, TypeError> {
+            match self {
+                Self::First(operation) => Self::infer_member(operation, input_types),
+                Self::Second(operation) => Self::infer_member(operation, input_types),
+                Self::Third(operation) => Self::infer_member(operation, input_types),
+                Self::Add => {
+                    check_count!("input", input_types, 2, TypeError);
+                    if input_types[0] != input_types[1] {
+                        return Err(TypeError::invalid("addition requires matching member types"));
+                    }
+                    Ok(vec![input_types[0].clone()])
+                }
+            }
+        }
+    }
+
+    impl InterpretableOperation<EagerContext<ProjectedProgramValue, Self>> for ProjectedProgramOperation {
+        fn interpret<D: InterpretationDriver<EagerContext<ProjectedProgramValue, Self>>>(
+            &self,
+            _context: &EagerContext<ProjectedProgramValue, Self>,
+            _driver: &D,
+            inputs: &[ProjectedProgramValue],
+        ) -> Result<Vec<ProjectedProgramValue>, ProgramError> {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            self.infer_output_types(input_types.as_slice(), &[])?;
+            if matches!(
+                self,
+                Self::Add
+                    | Self::First(ProjectedMemberOperation::Add)
+                    | Self::Second(ProjectedMemberOperation::Add)
+                    | Self::Third(ProjectedMemberOperation::Add)
+            ) {
+                let output = match (&inputs[0], &inputs[1]) {
+                    (ProjectedProgramValue::First(left), ProjectedProgramValue::First(right)) => {
+                        ProjectedProgramValue::First(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Second(left), ProjectedProgramValue::Second(right)) => {
+                        ProjectedProgramValue::Second(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Third(left), ProjectedProgramValue::Third(right)) => {
+                        ProjectedProgramValue::Third(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(vec![output])
+            } else {
+                Ok(inputs.to_vec())
+            }
+        }
+    }
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
     /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
@@ -261,6 +753,9 @@ pub(crate) mod tests {
         /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
         WithRegions(&'static [RegionSlot]),
+
+        /// Pure call whose body input types must match its operands, used by builder identity-instantiation tests.
+        Call,
     }
 
     impl Operation for TestRegionOperation {
@@ -271,6 +766,7 @@ pub(crate) mod tests {
                 Self::Add => "add",
                 Self::Effectful(_) => "effectful",
                 Self::WithRegions(_) => "with_regions",
+                Self::Call => "array_identity",
             }
         }
 
@@ -278,6 +774,7 @@ pub(crate) mod tests {
             match self {
                 Self::Add | Self::Effectful(_) => &[],
                 Self::WithRegions(slots) => slots,
+                Self::Call => const { &[RegionSlot::computation("body")] },
             }
         }
 
@@ -306,12 +803,26 @@ pub(crate) mod tests {
                     }
                     Ok(region_interfaces[0].output_types().to_vec())
                 }
+                Self::Call => {
+                    let [region_interface] = region_interfaces else {
+                        return Err(TypeError::invalid(format!(
+                            "array identity expects 1 attached region but got {}",
+                            region_interfaces.len(),
+                        )));
+                    };
+                    if region_interface.input_types() != input_types {
+                        return Err(TypeError::invalid(
+                            "array identity region input types do not match its operand types",
+                        ));
+                    }
+                    Ok(region_interface.output_types().to_vec())
+                }
             }
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
             Cow::Owned(Effects::explicit(match self {
-                Self::Add | Self::WithRegions(_) => EffectClasses::NONE,
+                Self::Add | Self::WithRegions(_) | Self::Call => EffectClasses::NONE,
                 Self::Effectful(effect) => EffectClasses::single(*effect),
             }))
         }
@@ -356,84 +867,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// [`BatchingDriver`] that counts the structural [`batch_program`](BatchingDriver::batch_program) requests a
-    /// region-carrying batching rule makes, delegating every request to the ordinary [`RecursiveBatchingDriver`] over
-    /// the same regions. Region-carrying rules discover their nested programs' natural output axes before instantiating
-    /// them at reconciled targets, and reuse a discovery program when its axes already match. This fixture lets rule
-    /// tests pin how many structural passes such a rule actually performs, which a program rendering alone cannot
-    /// observe.
-    pub(crate) struct CountingBatchingDriver<'r, V: Value, O: Operation<Type = V::Type>> {
-        /// [`Region`]s attached to the operation application under test, in operation-defined order.
-        regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>,
-
-        /// Number of structural program-batching requests observed so far.
-        batch_program_calls: Cell<usize>,
-    }
-
-    impl<'r, V: Value, O: Operation<Type = V::Type>> CountingBatchingDriver<'r, V, O> {
-        /// Creates a new [`CountingBatchingDriver`] over the provided attached regions.
-        pub(crate) fn new(regions: &'r Vec<Program<V, O, Vec<V>, Vec<V>>>) -> Self {
-            Self { regions, batch_program_calls: Cell::new(0) }
-        }
-
-        /// Returns the number of structural program-batching requests observed so far.
-        pub(crate) fn batch_program_calls(&self) -> usize {
-            self.batch_program_calls.get()
+    impl InterpretableOperation<EagerContext<Array, Self>> for TestOrderedStateOperation {
+        fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
+            &self,
+            _context: &EagerContext<Array, Self>,
+            _driver: &D,
+            inputs: &[Array],
+        ) -> Result<Vec<Array>, ProgramError> {
+            Ok(inputs.to_vec())
         }
     }
 
-    impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for CountingBatchingDriver<'_, V, O> {
-        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
-        where
-            V: 'r,
-            O: 'r,
-        {
-            self.regions.regions()
-        }
-    }
-
-    impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
-        for CountingBatchingDriver<'_, C::Constant, C::Operation>
-    {
-        fn batch_region(
-            &self,
-            context: &BatchingContext<C, P>,
-            index: usize,
-            inputs: Vec<P::Batch>,
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            RecursiveBatchingDriver::new(self.regions).batch_region(context, index, inputs)
-        }
-
-        fn batch_program(
-            &self,
-            context: &BatchingContext<C, P>,
-            region: RegionRef<'_, C::Constant, C::Operation>,
-            input_axes: &[BatchAxis],
-            output_axes_policy: ProgramBatchingOutputAxesPolicy,
-        ) -> Result<P::BatchedProgram, BatchingError> {
-            self.batch_program_calls.set(self.batch_program_calls.get() + 1);
-            RecursiveBatchingDriver::new(self.regions).batch_program(context, region, input_axes, output_axes_policy)
-        }
-
-        fn restore_batch(
-            &self,
-            value: C::Value,
-            batch_axis: BatchAxis,
-            r#type: &C::Type,
-            inputs: &[P::Batch],
-        ) -> Result<P::Batch, BatchingError> {
-            P::restore_batch(value, batch_axis, r#type, inputs)
-        }
-
-        fn align_batch_axis(
-            &self,
-            context: &BatchingContext<C, P>,
-            batch: P::Batch,
-            axis: Axis,
-        ) -> Result<P::Batch, BatchingError> {
-            P::align_batch_axis(context, batch, axis)
-        }
-    }
+    impl PartiallyEvaluatableOperation<EagerContext<Array, Self>> for TestOrderedStateOperation {}
 
     /// Transform marker used to observe generic region-cache preservation without depending on a built-in transform.
     pub(crate) struct IdentityTransform;
@@ -526,75 +971,5 @@ pub(crate) mod tests {
             assert_eq!(programs.len(), 1);
             programs.pop().unwrap()
         }
-    }
-
-    /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary,
-    /// shared by tests comparing direct reference transforms with explicit discharge. The program takes a Boolean
-    /// predicate and an `f32[]` initial value, allocates one local reference from that initial value, and passes the
-    /// reference into a condition whose branches access it with unequal modes. The `true` branch accumulates `1.0` and
-    /// reads the reference, while the `false` branch swaps in `9.0` and yields the replaced value. Its two outputs are
-    /// the condition's snapshot followed by the frozen final state, so a discharged program must thread identical state
-    /// through both branches and keep both public outputs interpretable. On `[true, 4.0]` the outputs are `[5.0, 5.0]`,
-    /// and on `[false, 4.0]` they are `[4.0, 9.0]`.
-    pub(crate) fn test_condition_program()
-    -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-
-        let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = true_builder.add_input(reference_type.clone().into());
-        let update = true_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
-        true_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let snapshot = true_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let true_branch = true_builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![snapshot],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = false_builder.add_input(reference_type.into());
-        let replacement = false_builder.add_constant(ArrayIrValue::Array(Array::scalar(9.0_f32)));
-        let snapshot = false_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
-            .unwrap()[0];
-        let false_branch = false_builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![snapshot],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let true_branch = builder.import_region(true_branch.entry_region_ref());
-        let false_branch = builder.import_region(false_branch.entry_region_ref());
-        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
-        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let snapshot = builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, reference],
-                None,
-            )
-            .unwrap()[0];
-        let frozen =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![snapshot, frozen],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap()
     }
 }

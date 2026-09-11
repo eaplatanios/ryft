@@ -785,9 +785,6 @@ mod tests {
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
-    use crate::contexts::tests::{
-        ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
-    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         CotangentDestinationKind, DifferentiationError, TransposableOperation, TranspositionContext,
@@ -808,6 +805,7 @@ mod tests {
         EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot,
         ValueProjection,
     };
+    use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
 
     use super::*;
