@@ -1,10 +1,8 @@
 use std::borrow::Cow;
 use std::fmt::Display;
-use std::marker::PhantomData;
 
 // TODO(eaplatanios): Review this module.
 
-// TODO(eaplatanios): Why this import?
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
@@ -13,10 +11,14 @@ use crate::arrays::{
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
-    batch_projected_operation,
+    MemberBatchableOperation, batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::differentiation::{
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    MemberDifferentiableOperation,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
@@ -28,8 +30,9 @@ use crate::operations::manipulation::transposition::{Transpose, TransposeOperati
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder,
-    ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    EffectClass, EffectClasses, Effects, MemberOperation, Operation, OperationFormatter, OperationProjection,
+    ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueProjection,
 };
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
@@ -490,22 +493,15 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
 /// verbatim to the kernel as its configuration.
 ///
-/// In the array IR, each dynamic axis occurrence in the declared outputs requires one trailing first-class
-/// dimension operand, ordered first by output and then by axis. Type inference verifies that each operand defines the
-/// exact variable referenced by its corresponding output axis. These logical result extents do not enter the foreign
-/// kernel ABI: only the leading array operands are passed to the kernel. Eager execution and backend lowering use the
-/// trailing operands to verify or attach the declared logical sizes to the returned buffers.
-///
-/// The type parameter selects that operand contract without introducing a second semantic operation:
-///
-///   - `CustomCallOperation<ArrayType>` accepts only the foreign kernel's array operands and is suitable for
-///     programs over homogeneous arrays whose result extents are fully described by their array types.
-///   - `CustomCallOperation<ArrayIrType>` additionally accepts the trailing first-class dimension operands
-///     described above and is suitable for mixed array/dimension programs.
-///
-/// Both forms carry the same target, output declarations, attributes, effects, rendering, and backend-kernel
-/// semantics. Conversion into the mixed form only reparameterizes the operation family; it moves the existing
-/// descriptor without copying its owned metadata.
+/// This is an [`ArrayType`] operation that participates in two operand contracts. In homogeneous array programs it
+/// accepts only the foreign kernel's array operands, so every declared output must have a static shape. As a mixed
+/// member of the array IR (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one trailing first-class
+/// dimension operand per dynamic axis occurrence in the declared outputs, ordered first by output and then by axis,
+/// and type inference verifies that each operand defines the exact variable referenced by its corresponding output
+/// axis. These logical result extents do not enter the foreign kernel ABI: only the leading array operands are passed
+/// to the kernel. Eager execution and backend lowering use the trailing operands to verify or attach the declared
+/// logical sizes to the returned buffers. Both contracts share one payload with the same target, output declarations,
+/// attributes, effects, rendering, and backend-kernel semantics.
 ///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
@@ -556,7 +552,7 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// tiling attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
 /// operation). If a configuration knob only makes sense for one backend, it does not belong on this operation.
 #[derive(Clone, Debug)]
-pub struct CustomCallOperation<T: Type> {
+pub struct CustomCallOperation {
     /// Name under which the foreign kernel is registered with the executing backend.
     target_name: String,
 
@@ -577,12 +573,9 @@ pub struct CustomCallOperation<T: Type> {
 
     /// Optional declared calling convention for discharging one level of ragged batching.
     ragged_contract: Option<CustomCallRaggedContract>,
-
-    /// Type universe that determines the operation's operand contract.
-    marker: PhantomData<fn() -> T>,
 }
 
-impl CustomCallOperation<ArrayType> {
+impl CustomCallOperation {
     /// Creates a new [`CustomCallOperation`] with the provided target name and declared output types.
     ///
     /// # Parameters
@@ -599,12 +592,58 @@ impl CustomCallOperation<ArrayType> {
             effect_class: None,
             batching: CustomCallBatching::default(),
             ragged_contract: None,
-            marker: PhantomData,
         }
     }
-}
 
-impl<T: Type> CustomCallOperation<T> {
+    /// Returns the name under which the foreign kernel is registered with the executing backend.
+    #[inline]
+    pub fn target_name(&self) -> &str {
+        self.target_name.as_str()
+    }
+
+    /// Returns the declared output types of the call.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        self.output_types.as_slice()
+    }
+
+    /// Returns the typed configuration attributes forwarded to the kernel, in insertion order.
+    #[inline]
+    pub fn attributes(&self) -> &[(String, CustomCallAttribute)] {
+        self.attributes.as_slice()
+    }
+
+    /// Returns the flat array input/output buffer aliases in declaration order.
+    #[inline]
+    pub fn input_output_aliases(&self) -> &[CustomCallInputOutputAlias] {
+        self.input_output_aliases.as_slice()
+    }
+
+    /// Returns whether the call has observable side effects beyond its returned outputs.
+    #[inline]
+    pub fn has_side_effect(&self) -> bool {
+        self.effect_class.is_some()
+    }
+
+    /// Returns the observable [`EffectClass`] declared by this call, or `None` for a pure call.
+    #[inline]
+    pub fn effect_class(&self) -> Option<EffectClass> {
+        self.effect_class
+    }
+
+    /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one of this call's
+    /// operands.
+    #[inline]
+    pub fn batching(&self) -> CustomCallBatching {
+        self.batching
+    }
+
+    /// Returns the declared ragged calling convention, when present.
+    #[inline]
+    pub fn ragged_contract(&self) -> Option<&CustomCallRaggedContract> {
+        self.ragged_contract.as_ref()
+    }
+
     /// Returns a copy of this [`CustomCallOperation`] with the provided typed configuration attribute appended.
     #[inline]
     pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
@@ -670,55 +709,6 @@ impl<T: Type> CustomCallOperation<T> {
         self
     }
 
-    /// Returns the name under which the foreign kernel is registered with the executing backend.
-    #[inline]
-    pub fn target_name(&self) -> &str {
-        self.target_name.as_str()
-    }
-
-    /// Returns the declared output types of the call.
-    #[inline]
-    pub fn output_types(&self) -> &[ArrayType] {
-        self.output_types.as_slice()
-    }
-
-    /// Returns the typed configuration attributes forwarded to the kernel, in insertion order.
-    #[inline]
-    pub fn attributes(&self) -> &[(String, CustomCallAttribute)] {
-        self.attributes.as_slice()
-    }
-
-    /// Returns the flat array input/output buffer aliases in declaration order.
-    #[inline]
-    pub fn input_output_aliases(&self) -> &[CustomCallInputOutputAlias] {
-        self.input_output_aliases.as_slice()
-    }
-
-    /// Returns whether the call has observable side effects beyond its returned outputs.
-    #[inline]
-    pub fn has_side_effect(&self) -> bool {
-        self.effect_class.is_some()
-    }
-
-    /// Returns the observable [`EffectClass`] declared by this call, or `None` for a pure call.
-    #[inline]
-    pub fn effect_class(&self) -> Option<EffectClass> {
-        self.effect_class
-    }
-
-    /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one of this call's
-    /// operands.
-    #[inline]
-    pub fn batching(&self) -> CustomCallBatching {
-        self.batching
-    }
-
-    /// Returns the declared ragged calling convention, when present.
-    #[inline]
-    pub fn ragged_contract(&self) -> Option<&CustomCallRaggedContract> {
-        self.ragged_contract.as_ref()
-    }
-
     /// Returns this payload with every declared output identity renamed according to `renaming`.
     fn renamed(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self {
@@ -733,7 +723,6 @@ impl<T: Type> CustomCallOperation<T> {
             effect_class: self.effect_class,
             batching: self.batching,
             ragged_contract: self.ragged_contract.as_ref().map(|contract| contract.renamed(renaming)).transpose()?,
-            marker: PhantomData,
         })
     }
 
@@ -822,70 +811,18 @@ impl<T: Type> CustomCallOperation<T> {
         }
     }
 
-    /// Renders this payload independently of its homogeneous or composite operation contract.
-    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CUSTOM_CALL_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("target", &self.target_name)?;
-            for (name, value) in &self.attributes {
-                operation.field(name, value)?;
-            }
-            for alias in &self.input_output_aliases {
-                operation.field("input_output_alias", alias)?;
-            }
-            if let Some(effect_class) = self.effect_class {
-                operation.field("has_side_effect", true)?;
-                if effect_class != EffectClass::OrderedIo {
-                    operation.field("effect_class", effect_class)?;
-                }
-            }
-            if self.batching != CustomCallBatching::default() {
-                operation.field("batching", self.batching)?;
-            }
-            if let Some(contract) = &self.ragged_contract {
-                operation.field("ragged_contract", contract)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-impl From<CustomCallOperation<ArrayType>> for CustomCallOperation<ArrayIrType> {
-    fn from(operation: CustomCallOperation<ArrayType>) -> Self {
-        Self {
-            target_name: operation.target_name,
-            output_types: operation.output_types,
-            attributes: operation.attributes,
-            input_output_aliases: operation.input_output_aliases,
-            effect_class: operation.effect_class,
-            batching: operation.batching,
-            ragged_contract: operation.ragged_contract,
-            marker: PhantomData,
+    /// Returns the [`ProgramError`] reported when a transform asks this opaque call for a derivative. Foreign kernels
+    /// have no derivable derivative, so users must wrap the call with `custom_jvp` or `custom_vjp` (which is also how
+    /// JAX handles `ffi_call` differentiation).
+    fn no_differentiation_rule_error(&self) -> ProgramError {
+        ProgramError::UnsupportedOperation {
+            message: format!(
+                "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
+                self.target_name, CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME,
+            ),
         }
     }
-}
 
-impl From<CustomCallOperation<ArrayIrType>> for CustomCallOperation<ArrayType> {
-    fn from(operation: CustomCallOperation<ArrayIrType>) -> Self {
-        Self {
-            target_name: operation.target_name,
-            output_types: operation.output_types,
-            attributes: operation.attributes,
-            input_output_aliases: operation.input_output_aliases,
-            effect_class: operation.effect_class,
-            batching: operation.batching,
-            ragged_contract: operation.ragged_contract,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<T: Type> Display for CustomCallOperation<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render_operation(formatter, 0)
-    }
-}
-
-impl<T: Type> CustomCallOperation<T> {
     /// Validates flat input/output aliases against the array operands of this operation.
     fn validate_input_output_aliases(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
         for alias in &self.input_output_aliases {
@@ -1392,7 +1329,14 @@ impl<T: Type> CustomCallOperation<T> {
     }
 }
 
-impl Operation for CustomCallOperation<ArrayType> {
+impl Display for CustomCallOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for CustomCallOperation {
     type Type = ArrayType;
 
     #[inline]
@@ -1427,81 +1371,40 @@ impl Operation for CustomCallOperation<ArrayType> {
         Cow::Owned(Effects::explicit(self.effect_class.map(EffectClasses::single).unwrap_or(EffectClasses::NONE)))
     }
 
-    fn rename_type_identities(
-        &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
-    ) -> Result<Self, TypeError> {
-        self.renamed(renaming)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
-impl Operation for CustomCallOperation<ArrayIrType> {
-    type Type = ArrayIrType;
-
     #[inline]
-    fn name(&self) -> &'static str {
-        CUSTOM_CALL_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
-        check_count!("region", region_interfaces, 0, TypeError);
-        let dynamic_output_dimensions = self
-            .output_types
-            .iter()
-            .flat_map(|output_type| output_type.shape().dimensions())
-            .filter_map(Dimension::variable)
-            .collect::<Vec<_>>();
-        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
-            return Err(TypeError::invalid(format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimensions but only {} inputs were \
-                 provided",
-                dynamic_output_dimensions.len(),
-                input_types.len(),
-            )));
-        };
-        let array_input_types =
-            input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
-        self.validate_input_output_aliases(array_input_types.as_slice())?;
-        self.validate_ragged_contract(array_input_types.as_slice())?;
-        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
-            let actual_variable = <&crate::arrays::DimensionType>::try_from(input_type)?.variable();
-            if actual_variable != expected_variable {
-                return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent operand defines dimension variable \
-                     `{actual_variable}`, but the corresponding declared output axis refers to \
-                     `{expected_variable}`",
-                )));
-            }
-        }
-        Ok(self.output_types.iter().cloned().map(Into::into).collect())
-    }
-
-    #[inline]
-    fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Owned(Effects::explicit(self.effect_class.map(EffectClasses::single).unwrap_or(EffectClasses::NONE)))
-    }
-
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         self.renamed(renaming)
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
+        OperationFormatter::new(formatter, indentation, CUSTOM_CALL_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("target", &self.target_name)?;
+            for (name, value) in &self.attributes {
+                operation.field(name, value)?;
+            }
+            for alias in &self.input_output_aliases {
+                operation.field("input_output_alias", alias)?;
+            }
+            if let Some(effect_class) = self.effect_class {
+                operation.field("has_side_effect", true)?;
+                if effect_class != EffectClass::OrderedIo {
+                    operation.field("effect_class", effect_class)?;
+                }
+            }
+            if self.batching != CustomCallBatching::default() {
+                operation.field("batching", self.batching)?;
+            }
+            if let Some(contract) = &self.ragged_contract {
+                operation.field("ragged_contract", contract)?;
+            }
+            Ok(())
+        })
     }
 }
 
-impl_reference_dischargeable_operation!(@reference_free <T> CustomCallOperation<T> where T: Type);
+impl_reference_dischargeable_operation!(@reference_free CustomCallOperation);
 
-impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation<ArrayType> {
+impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1515,10 +1418,8 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
 // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`. An all-known
 // custom call folds into the known side (executing there only if the known-side context can run foreign kernels), and a
 // side-effecting residual call survives dead-code elimination because `Operation::effects` is not `EffectClasses::NONE`.
-impl<T: Type, C: Context<Type = T, Operation: From<CustomCallOperation<T>>>> PartiallyEvaluatableOperation<C>
-    for CustomCallOperation<T>
-where
-    CustomCallOperation<T>: Operation<Type = T>,
+impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> PartiallyEvaluatableOperation<C>
+    for CustomCallOperation
 {
 }
 
@@ -1550,10 +1451,10 @@ where
 // host `usize` in this universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip
 // count is a first-class dimension operand.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for CustomCallOperation<ArrayType>
+    for CustomCallOperation
 where
     C::Value: PartialEq,
-    C::Operation: From<CustomCallOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
+    C::Operation: From<CustomCallOperation> + From<ScanOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -1690,6 +1591,135 @@ where
     }
 }
 
+impl_differentiable_operation! {
+    CustomCallOperation,
+    jvp<C>
+    {
+        |operation, _context, _driver, _inputs| {
+            // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
+            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
+            // `ffi_call` differentiation.
+            Err(operation.no_differentiation_rule_error().into())
+        }
+    },
+    transpose = @nonlinear,
+}
+
+// In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension operand per
+// dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference verifies
+// that each operand defines exactly the variable referenced by its output axis. The trailing operands never reach the
+// foreign kernel; they only ground the declared logical result extents.
+impl MemberOperation<ArrayIrType> for CustomCallOperation {
+    fn infer_parent_region_input_types(
+        &self,
+        _input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        Ok(Vec::new())
+    }
+
+    fn infer_parent_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        let dynamic_output_dimensions = self
+            .output_types
+            .iter()
+            .flat_map(|output_type| output_type.shape().dimensions())
+            .filter_map(Dimension::variable)
+            .collect::<Vec<_>>();
+        let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
+            return Err(TypeError::invalid(format!(
+                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimensions but only {} inputs were \
+                 provided",
+                dynamic_output_dimensions.len(),
+                input_types.len(),
+            )));
+        };
+        let array_input_types =
+            input_types[..array_input_count].iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+        self.validate_input_output_aliases(array_input_types.as_slice())?;
+        self.validate_ragged_contract(array_input_types.as_slice())?;
+        for (input_type, expected_variable) in input_types[array_input_count..].iter().zip(dynamic_output_dimensions) {
+            let actual_variable = <&crate::arrays::DimensionType>::try_from(input_type)?.variable();
+            if actual_variable != expected_variable {
+                return Err(TypeError::invalid(format!(
+                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent operand defines dimension variable \
+                     `{actual_variable}`, but the corresponding declared output axis refers to \
+                     `{expected_variable}`",
+                )));
+            }
+        }
+        Ok(self.output_types.iter().cloned().map(Into::into).collect())
+    }
+
+    #[inline]
+    fn rename_parent_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<DimensionVariable>,
+    ) -> Result<Self, TypeError> {
+        self.renamed(renaming)
+    }
+}
+
+// Mixed-universe interpretation splits the operands into the kernel's array inputs and the trailing declared result
+// extents, runs the kernel through the projected array value family, and verifies that every dynamic output axis has
+// exactly the extent its operand declared before lifting the outputs back into the parent value family.
+impl<C> MemberInterpretableOperation<C> for CustomCallOperation
+where
+    C: Domain<
+            Type = ArrayIrType,
+            Value: ValueProjection<
+                ArrayType,
+                Projected: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>,
+            > + ValueProjection<DimensionType, Projected = DimensionValue>,
+        >,
+{
+    fn interpret_in_parent<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_parent_output_types(input_types.as_slice(), &[])?;
+        let array_input_count = inputs.len() - self.dynamic_output_dimension_count();
+        let array_inputs = inputs[..array_input_count]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<ArrayType>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_extents = inputs[array_input_count..]
+            .iter()
+            .cloned()
+            .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = <C::Value as ValueProjection<ArrayType>>::Projected::custom_call(self, array_inputs.iter())?;
+        check_count!("output", outputs, self.output_types.len(), ProgramError);
+        let mut output_extents = output_extents.into_iter();
+        for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
+            for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+                if matches!(dimension, Dimension::Dynamic(_)) {
+                    let expected_extent = output_extents.next().unwrap().extent();
+                    let actual_extent = output.dimension_size(axis)?;
+                    if actual_extent != expected_extent {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "`{CUSTOM_CALL_OPERATION_NAME}` output {output_index} axis {axis} has extent \
+                                 {actual_extent}, but its explicit extent operand is {expected_extent}",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(outputs.into_iter().map(<C::Value as ValueProjection<ArrayType>>::from_projected).collect())
+    }
+}
+
 // Mixed array/dimension batching rule for [`CustomCallOperation`]. It applies the same all-replicated shortcut and
 // the same [`CustomCallBatching`] behaviors as the homogeneous rule above, with two composite-universe additions.
 //
@@ -1704,24 +1734,24 @@ where
 // [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
 // batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
 // dimension is itself dynamic.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: PartialEq
         + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: PartialEq + Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<CustomCallOperation<ArrayIrType>>
+    C::Operation: From<CustomCallOperation>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<ScanOperation<C::Constant>>
         + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<CustomCallOperation<ArrayType>>
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<CustomCallOperation>
         + From<ScanOperation<<C::Constant as ValueProjection<ArrayType>>::Projected>>
         + From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
@@ -1757,7 +1787,7 @@ where
         }
         let batch_dimension = <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.to_dimension();
         if extents.is_empty() && batch_dimension.value().is_some() {
-            return batch_projected_operation(context, &CustomCallOperation::<ArrayType>::from(self.clone()), inputs);
+            return batch_projected_operation(context, self, inputs);
         }
 
         let Some((index, mapped)) = arrays.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
@@ -1894,28 +1924,17 @@ where
     }
 }
 
-impl_differentiable_operation! {
-    <T> CustomCallOperation<T>,
-    jvp<C>
-    where
-        T: Type,
-    {
-        |operation, _context, _driver, _inputs| {
-            // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
-            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
-            // `ffi_call` differentiation.
-            Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
-                    operation.target_name,
-                    CUSTOM_JVP_OPERATION_NAME,
-                    CUSTOM_VJP_OPERATION_NAME,
-                ),
-            }
-            .into())
-        }
-    },
-    transpose = @nonlinear,
+// Differentiation in the mixed universe reports the same error as the homogeneous rule: the kernel is opaque, so the
+// derivative must come from a `custom_jvp` or `custom_vjp` wrapper.
+impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for CustomCallOperation {
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        _context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(self.no_differentiation_rule_error().into())
+    }
 }
 
 /// Represents the ability to call foreign kernels registered with the executing backend. [`CustomCall`] stages or
@@ -1926,23 +1945,23 @@ pub trait CustomCall: Sized {
     /// Calls the foreign kernel described by `operation` with the provided inputs, returning one value per
     /// declared output type, and a [`ProgramError`] if something goes wrong.
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
-        operation: &CustomCallOperation<ArrayType>,
+        operation: &CustomCallOperation,
         inputs: I,
     ) -> Result<Vec<Self>, ProgramError>
     where
         Self: 'a;
 }
 
-// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation<ArrayType>`] through its own
+// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation`] through its own
 // context. The conversion bound makes this disjoint from the eager reference value types (whose context operation is
 // [`ConstantOperation`]), so it covers the transform tracers and
 // backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> CustomCall for V
 where
-    V::DispatchDomain: Context<Operation: From<CustomCallOperation<ArrayType>>>,
+    V::DispatchDomain: Context<Operation: From<CustomCallOperation>>,
 {
     fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
-        operation: &CustomCallOperation<ArrayType>,
+        operation: &CustomCallOperation,
         inputs: I,
     ) -> Result<Vec<Self>, ProgramError>
     where
@@ -1981,7 +2000,6 @@ mod tests {
         ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope};
@@ -2131,8 +2149,7 @@ mod tests {
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
         assert_eq!(pure.effects().classes(), EffectClasses::NONE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
-        let roundtrip =
-            CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayIrType>::from(operation.clone()));
+        let roundtrip = operation.clone();
         assert_eq!(roundtrip.input_output_aliases(), operation.input_output_aliases());
         assert!(matches!(
             operation.clone().with_input_output_alias(0, 1),
@@ -2182,22 +2199,18 @@ mod tests {
                 Dimension::Dynamic(columns.clone()),
             ]),
         );
-        let dynamic_operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
-            "ryft.test.dynamic",
-            vec![dynamic_output_type.clone()],
-        ));
+        let dynamic_operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()]);
         let input_types = vec![
             vector_type().into(),
             DimensionType::new(rows.clone()).into(),
             DimensionType::new(columns.clone()).into(),
         ];
-        let aliased_dynamic_operation = CustomCallOperation::<ArrayIrType>::from(
+        let aliased_dynamic_operation =
             CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()])
                 .with_input_output_alias(0, 0)
-                .unwrap(),
-        );
+                .unwrap();
         assert_eq!(
-            aliased_dynamic_operation.infer_output_types(
+            aliased_dynamic_operation.infer_parent_output_types(
                 &[
                     dynamic_output_type.clone().into(),
                     DimensionType::new(rows.clone()).into(),
@@ -2207,9 +2220,12 @@ mod tests {
             ),
             Ok(vec![dynamic_output_type.clone().into()]),
         );
-        assert_eq!(dynamic_operation.infer_output_types(&input_types, &[]), Ok(vec![dynamic_output_type.into()]));
         assert_eq!(
-            dynamic_operation.infer_output_types(
+            dynamic_operation.infer_parent_output_types(&input_types, &[]),
+            Ok(vec![dynamic_output_type.into()])
+        );
+        assert_eq!(
+            dynamic_operation.infer_parent_output_types(
                 &[vector_type().into(), DimensionType::new(columns).into(), DimensionType::new(rows).into()],
                 &[],
             ),
@@ -2219,7 +2235,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            dynamic_operation.infer_output_types(
+            dynamic_operation.infer_parent_output_types(
                 &[DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap(),))
                     .into()],
                 &[],
@@ -2253,9 +2269,9 @@ mod tests {
                 operation.to_string(),
                 format!("custom_call [target=ryft.test.effect, has_side_effect=true, effect_class={effect_class}]"),
             );
-            let mixed = CustomCallOperation::<ArrayIrType>::from(operation.clone());
+            let mixed = operation.clone();
             assert_eq!(mixed.effect_class(), Some(effect_class));
-            assert_eq!(CustomCallOperation::<ArrayType>::from(mixed).effect_class(), Some(effect_class));
+            assert_eq!(mixed.effect_class(), Some(effect_class));
             assert_eq!(
                 operation.rename_type_identities(&TypeIdentityRenaming::default()).unwrap().effect_class(),
                 Some(effect_class),
@@ -2336,9 +2352,9 @@ mod tests {
         );
 
         // The declaration survives both universe conversions and identity renaming.
-        let mixed = CustomCallOperation::<ArrayIrType>::from(operation.clone());
+        let mixed = operation.clone();
         assert_eq!(mixed.ragged_contract(), Some(&contract));
-        assert_eq!(CustomCallOperation::<ArrayType>::from(mixed).ragged_contract(), Some(&contract));
+        assert_eq!(mixed.ragged_contract(), Some(&contract));
         let renamed_length = DimensionVariable::new("renamed_length", DimensionBounds::new(0, Some(5)).unwrap());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(length, renamed_length.clone()).unwrap();
@@ -2814,12 +2830,15 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
             .unwrap();
         let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(1)).unwrap();
-        let operation = CustomCallOperation::<ArrayIrType>::from(
+        let operation =
             CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [3, 4])])
                 .with_batching(CustomCallBatching::BroadcastAll)
-                .with_ragged_contract(preserved_ragged_contract(length).batch_prefixed(false)),
-        );
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts().0;
+                .with_ragged_contract(preserved_ragged_contract(length).batch_prefixed(false));
+        let outputs = operation
+            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
         assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
@@ -3165,9 +3184,9 @@ mod tests {
         );
 
         // Both conversions into and out of the mixed family, and identity renaming, preserve the selection.
-        let mixed = CustomCallOperation::<ArrayIrType>::from(broadcast.clone());
+        let mixed = broadcast.clone();
         assert_eq!(mixed.batching(), CustomCallBatching::BroadcastAll);
-        assert_eq!(CustomCallOperation::<ArrayType>::from(mixed).batching(), CustomCallBatching::BroadcastAll);
+        assert_eq!(mixed.batching(), CustomCallBatching::BroadcastAll);
         assert_eq!(
             broadcast.rename_type_identities(&TypeIdentityRenaming::default()).unwrap().batching(),
             CustomCallBatching::BroadcastAll,
@@ -3558,12 +3577,11 @@ mod tests {
             vec![0],
         )])?;
         let extent_operand = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
-                .with_batching(CustomCallBatching::BroadcastAll)
-                .with_ragged_contract(preserved_ragged_contract(length.clone())),
-        );
-        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+        let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_ragged_contract(preserved_ragged_contract(length.clone()));
+        let (outputs, evidence) =
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
         assert!(evidence.is_empty());
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].ragged_axes().len(), 1);
@@ -3577,29 +3595,28 @@ mod tests {
     fn test_array_ir_custom_call_attaches_fresh_ragged_output_to_replicated_call() -> Result<(), ProgramError> {
         let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
         let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new(
-                "ryft.test.fresh_ragged",
-                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
-            )
-            .with_ragged_contract(CustomCallRaggedContract::new(
-                Vec::new(),
-                vec![
-                    CustomCallRaggedOutputBinding::Fresh {
-                        axis: 0,
-                        extent_output_index: 1,
-                        dimension: output_length.clone(),
-                    },
-                    CustomCallRaggedOutputBinding::Consumed,
-                ],
-            )),
-        );
+        let operation = CustomCallOperation::new(
+            "ryft.test.fresh_ragged",
+            vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
+        )
+        .with_ragged_contract(CustomCallRaggedContract::new(
+            Vec::new(),
+            vec![
+                CustomCallRaggedOutputBinding::Fresh {
+                    axis: 0,
+                    extent_output_index: 1,
+                    dimension: output_length.clone(),
+                },
+                CustomCallRaggedOutputBinding::Consumed,
+            ],
+        ));
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F32, [4]).into());
         let axis_extent = trace.input(DimensionType::new(batch_size).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, axis_extent);
-        let (outputs, evidence) =
-            operation.batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?.into_parts();
+        let (outputs, evidence) = operation
+            .batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?
+            .into_parts();
         assert!(evidence.is_empty());
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].ragged_axes()[0].axis(), 0);
@@ -3613,8 +3630,7 @@ mod tests {
     fn test_array_ir_dense_custom_call_validates_extents_before_array_projection() {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
-        let operation =
-            CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type]);
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -3624,7 +3640,7 @@ mod tests {
             ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32))),
         ];
         assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &inputs),
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs),
             Err(BatchingError::Type(TypeError::Invalid { message }))
                 if message == "expected dimension type but got array type",
         ));
@@ -3636,10 +3652,8 @@ mod tests {
     fn test_array_ir_custom_call_broadcasts_all_operands_with_regrouped_extents() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-                .with_batching(CustomCallBatching::BroadcastAll),
-        );
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
+            .with_batching(CustomCallBatching::BroadcastAll);
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
@@ -3677,24 +3691,22 @@ mod tests {
     #[test]
     fn test_array_ir_custom_call_fresh_output_composes_under_nested_dense_batching() -> Result<(), ProgramError> {
         let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new(
-                "ryft.test.fresh_ragged",
-                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
-            )
-            .with_batching(CustomCallBatching::BroadcastAll)
-            .with_ragged_contract(CustomCallRaggedContract::new(
-                Vec::new(),
-                vec![
-                    CustomCallRaggedOutputBinding::Fresh {
-                        axis: 0,
-                        extent_output_index: 1,
-                        dimension: output_length.clone(),
-                    },
-                    CustomCallRaggedOutputBinding::Consumed,
-                ],
-            )),
-        );
+        let operation = CustomCallOperation::new(
+            "ryft.test.fresh_ragged",
+            vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
+        )
+        .with_batching(CustomCallBatching::BroadcastAll)
+        .with_ragged_contract(CustomCallRaggedContract::new(
+            Vec::new(),
+            vec![
+                CustomCallRaggedOutputBinding::Fresh {
+                    axis: 0,
+                    extent_output_index: 1,
+                    dimension: output_length.clone(),
+                },
+                CustomCallRaggedOutputBinding::Consumed,
+            ],
+        ));
         let output_types = operation
             .output_types
             .iter()
@@ -3718,7 +3730,7 @@ mod tests {
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
         let (outputs, evidence) = operation
-            .batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
+            .batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
             .into_parts();
         assert!(evidence.is_empty());
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -3757,10 +3769,7 @@ mod tests {
     fn test_array_ir_custom_call_batches_all_replicated_operands_unchanged() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
-            "ryft.test.dynamic",
-            vec![output_type.clone()],
-        ));
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type.clone()]);
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(vector_type().into());
@@ -3803,10 +3812,8 @@ mod tests {
     fn test_array_ir_custom_call_batches_sequentially_with_extent_carries() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-                .with_batching(CustomCallBatching::Sequential { unroll: None }),
-        );
+        let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
+            .with_batching(CustomCallBatching::Sequential { unroll: None });
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
@@ -3864,12 +3871,14 @@ mod tests {
             vec![0],
         )])?;
         let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
-                .with_batching(CustomCallBatching::Sequential { unroll: None })
-                .with_ragged_contract(preserved_ragged_contract(length)),
-        );
-        let output = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts().0.remove(0);
+        let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+            .with_batching(CustomCallBatching::Sequential { unroll: None })
+            .with_ragged_contract(preserved_ragged_contract(length));
+        let output = operation
+            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])?
+            .into_parts()
+            .0
+            .remove(0);
         let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![output.value().atom_id().unwrap()],
             vec![Placeholder; 3],
@@ -3896,10 +3905,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_custom_call_rejects_transforms() {
-        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
-            "ryft.test.add_one",
-            vec![vector_type()],
-        ));
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(vector_type().into());
         let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
@@ -3928,7 +3934,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            operation.batch(&batching_context, &EmptyRegionDriver, &[mapped]),
+            operation.batch_in_parent(&batching_context, &EmptyRegionDriver, &[mapped]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
                     == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
@@ -3936,17 +3942,10 @@ mod tests {
                         with `CustomCallOperation::with_batching`",
         ));
 
-        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        // Transposition of the mixed carrier routes through the composite dispatch to the projected non-linear rule.
         assert!(matches!(
-            operation.transpose(
-                &mut TranspositionContext::new(transposition_context.clone()),
-                &EmptyRegionDriver,
-                &[],
-                &[],
-                &[],
-            ),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `custom_call` is not transposable",
+            program.transpose_with_respect_to(&[0], &[]),
+            Err(error) if error.to_string() == "operation `custom_call` is not transposable",
         ));
     }
 }

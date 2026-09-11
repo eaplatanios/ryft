@@ -201,7 +201,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Tag(TagOperation<ArrayType>),
     Rematerialize(RematerializeOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
-    CustomCall(CustomCallOperation<ArrayType>),
+    CustomCall(CustomCallOperation),
     CustomJvp(CustomJvpOperation<ArrayType>),
     CustomVjp(CustomVjpOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
@@ -491,7 +491,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Concatenate(ConcatenateOperation<ArrayIrType>),
 
     /// Mixed foreign-kernel call whose trailing dimension operands define its dynamic output axes.
-    CustomCall(CustomCallOperation<ArrayIrType>),
+    #[ryft(mixed)]
+    CustomCall(CustomCallOperation),
 
     /// Mixed padding operation with one explicit result-extent operand per output axis.
     Pad(PadOperation<ArrayIrType>),
@@ -711,13 +712,6 @@ impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for Array
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
         Self::Concatenate(operation.into())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<CustomCallOperation<ArrayType>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: CustomCallOperation<ArrayType>) -> Self {
-        Self::CustomCall(operation.into())
     }
 }
 

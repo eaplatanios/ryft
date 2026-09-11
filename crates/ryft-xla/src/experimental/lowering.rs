@@ -3445,8 +3445,8 @@ fn lower_custom_call_memory_layouts(
 /// the same handler ABI but uses a fresh local token without joining the ordered chain. Handlers are resolved by the XLA
 /// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
 /// `Client::register_ffi_handler`).
-fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
-    operation: &CustomCallOperation<T>,
+fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &CustomCallOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -3454,10 +3454,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    CustomCallOperation<T>: Operation,
-{
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     // Every impure registered handler keeps its trailing token ABI; unordered calls use an independent local chain.
     let mut local_tokens = EffectTokens::default();
     let joins_ordered_chain =

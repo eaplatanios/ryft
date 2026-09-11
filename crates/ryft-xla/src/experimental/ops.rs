@@ -319,7 +319,8 @@ where
     Concatenate(ConcatenateOperation<ArrayIrType>),
 
     /// Calls a foreign kernel with explicit dynamic result extents.
-    CustomCall(CustomCallOperation<ArrayIrType>),
+    #[ryft(mixed)]
+    CustomCall(CustomCallOperation),
 
     /// Pads an array with explicit result extents.
     Pad(PadOperation<ArrayIrType>),
@@ -584,7 +585,6 @@ impl_composite_operation_conversion!(
     OneOperation<ArrayType>,
     IotaOperation<ArrayType>,
     ConcatenateOperation<ArrayType>,
-    CustomCallOperation<ArrayType>,
     PadOperation<ArrayType>,
 );
 
