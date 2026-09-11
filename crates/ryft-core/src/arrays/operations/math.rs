@@ -14,8 +14,8 @@ use num_complex::Complex;
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::encoding::{
-    ArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
-    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    ArrayElement, NumericArrayElement, RealArrayElement, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz,
+    f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::collectives::decode_nonnegative_integer_metadata;
@@ -38,10 +38,11 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // These contracts operate on decoded storage elements, keeping integer wrapping and low-precision re-encoding in
 // one place per element family. They complement the value-level capabilities with the scalar arithmetic needed by
-// elementwise kernels and reductions; basic arithmetic, extrema, and identities are provided by ArrayElement.
+// elementwise kernels and reductions; basic arithmetic is provided by NumericArrayElement and RealArrayElement,
+// while extrema and identities are provided by ArrayElement.
 
 /// Floating-point math operations shared by real floating-point and complex array elements.
-trait ElementFloatMath: ArrayElement {
+trait ElementFloatMath: NumericArrayElement {
     /// Computes the sine of this element.
     fn sin(self) -> Result<Self, ProgramError>;
 
@@ -74,7 +75,7 @@ trait ElementFloatMath: ArrayElement {
 }
 
 /// Operations supported only by real floating-point array elements.
-pub(crate) trait ElementRealFloatMath: ArrayElement {
+pub(crate) trait ElementRealFloatMath: RealArrayElement {
     /// Computes the Gauss error function of this element.
     fn erf(self) -> Result<Self, ProgramError>;
 
@@ -96,7 +97,7 @@ pub(crate) trait ElementRealFloatMath: ArrayElement {
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
-trait ElementDivideByCount: ArrayElement {
+trait ElementDivideByCount: NumericArrayElement {
     /// Divides this element by `count` after converting `count` to the element type.
     fn divide_by_count(self, count: usize) -> Result<Self, ProgramError>;
 }
@@ -459,7 +460,7 @@ macro_rules! impl_array_math_for_complex {
             fn atan2(self, x: Self) -> Result<Self, ProgramError> {
                 let imaginary_unit = Complex::new(0.0, 1.0);
                 let radius = (x * x + self * self).sqrt();
-                Ok(-imaginary_unit * ArrayElement::div(x + imaginary_unit * self, radius)?.ln())
+                Ok(-imaginary_unit * NumericArrayElement::div(x + imaginary_unit * self, radius)?.ln())
             }
 
             #[inline]
@@ -653,7 +654,7 @@ impl Array {
     /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
     /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
     /// group rather than the whole operand times the group count.
-    fn ragged_dot_elements<T: ArrayElement>(
+    fn ragged_dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
         group_sizes: &Self,
@@ -847,7 +848,7 @@ impl Array {
         Ok(output)
     }
 
-    fn dot_elements<T: ArrayElement>(
+    fn dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
@@ -954,8 +955,8 @@ impl Abs for Array {
             .into());
         }
         dispatch_on_array_element_type!(@numeric input_type, |Element| {
-            self.map_elements::<Element, <Element as ArrayElement>::Magnitude>(output_type, |value| {
-                <Element as ArrayElement>::abs(value)
+            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
+                <Element as NumericArrayElement>::abs(value)
             })
         })
     }
@@ -994,7 +995,7 @@ impl_array_elementwise_operation!(
     operation = "add",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| ArrayElement::add(lhs, rhs),
+    |lhs, rhs| NumericArrayElement::add(lhs, rhs),
 );
 
 impl_array_elementwise_operation!(
@@ -1003,7 +1004,7 @@ impl_array_elementwise_operation!(
     operation = "sub",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| ArrayElement::sub(lhs, rhs),
+    |lhs, rhs| NumericArrayElement::sub(lhs, rhs),
 );
 
 impl Mul for Array {
@@ -1021,7 +1022,7 @@ impl Mul for Array {
         let lhs = self.promoted_to(data_type)?;
         let rhs = rhs.promoted_to(data_type)?;
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, ArrayElement::mul)
+            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, NumericArrayElement::mul)
         })
     }
 }
@@ -1032,7 +1033,7 @@ impl_array_elementwise_operation!(
     operation = "div",
     inputs = @numeric,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ArrayElement::div(lhs, rhs),
+    |lhs, rhs| NumericArrayElement::div(lhs, rhs),
 );
 
 impl std::ops::Add for Array {
@@ -1218,19 +1219,19 @@ impl Sign for Array {
         if data_type.is_signed() {
             dispatch_on_array_element_type!(@signed data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ArrayElement>::sign(value)
+                    <Element as NumericArrayElement>::sign(value)
                 })
             })
         } else if data_type.is_complex() {
             dispatch_on_array_element_type!(@complex data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ArrayElement>::sign(value)
+                    <Element as NumericArrayElement>::sign(value)
                 })
             })
         } else {
             dispatch_on_array_element_type!(@float data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
-                    <Element as ArrayElement>::sign(value)
+                    <Element as NumericArrayElement>::sign(value)
                 })
             })
         }
@@ -1270,7 +1271,7 @@ impl_array_elementwise_operation!(
     operation = "rem",
     inputs = @numeric @real,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| ArrayElement::rem(lhs, rhs),
+    |lhs, rhs| RealArrayElement::rem(lhs, rhs),
 );
 
 impl Dot for Array {

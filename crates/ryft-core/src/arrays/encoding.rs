@@ -79,10 +79,6 @@ use crate::programs::{ProgramError, TypeError};
 /// source at four constructors plus one routing per element type instead of one body per ordered pair, which for the
 /// 32 element types below is 160 entry points instead of 1,024 pairwise bodies.
 pub trait ArrayElement: private::Codec {
-    /// Element type returned by [`abs`](Self::abs). Complex elements use their real component type,
-    /// and all other elements use `Self`, including types for which absolute value is not supported.
-    type Magnitude: ArrayElement;
-
     /// Returns the [`DataType`] represented by this element type.
     #[inline]
     fn data_type() -> DataType {
@@ -171,9 +167,25 @@ pub trait ArrayElement: private::Codec {
     /// elements use logical negation, flipping `true` and `false`. Elements of type [`f8e8m0fnu`] return an error.
     fn neg(self) -> Result<Self, ProgramError>;
 
+    /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
+    /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
+    /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
+    /// Refer to the trait documentation's [Conversions](ArrayElement#conversions) section. Because this function is
+    /// generic in `Output`, the compiler monomorphizes it per `(Self, Output)` pair and inlines both halves, leaving
+    /// a widening no-op followed by `Output`'s direct conversion (i.e., the same code a pairwise implementation would
+    /// produce).
+    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError>;
+}
+
+/// [`ArrayElement`] type that supports arithmetic operations across both real and complex numbers.
+pub trait NumericArrayElement: ArrayElement {
+    /// Element type returned by [`abs`](Self::abs). Complex elements use their real component type,
+    /// and all other elements use `Self`, including types for which absolute value is not supported.
+    type Magnitude: RealArrayElement;
+
     /// Adds `rhs` to this element. Integers wrap in their declared bit width. Floating-point and complex elements use
     /// their ordinary arithmetic, with low-precision results rounded to the destination format. Returns an error for
-    /// Boolean elements or unrepresentable low-precision results.
+    /// unrepresentable low-precision results.
     fn add(self, rhs: Self) -> Result<Self, ProgramError>;
 
     /// Subtracts `rhs` from this element, with the same wrapping, rounding, and error rules as [`add`](Self::add).
@@ -186,34 +198,28 @@ pub trait ArrayElement: private::Codec {
     /// or for signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination format's
     /// rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
     /// denominator, with explicit recovery for zero divisors and infinite operands when both result components would
-    /// otherwise be NaN. Intermediate overflow can still produce NaN components. Boolean elements return an error.
+    /// otherwise be NaN. Intermediate overflow can still produce NaN components.
     fn div(self, rhs: Self) -> Result<Self, ProgramError>;
-
-    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return an error. The
-    /// minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
-    /// destination format's rounding and representability rules. Boolean and complex elements return an error.
-    fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
 
     /// Returns this element's absolute value or complex magnitude. Signed integers wrap in their declared bit width,
     /// so the minimum signed value remains negative. Real floating-point values clear the sign, and complex values
-    /// return their Euclidean magnitude in [`Magnitude`](Self::Magnitude). Returns an error for Boolean, unsigned
-    /// integer, and [`i1`] elements, or a result that the element format cannot represent.
+    /// return their Euclidean magnitude in [`Magnitude`](Self::Magnitude). Returns an error for unsigned integer and
+    /// [`i1`] elements, or a result that the element format cannot represent.
     fn abs(self) -> Result<Self::Magnitude, ProgramError>;
 
     /// Returns the sign of this element. Signed integers produce `-1`, `0`, or `1`. Real floating-point values preserve
     /// zeros and NaNs, including their exact encodings, and otherwise produce `-1` or `1`. Complex values preserve zero
     /// and otherwise divide by their Euclidean magnitude, using ordinary floating-point arithmetic for infinite and NaN
-    /// components. Boolean and unsigned integer elements return an error.
+    /// components. Unsigned integer elements return an error.
     fn sign(self) -> Result<Self, ProgramError>;
+}
 
-    /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
-    /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
-    /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
-    /// Refer to the trait documentation's [Conversions](ArrayElement#conversions) section. Because this function is
-    /// generic in `Output`, the compiler monomorphizes it per `(Self, Output)` pair and inlines both halves, leaving
-    /// a widening no-op followed by `Output`'s direct conversion (i.e., the same code a pairwise implementation would
-    /// produce).
-    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError>;
+/// [`RealArrayElement`] type that supports arithmetic operations that are specific to real-valued numbers.
+pub trait RealArrayElement: NumericArrayElement {
+    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return an error. The
+    /// minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
+    /// destination format's rounding and representability rules.
+    fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
 }
 
 mod private {
@@ -1167,8 +1173,6 @@ impl private::Codec for Complex<f64> {
 // The Boolean element type carries `false` as `0` and `true` as `1`, and reads back as "the value is nonzero" from
 // every category. Complex sources are true when either component is nonzero, so the imaginary part is not discarded.
 impl ArrayElement for bool {
-    type Magnitude = Self;
-
     #[inline]
     fn from_signed(value: i64) -> Result<Self, ProgramError> {
         Ok(value != 0)
@@ -1214,44 +1218,6 @@ impl ArrayElement for bool {
         Ok(!self)
     }
 
-    fn add(self, _rhs: Self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute `add` for an element of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
-    fn sub(self, _rhs: Self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute `sub` for an element of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
-    fn mul(self, _rhs: Self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute `mul` for an element of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
-    fn div(self, _rhs: Self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute `div` for an element of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
-    fn rem(self, _rhs: Self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute `rem` for an element of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
-    fn abs(self) -> Result<Self::Magnitude, ProgramError> {
-        Err(TypeError::invalid(format!(
-            "cannot compute the absolute value of a scalar of data type `{}`",
-            DataType::Boolean,
-        ))
-        .into())
-    }
-
-    fn sign(self) -> Result<Self, ProgramError> {
-        Err(TypeError::invalid(format!("cannot compute the sign of a scalar of data type `{}`", DataType::Boolean))
-            .into())
-    }
-
     #[inline]
     fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
         Output::from_unsigned(u64::from(self))
@@ -1264,8 +1230,6 @@ impl ArrayElement for bool {
 macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
-            type Magnitude = Self;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
@@ -1311,6 +1275,15 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             }
 
             #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_signed(i64::from(self.value()))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
                 Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & bit_mask).unwrap())
@@ -1346,18 +1319,6 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
                 Ok(Self::new(self.value() / rhs.value()).unwrap())
             }
 
-            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
-                if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(self.value().wrapping_rem(rhs.value()) as u8 & bit_mask).unwrap())
-            }
-
             fn abs(self) -> Result<Self, ProgramError> {
                 if Self::data_type() == DataType::I1 {
                     return Err(TypeError::invalid(
@@ -1373,10 +1334,19 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             fn sign(self) -> Result<Self, ProgramError> {
                 Ok(Self::new(self.value().signum()).unwrap())
             }
+        }
 
-            #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::from_signed(i64::from(self.value()))
+        impl RealArrayElement for $type {
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_rem(rhs.value()) as u8 & bit_mask).unwrap())
             }
         }
     )+};
@@ -1390,8 +1360,6 @@ impl_array_element_for_signed_sub_byte_integer_types!(i1, i2, i4);
 macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
-            type Magnitude = Self;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
@@ -1433,6 +1401,15 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
             }
 
             #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_unsigned(u64::from(self.value()))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
                 Ok(Self::from_bits(self.to_bits().wrapping_add(rhs.to_bits()) & Self::MAX.to_bits()).unwrap())
             }
@@ -1458,17 +1435,6 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
                 Ok(Self::new(self.value() / rhs.value()).unwrap())
             }
 
-            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
-                if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() % rhs.value()).unwrap())
-            }
-
             fn abs(self) -> Result<Self::Magnitude, ProgramError> {
                 Err(TypeError::invalid(format!(
                     "cannot compute the absolute value of a scalar of data type `{}`",
@@ -1484,10 +1450,18 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
                 ))
                 .into())
             }
+        }
 
-            #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::from_unsigned(u64::from(self.value()))
+        impl RealArrayElement for $type {
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                if rhs.value() == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(Self::new(self.value() % rhs.value()).unwrap())
             }
         }
     )+};
@@ -1501,8 +1475,6 @@ impl_array_element_for_unsigned_sub_byte_integer_types!(u1, u2, u4);
 macro_rules! impl_array_element_for_integer_types {
     ($kind:ident, $carrier:ty, $route:ident, $($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
-            type Magnitude = Self;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(value as Self)
@@ -1544,6 +1516,15 @@ macro_rules! impl_array_element_for_integer_types {
             }
 
             #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::$route(self as $carrier)
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
                 Ok(self.wrapping_add(rhs))
             }
@@ -1576,6 +1557,10 @@ macro_rules! impl_array_element_for_integer_types {
                 Ok(self / rhs)
             }
 
+            impl_array_element_for_integer_types!(@$kind);
+        }
+
+        impl RealArrayElement for $type {
             fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs == 0 {
                     return Err(TypeError::invalid(format!(
@@ -1585,13 +1570,6 @@ macro_rules! impl_array_element_for_integer_types {
                     .into());
                 }
                 Ok(self.wrapping_rem(rhs))
-            }
-
-            impl_array_element_for_integer_types!(@$kind);
-
-            #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::$route(self as $carrier)
             }
         }
     )+};
@@ -1635,8 +1613,6 @@ impl_array_element_for_integer_types!(unsigned, u64, from_unsigned, u8, u16, u32
 macro_rules! impl_array_element_for_low_precision_floating_point_types {
     ($($type:ty => ($min_identity:expr, $max_identity:expr)),+ $(,)?) => {$(
         impl ArrayElement for $type {
-            type Magnitude = Self;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::from_f64(value as f64)?)
@@ -1698,6 +1674,15 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
             }
 
             #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real(self.to_f64())
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
                 Ok(Self::from_f64(self.to_f64() + rhs.to_f64())?)
             }
@@ -1718,11 +1703,6 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
             }
 
             #[inline]
-            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(self.to_f64() % rhs.to_f64())?)
-            }
-
-            #[inline]
             fn abs(self) -> Result<Self, ProgramError> {
                 Ok(Self::from_f64(self.to_f64().abs())?)
             }
@@ -1731,10 +1711,12 @@ macro_rules! impl_array_element_for_low_precision_floating_point_types {
                 let value = self.to_f64();
                 if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
             }
+        }
 
+        impl RealArrayElement for $type {
             #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::from_real(self.to_f64())
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(self.to_f64() % rhs.to_f64())?)
             }
         }
     )+};
@@ -1759,8 +1741,6 @@ impl_array_element_for_low_precision_floating_point_types!(
 macro_rules! impl_array_element_for_floating_point_type {
     ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr, $to_real:expr, $abs:expr $(,)?) => {
         impl ArrayElement for $type {
-            type Magnitude = Self;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok($from_signed(value))
@@ -1818,6 +1798,15 @@ macro_rules! impl_array_element_for_floating_point_type {
             }
 
             #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real($to_real(self))
+            }
+        }
+
+        impl NumericArrayElement for $type {
+            type Magnitude = Self;
+
+            #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
                 Ok(self + rhs)
             }
@@ -1838,11 +1827,6 @@ macro_rules! impl_array_element_for_floating_point_type {
             }
 
             #[inline]
-            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
-                Ok(self % rhs)
-            }
-
-            #[inline]
             fn abs(self) -> Result<Self, ProgramError> {
                 Ok($abs(self))
             }
@@ -1851,10 +1835,12 @@ macro_rules! impl_array_element_for_floating_point_type {
                 let value = $to_real(self);
                 if value.is_nan() || value == 0.0 { Ok(self) } else { Self::from_real(value.signum()) }
             }
+        }
 
+        impl RealArrayElement for $type {
             #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::from_real($to_real(self))
+            fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
+                Ok(self % rhs)
             }
         }
     };
@@ -1901,8 +1887,6 @@ impl_array_element_for_floating_point_type!(
 macro_rules! impl_array_element_for_complex_types {
     ($($component:ty),+ $(,)?) => {$(
         impl ArrayElement for Complex<$component> {
-            type Magnitude = $component;
-
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
                 Ok(Self::new(value as $component, 0.0))
@@ -1949,6 +1933,15 @@ macro_rules! impl_array_element_for_complex_types {
             fn neg(self) -> Result<Self, ProgramError> {
                 Ok(-self)
             }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_complex(Complex::new(self.re as f64, self.im as f64))
+            }
+        }
+
+        impl NumericArrayElement for Complex<$component> {
+            type Magnitude = $component;
 
             #[inline]
             fn add(self, rhs: Self) -> Result<Self, ProgramError> {
@@ -2008,14 +2001,6 @@ macro_rules! impl_array_element_for_complex_types {
                 Ok(result)
             }
 
-            fn rem(self, _rhs: Self) -> Result<Self, ProgramError> {
-                Err(TypeError::invalid(format!(
-                    "cannot compute `rem` for an element of data type `{}`",
-                    Self::data_type(),
-                ))
-                .into())
-            }
-
             #[inline]
             fn abs(self) -> Result<Self::Magnitude, ProgramError> {
                 Ok(self.norm())
@@ -2024,11 +2009,6 @@ macro_rules! impl_array_element_for_complex_types {
             fn sign(self) -> Result<Self, ProgramError> {
                 let norm = self.norm();
                 Ok(if norm == 0.0 { self } else { self / norm })
-            }
-
-            #[inline]
-            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
-                Output::from_complex(Complex::new(self.re as f64, self.im as f64))
             }
         }
     )+};
@@ -2658,100 +2638,98 @@ mod tests {
     }
 
     #[test]
-    fn test_array_element_add() {
-        assert_eq!(ArrayElement::add(i64::MAX, 1), Ok(i64::MIN));
-        assert_eq!(ArrayElement::add(u8::MAX, 1), Ok(0));
-        assert_eq!(ArrayElement::add(i4::MAX, i4::one().unwrap()), Ok(i4::MIN));
-        assert_eq!(ArrayElement::add(u1::MAX, u1::MAX), Ok(u1::MIN));
-        assert_eq!(ArrayElement::add(1.5f64, 2.0), Ok(3.5));
-        assert_eq!(ArrayElement::add(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(4.0, -2.0)));
+    fn test_numeric_array_element_add() {
+        assert_eq!(NumericArrayElement::add(i64::MAX, 1), Ok(i64::MIN));
+        assert_eq!(NumericArrayElement::add(u8::MAX, 1), Ok(0));
+        assert_eq!(NumericArrayElement::add(i4::MAX, i4::one().unwrap()), Ok(i4::MIN));
+        assert_eq!(NumericArrayElement::add(u1::MAX, u1::MAX), Ok(u1::MIN));
+        assert_eq!(NumericArrayElement::add(1.5f64, 2.0), Ok(3.5));
+        assert_eq!(
+            NumericArrayElement::add(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(4.0, -2.0))
+        );
 
         // Half and sub-byte floating-point sums round ties to the even destination encoding.
-        assert_eq!(ArrayElement::add(bf16::ONE, bf16::from_f32(1.0 / 256.0)).unwrap().to_bits(), 0x3f80);
+        assert_eq!(NumericArrayElement::add(bf16::ONE, bf16::from_f32(1.0 / 256.0)).unwrap().to_bits(), 0x3f80);
         assert_eq!(
-            ArrayElement::add(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::one().unwrap()).unwrap().to_bits(),
+            NumericArrayElement::add(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::one().unwrap())
+                .unwrap()
+                .to_bits(),
             0x4,
         );
-        assert!(matches!(
-            ArrayElement::add(true, false),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `add` for an element of data type `bool`",
-        ));
     }
 
     #[test]
-    fn test_array_element_sub() {
-        assert_eq!(ArrayElement::sub(i16::MIN, 1), Ok(i16::MAX));
-        assert_eq!(ArrayElement::sub(0u32, 1), Ok(u32::MAX));
-        assert_eq!(ArrayElement::sub(i2::MIN, i2::one().unwrap()), Ok(i2::MAX));
-        assert_eq!(ArrayElement::sub(u4::MIN, u4::one().unwrap()), Ok(u4::MAX));
-        assert_eq!(ArrayElement::sub(1.5f32, 2.0), Ok(-0.5));
-        assert_eq!(ArrayElement::sub(Complex::new(1.0f64, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(-2.0, 6.0)));
+    fn test_numeric_array_element_sub() {
+        assert_eq!(NumericArrayElement::sub(i16::MIN, 1), Ok(i16::MAX));
+        assert_eq!(NumericArrayElement::sub(0u32, 1), Ok(u32::MAX));
+        assert_eq!(NumericArrayElement::sub(i2::MIN, i2::one().unwrap()), Ok(i2::MAX));
+        assert_eq!(NumericArrayElement::sub(u4::MIN, u4::one().unwrap()), Ok(u4::MAX));
+        assert_eq!(NumericArrayElement::sub(1.5f32, 2.0), Ok(-0.5));
         assert_eq!(
-            ArrayElement::sub(f4e2m1fn::from_f64(3.0).unwrap(), f4e2m1fn::from_f64(0.5).unwrap())
+            NumericArrayElement::sub(Complex::new(1.0f64, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(-2.0, 6.0))
+        );
+        assert_eq!(
+            NumericArrayElement::sub(f4e2m1fn::from_f64(3.0).unwrap(), f4e2m1fn::from_f64(0.5).unwrap())
                 .unwrap()
                 .to_bits(),
             0x4,
         );
         assert!(matches!(
-            ArrayElement::sub(f8e8m0fnu::one().unwrap(), f8e8m0fnu::one().unwrap()),
+            NumericArrayElement::sub(f8e8m0fnu::one().unwrap(), f8e8m0fnu::one().unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
-        assert!(matches!(
-            ArrayElement::sub(true, false),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `sub` for an element of data type `bool`",
-        ));
     }
 
     #[test]
-    fn test_array_element_mul() {
-        assert_eq!(ArrayElement::mul(i32::MAX, 2), Ok(-2));
-        assert_eq!(ArrayElement::mul(u16::MAX, 2), Ok(u16::MAX - 1));
-        assert_eq!(ArrayElement::mul(i4::new(3).unwrap(), i4::new(3).unwrap()), Ok(i4::new(-7).unwrap()));
-        assert_eq!(ArrayElement::mul(u2::MAX, u2::MAX), Ok(u2::one().unwrap()));
-        assert_eq!(ArrayElement::mul(1.5f64, 2.0), Ok(3.0));
-        assert_eq!(ArrayElement::mul(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)), Ok(Complex::new(11.0, 2.0)));
+    fn test_numeric_array_element_mul() {
+        assert_eq!(NumericArrayElement::mul(i32::MAX, 2), Ok(-2));
+        assert_eq!(NumericArrayElement::mul(u16::MAX, 2), Ok(u16::MAX - 1));
+        assert_eq!(NumericArrayElement::mul(i4::new(3).unwrap(), i4::new(3).unwrap()), Ok(i4::new(-7).unwrap()));
+        assert_eq!(NumericArrayElement::mul(u2::MAX, u2::MAX), Ok(u2::one().unwrap()));
+        assert_eq!(NumericArrayElement::mul(1.5f64, 2.0), Ok(3.0));
         assert_eq!(
-            ArrayElement::mul(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::from_f64(1.5).unwrap())
+            NumericArrayElement::mul(Complex::new(1.0f32, 2.0), Complex::new(3.0, -4.0)),
+            Ok(Complex::new(11.0, 2.0))
+        );
+        assert_eq!(
+            NumericArrayElement::mul(f4e2m1fn::from_f64(1.5).unwrap(), f4e2m1fn::from_f64(1.5).unwrap())
                 .unwrap()
                 .to_bits(),
             0x4,
         );
-        assert!(matches!(
-            ArrayElement::mul(true, false),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `mul` for an element of data type `bool`",
-        ));
     }
 
     #[test]
-    fn test_array_element_div() {
+    fn test_numeric_array_element_div() {
         // Integer division truncates toward zero and rejects both zero divisors and signed overflow.
-        assert_eq!(ArrayElement::div(-7i32, 2), Ok(-3));
-        assert_eq!(ArrayElement::div(7u64, 2), Ok(3));
-        assert_eq!(ArrayElement::div(i4::new(-7).unwrap(), i4::new(2).unwrap()), Ok(i4::new(-3).unwrap()));
-        assert_eq!(ArrayElement::div(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::new(3).unwrap()));
+        assert_eq!(NumericArrayElement::div(-7i32, 2), Ok(-3));
+        assert_eq!(NumericArrayElement::div(7u64, 2), Ok(3));
+        assert_eq!(NumericArrayElement::div(i4::new(-7).unwrap(), i4::new(2).unwrap()), Ok(i4::new(-3).unwrap()));
+        assert_eq!(NumericArrayElement::div(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::new(3).unwrap()));
         assert!(matches!(
-            ArrayElement::div(1u8, 0),
+            NumericArrayElement::div(1u8, 0),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot divide an integer scalar of data type `u8` by zero",
         ));
         assert!(matches!(
-            ArrayElement::div(i8::MIN, -1),
+            NumericArrayElement::div(i8::MIN, -1),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
         ));
         assert!(matches!(
-            ArrayElement::div(i1::MIN, i1::MIN),
+            NumericArrayElement::div(i1::MIN, i1::MIN),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot divide the minimum integer scalar of data type `i1` by -1",
         ));
-        assert_eq!(ArrayElement::div(1.0f32, 0.0), Ok(f32::INFINITY));
-        assert_eq!(ArrayElement::div(f16::from_f32(3.0), f16::from_f32(2.0)), Ok(f16::from_f32(1.5)));
+        assert_eq!(NumericArrayElement::div(1.0f32, 0.0), Ok(f32::INFINITY));
+        assert_eq!(NumericArrayElement::div(f16::from_f32(3.0), f16::from_f32(2.0)), Ok(f16::from_f32(1.5)));
         assert_eq!(
-            ArrayElement::div(f4e2m1fn::one().unwrap(), f4e2m1fn::from_f64(3.0).unwrap()).unwrap().to_bits(),
+            NumericArrayElement::div(f4e2m1fn::one().unwrap(), f4e2m1fn::from_f64(3.0).unwrap())
+                .unwrap()
+                .to_bits(),
             0x1,
         );
 
@@ -2785,7 +2763,7 @@ mod tests {
             ((1.0, 2.0), (f32::INFINITY, f32::NAN), (0.0, 0.0)),
         ] {
             // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
-            let actual = ArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            let actual = NumericArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
             if expected.0.is_nan() {
                 assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
             } else {
@@ -2825,7 +2803,7 @@ mod tests {
             ((1.0, 2.0), (f64::INFINITY, f64::NAN), (0.0, 0.0)),
         ] {
             // Compare zero signs exactly, but do not impose a NaN sign or payload on the backend contract.
-            let actual = ArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
+            let actual = NumericArrayElement::div(Complex::new(lhs.0, lhs.1), Complex::new(rhs.0, rhs.1)).unwrap();
             if expected.0.is_nan() {
                 assert!(actual.re.is_nan(), "{lhs:?} / {rhs:?} = {actual:?}");
             } else {
@@ -2837,48 +2815,33 @@ mod tests {
                 assert_eq!(actual.im.to_bits(), expected.1.to_bits(), "{lhs:?} / {rhs:?}");
             }
         }
-        assert!(matches!(
-            ArrayElement::div(true, false),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `div` for an element of data type `bool`",
-        ));
     }
 
     #[test]
-    fn test_array_element_rem() {
+    fn test_real_array_element_rem() {
         // Remainders follow the dividend's sign; the signed minimum divided by -1 has remainder zero.
-        assert_eq!(ArrayElement::rem(-7i64, 2), Ok(-1));
-        assert_eq!(ArrayElement::rem(i64::MIN, -1), Ok(0));
-        assert_eq!(ArrayElement::rem(7u32, 2), Ok(1));
-        assert_eq!(ArrayElement::rem(i4::MIN, i4::new(-1).unwrap()), Ok(i4::zero().unwrap()));
-        assert_eq!(ArrayElement::rem(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::one().unwrap()));
-        assert_eq!(ArrayElement::rem(-3.5f64, 2.0), Ok(-1.5));
-        assert_eq!(ArrayElement::rem(-0.0f32, 2.0).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(RealArrayElement::rem(-7i64, 2), Ok(-1));
+        assert_eq!(RealArrayElement::rem(i64::MIN, -1), Ok(0));
+        assert_eq!(RealArrayElement::rem(7u32, 2), Ok(1));
+        assert_eq!(RealArrayElement::rem(i4::MIN, i4::new(-1).unwrap()), Ok(i4::zero().unwrap()));
+        assert_eq!(RealArrayElement::rem(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::one().unwrap()));
+        assert_eq!(RealArrayElement::rem(-3.5f64, 2.0), Ok(-1.5));
+        assert_eq!(RealArrayElement::rem(-0.0f32, 2.0).unwrap().to_bits(), (-0.0f32).to_bits());
         assert_eq!(
-            ArrayElement::rem(f4e2m1fn::from_f64(-3.0).unwrap(), f4e2m1fn::from_f64(2.0).unwrap())
+            RealArrayElement::rem(f4e2m1fn::from_f64(-3.0).unwrap(), f4e2m1fn::from_f64(2.0).unwrap())
                 .unwrap()
                 .to_bits(),
             0xa,
         );
         assert!(matches!(
-            ArrayElement::rem(1i32, 0),
+            RealArrayElement::rem(1i32, 0),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot compute the remainder of an integer scalar of data type `i32` with a zero divisor",
         ));
         assert!(matches!(
-            ArrayElement::rem(f4e2m1fn::one().unwrap(), f4e2m1fn::zero().unwrap()),
+            RealArrayElement::rem(f4e2m1fn::one().unwrap(), f4e2m1fn::zero().unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "data type `f4e2m1fn` cannot represent NaN",
-        ));
-        assert!(matches!(
-            ArrayElement::rem(Complex::new(1.0f32, 2.0), Complex::new(3.0, 4.0)),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `rem` for an element of data type `c64`",
-        ));
-        assert!(matches!(
-            ArrayElement::rem(true, false),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute `rem` for an element of data type `bool`",
         ));
     }
 

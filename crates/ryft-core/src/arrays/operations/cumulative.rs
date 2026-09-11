@@ -8,7 +8,7 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::arrays::Array;
-use crate::arrays::encoding::ArrayElement;
+use crate::arrays::encoding::{ArrayElement, NumericArrayElement};
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::math::ElementRealFloatMath;
 use crate::arrays::types::data::DataType;
@@ -46,8 +46,8 @@ impl Array {
             let elements = self.elements::<Element>()?;
             let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
                 match multiply {
-                    true => <Element as ArrayElement>::mul(left, right),
-                    false => <Element as ArrayElement>::add(left, right),
+                    true => <Element as NumericArrayElement>::mul(left, right),
+                    false => <Element as NumericArrayElement>::add(left, right),
                 }
             })?;
             Self::from_elements(output_type, scanned.as_slice())
