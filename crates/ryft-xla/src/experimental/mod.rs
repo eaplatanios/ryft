@@ -18,7 +18,7 @@ pub use lowering::RaggedDotLoweringStrategy;
 
 pub use domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
-    XlaOptimizedProgram,
+    XlaOptimizedProgram, XlaSession,
 };
 
 pub use shard_map::{

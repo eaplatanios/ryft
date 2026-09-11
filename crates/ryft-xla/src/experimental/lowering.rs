@@ -64,6 +64,7 @@ use crate::experimental::lowering::attention::{
     lower_dot_product_attention_backward_to_mlir, lower_dot_product_attention_to_mlir,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
+use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use crate::experimental::operations::SHARD_MAP_OPERATION_NAME;
 
@@ -115,12 +116,9 @@ pub(crate) enum LoweringError {
     #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
     UnresolvedState { construct: String },
 
-    /// Error returned when a shard-map body carries ordered effects, whose tokens `sdy.manual_computation` cannot
-    /// thread across its boundary.
-    #[error(
-        "effectful shard_map bodies are unsupported because sdy.manual_computation cannot preserve effect \
-             ordering across its boundary"
-    )]
+    /// Error returned when a shard-map body contains `OrderedIo`, whose order across devices cannot be provided by
+    /// independent per-device execution.
+    #[error("`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices")]
     EffectfulShardMapBody,
 
     /// Error returned when lowering encounters a captured constant reference without a matching hidden argument.
@@ -194,6 +192,20 @@ pub(crate) struct XlaExecutableSignature {
 
     /// Hidden scalar results that report bounded dynamic logical output extents.
     output_dimensions: Arc<[XlaOutputDimension]>,
+
+    /// Whether the executable carries the ordered-I/O boundary token, i.e., whether the program contains
+    /// `OrderedIo` or `DeviceOrderedIo` effects.
+    ordered_io: bool,
+
+    /// Whether every ordered-I/O occurrence is `DeviceOrderedIo`, so the boundary token only needs per-device
+    /// ordering and the executable may run on several devices.
+    device_ordered_io: bool,
+
+    /// Whether the executable contains unordered I/O.
+    unordered_io: bool,
+
+    /// Whether lowering emitted a runtime assertion, including synthesized checks.
+    requires_assertion_handler: bool,
 }
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
@@ -307,7 +319,63 @@ impl XlaExecutableSignature {
             output_mapping,
             input_dimensions: input_dimensions.into(),
             output_dimensions: output_dimensions.into(),
+            ordered_io: false,
+            device_ordered_io: false,
+            unordered_io: false,
+            requires_assertion_handler: false,
         }
+    }
+
+    /// Attaches the compile-time effect metadata, also used when restoring persistent executable metadata.
+    /// `device_ordered_io` is only meaningful together with `ordered_io` and is cleared otherwise.
+    pub(crate) fn with_effects(
+        mut self,
+        ordered_io: bool,
+        unordered_io: bool,
+        requires_assertion_handler: bool,
+        device_ordered_io: bool,
+    ) -> Self {
+        self.ordered_io = ordered_io;
+        self.device_ordered_io = ordered_io && device_ordered_io;
+        self.unordered_io = unordered_io;
+        self.requires_assertion_handler = requires_assertion_handler;
+        self
+    }
+
+    /// Returns whether this executable carries an ordered-I/O boundary token.
+    pub(crate) fn has_ordered_io(&self) -> bool {
+        self.ordered_io
+    }
+
+    /// Returns whether every ordered-I/O occurrence is `DeviceOrderedIo`, permitting multi-device execution with
+    /// per-device ordering.
+    pub(crate) fn has_device_ordered_io(&self) -> bool {
+        self.device_ordered_io
+    }
+
+    /// Returns whether this executable contains unordered I/O.
+    pub(crate) fn has_unordered_io(&self) -> bool {
+        self.unordered_io
+    }
+
+    /// Returns whether execution requires the runtime assertion handler.
+    pub(crate) fn requires_assertion_handler(&self) -> bool {
+        self.requires_assertion_handler
+    }
+
+    /// Returns whether execution participates in the effect barrier.
+    pub(crate) fn has_effects(&self) -> bool {
+        self.ordered_io || self.unordered_io || self.requires_assertion_handler
+    }
+
+    /// Returns the hidden ordered-I/O token argument ordinal, after every array and extent argument.
+    pub(crate) fn ordered_io_input_index(&self) -> Option<usize> {
+        self.ordered_io.then(|| self.input_mapping.iter().flatten().count() + self.input_dimensions.len())
+    }
+
+    /// Returns the hidden ordered-I/O token result ordinal, after every array and extent result.
+    pub(crate) fn ordered_io_output_index(&self) -> Option<usize> {
+        self.ordered_io.then(|| self.output_mapping.iter().flatten().count() + self.output_dimensions.len())
     }
 
     /// Returns the per-logical-input physical argument mapping.
@@ -334,10 +402,25 @@ impl XlaExecutableSignature {
         &self.output_dimensions
     }
 
+    /// Returns the number of physical array arguments, including hidden extent scalars but excluding tokens.
+    pub(crate) fn array_input_count(&self) -> usize {
+        self.input_mapping.iter().flatten().count() + self.input_dimensions.len()
+    }
+
+    /// Returns the number of physical array results, including hidden extent scalars but excluding tokens.
+    pub(crate) fn array_output_count(&self) -> usize {
+        self.output_mapping.iter().flatten().count() + self.output_dimensions.len()
+    }
+
     /// Returns the total number of physical executable arguments.
     #[inline]
     pub(crate) fn physical_input_count(&self) -> usize {
-        self.input_mapping.iter().flatten().count() + self.input_dimensions.len()
+        self.input_mapping.iter().flatten().count() + self.input_dimensions.len() + usize::from(self.ordered_io)
+    }
+
+    /// Returns the total number of physical executable results, including the hidden ordered-I/O token.
+    pub(crate) fn physical_output_count(&self) -> usize {
+        self.array_output_count() + usize::from(self.ordered_io)
     }
 
     /// Projects logical inputs into physical executable order.
@@ -351,6 +434,7 @@ impl XlaExecutableSignature {
     }
 
     /// Projects logical data inputs to bounded physical tensor types and appends hidden extent scalars.
+    /// Native effect tokens are separate from array types and are excluded.
     pub(crate) fn physical_input_types(&self, inputs: &[ArrayType]) -> Vec<ArrayType> {
         let mut physical = Self::project(&self.input_mapping, inputs);
         let mut converted = vec![false; physical.len()];
@@ -381,7 +465,7 @@ impl XlaExecutableSignature {
         physical
     }
 
-    /// Projects logical outputs and appends hidden output-extent scalar types.
+    /// Projects logical outputs and appends hidden output-extent scalar types, excluding native effect tokens.
     pub(crate) fn physical_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
         let mut physical = Self::project(&self.output_mapping, outputs);
         physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
@@ -458,12 +542,13 @@ struct EffectTokens<'b, 'c: 'b, 't: 'c> {
 }
 
 impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
-    /// Returns the current token for `effect_class`.
+    /// Returns the current token for `effect_class`. Both ordered I/O classes share the ordered-I/O slot: they form
+    /// one ordering domain on any given device and differ only in whether that order also spans devices.
     fn get(&self, effect_class: EffectClass) -> Option<ValueRef<'b, 'c, 't>> {
         match effect_class {
             EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
             EffectClass::OrderedAssertion => self.ordered_assertion,
-            EffectClass::OrderedIo => self.ordered_io,
+            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io,
             EffectClass::UnorderedIo => None,
         }
     }
@@ -473,7 +558,7 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
         match effect_class {
             EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
             EffectClass::OrderedAssertion => self.ordered_assertion = Some(token),
-            EffectClass::OrderedIo => self.ordered_io = Some(token),
+            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io = Some(token),
             EffectClass::UnorderedIo => panic!("unordered effects do not have token slots"),
         }
     }
@@ -534,10 +619,14 @@ where
 /// XLA lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn
 /// state into an ordinary token-threaded effect.
 fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
-    effects.into_iter().filter(|effect| match effect {
-        EffectClass::OrderedAssertion | EffectClass::OrderedIo => true,
-        EffectClass::UnorderedIo | EffectClass::OrderedState => false,
-    })
+    // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered-I/O slot,
+    // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`.
+    let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
+    effects
+        .contains(EffectClass::OrderedAssertion)
+        .then_some(EffectClass::OrderedAssertion)
+        .into_iter()
+        .chain(ordered_io.then_some(EffectClass::OrderedIo))
 }
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
@@ -2573,7 +2662,8 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one `print` operation to the [`PRINT_CUSTOM_CALL_TARGET`] host-callback custom call and advances the
-/// scope's effect token chain past it.
+/// scope's effect token chain past it when ordered. Unordered printing retains the same handler ABI but uses an
+/// independent local token.
 ///
 /// The emitted operation follows the calling convention decoded by the FFI handler registered by
 /// [`ensure_print_handler_registered`](crate::experimental::debugging::ensure_print_handler_registered):
@@ -2588,12 +2678,16 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
 /// forwarded input value, which the caller returns directly.
 fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     label: &str,
+    ordered: bool,
     value: ValueRef<'b, 'c, 't>,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
+    // Unordered calls retain the registered handler ABI, using a fresh local token with no boundary dependency.
+    let mut local_tokens = EffectTokens::default();
+    let effect_tokens = if ordered { effect_tokens } else { &mut local_tokens };
     let input_token = current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?;
     let token_type = context.stable_hlo_token_type()?;
     let backend_config = context.dictionary_attribute(&[
@@ -3346,8 +3440,9 @@ fn lower_custom_call_memory_layouts(
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
 /// (`api_version = 4`). Typed attributes become the `backend_config` dictionary, array layouts become complete
 /// StableHLO operand/result layout lists, and flat input/output aliases become StableHLO output-operand aliases.
-/// A side-effecting call additionally consumes and produces the current ordered-I/O token so multiple such calls
-/// remain ordered even when their array results do not carry a data dependency. Handlers are resolved by the XLA
+/// An ordered call additionally consumes and produces the current ordered-I/O token so multiple such calls
+/// remain ordered even when their array results do not carry a data dependency. An unordered impure call retains
+/// the same handler ABI but uses a fresh local token without joining the ordered chain. Handlers are resolved by the XLA
 /// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
 /// `Client::register_ffi_handler`).
 fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
@@ -3359,7 +3454,15 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    CustomCallOperation<T>: Operation,
+{
+    // Every impure registered handler keeps its trailing token ABI; unordered calls use an independent local chain.
+    let mut local_tokens = EffectTokens::default();
+    let joins_ordered_chain =
+        matches!(operation.effect_class(), Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo));
+    let effect_tokens = if joins_ordered_chain { effect_tokens } else { &mut local_tokens };
     check_count!("input", input_types, input_values.len(), ProgramError);
     let attributes = operation
         .attributes()
@@ -3714,6 +3817,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 check_count!("input", input_values, 1, ProgramError);
                 lower_print_to_custom_call(
                     operation.label(),
+                    operation.effect_class().is_ordered(),
                     input_values[0],
                     &mut lowerer.effect_tokens,
                     &mut lowerer.block,
@@ -4493,6 +4597,9 @@ pub(crate) struct CollectiveLoweringState {
     /// lowering completes: only a module that actually carries provenance locations is printed with debug
     /// information, so provenance-free modules keep their existing byte-identical StableHLO text and cache keys.
     has_provenance: Rc<Cell<bool>>,
+
+    /// Whether any emitted instruction requires the runtime assertion handler.
+    has_assertions: Rc<Cell<bool>>,
 }
 
 impl CollectiveLoweringState {
@@ -4506,6 +4613,7 @@ impl CollectiveLoweringState {
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
             named_compositions: None,
             has_provenance: Rc::new(Cell::new(false)),
+            has_assertions: Rc::new(Cell::new(false)),
         }
     }
 
@@ -4556,6 +4664,7 @@ impl CollectiveLoweringState {
             ragged_dot_lowering_strategy: self.ragged_dot_lowering_strategy,
             named_compositions: self.named_compositions.clone(),
             has_provenance: self.has_provenance.clone(),
+            has_assertions: self.has_assertions.clone(),
         }
     }
 
@@ -4817,6 +4926,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             &self.collective_state,
+            &mut self.effect_tokens,
         )
     }
 }
@@ -4913,6 +5023,7 @@ pub(crate) fn to_mlir_module<
             &context,
             location.as_ref(),
             &collective_state,
+            &mut EffectTokens::default(),
         )?;
         function_block_ref.append_operation(func::r#return(manual_results.as_slice(), location)?)?;
 
@@ -4987,7 +5098,7 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
-    lower_mlir_module_for_program_with_reference_state(
+    lower_mlir_module_for_program_with_effect_boundary(
         program,
         capture_types,
         global_input_types,
@@ -4998,6 +5109,7 @@ where
         target_platform,
         &[],
         RaggedDotLoweringStrategy::default(),
+        false,
     )
 }
 
@@ -5030,6 +5142,42 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
+    lower_mlir_module_for_program_with_effect_boundary(
+        program,
+        capture_types,
+        global_input_types,
+        global_output_types,
+        function_name,
+        arg_shardings,
+        result_shardings,
+        target_platform,
+        reference_states,
+        ragged_dot_lowering_strategy,
+        true,
+    )
+}
+
+/// Lowers the entry boundary, optionally exporting the runtime ordered-I/O chain.
+fn lower_mlir_module_for_program_with_effect_boundary<'o, Input, Output, ProgramInput, ProgramOutput, S>(
+    program: &XlaProgram<ProgramInput, ProgramOutput>,
+    capture_types: &[ArrayType],
+    global_input_types: &Input,
+    global_output_types: &Output,
+    function_name: S,
+    arg_shardings: Option<&[Sharding]>,
+    result_shardings: Option<&[Sharding]>,
+    target_platform: Option<&str>,
+    reference_states: &[ExternalReferenceBinding],
+    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+    export_effects: bool,
+) -> Result<LoweredXlaModule, LoweringError>
+where
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+    S: AsRef<str>,
+{
     if contains_unresolved_references(program) {
         return Err(LoweringError::UnresolvedReference { construct: "program".to_string() });
     }
@@ -5041,7 +5189,15 @@ where
     let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
     let logical_argument_types =
         capture_types.iter().cloned().chain(global_input_types.iter().cloned()).collect::<Vec<_>>();
-    let signature = XlaExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice());
+    let effects = program.effects().classes();
+    let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
+    let mut signature = XlaExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice())
+        .with_effects(
+            export_effects && ordered_io,
+            effects.contains(EffectClass::UnorderedIo),
+            effects.contains(EffectClass::OrderedAssertion),
+            !effects.contains(EffectClass::OrderedIo),
+        );
     if let Some(shardings) = arg_shardings
         && shardings.len() != logical_argument_types.len()
     {
@@ -5218,15 +5374,21 @@ where
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let physical_argument_tensor_types = physical_argument_types
+    let mut physical_argument_tensor_types = physical_argument_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, &context, location))
+        .map(|array_type| lower_tensor_type(array_type, &context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let physical_output_tensor_types = physical_output_types
+    if signature.has_ordered_io() {
+        physical_argument_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
+    }
+    let mut physical_output_tensor_types = physical_output_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, &context, location))
+        .map(|array_type| lower_tensor_type(array_type, &context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let arg_sharding_attributes = match arg_shardings {
+    if signature.has_ordered_io() {
+        physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
+    }
+    let mut arg_sharding_attributes = match arg_shardings {
         Some(shardings) => {
             let physical_shardings = signature.physical_input_shardings(shardings);
             Some(
@@ -5238,7 +5400,7 @@ where
         }
         None => None,
     };
-    let result_sharding_attributes = match result_shardings {
+    let mut result_sharding_attributes = match result_shardings {
         Some(shardings) => {
             let physical_shardings = signature.physical_output_shardings(shardings);
             Some(
@@ -5250,13 +5412,28 @@ where
         }
         None => None,
     };
+    if signature.has_ordered_io() && nested_mesh.as_ref().or(signature_mesh.as_ref()).is_some() {
+        let token_sharding = context.shardy_tensor_sharding(
+            context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
+            &[],
+            &[],
+            &[],
+            shardy::ReductionOperation::Sum,
+        )?;
+        if let Some(shardings) = &mut arg_sharding_attributes {
+            shardings.push(token_sharding);
+        }
+        if let Some(shardings) = &mut result_sharding_attributes {
+            shardings.push(token_sharding);
+        }
+    }
     let function_arguments = physical_argument_tensor_types
         .iter()
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(shardings) = &arg_sharding_attributes {
-                attributes.insert("sdy.sharding".into(), shardings[index].as_ref());
+            if let Some(sharding) = arg_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
+                attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(output_index) = aliases.get(&index) {
                 attributes.insert(
@@ -5274,7 +5451,8 @@ where
         .map(|(index, tensor_type)| {
             let attributes = result_sharding_attributes
                 .as_ref()
-                .map(|shardings| HashMap::from([("sdy.sharding".into(), shardings[index].as_ref())]));
+                .and_then(|shardings| shardings.get(index))
+                .map(|sharding| HashMap::from([("sdy.sharding".into(), sharding.as_ref())]));
             TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
         })
         .collect::<Vec<_>>();
@@ -5356,6 +5534,10 @@ where
             } else {
                 public_input_values
             };
+            let mut effect_tokens = EffectTokens::default();
+            if let Some(index) = signature.ordered_io_input_index() {
+                effect_tokens.set(EffectClass::OrderedIo, function_block.argument(index).unwrap().as_ref());
+            }
             let logical_outputs = lower_program_outputs_with_inputs(
                 program,
                 capture_values,
@@ -5365,6 +5547,7 @@ where
                 location.as_ref(),
                 Some(&nested_functions),
                 &collective_state,
+                &mut effect_tokens,
             )?;
             let mut physical_outputs = signature.project_outputs(logical_outputs.as_slice());
             for output_dimension in signature.output_dimensions() {
@@ -5375,6 +5558,9 @@ where
                     &context,
                     location.as_ref(),
                 )?);
+            }
+            if signature.has_ordered_io() {
+                physical_outputs.push(effect_tokens.get(EffectClass::OrderedIo).unwrap());
             }
             function_block_ref.append_operation(func::r#return(physical_outputs.as_slice(), location)?)?;
         }
@@ -5393,10 +5579,12 @@ where
     }
     // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
     // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
+    signature.requires_assertion_handler |= collective_state.has_assertions.get();
+    let requires_assertion_handler = signature.requires_assertion_handler;
     Ok(LoweredXlaModule {
         stable_hlo: serialize_lowered_module(&module, &collective_state)?,
         signature,
-        requires_assertion_handler: program.effects().classes().contains(EffectClass::OrderedAssertion),
+        requires_assertion_handler,
     })
 }
 
@@ -7254,6 +7442,9 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
                 output_types.as_slice(),
                 &mut lowerer,
             )?;
+            if lowerer.effect_tokens.ordered_assertion.is_some() {
+                collective_state.has_assertions.set(true);
+            }
             *effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
         },
@@ -7420,48 +7611,16 @@ where
                 PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
             )?;
+            if lowerer.effect_tokens.ordered_assertion.is_some() {
+                collective_state.has_assertions.set(true);
+            }
             effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
         },
     )
 }
 
-/// Lowers one traced program to values inside a block.
-fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &XlaProgram<ProgramInput, ProgramOutput>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    nested_functions: Option<&Rc<JitCallFunctionMap>>,
-    collective_state: &CollectiveLoweringState,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    ProgramInput: Parameterized<XlaConstant>,
-    ProgramOutput: Parameterized<XlaConstant>,
-{
-    let input_values = program
-        .input_ids()
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            block.argument(captured_values.len() + index).expect("body block arguments should exist").as_ref()
-        })
-        .collect::<Vec<_>>();
-    lower_program_outputs_with_inputs(
-        program,
-        captured_values,
-        input_values.as_slice(),
-        block,
-        context,
-        location,
-        nested_functions,
-        collective_state,
-    )
-}
-
-/// Lowers one traced program using explicitly provided logical input values.
-#[allow(clippy::too_many_arguments)]
+/// Lowers one traced program with explicit array inputs and the enclosing effect chains.
 fn lower_program_outputs_with_inputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     captured_values: &[ValueRef<'b, 'c, 't>],
@@ -7471,6 +7630,7 @@ fn lower_program_outputs_with_inputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOu
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     ProgramInput: Parameterized<XlaConstant>,
@@ -7491,8 +7651,6 @@ where
         atom_values[atom_id.index()] = Some(value);
     }
     let atom_values = std::cell::RefCell::new(atom_values);
-    // Function-body-scoped per-class effect chains are created lazily and dropped at the end of the function body.
-    let mut effect_tokens = EffectTokens::default();
     replay_program_into_block(
         program,
         input_values.to_vec(),
@@ -7517,7 +7675,7 @@ where
                 captured_values,
                 nested_functions,
                 collective_state,
-                &mut effect_tokens,
+                effect_tokens,
             )?;
             for (output_atom, lowered_output) in
                 instruction.outputs().iter().copied().zip(lowered_outputs.iter().copied())
@@ -7529,7 +7687,8 @@ where
     )
 }
 
-/// Lowers one `sdy.manual_computation` operation, including its nested body program.
+/// Lowers one `sdy.manual_computation` operation, threading per-device ordered tokens across its boundary.
+/// Assertions remain local to an executable; ordered I/O must explicitly permit per-device ordering.
 fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
@@ -7540,59 +7699,93 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     collective_state: &CollectiveLoweringState,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
 {
-    let local_input_tensor_types = local_input_types
+    let effects = program.effects();
+    // `OrderedIo` promises one order across devices, which independent per-device execution cannot provide; only
+    // `DeviceOrderedIo` (and unordered I/O) may appear inside a manual computation.
+    if effects.classes().contains(EffectClass::OrderedIo) {
+        return Err(LoweringError::EffectfulShardMapBody);
+    }
+    let threaded_effects = token_threaded_effects(effects.classes()).collect::<Vec<_>>();
+    let mut local_input_tensor_types = local_input_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let global_output_tensor_types = global_output_types
+    let mut global_output_tensor_types = global_output_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-
+    let mut manual_inputs = outer_inputs.to_vec();
+    let mut input_shardings = shard_map.to_shardy_in_shardings(context)?.shardings();
+    let mut output_shardings = shard_map.to_shardy_out_shardings(context)?.shardings();
+    if !threaded_effects.is_empty() {
+        let token_type = context.stable_hlo_token_type()?.as_ref();
+        // Tokens have rank zero and no replicated/unreduced axes. Each device carries its own token, without
+        // imposing a total order between devices or attempting to shard a numeric array dimension.
+        let token_sharding = context.shardy_tensor_sharding(
+            context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
+            &[],
+            &[],
+            &[],
+            shardy::ReductionOperation::Sum,
+        )?;
+        for &effect in &threaded_effects {
+            manual_inputs.push(current_or_new_token(effect, effect_tokens, block, location)?);
+            local_input_tensor_types.push(token_type);
+            global_output_tensor_types.push(token_type);
+            input_shardings.push(token_sharding);
+            output_shardings.push(token_sharding);
+        }
+    }
     let mut body_region = context.region();
-    let body_block = context.block(
-        local_input_tensor_types
-            .iter()
-            .map(|tensor_type| (*tensor_type, location))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
+    let body_block =
+        context.block(local_input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>().as_slice());
     {
         let mut body_block_ref = body_block.as_ref();
-        // Shard-map bodies lower with shard-local types, so their `jit_call`s always inline; do not thread the
-        // module's deduplicated functions (which are typed against global shapes) into them. The body is traced
-        // through a fresh-root context and lowers with an empty capture namespace; refer to the `CustomJvp` arm of
-        // `lower_operation` for the rationale.
+        // Shard-local callees always inline. The fresh-root body has no enclosing capture namespace.
         let body_collective_state = collective_state.enter_manual_region(shard_map.clone());
-        let body_outputs = lower_program_outputs(
+        let mut body_effect_tokens = EffectTokens::default();
+        for (index, &effect) in threaded_effects.iter().enumerate() {
+            body_effect_tokens.set(effect, body_block.argument(local_input_types.len() + index).unwrap().as_ref());
+        }
+        let body_inputs = (0..local_input_types.len())
+            .map(|index| body_block.argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        let mut body_outputs = lower_program_outputs_with_inputs(
             program,
             &[],
+            &body_inputs,
             &mut body_block_ref,
             context,
-            location.as_ref(),
+            location,
             None,
             &body_collective_state,
+            &mut body_effect_tokens,
         )?;
+        body_outputs.extend(threaded_effects.iter().map(|&effect| body_effect_tokens.get(effect).unwrap()));
         body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location)?)?;
     }
     body_region.append_block(body_block)?;
-
     let manual_computation = block.append_operation(shardy::manual_computation(
-        outer_inputs,
+        manual_inputs.as_slice(),
         global_output_tensor_types.as_slice(),
-        shard_map.to_shardy_in_shardings(context)?,
-        shard_map.to_shardy_out_shardings(context)?,
+        context.shardy_tensor_sharding_per_value(&input_shardings)?,
+        context.shardy_tensor_sharding_per_value(&output_shardings)?,
         shard_map.to_shardy_manual_axes(context)?,
         body_region,
         location,
     )?)?;
+    for (index, &effect) in threaded_effects.iter().enumerate() {
+        effect_tokens.set(effect, manual_computation.result(global_output_types.len() + index).unwrap().as_ref());
+    }
     manual_computation
         .results()
+        .take(global_output_types.len())
         .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
         .collect()
 }
@@ -7819,11 +8012,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     op: format!("{} expected 1 attached region but got {}", SHARD_MAP_OPERATION_NAME, regions.len(),),
                 });
             };
-            // Only ordered effects need token threading, which `sdy.manual_computation` cannot express; a body
-            // whose effects are all unordered lowers without any token state.
-            if body.effects().classes().is_ordered() {
-                return Err(LoweringError::EffectfulShardMapBody);
-            }
             let simplified_body = body
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
@@ -7904,6 +8092,9 @@ where
         output_types.as_slice(),
         &mut lowerer,
     )?;
+    if lowerer.effect_tokens.ordered_assertion.is_some() {
+        collective_state.has_assertions.set(true);
+    }
     *effect_tokens = lowerer.effect_tokens;
     Ok(outputs)
 }
@@ -11137,12 +11328,15 @@ mod tests {
     }
 
     /// Wraps one flat vector program in a replicated manual `shard_map` and lowers the enclosing program.
-    fn lower_replicated_shard_map_body(body_program: FlatXlaProgram) -> Result<String, LoweringError> {
+    fn lower_replicated_shard_map_body(
+        body_program: FlatXlaProgram,
+        device_count: usize,
+    ) -> Result<String, LoweringError> {
         use crate::experimental::operations::ShardMapOperation;
         use crate::experimental::shard_map::FlatTracedShardMap;
 
         let vector_type = test_vector_type(4);
-        let mesh = test_manual_mesh("x", 1);
+        let mesh = test_manual_mesh("x", device_count);
         let sharding = Sharding::replicated(mesh.clone(), 1);
         let body = FlatTracedShardMap::from_parts(
             ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()], true),
@@ -11256,7 +11450,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let module = lower_replicated_shard_map_body(body_program).unwrap();
+        let module = lower_replicated_shard_map_body(body_program, 1).unwrap();
 
         assert_eq!(
             module,
@@ -11278,11 +11472,150 @@ mod tests {
     }
 
     #[test]
+    fn test_device_ordered_effects_cross_manual_computation_boundary() {
+        let vector_type = test_vector_type(4);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(vector_type.into());
+        for label in ["first", "second"] {
+            builder
+                .add_instruction(
+                    CustomCallOperation::new(PRINT_CUSTOM_CALL_TARGET, Vec::new())
+                        .with_attribute("label", label)
+                        .with_effect_class(EffectClass::DeviceOrderedIo),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap();
+        }
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = lower_replicated_shard_map_body(program, 2).unwrap();
+        assert!(module.contains("sdy.mesh @mesh = <[\"x\"=2]>"));
+        assert_eq!(module.matches("stablehlo.after_all").count(), 1);
+        assert_eq!(module.matches("stablehlo.custom_call @ryft.print").count(), 2);
+        assert!(module.contains("in_shardings=[<@mesh, [{}], replicated={\"x\"}>, <@mesh, []>]"));
+        assert!(module.contains("out_shardings=[<@mesh, [{}], replicated={\"x\"}>, <@mesh, []>]"));
+        assert!(module.contains("sdy.return %arg1, %3 : tensor<4xf32>, !stablehlo.token"), "{module}");
+    }
+
+    #[test]
+    fn test_device_ordered_effects_execute_on_two_cpu_devices() {
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+        use ryft_pjrt::{
+            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+            load_cpu_plugin,
+        };
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::tests::{values_from_bytes, values_to_bytes};
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(test_vector_type(4).into());
+        let device_index = builder
+            .add_instruction(AxisIndexOperation::new("x".to_string()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let device_index = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F64),
+                Vec::new(),
+                vec![device_index],
+                None,
+            )
+            .unwrap()[0];
+        for label in ["first", "second"] {
+            builder
+                .add_instruction(
+                    CustomCallOperation::new(PRINT_CUSTOM_CALL_TARGET, Vec::new())
+                        .with_attribute("label", label)
+                        .with_effect_class(EffectClass::DeviceOrderedIo),
+                    Vec::new(),
+                    vec![device_index],
+                    None,
+                )
+                .unwrap();
+        }
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let module = lower_replicated_shard_map_body(program, 2).unwrap();
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let options = CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 2,
+                use_spmd_partitioning: true,
+                use_shardy_partitioner: true,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        };
+        let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let bytes = values_to_bytes(&values);
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| {
+                vec![ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(bytes.as_slice(), BufferType::F32, &[4], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let (outputs, lines) = with_captured_prints(|| {
+            executable
+                .execute(
+                    inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+        });
+        assert_eq!(outputs.len(), 2);
+        for output in outputs {
+            assert_eq!(output.outputs.len(), 1);
+            let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(&bytes), values);
+        }
+        assert_eq!(lines.len(), 4);
+        for device in [0, 1] {
+            let first = lines.iter().position(|line| line == &format!("first: {device}.0")).unwrap();
+            let second = lines.iter().position(|line| line == &format!("second: {device}.0")).unwrap();
+            assert!(first < second);
+        }
+    }
+
+    #[test]
     fn test_effectful_shard_map_body_is_rejected() {
         use ryft_core::PrintOperation;
 
-        // Shardy manual-computation boundaries cannot carry StableHLO effect tokens. Reject an effectful body instead
-        // of silently creating a private chain that is unordered with respect to effects outside the shard map.
+        // A default print declares `OrderedIo`, whose order across devices cannot be provided by independent
+        // per-device execution, so it is rejected inside manual computations.
         let vector_type = test_vector_type(4);
         let effectful_body_program = {
             let mut builder = CompositeXlaProgramBuilder::new();
@@ -11294,9 +11627,8 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            lower_replicated_shard_map_body(effectful_body_program).unwrap_err().to_string(),
-            "effectful shard_map bodies are unsupported because sdy.manual_computation cannot preserve effect \
-             ordering across its boundary",
+            lower_replicated_shard_map_body(effectful_body_program, 1).unwrap_err().to_string(),
+            "`shard_map` bodies require `DeviceOrderedIo` because `OrderedIo` demands one order across devices",
         );
     }
 
@@ -14790,6 +15122,59 @@ mod tests {
     }
 
     #[test]
+    fn test_executable_print_effect_boundary() {
+        use ryft_core::PrintOperation;
+
+        for effect_class in [EffectClass::UnorderedIo, EffectClass::OrderedIo, EffectClass::DeviceOrderedIo] {
+            let ordered = effect_class.is_ordered();
+            let array_type = ArrayType::scalar(DataType::F32);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(array_type.clone());
+            builder
+                .add_instruction(
+                    PrintOperation::new("value").with_effect_class(effect_class),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap();
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+                .unwrap();
+            let lowered = lower_mlir_module_for_program_with_reference_state(
+                &unproject_plain_program(program),
+                &[],
+                &vec![array_type],
+                &Vec::<ArrayType>::new(),
+                "main",
+                None,
+                None,
+                Some("cpu"),
+                &[],
+                RaggedDotLoweringStrategy::default(),
+            )
+            .unwrap();
+            assert_eq!(lowered.signature.has_ordered_io(), ordered);
+            assert_eq!(lowered.signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
+            assert_eq!(lowered.signature.has_unordered_io(), !ordered);
+            assert!(lowered.signature.has_effects());
+            assert!(!lowered.signature.requires_assertion_handler());
+            assert_eq!(lowered.signature.ordered_io_input_index(), ordered.then_some(1));
+            assert_eq!(lowered.signature.ordered_io_output_index(), ordered.then_some(0));
+            assert_eq!(lowered.signature.physical_input_count(), 1 + usize::from(ordered));
+            assert_eq!(lowered.stable_hlo.matches("stablehlo.after_all").count(), usize::from(!ordered));
+            assert!(lowered.stable_hlo.contains("has_side_effect = true"));
+            if ordered {
+                assert!(lowered.stable_hlo.contains("%arg1: !stablehlo.token) -> !stablehlo.token"));
+                assert!(lowered.stable_hlo.contains("@ryft.print(%arg0, %arg1)"));
+                assert!(lowered.stable_hlo.contains("return %0 : !stablehlo.token"));
+            } else {
+                assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<f32>) {"));
+            }
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_lowers_custom_call() {
         use ryft_core::operations::custom_call::CustomCallOperation;
         use ryft_core::{PrintOperation, StridedLayout, Tile, TileDimension, TiledLayout};
@@ -16527,6 +16912,58 @@ mod tests {
         let if_line = stablehlo.lines().find(|line| line.contains("\"stablehlo.if\"")).unwrap();
         assert!(if_line.contains(":3 ="), "{stablehlo}");
         assert!(stablehlo.contains("-> (tensor<i64>, !stablehlo.token, !stablehlo.token)"), "{stablehlo}",);
+    }
+
+    #[test]
+    fn test_executable_assertions_remain_local() {
+        use ryft_core::{DimensionFromScalarOperation, DimensionRequirementOperation};
+
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
+        let requirement = DimensionRequirementOperation::equal(
+            &DimensionType::new(left_variable.clone()),
+            &DimensionType::new(right_variable.clone()),
+        );
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let left = builder.add_input(scalar_type.clone().into());
+        let right = builder.add_input(scalar_type.clone().into());
+        let left_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
+            .unwrap()[0];
+        let right_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(requirement, Vec::new(), vec![left_dimension, right_dimension], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder, Placeholder], vec![])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program_with_reference_state(
+            &program,
+            &[],
+            &vec![scalar_type.clone(), scalar_type],
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+            Some("cpu"),
+            &[],
+            RaggedDotLoweringStrategy::default(),
+        )
+        .unwrap();
+        assert!(lowered.requires_assertion_handler);
+        assert!(lowered.signature.requires_assertion_handler());
+        assert!(lowered.signature.has_effects());
+        assert!(!lowered.signature.has_ordered_io());
+        assert!(!lowered.signature.has_unordered_io());
+        assert_eq!(lowered.signature.ordered_io_input_index(), None);
+        assert_eq!(lowered.signature.ordered_io_output_index(), None);
+        assert_eq!(lowered.signature.physical_input_count(), 2);
+        assert!(lowered.stable_hlo.contains("func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) {"));
+        assert!(lowered.stable_hlo.contains("stablehlo.after_all"));
+        assert!(lowered.stable_hlo.contains("stablehlo.custom_call @ryft.assert"));
     }
 
     #[test]

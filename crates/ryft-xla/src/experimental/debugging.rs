@@ -116,6 +116,7 @@ pub fn ensure_print_handler_registered(client: &Client<'_>) -> Result<(), Error>
 /// XLA FFI handler for [`PRINT_CUSTOM_CALL_TARGET`] custom calls. Refer to the documentation of
 /// [`PRINT_CUSTOM_CALL_TARGET`] for the calling convention that this handler decodes.
 unsafe extern "C" fn print_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+    let _callback_guard = super::domains::EffectCallbackGuard::enter();
     // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
     // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and `handle_print_call_frame`.
     unsafe {

@@ -19,7 +19,7 @@ pub use errors::Error;
 pub use experimental::RaggedDotLoweringStrategy;
 pub use experimental::domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
-    XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions,
+    XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession,
 };
 pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{

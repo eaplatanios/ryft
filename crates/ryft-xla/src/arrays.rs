@@ -5,8 +5,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
-    ArrayType, CompilationContext, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized,
-    ProjectedContext, Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, ProjectedContext, Sharding,
+    ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -54,13 +54,10 @@ pub struct Array<'o> {
     /// Refer to the documentation of [`Self::client`] for information on this field.
     client: Option<&'o Client<'o>>,
 
-    /// Process-local compile cache of the eager [`XlaDomain`] associated with this [`Array`], shared across array
-    /// clones and eager outputs via an [`Arc`]. Eager execution (see [`XlaDomain::bind`](ryft_core::Context::bind))
-    /// attaches the executing domain's cache to its outputs, and [`Value::execution_domain`] lazily initializes the
-    /// cache for arrays that were constructed outside any domain, so that every [`XlaDomain`] recovered from this
-    /// array (or from values derived from it) keeps hitting one shared dispatch cache instead of recompiling
-    /// repeated operation signatures.
-    compilation_cache: OnceLock<Arc<CompilationContext<XlaDomain<'o>>>>,
+    /// Execution association retained across clones and derived values. Explicit domains select their own scope;
+    /// receiver-based operations use this value's association, so `x + y` and `y + x` may select different scopes.
+    /// Arrays created without a session initialize an independent association on first dispatch.
+    execution_domain: Arc<OnceLock<XlaDomain<'o>>>,
 
     /// Value-local, clone-shared cache of lazily padded bound-shaped device materializations.
     bounded_materializations: Arc<BoundedMaterializationCache<'o>>,
@@ -95,7 +92,7 @@ impl<'o> Clone for Array<'o> {
             shard_index_by_device: self.shard_index_by_device.clone(),
             execution_fence: self.execution_fence.clone(),
             client: self.client,
-            compilation_cache: self.compilation_cache.clone(),
+            execution_domain: Arc::clone(&self.execution_domain),
             bounded_materializations: Arc::clone(&self.bounded_materializations),
             logical_extent_scalars: Arc::clone(&self.logical_extent_scalars),
         }
@@ -268,7 +265,7 @@ impl<'o> Array<'o> {
             shard_index_by_device,
             execution_fence: None,
             client: None,
-            compilation_cache: OnceLock::new(),
+            execution_domain: Arc::new(OnceLock::new()),
             bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
             logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
         };
@@ -320,7 +317,7 @@ impl<'o> Array<'o> {
             shard_index_by_device,
             execution_fence: None,
             client: Some(client),
-            compilation_cache: OnceLock::new(),
+            execution_domain: Arc::new(OnceLock::new()),
             bounded_materializations: Arc::new(BoundedMaterializationCache::default()),
             logical_extent_scalars: Arc::new(Mutex::new(VecDeque::new())),
         })
@@ -495,6 +492,9 @@ impl<'o> Array<'o> {
     ///
     /// # Errors
     ///
+    /// Changing the client of a bufferless array resets its execution association. Clones retain their original
+    /// association, and reattaching the same client preserves the existing scope.
+    ///
     /// Returns [`Error::PjrtError`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if any
     /// addressable shard's buffer is owned by a different PJRT client than the provided one.
     pub fn with_client(mut self, client: &'o Client<'o>) -> Result<Self, Error> {
@@ -509,6 +509,9 @@ impl<'o> Array<'o> {
                 .into());
             }
         }
+        if self.client.is_some_and(|previous| !std::ptr::eq(previous, client)) {
+            self.execution_domain = Arc::new(OnceLock::new());
+        }
         self.client = Some(client);
         Ok(self)
     }
@@ -521,12 +524,10 @@ impl<'o> Array<'o> {
         self.client = None;
     }
 
-    /// Attaches the provided [`XlaDomain`] compile cache to this [`Array`], replacing any cache attached earlier.
-    /// Eager execution calls this on its outputs so that domains recovered from them via
-    /// [`Value::execution_domain`] share the producing domain's dispatch cache. Refer to the documentation of the
-    /// [`Self::compilation_cache`] field for more information.
-    pub(crate) fn with_compilation_cache(mut self, cache: Arc<CompilationContext<XlaDomain<'o>>>) -> Self {
-        self.compilation_cache = OnceLock::from(cache);
+    /// Associates future receiver-based dispatch with `domain`. Execution paths validate client identity before
+    /// producing arrays; this internal function preserves that already-validated association on their outputs.
+    pub(crate) fn with_execution_domain(mut self, domain: XlaDomain<'o>) -> Self {
+        self.execution_domain = Arc::new(OnceLock::from(domain));
         self
     }
 
@@ -777,16 +778,15 @@ impl<'o> Value for Array<'o> {
 
     /// Recovers the eager [`XlaDomain`] this [`Array`] executes in. When the array carries an attached client (see
     /// [`Array::client`]), the returned domain is backed by that client and shares this array's compile cache
-    /// (lazily initialized on first recovery, so repeated recoveries from the same array — and from eager outputs
-    /// derived from it — keep hitting one dispatch cache). Arrays without an attached client recover a clientless
-    /// domain that carries the XLA staged operation universe but rejects eager binds with a clear
+    /// (lazily initialized on first recovery for raw-client arrays). Session-created arrays share their session and
+    /// selected effect scope. Association is per value: receiver-based `x + y` and `y + x` may choose different scopes
+    /// even when their numerical values match. Fork scopes at task boundaries rather than inside expressions. Arrays
+    /// without an attached client recover a clientless domain carrying the XLA staged operation universe, but eager
+    /// binds fail with a clear
     /// "requires a PJRT client" error; attach a client via [`Array::with_client`] to make such arrays executable.
     fn execution_domain(&self) -> Self::ExecutionDomain {
         ProjectedContext::new(match self.client {
-            Some(client) => {
-                let cache = Arc::clone(self.compilation_cache.get_or_init(|| Arc::new(CompilationContext::new())));
-                XlaDomain::with_shared_cache(client, cache)
-            }
+            Some(client) => self.execution_domain.get_or_init(|| XlaDomain::new(client)).clone(),
             None => XlaDomain::clientless(),
         })
     }
@@ -1203,18 +1203,19 @@ impl ArrayTypeExtension for ArrayType {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Error as CoreError,
         Layout, LogicalMesh, MeshAxis, MeshAxisType, Reference, Shape, Sharding, ShardingDimension, ShardingError,
-        StaticShape, TiledLayout, Typed,
+        StaticShape, TiledLayout, Typed, Value,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
-    use crate::{Error, FromPjrt};
+    use crate::{ArrayError, Error, FromPjrt, XlaSession};
 
     use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout, block_until_ready};
 
@@ -1476,6 +1477,43 @@ mod tests {
         let array = Array::from_addressable_buffers(None, array_type, mesh, Vec::new()).unwrap();
         assert!(array.client().is_none());
         assert!(std::ptr::eq(array.with_client(&other_client).unwrap().client().unwrap(), &other_client));
+    }
+
+    #[test]
+    fn test_array_with_client_replaces_bufferless_execution_association() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let other_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![device],
+        )
+        .unwrap();
+        let session = Arc::new(XlaSession::new(&client));
+        let array = session.array(ArrayType::scalar(DataType::Zero), mesh, []).unwrap();
+        let original = array.clone();
+        let unchanged = array.clone().with_client(&client).unwrap();
+        assert!(Arc::ptr_eq(&unchanged.execution_domain, &original.execution_domain));
+
+        let reassociated = array.with_client(&other_client).unwrap();
+        assert!(std::ptr::eq(reassociated.client().unwrap(), &other_client));
+        assert!(reassociated.execution_domain.get().is_none());
+        let _domain = reassociated.execution_domain();
+        assert!(std::ptr::eq(reassociated.execution_domain.get().unwrap().client().unwrap(), &other_client));
+        assert!(std::ptr::eq(original.execution_domain.get().unwrap().client().unwrap(), &client));
+
+        // Session association rejects a foreign client even when no numerical buffer can establish ownership.
+        let other_session = Arc::new(XlaSession::new(&other_client));
+        assert!(matches!(
+            other_session.associate(original),
+            Err(ArrayError::Error(Error::PjrtError(PjrtError::InvalidArgument { message, .. })))
+                if message == "array belongs to a different session client",
+        ));
     }
 
     #[test]

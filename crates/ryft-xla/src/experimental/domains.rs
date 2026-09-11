@@ -5,7 +5,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use prost::Message;
@@ -29,8 +29,8 @@ use ryft_core::{
 use ryft_core::{Array as CpuArray, ProjectedContext};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{
-    Buffer, Client, Execution, ExecutionFence, LoadOptions, LoadedExecutable, Program as PjrtProgram,
-    Value as PjrtValue,
+    Buffer, BufferSpecification, BufferType, Client, Execution, ExecutionFence, LoadOptions, LoadedExecutable,
+    Program as PjrtProgram, Value as PjrtValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,6 +111,10 @@ pub enum XlaDomainError {
     #[error("unsupported XLA reference ABI: {reason}")]
     UnsupportedReferenceAbi { reason: String },
 
+    /// Ordering, completion observation, or recovery of an effect scope failed.
+    #[error("effect scope: {reason}")]
+    EffectScope { reason: String },
+
     /// A submitted asynchronous XLA reference execution failed before its pending state became ready.
     #[error("asynchronous XLA reference execution failed: {reason}")]
     AsynchronousReferenceExecution { reason: String },
@@ -167,24 +171,447 @@ impl<'c> PreparedXlaExecution<'c> {
     }
 }
 
+/// Shared compilation and effect resources for execution on one externally owned PJRT [`Client`].
+///
+/// Keep one session alive across array creation and domain construction to share the cache and default effect scope.
+/// Separate sessions are independent, even on the same client. Domains can fork their scope while sharing this cache.
+/// Cached executables retain neither sessions nor arrays, so the ownership graph has no cache/session cycle.
+/// Call [`Self::effects_barrier`] before dropping the client when its effects must be observed; destruction adds no
+/// implicit barrier and backend behavior with unfinished device work is plugin-specific.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use ryft_core::{ArrayType, DataType, DeviceMesh, Print};
+/// use ryft_pjrt::Client;
+/// use ryft_xla::XlaSession;
+///
+/// fn print_values<'c>(client: &'c Client<'c>, mesh: DeviceMesh) -> Result<(), Box<dyn std::error::Error>> {
+///     let session = Arc::new(XlaSession::new(client));
+///     let value = session.array(ArrayType::scalar(DataType::F64), mesh, 1.0f64.to_ne_bytes())?;
+///     value.print("value");
+///     session.effects_barrier()?;
+///     Ok(())
+/// }
+/// ```
+///
+/// A session cannot outlive its client:
+/// ```compile_fail
+/// use ryft_xla::XlaSession;
+/// fn escaped(client: ryft_pjrt::Client<'_>) {
+///     let session = XlaSession::new(&client);
+///     drop(client);
+///     session.effects_barrier().unwrap();
+/// }
+/// ```
+pub struct XlaSession<'c> {
+    /// Externally owned client, which outlives cached executables and effect carriers.
+    client: &'c Client<'c>,
+    /// Cached artifacts contain no runtime execution association.
+    cache: CompilationContext<XlaDomain<'c>>,
+    /// Default ordering and completion scope shared by domains and arrays created through this session.
+    default_effect_scope: Arc<EffectScope<'c>>,
+}
+
+impl<'c> XlaSession<'c> {
+    /// Creates an independent session with an empty compilation cache and effect scope.
+    pub fn new(client: &'c Client<'c>) -> Self {
+        Self::with_compilation_context(client, CompilationContext::new())
+    }
+
+    /// Creates a session with an explicitly configured compilation cache.
+    pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<XlaDomain<'c>>) -> Self {
+        Self { client, cache, default_effect_scope: Arc::new(EffectScope::default()) }
+    }
+
+    /// Returns the externally owned PJRT client.
+    pub fn client(&self) -> &'c Client<'c> {
+        self.client
+    }
+
+    /// Returns the shared compilation cache.
+    pub fn compilation_context(&self) -> &CompilationContext<XlaDomain<'c>> {
+        &self.cache
+    }
+
+    /// Creates a domain sharing this session's cache and default scope.
+    pub fn domain(self: &Arc<Self>) -> XlaDomain<'c> {
+        XlaDomain::from_session_configuration(Arc::clone(self), None, XlaDomain::default_compilation_options())
+    }
+
+    /// Uploads host bytes and associates the resulting array with this session's default scope.
+    pub fn array<B: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        r#type: ArrayType,
+        mesh: DeviceMesh,
+        buffer: B,
+    ) -> Result<Array<'c>, ArrayError> {
+        Ok(Array::from_host_buffer(self.client, r#type, mesh, buffer)?.with_execution_domain(self.domain()))
+    }
+
+    /// Associates an existing array with this session for future dispatch, validating client ownership first.
+    /// This does not merge or retroactively order previously submitted work from its former scope.
+    pub fn associate(self: &Arc<Self>, array: Array<'c>) -> Result<Array<'c>, ArrayError> {
+        if array.client().is_some_and(|client| !std::ptr::eq(client, self.client)) {
+            return Err(ryft_pjrt::Error::invalid_argument("array belongs to a different session client").into());
+        }
+        Ok(array.with_client(self.client)?.with_execution_domain(self.domain()))
+    }
+
+    /// Waits for the default scope's previously reserved effects, including unordered I/O and local assertions.
+    /// Later submissions and forked scopes are excluded. Failures are retained until explicitly acknowledged.
+    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
+        self.default_effect_scope.barrier()
+    }
+
+    /// Acknowledges failures reported by a completed barrier once their affected ordering chain is quiescent.
+    /// This never waits, repairs reference state, or changes errors retained by existing arrays/executions.
+    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
+        self.default_effect_scope.acknowledge()
+    }
+}
+
+/// Completion-only state that is safe to retain in PJRT callbacks without retaining any client-borrowing resource.
+#[derive(Default)]
+struct EffectCompletion {
+    /// Immutable terminal outcome, published once after submission or cancellation.
+    result: Mutex<Option<Result<(), Arc<str>>>>,
+    /// Wakes barrier callers when the terminal outcome becomes available.
+    ready: Condvar,
+}
+
+impl EffectCompletion {
+    /// Records completion without entering scope state or running user code.
+    fn complete(&self, result: Result<(), Arc<str>>) {
+        *self.result.lock().expect("effect completion mutex poisoned") = Some(result);
+        self.ready.notify_all();
+    }
+
+    /// Returns a nonblocking snapshot of the completion state.
+    fn result(&self) -> Option<Result<(), Arc<str>>> {
+        self.result.lock().expect("effect completion mutex poisoned").clone()
+    }
+
+    /// Waits for this invocation, including its reservation-to-submission interval.
+    fn wait(&self) -> Result<(), Arc<str>> {
+        let mut result = self.result.lock().expect("effect completion mutex poisoned");
+        while result.is_none() {
+            result = self.ready.wait(result).expect("effect completion mutex poisoned");
+        }
+        result.as_ref().unwrap().clone()
+    }
+}
+
+/// Host publication state for an effect carrier, including cancellation forwarding without a host wait.
+#[derive(Clone, Default)]
+enum EffectCarrier<'c> {
+    /// The invocation has not published its physical result yet.
+    #[default]
+    Pending,
+
+    /// The invocation published its physical result or submission failure.
+    Published(Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>),
+
+    /// Preparation was cancelled; successors inherit the preceding invocation's eventual carrier.
+    Forward(Option<Arc<EffectSubmission<'c>>>),
+}
+
+/// One reserved invocation. Carrier ownership remains tied to the client lifetime through ordinary buffers.
+struct EffectSubmission<'c> {
+    /// Monotonically increasing scope-local submission identity.
+    identity: u64,
+    /// Whether the invocation participates in the ordered I/O chain.
+    ordered: bool,
+    /// Buffer-free state retained by the completion observer.
+    completion: Arc<EffectCompletion>,
+    /// Physical carrier publication or nonblocking forwarding of a cancelled reservation.
+    carrier: Mutex<EffectCarrier<'c>>,
+    /// Wakes submitting threads once the predecessor's physical result is available.
+    published: Condvar,
+}
+
+impl<'c> EffectSubmission<'c> {
+    /// Publishes a carrier after execution handoff, or forwards the predecessor after a cancelled submission.
+    fn publish(&self, carrier: Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>>) {
+        *self.carrier.lock().expect("effect publication mutex poisoned") = EffectCarrier::Published(carrier);
+        self.published.notify_all();
+    }
+
+    /// Waits only for host publication, following cancelled reservations without recursion or device waits.
+    fn carrier(&self) -> Result<Option<Vec<Arc<Buffer<'c>>>>, Arc<str>> {
+        let mut carrier = self.publication();
+        loop {
+            match carrier {
+                EffectCarrier::Published(result) => return result,
+                EffectCarrier::Forward(None) => return Ok(None),
+                EffectCarrier::Forward(Some(predecessor)) => carrier = predecessor.publication(),
+                EffectCarrier::Pending => unreachable!("publication waits for a terminal host state"),
+            }
+        }
+    }
+
+    /// Waits for this reservation's publication state, without following forwarding links under its mutex.
+    fn publication(&self) -> EffectCarrier<'c> {
+        let mut carrier = self.carrier.lock().expect("effect publication mutex poisoned");
+        while matches!(*carrier, EffectCarrier::Pending) {
+            carrier = self.published.wait(carrier).expect("effect publication mutex poisoned");
+        }
+        carrier.clone()
+    }
+}
+
+impl Drop for EffectSubmission<'_> {
+    fn drop(&mut self) {
+        // Cancelled reservations can form a long forwarding chain. Detach uniquely owned links before dropping
+        // each node so scope teardown does not consume one stack frame per cancelled submission.
+        let mut carrier = std::mem::take(self.carrier.get_mut().expect("effect publication mutex poisoned"));
+        while let EffectCarrier::Forward(Some(predecessor)) = carrier {
+            match Arc::try_unwrap(predecessor) {
+                Ok(mut predecessor) => {
+                    carrier = std::mem::take(predecessor.carrier.get_mut().expect("effect publication mutex poisoned"));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Synchronized scope metadata; callbacks never acquire this mutex or own this state.
+#[derive(Default)]
+struct EffectScopeState<'c> {
+    /// Identity of the next reserved invocation.
+    next_identity: u64,
+    /// Latest ordered invocation, retained even after its successful completion is retired.
+    tail: Option<Arc<EffectSubmission<'c>>>,
+    /// Outstanding invocations and unacknowledged failures, in reservation order.
+    submissions: Vec<Arc<EffectSubmission<'c>>>,
+    /// Failures reported by completed barriers.
+    observed: HashSet<u64>,
+    /// Ordered device assignment selected by the chain; changes require an explicit scope fork.
+    device: Option<Vec<DeviceId>>,
+}
+
+/// Session-owned ordering and completion scope, independent of numerical values and compilation artifacts.
+#[derive(Default)]
+struct EffectScope<'c> {
+    /// Reservation, observation, and recovery state; never held across PJRT calls or device waits.
+    state: Mutex<EffectScopeState<'c>>,
+}
+
+impl<'c> EffectScope<'c> {
+    /// Reserves a position and snapshots the predecessor atomically before releasing the scope mutex.
+    fn reserve(&self, device: Option<Vec<DeviceId>>) -> Result<EffectReservation<'c>, XlaDomainError> {
+        ensure_effect_dispatch_allowed()?;
+        let mut state = self.state.lock().expect("effect scope mutex poisoned");
+        if device.is_some()
+            && state
+                .submissions
+                .iter()
+                .any(|submission| submission.ordered && matches!(submission.completion.result(), Some(Err(_))))
+        {
+            return Err(XlaDomainError::EffectScope {
+                reason: "ordered I/O has failed; call `effects_barrier()` and then \
+                    `acknowledge_effect_errors()` before retrying"
+                    .to_string(),
+            });
+        }
+        if let Some(device) = &device {
+            if state.device.as_ref().is_some_and(|previous| previous != device) {
+                return Err(XlaDomainError::EffectScope {
+                    reason: "ordered I/O device changed; use `fork_effect_scope()` for a new device assignment"
+                        .to_string(),
+                });
+            }
+            state.device = Some(device.clone());
+        }
+        let submission = Arc::new(EffectSubmission {
+            identity: state.next_identity,
+            ordered: device.is_some(),
+            completion: Arc::new(EffectCompletion::default()),
+            carrier: Mutex::new(EffectCarrier::Pending),
+            published: Condvar::new(),
+        });
+        state.next_identity += 1;
+        let predecessor = if device.is_some() { state.tail.replace(Arc::clone(&submission)) } else { None };
+        let mut retired = Vec::new();
+        state.submissions.retain(|submission| {
+            if matches!(submission.completion.result(), Some(Ok(()))) {
+                retired.push(Arc::clone(submission));
+                false
+            } else {
+                true
+            }
+        });
+        state.submissions.push(Arc::clone(&submission));
+        drop(state);
+        drop(retired);
+        Ok(EffectReservation { submission, predecessor, published: false })
+    }
+
+    /// Waits for a fixed snapshot and reports its failures in submission order.
+    fn barrier(&self) -> Result<(), XlaDomainError> {
+        ensure_effect_dispatch_allowed()?;
+        let submissions = self.state.lock().expect("effect scope mutex poisoned").submissions.clone();
+        let mut failures = Vec::new();
+        let mut successful = HashSet::new();
+        for submission in &submissions {
+            match submission.completion.wait() {
+                Ok(()) => {
+                    successful.insert(submission.identity);
+                }
+                Err(error) => failures.push((submission.identity, error)),
+            }
+        }
+        let mut state = self.state.lock().expect("effect scope mutex poisoned");
+        state.observed.extend(failures.iter().map(|(identity, _)| *identity));
+        let mut retired = Vec::new();
+        state.submissions.retain(|submission| {
+            if successful.contains(&submission.identity) {
+                retired.push(Arc::clone(submission));
+                false
+            } else {
+                true
+            }
+        });
+        drop(state);
+        drop(retired);
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(XlaDomainError::EffectScope {
+            reason: format!(
+                "{}; call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` \
+                 to recover once affected work is complete",
+                failures
+                    .iter()
+                    .map(|(identity, error)| format!("submission {identity}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        })
+    }
+
+    /// Clears only observed failures after affected invocations have completed, without waiting.
+    fn acknowledge(&self) -> Result<(), XlaDomainError> {
+        ensure_effect_dispatch_allowed()?;
+        let mut state = self.state.lock().expect("effect scope mutex poisoned");
+        // Callbacks publish independently of the scope mutex. Read each completion exactly once so a failure
+        // arriving after validation cannot be discarded by the retirement step below.
+        let completions = state
+            .submissions
+            .iter()
+            .map(|submission| (submission.identity, submission.ordered, submission.completion.result()))
+            .collect::<Vec<_>>();
+        let ordered_failure = completions.iter().any(|(_, ordered, result)| *ordered && matches!(result, Some(Err(_))));
+        if completions.iter().any(|(identity, ordered, result)| {
+            (ordered_failure && *ordered && result.is_none())
+                || (matches!(result, Some(Err(_))) && !state.observed.contains(identity))
+        }) {
+            return Err(XlaDomainError::EffectScope {
+                reason: "effect failures are pending or unreported; call `effects_barrier()` and then \
+                    `acknowledge_effect_errors()` again"
+                    .to_string(),
+            });
+        }
+        let completed = completions
+            .iter()
+            .filter_map(|(identity, _, result)| result.as_ref().map(|_| *identity))
+            .collect::<HashSet<_>>();
+        let retired_tail = if ordered_failure { state.tail.take() } else { None };
+        if ordered_failure {
+            state.device = None;
+        }
+        let mut retired = Vec::new();
+        state.submissions.retain(|submission| {
+            if completed.contains(&submission.identity) {
+                retired.push(Arc::clone(submission));
+                false
+            } else {
+                true
+            }
+        });
+        state.observed.clear();
+        drop(state);
+        drop(retired);
+        drop(retired_tail);
+        Ok(())
+    }
+}
+
+/// Client-borrowing reservation, released on every preparation or submission failure.
+struct EffectReservation<'c> {
+    /// Invocation being prepared or published.
+    submission: Arc<EffectSubmission<'c>>,
+    /// Predecessor whose carrier will be forwarded if submission fails before handoff.
+    predecessor: Option<Arc<EffectSubmission<'c>>>,
+    /// Whether device work and its carrier have been published.
+    published: bool,
+}
+
+impl Drop for EffectReservation<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            // Cancellation must not wait: the predecessor may still be prepared on this same calling thread.
+            *self.submission.carrier.lock().expect("effect publication mutex poisoned") =
+                EffectCarrier::Forward(self.predecessor.take());
+            self.submission.published.notify_all();
+            self.submission.completion.complete(Ok(()));
+        }
+    }
+}
+
+std::thread_local! {
+    /// Reentrancy detection only; effect ordering lives in the explicit session scope.
+    static EFFECT_CALLBACK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores managed callback depth even when a callback returns an error or unwinds.
+pub(crate) struct EffectCallbackGuard;
+
+impl EffectCallbackGuard {
+    /// Enters a managed callback, preventing reentrant submission and barriers on its PJRT thread.
+    pub(crate) fn enter() -> Self {
+        EFFECT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for EffectCallbackGuard {
+    fn drop(&mut self) {
+        EFFECT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+/// Rejects managed-callback reentrancy before any scope or reference locks are taken.
+fn ensure_effect_dispatch_allowed() -> Result<(), XlaDomainError> {
+    if EFFECT_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
+        Err(XlaDomainError::EffectScope {
+            reason: "execution and effect barriers cannot be entered from a managed callback".to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs
 /// against a live PJRT [`Client`].
 ///
-/// An [`XlaDomain`] bundles four pieces of context:
+/// Domains retain an [`XlaSession`] for the client and compilation cache, a selected effect scope, optional
+/// [`DeviceMesh`], and shared default [`CompilationOptions`]. Clones share their scope; [`Self::fork_effect_scope`]
+/// starts an independent sequence while retaining the cache and configuration. Cached programs are session-free;
+/// execution always uses the invoking domain's scope, including cache hits and retained compiled functions.
 ///
-/// - a PJRT [`Client`] used to upload `zero`/`one` shards and to compile and execute programs (including the
-///   per-operation programs behind eager [`Context::bind`] dispatch),
-/// - an optional concrete [`DeviceMesh`] that eager binds prefer when deriving their execution mesh and that the
-///   constant-materialization fast path requires,
-/// - an immutable, shared default [`CompilationOptions`] template that the compile path forwards to PJRT, and
-/// - an internal [`CompilationContext`] that memoizes compiled programs across calls, shared
-///   across [`Clone`] of this domain via an [`Arc`].
+/// Ordered I/O dependencies gate the successor computation's entire launch, including its pure work. The backend
+/// may execute inline or asynchronously. Use unordered printing for throughput-sensitive debugging where ordering
+/// does not matter. [`Self::effects_barrier`] also observes unordered I/O and local assertion failures, so it is
+/// broader than flushing prints. Call it before dropping the client when its effects must be observed.
 ///
-/// The cache lives directly on the domain because the domain is the unit of execution from a
-/// user's perspective. Calls that reuse the same [`XlaDomain`] also reuse its cache for repeat
-/// compilations. Domain clones share the same underlying cache, so handing a cloned domain to a
-/// long-lived [`CompiledXlaFunction`](crate::CompiledXlaFunction)
-/// does not duplicate cached compilations.
+/// Custom calls and prints declaring `DeviceOrderedIo` may execute per device inside manual computation regions on
+/// CPU, while `OrderedIo` occurrences keep the program on one device. Tokens retain per-device dependencies without a
+/// Ryft-wide device rendezvous; the backend can impose additional scheduling
+/// dependencies, including serialization of multi-device launches. Opaque registered handlers must not reenter
+/// dispatch or barriers. Managed print/assertion handlers reject such reentrancy before acquiring scope locks.
 ///
 /// The same domain type covers both staged tracing and concrete execution. Nested traced code can borrow
 /// [`XlaDomain::token`] when it needs a clientless domain for static staging instead of defining a separate token type.
@@ -200,8 +627,14 @@ pub struct XlaDomain<'c> {
     /// [`XlaDomain`] values are cloned into every transform tracer that executes through this domain.
     compilation_options: Arc<CompilationOptions>,
 
-    /// Process-local cache of compiled programs, shared across domain clones via [`Arc`].
-    cache: Arc<CompilationContext<XlaDomain<'c>>>,
+    /// Shared execution resources; absent for clientless tracing domains.
+    session: Option<Arc<XlaSession<'c>>>,
+
+    /// Empty cache retained only for clientless tracing compatibility.
+    tracing_cache: Option<Arc<CompilationContext<XlaDomain<'c>>>>,
+
+    /// Selected ordering scope, which may be a fork of the session default.
+    effect_scope: Option<Arc<EffectScope<'c>>>,
 
     /// Phantom marker tying the domain lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
@@ -260,7 +693,9 @@ impl<'c> Clone for XlaDomain<'c> {
             client: self.client,
             mesh: self.mesh.clone(),
             compilation_options: Arc::clone(&self.compilation_options),
-            cache: Arc::clone(&self.cache),
+            session: self.session.clone(),
+            tracing_cache: self.tracing_cache.clone(),
+            effect_scope: self.effect_scope.clone(),
             marker: PhantomData,
         }
     }
@@ -296,26 +731,22 @@ impl<'c> XlaDomain<'c> {
     /// Creates a new [`XlaDomain`] with an explicit [`CompilationOptions`] template.
     #[inline]
     pub fn with_compilation_options(client: &'c Client<'c>, compilation_options: CompilationOptions) -> Self {
-        Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Arc::new(compilation_options),
-            cache: Arc::new(CompilationContext::new()),
-            marker: PhantomData,
-        }
+        Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::new())),
+            None,
+            Arc::new(compilation_options),
+        )
     }
 
     /// Creates a new [`XlaDomain`] with an explicit in-memory cache capacity. `capacity` must be
     /// greater than zero; values of zero are silently clamped to one entry.
     #[inline]
     pub fn with_cache_capacity(client: &'c Client<'c>, capacity: usize) -> Self {
-        Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(CompilationContext::with_capacity(capacity)),
-            marker: PhantomData,
-        }
+        Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::with_capacity(capacity))),
+            None,
+            Self::default_compilation_options(),
+        )
     }
 
     /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
@@ -324,26 +755,25 @@ impl<'c> XlaDomain<'c> {
     #[inline]
     pub fn with_disk_cache(client: &'c Client<'c>, directory: impl Into<PathBuf>) -> std::io::Result<Self> {
         let cache = CompilationContext::new().with_disk_cache(directory)?;
-        Ok(Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(cache),
-            marker: PhantomData,
-        })
+        Ok(Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(client, cache)),
+            None,
+            Self::default_compilation_options(),
+        ))
     }
 
     /// Creates a new [`XlaDomain`] using an already configured persistent [`DiskCache`]. This is the constructor to
     /// use when callers need explicit capacity or write thresholds rather than [`Self::with_disk_cache`]'s defaults.
     #[inline]
     pub fn with_configured_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Self {
-        Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(CompilationContext::new().with_configured_disk_cache(disk_cache)),
-            marker: PhantomData,
-        }
+        Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(
+                client,
+                CompilationContext::new().with_configured_disk_cache(disk_cache),
+            )),
+            None,
+            Self::default_compilation_options(),
+        )
     }
 
     /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
@@ -353,13 +783,14 @@ impl<'c> XlaDomain<'c> {
     /// corresponding I/O error.
     #[inline]
     pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> std::io::Result<Self> {
-        Ok(Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()?),
-            marker: PhantomData,
-        })
+        Ok(Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(
+                client,
+                CompilationContext::new().with_disk_cache_from_env()?,
+            )),
+            None,
+            Self::default_compilation_options(),
+        ))
     }
 
     /// Returns the singleton tracing-only domain token that carries the XLA staged operation
@@ -374,24 +805,27 @@ impl<'c> XlaDomain<'c> {
             client: None,
             mesh: None,
             compilation_options: XlaDomain::default_compilation_options(),
-            cache: Arc::new(CompilationContext::new()),
+            session: None,
+            tracing_cache: Some(Arc::new(CompilationContext::new())),
+            effect_scope: None,
             marker: PhantomData,
         });
         &TOKEN
     }
 
-    /// Creates a new [`XlaDomain`] that shares an existing compile cache instead of starting with an empty one.
-    ///
-    /// This is the constructor behind [`Array::execution_domain`](ryft_core::programs::Value::execution_domain)
-    /// recovery: eager outputs carry the compile cache of the domain that produced them, so recovered domains keep
-    /// hitting the same cache instead of recompiling every repeated operation signature.
-    #[inline]
-    pub(crate) fn with_shared_cache(client: &'c Client<'c>, cache: Arc<CompilationContext<XlaDomain<'c>>>) -> Self {
+    /// Creates a domain using the session's default scope and the supplied execution configuration.
+    fn from_session_configuration(
+        session: Arc<XlaSession<'c>>,
+        mesh: Option<DeviceMesh>,
+        compilation_options: Arc<CompilationOptions>,
+    ) -> Self {
         Self {
-            client: Some(client),
-            mesh: None,
-            compilation_options: Self::default_compilation_options(),
-            cache,
+            client: Some(session.client),
+            mesh,
+            compilation_options,
+            effect_scope: Some(Arc::clone(&session.default_effect_scope)),
+            session: Some(session),
+            tracing_cache: None,
             marker: PhantomData,
         }
     }
@@ -408,7 +842,9 @@ impl<'c> XlaDomain<'c> {
             client: None,
             mesh: None,
             compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(CompilationContext::new()),
+            session: None,
+            tracing_cache: Some(Arc::new(CompilationContext::new())),
+            effect_scope: None,
             marker: PhantomData,
         }
     }
@@ -418,6 +854,39 @@ impl<'c> XlaDomain<'c> {
     #[inline]
     pub fn client(&self) -> Result<&'c Client<'c>, Error> {
         self.client.ok_or(Error::MissingClient)
+    }
+
+    /// Returns the session shared by this domain, if it can execute device work.
+    pub fn session(&self) -> Option<&Arc<XlaSession<'c>>> {
+        self.session.as_ref()
+    }
+
+    /// Forks ordering and completion state while retaining the session, compilation cache, and configuration.
+    /// Use forks at independent task boundaries. References retain their own identity-based coordination.
+    pub fn fork_effect_scope(&self) -> Self {
+        let mut domain = self.clone();
+        domain.effect_scope = self.session.as_ref().map(|_| Arc::new(EffectScope::default()));
+        domain
+    }
+
+    /// Waits for this scope's previously reserved effects, including unordered I/O and local assertions.
+    /// Backend-selected inline execution is allowed; this function waits only for work still pending. Later
+    /// reservations and other scopes are excluded. Call before client destruction to ensure effects are observed.
+    /// On clientless tracing domains this succeeds without accessing PJRT or allocating runtime state.
+    pub fn effects_barrier(&self) -> Result<(), XlaDomainError> {
+        match &self.effect_scope {
+            Some(scope) => scope.barrier(),
+            None => Ok(()),
+        }
+    }
+
+    /// Acknowledges barrier-reported failures after affected work has completed, without waiting or repairing
+    /// references. If work is pending or unreported, call `effects_barrier()` and retry this function.
+    pub fn acknowledge_effect_errors(&self) -> Result<(), XlaDomainError> {
+        match &self.effect_scope {
+            Some(scope) => scope.acknowledge(),
+            None => Ok(()),
+        }
     }
 
     /// Returns the [`DeviceMesh`] this domain resolves shard placement against, or [`Error::MissingMesh`] when the
@@ -436,20 +905,23 @@ impl<'c> XlaDomain<'c> {
     /// Returns the number of compiled programs currently cached in the in-memory tier.
     #[inline]
     pub fn cache_size(&self) -> usize {
-        self.cache.cache_size()
+        self.compilation_context().cache_size()
     }
 
     /// Returns this domain's shared compilation context.
     #[inline]
     pub fn compilation_context(&self) -> &CompilationContext<Self> {
-        &self.cache
+        match &self.session {
+            Some(session) => &session.cache,
+            None => self.tracing_cache.as_ref().unwrap(),
+        }
     }
 
     /// Removes every entry from the in-memory cache. Mirrors JAX's
     /// `clear_in_memory_compilation_cache()`.
     #[inline]
     pub fn clear_cache(&self) {
-        self.cache.clear_cache();
+        self.compilation_context().clear_cache();
     }
 
     /// Test-only constructor that attaches a concrete [`DeviceMesh`] to this domain. Used by
@@ -457,13 +929,11 @@ impl<'c> XlaDomain<'c> {
     #[cfg(test)]
     #[inline]
     pub(crate) fn with_mesh(client: &'c Client<'c>, mesh: DeviceMesh) -> Self {
-        Self {
-            client: Some(client),
-            mesh: Some(mesh),
-            compilation_options: Self::default_compilation_options(),
-            cache: Arc::new(CompilationContext::new()),
-            marker: PhantomData,
-        }
+        Self::from_session_configuration(
+            Arc::new(XlaSession::with_compilation_context(client, CompilationContext::new())),
+            Some(mesh),
+            Self::default_compilation_options(),
+        )
     }
 }
 
@@ -503,6 +973,8 @@ impl<'c> Context for XlaDomain<'c> {
     where
         P: Into<Self::Operation>,
     {
+        ensure_effect_dispatch_allowed()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
         let name = operation.name();
@@ -755,7 +1227,7 @@ impl<'c> XlaDomain<'c> {
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
             let output = Array::from_host_buffer(client, output_type, mesh, extent.to_ne_bytes().as_slice())
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
-                .with_compilation_cache(Arc::clone(&self.cache));
+                .with_execution_domain(self.clone());
             return Ok(vec![ArrayIrValue::Array(output)]);
         }
 
@@ -811,7 +1283,7 @@ impl<'c> XlaDomain<'c> {
             .compilation_key(&lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
-            .cache
+            .compilation_context()
             .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let outputs = self
@@ -823,7 +1295,7 @@ impl<'c> XlaDomain<'c> {
         // executing on the same client and keeps hitting the same compile cache.
         Ok(outputs
             .into_iter()
-            .map(|output| ArrayIrValue::Array(output.with_compilation_cache(Arc::clone(&self.cache))))
+            .map(|output| ArrayIrValue::Array(output.with_execution_domain(self.clone())))
             .collect())
     }
 
@@ -942,8 +1414,9 @@ impl<'c> XlaDomain<'c> {
             None => array_type.replicated(mesh).map_err(ArrayError::from)?,
         };
         if array_type.data_type().is_zero() {
-            return Ok(Array::from_zero_space(client, effective_type, mesh.clone())?
-                .with_compilation_cache(Arc::clone(&self.cache)));
+            return Ok(
+                Array::from_zero_space(client, effective_type, mesh.clone())?.with_execution_domain(self.clone())
+            );
         }
         let addressable_ids = addressable_device_ids(client, mesh)?;
         let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
@@ -984,7 +1457,7 @@ impl<'c> XlaDomain<'c> {
         // Attach this domain's client and compile cache so that chained eager operations and transforms over the
         // materialized constant recover a context that keeps the same client and compile cache.
         Ok(Array::from_canonical_addressable_buffers(client, effective_type, mesh.clone(), addressable_buffers)?
-            .with_compilation_cache(Arc::clone(&self.cache)))
+            .with_execution_domain(self.clone()))
     }
 }
 
@@ -1497,10 +1970,10 @@ impl XlaLoweredProgram {
     }
 }
 
-const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA6";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 6;
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA7";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 7;
 const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 3;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 6;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 7;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1599,9 +2072,9 @@ pub struct XlaOptimizedProgram {
     pub bytes: Vec<u8>,
 }
 
-/// Stable cache-key payload for the V6 executable and external-reference ABI.
+/// Stable cache-key payload for the V7 executable and external-reference ABI.
 #[derive(Serialize)]
-struct XlaPersistentKeyV6<'a> {
+struct XlaPersistentKeyV7<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
@@ -1613,6 +2086,14 @@ struct XlaPersistentKeyV6<'a> {
     output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
+    /// Whether a native ordered-I/O slot is present after the array and extent slots.
+    ordered_io: bool,
+    /// Whether completion includes unordered I/O without a boundary slot.
+    unordered_io: bool,
+    /// Whether every ordered-I/O occurrence is `DeviceOrderedIo`, permitting per-device execution.
+    device_ordered_io: bool,
+    /// Version of the hidden effect calling convention.
+    effect_abi_version: u32,
     donation_flags: &'a [bool],
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -1624,9 +2105,9 @@ struct XlaPersistentKeyV6<'a> {
     xla_flags: &'a str,
 }
 
-/// Stable V6 metadata envelope stored before serialized PJRT executable bytes.
+/// Stable V7 metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV6 {
+struct XlaPersistentExecutableMetadataV7 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
@@ -1638,6 +2119,14 @@ struct XlaPersistentExecutableMetadataV6 {
     output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
+    /// Whether a native ordered-I/O slot is present after the array and extent slots.
+    ordered_io: bool,
+    /// Whether completion includes unordered I/O without a boundary slot.
+    unordered_io: bool,
+    /// Whether every ordered-I/O occurrence is `DeviceOrderedIo`, permitting per-device execution.
+    device_ordered_io: bool,
+    /// Version of the hidden effect calling convention.
+    effect_abi_version: u32,
     donation_flags: Vec<bool>,
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -2434,10 +2923,15 @@ impl<'c> XlaDomain<'c> {
     /// Ensures that process-local runtime support required by one compiled program is available.
     fn ensure_runtime_requirements(
         &self,
-        requires_assertion_handler: bool,
+        signature: &XlaExecutableSignature,
         platform_name: &str,
     ) -> Result<(), XlaDomainError> {
-        if !requires_assertion_handler {
+        // CPU I/O uses the shared registered-handler surface. Register the built-in print target at compilation
+        // and reload, so ordinary eager printing needs no separate process-global initialization by the caller.
+        if (signature.has_ordered_io() || signature.has_unordered_io()) && platform_name.eq_ignore_ascii_case("cpu") {
+            super::debugging::ensure_print_handler_registered(self.client()?)?;
+        }
+        if !signature.requires_assertion_handler() {
             return Ok(());
         }
         let supported = platform_name.eq_ignore_ascii_case("cpu")
@@ -2462,11 +2956,10 @@ impl<'c> XlaDomain<'c> {
     /// whole-execution fence. Programs with external reference state must flow through the stateful call surface
     /// instead, which owns the reference transaction and the hidden final-state outputs.
     ///
-    /// For programs without bounded-dynamic boundaries, this call only enqueues device work: the returned arrays and
-    /// fence resolve asynchronously. Bounded-dynamic boundaries weaken that guarantee in two ways: below-bound inputs
-    /// perform blocking device-to-host copies and bound-shaped uploads before the launch, and each bounded-dynamic
-    /// output blocks on the device-to-host readback of its hidden extent scalar because the logical output type cannot
-    /// be constructed without the runtime extent.
+    /// The backend may execute inline or return pending arrays and a completion fence. This function adds no wait
+    /// solely because public outputs are empty. Bounded-dynamic boundaries can introduce additional waits:
+    /// below-bound inputs perform device-to-host copies and bound-shaped uploads before launch, and each dynamic
+    /// output reads its hidden extent scalar before constructing the logical output type.
     pub(crate) fn execute_compiled_async(
         &self,
         program: &XlaCompiledProgram<'c>,
@@ -2478,7 +2971,7 @@ impl<'c> XlaDomain<'c> {
         // verbatim.
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
         let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
-        let execution = execute_pjrt_buffers(&program.executable, arguments, physical_output_count, |_| {})?;
+        let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, |_| {})?;
         let (physical_outputs, fence) = execution.into_parts();
         let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
         let outputs = reconstruct_compiled_outputs(
@@ -2494,7 +2987,10 @@ impl<'c> XlaDomain<'c> {
                 ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
             );
         }
-        Ok(Execution::new(outputs, fence))
+        Ok(Execution::new(
+            outputs.into_iter().map(|output| output.with_execution_domain(self.clone())).collect(),
+            fence,
+        ))
     }
 
     /// Materializes and validates physical execution arguments without submitting device work.
@@ -2504,8 +3000,9 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
         donation_overrides: &[(usize, bool)],
     ) -> Result<PreparedXlaExecution<'c>, XlaDomainError> {
+        ensure_effect_dispatch_allowed()?;
         self.validate_xla_program_owner(program)?;
-        self.ensure_runtime_requirements(program.requires_assertion_handler, &program.platform_name)?;
+        self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -2559,8 +3056,7 @@ impl<'c> XlaDomain<'c> {
                 *donation = false;
             }
         }
-        let physical_output_count =
-            program.signature.output_mapping().iter().flatten().count() + program.signature.output_dimensions().len();
+        let physical_output_count = program.signature.array_output_count();
         let addressable_device_ids = program
             .executable
             .addressable_devices()?
@@ -2738,7 +3234,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         // Cheap clone: the lowered program is a bundle of `Arc` handles. The snapshot outlives `compile_request`,
         // which consumes the request, so the resolved program can be cross-checked below even on cache hits.
         let expected = lowered.lowered().lowered_program().clone();
-        let compiled = self.cache.compile_request(
+        let compiled = self.compilation_context().compile_request(
             self,
             lowered,
             |program| self.compile_xla_program(program),
@@ -2771,7 +3267,7 @@ impl<'c> XlaDomain<'c> {
     /// The returned output arrays already carry the fence individually, so the synchronous [`CompilationDomain`]
     /// `call` drops the returned fence; the stateful asynchronous surface threads it into a completion instead so
     /// that awaiting a reference-free invocation still observes asynchronous execution errors. When the program has
-    /// no outputs, nothing would carry the fence at all, so this call blocks on it before returning.
+    /// no outputs, the effect scope retains effectful completion. Only pure zero-output calls explicitly wait.
     fn call_stateless_request<Request>(
         &self,
         request: Request,
@@ -2806,7 +3302,7 @@ impl<'c> XlaDomain<'c> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         let execution = self.execute_compiled_async(executable.compiled_program(), arguments)?;
-        if execution.output().is_empty() {
+        if execution.output().is_empty() && !executable.compiled_program().signature.has_effects() {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
@@ -2837,6 +3333,9 @@ impl<'c> XlaDomain<'c> {
     where
         Request: CallRequest<Self>,
     {
+        if let Err(error) = ensure_effect_dispatch_allowed() {
+            return ReferenceExecution::ready(Err(error));
+        }
         let executable = request.executable().clone();
         let program = executable.compiled_program();
         if program.reference_states.is_empty() {
@@ -3043,7 +3542,7 @@ impl<'c> XlaDomain<'c> {
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
                 let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_outputs.len()));
                 let execution =
-                    execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
+                    self.execute_pjrt_buffers(program, execution_arguments, physical_output_count, |fence| {
                         let mut completions = dependencies.clone();
                         completions.push(ReferenceCompletion::new(XlaReferenceCompletion { fence: fence.clone() }));
                         #[cfg(test)]
@@ -3118,9 +3617,12 @@ impl<'c> XlaDomain<'c> {
                 let replacements = replacement_transactions
                     .iter()
                     .map(|(logical_output_index, _)| {
-                        hidden_outputs.remove(logical_output_index).ok_or_else(|| {
-                            ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
-                        })
+                        hidden_outputs
+                            .remove(logical_output_index)
+                            .map(|output| output.with_execution_domain(self.clone()))
+                            .ok_or_else(|| {
+                                ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
+                            })
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 if !hidden_outputs.is_empty() {
@@ -3200,7 +3702,13 @@ impl<'c> XlaDomain<'c> {
                     .into());
                 }
                 validate_runtime_outputs(program.output_types(), &public_outputs)?;
-                Request::reconstruct(&executable, public_outputs.into_iter().map(ArrayIrValue::Array).collect())
+                Request::reconstruct(
+                    &executable,
+                    public_outputs
+                        .into_iter()
+                        .map(|output| ArrayIrValue::Array(output.with_execution_domain(self.clone())))
+                        .collect(),
+                )
             })();
             Ok(ReferenceExecution::pending(public_result, completion, xla_reference_completion_error))
         })();
@@ -3555,7 +4063,7 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV6 {
+        let key = XlaPersistentKeyV7 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
@@ -3567,6 +4075,10 @@ impl<'c> XlaDomain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
+            ordered_io: program.signature.has_ordered_io(),
+            unordered_io: program.signature.has_unordered_io(),
+            device_ordered_io: program.signature.has_device_ordered_io(),
+            effect_abi_version: 1,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -3590,7 +4102,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &XlaLoweredProgram,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
-        self.ensure_runtime_requirements(program.requires_assertion_handler, &program.platform_name)?;
+        self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
         let executable = self.client()?.compile(&pjrt_program, &program.compilation_options)?;
@@ -3634,7 +4146,7 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
         let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() {
+        if execution.output().is_empty() && !program.signature.has_effects() {
             // No output array carries the execution fence out of this call, so an asynchronous execution error would
             // otherwise be unobservable. Block here so this synchronous entry point still reports it.
             let (outputs, fence) = execution.into_parts();
@@ -3663,7 +4175,7 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV6 {
+        let metadata = XlaPersistentExecutableMetadataV7 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
@@ -3675,6 +4187,10 @@ impl<'c> XlaDomain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
+            ordered_io: program.signature.has_ordered_io(),
+            unordered_io: program.signature.has_unordered_io(),
+            device_ordered_io: program.signature.has_device_ordered_io(),
+            effect_abi_version: 1,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -3726,7 +4242,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV6 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV7 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -3812,7 +4328,18 @@ impl<'c> XlaDomain<'c> {
                 )));
             }
         }
-        let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice());
+        if metadata.effect_abi_version != 1 {
+            return Ok(None);
+        }
+        if metadata.device_ordered_io && !metadata.ordered_io {
+            return Err(persistent_error("device-ordered I/O metadata requires an ordered boundary slot"));
+        }
+        let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice()).with_effects(
+            metadata.ordered_io,
+            metadata.unordered_io,
+            metadata.requires_assertion_handler,
+            metadata.device_ordered_io,
+        );
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
             || persistent_input_dimensions(&signature) != metadata.input_dimensions
@@ -3836,7 +4363,7 @@ impl<'c> XlaDomain<'c> {
         if expected_argument_shardings.iter().any(|sharding| sharding.mesh() != mesh.logical_mesh()) {
             return Err(persistent_error("argument sharding mesh does not match executable mesh"));
         }
-        let physical_input_count = signature.physical_input_count();
+        let physical_input_count = signature.array_input_count();
         if expected_argument_shardings.len() != physical_input_count {
             return Err(persistent_error("expected argument shardings do not match the physical input count"));
         }
@@ -3886,12 +4413,20 @@ impl<'c> XlaDomain<'c> {
             .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
         // Register before deserialization because loading an executable may resolve its custom-call target. The
         // persisted flag is authoritative on cache hits, where the source program is no longer available to inspect.
-        self.ensure_runtime_requirements(metadata.requires_assertion_handler, metadata.platform_name.as_str())?;
+        self.ensure_runtime_requirements(&signature, metadata.platform_name.as_str())?;
         let executable = self.client()?.deserialize_and_load_executable(
             &bytes[metadata_end..],
             Some(&compilation_options),
             &LoadOptions::default(),
         )?;
+        let output_types_physical = executable.executable()?.output_element_types()?;
+        if output_types_physical.len() != signature.physical_output_count()
+            || signature
+                .ordered_io_output_index()
+                .is_some_and(|index| output_types_physical[index] != BufferType::Token)
+        {
+            return Err(persistent_error("effect signature does not match executable physical outputs"));
+        }
         let device_assignment = executable.device_assignment()?;
         if device_assignment.replica_count() != replica_count
             || device_assignment.computation_count() != partition_count
@@ -4999,7 +5534,7 @@ fn materialize_bounded_dynamic_inputs_with_readiness<'c>(
         report.extent_scalar_uploads += usize::from(uploaded);
         physical_inputs.push(extent_scalar);
     }
-    assert_eq!(physical_inputs.len(), signature.physical_input_count());
+    assert_eq!(physical_inputs.len(), signature.array_input_count());
     Ok(MaterializedBoundedInputs { inputs: physical_inputs, report })
 }
 
@@ -5267,49 +5802,155 @@ fn validate_compiled_output_refinements(
         .map_err(Into::into)
 }
 
-/// Executes one PJRT executable and transposes device-major results into one buffer vector per physical output.
-fn execute_pjrt_buffers<'c>(
-    executable: &LoadedExecutable<'c>,
-    arguments: ExecuteArguments<'c>,
-    output_count: usize,
-    after_submission: impl FnOnce(&ExecutionFence),
-) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, XlaDomainError> {
-    let addressable_device_count = arguments.addressable_device_ids().len();
-    #[cfg(test)]
-    if take_stateful_failure_injection(StatefulFailureInjection::BeforeSubmission) {
-        return Err(XlaDomainError::InvalidCompilationOptions {
-            reason: "injected failure before execution submission".to_string(),
-        });
-    }
-    let (device_outputs, fence) = executable
-        .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
-        .into_parts();
-    after_submission(&fence);
-
-    #[cfg(test)]
-    if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
-        return Err(XlaDomainError::InvalidCompilationOptions {
-            reason: "injected failure after execution handoff".to_string(),
-        });
-    }
-
-    for outputs in &device_outputs {
-        if outputs.outputs.len() != output_count {
+impl<'c> XlaDomain<'c> {
+    /// Submits at the common physical boundary and transposes array results, retaining hidden effect tokens in the
+    /// active scope. No scope lock is held across PJRT, which may execute callbacks inline on this thread.
+    fn execute_pjrt_buffers(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        mut arguments: ExecuteArguments<'c>,
+        array_output_count: usize,
+        after_submission: impl FnOnce(&ExecutionFence),
+    ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, XlaDomainError> {
+        ensure_effect_dispatch_allowed()?;
+        let addressable_device_count = arguments.addressable_device_ids().len();
+        let ordered = program.signature.has_ordered_io();
+        if ordered {
+            if !program.platform_name.eq_ignore_ascii_case("cpu") {
+                return Err(XlaDomainError::EffectScope {
+                    reason: format!(
+                        "native ordered I/O transport is not yet verified on platform `{}`",
+                        program.platform_name
+                    ),
+                });
+            }
+            if !is_fully_addressable_single_process_mesh(self.client()?, &program.mesh)? {
+                return Err(XlaDomainError::EffectScope {
+                    reason: "ordered I/O requires a fixed fully addressable single-process device assignment"
+                        .to_string(),
+                });
+            }
+            if addressable_device_count > 1 && !program.signature.has_device_ordered_io() {
+                return Err(XlaDomainError::EffectScope {
+                    reason: "multi-device ordered I/O requires every ordered occurrence to declare `DeviceOrderedIo`"
+                        .to_string(),
+                });
+            }
+        }
+        let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
+        let mut reservation = if program.signature.has_effects() {
+            Some(self.effect_scope.as_ref().unwrap().reserve(device)?)
+        } else {
+            None
+        };
+        if let Some(reservation) = &reservation {
+            if ordered {
+                let predecessor = reservation
+                    .predecessor
+                    .as_ref()
+                    .map_or(Ok(None), |previous| previous.carrier())
+                    .map_err(|error| XlaDomainError::EffectScope { reason: error.to_string() })?;
+                let tokens = match predecessor {
+                    Some(tokens) => tokens,
+                    None => {
+                        let client = self.client()?;
+                        let devices = client.addressable_devices()?;
+                        let mut tokens = Vec::with_capacity(addressable_device_count);
+                        for &device_id in arguments.addressable_device_ids() {
+                            let selected = devices
+                                .iter()
+                                .find(|candidate| {
+                                    Device::from_pjrt(*candidate).is_ok_and(|candidate| candidate.id() == device_id)
+                                })
+                                .ok_or_else(|| XlaDomainError::EffectScope {
+                                    reason: "ordered I/O device is not addressable".to_string(),
+                                })?;
+                            let manager = client.host_to_device_transfer_manager(
+                                vec![BufferSpecification::new(BufferType::Token, [])],
+                                selected.default_memory()?,
+                            )?;
+                            let token = manager.retrieve_buffer(0)?;
+                            // Only initial zero-byte token creation is awaited. Predecessor carriers remain pending inputs.
+                            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
+                            tokens.push(Arc::new(token));
+                        }
+                        tokens
+                    }
+                };
+                arguments.push_input_buffers(tokens);
+            }
+        }
+        debug_assert!(
+            arguments
+                .inputs_by_device()
+                .iter()
+                .all(|inputs| inputs.len() == program.signature.physical_input_count())
+        );
+        #[cfg(test)]
+        if take_stateful_failure_injection(StatefulFailureInjection::BeforeSubmission) {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "injected failure before execution submission".to_string(),
+            });
+        }
+        let (mut device_outputs, fence) = program
+            .executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
+            .into_parts();
+        // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
+        after_submission(&fence);
+        let output_count = program.signature.physical_output_count();
+        debug_assert_eq!(array_output_count, program.signature.array_output_count());
+        let invalid_count = device_outputs
+            .iter()
+            .find(|outputs| outputs.outputs.len() != output_count)
+            .map(|outputs| outputs.outputs.len());
+        if let Some(reservation) = &mut reservation {
+            if let Some(actual) = invalid_count {
+                let reason: Arc<str> =
+                    Arc::from(format!("expected {output_count} output(s) per device, but got {actual}"));
+                reservation.submission.publish(Err(Arc::clone(&reason)));
+                // Retain completion until the submitted work is done, then report the boundary failure.
+                let completion = Arc::clone(&reservation.submission.completion);
+                fence.on_ready(move |_| completion.complete(Err(reason)));
+            } else {
+                let carrier = if ordered {
+                    Some(
+                        device_outputs
+                            .iter_mut()
+                            .map(|outputs| {
+                                Arc::new(outputs.outputs.remove(program.signature.ordered_io_output_index().unwrap()))
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                reservation.submission.publish(Ok(carrier));
+                let completion = Arc::clone(&reservation.submission.completion);
+                fence.on_ready(move |result| completion.complete(result.map_err(|error| Arc::from(error.to_string()))));
+            }
+            reservation.published = true;
+        }
+        if let Some(actual) = invalid_count {
             return Err(XlaDomainError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
-                "expected {output_count} output(s) per device, but got {}",
-                outputs.outputs.len(),
+                "expected {output_count} output(s) per device, but got {actual}",
             ))));
         }
-    }
-
-    let mut per_output_buffers: Vec<Vec<Buffer<'c>>> =
-        (0..output_count).map(|_| Vec::with_capacity(addressable_device_count)).collect();
-    for device_output in device_outputs {
-        for (output_index, buffer) in device_output.outputs.into_iter().enumerate() {
-            per_output_buffers[output_index].push(buffer);
+        #[cfg(test)]
+        if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "injected failure after execution handoff".to_string(),
+            });
         }
+        let mut per_output_buffers =
+            (0..array_output_count).map(|_| Vec::with_capacity(addressable_device_count)).collect::<Vec<_>>();
+        for device_output in device_outputs {
+            for (output_index, buffer) in device_output.outputs.into_iter().enumerate() {
+                per_output_buffers[output_index].push(buffer);
+            }
+        }
+        Ok(Execution::new(per_output_buffers, fence))
     }
-    Ok(Execution::new(per_output_buffers, fence))
 }
 
 #[cfg(test)]
@@ -6522,7 +7163,10 @@ mod tests {
             )
             .unwrap();
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 2, "{}", lowered.stable_hlo());
+        // Only assertions create a local chain; ordered I/O is seeded from the hidden executable argument.
+        assert!(lowered.signature.has_ordered_io());
+        assert!(lowered.signature.requires_assertion_handler());
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let input = |value: i64| {
             Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
@@ -8974,7 +9618,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV6 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -8987,7 +9631,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV6 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -9042,7 +9686,7 @@ mod tests {
         .into_inner();
         let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             first_domain.compile(first_domain.lower(staged).unwrap()).unwrap();
-        assert_eq!(first_domain.cache.statistics().compilations, 1);
+        assert_eq!(first_domain.compilation_context().statistics().compilations, 1);
         drop(first);
         drop(first_domain);
 
@@ -9060,7 +9704,7 @@ mod tests {
         .into_inner();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
             second_domain.compile(second_domain.lower(staged).unwrap()).unwrap();
-        let statistics = second_domain.cache.statistics();
+        let statistics = second_domain.compilation_context().statistics();
         assert_eq!(statistics.persistent_hits, 1);
         assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
     }
@@ -9123,16 +9767,17 @@ mod tests {
         let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
 
         let exchange: Arc<dyn CompilationArtifactExchange> = Arc::new(CollidingArtifactExchange { artifact });
-        let consumer = XlaDomain::with_shared_cache(
+        let consumer = Arc::new(XlaSession::with_compilation_context(
             &client,
-            Arc::new(CompilationContext::new().with_artifact_exchange(
+            CompilationContext::new().with_artifact_exchange(
                 exchange,
                 CompilationArtifactExchangePolicy::PreferSharing {
                     timeout: Duration::from_secs(5),
                     fallback_to_local_compile: true,
                 },
-            )),
-        );
+            ),
+        ))
+        .domain();
         let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
             |x| x.sin().unwrap(),
             input_type,
@@ -9150,7 +9795,7 @@ mod tests {
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "cached executable has incompatible donation flags",
         ));
-        let statistics = consumer.cache.statistics();
+        let statistics = consumer.compilation_context().statistics();
         assert_eq!(statistics.exchange_hits, 1);
         assert_eq!(statistics.compilations, 0, "a resolved artifact must not fall back to backend compilation");
     }
@@ -9171,7 +9816,7 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV6 {
+        let metadata = XlaPersistentExecutableMetadataV7 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
@@ -9183,6 +9828,10 @@ mod tests {
             output_count: 0,
             reference_states: Vec::new(),
             requires_assertion_handler: false,
+            ordered_io: false,
+            unordered_io: false,
+            device_ordered_io: false,
+            effect_abi_version: 1,
             donation_flags: Vec::new(),
             capture_count: 0,
             expected_argument_shardings: Vec::new(),
@@ -10542,7 +11191,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let corrupt = |metadata: XlaPersistentExecutableMetadataV6| {
+        let corrupt = |metadata: XlaPersistentExecutableMetadataV7| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut corrupted = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -10550,7 +11199,7 @@ mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
-        let mut metadata: XlaPersistentExecutableMetadataV6 =
+        let mut metadata: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
         assert_eq!(metadata.reference_states[0].logical_input_index, 0);
@@ -10564,7 +11213,7 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        let mut metadata: XlaPersistentExecutableMetadataV6 =
+        let mut metadata: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
@@ -10575,7 +11224,7 @@ mod tests {
         ));
 
         // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_outputs: XlaPersistentExecutableMetadataV6 =
+        let mut invalid_outputs: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
@@ -10587,7 +11236,7 @@ mod tests {
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
         // no reference-state input could be checked against its own expected sharding.
-        let mut truncated_expected_shardings: XlaPersistentExecutableMetadataV6 =
+        let mut truncated_expected_shardings: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
         truncated_expected_shardings.expected_argument_shardings.pop();
@@ -10598,7 +11247,7 @@ mod tests {
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
-        let mut reordered: XlaPersistentExecutableMetadataV6 =
+        let mut reordered: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
@@ -10608,7 +11257,7 @@ mod tests {
                 if reason == "reference states are not in canonical logical input order",
         ));
 
-        let mut foreign_process_mesh: XlaPersistentExecutableMetadataV6 =
+        let mut foreign_process_mesh: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
@@ -10618,7 +11267,7 @@ mod tests {
                 if reason == "reference-state mesh is not fully addressable by this process",
         ));
 
-        let mut mismatched_expected_sharding: XlaPersistentExecutableMetadataV6 =
+        let mut mismatched_expected_sharding: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
@@ -10628,7 +11277,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_input: XlaPersistentExecutableMetadataV6 =
+        let mut mismatched_input: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_input.signature.input_types[0]
             .sharding
@@ -10649,7 +11298,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_output: XlaPersistentExecutableMetadataV6 =
+        let mut mismatched_output: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output.signature.output_types[1]
             .sharding
@@ -10664,7 +11313,7 @@ mod tests {
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
 
-        let mut zero_space: XlaPersistentExecutableMetadataV6 =
+        let mut zero_space: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
@@ -10674,7 +11323,7 @@ mod tests {
                 if reason == "reference-state input has a zero-space type",
         ));
 
-        let mut host_memory: XlaPersistentExecutableMetadataV6 =
+        let mut host_memory: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         host_memory.signature.input_types[0].memory = PersistentMemoryV1::Host(true);
         let corrupted = corrupt(host_memory);
@@ -10684,7 +11333,7 @@ mod tests {
                 if reason == "reference-state input is not in device memory",
         ));
 
-        let mut unbounded_dynamic: XlaPersistentExecutableMetadataV6 =
+        let mut unbounded_dynamic: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         unbounded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "unbounded".to_string(),
@@ -10701,7 +11350,7 @@ mod tests {
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
-        let mut mutated_dynamic: XlaPersistentExecutableMetadataV6 =
+        let mut mutated_dynamic: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mutated_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_mutation".to_string(),
@@ -10719,7 +11368,7 @@ mod tests {
                               compatibility has not been verified",
         ));
 
-        let mut sharded_dynamic: XlaPersistentExecutableMetadataV6 =
+        let mut sharded_dynamic: XlaPersistentExecutableMetadataV7 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         sharded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_sharded".to_string(),
@@ -11562,6 +12211,272 @@ mod tests {
     }
 
     #[test]
+    fn test_xla_session_array_ordered_effects() {
+        use crate::experimental::debugging::with_captured_prints;
+        use ryft_core::Print;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Arc::new(XlaSession::new(&client));
+        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
+        let first = session.array(r#type.clone(), mesh.clone(), 1.0f64.to_ne_bytes()).unwrap();
+        let second = session.array(r#type, mesh.clone(), 2.0f64.to_ne_bytes()).unwrap();
+        let manager = client
+            .host_to_device_transfer_manager(
+                vec![BufferSpecification::new(BufferType::Token, [])],
+                client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+            )
+            .unwrap();
+        // Model an outstanding predecessor without relying on compiler cost heuristics or expensive dummy work.
+        let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+        predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+        predecessor.submission.completion.complete(Ok(()));
+        predecessor.published = true;
+        let ((first_pending, second_pending), lines) = with_captured_prints(|| {
+            drop(first.print("first"));
+            let first_pending = !session
+                .default_effect_scope
+                .state
+                .lock()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .carrier()
+                .unwrap()
+                .unwrap()[0]
+                .ready()
+                .unwrap()
+                .ready()
+                .unwrap();
+            drop(second.print("second"));
+            let second_pending = !session
+                .default_effect_scope
+                .state
+                .lock()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .carrier()
+                .unwrap()
+                .unwrap()[0]
+                .ready()
+                .unwrap()
+                .ready()
+                .unwrap();
+            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            session.effects_barrier().unwrap();
+            (first_pending, second_pending)
+        });
+        assert!(first_pending);
+        assert!(second_pending);
+        assert_eq!(lines, vec!["first: [1.0]", "second: [2.0]"]);
+        assert_eq!(session.compilation_context().cache_size(), 2);
+    }
+
+    #[test]
+    fn test_xla_domain_effect_metadata_reload_and_unordered_completion() {
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Arc::new(XlaSession::new(&client));
+        let domain = session.domain();
+        ensure_print_handler_registered(&client).unwrap();
+        let input = f64_vector(&client, &mesh, &[3.0]);
+        let mut builder = XlaProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        builder.add_instruction(PrintOperation::new("ordered"), Vec::new(), vec![argument], None).unwrap();
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let lowered = domain.lower_xla_program(&source, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        assert!(compiled.signature.has_ordered_io());
+        let serialized = domain.serialize_xla_program(&compiled).unwrap().unwrap();
+        let restored = domain.deserialize_xla_program(&serialized).unwrap().unwrap();
+        assert_eq!(restored.signature, compiled.signature);
+        let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
+        let metadata_size = u64::from_le_bytes(serialized[8..header_size].try_into().unwrap()) as usize;
+        let metadata_end = header_size + metadata_size;
+        let mut metadata: XlaPersistentExecutableMetadataV7 =
+            serde_json::from_slice(&serialized[header_size..metadata_end]).unwrap();
+        metadata.ordered_io = false;
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut corrupted = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+        corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        corrupted.extend_from_slice(&metadata);
+        corrupted.extend_from_slice(&serialized[metadata_end..]);
+        assert!(matches!(domain.deserialize_xla_program(&corrupted),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason }) if reason == "effect signature does not match executable physical outputs"));
+        let mut builder = XlaProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        builder
+            .add_instruction(
+                PrintOperation::new("unordered").with_effect_class(EffectClass::UnorderedIo),
+                Vec::new(),
+                vec![argument],
+                None,
+            )
+            .unwrap();
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let lowered = domain.lower_xla_program(&source, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let unordered = domain.compile_xla_program(&lowered).unwrap();
+        assert!(unordered.signature.has_unordered_io());
+        assert!(!unordered.signature.has_ordered_io());
+        let manager = client
+            .host_to_device_transfer_manager(
+                vec![BufferSpecification::new(BufferType::Token, [])],
+                client.addressable_devices().unwrap()[0].default_memory().unwrap(),
+            )
+            .unwrap();
+        let mut predecessor = session.default_effect_scope.reserve(Some(vec![mesh.devices()[0].id()])).unwrap();
+        predecessor.submission.publish(Ok(Some(vec![Arc::new(manager.retrieve_buffer(0).unwrap())])));
+        predecessor.submission.completion.complete(Ok(()));
+        predecessor.published = true;
+        let ((), lines) = with_captured_prints(|| {
+            assert!(domain.execute_xla_program(&compiled, vec![input.clone()]).unwrap().is_empty());
+            assert!(domain.execute_xla_program(&restored, vec![input.clone()]).unwrap().is_empty());
+            let independent = domain.execute_compiled_async(&unordered, vec![input]).unwrap();
+            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+            independent.fence().block_until_ready().unwrap();
+            domain.effects_barrier().unwrap();
+        });
+        assert_eq!(lines.iter().filter(|line| line.as_str() == "ordered: [3.0]").count(), 2);
+        assert_eq!(lines.iter().filter(|line| line.as_str() == "unordered: [3.0]").count(), 1);
+    }
+
+    #[test]
+    fn test_xla_domain_device_ordered_effects_preserve_per_device_dependencies() {
+        use crate::experimental::debugging::{
+            PRINT_CUSTOM_CALL_TARGET, ensure_print_handler_registered, with_captured_prints,
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let domain = XlaDomain::new(&client);
+        ensure_print_handler_registered(&client).unwrap();
+        let r#type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![2])))
+            .with_sharding(
+                Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Sharded(vec!["x".to_string()])])
+                    .unwrap(),
+            )
+            .unwrap();
+        let first =
+            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(&[0.0f64, 1.0])).unwrap();
+        let second =
+            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(&[2.0f64, 3.0])).unwrap();
+        let local_type = ArrayType::new(DataType::F64, Shape::from(StaticShape::new(vec![1])));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(local_type.clone().into());
+        builder
+            .add_instruction(
+                CustomCallOperation::new(PRINT_CUSTOM_CALL_TARGET, Vec::new())
+                    .with_attribute("label", "effect")
+                    .with_effect_class(EffectClass::DeviceOrderedIo),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let body = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let body = crate::experimental::shard_map::FlatTracedShardMap::from_parts(
+            crate::experimental::shard_map::ShardMap::from_shardings(
+                mesh.logical_mesh().clone(),
+                vec![r#type.sharding().unwrap().clone()],
+                Vec::new(),
+                vec!["x".to_string()],
+                true,
+            ),
+            vec![r#type.clone()],
+            vec![local_type],
+            Vec::new(),
+            Vec::new(),
+            body,
+        );
+        let (operation, body) = ShardMapOperation::from_body(body);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(r#type.into());
+        let body = builder.import_program(body);
+        builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![input], None)
+            .unwrap();
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let lowered = domain.lower_xla_program(&source, 0, &XlaOptions::new(mesh)).unwrap();
+        let program = domain.compile_xla_program(&lowered).unwrap();
+        assert!(program.signature.has_device_ordered_io());
+        let devices = program.executable.addressable_devices().unwrap();
+        let managers = devices
+            .iter()
+            .map(|device| {
+                client
+                    .host_to_device_transfer_manager(
+                        vec![BufferSpecification::new(BufferType::Token, [])],
+                        device.default_memory().unwrap(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let scope = domain.effect_scope.as_ref().unwrap();
+        let mut predecessor = scope
+            .reserve(Some(devices.iter().map(|device| Device::from_pjrt(device).unwrap().id()).collect()))
+            .unwrap();
+        predecessor
+            .submission
+            .publish(Ok(Some(managers.iter().map(|manager| Arc::new(manager.retrieve_buffer(0).unwrap())).collect())));
+        predecessor.submission.completion.complete(Ok(()));
+        predecessor.published = true;
+        managers[1].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+        let (independent, lines) = with_captured_prints(|| {
+            domain.execute_xla_program(&program, vec![first]).unwrap();
+            let tokens = scope.state.lock().unwrap().tail.as_ref().unwrap().carrier().unwrap().unwrap();
+            let independent = std::thread::scope(|threads| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                threads.spawn(move || sender.send(tokens[1].ready().unwrap().r#await()).unwrap());
+                let independent = receiver.recv_timeout(Duration::from_secs(2));
+                // CPU itself serializes multi-device launches. Submit the next invocation without adding a Ryft
+                // join, but observe per-device readiness on the first invocation rather than promising overlap.
+                domain.execute_xla_program(&program, vec![second]).unwrap();
+                managers[0].transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();
+                independent
+            });
+            domain.effects_barrier().unwrap();
+            independent
+        });
+        assert!(matches!(independent, Ok(Ok(()))));
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "effect: [1.0]");
+        let position = |value: &str| lines.iter().position(|line| line == value).unwrap();
+        assert!(position("effect: [0.0]") < position("effect: [2.0]"));
+        assert!(position("effect: [1.0]") < position("effect: [3.0]"));
+    }
+
+    #[test]
     fn test_eager_bind_executes_print_effect() {
         use ryft_core::PrintOperation;
 
@@ -11807,5 +12722,224 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_effect_scope_reserve() {
+        let scope = EffectScope::default();
+        let first = scope.reserve(Some(vec![0])).unwrap();
+        let unordered = scope.reserve(None).unwrap();
+        let second = scope.reserve(Some(vec![0])).unwrap();
+        assert_eq!(first.submission.identity, 0);
+        assert_eq!(unordered.submission.identity, 1);
+        assert_eq!(second.submission.identity, 2);
+        assert!(first.predecessor.is_none());
+        assert!(unordered.predecessor.is_none());
+        assert!(Arc::ptr_eq(second.predecessor.as_ref().unwrap(), &first.submission));
+        assert!(matches!(
+            scope.reserve(Some(vec![1])),
+            Err(XlaDomainError::EffectScope { reason })
+                if reason == "ordered I/O device changed; use `fork_effect_scope()` for a new device assignment",
+        ));
+        // Cancelling the successor while its predecessor is unpublished must return without waiting.
+        let cancelled = Arc::clone(&second.submission);
+        std::thread::scope(|threads| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                drop(second);
+                sender.send(()).unwrap();
+            });
+            let cancellation = receiver.recv_timeout(Duration::from_secs(5));
+            let predecessor_pending = first.submission.completion.result().is_none();
+            drop(first);
+            assert!(cancellation.is_ok());
+            assert!(predecessor_pending);
+        });
+        assert_eq!(cancelled.completion.result(), Some(Ok(())));
+        assert!(cancelled.carrier().unwrap().is_none());
+        drop(unordered);
+        assert!(scope.barrier().is_ok());
+    }
+
+    #[test]
+    fn test_effect_reservation_cancelled_forwarding() {
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(Some(vec![0])).unwrap();
+        first.published = true;
+        let second = scope.reserve(Some(vec![0])).unwrap();
+        let third = scope.reserve(Some(vec![0])).unwrap();
+        let final_submission = Arc::clone(&third.submission);
+        std::thread::scope(|threads| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                drop(third);
+                drop(second);
+                sender.send(()).unwrap();
+            });
+            let cancellation = receiver.recv_timeout(Duration::from_secs(5));
+            first.submission.publish(Err(Arc::from("predecessor publication failed")));
+            first.submission.completion.complete(Err(Arc::from("predecessor publication failed")));
+            assert!(cancellation.is_ok());
+        });
+        assert!(
+            matches!(final_submission.carrier(), Err(reason) if reason.as_ref() == "predecessor publication failed")
+        );
+        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { .. })));
+    }
+
+    #[test]
+    fn test_effect_submission_drop_cancelled_chain() {
+        let scope = EffectScope::default();
+        for _ in 0..10_000 {
+            drop(scope.reserve(Some(vec![0])).unwrap());
+        }
+        let tail = Arc::clone(scope.state.lock().unwrap().tail.as_ref().unwrap());
+        assert!(tail.carrier().unwrap().is_none());
+        assert_eq!(tail.completion.result(), Some(Ok(())));
+        assert!(scope.barrier().is_ok());
+        drop(scope);
+        // The retained tail is the last owner of the entire cancelled chain.
+        drop(tail);
+    }
+
+    #[test]
+    fn test_effect_scope_reserve_device_assignment() {
+        let scope = EffectScope::default();
+        let first = scope.reserve(Some(vec![0, 1])).unwrap();
+        assert!(matches!(scope.reserve(Some(vec![1, 0])), Err(XlaDomainError::EffectScope { .. })));
+        drop(first);
+        let successor = scope.reserve(Some(vec![0, 1])).unwrap();
+        assert!(successor.predecessor.is_some());
+        drop(successor);
+        assert!(scope.barrier().is_ok());
+    }
+
+    #[test]
+    fn test_effect_scope_barrier_snapshot() {
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(None).unwrap();
+        first.published = true;
+        let references = Arc::strong_count(&first.submission);
+        std::thread::scope(|threads| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let scope = &scope;
+            threads.spawn(move || sender.send(scope.barrier()).unwrap());
+            // The barrier owns a submission reference only after capturing its fixed snapshot.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&first.submission) == references && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let captured = Arc::strong_count(&first.submission) > references;
+            let later = scope.reserve(None).unwrap();
+            first.submission.completion.complete(Ok(()));
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            let later_pending = later.submission.completion.result().is_none();
+            drop(later);
+            assert!(captured);
+            assert!(result.unwrap().is_ok());
+            assert!(later_pending);
+        });
+        assert!(scope.barrier().is_ok());
+    }
+
+    #[test]
+    fn test_effect_scope_acknowledge() {
+        let scope = EffectScope::default();
+        let mut first = scope.reserve(Some(vec![0])).unwrap();
+        let mut second = scope.reserve(Some(vec![0])).unwrap();
+        first.published = true;
+        second.published = true;
+        first.submission.publish(Ok(None));
+        second.submission.publish(Ok(None));
+        first.submission.completion.complete(Err(Arc::from("first effect failed")));
+        assert!(matches!(scope.reserve(Some(vec![0])), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(
+            scope.acknowledge(),
+            Err(XlaDomainError::EffectScope { reason })
+                if reason == "effect failures are pending or unreported; call `effects_barrier()` and then `acknowledge_effect_errors()` again",
+        ));
+        second.submission.completion.complete(Err(Arc::from("second effect failed")));
+        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { .. })));
+        let expected = concat!(
+            "submission 0: first effect failed; submission 1: second effect failed; ",
+            "call `effects_barrier()` again if more work was submitted, then `acknowledge_effect_errors()` ",
+            "to recover once affected work is complete",
+        );
+        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason }) if reason == expected));
+        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason }) if reason == expected));
+        assert!(scope.acknowledge().is_ok());
+        assert!(scope.barrier().is_ok());
+        let recovered = scope.reserve(Some(vec![1])).unwrap();
+        assert!(recovered.predecessor.is_none());
+        drop(recovered);
+        // Acknowledgment changes scope bookkeeping, not outcomes retained by callers.
+        assert_eq!(first.submission.completion.result(), Some(Err(Arc::from("first effect failed"))));
+    }
+
+    #[test]
+    fn test_effect_scope_acknowledge_preserves_pending() {
+        let scope = EffectScope::default();
+        let mut pending = scope.reserve(None).unwrap();
+        pending.published = true;
+        assert!(scope.acknowledge().is_ok());
+        assert_eq!(scope.state.lock().unwrap().submissions.len(), 1);
+        pending.submission.completion.complete(Err(Arc::from("late completion failure")));
+        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { .. })));
+        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { .. })));
+        assert!(scope.acknowledge().is_ok());
+        assert_eq!(scope.state.lock().unwrap().submissions.len(), 0);
+    }
+
+    #[test]
+    fn test_effect_scope_managed_callback_reentrancy() {
+        let scope = EffectScope::default();
+        let guard = EffectCallbackGuard::enter();
+        let reason = "execution and effect barriers cannot be entered from a managed callback";
+        assert!(matches!(scope.reserve(None), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
+        assert!(matches!(scope.barrier(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
+        assert!(matches!(scope.acknowledge(), Err(XlaDomainError::EffectScope { reason: actual }) if actual == reason));
+        let domain = XlaDomain::token();
+        assert!(matches!(
+            domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "effect scope: execution and effect barriers cannot be entered from a managed callback",
+        ));
+        drop(guard);
+        assert!(scope.barrier().is_ok());
+    }
+
+    #[test]
+    fn test_xla_domain_effects_barrier_clientless() {
+        let domain = XlaDomain::token();
+        assert!(domain.session().is_none());
+        assert!(domain.effects_barrier().is_ok());
+        assert!(domain.acknowledge_effect_errors().is_ok());
+        assert!(domain.fork_effect_scope().session().is_none());
+    }
+
+    #[test]
+    fn test_xla_session_domain() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let session = Arc::new(XlaSession::new(&client));
+        let retained = Arc::downgrade(&session);
+        let domain = session.domain();
+        let another = session.domain();
+        let fork = domain.fork_effect_scope();
+        assert!(std::ptr::eq(session.client(), &client));
+        assert!(std::ptr::eq(domain.compilation_context(), session.compilation_context()));
+        assert!(std::ptr::eq(fork.compilation_context(), session.compilation_context()));
+        assert!(Arc::ptr_eq(domain.effect_scope.as_ref().unwrap(), another.effect_scope.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(domain.effect_scope.as_ref().unwrap(), fork.effect_scope.as_ref().unwrap()));
+        let pending = domain.effect_scope.as_ref().unwrap().reserve(None).unwrap();
+        assert!(fork.effects_barrier().is_ok());
+        drop(pending);
+        assert!(session.effects_barrier().is_ok());
+        drop(session);
+        assert!(retained.upgrade().is_some());
+        drop(domain);
+        drop(another);
+        drop(fork);
+        assert!(retained.upgrade().is_none());
     }
 }

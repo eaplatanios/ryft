@@ -152,6 +152,7 @@ unsafe fn assertion_handler_for_memory(
     call_frame: *mut XLA_FFI_CallFrame,
     memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<AssertionBufferMemory, FfiError>,
 ) -> *mut XLA_FFI_Error {
+    let _callback_guard = super::domains::EffectCallbackGuard::enter();
     // SAFETY: XLA owns the call frame for this invocation. All access is localized in `FfiCallFrame` and the checked
     // scalar-buffer readers below.
     unsafe {

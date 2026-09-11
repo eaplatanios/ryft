@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::Array;
 
 use super::*;
@@ -24,6 +26,15 @@ impl<'o> ExecuteArguments<'o> {
     /// Creates PJRT `ExecutionDeviceInputs` in the same device order as [`Self::addressable_device_ids`].
     pub fn as_execution_device_inputs<'l>(&'l self) -> Vec<ExecutionDeviceInputs<'o, 'l>> {
         self.inputs_by_device.iter().map(|inputs| ExecutionDeviceInputs::from(inputs.as_slice())).collect()
+    }
+
+    /// Appends one non-donatable hidden input per addressable device. The execution boundary validates the device
+    /// assignment before calling this function; hidden tokens never pass through numerical array construction.
+    pub(crate) fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'o>>>) {
+        assert_eq!(buffers.len(), self.inputs_by_device.len());
+        for (inputs, buffer) in self.inputs_by_device.iter_mut().zip(buffers) {
+            inputs.push(ExecutionInput::from(buffer));
+        }
     }
 
     /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
