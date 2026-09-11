@@ -777,6 +777,158 @@ mod tests {
     }
 
     #[test]
+    fn test_array_min_complex() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+
+        // Compare complete operands lexicographically, selecting the right operand on ties and unordered comparisons.
+        // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
+        let left_values = [
+            num_complex::Complex::new(1.0f32, 100.0),
+            num_complex::Complex::new(1.0, 2.0),
+            num_complex::Complex::new(-0.0, 0.0),
+            num_complex::Complex::new(f32::from_bits(0x7fc0_1234), 1.0),
+            num_complex::Complex::new(1.0, f32::from_bits(0x7fc0_5678)),
+        ];
+        let right_values = [
+            num_complex::Complex::new(2.0f32, 0.0),
+            num_complex::Complex::new(1.0, 3.0),
+            num_complex::Complex::new(0.0, -0.0),
+            num_complex::Complex::new(2.0, 3.0),
+            num_complex::Complex::new(1.0, 4.0),
+        ];
+        let left = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[left_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&left_values).as_slice(),
+        )
+        .unwrap();
+        let right = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[right_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&right_values).as_slice(),
+        )
+        .unwrap();
+        let reference_left = CpuArray::vector(left_values.to_vec());
+        let reference_right = CpuArray::vector(right_values.to_vec());
+        let output = left.min(&right).unwrap();
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            reference_left.min(&reference_right).unwrap().logical_bytes(),
+        );
+        let reversed = right.min(&left).unwrap();
+        assert_eq!(
+            shard_host_bytes(reversed.addressable_shards().next().unwrap()).unwrap(),
+            reference_right.min(&reference_left).unwrap().logical_bytes(),
+        );
+
+        // A real scalar broadcasts into a complex vector after promotion to complex double precision.
+        let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
+        let complex = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[2]),
+            mesh.clone(),
+            values_to_bytes(&complex_values).as_slice(),
+        )
+        .unwrap();
+        let real = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F64, &[]),
+            mesh.clone(),
+            values_to_bytes(&[2.0f64]).as_slice(),
+        )
+        .unwrap();
+        let output = complex.min(&real).unwrap();
+        assert_eq!(output.data_type(), DataType::C128);
+        assert_eq!(output.shape().dimensions(), &[2]);
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            CpuArray::vector(complex_values.to_vec()).min(&CpuArray::scalar(2.0f64)).unwrap().logical_bytes(),
+        );
+    }
+
+    #[test]
+    fn test_array_max_complex() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+
+        // Compare complete operands lexicographically, selecting the right operand on ties and unordered comparisons.
+        // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
+        let left_values = [
+            num_complex::Complex::new(1.0f32, 100.0),
+            num_complex::Complex::new(1.0, 2.0),
+            num_complex::Complex::new(-0.0, 0.0),
+            num_complex::Complex::new(f32::from_bits(0x7fc0_1234), 1.0),
+            num_complex::Complex::new(1.0, f32::from_bits(0x7fc0_5678)),
+        ];
+        let right_values = [
+            num_complex::Complex::new(2.0f32, 0.0),
+            num_complex::Complex::new(1.0, 3.0),
+            num_complex::Complex::new(0.0, -0.0),
+            num_complex::Complex::new(2.0, 3.0),
+            num_complex::Complex::new(1.0, 4.0),
+        ];
+        let left = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[left_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&left_values).as_slice(),
+        )
+        .unwrap();
+        let right = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[right_values.len()]),
+            mesh.clone(),
+            values_to_bytes(&right_values).as_slice(),
+        )
+        .unwrap();
+        let reference_left = CpuArray::vector(left_values.to_vec());
+        let reference_right = CpuArray::vector(right_values.to_vec());
+        let output = left.max(&right).unwrap();
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            reference_left.max(&reference_right).unwrap().logical_bytes(),
+        );
+        let reversed = right.max(&left).unwrap();
+        assert_eq!(
+            shard_host_bytes(reversed.addressable_shards().next().unwrap()).unwrap(),
+            reference_right.max(&reference_left).unwrap().logical_bytes(),
+        );
+
+        // A real scalar broadcasts into a complex vector after promotion to complex double precision.
+        let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
+        let complex = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[2]),
+            mesh.clone(),
+            values_to_bytes(&complex_values).as_slice(),
+        )
+        .unwrap();
+        let real = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F64, &[]),
+            mesh.clone(),
+            values_to_bytes(&[2.0f64]).as_slice(),
+        )
+        .unwrap();
+        let output = complex.max(&real).unwrap();
+        assert_eq!(output.data_type(), DataType::C128);
+        assert_eq!(output.shape().dimensions(), &[2]);
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            CpuArray::vector(complex_values.to_vec()).max(&CpuArray::scalar(2.0f64)).unwrap().logical_bytes(),
+        );
+    }
+
+    #[test]
     fn test_eager_extrema_match_jax_semantics() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

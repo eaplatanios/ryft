@@ -21,7 +21,6 @@ use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::encoding::ArrayElement;
-use crate::arrays::operations::ElementExtremum;
 use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
 use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
 use crate::axes::Axis;
@@ -1791,8 +1790,8 @@ where
                 let element = match identity {
                     RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
                     RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
-                    RaggedMaskIdentity::Lowest => <Element as ElementExtremum>::maximum_identity(),
-                    RaggedMaskIdentity::Highest => <Element as ElementExtremum>::minimum_identity(),
+                    RaggedMaskIdentity::Lowest => <Element as ArrayElement>::max_identity(),
+                    RaggedMaskIdentity::Highest => <Element as ArrayElement>::min_identity(),
                 };
                 if identity == RaggedMaskIdentity::One && element.convert_to::<f64>()? != 1.0 {
                     return Err(BatchingError::UnsupportedOperation {

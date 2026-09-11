@@ -1589,6 +1589,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation<ArrayType>
             lowerer.context,
             lowerer.location,
         )?;
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_extremum_to_mlir(
+                true,
+                output_types[0].data_type(),
+                left,
+                right,
+                &mut lowerer.block,
+                lowerer.location,
+            )?]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::maximum(left, right, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.maximum should return one result").as_ref()])
     }
@@ -1609,6 +1619,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation<ArrayType>
             lowerer.context,
             lowerer.location,
         )?;
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_extremum_to_mlir(
+                false,
+                output_types[0].data_type(),
+                left,
+                right,
+                &mut lowerer.block,
+                lowerer.location,
+            )?]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()])
     }

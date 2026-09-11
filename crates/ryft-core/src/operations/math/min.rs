@@ -2,9 +2,10 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::complex::{Imaginary, Real};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, Type, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -14,15 +15,14 @@ pub const MIN_OPERATION_NAME: &str = "min";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that computes the elementwise minimum of two numeric values, promoting their element types and
-    /// broadcasting their shapes. Matching the operand constraints of
-    /// [StableHLO's `minimum`](https://openxla.org/stablehlo/spec#minimum), only real (non-complex) numeric operands
-    /// are supported because complex numbers are unordered (Boolean minima are spelled [`And`](crate::And)). For
-    /// floating-point operands, NaNs propagate (the minimum is NaN when either operand is NaN) and `-0.0` orders
-    /// below `+0.0` (so `min(-0.0, +0.0)` is `-0.0`). Array operands that still carry partial sums are rejected,
-    /// and their reduced-axis markers must agree.
+    /// broadcasting their shapes. Real floating-point operands propagate NaNs and order negative zero below positive
+    /// zero. Complex operands compare real components first, then imaginary components when the real components are
+    /// equal, selecting one whole operand. Ties and unordered deciding comparisons select the right complex operand.
+    /// Boolean operands are not supported. Array operands that still carry partial sums are rejected, and their
+    /// reduced-axis markers must agree.
     MinOperation, MIN_OPERATION_NAME,
     Min, min,
-    check_data_types = [@numeric @real],
+    check_data_types = [@numeric],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
@@ -31,17 +31,38 @@ impl_differentiable_elementwise_operation! {
     MinOperation,
     jvp<C>
     where
-        C::Value: Compare<C::Value> + Select + ZeroLike,
+        C::Value: Compare<C::Value> + Imaginary + Real + Select + ZeroLike,
     {
-        // The tangent follows the winning operand, with ties routing to the left operand: each contribution masks
-        // its own tangent by the same `left <= right` predicate, so the combined tangent is
-        // `select(left <= right, left_tangent, right_tangent)`.
+        // Real ties retain the existing left-tangent convention. Complex selection uses strict lexicographic
+        // comparisons, routing ties and unordered deciding comparisons to the right tangent like the primal.
         |(left, left_tangent), (right, _)| {
-            let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?;
+            let left_wins = if left.r#type().is_complex() || right.r#type().is_complex() {
+                let left_real = if left.r#type().is_complex() { left.real()? } else { left.clone() };
+                let right_real = if right.r#type().is_complex() { right.real()? } else { right.clone() };
+                let left_imaginary = if left.r#type().is_complex() { left.imaginary()? } else { left.zero_like()? };
+                let right_imaginary = if right.r#type().is_complex() { right.imaginary()? } else { right.zero_like()? };
+                let same_real = left_real.compare(&right_real, ComparisonDirection::Equal)?;
+                let real_wins = left_real.compare(&right_real, ComparisonDirection::LessThan)?;
+                let imaginary_wins = left_imaginary.compare(&right_imaginary, ComparisonDirection::LessThan)?;
+                C::Value::select(&same_real, &imaginary_wins, &real_wins)?
+            } else {
+                left.compare(&right, ComparisonDirection::LessThanOrEqual)?
+            };
             C::Value::select(&left_wins, &left_tangent, &left_tangent.zero_like()?)?
         };
         |(left, _), (right, right_tangent)| {
-            let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?;
+            let left_wins = if left.r#type().is_complex() || right.r#type().is_complex() {
+                let left_real = if left.r#type().is_complex() { left.real()? } else { left.clone() };
+                let right_real = if right.r#type().is_complex() { right.real()? } else { right.clone() };
+                let left_imaginary = if left.r#type().is_complex() { left.imaginary()? } else { left.zero_like()? };
+                let right_imaginary = if right.r#type().is_complex() { right.imaginary()? } else { right.zero_like()? };
+                let same_real = left_real.compare(&right_real, ComparisonDirection::Equal)?;
+                let real_wins = left_real.compare(&right_real, ComparisonDirection::LessThan)?;
+                let imaginary_wins = left_imaginary.compare(&right_imaginary, ComparisonDirection::LessThan)?;
+                C::Value::select(&same_real, &imaginary_wins, &real_wins)?
+            } else {
+                left.compare(&right, ComparisonDirection::LessThanOrEqual)?
+            };
             C::Value::select(&left_wins, &right_tangent.zero_like()?, &right_tangent)?
         };
     },
@@ -107,6 +128,7 @@ impl_capability_for_primitive!(@float f64);
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
@@ -136,7 +158,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "`min` does not support input data type c64",
+                    output_data_types = [DataType::C64],
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
@@ -176,6 +198,29 @@ mod tests {
             Array::vector(vec![0.7, -1.0]).min(&Array::vector(vec![0.3, 2.0])).unwrap(),
             Array::vector(vec![0.3, -1.0]),
         );
+    }
+
+    #[test]
+    fn test_min_interpretation_complex() {
+        // The real component takes precedence, and mixed real/complex inputs promote before selection.
+        let left = Array::scalar(Complex::new(1.0f32, 100.0));
+        let right = Array::scalar(Complex::new(2.0f32, -100.0));
+        assert_eq!(left.min(&right).unwrap(), Array::scalar(Complex::new(1.0f32, 100.0)));
+        assert_eq!(left.min(&Array::scalar(2.0f32)).unwrap(), Array::scalar(Complex::new(1.0f32, 100.0)),);
+
+        // Equal real components compare imaginary components, with scalar broadcasting across a vector.
+        let values = Array::vector(vec![Complex::new(1.0f64, 1.0), Complex::new(1.0, 3.0)]);
+        assert_eq!(
+            values.min(&Array::scalar(Complex::new(1.0f64, 2.0))).unwrap(),
+            Array::vector(vec![Complex::new(1.0f64, 1.0), Complex::new(1.0, 2.0)]),
+        );
+
+        // Unordered real comparisons and signed-zero ties select the right whole operand.
+        let unordered = Array::scalar(Complex::new(f32::NAN, 1.0));
+        assert_eq!(unordered.min(&right).unwrap(), right);
+        let zero = Array::scalar(Complex::new(1.0f32, -0.0));
+        let result = zero.min(&Array::scalar(Complex::new(1.0f32, 0.0))).unwrap();
+        assert_eq!(result.elements::<Complex<f32>>().unwrap()[0].im.to_bits(), 0.0f32.to_bits());
     }
 
     #[test]
@@ -251,6 +296,46 @@ mod tests {
             .interpret(vec![Array::scalar(2.0), Array::scalar(2.0), Array::scalar(3.0), Array::scalar(5.0)])
             .unwrap();
         assert_eq!(outputs, vec![Array::scalar(2.0), Array::scalar(3.0)]);
+    }
+
+    #[test]
+    fn test_min_differentiation_complex() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::C128));
+        let right = builder.add_input(ArrayType::scalar(DataType::C128));
+        let output = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let jvp_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let left_tangent = Array::scalar(Complex::new(3.0, 4.0));
+        let right_tangent = Array::scalar(Complex::new(5.0, 6.0));
+
+        // The imaginary component decides when the real components agree.
+        assert_eq!(
+            jvp_program
+                .interpret(vec![
+                    Array::scalar(Complex::new(1.0, 1.0)),
+                    Array::scalar(Complex::new(1.0, 2.0)),
+                    left_tangent.clone(),
+                    right_tangent.clone(),
+                ])
+                .unwrap(),
+            vec![Array::scalar(Complex::new(1.0, 1.0)), left_tangent.clone()],
+        );
+        // Complex ties follow the right operand, unlike the existing real tie convention.
+        assert_eq!(
+            jvp_program
+                .interpret(vec![
+                    Array::scalar(Complex::new(1.0, 2.0)),
+                    Array::scalar(Complex::new(1.0, 2.0)),
+                    left_tangent,
+                    right_tangent.clone(),
+                ])
+                .unwrap(),
+            vec![Array::scalar(Complex::new(1.0, 2.0)), right_tangent],
+        );
     }
 
     #[test]

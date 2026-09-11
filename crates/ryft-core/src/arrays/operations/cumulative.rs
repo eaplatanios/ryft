@@ -8,8 +8,9 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::arrays::Array;
+use crate::arrays::encoding::ArrayElement;
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::math::{ElementAdd, ElementExtremum, ElementMul, ElementRealFloatMath};
+use crate::arrays::operations::math::{ElementAdd, ElementMul, ElementRealFloatMath};
 use crate::arrays::types::data::DataType;
 use crate::operations::cumulative::cumulative_log_sum_exp::cumulative_log_sum_exp_abstract;
 use crate::operations::cumulative::cumulative_max::cumulative_max_abstract;
@@ -73,8 +74,8 @@ impl Array {
             let elements = self.elements::<Element>()?;
             let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
                 Ok(match maximum {
-                    true => <Element as ElementExtremum>::maximum(left, right),
-                    false => <Element as ElementExtremum>::minimum(left, right),
+                    true => ArrayElement::max(&left, &right),
+                    false => ArrayElement::min(&left, &right),
                 })
             })?;
             Self::from_elements(output_type, scanned.as_slice())

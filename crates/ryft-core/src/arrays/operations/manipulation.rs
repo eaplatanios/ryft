@@ -16,7 +16,7 @@ use crate::arrays::encoding::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::ArrayIrOperation;
-use crate::arrays::operations::math::{ElementAdd, ElementExtremum, ElementMul};
+use crate::arrays::operations::math::{ElementAdd, ElementMul};
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
@@ -628,9 +628,9 @@ impl Scatter for Array {
                         let current_value = Element::decode(current);
                         let update_value = Element::decode(update);
                         let result = if operation.kind() == ScatterReductionKind::Min {
-                            <Element as ElementExtremum>::minimum(current_value, update_value)
+                            ArrayElement::min(&current_value, &update_value)
                         } else {
-                            <Element as ElementExtremum>::maximum(current_value, update_value)
+                            ArrayElement::max(&current_value, &update_value)
                         };
                         result.encode(current);
                         Ok(())

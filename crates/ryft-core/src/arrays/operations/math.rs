@@ -6,7 +6,6 @@
 //! type promotion and NumPy-style broadcasting follow the corresponding operations' type-inference rules, so the
 //! eager results match what a staged program computes.
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use half::{bf16, f16};
@@ -1132,135 +1131,6 @@ macro_rules! impl_array_sign_for_signed_sub_byte_integer {
 
 impl_array_sign_for_signed_sub_byte_integer!(i1, i2, i4);
 
-/// Element-level minimum and maximum selection contract shared by reduction and scatter. The selection rules
-/// follow JAX's `lax` extrema: Booleans order `false < true`, floating-point extrema propagate NaNs and order `-0`
-/// below `+0`, and complex values compare lexicographically by `(real, imaginary)`.
-pub(crate) trait ElementExtremum: ArrayElement {
-    /// Returns the maximum of `self` and `right`.
-    fn maximum(self, right: Self) -> Self;
-
-    /// Returns the minimum of `self` and `right`.
-    fn minimum(self, right: Self) -> Self;
-}
-
-// Implements extrema for totally ordered element types using their ordinary comparison semantics.
-macro_rules! impl_array_extrema_for_ordered_element {
-    ($type:ty) => {
-        impl ElementExtremum for $type {
-            #[inline]
-            fn maximum(self, right: Self) -> Self {
-                self.max(right)
-            }
-
-            #[inline]
-            fn minimum(self, right: Self) -> Self {
-                self.min(right)
-            }
-        }
-    };
-}
-
-impl_array_extrema_for_ordered_element!(bool);
-impl_array_extrema_for_ordered_element!(i1);
-impl_array_extrema_for_ordered_element!(i2);
-impl_array_extrema_for_ordered_element!(i4);
-impl_array_extrema_for_ordered_element!(i8);
-impl_array_extrema_for_ordered_element!(i16);
-impl_array_extrema_for_ordered_element!(i32);
-impl_array_extrema_for_ordered_element!(i64);
-impl_array_extrema_for_ordered_element!(u1);
-impl_array_extrema_for_ordered_element!(u2);
-impl_array_extrema_for_ordered_element!(u4);
-impl_array_extrema_for_ordered_element!(u8);
-impl_array_extrema_for_ordered_element!(u16);
-impl_array_extrema_for_ordered_element!(u32);
-impl_array_extrema_for_ordered_element!(u64);
-
-/// Selects the larger floating-point element with NaN propagation and `-0` ordered below `+0`. Exact ties preserve
-/// `left`, including its original encoding.
-fn maximum_float_element<T: Copy>(left: T, right: T, to_f64: impl Fn(T) -> f64) -> T {
-    let left_value = to_f64(left);
-    let right_value = to_f64(right);
-    if left_value.is_nan() {
-        left
-    } else if right_value.is_nan() || left_value.total_cmp(&right_value) == Ordering::Less {
-        right
-    } else {
-        left
-    }
-}
-
-/// Selects the smaller floating-point element with NaN propagation and `-0` ordered below `+0`. Exact ties preserve
-/// `left`, including its original encoding.
-fn minimum_float_element<T: Copy>(left: T, right: T, to_f64: impl Fn(T) -> f64) -> T {
-    let left_value = to_f64(left);
-    let right_value = to_f64(right);
-    if left_value.is_nan() {
-        left
-    } else if right_value.is_nan() || left_value.total_cmp(&right_value) == Ordering::Greater {
-        right
-    } else {
-        left
-    }
-}
-
-// Implements floating-point extrema while retaining the selected operand's exact encoding.
-macro_rules! impl_array_extrema_for_float {
-    ($type:ty, $to_f64:expr $(,)?) => {
-        impl ElementExtremum for $type {
-            #[inline]
-            fn maximum(self, right: Self) -> Self {
-                maximum_float_element(self, right, $to_f64)
-            }
-
-            #[inline]
-            fn minimum(self, right: Self) -> Self {
-                minimum_float_element(self, right, $to_f64)
-            }
-        }
-    };
-}
-
-impl_array_extrema_for_float!(f4e2m1fn, f4e2m1fn::to_f64);
-impl_array_extrema_for_float!(f6e2m3fn, f6e2m3fn::to_f64);
-impl_array_extrema_for_float!(f6e3m2fn, f6e3m2fn::to_f64);
-impl_array_extrema_for_float!(f8e3m4, f8e3m4::to_f64);
-impl_array_extrema_for_float!(f8e4m3, f8e4m3::to_f64);
-impl_array_extrema_for_float!(f8e4m3fn, f8e4m3fn::to_f64);
-impl_array_extrema_for_float!(f8e4m3fnuz, f8e4m3fnuz::to_f64);
-impl_array_extrema_for_float!(f8e4m3b11fnuz, f8e4m3b11fnuz::to_f64,);
-impl_array_extrema_for_float!(f8e5m2, f8e5m2::to_f64);
-impl_array_extrema_for_float!(f8e5m2fnuz, f8e5m2fnuz::to_f64);
-impl_array_extrema_for_float!(f8e8m0fnu, f8e8m0fnu::to_f64);
-impl_array_extrema_for_float!(bf16, bf16::to_f64);
-impl_array_extrema_for_float!(f16, f16::to_f64);
-impl_array_extrema_for_float!(f32, f64::from);
-impl_array_extrema_for_float!(f64, |value| value);
-
-// Implements JAX's lexicographic complex extrema. Ordinary floating-point comparisons intentionally make every NaN
-// comparison false, so an unordered real or imaginary component selects `right`, exactly like JAX's compare/select
-// lowering.
-macro_rules! impl_array_extrema_for_complex {
-    ($component:ty) => {
-        impl ElementExtremum for Complex<$component> {
-            #[inline]
-            fn maximum(self, right: Self) -> Self {
-                let select_left = if self.re == right.re { self.im > right.im } else { self.re > right.re };
-                if select_left { self } else { right }
-            }
-
-            #[inline]
-            fn minimum(self, right: Self) -> Self {
-                let select_left = if self.re == right.re { self.im < right.im } else { self.re < right.re };
-                if select_left { self } else { right }
-            }
-        }
-    };
-}
-
-impl_array_extrema_for_complex!(f32);
-impl_array_extrema_for_complex!(f64);
-
 impl Array {
     /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
     /// and uniquely owned output buffers are mutated without another payload allocation.
@@ -1325,7 +1195,7 @@ impl Array {
     /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
     /// not finite, and then `log(sum(exp(x - safe_maximum))) + safe_maximum`. Every intermediate is held in the
     /// element's own encoding, so the result matches what the equivalent staged program computes.
-    fn log_sum_exp_elements<T: ElementZero + ElementAdd + ElementSub + ElementExtremum + ElementFloatMath>(
+    fn log_sum_exp_elements<T: ElementZero + ElementAdd + ElementSub + ElementFloatMath>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
@@ -1334,7 +1204,7 @@ impl Array {
         debug_assert_eq!(output_type.data_type(), T::data_type());
         let zero = T::zero()?;
         let mut maximums = self.reduce_elements::<T>(output_type.clone(), axes, T::max_identity(), |left, right| {
-            Ok(left.maximum(right))
+            Ok(ArrayElement::max(&left, &right))
         })?;
         maximums.map_elements_in_place::<T>(|value| {
             Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
@@ -2124,9 +1994,9 @@ impl Reduce for Array {
                     };
                     self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
                         Ok(if kind == ReductionKind::Max {
-                            <Element as ElementExtremum>::maximum(left, right)
+                            ArrayElement::max(&left, &right)
                         } else {
-                            <Element as ElementExtremum>::minimum(left, right)
+                            ArrayElement::min(&left, &right)
                         })
                     })
                 })
