@@ -20,7 +20,7 @@ use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::concatenation::Concatenate;
-use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::Add;

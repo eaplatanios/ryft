@@ -966,7 +966,7 @@ where
                         .tangent()
                         .bind(
                             ArrayIrOperation::<A>::Array(ArrayOperation::ConvertElementType(
-                                ConvertElementTypeOperation::new(tangent_array_type.data_type()),
+                                ConvertElementTypeOperation::new(tangent_array_type.data_type(), false),
                             )),
                             Vec::new(),
                             std::slice::from_ref(&tangent_primal),

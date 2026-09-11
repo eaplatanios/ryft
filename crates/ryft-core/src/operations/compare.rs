@@ -12,7 +12,7 @@ use crate::macros::{
     impl_reference_dischargeable_operation,
 };
 use crate::operations::ElementwiseOperation;
-use crate::operations::manipulation::conversion::ElementType;
+use crate::operations::manipulation::conversions::ElementType;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Value,
@@ -391,15 +391,15 @@ mod tests {
             )),
         );
 
-        // The array contract applies the same element-type rule while preserving the broadcasted structural metadata.
+        // Comparison preserves shape and placement but clears byte strides when the element storage width changes.
         let left = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
         let right = left.clone().with_data_type(DataType::F64);
         let ordered_array = CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan);
         assert_eq!(
             Operation::infer_output_types(&ordered_array, &[left.clone(), right], &[]),
-            Ok(vec![left.clone().with_data_type(DataType::Boolean)]),
+            Ok(vec![left.clone().with_data_type(DataType::Boolean).with_layout(None)]),
         );
 
         let equality_scalar = CompareOperation::<DataType>::new(ComparisonDirection::Equal);
@@ -411,7 +411,7 @@ mod tests {
         let complex = left.with_data_type(DataType::C64);
         assert_eq!(
             Operation::infer_output_types(&equality_array, &[complex.clone(), complex.clone()], &[]),
-            Ok(vec![complex.with_data_type(DataType::Boolean)]),
+            Ok(vec![complex.with_data_type(DataType::Boolean).with_layout(None)]),
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();

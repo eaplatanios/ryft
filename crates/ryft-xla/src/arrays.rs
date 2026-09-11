@@ -9,7 +9,7 @@ use ryft_core::{
     ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
 };
 use ryft_macros::Parameter;
-use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
+use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
 
 use crate::arrays_v0::{
     BoundedMaterializationCache, BoundedMaterializationKey, BoundedMaterializationProbe,
@@ -35,6 +35,10 @@ use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
 /// global placement while only transferring, executing with, or materializing buffers that this process can access
 /// directly. This distinction is what allows array movement, execution argument assembly, and cross-host transfers to
 /// preserve the full global sharding contract without requiring every process to own every shard buffer.
+///
+/// The current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays retain
+/// their logical `I1` or `U1` type while using one byte per element in this physical representation. This executable
+/// convention is separate from [`ToPjrt`] for [`DataType`], which preserves native PJRT one-bit integer types.
 #[derive(Parameter)]
 pub struct Array<'o> {
     /// [`ArrayType`] of this [`Array`].
@@ -204,10 +208,10 @@ impl<'o> Array<'o> {
             }
 
             // Validate the concrete buffer type against the physical representation of the logical shard type.
-            // `DataType::Zero` deliberately uses a predicate carrier, so converting the buffer type back to a
-            // `DataType` would incorrectly relabel a logical zero-space array as Boolean.
+            // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting a
+            // carrier back to a `DataType` would incorrectly relabel those logical arrays as Boolean.
             let buffer_type = buffer.element_type()?;
-            let expected_buffer_type = r#type.data_type().to_pjrt();
+            let expected_buffer_type = Self::physical_buffer_type(r#type.data_type());
             let data_type = if buffer_type == expected_buffer_type {
                 r#type.data_type()
             } else {
@@ -227,6 +231,12 @@ impl<'o> Array<'o> {
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
+            if buffer_type != expected_buffer_type && matches!(r#type.data_type(), DataType::I1 | DataType::U1) {
+                return Err(Error::BufferTypeMismatch {
+                    expected: ArrayType::new(DataType::Boolean, shape.clone().into()),
+                    actual: ArrayType::new(data_type, shape.into()),
+                });
+            }
             let array_type = ArrayType::new(data_type, shape.into());
             let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
             if array_type != expected_array_type {
@@ -390,7 +400,7 @@ impl<'o> Array<'o> {
             let shard_shape = shard.shape();
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let shard_slice = shard.slice();
-            let buffer_type = data_type.to_pjrt();
+            let buffer_type = Self::physical_buffer_type(data_type);
             if shard_slice.is_empty() {
                 addressable_buffers.push(client.buffer(
                     buffer,
@@ -718,6 +728,15 @@ impl<'o> Array<'o> {
             }
         }
         Ok(())
+    }
+
+    /// Selects the buffer representation required by the current StableHLO executable boundary. General PJRT type
+    /// conversion remains faithful to native one-bit types; only this array execution path uses predicate carriers.
+    pub(crate) fn physical_buffer_type(data_type: DataType) -> BufferType {
+        match data_type {
+            DataType::I1 | DataType::U1 => BufferType::Predicate,
+            _ => data_type.to_pjrt(),
+        }
     }
 }
 
@@ -1215,7 +1234,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
-    use crate::{ArrayError, Error, FromPjrt, XlaSession};
+    use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaSession};
 
     use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout, block_until_ready};
 
@@ -1405,6 +1424,27 @@ mod tests {
         assert!(array.shards()[0].buffer().is_none());
         assert!(!array.shards()[1].is_addressable());
         assert!(array.shards()[1].buffer().is_none());
+    }
+
+    #[test]
+    fn test_array_from_addressable_buffers_rejects_native_one_bit_carrier() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(device.clone()).unwrap()]).unwrap();
+        for data_type in [DataType::I1, DataType::U1] {
+            let array_type =
+                ArrayType::scalar(data_type).with_sharding(Sharding::replicated(logical_mesh.clone(), 0)).unwrap();
+            let buffer = client.buffer(&[1], data_type.to_pjrt(), [], None, device.clone(), None).unwrap();
+            assert!(matches!(
+                Array::from_addressable_buffers(&client, array_type, mesh.clone(), vec![buffer]),
+                Err(Error::BufferTypeMismatch { expected, actual })
+                    if expected == ArrayType::scalar(DataType::Boolean) && actual == ArrayType::scalar(data_type),
+            ));
+        }
     }
 
     #[test]
@@ -1761,6 +1801,16 @@ mod tests {
             })),
         );
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
+    }
+
+    #[test]
+    fn test_array_physical_buffer_type() {
+        assert_eq!(Array::physical_buffer_type(DataType::I1), BufferType::Predicate);
+        assert_eq!(Array::physical_buffer_type(DataType::U1), BufferType::Predicate);
+        assert_eq!(Array::physical_buffer_type(DataType::Boolean), BufferType::Predicate);
+        assert_eq!(Array::physical_buffer_type(DataType::I2), BufferType::I2);
+        assert_eq!(DataType::I1.to_pjrt(), BufferType::I1);
+        assert_eq!(DataType::U1.to_pjrt(), BufferType::U1);
     }
 
     #[test]

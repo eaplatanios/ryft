@@ -1445,7 +1445,7 @@ impl<'c> XlaDomain<'c> {
                 })?;
             let buffer = client.buffer(
                 bytes.as_slice(),
-                array_type.data_type().to_pjrt(),
+                Array::physical_buffer_type(array_type.data_type()),
                 dimensions.as_slice(),
                 None,
                 device,
@@ -6431,7 +6431,12 @@ mod tests {
         let logical_length =
             builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let logical_length = builder
-            .add_instruction(ConvertElementTypeOperation::new(DataType::I32), Vec::new(), vec![logical_length], None)
+            .add_instruction(
+                ConvertElementTypeOperation::new(DataType::I32, false),
+                Vec::new(),
+                vec![logical_length],
+                None,
+            )
             .unwrap()[0];
         let one = CpuArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
         let one = builder.add_instruction(ConstantOperation::new(one), Vec::new(), Vec::new(), None).unwrap()[0];
@@ -8853,7 +8858,12 @@ mod tests {
         let mask = builder.add_input(mask_type.into());
         let values = builder.add_input(values_type.into());
         let mask = builder
-            .add_instruction(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64), Vec::new(), vec![mask], None)
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
+                Vec::new(),
+                vec![mask],
+                None,
+            )
             .unwrap()[0];
         let count = builder
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
@@ -8886,6 +8896,90 @@ mod tests {
         let four = execute(&[true, true, true, true]);
         assert_eq!(four[0].shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, &four[0]), vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_bounded_dynamic_bitcast_element_type_preserves_prefix_extents() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "count",
+                DimensionBounds::new(0, Some(5)).unwrap(),
+            ))]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let values = builder.add_input(declared_type.into());
+        let halves = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
+                Vec::new(),
+                vec![values],
+                None,
+            )
+            .unwrap()[0];
+        let restored = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
+                Vec::new(),
+                vec![halves],
+                None,
+            )
+            .unwrap()[0];
+        let bits = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I1, true),
+                Vec::new(),
+                vec![values],
+                None,
+            )
+            .unwrap()[0];
+        let restored_bits = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
+                Vec::new(),
+                vec![bits],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![halves, restored, bits, restored_bits],
+                vec![Placeholder],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        // Splitting and joining the static bit-width axis preserves an independent dynamic prefix and its live bytes.
+        for count in [2usize, 4] {
+            let outputs =
+                domain.execute_xla_program(&compiled, vec![f32_vector(&client, &mesh, &vec![1.0; count])]).unwrap();
+            assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
+            assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
+            assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0; count]);
+            assert_eq!(outputs[2].shape(), StaticShape::new(vec![count, 32]));
+            assert_eq!(outputs[3].shape(), StaticShape::new(vec![count]));
+            assert_eq!(read_f32s(&client, &outputs[3]), vec![1.0; count]);
+            let bytes = outputs[0]
+                .addressable_shards()
+                .next()
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            assert_eq!(bytes, values_to_bytes(&vec![1.0f32; count]));
+        }
     }
 
     #[test]

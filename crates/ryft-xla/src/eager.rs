@@ -641,6 +641,142 @@ mod tests {
     }
 
     #[test]
+    fn test_array_convert_element_type_complex_boolean() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        // Purely imaginary values and NaNs in either component are nonzero; signed zeros are false.
+        let components = [0.0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[6]),
+            mesh.clone(),
+            values_to_bytes(&components).as_slice(),
+        )
+        .unwrap();
+        let output = input.convert_element_type(DataType::Boolean).unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_array_convert_element_type_one_bit_integers() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        // The same physical bits represent -1 for I1 and +1 for U1 and Boolean.
+        for (data_type, expected) in
+            [(DataType::I1, vec![0.0, -1.0]), (DataType::U1, vec![0.0, 1.0]), (DataType::Boolean, vec![0.0, 1.0])]
+        {
+            let input =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &[0, 1])
+                    .unwrap();
+            assert_eq!(read_f32s(&input.convert_element_type(DataType::F32).unwrap()), expected);
+        }
+        // Narrowing keeps parity, unlike Boolean truthiness. Fractional values truncate before narrowing.
+        let input = f32_vector(&client, &mesh, &[0.0, 1.9, 2.0, 3.0, -1.9, -2.0, 128.0, -129.0]);
+        for (data_type, expected) in [
+            (DataType::I1, vec![0, 1, 0, 1, 1, 0, 1, 0]),
+            (DataType::U1, vec![0, 1, 0, 1, 0, 0, 0, 0]),
+            (DataType::Boolean, vec![0, 1, 1, 1, 1, 1, 1, 1]),
+        ] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), expected);
+        }
+        let integers = [-129i32, -2, -1, 0, 1, 2, 128, 129];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[integers.len()]),
+            mesh.clone(),
+            values_to_bytes(&integers).as_slice(),
+        )
+        .unwrap();
+        for data_type in [DataType::I1, DataType::U1] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(
+                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                vec![1, 0, 1, 0, 1, 0, 0, 1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_convert_element_type_subbyte_carrier_boundaries() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let values = [
+            -129.0f32, -9.0, -8.0, -3.0, -2.0, -1.9, 0.0, 1.0, 2.0, 3.0, 7.0, 8.0, 15.0, 16.0, 127.0, 128.0, 255.0,
+            256.0,
+        ];
+        let input = f32_vector(&client, &mesh, &values);
+        let reference = CpuArray::vector(values.to_vec());
+        // Sub-byte conversion saturates at the byte carrier limits and then narrows modularly to the logical width.
+        for data_type in [DataType::I2, DataType::I4, DataType::U2, DataType::U4] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(
+                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                reference.convert_element_type(data_type).unwrap().logical_bytes(),
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[1.0, -0.0]);
+        let integers = input.bitcast_element_type(DataType::I32).unwrap();
+        assert_eq!(read_i32s(&integers), vec![0x3f800000, i32::MIN]);
+
+        // A narrower representation splits the trailing element bits; widening restores the original shape and bits.
+        let halves = input.bitcast_element_type(DataType::U16).unwrap();
+        assert_eq!(halves.shape().dimensions(), &[2, 2]);
+        let restored = halves.bitcast_element_type(DataType::F32).unwrap();
+        assert_eq!(restored.shape().dimensions(), &[2]);
+        assert_eq!(
+            shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(),
+            values_to_bytes(&[1.0f32, -0.0]),
+        );
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type_one_bit() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let input =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::U8, &[]), mesh.clone(), &[0xab]).unwrap();
+        for data_type in [DataType::I1, DataType::U1] {
+            let bits = input.bitcast_element_type(data_type).unwrap();
+            assert_eq!(bits.shape().dimensions(), &[8]);
+            assert_eq!(
+                shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(),
+                vec![1, 1, 0, 1, 0, 1, 0, 1]
+            );
+            let restored = bits.bitcast_element_type(DataType::U8).unwrap();
+            assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![0xab]);
+        }
+        let pair =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::U2, &[]), mesh.clone(), &[3]).unwrap();
+        let bits = pair.bitcast_element_type(DataType::U1).unwrap();
+        assert_eq!(shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(), vec![1, 1]);
+        let restored = bits.bitcast_element_type(DataType::U2).unwrap();
+        assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![3]);
+    }
+
+    #[test]
     fn test_eager_extrema_match_jax_semantics() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

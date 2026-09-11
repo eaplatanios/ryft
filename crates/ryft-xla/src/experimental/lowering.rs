@@ -744,13 +744,226 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
+        check_count!("input", lowerer.input_types, 1, ProgramError);
+        let input_type = &lowerer.input_types[0];
+        let input_data_type = input_type.data_type();
+        let output_data_type = output_types[0].data_type();
         let output_type = lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?;
-        let result =
-            lowerer
+        let mut input = input_values[0];
+        if self.bitcast() {
+            return Ok(vec![lower_bitcast_to_mlir(
+                input,
+                input_type,
+                &output_types[0],
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
+
+        // StableHLO's complex-to-predicate conversion discards the imaginary part. Ryft Boolean conversion tests
+        // the entire value for nonzero, including purely imaginary values and NaNs in either component.
+        if input_data_type.is_complex() && output_data_type == DataType::Boolean {
+            let real = lowerer.block.append_operation(stable_hlo::real(input, lowerer.location)?)?;
+            let imaginary = lowerer.block.append_operation(stable_hlo::imag(input, lowerer.location)?)?;
+            let real = lowerer.block.append_operation(stable_hlo::convert(
+                real.result(0).unwrap().as_ref(),
+                output_type,
+                lowerer.location,
+            )?)?;
+            let imaginary = lowerer.block.append_operation(stable_hlo::convert(
+                imaginary.result(0).unwrap().as_ref(),
+                output_type,
+                lowerer.location,
+            )?)?;
+            let result = lowerer.block.append_operation(stable_hlo::or(
+                real.result(0).unwrap().as_ref(),
+                imaginary.result(0).unwrap().as_ref(),
+                lowerer.location,
+            )?)?;
+            return Ok(vec![result.result(0).unwrap().as_ref()]);
+        }
+
+        // The shared i1 carrier has predicate semantics in StableHLO. Recover the signed numeric value before
+        // widening an I1, while preserving its bit directly when converting between one-bit carriers.
+        if matches!(input_data_type, DataType::Boolean | DataType::I1 | DataType::U1)
+            && matches!(output_data_type, DataType::Boolean | DataType::I1 | DataType::U1)
+        {
+            return Ok(vec![input]);
+        }
+        if input_data_type == DataType::I1 {
+            let signed_type = ArrayType::new(DataType::I8, input_type.shape().clone());
+            let signed_type = lower_tensor_type(&signed_type, lowerer.context, lowerer.location)?;
+            let widened = lowerer.block.append_operation(stable_hlo::convert(input, signed_type, lowerer.location)?)?;
+            let signed = lowerer
                 .block
-                .append_operation(stable_hlo::convert(input_values[0], output_type, lowerer.location)?)?;
+                .append_operation(stable_hlo::negate(widened.result(0).unwrap().as_ref(), lowerer.location)?)?;
+            input = signed.result(0).unwrap().as_ref();
+        }
+        if matches!(
+            output_data_type,
+            DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4
+        ) {
+            // Integer narrowing retains the low bits. Real inputs first truncate/saturate to the same byte carrier
+            // used by the reference sub-byte codecs, then narrow modularly; conversion directly to i1 tests nonzero.
+            let carrier_data_type = if matches!(output_data_type, DataType::I1 | DataType::I2 | DataType::I4) {
+                DataType::I8
+            } else {
+                DataType::U8
+            };
+            let carrier_type = ArrayType::new(carrier_data_type, input_type.shape().clone());
+            let carrier_tensor_type = lower_tensor_type(&carrier_type, lowerer.context, lowerer.location)?;
+            let converted =
+                lowerer.block.append_operation(stable_hlo::convert(input, carrier_tensor_type, lowerer.location)?)?;
+            let mask = lower_unplaced_constant_output(
+                &[carrier_type],
+                match output_data_type {
+                    DataType::I1 | DataType::U1 => 1,
+                    DataType::I2 | DataType::U2 => 3,
+                    _ => 15,
+                },
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?[0];
+            let masked = lowerer.block.append_operation(stable_hlo::and(
+                converted.result(0).unwrap().as_ref(),
+                mask,
+                lowerer.location,
+            )?)?;
+            input = masked.result(0).unwrap().as_ref();
+        }
+        let result = lowerer.block.append_operation(stable_hlo::convert(input, output_type, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.convert should return one result").as_ref()])
     }
+}
+
+/// Reinterprets physical encoding bits, including logical one-bit integers whose XLA predicate carrier occupies a
+/// full byte. Dynamic prefix extents are restored after operating on fixed physical bounds because XLA's padding
+/// pass does not support width-changing bitcasts of dynamic tensors.
+fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let input_one_bit = matches!(input_type.data_type(), DataType::I1 | DataType::U1);
+    let output_one_bit = matches!(output_type.data_type(), DataType::I1 | DataType::U1);
+    if input_type.data_type() == output_type.data_type() || input_one_bit && output_one_bit {
+        return Ok(input);
+    }
+    let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
+    let carrier_input_type =
+        if input_one_bit { input_type.clone().with_data_type(DataType::Boolean) } else { input_type.clone() };
+    let physical_input = lower_physical_bound_value(input, &carrier_input_type, padding, block, context, location)?;
+    let physical_input_type = physical_bound_type(input_type)?;
+    let physical_output_type = physical_bound_type(output_type)?;
+    let output_tensor_type = lower_tensor_type(&physical_output_type, context, location)?;
+    let result = if output_one_bit {
+        // Split into two-bit groups first: every supported non-one-bit numeric encoding has an even width, including
+        // six-bit floats. Expanding each group to two predicates avoids treating each predicate as eight bits.
+        let mut shape = static_dimensions(&physical_output_type)?;
+        let width = shape.pop().unwrap();
+        if width > 2 {
+            shape.push(width / 2);
+        }
+        let groups_type =
+            ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+        let groups = block.append_operation(stable_hlo::bitcast_convert(
+            physical_input,
+            lower_tensor_type(&groups_type, context, location)?,
+            location,
+        )?)?;
+        let groups = block.append_operation(stable_hlo::convert(
+            groups.result(0).unwrap().as_ref(),
+            lower_tensor_type(&groups_type.clone().with_data_type(DataType::U8), context, location)?,
+            location,
+        )?)?;
+        let group_rank = shape.len();
+        shape.push(2);
+        let expanded_type =
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded = block.append_operation(stable_hlo::broadcast(
+            groups.result(0).unwrap().as_ref(),
+            expanded_tensor_type,
+            &(0..group_rank).collect::<Vec<_>>(),
+            location,
+        )?)?;
+        let offsets = block.append_operation(stable_hlo::iota(expanded_tensor_type, group_rank, location)?)?;
+        let shifted = block.append_operation(stable_hlo::shift_right_logical(
+            expanded.result(0).unwrap().as_ref(),
+            offsets.result(0).unwrap().as_ref(),
+            location,
+        )?)?;
+        let one = lower_unplaced_constant_output(&[expanded_type.clone()], 1, block, context, location)?[0];
+        let bits = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), one, location)?)?;
+        let bits = block.append_operation(stable_hlo::convert(
+            bits.result(0).unwrap().as_ref(),
+            lower_tensor_type(&expanded_type.with_data_type(DataType::Boolean), context, location)?,
+            location,
+        )?)?;
+        let result = block.append_operation(stable_hlo::reshape(
+            bits.result(0).unwrap().as_ref(),
+            &static_dimensions(&physical_output_type)?,
+            location,
+        )?)?;
+        result.result(0).unwrap().as_ref()
+    } else if input_one_bit {
+        // Pack neighboring predicates into two-bit groups with disjoint shifts; their sum is their bitwise union.
+        let mut shape = static_dimensions(&physical_input_type)?;
+        let width = shape.pop().unwrap();
+        if width > 2 {
+            shape.push(width / 2);
+        }
+        shape.push(2);
+        let reshaped = block.append_operation(stable_hlo::reshape(physical_input, &shape, location)?)?;
+        let expanded_type =
+            ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
+        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded = block.append_operation(stable_hlo::convert(
+            reshaped.result(0).unwrap().as_ref(),
+            expanded_tensor_type,
+            location,
+        )?)?;
+        let bit_axis = shape.len() - 1;
+        let offsets = block.append_operation(stable_hlo::iota(expanded_tensor_type, bit_axis, location)?)?;
+        let shifted = block.append_operation(stable_hlo::shift_left(
+            expanded.result(0).unwrap().as_ref(),
+            offsets.result(0).unwrap().as_ref(),
+            location,
+        )?)?;
+        shape.pop();
+        let groups_type = ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
+        let groups = lower_reduce_to_mlir(
+            ReductionKind::Sum,
+            &[bit_axis],
+            shifted.result(0).unwrap().as_ref(),
+            &groups_type,
+            block,
+            context,
+            location,
+        )?;
+        let groups = block.append_operation(stable_hlo::convert(
+            groups,
+            lower_tensor_type(&groups_type.with_data_type(DataType::U2), context, location)?,
+            location,
+        )?)?;
+        let result = block.append_operation(stable_hlo::bitcast_convert(
+            groups.result(0).unwrap().as_ref(),
+            output_tensor_type,
+            location,
+        )?)?;
+        result.result(0).unwrap().as_ref()
+    } else {
+        let result =
+            block.append_operation(stable_hlo::bitcast_convert(physical_input, output_tensor_type, location)?)?;
+        result.result(0).unwrap().as_ref()
+    };
+    let sources = (0..output_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
+    lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
 }
 
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
@@ -11515,7 +11728,7 @@ mod tests {
             .unwrap()[0];
         let device_index = builder
             .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::F64),
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F64, false),
                 Vec::new(),
                 vec![device_index],
                 None,

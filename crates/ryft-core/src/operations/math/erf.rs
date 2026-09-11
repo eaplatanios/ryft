@@ -5,7 +5,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::fill::Fill;
-use crate::operations::manipulation::conversion::ElementType;
+use crate::operations::manipulation::conversions::ElementType;
 use crate::operations::math::exp::Exp;
 use crate::programs::{Typed, Value};
 

@@ -20,7 +20,7 @@ use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::{
     DynamicReshapeOperation, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
 };

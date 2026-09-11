@@ -128,7 +128,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::manipulation::conversion::ConvertElementType;
+    use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::programs::{EmptyRegionDriver, MaybeZero};
 
     use super::*;

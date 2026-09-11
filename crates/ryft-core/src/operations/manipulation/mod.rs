@@ -1,6 +1,6 @@
 pub mod broadcasting;
 pub mod concatenation;
-pub mod conversion;
+pub mod conversions;
 pub mod gathering;
 pub mod memory;
 pub mod padding;
@@ -13,7 +13,7 @@ pub use broadcasting::{
     BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
-pub use conversion::{
+pub use conversions::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
 };
 pub use gathering::{GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};

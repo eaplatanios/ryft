@@ -303,8 +303,9 @@ mod tests {
             DataType::from_pjrt(BufferType::Invalid),
             Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
         ));
-        // `Zero` uses predicate as a private physical carrier, but predicate buffers are interpreted as ordinary
-        // Booleans when no retained Ryft signature supplies the logical type.
+
+        // Zero-space values have no PJRT type and use a predicate carrier. One-bit integer types retain their
+        // native PJRT representations independently of the carrier selected by an executable.
         assert_eq!(DataType::Zero.to_pjrt(), BufferType::Predicate);
         assert_eq!(DataType::from_pjrt(BufferType::Predicate), Ok(DataType::Boolean));
         for &(data_type, buffer_type) in &[

@@ -388,7 +388,10 @@ fn data_dependent_prefix_program() -> Result<
     let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])).into());
     let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into());
     let mask = builder.add_instruction(
-        ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64))),
+        ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(
+            DataType::I64,
+            false,
+        ))),
         Vec::new(),
         vec![mask],
         None,

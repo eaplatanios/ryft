@@ -17,7 +17,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{

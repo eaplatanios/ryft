@@ -6,7 +6,7 @@ use crate::differentiation::{
 };
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::manipulation::broadcasting::{BROADCAST_OPERATION_NAME, Broadcast};
-use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::partial::{PartialEvaluationContext, PartialTracer};
 use crate::programs::{Operation, ProgramError, Type, TypeError, Typed, Value, ValueProjection};

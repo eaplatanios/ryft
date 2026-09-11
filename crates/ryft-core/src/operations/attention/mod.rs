@@ -16,8 +16,7 @@ use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::constants::constant::DimensionConstant;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
@@ -26,7 +25,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::dot::{Dot, DotDimensionNumbers};
 use crate::operations::logical::and::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
-use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::Add;

@@ -22,7 +22,7 @@ use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::dot::{Dot, DotDimensionNumbers, dot_abstract, lift_dot_dimensions};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
-use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;

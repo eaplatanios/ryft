@@ -26,7 +26,7 @@ use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
-use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
@@ -522,7 +522,7 @@ where
                         let numeric_mask = context
                             .bind(
                                 <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    ConvertElementTypeOperation::new(operand_type.tangent()?.data_type()),
+                                    ConvertElementTypeOperation::new(operand_type.tangent()?.data_type(), false),
                                 ),
                                 Vec::new(),
                                 &[mask],
@@ -674,7 +674,7 @@ where
                                 let element_count = transpose_context
                                     .bind(
                                         <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                            ConvertElementTypeOperation::new(transpose_operand_type.data_type()),
+                                            ConvertElementTypeOperation::new(transpose_operand_type.data_type(), false),
                                         ),
                                         Vec::new(),
                                         &[element_count],

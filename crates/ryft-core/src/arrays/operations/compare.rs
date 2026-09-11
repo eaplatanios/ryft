@@ -150,15 +150,15 @@ mod tests {
             Ok(vec![false, true, true, false, false, false]),
         );
 
-        // Addressed input and output layouts remain physical contracts; comparison writes only the Boolean element
-        // ranges and leaves output holes zero.
+        // Addressed inputs retain their physical layout; changing to narrower Boolean elements clears byte strides.
         let strided_type =
             ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let left = Array::from_elements(strided_type.clone(), &[1u16, 3]).unwrap();
         let right = Array::from_elements(strided_type, &[2u16, 2]).unwrap();
         let compared = left.compare(&right, ComparisonDirection::LessThan).unwrap();
         assert_eq!(compared.elements::<bool>(), Ok(vec![true, false]));
-        assert_eq!(compared.storage_bytes(), [1, 0, 0, 0, 0]);
+        assert_eq!(compared.r#type().layout(), None);
+        assert_eq!(compared.storage_bytes(), [1, 0]);
 
         // Floating-point NaNs are unordered, while complex arrays expose only equality comparisons.
         let nan = Array::vector(vec![f8e5m2::NAN]);

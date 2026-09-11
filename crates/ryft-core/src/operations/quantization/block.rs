@@ -1,7 +1,7 @@
 use crate::arrays::{ArrayType, DataType, Dimension, Shape};
 use crate::operations::constants::fill::Fill;
 use crate::operations::manipulation::broadcasting::Broadcast;
-use crate::operations::manipulation::conversion::ConvertElementType;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::math::abs::Abs;
 use crate::operations::math::clamp::Clamp;

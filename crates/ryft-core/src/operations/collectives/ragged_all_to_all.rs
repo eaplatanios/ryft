@@ -36,7 +36,7 @@ use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::cumulative::cumulative_sum::{CumulativeSum, CumulativeSumOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
-use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
@@ -585,7 +585,7 @@ where
                                 let value = context
                                     .parent()
                                     .bind(
-                                        ConvertElementTypeOperation::new(DataType::U64),
+                                        ConvertElementTypeOperation::new(DataType::U64, false),
                                         Vec::new(),
                                         std::slice::from_ref(metadata.value()),
                                     )?

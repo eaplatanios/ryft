@@ -797,7 +797,7 @@ mod tests {
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::dimensions::dimension_from_scalar::{DimensionFromScalar, DimensionFromScalarOperation};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
-    use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+    use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::reduce::{Reduce, ReductionKind};
@@ -834,7 +834,7 @@ mod tests {
             .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let factor = builder
-            .add_instruction(ConvertElementTypeOperation::new(DataType::F64), Vec::new(), vec![index], None)
+            .add_instruction(ConvertElementTypeOperation::new(DataType::F64, false), Vec::new(), vec![index], None)
             .unwrap()[0];
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, factor], None).unwrap()[0];
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
