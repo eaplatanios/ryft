@@ -13,7 +13,7 @@ use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::elements::{
     ArrayElement, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn,
     f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2,
-    u4, validate_storage_bytes,
+    u4,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::ArrayOperation;
@@ -82,7 +82,7 @@ impl Array {
     /// or padding byte. Dynamically shaped types are rejected because they cannot describe materialized storage.
     #[inline]
     pub fn new(r#type: ArrayType, bytes: Vec<u8>) -> Result<Self, ProgramError> {
-        validate_storage_bytes(&r#type, &bytes)?;
+        ArrayAddressing::new(r#type.clone())?.validate_storage_bytes(&bytes)?;
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 

@@ -293,8 +293,6 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>, P: DifferentiationPo
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use half::{bf16, f16};
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -304,11 +302,6 @@ mod tests {
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Shape, StridedLayout, i4,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
-    use crate::compilation::{
-        CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction,
-        CompiledFunctionDispatcher, FlatCompilationProgram, LoweredFunction, LoweringRequest, StageRequest,
-        StagedFunction, try_jit,
-    };
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
@@ -320,114 +313,6 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
-
-    /// Minimal composite compilation domain used to prove the retained-JIT contract over dimension inputs: it
-    /// stages through the ordinary tracing path, "lowers" and "compiles" to the lifted flat program itself, counts
-    /// backend compilations, and executes calls by eager interpretation of the compiled program.
-    #[derive(Clone)]
-    struct RetainedJitDomain {
-        /// Number of backend compilations performed by this domain.
-        compilations: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    /// Compilation options of [`RetainedJitDomain`], which requires none.
-    #[derive(Clone, Debug, Default, PartialEq)]
-    struct RetainedJitOptions;
-
-    impl RetainedJitDomain {
-        /// Creates a domain with no backend compilations.
-        fn new() -> Self {
-            Self { compilations: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
-        }
-
-        /// Returns the number of backend compilations performed so far.
-        fn compilation_count(&self) -> usize {
-            self.compilations.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    impl Domain for RetainedJitDomain {
-        type Type = ArrayIrType;
-        type Value = ArrayIrValue<Array>;
-        type Constant = crate::captures::CaptureReference<ArrayIrType>;
-        type Operation = ArrayIrOperation<Array>;
-    }
-
-    impl CompilationDomain for RetainedJitDomain {
-        type DispatchKey = Arc<[ArrayIrType]>;
-        type LoweredProgram = FlatCompilationProgram<Self>;
-        type CompiledProgram = FlatCompilationProgram<Self>;
-        type Options = RetainedJitOptions;
-        type Error = ProgramError;
-
-        fn dispatch_signature(
-            &self,
-            input_types: Vec<ArrayIrType>,
-            _options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
-            let input_types: Arc<[ArrayIrType]> = input_types.into();
-            Ok((input_types.clone(), input_types))
-        }
-
-        fn stage<Request>(
-            &self,
-            request: Request,
-        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: StageRequest<Self>,
-        {
-            request.trace(|_, output_types| Ok(output_types))
-        }
-
-        fn lower<Request>(
-            &self,
-            staged: Request,
-        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: LoweringRequest<Self>,
-        {
-            let program = staged.lifted_program()?.as_ref().clone();
-            let output_types = staged.staged().output_types().to_vec();
-            Ok(staged.into_lowered(program, output_types))
-        }
-
-        fn compile<Request>(
-            &self,
-            lowered: Request,
-        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, ProgramError>
-        where
-            Request: CompileRequest<Self>,
-        {
-            self.compilations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let program = lowered.lowered().lowered_program().clone();
-            let output_types = lowered.lowered().output_types().to_vec();
-            Ok(lowered.into_compiled(std::sync::Arc::new(program), output_types))
-        }
-
-        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, ProgramError>
-        where
-            Request: CallRequest<Self>,
-        {
-            let executable = request.executable().clone();
-            let outputs = executable.compiled_program().interpret_with(
-                request.into_arguments(),
-                |_, capture| {
-                    Err(ProgramError::MalformedProgram(format!(
-                        "retained-JIT test program retained capture {}",
-                        capture.index(),
-                    )))
-                },
-                |instruction, inputs| {
-                    instruction.operation().interpret(
-                        &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                        &EmptyRegionDriver,
-                        inputs,
-                    )
-                },
-            )?;
-            Request::reconstruct(&executable, outputs)
-        }
-    }
 
     #[test]
     fn test_zero() {
@@ -476,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_type_inference_alpha_renamed_instantiation() {
+    fn test_zero_type_inference_dynamic_identity_instantiation() {
         let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
         let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -949,147 +834,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_zero_retained_jit_reuses_one_specialization() {
-        let domain = RetainedJitDomain::new();
-        let function: CompiledFunctionDispatcher<RetainedJitDomain, _, (), ArrayIrType, ArrayIrType> =
-            try_jit(&domain, |(), extent: CompilationTracer<RetainedJitDomain>| {
-                let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
-                    return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
-                };
-                Ok(extent
-                    .context()
-                    .bind(
-                        ZeroOperation::new(ArrayType::new(
-                            DataType::F32,
-                            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
-                        )),
-                        Vec::new(),
-                        std::slice::from_ref(&extent),
-                    )?
-                    .remove(0))
-            });
-
-        // Two calls with different runtime extents share one abstract input type, and therefore one retained trace,
-        // lowering, and compiled specialization, while still producing outputs with different logical shapes. This is
-        // the retained-JIT contract that would break if concrete extents ever became part of type or cache identity.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
-        assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))),
-        );
-        assert_eq!(
-            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]))),
-        );
-        assert_eq!(function.specialization_count(), 1);
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_misses, 1);
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.traces, 1);
-        assert_eq!(statistics.lowerings, 1);
-        assert_eq!(statistics.compilation_requests, 1);
-        assert_eq!(domain.compilation_count(), 1);
-    }
-
-    #[test]
-    fn test_zero_retained_jit_specializes_on_dimension_identity() {
-        let domain = RetainedJitDomain::new();
-        let function: CompiledFunctionDispatcher<RetainedJitDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
-            try_jit(&domain, |(), extents: Vec<CompilationTracer<RetainedJitDomain>>| {
-                let dimensions = extents
-                    .iter()
-                    .map(|extent| match extent.r#type().into_owned() {
-                        ArrayIrType::Dimension(extent_type) => Ok(Dimension::Dynamic(extent_type.variable().clone())),
-                        ArrayIrType::Array(_) => {
-                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
-                        }
-                        ArrayIrType::Reference(_) => {
-                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(extents[0]
-                    .context()
-                    .bind(
-                        ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(dimensions))),
-                        Vec::new(),
-                        extents.as_slice(),
-                    )?
-                    .remove(0))
-            });
-
-        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
-        let rows = DimensionType::new(DimensionVariable::new("rows", bounds));
-        let columns = DimensionType::new(DimensionVariable::new("columns", bounds));
-
-        // Only the declared dimension identities enter the dispatch key, so two calls that differ solely in their
-        // runtime extents share one specialization.
-        assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 3).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
-        );
-        assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 3).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 2).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
-        );
-        assert_eq!(function.statistics().dispatch_hits, 1);
-        assert_eq!(function.specialization_count(), 1);
-
-        // Dimension identity is nominal: each `DimensionVariable::new` creates an independent variable even when its
-        // name and bounds match another one. An alpha-equivalent instantiation therefore describes a *different*
-        // input type and gets its own specialization, exactly as independently built but structurally equal callees
-        // stay distinct at the region-interning level. Alpha-invariance in this system is invariance to the runtime
-        // extent above, not to the declared identity.
-        let alpha_rows = DimensionType::new(DimensionVariable::new("rows", bounds));
-        let alpha_columns = DimensionType::new(DimensionVariable::new("columns", bounds));
-        assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(alpha_rows, 2).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(alpha_columns, 3).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
-        );
-        assert_eq!(function.specialization_count(), 2);
-
-        // A permutation of the *same* two live identities also stays distinct, because the key is the ordered list of
-        // input types rather than the set of identities they mention.
-        assert_eq!(
-            function.call(
-                (),
-                vec![
-                    ArrayIrValue::Dimension(DimensionValue::new(columns, 3).unwrap()),
-                    ArrayIrValue::Dimension(DimensionValue::new(rows, 2).unwrap()),
-                ],
-            ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
-        );
-        assert_eq!(function.specialization_count(), 3);
-
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_hits, 1);
-        assert_eq!(statistics.dispatch_misses, 3);
-        assert_eq!(statistics.traces, 3);
-        assert_eq!(statistics.lowerings, 3);
-        assert_eq!(statistics.compilation_requests, 3);
-        assert_eq!(domain.compilation_count(), 3);
     }
 }

@@ -1709,11 +1709,17 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Shape,
+    };
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
+    use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::ZeroOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Operation, RegionInterface, Type, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, Type, TypeError};
 
     use super::*;
 
@@ -1938,6 +1944,114 @@ mod tests {
                 format!("{}:{:?}:{:?}", instruction.operation().name(), instruction.inputs(), instruction.outputs(),)
             }));
             Ok(key)
+        }
+    }
+
+    /// Minimal composite compilation domain used to prove the retained-JIT contract over dimension inputs: it
+    /// stages through the ordinary tracing path, "lowers" and "compiles" to the lifted flat program itself, counts
+    /// backend compilations, and executes calls by eager interpretation of the compiled program.
+    #[derive(Clone)]
+    struct TestArrayIrDomain {
+        /// Number of backend compilations performed by this domain.
+        compilations: Arc<AtomicUsize>,
+    }
+
+    /// Compilation options of [`TestArrayIrDomain`], which requires none.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct TestArrayIrOptions;
+
+    impl TestArrayIrDomain {
+        /// Creates a domain with no backend compilations.
+        fn new() -> Self {
+            Self { compilations: Arc::new(AtomicUsize::new(0)) }
+        }
+
+        /// Returns the number of backend compilations performed so far.
+        fn compilation_count(&self) -> usize {
+            self.compilations.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Domain for TestArrayIrDomain {
+        type Type = ArrayIrType;
+        type Value = ArrayIrValue<Array>;
+        type Constant = CaptureReference<ArrayIrType>;
+        type Operation = ArrayIrOperation<Array>;
+    }
+
+    impl CompilationDomain for TestArrayIrDomain {
+        type DispatchKey = Arc<[ArrayIrType]>;
+        type LoweredProgram = FlatCompilationProgram<Self>;
+        type CompiledProgram = FlatCompilationProgram<Self>;
+        type Options = TestArrayIrOptions;
+        type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayIrType>,
+            _options: &Self::Options,
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+            let input_types: Arc<[ArrayIrType]> = input_types.into();
+            Ok((input_types.clone(), input_types))
+        }
+
+        fn stage<Request>(
+            &self,
+            request: Request,
+        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: StageRequest<Self>,
+        {
+            request.trace(|_, output_types| Ok(output_types))
+        }
+
+        fn lower<Request>(
+            &self,
+            staged: Request,
+        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: LoweringRequest<Self>,
+        {
+            let program = staged.lifted_program()?.as_ref().clone();
+            let output_types = staged.staged().output_types().to_vec();
+            Ok(staged.into_lowered(program, output_types))
+        }
+
+        fn compile<Request>(
+            &self,
+            lowered: Request,
+        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, ProgramError>
+        where
+            Request: CompileRequest<Self>,
+        {
+            self.compilations.fetch_add(1, Ordering::Relaxed);
+            let program = lowered.lowered().lowered_program().clone();
+            let output_types = lowered.lowered().output_types().to_vec();
+            Ok(lowered.into_compiled(Arc::new(program), output_types))
+        }
+
+        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, ProgramError>
+        where
+            Request: CallRequest<Self>,
+        {
+            let executable = request.executable().clone();
+            let outputs = executable.compiled_program().interpret_with(
+                request.into_arguments(),
+                |_, capture| {
+                    Err(ProgramError::MalformedProgram(format!(
+                        "retained-JIT test program retained capture {}",
+                        capture.index(),
+                    )))
+                },
+                |instruction, inputs| {
+                    instruction.operation().interpret(
+                        &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                        &EmptyRegionDriver,
+                        inputs,
+                    )
+                },
+            )?;
+            Request::reconstruct(&executable, outputs)
         }
     }
 
@@ -2246,6 +2360,145 @@ mod tests {
         assert_eq!(statistics.lowerings, 2);
         assert_eq!(statistics.compilation_requests, 2);
         assert_eq!(domain.compilation_count(), 2);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_reuses_specialization_across_runtime_extents() {
+        let domain = TestArrayIrDomain::new();
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), ArrayIrType, ArrayIrType> =
+            try_jit(&domain, |(), extent: CompilationTracer<TestArrayIrDomain>| {
+                let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
+                    return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
+                };
+                Ok(extent
+                    .context()
+                    .bind(
+                        ZeroOperation::new(ArrayType::new(
+                            DataType::F32,
+                            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                        )),
+                        Vec::new(),
+                        std::slice::from_ref(&extent),
+                    )?
+                    .remove(0))
+            });
+
+        // Two calls with different runtime extents share one abstract input type, and therefore one retained trace,
+        // lowering, and compiled specialization, while still producing outputs with different logical shapes. This is
+        // the retained-JIT contract that would break if concrete extents ever became part of type or cache identity.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        assert_eq!(
+            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))),
+        );
+        assert_eq!(
+            function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]))),
+        );
+        assert_eq!(function.specialization_count(), 1);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.traces, 1);
+        assert_eq!(statistics.lowerings, 1);
+        assert_eq!(statistics.compilation_requests, 1);
+        assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_specializes_on_dimension_identity() {
+        let domain = TestArrayIrDomain::new();
+        let function: CompiledFunctionDispatcher<TestArrayIrDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, |(), extents: Vec<CompilationTracer<TestArrayIrDomain>>| {
+                let dimensions = extents
+                    .iter()
+                    .map(|extent| match extent.r#type().into_owned() {
+                        ArrayIrType::Dimension(extent_type) => Ok(Dimension::Dynamic(extent_type.variable().clone())),
+                        ArrayIrType::Array(_) => {
+                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
+                        }
+                        ArrayIrType::Reference(_) => {
+                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(extents[0]
+                    .context()
+                    .bind(
+                        ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(dimensions))),
+                        Vec::new(),
+                        extents.as_slice(),
+                    )?
+                    .remove(0))
+            });
+
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let rows = DimensionType::new(DimensionVariable::new("rows", bounds));
+        let columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+
+        // Only the declared dimension identities enter the dispatch key, so two calls that differ solely in their
+        // runtime extents share one specialization.
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 2).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 3).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 2).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.statistics().dispatch_hits, 1);
+        assert_eq!(function.specialization_count(), 1);
+
+        // New dimension variables have distinct identities even when their names and bounds match. They therefore
+        // change the input types and require a separate compiled specialization.
+        let independent_rows = DimensionType::new(DimensionVariable::new("rows", bounds));
+        let independent_columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(independent_rows, 2).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(independent_columns, 3).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.specialization_count(), 2);
+
+        // A permutation of the *same* two live identities also stays distinct, because the key is the ordered list of
+        // input types rather than the set of identities they mention.
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(columns, 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(rows, 2).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.specialization_count(), 3);
+
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 3);
+        assert_eq!(statistics.traces, 3);
+        assert_eq!(statistics.lowerings, 3);
+        assert_eq!(statistics.compilation_requests, 3);
+        assert_eq!(domain.compilation_count(), 3);
     }
 
     #[test]

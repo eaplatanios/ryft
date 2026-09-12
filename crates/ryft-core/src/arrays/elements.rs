@@ -2646,19 +2646,6 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
     Ok(logical_bytes)
 }
 
-/// Validates that `bytes` is a complete physical storage buffer for `r#type`. Refer to the documentation of
-/// [`ArrayAddressing::validate_storage_bytes`] for more information.
-///
-/// # Parameters
-///
-///   - `r#type`: Static [`ArrayType`] that determines the element [`DataType`], [`Shape`](crate::arrays::Shape),
-///     and [`Layout`](crate::arrays::Layout).
-///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
-#[inline]
-pub fn validate_storage_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<(), ProgramError> {
-    ArrayAddressing::new(r#type.clone())?.validate_storage_bytes(bytes)
-}
-
 /// Validates one element's data-type-specific bit representation. Sub-byte integer encodings are two's complement in
 /// the low bits of one storage byte, matching the [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`] element types in
 /// this module, so all of their higher bits must be zero.
@@ -3978,7 +3965,7 @@ mod tests {
         let elements = [-8, -1, 0, 7].map(|value| i4::new(value).unwrap());
         let bytes = encode_elements(&r#type, &elements).unwrap();
         assert_eq!(bytes, [0x08, 0x0f, 0x00, 0x07]);
-        assert_eq!(validate_storage_bytes(&r#type, &bytes), Ok(()));
+        assert_eq!(ArrayAddressing::new(r#type.clone()).unwrap().validate_storage_bytes(&bytes), Ok(()));
         let decoded = decode_elements::<i4>(&r#type, &bytes).unwrap();
         assert_eq!(decoded, elements.to_vec());
         assert_eq!(decoded.into_iter().map(i4::value).collect::<Vec<_>>(), [-8, -1, 0, 7]);
@@ -4005,7 +3992,7 @@ mod tests {
         let elements = [-448.0, -0.5, 0.0, 448.0].map(|value| f8e4m3fn::from_f64(value).unwrap());
         let bytes = encode_elements(&r#type, &elements).unwrap();
         assert_eq!(bytes, [0xfe, 0xb0, 0x00, 0x7e]);
-        assert_eq!(validate_storage_bytes(&r#type, &bytes), Ok(()));
+        assert_eq!(ArrayAddressing::new(r#type.clone()).unwrap().validate_storage_bytes(&bytes), Ok(()));
         let decoded = decode_elements::<f8e4m3fn>(&r#type, &bytes).unwrap();
         assert_eq!(decoded, elements.to_vec());
         assert_eq!(decoded.into_iter().map(f8e4m3fn::to_f64).collect::<Vec<_>>(), [-448.0, -0.5, 0.0, 448.0]);
@@ -4015,7 +4002,7 @@ mod tests {
         let narrow_elements = [-6.0, 1.5].map(|value| f4e2m1fn::from_f64(value).unwrap());
         let narrow_bytes = encode_elements(&narrow, &narrow_elements).unwrap();
         assert_eq!(narrow_bytes, [0x0f, 0x03]);
-        assert_eq!(validate_storage_bytes(&narrow, &narrow_bytes), Ok(()));
+        assert_eq!(ArrayAddressing::new(narrow.clone()).unwrap().validate_storage_bytes(&narrow_bytes), Ok(()));
         assert_eq!(decode_elements::<f4e2m1fn>(&narrow, &narrow_bytes), Ok(narrow_elements.to_vec()));
     }
 
@@ -4089,18 +4076,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_storage_bytes() {
+    fn test_encode_logical_bytes_and_elements_validate_encodings() {
+        // The encoders validate every element encoding against its data type and reject inputs whose element type or
+        // count disagrees with the array type; payload-free element types encode to no bytes at all.
         let booleans = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(encode_logical_bytes(&booleans, &[0, 1]), Ok(vec![0, 1]));
         assert!(matches!(
             encode_logical_bytes(&booleans, &[0, 2]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "array element 1 has invalid bool byte encoding [2]",
-        ));
-        assert!(matches!(
-            validate_storage_bytes(&booleans, &[0]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array type bool[2] requires 2 physical storage bytes but got 1",
         ));
 
         let narrow = ArrayType::scalar(DataType::I2);
@@ -4129,22 +4113,7 @@ mod tests {
                 if message == "array type bool[2] requires 2 logical elements but got 1",
         ));
 
-        let padded = ArrayType::new(DataType::U8, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
-            .with_layout(Layout::Tiled(TiledLayout::new(
-                vec![1, 0],
-                vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
-            )));
-        let mut bytes = encode_elements(&padded, &[1u8, 2, 3, 4, 5, 6]).unwrap();
-        bytes[5] = 255;
-        bytes[7] = 254;
-        assert!(matches!(
-            validate_storage_bytes(&padded, &bytes),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "array layout holes and tile padding must contain zero bytes",
-        ));
-
         let payload_free = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(usize::MAX)]));
         assert_eq!(encode_logical_bytes(&payload_free, &[]), Ok(Vec::new()));
-        assert_eq!(validate_storage_bytes(&payload_free, &[]), Ok(()));
     }
 }

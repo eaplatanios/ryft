@@ -38,7 +38,7 @@ pub use arrays::{
     TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,
     f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
     f16, i1, i2, i4, materialize_array_tangent, reapply_array_reference_view, u1, u2, u4,
-    validate_array_reference_view, validate_storage_bytes,
+    validate_array_reference_view,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
