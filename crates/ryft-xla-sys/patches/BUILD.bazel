@@ -1,1 +1,4 @@
-exports_files(["jax-mosaic-c-api-visibility.patch"])
+exports_files([
+    "jax-mosaic-c-api-visibility.patch",
+    "xla-fp6-nan-predicate.patch",
+])

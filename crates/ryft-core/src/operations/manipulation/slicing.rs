@@ -4380,6 +4380,34 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_slice_batching_nested() {
+        // Both maps supply independent starts while sharing one input and a fixed two-element window.
+        let output = batch(
+            |(input, starts)| {
+                Ok(batch(
+                    |(input, start)| input.dynamic_slice(&[start], &[2]),
+                    (input, starts),
+                    (BatchAxis::replicated(), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            },
+            (Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::matrix(2, 2, vec![0_i32, 1, 2, 3]).unwrap()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(
+            output,
+            Ok(Array::from_elements(
+                ArrayType::new_static(DataType::F32, [2, 2, 2]),
+                &[1.0_f32, 2.0, 2.0, 3.0, 3.0, 4.0, 3.0, 4.0],
+            )
+            .unwrap()),
+        );
+    }
+
+    #[test]
     fn test_dynamic_slice_batching_under_tracing() {
         // vmap-under-tracing composition: each batch item extracts a window of the differentiated vector at its own
         // start index, so the batching rule must stage the per-item expansion (instead of rejecting the batch-varying
@@ -5045,6 +5073,27 @@ mod tests {
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
+
+        // A shared input contributes once per mapped update outside that item's clamped overwrite window.
+        let (_, (input_gradient, update_gradient)) = differentiate_at((
+            Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(),
+            Array::matrix(2, 2, vec![7.0_f32, 8.0, 9.0, 10.0]).unwrap(),
+        ))
+        .value_and_gradient(|(input, updates)| {
+            let starts = input.context().constant(Array::vector(vec![1_i32, 3]).unwrap()).unwrap();
+            batch(
+                |(input, updates, start)| input.dynamic_update_slice(&updates, &[start]),
+                (input, updates, starts),
+                (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap()
+            .reduce(&[0, 1], ReductionKind::Sum)
+        })
+        .unwrap();
+        assert_eq!(input_gradient, Array::vector(vec![2.0_f32, 1.0, 0.0, 1.0]).unwrap());
+        assert_eq!(update_gradient, Array::matrix(2, 2, vec![1.0_f32; 4]).unwrap());
     }
 
     #[test]

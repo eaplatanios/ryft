@@ -16,6 +16,8 @@ JAX_SHA256 = "041ce581933c9ed263f730e19f784246d659ae800991ebb59ccc1baa39b95acd"
 
 http_archive(
     name = "xla",
+    patch_args = ["-p1"],
+    patches = ["//patches:xla-fp6-nan-predicate.patch"],
     sha256 = XLA_SHA256,
     strip_prefix = "xla-{commit}".format(commit = XLA_COMMIT),
     urls = [

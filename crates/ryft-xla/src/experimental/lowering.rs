@@ -1333,8 +1333,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
     let float_type = r#type.clone().with_data_type(DataType::F32);
     let float_tensor_type = lower_tensor_type(&float_type, context, location)?;
-    // TODO: The pinned XLA decoder emits an invalid i6-to-i8 NaN-predicate bitcast for FP6 inputs. Enable
-    // backend FP6 decoding/bitcast tests once this is fixed upstream; conversions into FP6 are unaffected.
+    // The native dependency patches the finite-only FP6 NaN predicate, making this exact widening conversion valid.
     let float = block.append_operation(stable_hlo::convert(input, float_tensor_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
     let bits = block.append_operation(stable_hlo::bitcast_convert(float, integer_tensor_type, location)?)?;

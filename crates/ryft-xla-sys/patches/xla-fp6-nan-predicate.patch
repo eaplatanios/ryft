@@ -1,0 +1,46 @@
+diff --git a/xla/codegen/emitters/transforms/expand_float_ops.cc b/xla/codegen/emitters/transforms/expand_float_ops.cc
+--- a/xla/codegen/emitters/transforms/expand_float_ops.cc
++++ b/xla/codegen/emitters/transforms/expand_float_ops.cc
+@@ -168,7 +168,8 @@ Value IsNaN(Value value, mlir::ImplicitLocOpBuilder& b) {
+   if (mlir::LLVM::isCompatibleOuterType(ty)) {
+     return ma::CmpFOp::create(b, ma::CmpFPredicate::UNO, value, value);
+   }
+-  if (llvm::isa<mlir::Float4E2M1FNType>(ty)) {
++  if (llvm::isa<mlir::Float4E2M1FNType, mlir::Float6E2M3FNType,
++                mlir::Float6E3M2FNType>(ty)) {
+     return ma::ConstantIntOp::create(b, b.getI1Type(), false);
+   }
+ 
+diff --git a/xla/codegen/emitters/transforms/tests/expand_float_ops.mlir b/xla/codegen/emitters/transforms/tests/expand_float_ops.mlir
+--- a/xla/codegen/emitters/transforms/tests/expand_float_ops.mlir
++++ b/xla/codegen/emitters/transforms/tests/expand_float_ops.mlir
+@@ -219,3 +219,29 @@ module {
+ // CHECK-LABEL: @minimumf_f8
+ // CHECK-NOT: arith.minimumf {{.*}}f8E4M3FN
+ // CHECK: arith.minimumf {{.*}} : f32
++
++// -----
++
++// FP6 has no NaN encodings. Its special-value predicate must not introduce an
++// invalid bitcast from a six-bit input into an eight-bit integer.
++func.func @f6e2m3fn_to_f32(%arg0: f6E2M3FN) -> f32 {
++  %ret = arith.extf %arg0 : f6E2M3FN to f32
++  return %ret : f32
++}
++
++// CHECK-LABEL: @f6e2m3fn_to_f32
++// CHECK-NOT: arith.extf
++// CHECK-NOT: arith.bitcast {{.*}} : f6E2M3FN to i8
++// CHECK: return {{.*}} : f32
++
++// -----
++
++func.func @f6e3m2fn_to_f32(%arg0: f6E3M2FN) -> f32 {
++  %ret = arith.extf %arg0 : f6E3M2FN to f32
++  return %ret : f32
++}
++
++// CHECK-LABEL: @f6e3m2fn_to_f32
++// CHECK-NOT: arith.extf
++// CHECK-NOT: arith.bitcast {{.*}} : f6E3M2FN to i8
++// CHECK: return {{.*}} : f32

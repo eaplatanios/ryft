@@ -297,14 +297,14 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin, CumulativeProduct, CumulativeSum,
-        DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor,
-        ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, Log, Log1p,
-        LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow,
-        ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
-        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
-        Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch,
-        differentiate_at, f4e2m1fn, f8e4m3fn,
+        ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
+        CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
+        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers,
+        GatherOperation, GatherScatterMode, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis,
+        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
+        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
+        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -738,6 +738,47 @@ mod tests {
     }
 
     #[test]
+    fn test_array_convert_element_type_fp6_decoding() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let encodings = (0_u8..64).collect::<Vec<_>>();
+        // Every FP6 encoding is finite. Exact F32 bytes distinguish both zeros and cover the subnormal/normal boundary
+        // and the largest exponent, which must not be mistaken for an infinity or NaN exponent.
+        for (data_type, magnitudes) in [
+            (
+                DataType::F6E2M3FN,
+                [
+                    0.0_f32, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75,
+                    1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
+                ],
+            ),
+            (
+                DataType::F6E3M2FN,
+                [
+                    0.0_f32, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25,
+                    1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 28.0,
+                ],
+            ),
+        ] {
+            let input_type = replicated_type(&mesh, data_type, &[64]);
+            let input = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &encodings).unwrap();
+            let output = input.convert_element_type(DataType::F32).unwrap();
+            let expected = magnitudes.into_iter().chain(magnitudes.map(|value| -value)).collect::<Vec<_>>();
+            assert_eq!(output.shape().dimensions(), &[64]);
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false)
+                    .infer_output_types(&[input_type], &[]),
+                Ok(vec![output.r#type().into_owned()]),
+            );
+            assert_eq!(
+                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                values_to_bytes(&expected),
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
     fn test_array_convert_element_type_f64_rounding() {
         let client = execution_client();
         let mesh = cpu_mesh(&client);
@@ -925,6 +966,65 @@ mod tests {
         assert_eq!(shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(), vec![1, 1]);
         let restored = bits.bitcast_element_type(DataType::U2).unwrap();
         assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type_fp6() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let encodings = (0_u8..64).collect::<Vec<_>>();
+        for (data_type, other_data_type) in
+            [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]
+        {
+            let input_type = replicated_type(&mesh, data_type, &[64]);
+            let input = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &encodings).unwrap();
+            // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
+            let output = input.bitcast_element_type(other_data_type).unwrap();
+            assert_eq!(output.shape().dimensions(), &[64]);
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(other_data_type, true)
+                    .infer_output_types(&[input_type.clone()], &[]),
+                Ok(vec![output.r#type().into_owned()]),
+            );
+            assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), encodings);
+
+            // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
+            // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
+            for (pieces_type, bit_width) in [(DataType::U1, 1), (DataType::U2, 2)] {
+                let pieces = input.bitcast_element_type(pieces_type).unwrap();
+                let piece_count = 6 / bit_width;
+                let expected = encodings
+                    .iter()
+                    .flat_map(|&encoding| {
+                        (0..piece_count).map(move |piece| (encoding >> (piece * bit_width)) & ((1 << bit_width) - 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(pieces.shape().dimensions(), &[64, piece_count]);
+                assert_eq!(
+                    ConvertElementTypeOperation::<ArrayType>::new(pieces_type, true)
+                        .infer_output_types(&[input_type.clone()], &[]),
+                    Ok(vec![pieces.r#type().into_owned()]),
+                );
+                assert_eq!(
+                    shard_host_bytes(pieces.addressable_shards().next().unwrap()).unwrap(),
+                    expected,
+                    "{data_type} to {pieces_type}",
+                );
+                let restored = pieces.bitcast_element_type(data_type).unwrap();
+                assert_eq!(restored.shape().dimensions(), &[64]);
+                assert_eq!(restored.r#type().as_ref(), &input_type);
+                assert_eq!(
+                    ConvertElementTypeOperation::<ArrayType>::new(data_type, true)
+                        .infer_output_types(&[pieces.r#type().into_owned()], &[]),
+                    Ok(vec![input_type.clone()]),
+                );
+                assert_eq!(
+                    shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(),
+                    encodings,
+                    "{data_type} from {pieces_type}",
+                );
+            }
+        }
     }
 
     #[test]
