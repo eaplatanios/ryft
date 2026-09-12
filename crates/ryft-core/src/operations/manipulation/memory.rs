@@ -15,23 +15,21 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-// TODO(eaplatanios): Review this.
-
 /// Canonical operation name for [`TransferToMemoryOperation`].
 pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &str = "transfer_to_memory";
 
 /// [`Operation`] that moves its input into a destination [`Memory`].
 ///
-/// Placement is metadata about _where_ a value lives, never about its contents, so this operation is shape- and
-/// value-preserving: type inference returns the input type with its [`Memory`] replaced by the destination, and
-/// interpretation for reference arrays keeps the payload unchanged while updating the value's carried type to the
+/// Memory placement is metadata about _where_ a value lives, never about its contents, so this operation is shape-
+/// and value-preserving. Type inference returns the input type with its [`Memory`] replaced by the destination.
+/// Interpretation for reference arrays keeps the payload unchanged while updating the value's carried type to the
 /// destination so that interpreted values agree with the declared output types. Backends with a memory hierarchy lower
-/// the staged operation into their native placement annotations (for example, XLA's device placement annotations
-/// consumed by its host-offloading pipeline).
+/// the staged operation into their native placement annotations (e.g., XLA's device placement annotations consumed by
+/// its host-offloading pipeline).
 ///
-/// Differentiation moves derivatives along with the value: the JVP transfers the primal and the tangent to the
-/// destination, and the staged linear transfer transposes into a transfer that moves the cotangent back to the
-/// input's source memory (read off the input type during transposition).
+/// Differentiation moves derivatives along with the value (i.e., the JVP transfers the primal and the tangent to the
+/// destination, and the staged linear transfer transposes into a transfer that moves the cotangent back to the input's
+/// source memory, which is read off the input type during transposition).
 #[derive(Copy, Clone, Debug)]
 pub struct TransferToMemoryOperation {
     /// Destination [`Memory`] that the input is moved into.
@@ -52,6 +50,7 @@ impl TransferToMemoryOperation {
 }
 
 impl Display for TransferToMemoryOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -76,6 +75,7 @@ impl Operation for TransferToMemoryOperation {
         Ok(vec![input_types[0].clone().with_memory(self.destination)])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("destination", self.destination))
@@ -83,8 +83,8 @@ impl Operation for TransferToMemoryOperation {
 }
 
 impl<C: Domain<Type = ArrayType, Value: TransferToMemory>> InterpretableOperation<C> for TransferToMemoryOperation {
-    // Interprets the transfer by delegating to the value-level [`TransferToMemory`] capability. Eager values keep
-    // their payload unchanged but must re-place their carried type in the destination [`Memory`], so that the
+    // Interprets the transfer by delegating to the value-level `TransferToMemory` capability. Eager values keep
+    // their payload unchanged but must re-place their carried type in the destination `Memory`, so that the
     // interpreted value's type stays faithful to the instruction's declared output type.
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -98,18 +98,12 @@ impl<C: Domain<Type = ArrayType, Value: TransferToMemory>> InterpretableOperatio
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of
-// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for TransferToMemoryOperation where
     C::Operation: From<TransferToMemoryOperation>
 {
 }
 
-// Batching rule for [`TransferToMemoryOperation`]: memory placement is metadata that applies identically to every
-// batch item, so the rule moves the packed value through the value-level [`TransferToMemory`] capability and
-// preserves the input's batch axis. On traced values this stages the transfer on the batched physical value; on
-// concrete values it keeps the payload unchanged while re-placing the carried type in the destination, exactly like
-// interpretation.
 impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayExtentBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatchingPolicy<P>> for TransferToMemoryOperation
 {
@@ -119,6 +113,11 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayExtentBatchi
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // The batching rule for `TransferToMemoryOperation` treats memory placement as metadata that applies
+        // identically to every batch item, and so it moves the packed value through the value-level `TransferToMemory`
+        // capability and preserves the input's batch axis. On traced values this stages the transfer on the batched
+        // physical value. On concrete values it keeps the payload unchanged while re-placing the carried type in the
+        // destination, exactly like interpretation.
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination)?;
         let ragged_axes = inputs[0]
@@ -146,8 +145,8 @@ impl_differentiable_operation! {
         C::Value: TransferToMemory,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode rule for [`TransferToMemoryOperation`]: a memory transfer is structural-linear, so the
-            // tangent is transferred to the same destination as the primal, retaining symbolic zeros without allocation.
+            // A memory transfer is structural-linear and so the tangent is transferred to the same destination
+            // as the primal, retaining symbolic zeros without allocation.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transfer_to_memory(operation.destination())?;
             let tangent = match inputs[0].tangent() {
@@ -163,9 +162,9 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
-            // memories, so its transpose moves the output cotangent back to the input's source memory by staging a
-            // transfer to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
+            // A memory transfer is the identity linear map between two memories, so its transpose moves the output
+            // cotangent back to the input's source memory by staging a transfer to `input_types[0]`'s memory.
+            // Symbolic-zero cotangents propagate unchanged.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -178,23 +177,20 @@ impl_differentiable_operation! {
                         std::slice::from_ref(cotangent),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
-                    {
-                        let contribution = MaybeZero::Value(outputs.into_iter().next().unwrap());
-                        accumulators[0].accumulate(context, contribution)?;
-                        Ok(())
-                    }
+                    let contribution = MaybeZero::Value(outputs.into_iter().next().unwrap());
+                    accumulators[0].accumulate(context, contribution)?;
+                    Ok(())
                 }
             }
         }
     },
 }
 
-/// Transfers a value to a destination [`Memory`] without changing its elements, shape, layout, or sharding.
-///
-/// Reference [`Array`] values retain their shared host storage and update the memory recorded in their type. Traced
-/// values stage a [`TransferToMemoryOperation`]; execution on a backend performs the transfer if the destination is
-/// supported. Transfer and staging failures are returned to the caller. Native scalar values have no memory-placement
-/// metadata and are returned unchanged.
+/// Transfers a value to a destination [`Memory`] without changing its value or any other of its metadata (e.g., the
+/// shape, layout, or sharding or [`Array`]s). Reference [`Array`] values retain their shared host storage and update
+/// the memory recorded in their type. Traced values stage a [`TransferToMemoryOperation`] and execution on a backend
+/// performs the transfer if the destination is supported. Transfer and staging failures are returned to the caller.
+/// Native scalar values have no memory placement metadata and are returned unchanged.
 ///
 /// # Examples
 ///
@@ -209,23 +205,22 @@ impl_differentiable_operation! {
 /// # }
 /// ```
 pub trait TransferToMemory: Sized {
-    /// Returns this value placed in `destination`, preserving its contents and all other type metadata.
+    /// Returns this value placed in `destination`, preserving its contents and all other type metadata. Note that
+    /// reference [`Array`]s model the placement in their type without physically moving storage.
     ///
     /// # Parameters
     ///
-    ///   - `destination`: Memory space for the resulting value. Backend execution may fail if the requested memory
-    ///     space is unavailable. Reference arrays model the placement in their type without physically moving storage.
+    ///   - `destination`: [`Memory`] space for the resulting value. Backend execution may fail if the requested memory
+    ///     space is unavailable.
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError>;
 }
 
-// Context-carrying values bind through their owning context. The operation conversion bound keeps this disjoint
-// from reference arrays, whose dispatch domain does not provide a memory-transfer operation.
-impl<V: Value<Type = ArrayType>> TransferToMemory for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<TransferToMemoryOperation>,
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransferToMemoryOperation>>>>
+    TransferToMemory for V
 {
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
+        // Context-carrying values bind through their owning context. The operation conversion bound keeps this disjoint
+        // from reference arrays, whose dispatch domain does not provide a memory transfer operation.
         let outputs = self.dispatch_domain().bind(
             TransferToMemoryOperation::new(destination),
             Vec::new(),
@@ -236,9 +231,9 @@ where
     }
 }
 
+// TODO(eaplatanios): Make this take a single type and convert its one invocation below to one per type.
 /// Implements placement as an identity for scalar types that have no memory metadata.
 macro_rules! impl_transfer_to_memory_identity {
-    // Each listed scalar has no associated allocation to move.
     ($($element:ty),* $(,)?) => {
         $(impl TransferToMemory for $element {
             #[inline]
@@ -287,7 +282,7 @@ impl_transfer_to_memory_identity!(
 impl TransferToMemory for Array {
     #[inline]
     fn transfer_to_memory(&self, destination: Memory) -> Result<Self, ProgramError> {
-        // Reference storage stays host-resident. Updating only placement metadata retains exact physical bytes,
+        // Reference array storage stays host-resident. Updating only placement metadata retains exact physical bytes,
         // layout and sharding while making interpreted output types agree with staged output types.
         Ok(Self::new_unchecked(self.r#type().into_owned().with_memory(destination), self.shared_storage().clone()))
     }
@@ -349,9 +344,9 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_interpretation() {
-        let operation = TransferToMemoryOperation::new(PINNED_HOST);
         // Reference arrays have no memory hierarchy, so interpretation keeps the payload unchanged while updating
         // the value's carried type in the destination so that it matches the declared output type.
+        let operation = TransferToMemoryOperation::new(PINNED_HOST);
         let input = Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[1.0f64, 2.0]).unwrap();
         let outputs = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
@@ -359,7 +354,6 @@ mod tests {
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST).unwrap()]);
         assert_eq!(*outputs[0].r#type(), ArrayType::new_static(DataType::F64, [2]).with_memory(PINNED_HOST));
         assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
-
         assert_eq!(
             operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -566,7 +560,7 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_batching() {
         // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
-        // destination — exactly like interpretation — and preserves the batch axis.
+        // destination (i.e., exactly like interpretation) and preserves the batch axis.
         let input = {
             let value = Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0f64; 6]).unwrap();
             ArrayBatch::new(value, Some(0))
@@ -670,7 +664,7 @@ mod tests {
             Ok(vec![Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[5.0f64, 7.0]).unwrap()]),
         );
         assert_eq!(output.elements::<f64>().unwrap(), vec![2.0, 3.0]);
-        // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
+        // The linear transfer carries no residual, so the direct transpose pullback consumes only the pinned-host
         // cotangent and transfers it back to the input's source memory.
         assert!(residuals.is_empty(), "transfer_to_memory has no residual");
         let input_types: Vec<_> = pullback.inputs().map(|atom| atom.r#type().into_owned()).collect();
