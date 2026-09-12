@@ -1,5 +1,7 @@
 //! Context-aware kernel launching, bounded module retention, and explicit resource cleanup.
 
+// TODO(eaplatanios): Review this.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,11 +42,11 @@ impl CudaKernelCacheLimits {
         max_artifact_bytes_per_context_device: usize,
     ) -> Result<Self, Error> {
         if max_entries_per_context_device == 0 {
-            return Err(Error::invalid_argument("cuda kernel cache entries per context/device must be positive"));
+            return Err(Error::invalid_argument("CUDA kernel cache entries per context/device must be positive"));
         }
         if max_artifact_bytes_per_context_device == 0 {
             return Err(Error::invalid_argument(
-                "cuda kernel cache artifact bytes per context/device must be positive",
+                "CUDA kernel cache artifact bytes per context/device must be positive",
             ));
         }
         Ok(Self { max_entries_per_context_device, max_artifact_bytes_per_context_device })
@@ -230,7 +232,7 @@ impl CudaKernelLauncher {
     /// This unsafe boundary supports integration with externally owned CUDA contexts, streams, and device allocations.
     pub unsafe fn launch(&self, artifact: &CudaKernelArtifact, launch: &CudaKernelLaunch<'_>) -> Result<(), Error> {
         if self.is_shutdown.load(Ordering::Acquire) {
-            return Err(Error::unavailable("cuda kernel launcher has been shut down"));
+            return Err(Error::unavailable("CUDA kernel launcher has been shut down"));
         }
         validate_launch(artifact, launch)?;
         let mut storage = launch.arguments().iter().map(CudaKernelArgumentStorage::from_argument).collect::<Vec<_>>();
@@ -390,7 +392,7 @@ impl CudaKernelLauncher {
     ) -> Result<(), Error> {
         if artifact_bytes > kernels.limits.max_artifact_bytes_per_context_device {
             return Err(Error::unavailable(format!(
-                "cuda kernel artifact contains {artifact_bytes} bytes, exceeding the per-context/device cache budget \
+                "CUDA kernel artifact contains {artifact_bytes} bytes, exceeding the per-context/device cache budget \
                  of {} bytes",
                 kernels.limits.max_artifact_bytes_per_context_device,
             )));
@@ -411,7 +413,7 @@ impl CudaKernelLauncher {
                 .map(|(key, _)| *key)
                 .ok_or_else(|| {
                     Error::unavailable(
-                        "cuda kernel cache partition is full and all cached modules in that context/device are in use",
+                        "CUDA kernel cache partition is full and all cached modules in that context/device are in use",
                     )
                 })?;
             let entry = kernels.entries.remove(&key).unwrap();
@@ -631,10 +633,10 @@ mod tests {
     impl CudaDriverApi for TestCudaDriver {
         fn context_for_stream(&self, stream: *mut c_void) -> Result<CudaContext, Error> {
             if self.stream_is_capturing.load(Ordering::SeqCst) {
-                return Err(Error::unavailable("cuda kernel launches on capturing streams are unsupported"));
+                return Err(Error::unavailable("CUDA kernel launches on capturing streams are unsupported"));
             }
             if !self.context_matches_stream.load(Ordering::SeqCst) {
-                return Err(Error::invalid_argument("the cuda stream does not belong to the current cuda context"));
+                return Err(Error::invalid_argument("the CUDA stream does not belong to the current CUDA context"));
             }
             if self.context_from_stream.load(Ordering::SeqCst) {
                 // Streams model distinct contexts: odd stream handles live on device 1 and even ones on device 0.
@@ -663,7 +665,7 @@ mod tests {
         ) -> Result<CudaLoadedKernel, CudaKernelLoadError> {
             if artifact.bytes().ends_with(b"malformed") {
                 return Err(CudaKernelLoadError::new(Error::invalid_argument(
-                    "cuda driver rejected a malformed cubin",
+                    "CUDA driver rejected a malformed cubin",
                 )));
             }
             if artifact.target_architecture() != self.supported_architecture.lock().unwrap().as_str() {
@@ -684,7 +686,7 @@ mod tests {
                 max_dynamic_shared_memory_bytes: u32::MAX,
             };
             if self.fail_after_module_load.load(Ordering::SeqCst) {
-                let load_error = Error::internal("injected cuda symbol lookup failure");
+                let load_error = Error::internal("injected CUDA symbol lookup failure");
                 return match self.unload_kernel(&kernel) {
                     Ok(()) => Err(CudaKernelLoadError::new(load_error)),
                     Err(unload_error) => Err(CudaKernelLoadError {
@@ -710,7 +712,7 @@ mod tests {
             }
             *self.recorded_launch.lock().unwrap() = Some((dimensions, stream as usize));
             if self.fail_launch.load(Ordering::SeqCst) {
-                return Err(Error::internal("injected cuda kernel launch failure"));
+                return Err(Error::internal("injected CUDA kernel launch failure"));
             }
             let parameter_types = self.parameter_types.lock().unwrap();
             assert_eq!(parameters.is_null(), parameter_types.is_empty());
@@ -742,10 +744,10 @@ mod tests {
             if self.fail_unload.load(Ordering::SeqCst)
                 || self.fail_unload_context.load(Ordering::SeqCst) == kernel.context.id
             {
-                Err(CudaUnloadError::retained(Error::internal("injected cuda module unload failure")))
+                Err(CudaUnloadError::retained(Error::internal("injected CUDA module unload failure")))
             } else if self.fail_after_unload.load(Ordering::SeqCst) {
                 self.unloaded_modules.lock().unwrap().push(kernel.module as usize);
-                Err(CudaUnloadError::unloaded(Error::internal("injected cuda context restoration failure")))
+                Err(CudaUnloadError::unloaded(Error::internal("injected CUDA context restoration failure")))
             } else {
                 self.unloaded_modules.lock().unwrap().push(kernel.module as usize);
                 Ok(())
@@ -999,12 +1001,12 @@ mod tests {
         assert!(matches!(
             CudaKernelCacheLimits::new(0, 1),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel cache entries per context/device must be positive",
+                if message == "CUDA kernel cache entries per context/device must be positive",
         ));
         assert!(matches!(
             CudaKernelCacheLimits::new(1, 0),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel cache artifact bytes per context/device must be positive",
+                if message == "CUDA kernel cache artifact bytes per context/device must be positive",
         ));
     }
 
@@ -1071,7 +1073,7 @@ mod tests {
         assert!(matches!(
             CudaKernelLauncher::with_cache_capacity(CudaVersion::from_encoded(12_000).unwrap(), 0),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel cache entries per context/device must be positive",
+                if message == "CUDA kernel cache entries per context/device must be positive",
         ));
     }
 
@@ -1188,7 +1190,7 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.launch(&oversized_artifact, &launch) },
             Err(Error::Unavailable { message, .. })
-                if message == "cuda kernel artifact contains 70 bytes, exceeding the per-context/device cache budget \
+                if message == "CUDA kernel artifact contains 70 bytes, exceeding the per-context/device cache budget \
                                of 69 bytes",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
@@ -1217,7 +1219,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             unsafe { launcher.launch(&malformed, &launch) },
-            Err(Error::InvalidArgument { message, .. }) if message == "cuda driver rejected a malformed cubin",
+            Err(Error::InvalidArgument { message, .. }) if message == "CUDA driver rejected a malformed cubin",
         ));
 
         // A cubin for another SM is rejected before the driver sees it, naming the artifact target and the device.
@@ -1233,7 +1235,7 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.launch(&wrong_architecture, &launch) },
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda cubin targets `sm_90`, but cuda device 0 has compute capability 10.0",
+                if message == "CUDA cubin targets `sm_90`, but CUDA device 0 has compute capability 10.0",
         ));
 
         // PTX for a newer virtual architecture than the device is rejected before the driver sees it, while PTX for an
@@ -1252,7 +1254,7 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.launch(&ptx("compute_120"), &launch) },
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda PTX targets `compute_120`, but cuda device 0 has compute capability 10.0",
+                if message == "CUDA PTX targets `compute_120`, but CUDA device 0 has compute capability 10.0",
         ));
         assert!(matches!(
             unsafe { launcher.launch(&ptx("compute_90"), &launch) },
@@ -1272,7 +1274,7 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &launch) },
             Err(Error::InvalidArgument { message, .. })
-                if message == "the cuda stream does not belong to the current cuda context",
+                if message == "the CUDA stream does not belong to the current CUDA context",
         ));
         assert_eq!(driver.load_count.load(Ordering::SeqCst), 0);
 
@@ -1297,7 +1299,7 @@ mod tests {
         driver.fail_after_unload.store(true, Ordering::SeqCst);
         assert!(matches!(
             unsafe { launcher.launch(&second_artifact, &launch) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda context restoration failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA context restoration failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 0);
         assert_eq!(launcher.cache_statistics().misses(), 2);
@@ -1315,14 +1317,14 @@ mod tests {
 
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &launch) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         assert_eq!(driver.unload_count.load(Ordering::SeqCst), 1);
 
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &launch) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         assert_eq!(driver.load_count.load(Ordering::SeqCst), 1);
@@ -1414,12 +1416,12 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.launch(&first, &test_launch()) },
             Err(Error::Unavailable { message, .. })
-                if message == "cuda kernel launches on capturing streams are unsupported",
+                if message == "CUDA kernel launches on capturing streams are unsupported",
         ));
         assert!(matches!(
             unsafe { launcher.launch(&second, &test_launch()) },
             Err(Error::Unavailable { message, .. })
-                if message == "cuda kernel launches on capturing streams are unsupported",
+                if message == "CUDA kernel launches on capturing streams are unsupported",
         ));
         assert_eq!(launcher.cache_statistics(), CudaKernelCacheStatistics { hits: 0, misses: 1, evictions: 0 });
         assert_eq!(driver.load_count.load(Ordering::SeqCst), 1);
@@ -1450,7 +1452,7 @@ mod tests {
         let artifact = test_artifact(Vec::new());
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &test_launch()) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda kernel launch failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA kernel launch failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         assert_eq!(driver.launch_count.load(Ordering::SeqCst), 0);
@@ -1469,7 +1471,7 @@ mod tests {
         driver.fail_unload_context.store(1, Ordering::SeqCst);
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &test_launch()) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
 
         // A retained partial load in context 1 cannot interfere with admitting a healthy context 2.
@@ -1496,7 +1498,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::Unavailable { message, .. }) if message ==
-                "cuda kernel cache partition is full and all cached modules in that context/device are in use",
+                "CUDA kernel cache partition is full and all cached modules in that context/device are in use",
         ));
         assert_eq!(driver.unload_count.load(Ordering::SeqCst), 0);
         assert_eq!(unsafe { launcher.launch(&second, &test_launch()) }, Ok(()));
@@ -1661,7 +1663,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(Error::Unavailable { message, .. })
-                    if message == "cuda kernel launches on capturing streams are unsupported",
+                    if message == "CUDA kernel launches on capturing streams are unsupported",
             ));
             assert_eq!(status_result, 0);
             assert_eq!(capture_status, 1);
@@ -1697,7 +1699,7 @@ mod tests {
         driver.fail_unload_context.store(1, Ordering::SeqCst);
         assert!(matches!(
             unsafe { launcher.clear() },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         let mut attempted_contexts = driver.unload_contexts.lock().unwrap().clone();
@@ -1738,7 +1740,7 @@ mod tests {
         driver.fail_unload_context.store(1, Ordering::SeqCst);
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &test_launch()) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         driver.fail_after_module_load.store(false, Ordering::SeqCst);
         driver.context_id.store(2, Ordering::SeqCst);
@@ -1750,7 +1752,7 @@ mod tests {
         driver.context_id.store(1, Ordering::SeqCst);
         assert!(matches!(
             unsafe { launcher.clear_context(stream) },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         driver.fail_unload_context.store(0, Ordering::SeqCst);
@@ -1768,7 +1770,7 @@ mod tests {
         assert!(matches!(
             unsafe { launcher.clear_context(stream) },
             Err(Error::InvalidArgument { message, .. })
-                if message == "the cuda stream does not belong to the current cuda context",
+                if message == "the CUDA stream does not belong to the current CUDA context",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         assert_eq!(driver.unload_count.load(Ordering::SeqCst), 0);
@@ -1799,7 +1801,7 @@ mod tests {
         assert_eq!(driver.unload_count.load(Ordering::SeqCst), 1);
         assert!(matches!(
             unsafe { launcher.launch(&artifact, &test_launch()) },
-            Err(Error::Unavailable { message, .. }) if message == "cuda kernel launcher has been shut down",
+            Err(Error::Unavailable { message, .. }) if message == "CUDA kernel launcher has been shut down",
         ));
         assert_eq!(unsafe { launcher.shutdown() }, Ok(()));
         assert_eq!(driver.unload_count.load(Ordering::SeqCst), 1);
@@ -1815,7 +1817,7 @@ mod tests {
         assert_eq!(unsafe { launcher.launch(&artifact, &launch) }, Ok(()));
         assert!(matches!(
             unsafe { launcher.shutdown() },
-            Err(Error::Internal { message, .. }) if message == "injected cuda module unload failure",
+            Err(Error::Internal { message, .. }) if message == "injected CUDA module unload failure",
         ));
         assert_eq!(launcher.cached_kernel_count(), 1);
         driver.fail_unload.store(false, Ordering::SeqCst);
@@ -1835,7 +1837,7 @@ mod tests {
         // Other tests may record errors concurrently; require this destructor's precise diagnostic to be present.
         assert!(Error::take_cleanup_errors().iter().any(|error| matches!(
             error,
-            Error::Internal { message, .. } if message == "injected cuda module unload failure",
+            Error::Internal { message, .. } if message == "injected CUDA module unload failure",
         )));
     }
 

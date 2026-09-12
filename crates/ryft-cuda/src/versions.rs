@@ -1,5 +1,7 @@
 //! CUDA version encoding, validation, and presentation.
 
+// TODO(eaplatanios): Review this.
+
 use std::fmt::{Display, Formatter};
 
 use crate::{Error, ffi};
@@ -15,11 +17,11 @@ impl CudaVersion {
     /// Creates a CUDA version from CUDA's integer encoding: `1000 * major + 10 * minor`.
     pub fn from_encoded(encoded: u32) -> Result<Self, Error> {
         let encoded = i32::try_from(encoded).map_err(|_| {
-            Error::invalid_argument("the encoded cuda version cannot be represented by the CUDA Driver API")
+            Error::invalid_argument("the encoded CUDA version cannot be represented by the CUDA Driver API")
         })?;
         if encoded < ffi::ENTRY_POINT_ABI_VERSION || encoded.rem_euclid(10) != 0 {
             return Err(Error::invalid_argument(format!(
-                "invalid encoded cuda version `{encoded}`; expected CUDA 12.0 or newer",
+                "invalid encoded CUDA version `{encoded}`; expected CUDA 12.0 or newer",
             )));
         }
         Ok(Self { encoded })
@@ -66,17 +68,17 @@ mod tests {
         assert!(matches!(
             CudaVersion::from_encoded(11_080),
             Err(Error::InvalidArgument { message, .. })
-                if message == "invalid encoded cuda version `11080`; expected CUDA 12.0 or newer",
+                if message == "invalid encoded CUDA version `11080`; expected CUDA 12.0 or newer",
         ));
         assert!(matches!(
             CudaVersion::from_encoded(12_091),
             Err(Error::InvalidArgument { message, .. })
-                if message == "invalid encoded cuda version `12091`; expected CUDA 12.0 or newer",
+                if message == "invalid encoded CUDA version `12091`; expected CUDA 12.0 or newer",
         ));
         assert!(matches!(
             CudaVersion::from_encoded(u32::MAX),
             Err(Error::InvalidArgument { message, .. })
-                if message == "the encoded cuda version cannot be represented by the CUDA Driver API",
+                if message == "the encoded CUDA version cannot be represented by the CUDA Driver API",
         ));
     }
 

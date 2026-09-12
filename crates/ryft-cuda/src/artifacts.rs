@@ -1,5 +1,7 @@
 //! Immutable CUDA images, parameter ABIs, and launch resource metadata.
 
+// TODO(eaplatanios): Review this.
+
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -63,12 +65,12 @@ const ELF_ABI_VERSION_CUDA_V2: u8 = 8;
 fn cubin_elf_architecture(bytes: &[u8]) -> Result<u32, Error> {
     // ELF identification: magic, `EI_CLASS == ELFCLASS64`, and `EI_DATA == ELFDATA2LSB`.
     if bytes.len() < ELF64_HEADER_SIZE || bytes[..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 || bytes[5] != 1 {
-        return Err(Error::invalid_argument("cuda cubin bytes do not start with a little-endian ELF64 header"));
+        return Err(Error::invalid_argument("CUDA cubin bytes do not start with a little-endian ELF64 header"));
     }
     let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
     if machine != ELF_MACHINE_CUDA {
         return Err(Error::invalid_argument(format!(
-            "cuda cubin ELF header has `e_machine` {machine}, expected {ELF_MACHINE_CUDA} (NVIDIA CUDA)",
+            "CUDA cubin ELF header has `e_machine` {machine}, expected {ELF_MACHINE_CUDA} (NVIDIA CUDA)",
         )));
     }
     let flags = u32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]);
@@ -220,10 +222,10 @@ impl CudaKernelLaunchDimensions {
     /// Device-specific limits and kernel resource requirements are checked by CUDA at launch time.
     pub fn new(grid: [u32; 3], block: [u32; 3], dynamic_shared_memory_bytes: u32) -> Result<Self, Error> {
         if grid.contains(&0) {
-            return Err(Error::invalid_argument("cuda grid dimensions must be nonzero"));
+            return Err(Error::invalid_argument("CUDA grid dimensions must be nonzero"));
         }
         if block.contains(&0) {
-            return Err(Error::invalid_argument("cuda thread-block dimensions must be nonzero"));
+            return Err(Error::invalid_argument("CUDA thread-block dimensions must be nonzero"));
         }
         Ok(Self { grid, block, dynamic_shared_memory_bytes })
     }
@@ -269,7 +271,7 @@ impl CudaKernelAbi {
     ) -> Result<Self, Error> {
         let schema = schema.into();
         if schema.trim().is_empty() {
-            return Err(Error::invalid_argument("cuda kernel ABI schema must not be empty"));
+            return Err(Error::invalid_argument("CUDA kernel ABI schema must not be empty"));
         }
         Ok(Self { schema, version, parameters: parameters.into() })
     }
@@ -351,21 +353,21 @@ impl CudaKernelArtifact {
     ) -> Result<Self, Error> {
         let bytes = bytes.into();
         if bytes.is_empty() {
-            return Err(Error::invalid_argument("cuda kernel artifact bytes must not be empty"));
+            return Err(Error::invalid_argument("CUDA kernel artifact bytes must not be empty"));
         }
         if format == CudaArtifactFormat::Ptx && bytes.contains(&0) {
-            return Err(Error::invalid_argument("cuda PTX must not contain a NUL byte"));
+            return Err(Error::invalid_argument("CUDA PTX must not contain a NUL byte"));
         }
         let symbol = symbol.into();
         if symbol.is_empty() {
-            return Err(Error::invalid_argument("cuda kernel symbol must not be empty"));
+            return Err(Error::invalid_argument("CUDA kernel symbol must not be empty"));
         }
         if symbol.as_bytes().contains(&0) {
-            return Err(Error::invalid_argument("cuda kernel symbol must not contain a NUL byte"));
+            return Err(Error::invalid_argument("CUDA kernel symbol must not contain a NUL byte"));
         }
         let target_architecture = target_architecture.into();
         if target_architecture.trim().is_empty() {
-            return Err(Error::invalid_argument("cuda target architecture must not be empty"));
+            return Err(Error::invalid_argument("CUDA target architecture must not be empty"));
         }
         let cubin_architecture = match format {
             CudaArtifactFormat::Cubin => {
@@ -376,7 +378,7 @@ impl CudaKernelArtifact {
                     && recorded != architecture
                 {
                     return Err(Error::invalid_argument(format!(
-                        "cuda cubin ELF header targets `sm_{architecture}`, but the artifact records target \
+                        "CUDA cubin ELF header targets `sm_{architecture}`, but the artifact records target \
                          architecture `{target_architecture}`",
                     )));
                 }
@@ -456,11 +458,11 @@ impl CudaKernelArtifact {
             return Ok(());
         }
         let description = match self.inner.cubin_architecture {
-            Some(architecture) => format!("cuda cubin targets `sm_{architecture}`"),
-            None => format!("cuda PTX targets `{}`", self.target_architecture()),
+            Some(architecture) => format!("CUDA cubin targets `sm_{architecture}`"),
+            None => format!("CUDA PTX targets `{}`", self.target_architecture()),
         };
         Err(Error::invalid_argument(format!(
-            "{description}, but cuda device {device} has compute capability {capability}",
+            "{description}, but CUDA device {device} has compute capability {capability}",
         )))
     }
 
@@ -555,14 +557,14 @@ mod tests {
                 cubin_elf_architecture(&bytes),
                 Err(Error::InvalidArgument { message, .. })
 
-                    if message == "cuda cubin bytes do not start with a little-endian ELF64 header",
+                    if message == "CUDA cubin bytes do not start with a little-endian ELF64 header",
             ));
         }
         assert!(matches!(
             cubin_elf_architecture(&[0; 63]),
             Err(Error::InvalidArgument { message, .. })
 
-                if message == "cuda cubin bytes do not start with a little-endian ELF64 header",
+                if message == "CUDA cubin bytes do not start with a little-endian ELF64 header",
         ));
     }
 
@@ -597,12 +599,12 @@ mod tests {
         assert!(matches!(
             CudaKernelLaunchDimensions::new([0, 1, 1], [1, 1, 1], 0),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda grid dimensions must be nonzero",
+                if message == "CUDA grid dimensions must be nonzero",
         ));
         assert!(matches!(
             CudaKernelLaunchDimensions::new([1, 1, 1], [1, 0, 1], 0),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda thread-block dimensions must be nonzero",
+                if message == "CUDA thread-block dimensions must be nonzero",
         ));
     }
 
@@ -647,7 +649,7 @@ mod tests {
             assert!(matches!(
                 CudaKernelAbi::new(schema, 1, Vec::new()),
                 Err(Error::InvalidArgument { message, .. })
-                    if message == "cuda kernel ABI schema must not be empty",
+                    if message == "CUDA kernel ABI schema must not be empty",
             ));
         }
     }
@@ -706,22 +708,22 @@ mod tests {
     fn test_cuda_kernel_artifact_new_invalid_metadata() {
         let dimensions = CudaKernelLaunchDimensions::new([1, 1, 1], [1, 1, 1], 0).unwrap();
         for (format, bytes, symbol, target, expected) in [
-            (CudaArtifactFormat::Cubin, Vec::new(), "kernel", "sm_100", "cuda kernel artifact bytes must not be empty"),
-            (CudaArtifactFormat::Ptx, b"a\0b".to_vec(), "kernel", "sm_100", "cuda PTX must not contain a NUL byte"),
-            (CudaArtifactFormat::Cubin, test_cubin(100, &[]), "", "sm_100", "cuda kernel symbol must not be empty"),
+            (CudaArtifactFormat::Cubin, Vec::new(), "kernel", "sm_100", "CUDA kernel artifact bytes must not be empty"),
+            (CudaArtifactFormat::Ptx, b"a\0b".to_vec(), "kernel", "sm_100", "CUDA PTX must not contain a NUL byte"),
+            (CudaArtifactFormat::Cubin, test_cubin(100, &[]), "", "sm_100", "CUDA kernel symbol must not be empty"),
             (
                 CudaArtifactFormat::Cubin,
                 test_cubin(100, &[]),
                 "a\0b",
                 "sm_100",
-                "cuda kernel symbol must not contain a NUL byte",
+                "CUDA kernel symbol must not contain a NUL byte",
             ),
             (
                 CudaArtifactFormat::Cubin,
                 test_cubin(100, &[]),
                 "kernel",
                 " ",
-                "cuda target architecture must not be empty",
+                "CUDA target architecture must not be empty",
             ),
         ] {
             assert!(matches!(
@@ -744,30 +746,26 @@ mod tests {
         assert!(matches!(
             test_image(CudaArtifactFormat::Cubin, b"malformed".to_vec(), "sm_100"),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin bytes do not start with a little-endian ELF64 header",
+                if message == "CUDA cubin bytes do not start with a little-endian ELF64 header",
         ));
         let mut big_endian = test_cubin(100, &[]);
         big_endian[5] = 2;
         assert!(matches!(
             test_image(CudaArtifactFormat::Cubin, big_endian, "sm_100"),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin bytes do not start with a little-endian ELF64 header",
+                if message == "CUDA cubin bytes do not start with a little-endian ELF64 header",
         ));
         let mut x86_64 = test_cubin(100, &[]);
         x86_64[18..20].copy_from_slice(&62u16.to_le_bytes());
         assert!(matches!(
             test_image(CudaArtifactFormat::Cubin, x86_64, "sm_100"),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin ELF header has `e_machine` 62, expected 190 (NVIDIA CUDA)",
+                if message == "CUDA cubin ELF header has `e_machine` 62, expected 190 (NVIDIA CUDA)",
         ));
         assert!(matches!(
             test_image(CudaArtifactFormat::Cubin, test_cubin(100, &[]), "sm_90"),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin ELF header targets `sm_100`, but the artifact records target \
+                if message == "CUDA cubin ELF header targets `sm_100`, but the artifact records target \
                                architecture `sm_90`",
         ));
     }
@@ -835,14 +833,12 @@ mod tests {
         assert!(matches!(
             cubin.validate_device_compatibility(1, CudaComputeCapability { major: 9, minor: 0 }),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin targets `sm_100`, but cuda device 1 has compute capability 9.0",
+                if message == "CUDA cubin targets `sm_100`, but CUDA device 1 has compute capability 9.0",
         ));
         assert!(matches!(
             cubin.validate_device_compatibility(0, CudaComputeCapability { major: 12, minor: 0 }),
             Err(Error::InvalidArgument { message, .. })
-
-                if message == "cuda cubin targets `sm_100`, but cuda device 0 has compute capability 12.0",
+                if message == "CUDA cubin targets `sm_100`, but CUDA device 0 has compute capability 12.0",
         ));
 
         // Ordinary PTX can JIT forward; restricted target acceptance is decided by CUDA.
@@ -853,7 +849,7 @@ mod tests {
             ptx.validate_device_compatibility(2, CudaComputeCapability { major: 8, minor: 9 }),
             Err(Error::InvalidArgument { message, .. })
 
-                if message == "cuda PTX targets `compute_90`, but cuda device 2 has compute capability 8.9",
+                if message == "CUDA PTX targets `compute_90`, but CUDA device 2 has compute capability 8.9",
         ));
         assert_eq!(
             test_ptx_artifact("sm_90").validate_device_compatibility(0, CudaComputeCapability { major: 10, minor: 0 }),
@@ -869,7 +865,7 @@ mod tests {
         assert!(matches!(
             newer_minor.validate_device_compatibility(0, CudaComputeCapability { major: 8, minor: 0 }),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda cubin targets `sm_86`, but cuda device 0 has compute capability 8.0",
+                if message == "CUDA cubin targets `sm_86`, but CUDA device 0 has compute capability 8.0",
         ));
         for target in ["sm_90a", "compute_120f"] {
             assert_eq!(

@@ -1,9 +1,9 @@
-//! Structured errors from artifact validation, framework integration, and CUDA driver calls.
-
 use std::backtrace::Backtrace;
 use std::sync::Mutex;
 
 use thiserror::Error;
+
+// TODO(eaplatanios): Review this.
 
 /// Error produced while validating, loading, or launching a CUDA kernel artifact.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub enum Error {
     Internal { message: String, backtrace: String },
 
     /// A CUDA Driver API function returned an error.
-    #[error("cuda driver function `{operation}` failed with `{name}` ({code}): {message}")]
+    #[error("CUDA driver function `{operation}` failed with `{name}` ({code}): {message}")]
     Driver { operation: String, code: i32, name: String, message: String, backtrace: String },
 }
 
@@ -150,7 +150,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "cuda driver function `cuModuleLoadDataEx` failed with `CUDA_ERROR_NO_BINARY_FOR_GPU` (209): \
+            "CUDA driver function `cuModuleLoadDataEx` failed with `CUDA_ERROR_NO_BINARY_FOR_GPU` (209): \
              no kernel image is available for execution on the device",
         );
         assert_eq!(

@@ -77,6 +77,8 @@
 //! Explicit cleanup returns errors for retry while owners are still live. Destructor failures are retained for
 //! observation through [`Error::take_cleanup_errors`]; context destruction owns resources that remain unreleased.
 
+// TODO(eaplatanios): Review this.
+
 mod artifacts;
 mod drivers;
 mod errors;
@@ -323,11 +325,11 @@ pub(crate) mod ffi {
         unsafe fn resolve<T: Copy>(&self, name: &str) -> Result<T, Error> {
             if size_of::<T>() != size_of::<*mut c_void>() {
                 return Err(Error::internal(format!(
-                    "cuda entry point `{name}` has an unsupported function-pointer representation",
+                    "CUDA entry point `{name}` has an unsupported function-pointer representation",
                 )));
             }
             let name =
-                CString::new(name).map_err(|_| Error::internal("cuda entry point name must not contain a NUL byte"))?;
+                CString::new(name).map_err(|_| Error::internal("CUDA entry point name must not contain a NUL byte"))?;
             let mut function = std::ptr::null_mut();
             let mut symbol_status = 0;
             self.check(
@@ -344,7 +346,7 @@ pub(crate) mod ffi {
             )?;
             if symbol_status != 0 || function.is_null() {
                 return Err(Error::unavailable(format!(
-                    "cuda driver could not resolve required entry point `{}` at API version {}: {}",
+                    "CUDA driver could not resolve required entry point `{}` at API version {}: {}",
                     name.to_string_lossy(),
                     format_version(ENTRY_POINT_ABI_VERSION),
                     proc_address_status_description(symbol_status),
@@ -550,7 +552,7 @@ pub(crate) mod ffi {
             assert!(matches!(
                 unsafe { bootstrap.resolve::<CuInit>("cuInit\0suffix") },
                 Err(Error::Internal { message, .. })
-                    if message == "cuda entry point name must not contain a NUL byte",
+                    if message == "CUDA entry point name must not contain a NUL byte",
             ));
             assert_eq!(STATE.with_borrow(|state| state.queries.len()), 0);
         }
@@ -563,7 +565,7 @@ pub(crate) mod ffi {
                 unsafe { bootstrap.resolve::<CuInit>("cuInit") },
                 Err(Error::Unavailable { message, .. })
                     if message ==
-                        "cuda driver could not resolve required entry point `cuInit` at API version 12.0: the symbol \
+                        "CUDA driver could not resolve required entry point `cuInit` at API version 12.0: the symbol \
                          was not found",
             ));
             STATE.with_borrow_mut(|state| state.symbol_status = 2);
@@ -571,7 +573,7 @@ pub(crate) mod ffi {
                 unsafe { bootstrap.resolve::<CuInit>("cuInit") },
                 Err(Error::Unavailable { message, .. })
                     if message ==
-                        "cuda driver could not resolve required entry point `cuInit` at API version 12.0: the \
+                        "CUDA driver could not resolve required entry point `cuInit` at API version 12.0: the \
                          requested API version is insufficient for the symbol",
             ));
             STATE.with_borrow_mut(|state| state.symbol_status = 42);
@@ -579,7 +581,7 @@ pub(crate) mod ffi {
                 unsafe { bootstrap.resolve::<CuInit>("cuInit") },
                 Err(Error::Unavailable { message, .. })
                     if message ==
-                        "cuda driver could not resolve required entry point `cuInit` at API version 12.0: the driver \
+                        "CUDA driver could not resolve required entry point `cuInit` at API version 12.0: the driver \
                          reported unknown query status 42",
             ));
         }
@@ -592,7 +594,7 @@ pub(crate) mod ffi {
                 unsafe { bootstrap.resolve::<CuInit>("cuInit") },
                 Err(Error::Unavailable { message, .. })
                     if message ==
-                        "cuda driver could not resolve required entry point `cuInit` at API version 12.0: the driver \
+                        "CUDA driver could not resolve required entry point `cuInit` at API version 12.0: the driver \
                          returned a null pointer despite reporting success",
             ));
         }

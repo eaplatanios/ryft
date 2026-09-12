@@ -1,5 +1,7 @@
 //! Borrowed CUDA resources, typed execution arguments, and native argument packing.
 
+// TODO(eaplatanios): Review this.
+
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -240,7 +242,7 @@ pub(super) fn validate_launch(artifact: &CudaKernelArtifact, launch: &CudaKernel
     let expected = artifact.abi().parameters();
     if expected.len() != launch.arguments.len() {
         return Err(Error::invalid_argument(format!(
-            "cuda kernel `{}` expects {} parameters but the launch frame contains {}",
+            "CUDA kernel `{}` expects {} parameters but the launch frame contains {}",
             artifact.symbol(),
             expected.len(),
             launch.arguments.len(),
@@ -250,7 +252,7 @@ pub(super) fn validate_launch(artifact: &CudaKernelArtifact, launch: &CudaKernel
         let actual = argument.r#type();
         if *expected != actual {
             return Err(Error::invalid_argument(format!(
-                "cuda kernel `{}` parameter {index} expects `{expected:?}` but received `{actual:?}`",
+                "CUDA kernel `{}` parameter {index} expects `{expected:?}` but received `{actual:?}`",
                 artifact.symbol(),
             )));
         }
@@ -447,7 +449,7 @@ mod tests {
             assert!(matches!(
                 unsafe { CudaStream::from_raw(std::ptr::without_provenance_mut(address)) },
                 Err(Error::InvalidArgument { message, .. })
-                    if message == "cuda default stream handles are unsupported",
+                    if message == "CUDA default stream handles are unsupported",
             ));
         }
     }
@@ -500,7 +502,7 @@ mod tests {
         assert!(matches!(
             validate_launch(&artifact, &CudaKernelLaunch::new(test_stream(), Vec::new())),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel `test_kernel` expects 1 parameters but the launch frame contains 0",
+                if message == "CUDA kernel `test_kernel` expects 1 parameters but the launch frame contains 0",
         ));
     }
 
@@ -511,7 +513,7 @@ mod tests {
         assert!(matches!(
             validate_launch(&artifact, &launch),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel `test_kernel` parameter 0 expects `Scalar(I32)` but received `Scalar(U32)`",
+                if message == "CUDA kernel `test_kernel` parameter 0 expects `Scalar(I32)` but received `Scalar(U32)`",
         ));
         let artifact = test_artifact(vec![CudaKernelParameterType::Scalar(CudaScalarType::F16)]);
         let launch =
@@ -519,7 +521,7 @@ mod tests {
         assert!(matches!(
             validate_launch(&artifact, &launch),
             Err(Error::InvalidArgument { message, .. })
-                if message == "cuda kernel `test_kernel` parameter 0 expects `Scalar(F16)` but received `Scalar(BF16)`",
+                if message == "CUDA kernel `test_kernel` parameter 0 expects `Scalar(F16)` but received `Scalar(BF16)`",
         ));
     }
 

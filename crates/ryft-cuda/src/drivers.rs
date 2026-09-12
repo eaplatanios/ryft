@@ -1,5 +1,7 @@
 //! CUDA context validation, kernel configuration, and module lifetime operations.
 
+// TODO(eaplatanios): Review this.
+
 use std::ffi::{CString, c_void};
 
 use crate::artifacts::CudaComputeCapability;
@@ -169,29 +171,29 @@ impl CudaDriverApi for CudaDriver {
         let mut current_context = std::ptr::null_mut();
         self.api.check(unsafe { (self.api.context_get_current)(&mut current_context) }, "cuCtxGetCurrent")?;
         if current_context.is_null() {
-            return Err(Error::invalid_argument("the current cuda context is a null pointer"));
+            return Err(Error::invalid_argument("the current CUDA context is a null pointer"));
         }
         let mut stream_context = std::ptr::null_mut();
         self.api
             .check(unsafe { (self.api.stream_get_context)(stream, &mut stream_context) }, "cuStreamGetCtx")?;
         if stream_context.is_null() {
-            return Err(Error::internal("cuda driver returned a null context for the cuda stream"));
+            return Err(Error::internal("CUDA driver returned a null context for the CUDA stream"));
         }
         if current_context != stream_context {
-            return Err(Error::invalid_argument("the cuda stream does not belong to the current cuda context"));
+            return Err(Error::invalid_argument("the CUDA stream does not belong to the current CUDA context"));
         }
         let mut capture_status = ffi::STREAM_CAPTURE_STATUS_NONE;
         self.api
             .check(unsafe { (self.api.stream_is_capturing)(stream, &mut capture_status) }, "cuStreamIsCapturing")?;
         if capture_status != ffi::STREAM_CAPTURE_STATUS_NONE {
-            return Err(Error::unavailable("cuda kernel launches on capturing streams are unsupported"));
+            return Err(Error::unavailable("CUDA kernel launches on capturing streams are unsupported"));
         }
         let mut id = 0;
         self.api.check(unsafe { (self.api.context_get_id)(current_context, &mut id) }, "cuCtxGetId")?;
         let mut device = -1;
         self.api.check(unsafe { (self.api.context_get_device)(&mut device) }, "cuCtxGetDevice")?;
         if device < 0 {
-            return Err(Error::internal("cuda driver returned a negative current device ordinal"));
+            return Err(Error::internal("CUDA driver returned a negative current device ordinal"));
         }
         Ok(CudaContext { handle: current_context, id, device })
     }
@@ -202,7 +204,7 @@ impl CudaDriverApi for CudaDriver {
             self.api
                 .check(unsafe { (self.api.device_get_attribute)(&mut value, name, device) }, "cuDeviceGetAttribute")?;
             u32::try_from(value).map_err(|_| {
-                Error::internal(format!("cuda driver returned negative compute capability component {value}"))
+                Error::internal(format!("CUDA driver returned negative compute capability component {value}"))
             })
         };
         Ok(CudaComputeCapability {
@@ -235,7 +237,7 @@ impl CudaDriverApi for CudaDriver {
             .map_err(CudaKernelLoadError::new)?;
         if module.is_null() {
             return Err(CudaKernelLoadError::new(Error::internal(
-                "cuda driver returned a null module after loading an artifact",
+                "CUDA driver returned a null module after loading an artifact",
             )));
         }
 
@@ -249,7 +251,7 @@ impl CudaDriverApi for CudaDriver {
             )
             .and_then(|()| {
                 if function.is_null() {
-                    Err(Error::internal("cuda driver returned a null function after resolving a kernel symbol"))
+                    Err(Error::internal("CUDA driver returned a null function after resolving a kernel symbol"))
                 } else {
                     Ok(())
                 }
@@ -278,7 +280,7 @@ impl CudaDriverApi for CudaDriver {
                 "cuDeviceGetAttribute",
             )?;
             if static_shared_memory_bytes < 0 || shared_memory_limit < static_shared_memory_bytes {
-                return Err(Error::internal("cuda driver returned inconsistent kernel shared-memory limits"));
+                return Err(Error::internal("CUDA driver returned inconsistent kernel shared-memory limits"));
             }
             let max_dynamic_shared_memory_bytes = shared_memory_limit - static_shared_memory_bytes;
             // Configure the full legal budget once. Cache hits may use different launch dimensions, and mutating
@@ -332,7 +334,7 @@ impl CudaDriverApi for CudaDriver {
     ) -> Result<(), Error> {
         if dimensions.dynamic_shared_memory_bytes() > kernel.max_dynamic_shared_memory_bytes {
             return Err(Error::invalid_argument(format!(
-                "cuda kernel requests {} bytes of dynamic shared memory, exceeding its configured limit of {} bytes",
+                "CUDA kernel requests {} bytes of dynamic shared memory, exceeding its configured limit of {} bytes",
                 dimensions.dynamic_shared_memory_bytes(),
                 kernel.max_dynamic_shared_memory_bytes,
             )));
@@ -369,7 +371,7 @@ impl CudaDriverApi for CudaDriver {
             (Ok(()), Err(error)) => Err(CudaUnloadError::unloaded(error)),
             (Err(error), Ok(())) => Err(CudaUnloadError::retained(error)),
             (Err(unload_error), Err(restore_error)) => Err(CudaUnloadError::retained(Error::internal(format!(
-                "failed to unload cuda module: {unload_error}; failed to restore previous cuda context: \
+                "failed to unload CUDA module: {unload_error}; failed to restore previous CUDA context: \
                  {restore_error}",
             )))),
         }
@@ -802,7 +804,7 @@ mod tests {
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::InvalidArgument { message, .. })
-                if message == "the current cuda context is a null pointer",
+                if message == "the current CUDA context is a null pointer",
         ));
         STATE.with_borrow_mut(|state| {
             state.handles[0] = 11;
@@ -811,13 +813,13 @@ mod tests {
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::Internal { message, .. })
-                if message == "cuda driver returned a null context for the cuda stream",
+                if message == "CUDA driver returned a null context for the CUDA stream",
         ));
         STATE.with_borrow_mut(|state| state.handles[1] = 12);
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::InvalidArgument { message, .. })
-                if message == "the cuda stream does not belong to the current cuda context",
+                if message == "the CUDA stream does not belong to the current CUDA context",
         ));
         STATE.with_borrow_mut(|state| {
             state.handles[1] = 11;
@@ -826,7 +828,7 @@ mod tests {
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::Internal { message, .. })
-                if message == "cuda driver returned a negative current device ordinal",
+                if message == "CUDA driver returned a negative current device ordinal",
         ));
     }
 
@@ -837,7 +839,7 @@ mod tests {
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::Unavailable { message, .. })
-                if message == "cuda kernel launches on capturing streams are unsupported",
+                if message == "CUDA kernel launches on capturing streams are unsupported",
         ));
         assert_eq!(
             STATE.with_borrow(|state| state.calls.clone()),
@@ -847,7 +849,7 @@ mod tests {
         assert!(matches!(
             driver.context_for_stream(44usize as *mut c_void),
             Err(Error::Unavailable { message, .. })
-                if message == "cuda kernel launches on capturing streams are unsupported",
+                if message == "CUDA kernel launches on capturing streams are unsupported",
         ));
     }
 
@@ -901,7 +903,7 @@ mod tests {
         assert!(matches!(
             driver.device_compute_capability(2),
             Err(Error::Internal { message, .. })
-                if message == "cuda driver returned negative compute capability component -1",
+                if message == "CUDA driver returned negative compute capability component -1",
         ));
         fail("cuDeviceGetAttribute", [701]);
         assert!(matches!(
@@ -981,7 +983,7 @@ mod tests {
         assert!(matches!(
             error.error,
             Error::Internal { message, .. }
-                if message == "cuda driver returned a null module after loading an artifact",
+                if message == "CUDA driver returned a null module after loading an artifact",
         ));
         assert!(error.pending_unload.is_none());
         assert_eq!(STATE.with_borrow(|state| state.calls.clone()), ["cuModuleLoadDataEx"]);
@@ -994,7 +996,7 @@ mod tests {
         assert!(matches!(
             error.error,
             Error::Internal { message, .. }
-                if message == "cuda driver returned a null function after resolving a kernel symbol",
+                if message == "CUDA driver returned a null function after resolving a kernel symbol",
         ));
         assert!(error.pending_unload.is_none());
         assert_eq!(STATE.with_borrow(|state| state.unloaded_modules.clone()), [22]);
@@ -1072,7 +1074,7 @@ mod tests {
         assert!(matches!(
             error.error,
             Error::Internal { message, .. }
-                if message == "cuda driver returned inconsistent kernel shared-memory limits",
+                if message == "CUDA driver returned inconsistent kernel shared-memory limits",
         ));
         assert!(error.pending_unload.is_none());
         assert_eq!(STATE.with_borrow(|state| state.unloaded_modules.clone()), [22]);
@@ -1083,7 +1085,7 @@ mod tests {
         assert!(matches!(
             error.error,
             Error::Internal { message, .. }
-                if message == "cuda driver returned inconsistent kernel shared-memory limits",
+                if message == "CUDA driver returned inconsistent kernel shared-memory limits",
         ));
         assert!(error.pending_unload.is_none());
         assert_eq!(STATE.with_borrow(|state| state.unloaded_modules.clone()), [22, 22]);
@@ -1118,7 +1120,7 @@ mod tests {
             driver.launch_kernel(&kernel, dimensions, 44usize as *mut c_void, std::ptr::null_mut()),
             Err(Error::InvalidArgument { message, .. })
                 if message ==
-                    "cuda kernel requests 97281 bytes of dynamic shared memory, exceeding its configured limit of \
+                    "CUDA kernel requests 97281 bytes of dynamic shared memory, exceeding its configured limit of \
                      97280 bytes",
         ));
         assert_eq!(STATE.with_borrow(|state| state.calls.clone()), Vec::<&str>::new());
@@ -1189,8 +1191,8 @@ mod tests {
             error.error,
             Error::Internal { message, .. }
                 if message ==
-                    "failed to unload cuda module: cuda driver function `cuModuleUnload` failed with `CUDA_ERROR_TEST` \
-                     (701): injected test error; failed to restore previous cuda context: cuda driver function \
+                    "failed to unload CUDA module: CUDA driver function `cuModuleUnload` failed with `CUDA_ERROR_TEST` \
+                     (701): injected test error; failed to restore previous CUDA context: CUDA driver function \
                      `cuCtxSetCurrent` failed with `CUDA_ERROR_TEST` (702): injected test error",
         ));
         assert_eq!(STATE.with_borrow(|state| state.handles[0]), 77);
