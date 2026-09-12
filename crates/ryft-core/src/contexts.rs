@@ -650,8 +650,12 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
     /// its outputs. The application-scoped [`BindingRegionDriver`] provides the operation's complete ordered region
     /// sequence. Staging consumes that driver through [`BindingRegionDriver::import_into`] to obtain destination
     /// [`RegionId`](crate::RegionId)s (owned region programs are imported, replayed regions preserve source-arena
-    /// sharing, and shared callees are interned by [`Rc`] identity). The resulting identifiers are recorded on the new
-    /// [`Instruction`](crate::Instruction) in the same order.
+    /// sharing, and shared callees are interned by [`Arc`](std::sync::Arc) identity). Staging specializes imported
+    /// bodies when their requested inputs are more precise and reconciles signatures in region order. For example,
+    /// a linear call's transpose must receive the cotangent type of its specialized forward output. Drivers perform
+    /// only structural import and identity instantiation, so each required body specialization happens here once.
+    /// The finalized region identifiers are recorded on the new [`Instruction`](crate::Instruction) in the same
+    /// order after ordinary operation validation.
     ///
     /// # Parameters
     ///
@@ -680,9 +684,9 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         // region or its instantiation request. Region-free operations avoid collecting input types here as the checked
         // builder path will infer them directly from its atoms.
         let declared_region_count = operation.region_slots().len();
-        let (input_types, region_input_types) = if declared_region_count == 0 {
+        let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
             operation.validate_region_count(driver.region_count()).map_err(|error| self.error(error))?;
-            (None, Vec::new())
+            (None, Vec::new(), Vec::new())
         } else {
             let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
             operation.validate_region_count(region_interfaces.len()).map_err(|error| self.error(error))?;
@@ -698,7 +702,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     declared_region_count,
                 ))));
             }
-            (Some(input_types), region_input_types)
+            (Some(input_types), region_interfaces, region_input_types)
         };
 
         if self.builder().borrow().error.is_some() {
@@ -730,8 +734,133 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 Ok(input_atom_ids) => input_atom_ids,
                 Err(error) => return Err(self.error(error)),
             };
-            let region_ids =
-                driver.import_into(self.builder(), &region_input_types).map_err(|error| self.error(error))?;
+
+            // Prepare genuine refinements in a separate arena because specializing one region can require replacing
+            // another. For example, specializing a linear call's forward region can change the cotangent shape its
+            // transpose must accept. Importing both the provisional and replacement transpose directly into the final
+            // builder would leave an unreachable region. Import only the finalized reachable closures below, preserving
+            // shared regions. Pure identity renaming uses the driver's ordinary import cache without a separate arena.
+            let mut requires_specialization = false;
+            let mut narrowed_regions = Vec::new();
+            for (interface, requested) in region_interfaces.iter().zip(&region_input_types) {
+                let mut narrows_bounds = false;
+                if let Some(requested) = requested {
+                    let declared = interface.input_types();
+                    let renaming = Self::Type::derive_identity_renaming(declared, requested)
+                        .map_err(|error| self.error(error.into()))?;
+                    let renamed = declared
+                        .iter()
+                        .map(|r#type| r#type.rename_identities(&renaming))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| self.error(error.into()))?;
+
+                    // Renamed inputs can equal the request even though the body still needs specialization. Consider
+                    // a region `d -> d + 2`, where `d` originally has broad bounds and is now exactly 3. Renaming its
+                    // formal dimension to the exact input updates the signature but does not infer that `d + 2` is 5.
+                    // Remember the narrowing before renaming hides it, so the body is replayed below.
+                    narrows_bounds = declared
+                        .iter()
+                        .zip(requested)
+                        .any(|(declared, actual)| declared.is_refined_by(actual) && !actual.is_refined_by(declared));
+                    requires_specialization |= renamed != *requested || narrows_bounds;
+                }
+                narrowed_regions.push(narrows_bounds);
+            }
+            let preparation_builder = requires_specialization.then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
+            let region_builder = preparation_builder.as_ref().unwrap_or(self.builder());
+            let mut region_ids =
+                driver.import_into(region_builder, &region_input_types).map_err(|error| self.error(error))?;
+
+            // Region signatures may depend on earlier regions' inferred outputs. For a linear call implementing
+            // reshape, the array portions of its forward and transpose signatures might specialize as follows:
+            //
+            //   - Forward: `Array[n, 4]` -> `Array[2, 2*n]` becomes `Array[4, 4]` -> `Array[2, 8]`
+            //   - Transpose: `Array[2, 2*n] -> Array[n, 4]` becomes `Array[2, 8]` -> `Array[4, 4]`
+            //
+            // The transpose receives the forward output's cotangent. Computing its requested input signature only
+            // from the original symbolic forward interface would leave it stale after the forward is specialized.
+            // Recompute requests from the imported interfaces and visit slots in declaration order, updating later
+            // requests whenever an earlier region changes. The final operation inference still checks the resulting
+            // signatures exactly. Operations without explicit instantiation requests need no reconciliation.
+            if region_input_types.iter().any(Option::is_some) {
+                let input_types = input_types.as_ref().unwrap();
+                let mut interfaces = region_ids
+                    .iter()
+                    .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| self.error(error))?;
+                let mut requests = operation
+                    .infer_region_input_types(input_types, &interfaces)
+                    .map_err(|error| self.error(error.into()))?;
+                if requests.len() != declared_region_count {
+                    return Err(self.error(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returned {} region instantiation entries for {} attached regions",
+                        operation.name(),
+                        requests.len(),
+                        declared_region_count,
+                    ))));
+                }
+                let mut specialized_regions = Vec::new();
+                for index in 0..region_ids.len() {
+                    let Some(requested) = &requests[index] else { continue };
+                    if interfaces[index].input_types() == requested && !narrowed_regions[index] {
+                        continue;
+                    }
+                    if let Some((_, _, specialized_id)) = specialized_regions
+                        .iter()
+                        .find(|(source_id, input_types, _)| *source_id == region_ids[index] && input_types == requested)
+                    {
+                        region_ids[index] = *specialized_id;
+                        interfaces[index] = region_builder.borrow().region_ref(*specialized_id).unwrap().interface();
+                    } else {
+                        let source_id = region_ids[index];
+                        let region = region_builder.borrow().region_ref(source_id).unwrap().to_program();
+                        let instantiated = region
+                            .with_instantiated_type_identities(requested)
+                            .map_err(|error| self.error(error))?
+                            .into_owned();
+                        let specialized = if narrowed_regions[index] {
+                            // Force body replay. Identity instantiation may already have made the formal inputs equal
+                            // the request, in which case `specialize` would return early and retain broad body bounds.
+                            TracingContext::<Self::Constant, Self::Operation>::trace(
+                                |inputs: Vec<Tracer<TracingContext<Self::Constant, Self::Operation>>>| {
+                                    // A narrowed input bound guarantees a non-empty input signature.
+                                    let context = inputs[0].context().clone();
+                                    instantiated.interpret_in_context(&context, inputs)
+                                },
+                                requested.clone(),
+                            )
+                            .map_err(|error| self.error(error))?
+                            .1
+                        } else {
+                            instantiated.specialize(requested).map_err(|error| self.error(error))?
+                        };
+                        interfaces[index] = specialized.interface();
+                        region_ids[index] = region_builder.borrow_mut().import_program(specialized);
+                        specialized_regions.push((source_id, requested.clone(), region_ids[index]));
+                    }
+
+                    if index + 1 < region_ids.len() {
+                        requests = operation
+                            .infer_region_input_types(input_types, &interfaces)
+                            .map_err(|error| self.error(error.into()))?;
+                        if requests.len() != declared_region_count {
+                            return Err(self.error(ProgramError::MalformedProgram(format!(
+                                "operation `{}` returned {} region instantiation entries for {} attached regions",
+                                operation.name(),
+                                requests.len(),
+                                declared_region_count,
+                            ))));
+                        }
+                    }
+                }
+            }
+
+            if preparation_builder.is_some() {
+                let prepared = region_builder.borrow();
+                let roots = region_ids.iter().map(|id| prepared.region_ref(*id).unwrap()).collect::<Vec<_>>();
+                region_ids = self.builder().borrow_mut().import_regions(&roots).map_err(|error| self.error(error))?;
+            }
 
             // Snapshot the active provenance and attach it to the recorded instruction. Provenance state lives in
             // its own cell, separate from the builder, so scope transitions never contend with builder borrows.
@@ -794,23 +923,27 @@ impl<V> ValueResolution<V> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape,
     };
     use crate::differentiation::DifferentiationTracer;
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, NegOperation, OneOperation, WhileOperation, ZeroOperation,
+        AddOperation, CompareOperation, ComparisonDirection, DimensionAddOperation, NegOperation, OneOperation,
+        WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialTracer;
     use crate::programs::{
         Atom, AtomId, CalleeRegionDriver, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
-        RegionInterface, RegionSlot, TypeError, Typed, ValueProjection,
+        RegionInterface, RegionReplayMappings, RegionSlot, ReplayRegionDriver, TypeError, TypeIdentityRenaming, Typed,
+        ValueProjection,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -1214,7 +1347,9 @@ mod tests {
         }
 
         #[derive(Clone)]
-        struct IdentityInstantiatingRegionOperation;
+        struct IdentityInstantiatingRegionOperation {
+            dependent_regions: bool,
+        }
 
         impl Operation for IdentityInstantiatingRegionOperation {
             type Type = ArrayType;
@@ -1224,15 +1359,33 @@ mod tests {
             }
 
             fn region_slots(&self) -> &'static [RegionSlot] {
-                const { &[RegionSlot::computation("body")] }
+                if self.dependent_regions {
+                    const {
+                        &[
+                            RegionSlot::computation("forward"),
+                            RegionSlot::computation("first"),
+                            RegionSlot::computation("second"),
+                        ]
+                    }
+                } else {
+                    const { &[RegionSlot::computation("body")] }
+                }
             }
 
             fn infer_region_input_types(
                 &self,
                 input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
+                region_interfaces: &[RegionInterface<ArrayType>],
             ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
-                Ok(vec![Some(input_types.to_vec())])
+                if self.dependent_regions {
+                    Ok(vec![
+                        Some(input_types.to_vec()),
+                        Some(region_interfaces[0].output_types().to_vec()),
+                        Some(region_interfaces[0].output_types().to_vec()),
+                    ])
+                } else {
+                    Ok(vec![Some(input_types.to_vec())])
+                }
             }
 
             fn infer_output_types(
@@ -1240,6 +1393,9 @@ mod tests {
                 _input_types: &[ArrayType],
                 region_interfaces: &[RegionInterface<ArrayType>],
             ) -> Result<Vec<ArrayType>, TypeError> {
+                if self.dependent_regions {
+                    return Ok(region_interfaces[1].output_types().to_vec());
+                }
                 let [region_interface] = region_interfaces else {
                     return Err(TypeError::invalid(format!(
                         "identity-instantiating region expects 1 attached region but got {}",
@@ -1345,7 +1501,11 @@ mod tests {
         let context = TracingContext::<Array, IdentityInstantiatingRegionOperation>::new();
         let input = context.input(caller_type.clone());
         let outputs = context
-            .stage_operation(IdentityInstantiatingRegionOperation, vec![region], std::slice::from_ref(&input))
+            .stage_operation(
+                IdentityInstantiatingRegionOperation { dependent_regions: false },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            )
             .unwrap();
         assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
         let builder = context.builder().borrow();
@@ -1358,6 +1518,154 @@ mod tests {
         let interface = builder.region_ref(*region_id).unwrap().interface();
         assert_eq!(interface.input_types(), std::slice::from_ref(&caller_type));
         assert_eq!(interface.output_types(), std::slice::from_ref(&caller_type));
+        drop(builder);
+
+        // Dependent region inputs follow the specialized forward output. Provisional imports must not leave
+        // unreachable regions, and the two references to one callee must remain one shared final region.
+        let context = TracingContext::<Array, IdentityInstantiatingRegionOperation>::new();
+        let input = context.input(ArrayType::new_static(DataType::F64, [3]));
+        let callee = Arc::new(region);
+        let callees = [callee.clone(), callee.clone(), callee];
+        let outputs = context
+            .stage_operation(
+                IdentityInstantiatingRegionOperation { dependent_regions: true },
+                CalleeRegionDriver::new(&callees),
+                &[input],
+            )
+            .unwrap();
+        let destination = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0].atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let attached = destination.instructions()[0].regions();
+        assert_eq!(attached[1], attached[2]);
+        assert_eq!(destination.output_types(), vec![ArrayType::new_static(DataType::F64, [3])]);
+
+        // All driver forms import nominal identities only. Staging must infer the narrower arithmetic body once,
+        // including when input identity instantiation already made its signature exactly match the request.
+
+        /// Small region family that counts arithmetic inference without requiring an array operation domain.
+        #[derive(Clone)]
+        enum NarrowingOperation {
+            /// Dimension addition whose inference is observed by the test.
+            Add { operation: DimensionAddOperation, inference_count: Rc<Cell<usize>> },
+
+            /// One attached body instantiated from the supplied dimension input.
+            Call,
+        }
+
+        impl Operation for NarrowingOperation {
+            type Type = DimensionType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Add { .. } => "counted_dimension_add",
+                    Self::Call => "dimension_call",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Add { .. } => &[],
+                    Self::Call => const { &[RegionSlot::computation("body")] },
+                }
+            }
+
+            fn infer_region_input_types(
+                &self,
+                inputs: &[DimensionType],
+                _: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<Option<Vec<DimensionType>>>, TypeError> {
+                Ok(match self {
+                    Self::Add { .. } => vec![],
+                    Self::Call => vec![Some(inputs.to_vec())],
+                })
+            }
+
+            fn infer_output_types(
+                &self,
+                inputs: &[DimensionType],
+                regions: &[RegionInterface<DimensionType>],
+            ) -> Result<Vec<DimensionType>, TypeError> {
+                match self {
+                    Self::Add { operation, inference_count } => {
+                        inference_count.set(inference_count.get() + 1);
+                        operation.infer_output_types(inputs, regions)
+                    }
+                    Self::Call => {
+                        assert_eq!(regions[0].input_types(), inputs);
+                        Ok(regions[0].output_types().to_vec())
+                    }
+                }
+            }
+
+            fn rename_type_identities(
+                &self,
+                renaming: &TypeIdentityRenaming<DimensionVariable>,
+            ) -> Result<Self, TypeError> {
+                Ok(match self {
+                    Self::Add { operation, inference_count } => Self::Add {
+                        operation: operation.rename_type_identities(renaming)?,
+                        inference_count: inference_count.clone(),
+                    },
+                    Self::Call => Self::Call,
+                })
+            }
+        }
+
+        /// Stages one narrowed body through the chosen driver and checks its result, inference count, and closure.
+        fn check_narrowed_body<D: BindingRegionDriver<DimensionValue, NarrowingOperation>>(
+            driver: D,
+            inference_count: &Cell<usize>,
+        ) {
+            inference_count.set(0);
+            let context = TracingContext::<DimensionValue, NarrowingOperation>::new();
+            let input = context.input(DimensionValue::constant(3).unwrap().r#type().into_owned());
+            let outputs = context.stage_operation(NarrowingOperation::Call, driver, &[input]).unwrap();
+            assert_eq!(outputs[0].r#type().bounds(), DimensionBounds::new(5, Some(6)).unwrap());
+            assert_eq!(inference_count.get(), 1);
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                    vec![outputs[0].atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+        }
+
+        let inference_count = Rc::new(Cell::new(0));
+        let dimension =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::non_negative(Some(16)).unwrap()));
+        let two = DimensionValue::constant(2).unwrap();
+        let operation = DimensionAddOperation::new(&dimension, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, NarrowingOperation>::new();
+        let input = builder.add_input(dimension);
+        let two = builder.add_constant(two);
+        let output = builder
+            .add_instruction(
+                NarrowingOperation::Add { operation, inference_count: inference_count.clone() },
+                vec![],
+                vec![input, two],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        check_narrowed_body(vec![source.clone()], &inference_count);
+        let callees = [Arc::new(source.clone())];
+        check_narrowed_body(CalleeRegionDriver::new(&callees), &inference_count);
+        let mappings = RegionReplayMappings::new();
+        let roots = [source.entry()];
+        check_narrowed_body(
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            &inference_count,
+        );
     }
 
     #[test]
