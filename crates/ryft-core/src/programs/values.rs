@@ -312,11 +312,11 @@ pub trait ValueProjection<T: Type>: Value {
 /// # use ryft_core::{Array, ArrayIrValue, ArrayType, Mul, ParameterProjection, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let model = vec![ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]))];
+/// let model = vec![ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap())];
 /// let arrays = model.project_parameters::<ArrayType>()?;
 /// let squared = arrays.iter().map(|array| array.mul(array)).collect::<Result<Vec<_>, _>>()?;
 /// let squared = squared.lift_parameters::<ArrayIrValue<Array>>()?;
-/// assert_eq!(squared, vec![ArrayIrValue::Array(Array::vector(vec![1.0, 4.0]))]);
+/// assert_eq!(squared, vec![ArrayIrValue::Array(Array::vector(vec![1.0, 4.0]).unwrap())]);
 /// # Ok(())
 /// # }
 /// ```
@@ -551,8 +551,8 @@ mod tests {
         // where a model tree of weights and biases enters as composite values, and the layer arithmetic is homogeneous
         // array math.
         let model = (
-            ArrayIrValue::<Array>::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0])),
-            vec![ArrayIrValue::<Array>::Array(Array::vector(vec![5.0_f64, 6.0]))],
+            ArrayIrValue::<Array>::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+            vec![ArrayIrValue::<Array>::Array(Array::vector(vec![5.0_f64, 6.0]).unwrap())],
         );
         let (weights, biases) = model.project_parameters::<ArrayType>().unwrap();
         let weights = weights.mul(&weights).unwrap();
@@ -561,15 +561,15 @@ mod tests {
         assert_eq!(
             scaled,
             (
-                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 4.0, 9.0, 16.0])),
-                vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0]))],
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 4.0, 9.0, 16.0]).unwrap()),
+                vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0]).unwrap())],
             ),
         );
 
         // A leaf holding a different member kind fails the projection with the canonical member diagnostic,
         // and the tree structure itself is preserved exactly across a projection round trip.
         let mixed = vec![
-            ArrayIrValue::<Array>::Array(Array::scalar(1.0_f64)),
+            ArrayIrValue::<Array>::Array(Array::scalar(1.0_f64).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         ];
         assert_eq!(

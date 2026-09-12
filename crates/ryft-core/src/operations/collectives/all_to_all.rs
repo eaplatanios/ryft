@@ -811,9 +811,14 @@ mod tests {
     #[test]
     fn test_all_to_all_rejects_ragged_operands_without_explicit_routing() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0_f32; 8]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0_f32; 8]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2_i32, 4]), variable.clone(), vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                Array::vector(vec![2_i32, 4]).unwrap(),
+                variable.clone(),
+                vec![0],
+            )])
             .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
@@ -831,11 +836,12 @@ mod tests {
             }),
         );
 
-        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]));
-        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8])), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-            .unwrap();
+        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]).unwrap());
+        let input =
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8]).unwrap()), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+                .unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -887,7 +893,7 @@ mod tests {
         // receives its own chunk index from every item, concatenated item-major. With items `[1, 2, 3, 4]` and
         // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
-        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let output: ArrayIrValue<Array> = batch(
             |item: BatchingTracer<
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
@@ -926,7 +932,8 @@ mod tests {
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
             ),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let output: ArrayIrValue<Array> = batch(
             |item: BatchingTracer<
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,

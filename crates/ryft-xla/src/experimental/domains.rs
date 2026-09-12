@@ -10399,15 +10399,15 @@ mod tests {
         assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
 
-        let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32));
-        let eager_replacement = ArrayIrValue::Array(CpuArray::scalar(5.0f32));
+        let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32).unwrap());
+        let eager_replacement = ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap());
         let eager_reference = eager_input.reference_new().unwrap();
         eager_reference.write(&eager_replacement).unwrap();
         let eager_snapshot = eager_reference.read().unwrap();
         eager_reference.add_update(&eager_input).unwrap();
         let eager_final = eager_reference.freeze().unwrap();
-        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(5.0f32)));
-        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(8.0f32)));
+        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(5.0f32).unwrap()));
+        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(8.0f32).unwrap()));
     }
 
     #[test]

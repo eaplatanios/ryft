@@ -377,8 +377,8 @@ mod tests {
     #[test]
     fn test_reference_add_update_operation_jvp() {
         let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
         let active = DifferentiationTracer::new(
             DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
             context.clone(),
@@ -387,31 +387,32 @@ mod tests {
         // Addition is linear, so the update's tangent accumulates into the tangent reference.
         let update = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])),
-                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[active.clone(), update]).unwrap();
         assert!(outputs.is_empty());
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![6.0_f32, 8.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![6.0_f32, 8.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
 
         // A symbolic zero update tangent accumulates nothing and is not instantiated.
         let update = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
+                .unwrap(),
             context.clone(),
         );
         context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[active, update]).unwrap();
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 9.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 9.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
 
         // Staged, the zero-tangent accumulation is therefore elided from the tangent side entirely: the fused program
         // accumulates the constant into the primal reference and leaves the tangent reference untouched.
         let mut builder = ProgramBuilder::<TestIrValue, ArrayIrOperation<Array>>::new();
         let reference_atom = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let constant = builder.add_constant(TestIrValue::Array(Array::scalar(1.0_f32)));
+        let constant = builder.add_constant(TestIrValue::Array(Array::scalar(1.0_f32).unwrap()));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference_atom, constant], None)
             .unwrap();
@@ -436,15 +437,16 @@ mod tests {
             context.clone(),
         );
         let update = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
+                .unwrap(),
             context.clone(),
         );
         context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[plumbing.clone(), update]).unwrap();
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
         let update = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0])),
-                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0])),
+                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
@@ -459,8 +461,8 @@ mod tests {
                         .to_string(),
             },
         );
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
     }
 
     #[test]
@@ -474,7 +476,8 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let initial = TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let initial =
+            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let reference = initial.reference_new().unwrap();
         let batched =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
@@ -483,7 +486,7 @@ mod tests {
         let update = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0; 6])),
+                TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),
@@ -492,15 +495,18 @@ mod tests {
         assert!(outputs.is_empty());
         assert_eq!(
             reference.read(),
-            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))),
+            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap())),
         );
 
         // A batched update cannot accumulate into an unbatched reference.
         let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference.clone()));
         let update = BatchingTracer::new(
             context.clone(),
-            ArrayIrBatch::new(TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0; 6])), BatchAxis::new(0))
-                .unwrap(),
+            ArrayIrBatch::new(
+                TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0; 6]).unwrap()),
+                BatchAxis::new(0),
+            )
+            .unwrap(),
         );
         let error = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[replicated, update]).unwrap_err();
         assert_eq!(

@@ -340,7 +340,7 @@ mod tests {
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         )
         .with_axis_name("x".to_string());
-        let input = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let input = ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap();
         let input = BatchingTracer::new(context, input);
         let output = input.parallel_shuffle("x", &[2, 0, 1]).unwrap().into_batch();
@@ -355,10 +355,16 @@ mod tests {
     #[test]
     fn test_parallel_permute_co_moves_and_materializes_ragged_extents() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
-            .unwrap();
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(vec![1_i32, 3]).unwrap(),
+                    variable.clone(),
+                    vec![0],
+                )])
+                .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
 
@@ -372,7 +378,7 @@ mod tests {
         assert_eq!(output.value().to_f64s(), vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0]);
         assert_eq!(
             output.ragged_axes(),
-            &[RaggedAxis::new(1, Array::vector(vec![3_i32, 1]), variable.clone(), vec![0])],
+            &[RaggedAxis::new(1, Array::vector(vec![3_i32, 1]).unwrap(), variable.clone(), vec![0])],
         );
 
         let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)])
@@ -382,21 +388,25 @@ mod tests {
             .0
             .remove(0);
         assert_eq!(output.value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(output.ragged_axes()[0].extents(), &Array::vector(vec![0_i32, 1]));
+        assert_eq!(output.ragged_axes()[0].extents(), &Array::vector(vec![0_i32, 1]).unwrap());
 
         // Replicated extent metadata must first be materialized across the participant axis so the same partial
         // permutation zeros the extent of every untargeted participant together with its packed value.
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())])
-            .unwrap();
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32).unwrap(), variable.clone(), Vec::new())])
+                .unwrap();
         let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)])
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap()
             .into_parts()
             .0
             .remove(0);
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())],);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::scalar(1_i32).unwrap(), variable.clone(), Vec::new())],
+        );
 
         let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)])
             .batch(&context, &EmptyRegionDriver, &[input])
@@ -404,17 +414,26 @@ mod tests {
             .into_parts()
             .0
             .remove(0);
-        assert_eq!(output.value(), &Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]));
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![0_i32, 1]), variable, vec![0])],);
+        assert_eq!(output.value(), &Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap());
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![0_i32, 1]).unwrap(), variable, vec![0])],
+        );
     }
 
     #[test]
     fn test_parallel_permute_rejects_untargeted_ragged_extent_outside_dimension_bounds() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
-            .unwrap();
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(vec![1_i32, 3]).unwrap(),
+                    variable.clone(),
+                    vec![0],
+                )])
+                .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
 
@@ -425,7 +444,10 @@ mod tests {
             .into_parts()
             .0
             .remove(0);
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![3_i32, 1]), variable, vec![0])],);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![3_i32, 1]).unwrap(), variable, vec![0])],
+        );
 
         assert!(matches!(
             ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)]).batch(
@@ -443,10 +465,11 @@ mod tests {
     #[test]
     fn test_array_ir_parallel_permute_materializes_replicated_ragged_extents() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())])
-            .unwrap();
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32).unwrap(), variable.clone(), Vec::new())])
+                .unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -460,8 +483,11 @@ mod tests {
             .0
             .remove(0);
 
-        assert_eq!(output.value(), &Array::matrix(2, 3, vec![0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]));
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![0_i32, 1]), variable, vec![0])],);
+        assert_eq!(output.value(), &Array::matrix(2, 3, vec![0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap());
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![0_i32, 1]).unwrap(), variable, vec![0])],
+        );
     }
 
     #[test]
@@ -531,7 +557,7 @@ mod tests {
             |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_permute("x", vec![(0, 1), (1, 0)])
             },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
@@ -554,7 +580,7 @@ mod tests {
             |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_permute("x", vec![(0, 1)])
             },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),

@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(bits.elements::<u8>(), Ok(expected_words.into_iter().map(|word| word as u8).collect()));
 
         // Direct backend calls enforce the same state contract as operation type inference.
-        let invalid_state = Array::vector(vec![42u64, 7, 9]);
+        let invalid_state = Array::vector(vec![42u64, 7, 9]).unwrap();
         assert!(matches!(
             invalid_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
             Err(ProgramError::Type(TypeError::Invalid { message }))

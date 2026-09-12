@@ -186,7 +186,7 @@ fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, StatisticsError> 
     let (_, program): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) =
         EagerContext::<Array, ArrayOperation<Array>>::new().interpret_and_trace(
             |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-            (Array::scalar(2.0), Array::scalar(3.0)),
+            (Array::scalar(2.0)?, Array::scalar(3.0)?),
         )?;
     Ok(program.statistics())
 }
@@ -195,7 +195,7 @@ fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, StatisticsError> 
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, StatisticsError> {
     let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new().vjp(
         |inputs, ()| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
-        (Array::scalar(2.0), Array::scalar(3.0)),
+        (Array::scalar(2.0)?, Array::scalar(3.0)?),
         (),
     )?;
     let (pullback, _residuals) = pullback.into_transposed_parts()?;
@@ -216,7 +216,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, StatisticsEr
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
             },
-            Array::scalar(2.0),
+            Array::scalar(2.0)?,
         )?;
     Ok(program.statistics())
 }
@@ -235,7 +235,7 @@ fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
             },
-            Array::scalar(2.0),
+            Array::scalar(2.0)?,
         )?;
     Ok(program.statistics())
 }
@@ -245,7 +245,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
     let context = EagerContext::<Array, ArrayOperation<Array>>::new();
     let (_, pushforward) = context.linearize(
         |x, ()| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?),
-        Array::scalar(2.0),
+        Array::scalar(2.0)?,
         (),
     )?;
     let (_, pushforward, residuals, _, _, _) = pushforward.into_parts();
@@ -263,7 +263,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
             let mut outputs = pushforward.interpret_in_context(&tracing_context, inputs)?;
             Ok(outputs.remove(0))
         },
-        Array::scalar(1.0),
+        Array::scalar(1.0)?,
     )?;
     Ok(closed_pushforward.statistics())
 }

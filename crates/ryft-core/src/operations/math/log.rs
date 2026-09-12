@@ -103,28 +103,38 @@ mod tests {
 
     #[test]
     fn test_log_interpretation() {
-        assert_eq!(Array::scalar(0.5f32).log().unwrap(), Array::scalar(0.5f32.ln()));
-        assert_eq!(Array::scalar(0.5f64).log().unwrap(), Array::scalar(0.5f64.ln()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).log().unwrap(), Array::scalar(bf16::from_f32(0.5f32.ln())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).log().unwrap(), Array::scalar(f16::from_f32(0.5f32.ln())),);
+        assert_eq!(Array::scalar(0.5f32).unwrap().log().unwrap(), Array::scalar(0.5f32.ln()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().log().unwrap(), Array::scalar(0.5f64.ln()).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().log().unwrap(),
+            Array::scalar(bf16::from_f32(0.5f32.ln())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().log().unwrap(),
+            Array::scalar(f16::from_f32(0.5f32.ln())).unwrap(),
+        );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).log().unwrap(), Array::scalar(input.ln()), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().log().unwrap(),
+            Array::scalar(input.ln()).unwrap(),
+            epsilon = 1e-12
+        );
         // The principal branch maps the negative real axis to `ln|x| + iπ`.
         assert_abs_diff_eq!(
-            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
+            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).unwrap().log().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).unwrap(),
             epsilon = 1e-12,
         );
 
-        assert_eq!(Array::scalar(0.7).log().unwrap(), Array::scalar(0.7f64.ln()),);
+        assert_eq!(Array::scalar(0.7).unwrap().log().unwrap(), Array::scalar(0.7f64.ln()).unwrap(),);
     }
 
     #[test]
     fn test_log_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.ln()),
+            inputs = [Array::scalar(0.7).unwrap()],
+            expected = Array::scalar(0.7f64.ln()).unwrap(),
         );
     }
 
@@ -135,8 +145,8 @@ mod tests {
             operation = LogOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.ln(), 2.0f64.ln()]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.ln(), 2.0f64.ln()]).unwrap())],
             }],
         );
     }
@@ -147,10 +157,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = LogOperation::new(),
             cases = [{
-                primals = [Array::scalar(0.7)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(0.7f64.ln())],
-                tangent_outputs = [Array::scalar(3.0 / 0.7)],
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64.ln()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 / 0.7).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = log %0
@@ -166,16 +176,19 @@ mod tests {
         // The analytic quotient and the scalar division algorithm may round their intermediate values differently.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.log().unwrap()).unwrap(),
-            Array::scalar(ComplexNumber::new(1.0, 0.0) / input),
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| input.log().unwrap())
+                .unwrap(),
+            Array::scalar(ComplexNumber::new(1.0, 0.0) / input).unwrap(),
             epsilon = 1e-15,
         );
     }
 
     #[test]
     fn test_log_low_precision_differentiation_uses_widened_tangents() {
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.log()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.to_f64s()[0], 1.5, epsilon = 1e-9);

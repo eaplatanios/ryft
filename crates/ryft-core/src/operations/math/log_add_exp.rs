@@ -296,70 +296,88 @@ mod tests {
     fn test_log_add_exp_interpretation() {
         // Ordinary values in every supported floating-point width, each evaluated in its own precision.
         assert_eq!(
-            Array::scalar(1.0f64).log_add_exp(&Array::scalar(2.0f64)).unwrap(),
-            Array::scalar(expected(1.0, 2.0)),
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(2.0f64).unwrap()).unwrap(),
+            Array::scalar(expected(1.0, 2.0)).unwrap(),
         );
         assert_eq!(
-            Array::scalar(1.0f32).log_add_exp(&Array::scalar(2.0f32)).unwrap(),
-            Array::scalar(2.0f32 + (-1.0f32).exp().ln_1p()),
+            Array::scalar(1.0f32).unwrap().log_add_exp(&Array::scalar(2.0f32).unwrap()).unwrap(),
+            Array::scalar(2.0f32 + (-1.0f32).exp().ln_1p()).unwrap(),
         );
         assert_eq!(
-            Array::scalar(bf16::from_f32(1.0)).log_add_exp(&Array::scalar(bf16::from_f32(2.0))).unwrap(),
-            Array::scalar(bf16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())),
+            Array::scalar(bf16::from_f32(1.0))
+                .unwrap()
+                .log_add_exp(&Array::scalar(bf16::from_f32(2.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(1.0)).log_add_exp(&Array::scalar(f16::from_f32(2.0))).unwrap(),
-            Array::scalar(f16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())),
+            Array::scalar(f16::from_f32(1.0))
+                .unwrap()
+                .log_add_exp(&Array::scalar(f16::from_f32(2.0)).unwrap())
+                .unwrap(),
+            Array::scalar(f16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap(),
         );
 
         // The operation is symmetric, and two equal operands add exactly `log(2)`.
         assert_eq!(
-            Array::scalar(2.0f64).log_add_exp(&Array::scalar(1.0f64)).unwrap(),
-            Array::scalar(expected(1.0, 2.0)),
+            Array::scalar(2.0f64).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap(),
+            Array::scalar(expected(1.0, 2.0)).unwrap(),
         );
         assert_eq!(
-            Array::scalar(0.0f64).log_add_exp(&Array::scalar(0.0f64)).unwrap(),
-            Array::scalar(std::f64::consts::LN_2),
+            Array::scalar(0.0f64).unwrap().log_add_exp(&Array::scalar(0.0f64).unwrap()).unwrap(),
+            Array::scalar(std::f64::consts::LN_2).unwrap(),
         );
 
         // The reason the primitive exists: neither exponential is ever formed, so operands far outside the range of
         // `exp` still produce the exact shifted result instead of infinity.
         assert_eq!(
-            Array::scalar(1000.0f64).log_add_exp(&Array::scalar(1000.0f64)).unwrap(),
-            Array::scalar(1000.0 + std::f64::consts::LN_2),
+            Array::scalar(1000.0f64).unwrap().log_add_exp(&Array::scalar(1000.0f64).unwrap()).unwrap(),
+            Array::scalar(1000.0 + std::f64::consts::LN_2).unwrap(),
         );
         assert!((1000.0f64.exp() + 1000.0f64.exp()).ln().is_infinite());
 
         // The pinned exceptional values: same-sign infinities saturate, mixed infinities return the larger operand,
         // and NaN propagates from either operand.
         assert_eq!(
-            Array::scalar(f64::INFINITY).log_add_exp(&Array::scalar(f64::INFINITY)).unwrap(),
-            Array::scalar(f64::INFINITY),
+            Array::scalar(f64::INFINITY).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()).unwrap(),
+            Array::scalar(f64::INFINITY).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f64::NEG_INFINITY).log_add_exp(&Array::scalar(f64::NEG_INFINITY)).unwrap(),
-            Array::scalar(f64::NEG_INFINITY),
+            Array::scalar(f64::NEG_INFINITY)
+                .unwrap()
+                .log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap())
+                .unwrap(),
+            Array::scalar(f64::NEG_INFINITY).unwrap(),
         );
         assert_eq!(
-            Array::scalar(1.0f64).log_add_exp(&Array::scalar(f64::INFINITY)).unwrap(),
-            Array::scalar(f64::INFINITY),
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()).unwrap(),
+            Array::scalar(f64::INFINITY).unwrap(),
         );
         assert_eq!(
-            Array::scalar(1.0f64).log_add_exp(&Array::scalar(f64::NEG_INFINITY)).unwrap(),
-            Array::scalar(1.0f64),
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap()).unwrap(),
+            Array::scalar(1.0f64).unwrap(),
         );
-        assert!(Array::scalar(f64::NAN).log_add_exp(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
-        assert!(Array::scalar(1.0f64).log_add_exp(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
+        assert!(
+            Array::scalar(f64::NAN).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap().to_f64s()[0]
+                .is_nan()
+        );
+        assert!(
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NAN).unwrap()).unwrap().to_f64s()[0]
+                .is_nan()
+        );
 
-        assert_eq!(Array::scalar(1.0).log_add_exp(&Array::scalar(2.0)).unwrap(), Array::scalar(expected(1.0, 2.0)));
+        assert_eq!(
+            Array::scalar(1.0).unwrap().log_add_exp(&Array::scalar(2.0).unwrap()).unwrap(),
+            Array::scalar(expected(1.0, 2.0)).unwrap()
+        );
     }
 
     #[test]
     fn test_log_add_exp_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogAddExpOperation::new(),
-            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
-            expected = Array::scalar(expected(0.5, -0.25)),
+            inputs = [Array::scalar(0.5).unwrap(), Array::scalar(-0.25).unwrap()],
+            expected = Array::scalar(expected(0.5, -0.25)).unwrap(),
         );
     }
 
@@ -371,10 +389,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
-                    (@replicated, Array::scalar(2.0)),
+                    (@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap()),
+                    (@replicated, Array::scalar(2.0).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![expected(0.5, 2.0), expected(-1.0, 2.0)]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![expected(0.5, 2.0), expected(-1.0, 2.0)]).unwrap())],
             }],
         );
     }
@@ -390,10 +408,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = LogAddExpOperation::new(),
             cases = [{
-                primals = [Array::scalar(left), Array::scalar(right)],
-                tangents = [Array::scalar(left_tangent), Array::scalar(right_tangent)],
-                primal_outputs = [Array::scalar(output)],
-                tangent_outputs = [Array::scalar(tangent)],
+                primals = [Array::scalar(left).unwrap(), Array::scalar(right).unwrap()],
+                tangents = [Array::scalar(left_tangent).unwrap(), Array::scalar(right_tangent).unwrap()],
+                primal_outputs = [Array::scalar(output).unwrap()],
+                tangent_outputs = [Array::scalar(tangent).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = log_add_exp %0 %1
@@ -426,8 +444,10 @@ mod tests {
         // primal, so they are pinned exactly. They follow from replacing only *positive* infinity with zero before
         // the weight subtraction, exactly as JAX's `_logaddexp_jvp` does.
         let jvp = |primals: (f64, f64), tangents: (f64, f64)| {
-            differentiate_at((Array::scalar(primals.0), Array::scalar(primals.1)))
-                .jvp((Array::scalar(tangents.0), Array::scalar(tangents.1)), |(left, right)| left.log_add_exp(&right))
+            differentiate_at((Array::scalar(primals.0).unwrap(), Array::scalar(primals.1).unwrap()))
+                .jvp((Array::scalar(tangents.0).unwrap(), Array::scalar(tangents.1).unwrap()), |(left, right)| {
+                    left.log_add_exp(&right)
+                })
                 .unwrap()
                 .1
                 .to_f64s()[0]

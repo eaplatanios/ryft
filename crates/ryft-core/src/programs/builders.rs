@@ -984,7 +984,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c0 = builder.add_constant(Array::scalar(2.0f64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64).unwrap());
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1], None).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
@@ -998,7 +998,7 @@ mod tests {
         ));
         assert!(matches!(
             builder.atoms.get(c0.index()),
-            Some(Atom::Constant(value)) if *value == Array::scalar(2.0)
+            Some(Atom::Constant(value)) if *value == Array::scalar(2.0).unwrap()
         ));
         assert!(matches!(
             builder.atoms.get(v0.index()),
@@ -1019,7 +1019,10 @@ mod tests {
         assert_eq!(program.input_ids(), vec![i0, i1]);
         assert_eq!(program.output_ids(), vec![v1]);
         assert_eq!(program.instructions().len(), 2);
-        assert_eq!(program.interpret((Array::scalar(2.0f64), Array::scalar(38.0f64))), Ok(Array::scalar(36.0f64)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0f64).unwrap(), Array::scalar(38.0f64).unwrap())),
+            Ok(Array::scalar(36.0f64).unwrap())
+        );
 
         // `splice_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to
         // the provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is
@@ -1033,8 +1036,8 @@ mod tests {
         let outer_program =
             outer.build::<(Array, Array), Array>(outputs, (Placeholder, Placeholder), Placeholder).unwrap();
         assert_eq!(
-            outer_program.interpret((Array::scalar(2.0f64), Array::scalar(38.0f64))),
-            Ok(Array::scalar(36.0f64))
+            outer_program.interpret((Array::scalar(2.0f64).unwrap(), Array::scalar(38.0f64).unwrap())),
+            Ok(Array::scalar(36.0f64).unwrap())
         );
     }
 

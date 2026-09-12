@@ -319,7 +319,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ProgramError, Transpose};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let output = input.transpose([1, 0])?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 /// # Ok(())
@@ -391,8 +391,8 @@ pub trait Transpose: Sized {
     ///
     /// ```rust
     /// # use ryft_core::{Array, ProgramError, Transpose};
-    /// let input = Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]);
-    /// assert_eq!(input.swap_axes(-2, -1)?, Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]));
+    /// let input = Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap();
+    /// assert_eq!(input.swap_axes(-2, -1)?, Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]).unwrap());
     /// # Ok::<(), ProgramError>(())
     /// ```
     #[inline]
@@ -748,7 +748,7 @@ mod tests {
         let operation = TransposeOperation::new(vec![1, 0]);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         // Interpretation reorders the row-major payload.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
             .clone()
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_transpose_interpretation_invalid_permutation() {
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             TransposeOperation::new([0]).interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input]),
             Err(ProgramError::Type(TypeError::invalid("permutation has length 1 but input has rank 2"))),
@@ -774,8 +774,8 @@ mod tests {
     #[test]
     fn test_transpose_partial_evaluation() {
         // Check standard partial evaluation with known and residual operands.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let expected = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let expected = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = TransposeOperation::new(vec![1, 0]),
@@ -800,14 +800,16 @@ mod tests {
         let batched_input = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
             (0..24).map(|value| value as f64).collect(),
-        );
+        )
+        .unwrap();
         let batched_output = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 4.into(), 3.into()])),
             vec![
                 0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 12.0, 16.0, 20.0, 13.0, 17.0, 21.0, 14.0,
                 18.0, 22.0, 15.0, 19.0, 23.0,
             ],
-        );
+        )
+        .unwrap();
         check_operation_batching!(
             @exact,
             operation = TransposeOperation::new(vec![1, 0]),
@@ -826,8 +828,8 @@ mod tests {
             operation = TransposeOperation::new([1, 0]),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]))],
-                outputs = [(@replicated, Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]))],
+                inputs = [(@replicated, Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap())],
+                outputs = [(@replicated, Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]).unwrap())],
             }],
         );
     }
@@ -867,7 +869,8 @@ mod tests {
         let middle_axis_input = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into(), 4.into()])),
             (0..48).map(f64::from).collect(),
-        );
+        )
+        .unwrap();
         let middle_axis_output = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![4.into(), 2.into(), 2.into(), 3.into()])),
             vec![
@@ -875,11 +878,13 @@ mod tests {
                 13.0, 17.0, 21.0, 37.0, 41.0, 45.0, 2.0, 6.0, 10.0, 26.0, 30.0, 34.0, 14.0, 18.0, 22.0, 38.0, 42.0,
                 46.0, 3.0, 7.0, 11.0, 27.0, 31.0, 35.0, 15.0, 19.0, 23.0, 39.0, 43.0, 47.0,
             ],
-        );
+        )
+        .unwrap();
         let trailing_axis_input = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into(), 2.into()])),
             (0..48).map(f64::from).collect(),
-        );
+        )
+        .unwrap();
         let trailing_axis_output = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![4.into(), 2.into(), 3.into(), 2.into()])),
             vec![
@@ -887,7 +892,8 @@ mod tests {
                 26.0, 27.0, 34.0, 35.0, 42.0, 43.0, 4.0, 5.0, 12.0, 13.0, 20.0, 21.0, 28.0, 29.0, 36.0, 37.0, 44.0,
                 45.0, 6.0, 7.0, 14.0, 15.0, 22.0, 23.0, 30.0, 31.0, 38.0, 39.0, 46.0, 47.0,
             ],
-        );
+        )
+        .unwrap();
         check_operation_batching!(
             @exact,
             operation = TransposeOperation::new(vec![2, 0, 1]),
@@ -910,9 +916,10 @@ mod tests {
         // Ragged metadata names physical packed axes, so the lifted transpose must apply its inverse axis map to the
         // ragged dimension and every extent axis while preserving the mapped batch axis.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let extents = Array::matrix(2, 2, vec![1_i32, 4, 2, 3]);
+        let extents = Array::matrix(2, 2, vec![1_i32, 4, 2, 3]).unwrap();
         let packed =
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2, 3, 4]), (0..48).map(f64::from).collect());
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2, 3, 4]), (0..48).map(f64::from).collect())
+                .unwrap();
         let expected_value = packed.transpose([3, 1, 0, 2]).unwrap();
         let input = ArrayBatch::new(packed, BatchAxis::new(1))
             .unwrap()
@@ -982,10 +989,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = TransposeOperation::new(vec![1, 0]),
             cases = [{
-                primals = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])],
-                tangents = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0])],
-                primal_outputs = [Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0])],
-                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 7.0, 6.0, 8.0])],
+                primals = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangents = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0]).unwrap()],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0]).unwrap()],
+                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 7.0, 6.0, 8.0]).unwrap()],
             }],
         );
     }
@@ -999,22 +1006,22 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = TransposeOperation::new(vec![2, 0, 1]),
             cases = [{
-                primals = [Array::from_f64s(cycle_input_type.clone(), (0..24).map(f64::from).collect())],
-                tangents = [Array::from_f64s(cycle_input_type.clone(), (24..48).map(f64::from).collect())],
+                primals = [Array::from_f64s(cycle_input_type.clone(), (0..24).map(f64::from).collect()).unwrap()],
+                tangents = [Array::from_f64s(cycle_input_type.clone(), (24..48).map(f64::from).collect()).unwrap()],
                 primal_outputs = [Array::from_f64s(
                     cycle_output_type.clone(),
                     vec![
                         0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 2.0, 6.0, 10.0,
                         14.0, 18.0, 22.0, 3.0, 7.0, 11.0, 15.0, 19.0, 23.0,
                     ],
-                )],
+                ).unwrap()],
                 tangent_outputs = [Array::from_f64s(
                     cycle_output_type.clone(),
                     vec![
                         24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 25.0, 29.0, 33.0, 37.0, 41.0, 45.0, 26.0, 30.0,
                         34.0, 38.0, 42.0, 46.0, 27.0, 31.0, 35.0, 39.0, 43.0, 47.0,
                     ],
-                )],
+                ).unwrap()],
             }],
         );
     }
@@ -1045,8 +1052,8 @@ mod tests {
             operation = TransposeOperation::new(vec![1, 0]),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))))],
-                output_cotangents = [Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
-                input_cotangents = [Array::matrix(2, 3, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])],
+                output_cotangents = [Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [Array::matrix(2, 3, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap()],
             }],
         );
     }
@@ -1063,14 +1070,14 @@ mod tests {
                 output_cotangents = [Array::from_f64s(
                     cycle_output_type.clone(),
                     (0..24).map(f64::from).collect(),
-                )],
+                ).unwrap()],
                 input_cotangents = [Array::from_f64s(
                     cycle_input_type.clone(),
                     vec![
                         0.0, 6.0, 12.0, 18.0, 1.0, 7.0, 13.0, 19.0, 2.0, 8.0, 14.0, 20.0, 3.0, 9.0, 15.0,
                         21.0, 4.0, 10.0, 16.0, 22.0, 5.0, 11.0, 17.0, 23.0,
                     ],
-                )],
+                ).unwrap()],
             }],
         );
     }
@@ -1119,11 +1126,11 @@ mod tests {
                 output_cotangents = [Array::from_f64s(
                     placed_output_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                )],
+                ).unwrap()],
                 input_cotangents = [Array::from_f64s(
                     placed_input_type,
                     vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
-                )],
+                ).unwrap()],
             }],
         );
     }
@@ -1153,7 +1160,7 @@ mod tests {
     fn test_transpose_move_axis() {
         // `move_axis` shifts intervening dimensions while preserving their relative order.
         // On a matrix, moving axis 0 to position 1 is a plain transpose: the [2, 3] payload becomes [3, 2].
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = matrix.move_axis(0, 1).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
@@ -1168,7 +1175,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).move_axis(0, 2).unwrap();
+        let output = Array::from_f64s(input_type, values).unwrap().move_axis(0, 2).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1249,7 +1256,7 @@ mod tests {
     fn test_transpose_swap_axes() {
         // `swap_axes` exchanges exactly two dimensions and validates both indices.
         // Swapping axes 0 and 1 of a matrix is a plain transpose: the [2, 3] payload becomes [3, 2].
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let swapped = matrix.swap_axes(0, 1).unwrap();
         assert_eq!(
             swapped.r#type().into_owned(),
@@ -1267,7 +1274,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).swap_axes(0, 1).unwrap();
+        let output = Array::from_f64s(input_type, values).unwrap().swap_axes(0, 1).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1293,7 +1300,7 @@ mod tests {
                 if message == "`transpose` swap axis 2 is out of bounds for rank 2",
         ));
         assert!(matches!(
-            Array::scalar(1_i32).swap_axes(0, 0),
+            Array::scalar(1_i32).unwrap().swap_axes(0, 0),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`transpose` swap axis 0 is out of bounds for rank 0",
         ));
@@ -1363,7 +1370,7 @@ mod tests {
     #[test]
     fn test_array_transpose() {
         // Rank-2 swap of a row-major 2x3 payload.
-        let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
+        let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap().transpose(vec![1, 0]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
@@ -1371,17 +1378,21 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // The eager kernel reorders exact typed payloads without changing their element representation.
-        let input = Array::matrix(2, 3, vec![false, true, true, false, false, true]);
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![false, false, true, false, true, true])));
-        let input = Array::matrix(2, 3, (0..6).collect::<Vec<i32>>());
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![0, 3, 1, 4, 2, 5])));
-        let input = Array::matrix(2, 3, (1..=6).map(f8e8m0fnu::from_bits).collect());
+        let input = Array::matrix(2, 3, vec![false, true, true, false, false, true]).unwrap();
+        assert_eq!(
+            input.transpose([1, 0]),
+            Ok(Array::matrix(3, 2, vec![false, false, true, false, true, true]).unwrap())
+        );
+        let input = Array::matrix(2, 3, (0..6).collect::<Vec<i32>>()).unwrap();
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![0, 3, 1, 4, 2, 5]).unwrap()));
+        let input = Array::matrix(2, 3, (1..=6).map(f8e8m0fnu::from_bits).collect()).unwrap();
         let expected = [1, 4, 2, 5, 3, 6].map(f8e8m0fnu::from_bits).to_vec();
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected)));
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected).unwrap()));
         let input =
-            Array::matrix(2, 3, (0..6).map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).collect());
+            Array::matrix(2, 3, (0..6).map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).collect())
+                .unwrap();
         let expected = [0, 3, 1, 4, 2, 5].map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).to_vec();
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected)));
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected).unwrap()));
     }
 
     #[test]
@@ -1399,13 +1410,13 @@ mod tests {
         let input_type =
             ArrayType::new_static(DataType::I32, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
         let input = Array::from_elements(input_type, &[1_i32, 2, 3, 4]).unwrap();
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(2, 2, vec![1_i32, 3, 2, 4])));
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(2, 2, vec![1_i32, 3, 2, 4]).unwrap()));
 
         // Tiled storage is decoded before permuting, including the padding in a partial tile.
         let input_type = ArrayType::new_static(DataType::I32, [2, 3])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
         let input = Array::from_elements(input_type, &[1_i32, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6])));
+        assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]).unwrap()));
     }
 
     #[test]
@@ -1416,7 +1427,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).transpose(vec![2, 0, 1]).unwrap();
+        let output = Array::from_f64s(input_type, values).unwrap().transpose(vec![2, 0, 1]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1436,11 +1447,11 @@ mod tests {
     #[test]
     fn test_array_transpose_empty() {
         // Rank-0 and empty payloads pass through unchanged.
-        let output = Array::scalar(42.0).transpose(vec![]).unwrap();
+        let output = Array::scalar(42.0).unwrap().transpose(vec![]).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output.to_f64s(), vec![42.0]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
-        let output = Array::from_f64s(input_type, Vec::new()).transpose(vec![1, 0]).unwrap();
+        let output = Array::from_f64s(input_type, Vec::new()).unwrap().transpose(vec![1, 0]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(0)])),
@@ -1470,7 +1481,7 @@ mod tests {
     fn test_array_transpose_invalid_permutation() {
         // An invalid permutation is a clean error rather than an out-of-bounds panic, since the value-level transpose
         // validates the permutation through the type-level rule before indexing.
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             matrix.transpose(vec![1]),
             Err(ProgramError::Type(TypeError::invalid("permutation has length 1 but input has rank 2"))),

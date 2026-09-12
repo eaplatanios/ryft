@@ -14,7 +14,7 @@ include!("support/allocation_measurement.rs");
 
 /// Constructs a large stored reference array outside the measured interval.
 fn stored_array() -> ArrayIrValue<Array> {
-    ArrayIrValue::Array(Array::vector((0..4096).map(|value| value as f32).collect()))
+    ArrayIrValue::Array(Array::vector((0..4096).map(|value| value as f32).collect()).unwrap())
 }
 
 /// Constructs a stored first-class runtime dimension outside the measured interval.
@@ -26,7 +26,7 @@ fn stored_dimension() -> ArrayIrValue<Array> {
 #[test]
 fn test_large_array_clone_does_not_allocate_payload_storage() {
     let small_statistics = measure_allocations(
-        || Array::vector(vec![0.0_f32]),
+        || Array::vector(vec![0.0_f32]).unwrap(),
         |array| {
             let payload = array.storage_bytes().as_ptr();
             let cloned = black_box(&array).clone();
@@ -35,7 +35,7 @@ fn test_large_array_clone_does_not_allocate_payload_storage() {
         },
     );
     let large_statistics = measure_allocations(
-        || Array::vector((0..4096).map(|value| value as f32).collect()),
+        || Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
         |array| {
             let payload = array.storage_bytes().as_ptr();
             let cloned = black_box(&array).clone();

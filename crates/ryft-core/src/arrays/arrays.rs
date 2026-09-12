@@ -62,9 +62,9 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// ```rust
 /// # use ryft_core::arrays::Array;
 /// # use ryft_core::operations::math::Add;
-/// let left = Array::vector(vec![1.0, 2.0]);
-/// let right = Array::vector(vec![3.0, 4.0]);
-/// assert_eq!(left.add(&right).unwrap(), Array::vector(vec![4.0, 6.0]));
+/// let left = Array::vector(vec![1.0, 2.0]).unwrap();
+/// let right = Array::vector(vec![3.0, 4.0]).unwrap();
+/// assert_eq!(left.add(&right).unwrap(), Array::vector(vec![4.0, 6.0]).unwrap());
 /// ```
 #[derive(Clone, Parameter)]
 pub struct Array {
@@ -93,8 +93,29 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    /// Creates a new [`Array`] from `bytes` assuming it represents the concatenated densely packed logical element
-    /// encodings in row-major order.
+    /// Creates a new [`Array`] from concatenated logical element encodings in row-major order. Places each element
+    /// according to the provided type's layout and fills any storage holes or tile padding with zeros. In contrast,
+    /// [`Array::new`] expects bytes that already represent the complete physical storage, including holes and padding.
+    /// The two byte representations coincide for a dense row-major layout.
+    ///
+    /// # Example
+    ///
+    /// A two-element [`DataType::U8`] array with a byte stride of two requires a zero-filled hole between its elements:
+    ///
+    /// ```
+    /// # use ryft_core::{Array, ArrayType, DataType, Layout, StridedLayout};
+    /// #
+    /// # fn example() -> Result<(), ryft_core::ProgramError> {
+    /// let array_type = ArrayType::new_static(DataType::U8, [2])
+    ///     .with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+    /// let array = Array::from_logical_bytes(array_type.clone(), &[10, 20])?;
+    /// assert_eq!(array.logical_bytes(), vec![10, 20]);
+    /// assert_eq!(array.storage_bytes(), &[10, 0, 20]);
+    /// assert_eq!(array, Array::new(array_type, vec![10, 0, 20])?);
+    /// # Ok(())
+    /// # }
+    /// # example().unwrap();
+    /// ```
     #[inline]
     pub fn from_logical_bytes(r#type: ArrayType, bytes: &[u8]) -> Result<Self, ProgramError> {
         let bytes = encode_logical_bytes(&r#type, bytes)?;
@@ -103,47 +124,50 @@ impl Array {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Creates a rank-0 array containing `value`.
-    pub fn scalar<T: ArrayElement>(value: T) -> Self {
-        Self::from_elements(ArrayType::scalar(T::data_type()), &[value]).unwrap_or_else(|error| panic!("{error}"))
+    /// Creates a new rank-0 [`Array`] containing `value`.
+    #[inline]
+    pub fn scalar<T: ArrayElement>(value: T) -> Result<Self, ProgramError> {
+        Self::from_elements(ArrayType::scalar(T::data_type()), &[value])
     }
 
-    /// Creates a rank-1 array containing `elements` in logical order.
-    pub fn vector<T: ArrayElement>(elements: Vec<T>) -> Self {
-        let r#type = ArrayType::new(T::data_type(), Shape::new(vec![Dimension::Static(elements.len())]));
-        Self::from_elements(r#type, &elements).unwrap_or_else(|error| panic!("{error}"))
+    /// Creates a new rank-1 [`Array`] containing `elements` in logical order.
+    #[inline]
+    pub fn vector<T: ArrayElement>(elements: Vec<T>) -> Result<Self, ProgramError> {
+        Self::from_elements(
+            ArrayType::new(T::data_type(), Shape::new(vec![Dimension::Static(elements.len())])),
+            &elements,
+        )
     }
 
-    /// Creates a rank-2 array containing `elements` in logical row-major order. Panics if the element count does not
-    /// equal `rows * columns`.
-    pub fn matrix<T: ArrayElement>(rows: usize, columns: usize, elements: Vec<T>) -> Self {
-        let r#type =
-            ArrayType::new(T::data_type(), Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]));
-        Self::from_elements(r#type, &elements).unwrap_or_else(|error| panic!("{error}"))
+    /// Creates a new rank-2 [`Array`] containing `elements` in logical row-major order. Returns an error if the element
+    /// count does not equal `rows * columns` or the shape cannot be represented.
+    #[inline]
+    pub fn matrix<T: ArrayElement>(rows: usize, columns: usize, elements: Vec<T>) -> Result<Self, ProgramError> {
+        Self::from_elements(
+            ArrayType::new(T::data_type(), Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)])),
+            &elements,
+        )
     }
 
-    /// Creates an array from its staged array type and a row-major `f64` payload, converting each element into the
-    /// element data type declared by `type` (e.g., rounding into a low-precision floating-point encoding). This is
-    /// test-writing sugar for payloads written as plain floating-point literals, and it panics when an element
-    /// cannot be converted or when the payload does not match `type`, because in tests such a failure is the
-    /// assertion failing.
+    /// Creates a new [`Array`] from an array type and a row-major `f64` payload, converting each element into the
+    /// declared element data type (e.g., rounding into a low-precision floating-point encoding). Returns an error if
+    /// an element cannot be converted, the payload size does not match the type, or the type cannot describe
+    /// materialized storage. Token and residual-zero element types do not support conversion from `f64`.
     ///
     /// # Parameters
     ///
-    ///   - `type`: Staged array type of the array.
+    ///   - `type`: Array type, including the destination element data type and a fully static shape.
     ///   - `values`: Row-major payload of the array, converted elementwise into `type`'s element data type.
-    pub fn from_f64s(r#type: ArrayType, values: Vec<f64>) -> Self {
+    pub fn from_f64s(r#type: ArrayType, values: Vec<f64>) -> Result<Self, ProgramError> {
         let data_type = r#type.data_type();
         if data_type.is_token() || data_type.is_zero() {
-            panic!("cannot convert `f64` values to the `{data_type}` data type");
+            return Err(
+                TypeError::invalid(format!("cannot convert `f64` values to the `{data_type}` data type")).into()
+            );
         }
         dispatch_on_array_element_type!(data_type, |Element| {
-            let elements = values
-                .into_iter()
-                .map(Element::from_real)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap_or_else(|error| panic!("{error}"));
-            Self::from_elements(r#type, &elements).unwrap_or_else(|error| panic!("{error}"))
+            let elements = values.into_iter().map(Element::from_real).collect::<Result<Vec<_>, _>>()?;
+            Self::from_elements(r#type, &elements)
         })
     }
 
@@ -1159,33 +1183,85 @@ mod tests {
     }
 
     #[test]
-    fn test_array_convenience_constructors() {
-        // The scalar, vector, and matrix constructors infer the element data type from their payloads.
-        assert_eq!(Array::scalar(2.5).r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(Array::vector(vec![1.0f32, 2.0]).r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
+    fn test_array_scalar() {
+        assert_eq!(Array::scalar(2.5).unwrap().r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(Array::scalar(2.5), Array::from_elements(ArrayType::scalar(DataType::F64), &[2.5]));
+    }
+
+    #[test]
+    fn test_array_vector() {
         assert_eq!(
-            Array::vector(vec![true, false]).r#type().into_owned(),
-            ArrayType::new_static(DataType::Boolean, [2])
+            Array::vector(vec![1.0f32, 2.0]),
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0f32, 2.0]),
         );
         assert_eq!(
-            Array::matrix(2, 2, vec![1, 2, 3, 4]).r#type().into_owned(),
-            ArrayType::new_static(DataType::I32, [2, 2])
+            Array::vector(vec![true, false]).unwrap().r#type().into_owned(),
+            ArrayType::new_static(DataType::Boolean, [2]),
         );
-        // An empty vector defaults to `f64`.
-        assert_eq!(Array::vector(Vec::<f64>::new()).r#type().into_owned(), ArrayType::new_static(DataType::F64, [0]));
-        // `from_f64s` converts the payload into the declared element data type, including exact low-precision
-        // floating-point encodings (1.5 is representable in `f8e4m3fn` as `0x3c`).
-        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.5, -1.5]);
+        assert_eq!(Array::vector(Vec::<f64>::new()).unwrap().elements::<f64>(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn test_array_matrix() {
+        assert_eq!(
+            Array::matrix(2, 2, vec![1, 2, 3, 4]),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[1, 2, 3, 4]),
+        );
+        assert_eq!(Array::matrix(0, 2, Vec::<i32>::new()).unwrap().elements::<i32>(), Ok(Vec::new()));
+
+        // Invalid sizes are returned as errors before attempting to allocate output storage.
+        let array_type = ArrayType::new_static(DataType::I32, [2, 2]);
+        assert!(matches!(
+            Array::matrix(2, 2, vec![1, 2, 3]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!("array type {array_type} requires 4 logical elements but got 3"),
+        ));
+        let array_type = ArrayType::new_static(DataType::U8, [usize::MAX, 2]);
+        assert!(matches!(
+            Array::matrix(usize::MAX, 2, Vec::<u8>::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!("array type {array_type} requires more bytes than can be represented"),
+        ));
+    }
+
+    #[test]
+    fn test_array_from_f64s() {
+        // Conversion preserves the destination type's rounding and exact low-precision encodings.
+        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.5, -1.5]).unwrap();
         assert_eq!(array.elements::<f8e4m3fn>().unwrap()[0].to_bits(), 0x3c);
         assert_eq!(array.elements::<f8e4m3fn>().unwrap()[1].to_bits(), 0xbc);
-        let array = Array::from_f64s(ArrayType::new_static(DataType::I32, [2]), vec![1.0, -2.0]);
+        let array = Array::from_f64s(ArrayType::new_static(DataType::I32, [2]), vec![1.0, -2.0]).unwrap();
         assert_eq!(array.elements::<i32>(), Ok(vec![1, -2]));
+
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        assert!(matches!(
+            Array::from_f64s(array_type.clone(), vec![1.0]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!("array type {array_type} requires 2 logical elements but got 1"),
+        ));
+        for data_type in [DataType::Token, DataType::Zero] {
+            assert!(matches!(
+                Array::from_f64s(ArrayType::scalar(data_type), vec![0.0]),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == format!("cannot convert `f64` values to the `{data_type}` data type"),
+            ));
+        }
+        assert!(matches!(
+            Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![0.0]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f8e8m0fnu` cannot represent zero",
+        ));
+        assert!(matches!(
+            Array::from_f64s(ArrayType::scalar(DataType::F4E2M1FN), vec![f64::NAN]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type `f4e2m1fn` cannot represent NaN",
+        ));
     }
 
     #[test]
     fn test_array_map_elements() {
         // `map_elements` applies a typed elementwise function, allowing input and output element types to differ.
-        let integers = Array::vector(vec![1i32, -2, 3]);
+        let integers = Array::vector(vec![1i32, -2, 3]).unwrap();
         let doubled = integers.map_elements::<i32, i32>(integers.r#type().into_owned(), |value| Ok(value * 2)).unwrap();
         assert_eq!(doubled.elements::<i32>(), Ok(vec![2, -4, 6]));
         let negative = integers
@@ -1207,7 +1283,7 @@ mod tests {
     #[test]
     fn test_array_map_element_pairs() {
         let left = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1i32, 3]).unwrap();
-        let right = Array::vector(vec![0i32, 2, 4]);
+        let right = Array::vector(vec![0i32, 2, 4]).unwrap();
 
         // Broadcasting preserves the input element type while allowing a different output element type.
         let comparisons = left
@@ -1263,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_array_gather_elements() {
-        let integers = Array::vector(vec![1i32, -2, 3]);
+        let integers = Array::vector(vec![1i32, -2, 3]).unwrap();
         // `gather_elements` copies whole element encodings through a flat index mapping without decoding them, so it
         // serves reversal, repetition, and selection over any element data type, including sub-byte ones.
         let reversed =
@@ -1292,9 +1368,9 @@ mod tests {
 
     #[test]
     fn test_array_to_f64s() {
-        assert_eq!(Array::vector(vec![1.5, 2.5]).to_f64s(), vec![1.5, 2.5]);
-        assert_eq!(Array::vector(vec![true, false]).to_f64s(), vec![1.0, 0.0]);
-        assert_eq!(Array::vector(vec![1i32, -2]).to_f64s(), vec![1.0, -2.0]);
+        assert_eq!(Array::vector(vec![1.5, 2.5]).unwrap().to_f64s(), vec![1.5, 2.5]);
+        assert_eq!(Array::vector(vec![true, false]).unwrap().to_f64s(), vec![1.0, 0.0]);
+        assert_eq!(Array::vector(vec![1i32, -2]).unwrap().to_f64s(), vec![1.0, -2.0]);
         assert_eq!(
             Array::from_elements(
                 ArrayType::new_static(DataType::I4, [2]),
@@ -1305,14 +1381,17 @@ mod tests {
             vec![-8.0, 7.0],
         );
         // Low-precision floating-point elements decode to the exact values they denote.
-        assert_eq!(Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![1.5]).to_f64s(), vec![1.5]);
+        assert_eq!(
+            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![1.5]).unwrap().to_f64s(),
+            vec![1.5]
+        );
     }
 
     #[test]
     #[should_panic(expected = "cannot view an array of complex element data type `c128` as `f64` values")]
     fn test_array_to_f64s_rejects_complex_arrays() {
-        let real = Array::vector(vec![1.0, 2.0]);
-        let imaginary = Array::vector(vec![3.0, 4.0]);
+        let real = Array::vector(vec![1.0, 2.0]).unwrap();
+        let imaginary = Array::vector(vec![3.0, 4.0]).unwrap();
         let _ = real.complex(&imaginary).unwrap().to_f64s();
     }
 
@@ -1350,20 +1429,20 @@ mod tests {
     fn test_array_display() {
         // Rank zero renders as a scalar and each higher rank contributes one bracketed level in logical row-major
         // order. Real floating-point payloads keep a decimal point, while other payloads use scalar rendering.
-        assert_eq!(Array::scalar(1.0).to_string(), "1.0");
-        assert_eq!(Array::vector(vec![1.0, 2.5]).to_string(), "[1.0, 2.5]");
-        assert_eq!(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).to_string(), "[[1.0, 2.0], [3.0, 4.0]]");
+        assert_eq!(Array::scalar(1.0).unwrap().to_string(), "1.0");
+        assert_eq!(Array::vector(vec![1.0, 2.5]).unwrap().to_string(), "[1.0, 2.5]");
+        assert_eq!(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap().to_string(), "[[1.0, 2.0], [3.0, 4.0]]");
         assert_eq!(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 2]), &[1.0, 2.0, 3.0, 4.0])
                 .unwrap()
                 .to_string(),
             "[[[1.0, 2.0]], [[3.0, 4.0]]]",
         );
-        assert_eq!(Array::vector(vec![1i32, 2]).to_string(), "[1, 2]");
-        assert_eq!(Array::vector(vec![true, false]).to_string(), "[true, false]");
-        let complex = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
+        assert_eq!(Array::vector(vec![1i32, 2]).unwrap().to_string(), "[1, 2]");
+        assert_eq!(Array::vector(vec![true, false]).unwrap().to_string(), "[true, false]");
+        let complex = Array::vector(vec![1.0]).unwrap().complex(&Array::vector(vec![2.0]).unwrap()).unwrap();
         assert_eq!(complex.to_string(), "[1+2i]");
-        assert_eq!(Array::vector(Vec::<f64>::new()).to_string(), "[]");
+        assert_eq!(Array::vector(Vec::<f64>::new()).unwrap().to_string(), "[]");
         assert_eq!(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 0]), &[] as &[f64])
                 .unwrap()
@@ -1401,24 +1480,28 @@ mod tests {
     #[test]
     fn test_array_equality() {
         // Exact equality requires identical types and elementwise-equal payloads.
-        assert_eq!(Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0, 2.0]));
-        assert_ne!(Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0, 2.5]));
-        assert_ne!(Array::vector(vec![1.0f32]), Array::vector(vec![1.0f64]));
+        assert_eq!(Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap());
+        assert_ne!(Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![1.0, 2.5]).unwrap());
+        assert_ne!(Array::vector(vec![1.0f32]).unwrap(), Array::vector(vec![1.0f64]).unwrap());
         // Low-precision floating-point elements compare through their decoded values, so signed zeros compare equal.
-        let positive_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![0.0]);
-        let negative_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![-0.0]);
+        let positive_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![0.0]).unwrap();
+        let negative_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![-0.0]).unwrap();
         assert_eq!(positive_zero, negative_zero);
         // Equality decodes typed values directly, retaining IEEE NaN and signed-zero semantics rather than relying on
         // physical byte equality.
-        let positive_zero = Array::vector(vec![0.0f32]);
-        let negative_zero = Array::vector(vec![-0.0f32]);
+        let positive_zero = Array::vector(vec![0.0f32]).unwrap();
+        let negative_zero = Array::vector(vec![-0.0f32]).unwrap();
         assert_eq!(positive_zero, negative_zero);
-        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
+        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]).unwrap();
         assert_ne!(nan, nan.clone());
         // Approximate equality delegates to the elementwise scalar approximation.
-        assert_abs_diff_eq!(Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0 + 1e-10, 2.0]), epsilon = 1e-9);
-        let left = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
-        let right = Array::vector(vec![1.0 + 1e-10]).complex(&Array::vector(vec![2.0])).unwrap();
+        assert_abs_diff_eq!(
+            Array::vector(vec![1.0, 2.0]).unwrap(),
+            Array::vector(vec![1.0 + 1e-10, 2.0]).unwrap(),
+            epsilon = 1e-9
+        );
+        let left = Array::vector(vec![1.0]).unwrap().complex(&Array::vector(vec![2.0]).unwrap()).unwrap();
+        let right = Array::vector(vec![1.0 + 1e-10]).unwrap().complex(&Array::vector(vec![2.0]).unwrap()).unwrap();
         assert_abs_diff_eq!(left, right, epsilon = 1e-9);
         // Approximate equality reads low-precision, arbitrarily laid-out values directly from physical storage.
         let r#type =
@@ -1434,13 +1517,13 @@ mod tests {
 
     #[test]
     fn test_array_concretize_bool() {
-        let vector = Array::vector(vec![0.0, 2.5]);
-        let boolean = vector.compare(&Array::vector(vec![0.0, 0.0]), ComparisonDirection::NotEqual).unwrap();
+        let vector = Array::vector(vec![0.0, 2.5]).unwrap();
+        let boolean = vector.compare(&Array::vector(vec![0.0, 0.0]).unwrap(), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.r#type().into_owned(), ArrayType::new_static(DataType::Boolean, [2]));
-        assert_eq!(boolean, Array::vector(vec![false, true]));
-        assert_eq!(Array::scalar(true).concretize(), Ok(true));
-        let vector_result: Result<bool, ProgramError> = Array::vector(vec![true, false]).concretize();
-        let scalar_result: Result<bool, ProgramError> = Array::scalar(1.0).concretize();
+        assert_eq!(boolean, Array::vector(vec![false, true]).unwrap());
+        assert_eq!(Array::scalar(true).unwrap().concretize(), Ok(true));
+        let vector_result: Result<bool, ProgramError> = Array::vector(vec![true, false]).unwrap().concretize();
+        let scalar_result: Result<bool, ProgramError> = Array::scalar(1.0).unwrap().concretize();
         assert_eq!(
             vector_result,
             Err(ProgramError::Concretization {
@@ -1457,11 +1540,11 @@ mod tests {
 
     #[test]
     fn test_array_concretize_i128() {
-        let signed: Result<i128, ProgramError> = Array::scalar(i64::MIN).concretize();
-        let unsigned: Result<i128, ProgramError> = Array::scalar(u64::MAX).concretize();
+        let signed: Result<i128, ProgramError> = Array::scalar(i64::MIN).unwrap().concretize();
+        let unsigned: Result<i128, ProgramError> = Array::scalar(u64::MAX).unwrap().concretize();
         assert_eq!(signed, Ok(i128::from(i64::MIN)));
         assert_eq!(unsigned, Ok(i128::from(u64::MAX)));
-        let invalid: Result<i128, ProgramError> = Array::scalar(1.0_f32).concretize();
+        let invalid: Result<i128, ProgramError> = Array::scalar(1.0_f32).unwrap().concretize();
         assert_eq!(
             invalid,
             Err(ProgramError::Concretization {
@@ -1474,7 +1557,13 @@ mod tests {
     fn test_array_min() {
         // Minimum preserves the selected operand's IEEE signed-zero encoding.
         assert_eq!(
-            Array::scalar(-0.0f32).min(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            Array::scalar(-0.0f32)
+                .unwrap()
+                .min(&Array::scalar(0.0f32).unwrap())
+                .unwrap()
+                .elements::<f32>()
+                .unwrap()[0]
+                .to_bits(),
             (-0.0f32).to_bits(),
         );
     }
@@ -1484,11 +1573,18 @@ mod tests {
         // Elementwise extrema retain the selected operand's NaN payload and IEEE signed-zero encoding.
         let nan = f32::from_bits(0x7fc0_1234);
         assert_eq!(
-            Array::scalar(nan).max(&Array::scalar(1.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            Array::scalar(nan).unwrap().max(&Array::scalar(1.0f32).unwrap()).unwrap().elements::<f32>().unwrap()[0]
+                .to_bits(),
             nan.to_bits(),
         );
         assert_eq!(
-            Array::scalar(-0.0f32).max(&Array::scalar(0.0f32)).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            Array::scalar(-0.0f32)
+                .unwrap()
+                .max(&Array::scalar(0.0f32).unwrap())
+                .unwrap()
+                .elements::<f32>()
+                .unwrap()[0]
+                .to_bits(),
             0.0f32.to_bits(),
         );
     }

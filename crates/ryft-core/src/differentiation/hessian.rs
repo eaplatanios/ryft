@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(reparameterized.values(), &[5.0, 6.0, 7.0, 8.0]);
 
         // A scalar-valued function of two scalar inputs produces the expected dense 2-by-2 Hessian blocks.
-        let scalar_hessian = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+        let scalar_hessian = differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .hessian(|(x, y)| Ok(x.clone() * y + x.sin()?))
             .unwrap();
         let blocks = scalar_hessian.iter_blocks().collect::<Vec<_>>();
@@ -412,7 +412,7 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 0.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Hessian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
         let widened_hessian = differentiate_at(input).hessian(|value| value.sin()).unwrap();
         let block = widened_hessian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
@@ -420,7 +420,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let zero_sized_hessian = differentiate_at(Array::from_f64s(r#type, Vec::new()))
+        let zero_sized_hessian = differentiate_at(Array::from_f64s(r#type, Vec::new()).unwrap())
             .hessian(|input| Ok(input.clone() * input))
             .unwrap();
         let block = zero_sized_hessian.iter_blocks().next().unwrap();
@@ -428,7 +428,7 @@ mod tests {
         assert!(block.value().storage_bytes().is_empty());
 
         // Structured outputs retain a distinct Hessian block for each output leaf.
-        let structured_hessian = differentiate_at(Array::scalar(2.0))
+        let structured_hessian = differentiate_at(Array::scalar(2.0).unwrap())
             .hessian(|x| Ok((x.clone() * x.clone(), x.clone() * x.clone() * x)))
             .unwrap();
         let blocks = structured_hessian.iter_blocks().collect::<Vec<_>>();
@@ -442,9 +442,10 @@ mod tests {
 
         // Mixed-rank structured inputs materialize the entire block Cartesian product with output axes leading both
         // input-axis groups.
-        let mixed_rank_hessian = differentiate_at((Array::vector(vec![1.0, 2.0]), Array::scalar(3.0)))
-            .hessian(|(vector, scalar)| Ok((vector.clone() * vector, scalar.clone() * scalar)))
-            .unwrap();
+        let mixed_rank_hessian =
+            differentiate_at((Array::vector(vec![1.0, 2.0]).unwrap(), Array::scalar(3.0).unwrap()))
+                .hessian(|(vector, scalar)| Ok((vector.clone() * vector, scalar.clone() * scalar)))
+                .unwrap();
         let blocks = mixed_rank_hessian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 8);
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
@@ -471,7 +472,7 @@ mod tests {
         assert_eq!(blocks[7].value().to_f64s(), vec![2.0]);
 
         // Holomorphic Hessians remain complex linear at both derivative levels.
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
         let holomorphic_hessian =
             differentiate_at(input).holomorphic().hessian(|x| Ok(x.clone() * x.clone() * x)).unwrap();
         assert_eq!(
@@ -483,7 +484,7 @@ mod tests {
     #[test]
     fn test_hessian_with_auxiliary_outputs() {
         let evaluations = Cell::new(0);
-        let (ordinary_hessian, auxiliary) = differentiate_at(Array::scalar(2.0))
+        let (ordinary_hessian, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
             .with_auxiliary_output()
             .hessian(|x| {
                 evaluations.set(evaluations.get() + 1);
@@ -494,7 +495,7 @@ mod tests {
         assert_abs_diff_eq!(ordinary_hessian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
         assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
         let (holomorphic_hessian, auxiliary) = differentiate_at(input.clone())
             .with_auxiliary_output()
             .holomorphic()
@@ -511,7 +512,7 @@ mod tests {
     fn test_hessian_nested_in_jacobian_forward() {
         // For f(x) = x³, the Hessian is f″(x) = 6x. Differentiating that materialized Hessian with a forward
         // Jacobian computes the third derivative f‴(x) = 6.
-        let derivative = differentiate_at(Array::scalar(2.0))
+        let derivative = differentiate_at(Array::scalar(2.0).unwrap())
             .jacobian_forward(|input| {
                 let context = input.context().clone();
                 let hessian = context

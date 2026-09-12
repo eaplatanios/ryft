@@ -116,10 +116,13 @@ mod tests {
     #[test]
     fn test_or_interpretation() {
         // Check elementwise and scalar-broadcast eager value semantics.
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
+        let left = Array::vector(vec![true, true, false, false]).unwrap();
+        let right = Array::vector(vec![true, false, true, false]).unwrap();
         assert_eq!((left | right).elements::<bool>(), Ok(vec![true, true, true, false]));
-        assert_eq!((Array::vector(vec![true, false]) | Array::scalar(false)).elements::<bool>(), Ok(vec![true, false]));
+        assert_eq!(
+            (Array::vector(vec![true, false]).unwrap() | Array::scalar(false).unwrap()).elements::<bool>(),
+            Ok(vec![true, false])
+        );
     }
 
     #[test]
@@ -127,8 +130,8 @@ mod tests {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = OrOperation::new(),
-            inputs = [Array::scalar(true), Array::scalar(false)],
-            expected = Array::scalar(true),
+            inputs = [Array::scalar(true).unwrap(), Array::scalar(false).unwrap()],
+            expected = Array::scalar(true).unwrap(),
         );
     }
 
@@ -141,10 +144,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![true, false])),
-                    (@replicated, Array::scalar(false)),
+                    (@mapped(axis = 0), Array::vector(vec![true, false]).unwrap()),
+                    (@replicated, Array::scalar(false).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]).unwrap())],
             }],
         );
     }
@@ -156,13 +159,13 @@ mod tests {
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
-                    DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap(),
-                    DifferentiationDual::new_with_zero_tangent(Array::scalar(false)).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(true).unwrap()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(false).unwrap()).unwrap(),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(true));
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
@@ -196,8 +199,8 @@ mod tests {
 
     #[test]
     fn test_or_for_array() {
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
-        assert_eq!(left.or(&right).unwrap(), Array::vector(vec![true, true, true, false]));
+        let left = Array::vector(vec![true, true, false, false]).unwrap();
+        let right = Array::vector(vec![true, false, true, false]).unwrap();
+        assert_eq!(left.or(&right).unwrap(), Array::vector(vec![true, true, true, false]).unwrap());
     }
 }

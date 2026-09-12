@@ -334,24 +334,24 @@ mod tests {
             ],
         );
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
-        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 1.0, 3.0]));
+        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 1.0, 3.0]).unwrap());
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])), indices])
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()), indices])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![20.0_f64, 20.0, 40.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![20.0_f64, 20.0, 40.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 2.0, 4.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 2.0, 4.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0, 5.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0, 5.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 0.0, 5.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 0.0, 5.0]).unwrap())]),
         );
     }
 
@@ -385,33 +385,33 @@ mod tests {
         let linearization = program.linearize().unwrap();
 
         assert_eq!(linearization.residual_count(), 1);
-        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]));
+        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]).unwrap());
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
                 indices,
-                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap()),
             ])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 12.0, 3.0, 24.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 12.0, 3.0, 24.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
         let mut tangent_inputs = vec![
-            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
-            ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0]).unwrap()),
         ];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 7.0, 3.0, 10.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 7.0, 3.0, 10.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
-                ArrayIrValue::Array(Array::vector(vec![20.0_f64, 40.0])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![20.0_f64, 40.0]).unwrap()),
             ]),
         );
     }
@@ -472,13 +472,13 @@ mod tests {
         assert_eq!(
             jvp.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0])),
-                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0])),
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0])),
+                ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 11.0, 1.0, 21.0])),
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 0.0, 2.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 11.0, 1.0, 21.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 0.0, 2.0]).unwrap()),
             ]),
         );
     }
@@ -486,8 +486,8 @@ mod tests {
     #[test]
     fn test_array_gather() {
         // Gather rows 2 and 0 of a 3x2 matrix.
-        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let indices = Array::matrix(2, 1, vec![2i64, 0]);
+        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let indices = Array::matrix(2, 1, vec![2i64, 0]).unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let gathered = operand.gather(&indices, &operation).unwrap();
         assert_eq!(gathered.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
@@ -496,7 +496,7 @@ mod tests {
         // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
         // represent zero.
         let operand = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
-        let indices = Array::matrix(1, 1, vec![1i64]);
+        let indices = Array::matrix(1, 1, vec![1i64]).unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
         assert_eq!(
             operand.gather(&indices, &operation),
@@ -523,19 +523,22 @@ mod tests {
     #[test]
     fn test_array_scatter() {
         // Scatter-add updates 10 and 20 into elements 3 and 0 of a vector.
-        let operand = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let indices = Array::from_f64s(ArrayType::new_static(DataType::I64, [2, 1]), vec![3.0, 0.0]);
-        let updates = Array::vector(vec![10.0, 20.0]);
+        let operand = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let indices = Array::from_f64s(ArrayType::new_static(DataType::I64, [2, 1]), vec![3.0, 0.0]).unwrap();
+        let updates = Array::vector(vec![10.0, 20.0]).unwrap();
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
         let scattered = operand.scatter(&indices, &updates, &operation).unwrap();
-        assert_eq!(scattered, Array::vector(vec![21.0, 2.0, 3.0, 14.0]));
+        assert_eq!(scattered, Array::vector(vec![21.0, 2.0, 3.0, 14.0]).unwrap());
 
         // Scatter decodes sub-byte indices through their physical layout without materializing a scalar index vector.
         let indices_type =
             ArrayType::new_static(DataType::I4, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
         let indices = Array::from_elements(indices_type, &[i4::new(3).unwrap(), i4::new(0).unwrap()]).unwrap();
-        assert_eq!(operand.scatter(&indices, &updates, &operation).unwrap(), Array::vector(vec![21.0, 2.0, 3.0, 14.0]),);
+        assert_eq!(
+            operand.scatter(&indices, &updates, &operation).unwrap(),
+            Array::vector(vec![21.0, 2.0, 3.0, 14.0]).unwrap(),
+        );
 
         // Operand and update payloads are decoded and written through their independent physical layouts.
         let operand_type =
@@ -550,9 +553,9 @@ mod tests {
         );
 
         // Sub-byte arithmetic wraps in the declared bit width, including repeated modular addition.
-        let operand = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
-        let indices = Array::matrix(2, 1, vec![0i32, 1]);
-        let updates = Array::vector(vec![i4::new(2).unwrap(), i4::new(-3).unwrap()]);
+        let operand = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        let indices = Array::matrix(2, 1, vec![0i32, 1]).unwrap();
+        let updates = Array::vector(vec![i4::new(2).unwrap(), i4::new(-3).unwrap()]).unwrap();
         assert_eq!(
             operand.scatter(&indices, &updates, &operation).unwrap().elements::<i4>(),
             Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
@@ -561,7 +564,7 @@ mod tests {
         // Overwrite moves encodings without requiring arithmetic identities, including for formats without zero.
         let operand = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
         let updates = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x81]).unwrap();
-        let indices = Array::matrix(1, 1, vec![0i32]);
+        let indices = Array::matrix(1, 1, vec![0i32]).unwrap();
         let operation = ScatterOperation::new(
             ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
             ScatterReductionKind::Overwrite,
@@ -572,9 +575,9 @@ mod tests {
         );
 
         // Extrema follow JAX for floating-point NaNs and signed zero and for lexicographically ordered complex values.
-        let indices = Array::matrix(2, 1, vec![0i32, 1]);
-        let operand = Array::vector(vec![f32::NAN, -0.0]);
-        let updates = Array::vector(vec![1.0f32, 0.0]);
+        let indices = Array::matrix(2, 1, vec![0i32, 1]).unwrap();
+        let operand = Array::vector(vec![f32::NAN, -0.0]).unwrap();
+        let updates = Array::vector(vec![1.0f32, 0.0]).unwrap();
         let maximum =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
         let minimum =
@@ -586,8 +589,8 @@ mod tests {
         assert!(minimum_values[0].is_nan());
         assert_eq!(minimum_values[1].to_bits(), (-0.0f32).to_bits());
 
-        let operand = Array::vector(vec![ComplexNumber::new(1.0f32, 9.0), ComplexNumber::new(2.0, -1.0)]);
-        let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 10.0), ComplexNumber::new(1.0, 100.0)]);
+        let operand = Array::vector(vec![ComplexNumber::new(1.0f32, 9.0), ComplexNumber::new(2.0, -1.0)]).unwrap();
+        let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 10.0), ComplexNumber::new(1.0, 100.0)]).unwrap();
         assert_eq!(
             operand.scatter(&indices, &updates, &maximum).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(1.0, 10.0), ComplexNumber::new(2.0, -1.0)]),

@@ -243,7 +243,7 @@ impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
 /// let ArrayIrValue::Array(result) = left.less_than(&right)? else {
 ///     unreachable!("comparing dimensions always returns an array member");
 /// };
-/// assert_eq!(result, Array::scalar(true));
+/// assert_eq!(result, Array::scalar(true).unwrap());
 /// # Ok(())
 /// # }
 /// ```
@@ -350,8 +350,8 @@ mod tests {
 
     #[test]
     fn test_compare() {
-        let left = || Array::vector(vec![1.0, 2.0, 3.0]);
-        let right = || Array::vector(vec![2.0, 2.0, 2.0]);
+        let left = || Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let right = || Array::vector(vec![2.0, 2.0, 2.0]).unwrap();
         assert_eq!(left().equal(&right()).unwrap().elements::<bool>(), Ok(vec![false, true, false]));
         assert_eq!(left().not_equal(&right()).unwrap().elements::<bool>(), Ok(vec![true, false, true]));
         assert_eq!(left().less_than(&right()).unwrap().elements::<bool>(), Ok(vec![true, false, false]));
@@ -361,16 +361,16 @@ mod tests {
 
         let left = DimensionValue::constant(3).unwrap();
         let right = DimensionValue::constant(5).unwrap();
-        assert_eq!(left.equal(&right), Ok(Array::scalar(false)));
-        assert_eq!(left.not_equal(&right), Ok(Array::scalar(true)));
-        assert_eq!(left.less_than(&right), Ok(Array::scalar(true)));
-        assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true)));
-        assert_eq!(left.greater_than(&right), Ok(Array::scalar(false)));
-        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false)));
+        assert_eq!(left.equal(&right), Ok(Array::scalar(false).unwrap()));
+        assert_eq!(left.not_equal(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.less_than(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.greater_than(&right), Ok(Array::scalar(false).unwrap()));
+        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false).unwrap()));
 
         let left = ArrayIrValue::<Array>::Dimension(left);
         let right = ArrayIrValue::<Array>::Dimension(right);
-        assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true))));
+        assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())));
     }
 
     #[test]
@@ -445,9 +445,9 @@ mod tests {
             CompareOperation::new(ComparisonDirection::GreaterThan).interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![1.0, -2.0]), Array::scalar(0.0)],
+                &[Array::vector(vec![1.0, -2.0]).unwrap(), Array::scalar(0.0).unwrap()],
             ),
-            Ok(vec![Array::vector(vec![true, false])]),
+            Ok(vec![Array::vector(vec![true, false]).unwrap()]),
         );
     }
 
@@ -492,7 +492,7 @@ mod tests {
                 ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(true))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(true).unwrap())]),
         );
 
         let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -535,8 +535,8 @@ mod tests {
     fn test_compare_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
-            inputs = [Array::scalar(1.0), Array::scalar(0.0)],
-            expected = Array::scalar(true),
+            inputs = [Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap()],
+            expected = Array::scalar(true).unwrap(),
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
@@ -556,7 +556,7 @@ mod tests {
                         )),
                     ],
                     outputs = [
-                        (@known, ArrayIrValue::Array(Array::scalar(true))),
+                        (@known, ArrayIrValue::Array(Array::scalar(true).unwrap())),
                     ],
                     residual_instructions = 0,
                 },
@@ -576,7 +576,7 @@ mod tests {
                         )),
                     ],
                     outputs = [
-                        (@residual, ArrayIrValue::Array(Array::scalar(true))),
+                        (@residual, ArrayIrValue::Array(Array::scalar(true).unwrap())),
                     ],
                     residual_instructions = 1,
                 },
@@ -593,17 +593,17 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@replicated, Array::scalar(0.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                        (@replicated, Array::scalar(0.0).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(0.0)),
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(0.0).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]).unwrap())],
                 },
             ],
         );
@@ -613,12 +613,15 @@ mod tests {
     fn test_compare_differentiation() {
         // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
         // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), piecewise_select)
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(-2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(-2.0).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), piecewise_select)
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![-6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
     }

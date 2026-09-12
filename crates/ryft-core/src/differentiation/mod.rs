@@ -2124,7 +2124,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
 /// }
 ///
 /// let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-/// let (_, gradient) = context.differentiate_at(Array::scalar(2.0)).value_and_gradient(square)?;
+/// let (_, gradient) = context.differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(square)?;
 /// assert_eq!(gradient.to_f64s(), vec![4.0]);
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
@@ -2168,8 +2168,8 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///     input * scale
 /// }
 ///
-/// let (_, gradient) = differentiate_at(Array::scalar(2.0))
-///     .with_captures(Array::scalar(3.0))
+/// let (_, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
+///     .with_captures(Array::scalar(3.0).unwrap())
 ///     .value_and_gradient(scale)?;
 ///
 /// assert_eq!(gradient.to_f64s(), vec![3.0]);
@@ -2208,8 +2208,8 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///     (output.clone(), Auxiliary { prediction: output, diagnostic: offsets.into_iter().next() })
 /// }
 ///
-/// let ((value, auxiliary), gradient): ((Array, Auxiliary<Array>), Array) = differentiate_at(Array::scalar(2.0))
-///     .with_captures((Array::scalar(3.0), vec![Array::scalar(4.0)]))
+/// let ((value, auxiliary), gradient): ((Array, Auxiliary<Array>), Array) = differentiate_at(Array::scalar(2.0).unwrap())
+///     .with_captures((Array::scalar(3.0).unwrap(), vec![Array::scalar(4.0).unwrap()]))
 ///     .with_auxiliary_output()
 ///     .value_and_gradient(evaluate)?;
 /// assert_eq!(value.to_f64s(), vec![10.0]);
@@ -2227,7 +2227,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// ```compile_fail
 /// # use ryft_core::{Array, differentiate_at};
 ///
-/// let _ = differentiate_at(Array::scalar(2.0)).gradient(|input, capture| input * capture);
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).gradient(|input, capture| input * capture);
 /// ```
 ///
 /// A builder with captures requires a binary closure, so a unary closure literal fails the same way:
@@ -2235,7 +2235,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// ```compile_fail
 /// # use ryft_core::{Array, differentiate_at};
 ///
-/// let _ = differentiate_at(Array::scalar(2.0)).with_captures(Array::scalar(3.0)).gradient(|input| input);
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).with_captures(Array::scalar(3.0).unwrap()).gradient(|input| input);
 /// ```
 ///
 /// An explicitly selected context cannot be silently replaced, because [`DifferentiationBuilder::in_context`] only
@@ -2246,7 +2246,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///
 /// let first = EagerContext::<Array, ArrayOperation<Array>>::new();
 /// let second = EagerContext::<Array, ArrayOperation<Array>>::new();
-/// let _ = differentiate_at(Array::scalar(2.0)).in_context(&first).in_context(&second);
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).in_context(&first).in_context(&second);
 /// ```
 ///
 /// Holomorphic validation is intentionally unavailable for the Jacobian-Vector Product (JVP), linearization,
@@ -2262,7 +2262,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///     Ok(input.clone() * input)
 /// }
 ///
-/// let _ = differentiate_at(Array::scalar(2.0)).holomorphic().linearize(square);
+/// let _ = differentiate_at(Array::scalar(2.0).unwrap()).holomorphic().linearize(square);
 /// ```
 ///
 /// # Parameters
@@ -2434,14 +2434,14 @@ mod tests {
     fn test_reference_boundary_new_for_differentiation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = [
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
-            ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
         ];
         let tangents = [
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))),
-            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()),
         ];
-        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32)))];
+        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32).unwrap()))];
         assert_eq!(
             ReferenceBoundary::new_for_differentiation(&context, &inputs, &tangents, &captures).map(|_| ()),
             Ok(())
@@ -2483,8 +2483,8 @@ mod tests {
     #[test]
     fn test_reference_boundary_validate_differentiation_arguments() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let primal = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let derivative = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32)));
+        let primal = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let derivative = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap()));
         let boundary = ReferenceBoundary::new_for_differentiation(&context, [&primal], [], []).unwrap();
         assert_eq!(
             boundary.validate_differentiation_arguments(
@@ -2540,13 +2540,13 @@ mod tests {
 
     #[test]
     fn test_differentiation_builder_forward_and_reverse_transforms_with_captures() {
-        let primal = Array::scalar(2.0);
-        let capture = Array::scalar(3.0);
+        let primal = Array::scalar(2.0).unwrap();
+        let capture = Array::scalar(3.0).unwrap();
 
         // JVP differentiates only the active primal while treating the capture as a fixed runtime coefficient.
         let (value, tangent) = differentiate_at(primal.clone())
             .with_captures(capture.clone())
-            .jvp(Array::scalar(1.0), |input, scale| Ok(input * scale))
+            .jvp(Array::scalar(1.0).unwrap(), |input, scale| Ok(input * scale))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
@@ -2557,7 +2557,7 @@ mod tests {
             .linearize(|input, scale| Ok(input * scale))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
-        assert_eq!(pushforward.apply(Array::scalar(2.0)).unwrap().to_f64s(), vec![6.0]);
+        assert_eq!(pushforward.apply(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
 
         // Reverse mode likewise excludes captures from the pullback result.
         let (value, pullback) = differentiate_at(primal.clone())
@@ -2565,7 +2565,7 @@ mod tests {
             .vjp(|input, scale| Ok(input * scale))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
-        assert_eq!(pullback.apply(Array::scalar(2.0)).unwrap().to_f64s(), vec![6.0]);
+        assert_eq!(pullback.apply(Array::scalar(2.0).unwrap()).unwrap().to_f64s(), vec![6.0]);
 
         // Scalar-gradient projection returns no gradient leaf for the capture.
         let (value, gradient) = differentiate_at(primal)
@@ -2576,8 +2576,8 @@ mod tests {
         assert_eq!(gradient.to_f64s(), vec![3.0]);
 
         // Tangents must remain structurally isomorphic to the active primals.
-        let error = differentiate_at(vec![Array::scalar(2.0)])
-            .with_captures(Array::scalar(3.0))
+        let error = differentiate_at(vec![Array::scalar(2.0).unwrap()])
+            .with_captures(Array::scalar(3.0).unwrap())
             .jvp(Vec::<Array>::new(), |inputs, scale| Ok(inputs[0].clone() * scale))
             .unwrap_err();
         assert_eq!(
@@ -2591,8 +2591,8 @@ mod tests {
 
     #[test]
     fn test_differentiation_builder_jacobian_and_hessian_with_captures() {
-        let primal = Array::scalar(2.0);
-        let capture = Array::scalar(3.0);
+        let primal = Array::scalar(2.0).unwrap();
+        let capture = Array::scalar(3.0).unwrap();
 
         // Both Jacobian directions materialize derivatives only with respect to the active primal.
         let forward = differentiate_at(primal.clone())
@@ -2614,8 +2614,8 @@ mod tests {
         assert_eq!(hessian.values()[0].to_f64s(), vec![6.0]);
 
         // Auxiliary output is reconstructed from primal values and excluded from both Jacobian directions.
-        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .with_auxiliary_output()
             .jacobian_reverse(|input, scale| {
                 let output = input * scale;
@@ -2625,8 +2625,8 @@ mod tests {
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
         assert_eq!(auxiliary.to_f64s(), vec![6.0]);
 
-        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+        let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .with_auxiliary_output()
             .jacobian_forward(|input, scale| {
                 let output = input * scale;
@@ -2637,8 +2637,8 @@ mod tests {
         assert_eq!(auxiliary.to_f64s(), vec![6.0]);
 
         // Hessian auxiliary output follows the same nondifferentiated contract.
-        let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+        let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .with_auxiliary_output()
             .hessian(|input, scale| {
                 let output = input.clone() * input * scale;
@@ -2651,7 +2651,7 @@ mod tests {
 
     #[test]
     fn test_differentiation_builder_capture_free_terminal_functions() {
-        let primal = Array::scalar(2.0);
+        let primal = Array::scalar(2.0).unwrap();
 
         // Capture-free scalar gradients retain the ergonomic unary closure shape.
         let (value, gradient) =
@@ -2672,13 +2672,13 @@ mod tests {
         let (actual_value, actual_pullback) = differentiate_at(primal).vjp(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(actual_value, expected_value);
         assert_eq!(
-            actual_pullback.apply(Array::scalar(1.0)).unwrap(),
-            expected_pullback.apply(Array::scalar(1.0)).unwrap(),
+            actual_pullback.apply(Array::scalar(1.0).unwrap()).unwrap(),
+            expected_pullback.apply(Array::scalar(1.0).unwrap()).unwrap(),
         );
 
         // Capture-free linearization stages the expected unary pushforward program.
         let (_, actual_pushforward) =
-            differentiate_at(Array::scalar(2.0)).linearize(|input| Ok(input.clone() * input)).unwrap();
+            differentiate_at(Array::scalar(2.0).unwrap()).linearize(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(
             actual_pushforward.program().to_string(),
             indoc! {"
@@ -2692,24 +2692,24 @@ mod tests {
         );
 
         // Higher-order terminal functions retain the same unary closure shape.
-        let hessian = differentiate_at(Array::scalar(2.0)).hessian(|input| Ok(input.clone() * input)).unwrap();
+        let hessian = differentiate_at(Array::scalar(2.0).unwrap()).hessian(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(hessian.values()[0].to_f64s(), vec![2.0]);
     }
 
     #[test]
     fn test_differentiation_builder_capture_values_do_not_specialize_linearization() {
-        let (_, pushforward_at_three) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+        let (_, pushforward_at_three) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .linearize(|input, scale| Ok(input * scale))
             .unwrap();
-        let (_, pushforward_at_five) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(5.0))
+        let (_, pushforward_at_five) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(5.0).unwrap())
             .linearize(|input, scale| Ok(input * scale))
             .unwrap();
 
         assert_eq!(pushforward_at_three.program().to_string(), pushforward_at_five.program().to_string());
-        assert_eq!(pushforward_at_three.apply(Array::scalar(1.0)).unwrap().to_f64s(), vec![3.0]);
-        assert_eq!(pushforward_at_five.apply(Array::scalar(1.0)).unwrap().to_f64s(), vec![5.0]);
+        assert_eq!(pushforward_at_three.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s(), vec![3.0]);
+        assert_eq!(pushforward_at_five.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s(), vec![5.0]);
     }
 
     #[test]
@@ -2725,7 +2725,7 @@ mod tests {
                     })
                     .map_err(ProgramError::from)
             },
-            (Array::vector(vec![2.0, 3.0]), Array::vector(vec![4.0, 5.0])),
+            (Array::vector(vec![2.0, 3.0]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             (BatchAxis::new(0), BatchAxis::new(0)),
             None,
@@ -2735,8 +2735,8 @@ mod tests {
         assert_eq!(per_example.1.to_f64s(), vec![4.0, 5.0]);
         assert!(capture_tangent_was_zero.get());
 
-        let (value, gradient) = differentiate_at(Array::vector(vec![2.0, 3.0]))
-            .with_captures(Array::vector(vec![4.0, 5.0]))
+        let (value, gradient) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
+            .with_captures(Array::vector(vec![4.0, 5.0]).unwrap())
             .value_and_gradient(|input, scale| {
                 let mapped = batch(
                     |(item, factor)| Ok(item * factor),
@@ -2815,15 +2815,15 @@ mod tests {
         // machinery when the builder is context-bound.
         let context = ExplicitContext(EagerContext::new());
         let (_, gradient) = context
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|input| input.clone() * input)
             .unwrap();
         assert_eq!(gradient.to_f64s(), vec![4.0]);
 
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (_, gradient) = context
-            .differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .value_and_gradient(|input, scale| input * scale)
             .unwrap();
         assert_eq!(gradient.to_f64s(), vec![3.0]);
@@ -2847,8 +2847,8 @@ mod tests {
 
     #[test]
     fn test_differentiation_builder_holomorphic_terminal_functions_with_captures() {
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
-        let capture = Array::scalar(ComplexNumber::new(3.0f32, -1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
+        let capture = Array::scalar(ComplexNumber::new(3.0f32, -1.0)).unwrap();
         let (_, gradient) = differentiate_at(input)
             .with_captures(capture.clone())
             .holomorphic()
@@ -2856,14 +2856,14 @@ mod tests {
             .unwrap();
         assert_eq!(gradient.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, -1.0)]));
 
-        let jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
+        let jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
             .with_captures(capture.clone())
             .holomorphic()
             .jacobian_reverse(|input, capture| Ok(input * capture))
             .unwrap();
         assert_eq!(jacobian.values()[0].elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, -1.0)]));
 
-        let forward_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
+        let forward_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
             .with_captures(capture.clone())
             .holomorphic()
             .jacobian_forward(|input, capture| Ok(input * capture))
@@ -2873,7 +2873,7 @@ mod tests {
             Ok(vec![ComplexNumber::new(3.0, -1.0)]),
         );
 
-        let hessian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
+        let hessian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
             .with_captures(capture.clone())
             .holomorphic()
             .hessian(|input, scale| Ok(input.clone() * input * scale))
@@ -2883,8 +2883,8 @@ mod tests {
         // Linearity-mode validation constrains only active inputs and differentiated outputs, so captures are exempt
         // in both directions. A real capture under `holomorphic()` must not raise `NonComplexParameter`, even though
         // the same type in the active input position would.
-        let real_capture = Array::scalar(3.0f32);
-        let (value, gradient) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
+        let real_capture = Array::scalar(3.0f32).unwrap();
+        let (value, gradient) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
             .with_captures(real_capture.clone())
             .holomorphic()
             .value_and_gradient(|input, capture| Ok(input * capture.complex(&capture)?))
@@ -2892,7 +2892,7 @@ mod tests {
         assert_eq!(value.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 9.0)]));
         assert_eq!(gradient.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 3.0)]));
 
-        let real_capture_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
+        let real_capture_jacobian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap())
             .with_captures(real_capture)
             .holomorphic()
             .jacobian_forward(|input, capture| Ok(input * capture.complex(&capture)?))
@@ -2903,14 +2903,14 @@ mod tests {
         );
 
         // Symmetrically, a complex capture in ordinary (i.e., real-valued) mode must not raise `ComplexParameter`.
-        let (value, gradient) = differentiate_at(Array::scalar(2.0f32))
+        let (value, gradient) = differentiate_at(Array::scalar(2.0f32).unwrap())
             .with_captures(capture.clone())
             .value_and_gradient(|input, capture| Ok(input * capture.real()?))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(gradient.to_f64s(), vec![3.0]);
 
-        let complex_capture_jacobian = differentiate_at(Array::scalar(2.0f32))
+        let complex_capture_jacobian = differentiate_at(Array::scalar(2.0f32).unwrap())
             .with_captures(capture)
             .jacobian_reverse(|input, capture| Ok(input * capture.real()?))
             .unwrap();
@@ -2920,7 +2920,7 @@ mod tests {
     #[test]
     fn test_differentiation_builder_empty_active_input_ignores_captures() {
         let error = differentiate_at(Vec::<Array>::new())
-            .with_captures(Array::scalar(3.0))
+            .with_captures(Array::scalar(3.0).unwrap())
             .value_and_gradient(|_input, capture| capture)
             .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
@@ -2970,13 +2970,13 @@ mod tests {
     #[test]
     fn test_differentiation_builder_structured_captures_and_auxiliary_output() {
         let captures = StructuredCaptures {
-            scale: Array::scalar(3.0),
-            offsets: vec![Array::scalar(4.0)],
-            extra: Some(Array::scalar(5.0)),
+            scale: Array::scalar(3.0).unwrap(),
+            offsets: vec![Array::scalar(4.0).unwrap()],
+            extra: Some(Array::scalar(5.0).unwrap()),
         };
         let ((value, auxiliary), gradient): ((Array, StructuredAuxiliary<Array>), Array) =
-            differentiate_at(Array::scalar(2.0))
-                .with_captures((captures, Array::scalar(1.0)))
+            differentiate_at(Array::scalar(2.0).unwrap())
+                .with_captures((captures, Array::scalar(1.0).unwrap()))
                 .with_auxiliary_output()
                 .value_and_gradient(|input, (captures, tail)| {
                     let scaled = input * captures.scale;
@@ -3003,18 +3003,18 @@ mod tests {
 
     #[test]
     fn test_differentiation_builder_modifier_order_is_orthogonal() {
-        let first: (Array, Array) = differentiate_at(Array::scalar(2.0))
-            .with_captures(Array::scalar(3.0))
+        let first: (Array, Array) = differentiate_at(Array::scalar(2.0).unwrap())
+            .with_captures(Array::scalar(3.0).unwrap())
             .with_auxiliary_output()
             .gradient(|input, scale| {
                 let output = input * scale;
                 Ok((output.clone(), output))
             })
             .unwrap();
-        let second: (Array, Array) = differentiate_at(Array::scalar(2.0))
+        let second: (Array, Array) = differentiate_at(Array::scalar(2.0).unwrap())
             // This reverse order is intentional because this test verifies that these transitions are orthogonal.
             .with_auxiliary_output()
-            .with_captures(Array::scalar(3.0))
+            .with_captures(Array::scalar(3.0).unwrap())
             .gradient(|input, scale| {
                 let output = input * scale;
                 Ok((output.clone(), output))

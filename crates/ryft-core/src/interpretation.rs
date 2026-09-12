@@ -759,7 +759,10 @@ mod tests {
         let program = builder
             .build::<Array, (Array, Array)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
-        assert_eq!(program.interpret(Array::scalar(2.0f32)), Ok((Array::scalar(4.0f32), Array::scalar(4.0f32))));
+        assert_eq!(
+            program.interpret(Array::scalar(2.0f32).unwrap()),
+            Ok((Array::scalar(4.0f32).unwrap(), Array::scalar(4.0f32).unwrap()))
+        );
     }
 
     #[test]
@@ -880,14 +883,14 @@ mod tests {
     fn test_program_interpret_lifts_live_constants_once() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c0 = builder.add_constant(Array::scalar(7.0f64));
-        let c1 = builder.add_constant(Array::scalar(3.0f64));
+        let c0 = builder.add_constant(Array::scalar(7.0f64).unwrap());
+        let c1 = builder.add_constant(Array::scalar(3.0f64).unwrap());
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
             program.interpret_with(
-                vec![Array::scalar(2.0f64)],
+                vec![Array::scalar(2.0f64).unwrap()],
                 |atom_id, value| {
                     lifted_constants.push((atom_id, value.clone()));
                     Ok(value.clone())
@@ -898,9 +901,9 @@ mod tests {
                     inputs,
                 ),
             ),
-            Ok(vec![Array::scalar(5.0f64)]),
+            Ok(vec![Array::scalar(5.0f64).unwrap()]),
         );
-        assert_eq!(lifted_constants, vec![(c1, Array::scalar(3.0f64))]);
+        assert_eq!(lifted_constants, vec![(c1, Array::scalar(3.0f64).unwrap())]);
         assert_eq!(c0, AtomId::new(1));
     }
 
@@ -910,13 +913,13 @@ mod tests {
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Vec<Array>, Array>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
-            program.interpret(vec![Array::scalar(1.0f64), Array::scalar(2.0f64)]),
+            program.interpret(vec![Array::scalar(1.0f64).unwrap(), Array::scalar(2.0f64).unwrap()]),
             Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![Placeholder])
                 && right_structure
-                    == format!("{:?}", vec![Array::scalar(1.0f64), Array::scalar(2.0f64)].parameter_structure())
+                    == format!("{:?}", vec![Array::scalar(1.0f64).unwrap(), Array::scalar(2.0f64).unwrap()].parameter_structure())
         ));
     }
 
@@ -927,9 +930,9 @@ mod tests {
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0]).unwrap()).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
-            program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
+            program.interpret(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
                 == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
         ));
@@ -943,10 +946,13 @@ mod tests {
         ));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
-        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0, 3.0])).unwrap().to_f64s(), vec![2.0, 4.0, 6.0]);
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0]).unwrap()).unwrap().to_f64s(), vec![2.0, 4.0]);
+        assert_eq!(
+            program.interpret(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()).unwrap().to_f64s(),
+            vec![2.0, 4.0, 6.0]
+        );
         assert!(matches!(
-            program.interpret(Array::scalar(1.0)),
+            program.interpret(Array::scalar(1.0).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
                 == "encountered input type f64[] which is incompatible with the program's declared type f64[dynamic]",
         ));
@@ -962,9 +968,9 @@ mod tests {
         ));
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0]).unwrap()).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
-            program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
+            program.interpret(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             Err(ProgramError::Type(error))
                 if error.downcast_custom::<DimensionError>()
                     == Some(&DimensionError::BindingOutOfBounds {
@@ -1011,7 +1017,7 @@ mod tests {
                 _driver: &D,
                 _inputs: &[Array],
             ) -> Result<Vec<Array>, ProgramError> {
-                Ok(vec![Array::vector(vec![1.0, 2.0, 3.0])])
+                Ok(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()])
             }
         }
 
@@ -1028,7 +1034,7 @@ mod tests {
             .build::<(Array, Array), Array>(vec![first], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         assert!(matches!(
-            program.interpret((Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0, 2.0, 3.0]))),
+            program.interpret((Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![1.0, 2.0, 3.0]).unwrap())),
             Err(ProgramError::Type(error))
                 if error.downcast_custom::<DimensionError>()
                     == Some(&DimensionError::InputDimensionMismatch {
@@ -1045,7 +1051,7 @@ mod tests {
         let output = builder.add_instruction(WrongShapeOperation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
-            program.interpret(Array::vector(vec![1.0, 2.0])),
+            program.interpret(Array::vector(vec![1.0, 2.0]).unwrap()),
             Err(ProgramError::Type(error))
                 if error.downcast_custom::<DimensionError>()
                     == Some(&DimensionError::InputDimensionMismatch {
@@ -1059,7 +1065,7 @@ mod tests {
                 .entry_region_ref()
                 .interpret_in_context(
                     &EagerContext::<Array, WrongShapeOperation>::new(),
-                    vec![Array::vector(vec![1.0, 2.0])],
+                    vec![Array::vector(vec![1.0, 2.0]).unwrap()],
                 ),
             Err(ProgramError::Type(error))
                 if error.downcast_custom::<DimensionError>()
@@ -1105,7 +1111,7 @@ mod tests {
         // Static Single Assignment (SSA) operands, as in `DynamicBroadcastOperation`. A diagnostic that named the
         // stale payload would have to originate from a structured operation error that causally identifies the failing
         // payload constraint, because the surfaced error alone does not establish that cause.
-        let error = program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap_err();
+        let error = program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()]).unwrap_err();
         assert!(matches!(error, ProgramError::Type(_)));
         assert_eq!(
             error.to_string(),
@@ -1130,8 +1136,8 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]),
-            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])]),
+            program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()]),
         );
     }
 
@@ -1162,7 +1168,7 @@ mod tests {
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
-                vec![Array::scalar(2.0f64)],
+                vec![Array::scalar(2.0f64).unwrap()],
                 |_, value| Ok(value.clone()),
                 |_, _| Ok::<Vec<Array>, ProgramError>(Vec::new()),
             ),
@@ -1174,11 +1180,13 @@ mod tests {
     fn test_interpret_projected_operation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let operation = ArrayOperation::Add(AddOperation::new());
-        let inputs =
-            [ArrayIrValue::Array(Array::vector(vec![1.0, 2.0])), ArrayIrValue::Array(Array::vector(vec![3.0, 4.0]))];
+        let inputs = [
+            ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0, 4.0]).unwrap()),
+        ];
         assert_eq!(
             interpret_projected_operation(&context, &operation, &EmptyRegionDriver, &inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())]),
         );
     }
 }

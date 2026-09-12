@@ -30,7 +30,7 @@ impl Compare<Array> for DimensionValue {
             ComparisonDirection::GreaterThan => self.extent() > rhs.extent(),
             ComparisonDirection::GreaterThanOrEqual => self.extent() >= rhs.extent(),
         };
-        Ok(Array::scalar(result))
+        Array::scalar(result)
     }
 }
 
@@ -133,18 +133,20 @@ mod tests {
 
     #[test]
     fn test_array_compare() {
-        let left = Array::vector(vec![1.0, 2.0, 3.0]);
-        let right = Array::vector(vec![2.0, 2.0, 2.0]);
+        let left = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let right = Array::vector(vec![2.0, 2.0, 2.0]).unwrap();
         let less_than = left.compare(&right, ComparisonDirection::LessThan).unwrap();
         assert_eq!(less_than.r#type().into_owned(), ArrayType::new_static(DataType::Boolean, [3]));
-        assert_eq!(less_than, Array::vector(vec![true, false, false]));
+        assert_eq!(less_than, Array::vector(vec![true, false, false]).unwrap());
         // Operands broadcast and promote before comparing.
-        let mixed = Array::vector(vec![1.0f32, 3.0]).compare(&Array::scalar(2.0f64), ComparisonDirection::GreaterThan);
-        assert_eq!(mixed.unwrap(), Array::vector(vec![false, true]));
+        let mixed = Array::vector(vec![1.0f32, 3.0])
+            .unwrap()
+            .compare(&Array::scalar(2.0f64).unwrap(), ComparisonDirection::GreaterThan);
+        assert_eq!(mixed.unwrap(), Array::vector(vec![false, true]).unwrap());
 
         // Sealed sub-byte elements use their signed value ordering and participate in full NumPy-style broadcasting.
-        let left = Array::matrix(2, 1, vec![i2::new(-1).unwrap(), i2::new(1).unwrap()]);
-        let right = Array::matrix(1, 3, vec![i2::new(-2).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]);
+        let left = Array::matrix(2, 1, vec![i2::new(-1).unwrap(), i2::new(1).unwrap()]).unwrap();
+        let right = Array::matrix(1, 3, vec![i2::new(-2).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]).unwrap();
         assert_eq!(
             left.compare(&right, ComparisonDirection::LessThan).unwrap().elements::<bool>(),
             Ok(vec![false, true, true, false, false, false]),
@@ -161,9 +163,9 @@ mod tests {
         assert_eq!(compared.storage_bytes(), [1, 0]);
 
         // Floating-point NaNs are unordered, while complex arrays expose only equality comparisons.
-        let nan = Array::vector(vec![f8e5m2::NAN]);
+        let nan = Array::vector(vec![f8e5m2::NAN]).unwrap();
         assert_eq!(nan.compare(&nan, ComparisonDirection::NotEqual).unwrap().elements::<bool>(), Ok(vec![true]));
-        let complex = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0)]);
+        let complex = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0)]).unwrap();
         assert_eq!(complex.compare(&complex, ComparisonDirection::Equal).unwrap().elements::<bool>(), Ok(vec![true]),);
         assert!(matches!(
             complex.compare(&complex, ComparisonDirection::LessThan),

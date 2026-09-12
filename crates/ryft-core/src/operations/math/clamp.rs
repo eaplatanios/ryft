@@ -48,16 +48,25 @@ mod tests {
 
     #[test]
     fn test_clamp() {
-        let lower = Array::scalar(-1.0f64);
-        let upper = Array::scalar(1.0f64);
-        assert_eq!(Array::scalar(0.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(0.5f64));
-        assert_eq!(Array::scalar(-2.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(-1.0f64));
-        assert_eq!(Array::scalar(2.5f64).clamp(&lower, &upper).unwrap(), Array::scalar(1.0f64));
-        assert_eq!(Array::scalar(7i32).clamp(&Array::scalar(0i32), &Array::scalar(5i32)).unwrap(), Array::scalar(5i32),);
+        let lower = Array::scalar(-1.0f64).unwrap();
+        let upper = Array::scalar(1.0f64).unwrap();
+        assert_eq!(Array::scalar(0.5f64).unwrap().clamp(&lower, &upper).unwrap(), Array::scalar(0.5f64).unwrap());
+        assert_eq!(Array::scalar(-2.5f64).unwrap().clamp(&lower, &upper).unwrap(), Array::scalar(-1.0f64).unwrap());
+        assert_eq!(Array::scalar(2.5f64).unwrap().clamp(&lower, &upper).unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(7i32)
+                .unwrap()
+                .clamp(&Array::scalar(0i32).unwrap(), &Array::scalar(5i32).unwrap())
+                .unwrap(),
+            Array::scalar(5i32).unwrap(),
+        );
 
         assert_eq!(
-            Array::vector(vec![-2.0, 0.5, 3.0]).clamp(&Array::scalar(-1.0), &Array::scalar(1.0)).unwrap(),
-            Array::vector(vec![-1.0, 0.5, 1.0]),
+            Array::vector(vec![-2.0, 0.5, 3.0])
+                .unwrap()
+                .clamp(&Array::scalar(-1.0).unwrap(), &Array::scalar(1.0).unwrap())
+                .unwrap(),
+            Array::vector(vec![-1.0, 0.5, 1.0]).unwrap(),
         );
     }
 
@@ -65,15 +74,15 @@ mod tests {
     fn test_clamp_differentiation() {
         // The gradient follows the clamped value: `1` strictly inside the interval and `0` outside it.
         let (value, gradient) =
-            differentiate_at(Array::scalar(0.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
+            differentiate_at(Array::scalar(0.5).unwrap()).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![0.5]);
         assert_eq!(gradient.to_f64s(), vec![1.0]);
         let (value, gradient) =
-            differentiate_at(Array::scalar(2.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
+            differentiate_at(Array::scalar(2.5).unwrap()).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
         let (value, gradient) =
-            differentiate_at(Array::scalar(-2.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
+            differentiate_at(Array::scalar(-2.5).unwrap()).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![-1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
     }

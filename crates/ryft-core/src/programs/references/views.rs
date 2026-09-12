@@ -1296,7 +1296,7 @@ mod tests {
         let context =
             BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()))
+        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()).unwrap())
             .reference_new()
             .unwrap();
 
@@ -1313,20 +1313,20 @@ mod tests {
         .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![2.0f32, 5.0]))));
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![2.0f32, 5.0]).unwrap())));
 
         // A dynamic index shared by every batch item follows the same axis adjustment as a static index.
         let outputs = ReferenceViewOperation::batch(
             &TestOperation::from(ReferenceDynamicIndexOperation::new(0)),
             &context,
-            &[batch.clone(), ArrayIrBatch::replicated(TestValue::Array(Array::scalar(1i64)))],
+            &[batch.clone(), ArrayIrBatch::replicated(TestValue::Array(Array::scalar(1i64).unwrap()))],
         )
         .unwrap()
         .into_parts()
         .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![1.0f32, 4.0]))));
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![1.0f32, 4.0]).unwrap())));
 
         // A replicated source is viewed unchanged and stays replicated.
         let replicated = ArrayIrBatch::replicated(reference);
@@ -1339,7 +1339,7 @@ mod tests {
         .into_parts()
         .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![3.0f32, 4.0, 5.0]))));
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![3.0f32, 4.0, 5.0]).unwrap())));
 
         // Only view operations batch through the rule: an operation without a view alias and one with an allocation
         // output are rejected by name, and so is a mapped input other than the viewed source.
@@ -1358,7 +1358,7 @@ mod tests {
             ReferenceViewOperation::batch(
                 &TestOperation::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
                 &context,
-                &[ArrayIrBatch::replicated(TestValue::Array(Array::scalar(0.0f32)))],
+                &[ArrayIrBatch::replicated(TestValue::Array(Array::scalar(0.0f32).unwrap()))],
             )
             .err(),
             Some(BatchingError::UnsupportedOperation {
@@ -1371,7 +1371,11 @@ mod tests {
             ReferenceViewOperation::batch(
                 &TestOperation::from(ReferenceDynamicIndexOperation::new(0)),
                 &context,
-                &[batch, ArrayIrBatch::new(TestValue::Array(Array::vector(vec![0i64, 1])), BatchAxis::new(0)).unwrap()],
+                &[
+                    batch,
+                    ArrayIrBatch::new(TestValue::Array(Array::vector(vec![0i64, 1]).unwrap()), BatchAxis::new(0))
+                        .unwrap()
+                ],
             )
             .err(),
             Some(BatchingError::UnsupportedOperation {
@@ -1636,7 +1640,7 @@ mod tests {
     fn test_reference_view_analysis_new_handles_reverse_numbered_alias_chains() {
         let mut condition = TestBuilder::new();
         condition.add_input(reference_type([2]));
-        let predicate = condition.add_constant(TestValue::Array(Array::scalar(false)));
+        let predicate = condition.add_constant(TestValue::Array(Array::scalar(false).unwrap()));
         let condition: TestProgram = condition.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap();
         let mut body = TestBuilder::new();
         let reference = body.add_input(reference_type([2]));
@@ -1673,7 +1677,7 @@ mod tests {
         let mut condition = TestBuilder::new();
         condition.add_input(scalar_type.clone());
         condition.add_input(reference_type([2]));
-        let predicate = condition.add_constant(TestValue::Array(Array::scalar(false)));
+        let predicate = condition.add_constant(TestValue::Array(Array::scalar(false).unwrap()));
         let condition = condition
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

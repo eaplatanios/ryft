@@ -2144,12 +2144,12 @@ mod tests {
         let negate = compile_from_one_call_site(&domain, true);
 
         assert_eq!(
-            call_function(&domain, identity.executable_function(), Array::scalar(3.0)).unwrap(),
-            Array::scalar(3.0)
+            call_function(&domain, identity.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(3.0).unwrap()
         );
         assert_eq!(
-            call_function(&domain, negate.executable_function(), Array::scalar(3.0)).unwrap(),
-            Array::scalar(-3.0)
+            call_function(&domain, negate.executable_function(), Array::scalar(3.0).unwrap()).unwrap(),
+            Array::scalar(-3.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 2);
     }
@@ -2171,12 +2171,12 @@ mod tests {
         let second = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
         assert_eq!(
-            call_function(&domain, first.executable_function(), Array::scalar(2.0)).unwrap(),
-            Array::scalar(-2.0)
+            call_function(&domain, first.executable_function(), Array::scalar(2.0).unwrap()).unwrap(),
+            Array::scalar(-2.0).unwrap()
         );
         assert_eq!(
-            call_function(&domain, second.executable_function(), Array::scalar(4.0)).unwrap(),
-            Array::scalar(-4.0)
+            call_function(&domain, second.executable_function(), Array::scalar(4.0).unwrap()).unwrap(),
+            Array::scalar(-4.0).unwrap()
         );
         assert_eq!(domain.compilation_count(), 1);
         assert_eq!(domain.cache.statistics().memory_hits, 1);
@@ -2206,7 +2206,7 @@ mod tests {
         let compiled = compile_from_one_call_site(&domain, false);
 
         assert!(matches!(
-            call_function(&domain, compiled.executable_function(), Array::scalar(3_i64)),
+            call_function(&domain, compiled.executable_function(), Array::scalar(3_i64).unwrap()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "runtime input type i64[] does not refine declared type f64[]",
         ));
@@ -2218,15 +2218,15 @@ mod tests {
         let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0)],
+                vec![Array::scalar(7.0).unwrap()],
                 (),
                 TestOptions::default(),
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0));
-        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0)]);
+        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0).unwrap());
+        assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
     }
 
     #[test]
@@ -2235,7 +2235,7 @@ mod tests {
         let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
-                vec![Array::scalar(7.0)],
+                vec![Array::scalar(7.0).unwrap()],
                 (),
                 TestOptions::default(),
             ))
@@ -2243,10 +2243,10 @@ mod tests {
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let executable = compiled.into_executable_function();
 
-        assert_eq!(executable.captures(), &[Array::scalar(7.0)]);
+        assert_eq!(executable.captures(), &[Array::scalar(7.0).unwrap()]);
         assert!(executable.input_types().is_empty());
         assert_eq!(executable.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0));
+        assert_eq!(call_function(&domain, &executable, ()).unwrap(), Array::scalar(7.0).unwrap());
     }
 
     #[test]
@@ -2261,12 +2261,12 @@ mod tests {
         let first_domain = domain.clone();
         let second_domain = domain.clone();
         let first_thread =
-            std::thread::spawn(move || call_function(&first_domain, &executable, Array::scalar(3.0)).unwrap());
+            std::thread::spawn(move || call_function(&first_domain, &executable, Array::scalar(3.0).unwrap()).unwrap());
         let second_thread =
-            std::thread::spawn(move || call_function(&second_domain, &second, Array::scalar(4.0)).unwrap());
+            std::thread::spawn(move || call_function(&second_domain, &second, Array::scalar(4.0).unwrap()).unwrap());
 
-        assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0));
-        assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0));
+        assert_eq!(first_thread.join().unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(second_thread.join().unwrap(), Array::scalar(-4.0).unwrap());
     }
 
     #[test]
@@ -2289,7 +2289,7 @@ mod tests {
         let staged: StagedFunction<TestDomain, ArrayType, ArrayType> = domain
             .stage(CompilationStagingRequest::new(
                 |_, _, input: CompilationTracer<TestDomain>| Ok(input),
-                vec![Array::scalar(7.0)],
+                vec![Array::scalar(7.0).unwrap()],
                 ArrayType::scalar(DataType::F64),
                 TestOptions::default(),
             ))
@@ -2349,9 +2349,9 @@ mod tests {
             },
         );
 
-        assert_eq!(function.call(true, Array::scalar(2.0)).unwrap(), Array::scalar(-2.0));
-        assert_eq!(function.call(true, Array::scalar(3.0)).unwrap(), Array::scalar(-3.0));
-        assert_eq!(function.call(false, Array::scalar(4.0)).unwrap(), Array::scalar(4.0));
+        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(-2.0).unwrap());
+        assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
+        assert_eq!(function.call(false, Array::scalar(4.0).unwrap()).unwrap(), Array::scalar(4.0).unwrap());
         assert_eq!(function.specialization_count(), 2);
         let statistics = function.statistics();
         assert_eq!(statistics.dispatch_hits, 1);
@@ -2390,11 +2390,11 @@ mod tests {
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
         assert_eq!(
             function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())),
         );
         assert_eq!(
             function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap())),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]))),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0, 0.0]).unwrap())),
         );
         assert_eq!(function.specialization_count(), 1);
         let statistics = function.statistics();
@@ -2447,7 +2447,7 @@ mod tests {
                     ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 3).unwrap()),
                 ],
             ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())),
         );
         assert_eq!(
             function.call(
@@ -2457,7 +2457,7 @@ mod tests {
                     ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 2).unwrap()),
                 ],
             ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())),
         );
         assert_eq!(function.statistics().dispatch_hits, 1);
         assert_eq!(function.specialization_count(), 1);
@@ -2474,7 +2474,7 @@ mod tests {
                     ArrayIrValue::Dimension(DimensionValue::new(independent_columns, 3).unwrap()),
                 ],
             ),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())),
         );
         assert_eq!(function.specialization_count(), 2);
 
@@ -2488,7 +2488,7 @@ mod tests {
                     ArrayIrValue::Dimension(DimensionValue::new(rows, 2).unwrap()),
                 ],
             ),
-            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())),
         );
         assert_eq!(function.specialization_count(), 3);
 
@@ -2510,7 +2510,7 @@ mod tests {
             jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
         assert!(matches!(
-            function.call((), Array::scalar(2.0)),
+            function.call((), Array::scalar(2.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "runtime input type f64[] does not refine declared type i64[]",
         ));
@@ -2536,8 +2536,14 @@ mod tests {
             },
         );
 
-        assert_eq!(function.call(CollidingStatic(false), Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
-        assert_eq!(function.call(CollidingStatic(true), Array::scalar(2.0)).unwrap(), Array::scalar(-2.0));
+        assert_eq!(
+            function.call(CollidingStatic(false), Array::scalar(2.0).unwrap()).unwrap(),
+            Array::scalar(2.0).unwrap()
+        );
+        assert_eq!(
+            function.call(CollidingStatic(true), Array::scalar(2.0).unwrap()).unwrap(),
+            Array::scalar(-2.0).unwrap()
+        );
         assert_eq!(function.specialization_count(), 2);
         assert_eq!(domain.compilation_count(), 2);
     }
@@ -2550,8 +2556,11 @@ mod tests {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
-        assert_eq!(function.call((), vec![Array::scalar(2.0)]).unwrap(), Array::scalar(2.0));
-        assert_eq!(function.call((), vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap(), Array::scalar(2.0),);
+        assert_eq!(function.call((), vec![Array::scalar(2.0).unwrap()]).unwrap(), Array::scalar(2.0).unwrap());
+        assert_eq!(
+            function.call((), vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]).unwrap(),
+            Array::scalar(2.0).unwrap(),
+        );
         assert_eq!(function.specialization_count(), 2);
     }
 
@@ -2589,13 +2598,13 @@ mod tests {
                 if negate { input.unary(NegateOperation) } else { input }
             },
         );
-        function.call(true, Array::scalar(2.0)).unwrap();
-        function.call(false, Array::scalar(2.0)).unwrap();
+        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
+        function.call(false, Array::scalar(2.0).unwrap()).unwrap();
 
         assert_eq!(function.cache_capacity(), DEFAULT_JIT_CACHE_CAPACITY);
         assert_eq!(function.invalidate_static(&true), 1);
         assert_eq!(function.specialization_count(), 1);
-        function.call(true, Array::scalar(2.0)).unwrap();
+        function.call(true, Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(function.statistics().traces, 3);
         assert_eq!(domain.compilation_count(), 2);
     }
@@ -2614,11 +2623,11 @@ mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                function.call(true, Array::scalar(2.0)),
+                function.call(true, Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected trace failure",
             ));
         }
-        assert_eq!(function.call(false, Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(function.call(false, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
     }
@@ -2631,7 +2640,7 @@ mod tests {
             jit_with_options(&lowering_domain, |(), input: CompilationTracer<TestDomain>| input, lowering_options);
         for _ in 0..2 {
             assert!(matches!(
-                lowering_function.call((), Array::scalar(2.0)),
+                lowering_function.call((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected lowering failure",
             ));
         }
@@ -2649,7 +2658,7 @@ mod tests {
             );
         for _ in 0..2 {
             assert!(matches!(
-                compilation_function.call((), Array::scalar(2.0)),
+                compilation_function.call((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message }) if message == "expected compilation failure",
             ));
         }
@@ -2667,8 +2676,8 @@ mod tests {
         let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
 
-        assert_eq!(first.call((), Array::scalar(1.0)).unwrap(), Array::scalar(1.0));
-        assert_eq!(second.call((), Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(first.call((), Array::scalar(1.0).unwrap()).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(second.call((), Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(first.specialization_count(), 1);
         assert_eq!(second.specialization_count(), 1);
         assert_eq!(first.statistics().traces, 1);
@@ -2689,9 +2698,9 @@ mod tests {
                 1,
             );
 
-        function.call(false, Array::scalar(1.0)).unwrap();
-        function.call(true, Array::scalar(1.0)).unwrap();
-        function.call(false, Array::scalar(1.0)).unwrap();
+        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
+        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
+        function.call(false, Array::scalar(1.0).unwrap()).unwrap();
 
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
@@ -2709,10 +2718,10 @@ mod tests {
                 inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
 
-        let first = BTreeMap::from([("a", Array::scalar(1.0)), ("b", Array::scalar(2.0))]);
-        let second = BTreeMap::from([("b", Array::scalar(4.0)), ("a", Array::scalar(3.0))]);
-        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0));
-        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0));
+        let first = BTreeMap::from([("a", Array::scalar(1.0).unwrap()), ("b", Array::scalar(2.0).unwrap())]);
+        let second = BTreeMap::from([("b", Array::scalar(4.0).unwrap()), ("a", Array::scalar(3.0).unwrap())]);
+        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0).unwrap());
+        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0).unwrap());
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_hits, 1);
     }
@@ -2730,10 +2739,10 @@ mod tests {
                 Ok(input)
             });
         let function_clone = function.clone();
-        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(true, Array::scalar(1.0))));
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(true, Array::scalar(1.0).unwrap())));
 
         assert!(matches!(
-            function.call(true, Array::scalar(1.0)),
+            function.call(true, Array::scalar(1.0).unwrap()),
             Err(ProgramError::InvalidArgument { message })
                 if message == "recursive JIT dispatch requested a specialization that is already being produced",
         ));
@@ -2756,9 +2765,9 @@ mod tests {
                 Ok(input)
             });
         let function_clone = function.clone();
-        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(false, Array::scalar(1.0))));
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(false, Array::scalar(1.0).unwrap())));
 
-        assert_eq!(function.call(true, Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(function.call(true, Array::scalar(2.0).unwrap()).unwrap(), Array::scalar(2.0).unwrap());
         assert_eq!(function.specialization_count(), 2);
         assert_eq!(function.statistics().traces, 2);
     }
@@ -2773,7 +2782,7 @@ mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                function.call((), Array::scalar(2.0)),
+                function.call((), Array::scalar(2.0).unwrap()),
                 Err(ProgramError::InvalidArgument { message })
                     if message == "runtime input type f64[] does not refine declared type i64[]",
             ));
@@ -2818,14 +2827,17 @@ mod tests {
                 if negate { input.unary(NegateOperation) } else { input }
             },
         );
-        function.call(true, Array::scalar(1.0)).unwrap();
+        function.call(true, Array::scalar(1.0).unwrap()).unwrap();
 
         std::thread::scope(|scope| {
             for index in 0..4 {
                 let function = function.clone();
                 scope.spawn(move || {
                     let value = f64::from(index);
-                    assert_eq!(function.call(true, Array::scalar(value)).unwrap(), Array::scalar(-value));
+                    assert_eq!(
+                        function.call(true, Array::scalar(value).unwrap()).unwrap(),
+                        Array::scalar(-value).unwrap()
+                    );
                 });
             }
         });
@@ -2852,7 +2864,7 @@ mod tests {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    assert_eq!(function.call(true, Array::scalar(3.0)).unwrap(), Array::scalar(-3.0));
+                    assert_eq!(function.call(true, Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(-3.0).unwrap());
                 });
             }
         });

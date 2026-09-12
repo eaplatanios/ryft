@@ -47,7 +47,7 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// ```compile_fail
     /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
     ///
-    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
     /// let frozen = allocation.freeze()?;
     /// // The handle was consumed, so reading it again does not compile.
     /// let stale = allocation.read()?;
@@ -58,9 +58,9 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
     ///
     /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
-    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
     /// let alias = allocation.clone();
-    /// assert_eq!(allocation.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32)));
+    /// assert_eq!(allocation.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
     /// assert_eq!(
     ///     alias.read().unwrap_err().downcast_custom::<ReferenceError>(),
     ///     Some(&ReferenceError::Frozen),
@@ -329,8 +329,8 @@ mod tests {
     #[test]
     fn test_reference_freeze_operation_jvp() {
         let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
 
         // Freezing an active reference freezes its tangent reference alongside and invalidates both alias families.
         let active = DifferentiationTracer::new(
@@ -339,19 +339,22 @@ mod tests {
         );
         let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[active]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])));
-        assert_eq!(outputs[0].tangent().as_value(), Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
+        assert_eq!(
+            outputs[0].tangent().as_value(),
+            Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
+        );
         assert!(reference.read().is_err());
         assert!(tangent_reference.read().is_err());
 
         // Freezing a plumbing reference yields a symbolic zero tangent of the referent's tangent type.
-        let reference = TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()).reference_new().unwrap();
         let plumbing = DifferentiationTracer::new(
             DifferentiationDual::new_with_zero_tangent(reference.clone()).unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[plumbing]).unwrap();
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()));
         assert!(matches!(
             outputs[0].tangent(),
             MaybeZero::Zero(r#type) if *r#type == ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
@@ -370,7 +373,7 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
 
         // Freezing a batched reference yields the final packed referent at the reference's batch axis.
         let reference = packed.reference_new().unwrap();

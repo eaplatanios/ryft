@@ -314,7 +314,7 @@ macro_rules! dispatch_on_array_element_type {
 ///     |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
 /// );
 ///
-/// let result = Array::vector(vec![1i32, 5, 3]).minimum(&Array::scalar(2i32))?;
+/// let result = Array::vector(vec![1i32, 5, 3]).unwrap().minimum(&Array::scalar(2i32).unwrap())?;
 /// assert_eq!(result.elements::<i32>()?, vec![1, 2, 2]);
 /// # Ok::<(), ProgramError>(())
 /// ```
@@ -338,7 +338,7 @@ macro_rules! dispatch_on_array_element_type {
 ///     |input| Ok(ArrayElement::max(&input, &ArrayElement::from_signed(0)?)),
 /// );
 ///
-/// let result = Array::vector(vec![-2i32, 1, 5]).nonnegative()?;
+/// let result = Array::vector(vec![-2i32, 1, 5]).unwrap().nonnegative()?;
 /// assert_eq!(result.elements::<i32>()?, vec![0, 1, 5]);
 /// # Ok::<(), ProgramError>(())
 /// ```
@@ -709,10 +709,10 @@ mod tests {
             &[Complex::new(1f32, -2.0), Complex::new(3.0, 4.0)],
         )?;
         assert_eq!(input.float_identity()?, input);
-        let input = Array::scalar(-0f32);
+        let input = Array::scalar(-0f32).unwrap();
         assert_eq!(input.float_identity()?.elements::<f32>()?[0].to_bits(), (-0f32).to_bits());
         assert!(matches!(
-            Array::scalar(1i32).float_identity(),
+            Array::scalar(1i32).unwrap().float_identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`float_identity` does not support input data type `i32`",
         ));
@@ -737,9 +737,9 @@ mod tests {
             |input| Ok(input),
         );
 
-        assert_eq!(Array::scalar(2f32).real_float_identity()?, Array::scalar(2f32));
+        assert_eq!(Array::scalar(2f32).unwrap().real_float_identity()?, Array::scalar(2f32).unwrap());
         assert!(matches!(
-            Array::scalar(Complex::new(1f32, 2.0)).real_float_identity(),
+            Array::scalar(Complex::new(1f32, 2.0)).unwrap().real_float_identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`real_float_identity` does not support input data type `c64`",
         ));
@@ -799,7 +799,7 @@ mod tests {
         );
 
         assert!(matches!(
-            Array::scalar(1i32).fail(),
+            Array::scalar(1i32).unwrap().fail(),
             Err(ProgramError::InvalidArgument { message }) if message == "scalar kernel failed",
         ));
 
@@ -933,7 +933,7 @@ mod tests {
             }),
         );
 
-        let output = Array::scalar(1i32).fail(&Array::scalar(2i32));
+        let output = Array::scalar(1i32).unwrap().fail(&Array::scalar(2i32).unwrap());
         assert!(matches!(
             output,
             Err(ProgramError::InvalidArgument { message }) if message == "scalar kernel failed",

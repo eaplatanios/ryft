@@ -1403,7 +1403,7 @@ mod tests {
             context
                 .bind_discharged(
                     ReferenceType::new(allocation_type.clone()),
-                    TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
+                    TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect()).unwrap()),
                 )
                 .unwrap(),
         );
@@ -1433,7 +1433,7 @@ mod tests {
                 })
                 .with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }),
         );
-        assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
+        assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap())));
 
         // A composition that does not fit the incoming view is rejected before any handle exists, with the view
         // algebra's own diagnostic rather than a discharge-specific one.
@@ -1447,7 +1447,7 @@ mod tests {
         );
 
         // The operand must be a reference handle, and there must be exactly one of them.
-        let pure = ReferenceDischargeValue::Value(TestValue::Array(Array::scalar(1.0_f32)));
+        let pure = ReferenceDischargeValue::Value(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
         assert_eq!(
             ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)]).discharge_references(
                 &context,
@@ -1471,11 +1471,9 @@ mod tests {
             context
                 .bind_preserved(
                     ReferenceType::new(allocation_type),
-                    TestValue::Reference(ArrayReference::new(Array::matrix(
-                        3,
-                        3,
-                        (1..=9).map(|value| value as f32).collect(),
-                    ))),
+                    TestValue::Reference(ArrayReference::new(
+                        Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect()).unwrap(),
+                    )),
                 )
                 .unwrap(),
         );
@@ -1501,7 +1499,7 @@ mod tests {
         // through the view: the first row of the preserved allocation rather than the allocation itself.
         assert_eq!(
             view.preserved().map(ReferenceRead::read),
-            Some(Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])))),
+            Some(Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()))),
         );
     }
 
@@ -1509,11 +1507,11 @@ mod tests {
     fn test_reference_dynamic_index_operation_discharge_preserved_reference() {
         let context =
             ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(TestDestination::new());
-        let value = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
+        let value = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()).reference_new().unwrap();
         let reference = context
             .bind_preserved(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])), value)
             .unwrap();
-        let index = TestValue::Array(Array::scalar(2_i64));
+        let index = TestValue::Array(Array::scalar(2_i64).unwrap());
         let outputs = ReferenceDynamicIndexOperation::new(0)
             .discharge_references(
                 &context,
@@ -1522,18 +1520,19 @@ mod tests {
             )
             .unwrap();
         let view = outputs[0].try_as_reference("a dynamic reference view").unwrap();
-        assert_eq!(view.preserved().unwrap().read(), Ok(TestValue::Array(Array::scalar(3.0_f32))));
+        assert_eq!(view.preserved().unwrap().read(), Ok(TestValue::Array(Array::scalar(3.0_f32).unwrap())));
     }
 
     #[test]
     fn test_array_reference_view_operations_jvp() {
         let context = DifferentiationContext::fused(TestDestination::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestValue::Array(Array::from_f64s(allocation_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
-            .reference_new()
-            .unwrap();
+        let reference =
+            TestValue::Array(Array::from_f64s(allocation_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())
+                .reference_new()
+                .unwrap();
         let tangent_reference =
-            TestValue::Array(Array::from_f64s(allocation_type, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]))
+            TestValue::Array(Array::from_f64s(allocation_type, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap())
                 .reference_new()
                 .unwrap();
 
@@ -1545,7 +1544,7 @@ mod tests {
         );
         let indexed = context.bind(ReferenceIndexOperation::new(0, 1), Vec::new(), &[active.clone()]).unwrap();
         let index = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::scalar(1_i64))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::scalar(1_i64).unwrap())).unwrap(),
             context.clone(),
         );
         let dynamic =
@@ -1554,46 +1553,46 @@ mod tests {
         assert_eq!(dynamic[0].tangent().as_value().unwrap().read(), indexed[0].tangent().as_value().unwrap().read());
 
         assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))));
+        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())));
         assert_eq!(
             indexed[0].tangent().as_value().unwrap().read(),
-            Ok(TestValue::Array(Array::vector(vec![10.0_f32, 11.0, 12.0]))),
+            Ok(TestValue::Array(Array::vector(vec![10.0_f32, 11.0, 12.0]).unwrap())),
         );
         let axes = vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)];
         let sliced = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[active]).unwrap();
         let sliced_type = ArrayType::new_static(DataType::F32, [2, 2]);
         assert_eq!(
             sliced[0].primal().read(),
-            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![2.0, 3.0, 5.0, 6.0]))),
+            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![2.0, 3.0, 5.0, 6.0]).unwrap())),
         );
         assert_eq!(
             sliced[0].tangent().as_value().unwrap().read(),
-            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![8.0, 9.0, 11.0, 12.0]))),
+            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![8.0, 9.0, 11.0, 12.0]).unwrap())),
         );
 
         // A store through the tangent view lands in the tangent allocation and leaves the primal allocation untouched.
-        let zeros = TestValue::Array(Array::from_f64s(sliced_type, vec![0.0; 4]));
+        let zeros = TestValue::Array(Array::from_f64s(sliced_type, vec![0.0; 4]).unwrap());
         sliced[0].tangent().as_value().unwrap().write(&zeros).unwrap();
         assert_eq!(
             tangent_reference.read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [2, 3]),
-                vec![7.0, 0.0, 0.0, 10.0, 0.0, 0.0],
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![7.0, 0.0, 0.0, 10.0, 0.0, 0.0],)
+                    .unwrap()
+            )),
         );
         assert_eq!(
             reference.read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [2, 3]),
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],)
+                    .unwrap()
+            )),
         );
 
         // The views of a plumbing reference stay plumbing, typed with the view's own reference type.
         let plumbing =
             DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(reference).unwrap(), context.clone());
         let indexed = context.bind(ReferenceIndexOperation::new(1, 2), Vec::new(), &[plumbing.clone()]).unwrap();
-        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 6.0]))));
+        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
         assert!(matches!(
             indexed[0].tangent(),
             MaybeZero::Zero(r#type)
@@ -1616,7 +1615,7 @@ mod tests {
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestDestination::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..24).map(f64::from).collect()))
+        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..24).map(f64::from).collect()).unwrap())
             .reference_new()
             .unwrap();
 
@@ -1633,10 +1632,10 @@ mod tests {
         );
         assert_eq!(
             outputs[0].batch().value().read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [2, 3]),
-                vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0],
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0],)
+                    .unwrap()
+            )),
         );
 
         // A batch axis after the indexed axis leaves the packed indexed axis alone and moves the output batch axis one
@@ -1651,10 +1650,10 @@ mod tests {
         );
         assert_eq!(
             outputs[0].batch().value().read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [3, 4]),
-                (12..24).map(f64::from).collect(),
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [3, 4]), (12..24).map(f64::from).collect(),)
+                    .unwrap()
+            )),
         );
 
         // A batch axis at the indexed axis position precedes the indexed per-item axis in the packed referent.
@@ -1666,10 +1665,10 @@ mod tests {
         );
         assert_eq!(
             outputs[0].batch().value().read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [2, 3]),
-                vec![3.0, 7.0, 11.0, 15.0, 19.0, 23.0],
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![3.0, 7.0, 11.0, 15.0, 19.0, 23.0],)
+                    .unwrap()
+            )),
         );
 
         // Slicing inserts an identity selection at the batch axis position and keeps the output batch axis.
@@ -1682,10 +1681,13 @@ mod tests {
         );
         assert_eq!(
             outputs[0].batch().value().read(),
-            Ok(TestValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [1, 3, 2]),
-                vec![13.0, 14.0, 17.0, 18.0, 21.0, 22.0],
-            ))),
+            Ok(TestValue::Array(
+                Array::from_f64s(
+                    ArrayType::new_static(DataType::F32, [1, 3, 2]),
+                    vec![13.0, 14.0, 17.0, 18.0, 21.0, 22.0],
+                )
+                .unwrap()
+            )),
         );
 
         // Replicated references are viewed unchanged and stay replicated.
@@ -1808,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_eager_reference_allocation_and_read_roundtrip() {
-        let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let reference = initial.reference_new().unwrap();
         assert!(matches!(reference, ArrayIrValue::Reference(_)));
         assert_eq!(reference.read().unwrap(), initial);
@@ -1817,59 +1819,64 @@ mod tests {
     #[test]
     fn test_eager_reference_index_slice_and_composition() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let allocation = initial.reference_new().unwrap();
         let row = allocation.reference_index(0, 1).unwrap();
-        assert_eq!(row.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))));
+        assert_eq!(row.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())));
 
         let slice = allocation.reference_slice(&[ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)]).unwrap();
         assert_eq!(
             slice.read(),
-            Ok(ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]),),
-                vec![2.0, 3.0, 5.0, 6.0],
-            ))),
+            Ok(ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]),),
+                    vec![2.0, 3.0, 5.0, 6.0],
+                )
+                .unwrap()
+            )),
         );
         let composed = slice.reference_index(0, 1).unwrap();
-        assert_eq!(composed.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))));
+        assert_eq!(composed.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())));
     }
 
     #[test]
     fn test_eager_reference_indexed_mutation_reconstructs_removed_axis() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let initial =
+            ArrayIrValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let allocation = initial.reference_new().unwrap();
         let row = allocation.reference_index(0, 1).unwrap();
 
         assert_eq!(
-            row.swap(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0]))),
-            Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))),
+            row.swap(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())),
         );
-        row.add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))).unwrap();
+        row.add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())).unwrap();
         assert_eq!(
             allocation.read(),
-            Ok(ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0],))),
+            Ok(ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0],).unwrap())),
         );
     }
 
     #[test]
     fn test_eager_reference_views_share_overlapping_allocation_state() {
-        let allocation = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])).reference_new().unwrap();
+        let allocation =
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()).reference_new().unwrap();
         let left = allocation.reference_slice(&[ArraySliceAxis::new(0, 3, 1)]).unwrap();
         let right = allocation.reference_slice(&[ArraySliceAxis::new(1, 3, 1)]).unwrap();
 
         assert_eq!(
-            left.swap(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0]))),
-            Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))),
+            left.swap(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())),
         );
-        assert_eq!(right.read(), Ok(ArrayIrValue::Array(Array::vector(vec![20.0_f32, 30.0, 4.0]))));
-        right.add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))).unwrap();
-        assert_eq!(allocation.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f32, 21.0, 32.0, 7.0]))));
+        assert_eq!(right.read(), Ok(ArrayIrValue::Array(Array::vector(vec![20.0_f32, 30.0, 4.0]).unwrap())));
+        right.add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())).unwrap();
+        assert_eq!(allocation.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f32, 21.0, 32.0, 7.0]).unwrap())));
     }
 
     #[test]
     fn test_eager_reference_view_validation_and_freeze_invalidation() {
-        let allocation = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
+        let allocation = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()).reference_new().unwrap();
         assert_eq!(
             allocation.reference_index(1, 0),
             Err(TypeError::invalid("reference index axis 1 is out of bounds for rank 1").into()),
@@ -1931,16 +1938,16 @@ mod tests {
             error.downcast_custom::<ArrayReferenceViewError>(),
             Some(&ArrayReferenceViewError::CannotFreezeView)
         );
-        assert_eq!(allocation.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
+        assert_eq!(allocation.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())));
 
-        assert_eq!(allocation.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
+        assert_eq!(allocation.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())));
         let error = view.read().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
     fn test_eager_reference_operations_reject_mismatched_member_kinds() {
-        let array = ArrayIrValue::<Array>::Array(Array::scalar(1.0_f32));
+        let array = ArrayIrValue::<Array>::Array(Array::scalar(1.0_f32).unwrap());
         assert_eq!(array.read(), Err(TypeError::invalid("expected reference type but got array type").into()));
         let reference = array.reference_new().unwrap();
         assert_eq!(
@@ -1965,10 +1972,10 @@ mod tests {
 
     #[test]
     fn test_eager_reference_updates_enforce_exact_storage_and_preserve_rejected_state() {
-        let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let reference = initial.reference_new().unwrap();
 
-        let error = reference.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        let error = reference.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]).unwrap())).unwrap_err();
         assert_eq!(
             error,
             TypeError::invalid(
@@ -1978,7 +1985,7 @@ mod tests {
         );
         assert_eq!(reference.read(), Ok(initial.clone()));
 
-        let error = reference.write(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        let error = reference.write(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]).unwrap())).unwrap_err();
         assert_eq!(
             error,
             TypeError::invalid(
@@ -1988,7 +1995,7 @@ mod tests {
         );
         assert_eq!(reference.read(), Ok(initial.clone()));
 
-        let error = reference.add_update(&ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]))).unwrap_err();
+        let error = reference.add_update(&ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]).unwrap())).unwrap_err();
         assert_eq!(
             error,
             TypeError::invalid(
@@ -1999,26 +2006,26 @@ mod tests {
         );
         assert_eq!(reference.read(), Ok(initial));
 
-        let replacement = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0]));
-        assert_eq!(reference.swap(&replacement), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))),);
+        let replacement = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0]).unwrap());
+        assert_eq!(reference.swap(&replacement), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap())),);
         assert_eq!(reference.read(), Ok(replacement));
 
         // Broadcasting is valid only because the computed result preserves the exact stored type.
-        assert_eq!(reference.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32))), Ok(()));
-        assert_eq!(reference.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))));
+        assert_eq!(reference.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap())), Ok(()));
+        assert_eq!(reference.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())));
     }
 
     #[test]
     fn test_eager_reference_freeze_invalidates_composite_aliases() {
-        let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
         let alias = reference.clone();
-        assert_eq!(reference.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))));
+        assert_eq!(reference.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap())));
 
         let error = alias.read().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        let error = alias.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))).unwrap_err();
+        let error = alias.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        let error = alias.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32))).unwrap_err();
+        let error = alias.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap())).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         let error = alias.freeze().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
@@ -2098,9 +2105,9 @@ mod tests {
         // Under the `Stage` placement every reference operation stages regardless of operand knowledge: the live state
         // is untouched, the write produces nothing, and the swap's previous value is an unknown of the residual
         // program.
-        let live = ArrayReference::new(Array::scalar(1.0_f32));
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
-        let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
+        let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
         assert!(
@@ -2122,7 +2129,7 @@ mod tests {
             .unwrap();
         assert_eq!(swapped.len(), 1);
         assert!(swapped[0].is_unknown());
-        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
 
         // Under the default `Execute` placement all-known reference operations fold: they run against the live state in
         // program order and the swap's previous value is known.
@@ -2137,17 +2144,17 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         let swapped = executing
             .fold_or_residualize(
                 TestOperation::ReferenceSwap(TestSwap::new()),
                 Vec::new(),
-                &[reference, PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32)))],
+                &[reference, PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32).unwrap()))],
             )
             .unwrap();
         assert_eq!(swapped.len(), 1);
-        assert_eq!(swapped[0].as_known(), Some(&TestValue::Array(Array::scalar(2.0_f32))));
-        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(swapped[0].as_known(), Some(&TestValue::Array(Array::scalar(2.0_f32).unwrap())));
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
@@ -2459,7 +2466,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         condition_builder.add_input(reference_type.clone());
         let predicate = condition_builder
-            .add_constant(TestValue::Array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0])));
+            .add_constant(TestValue::Array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap()));
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2496,19 +2503,19 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_reference_dynamic_index() {
-        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
-        let negative = TestValue::Array(Array::scalar(-9_i64));
-        let large = TestValue::Array(Array::scalar(u64::MAX));
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()).reference_new().unwrap();
+        let negative = TestValue::Array(Array::scalar(-9_i64).unwrap());
+        let large = TestValue::Array(Array::scalar(u64::MAX).unwrap());
         assert_eq!(
             reference.reference_dynamic_index(0, &negative).unwrap().read(),
-            Ok(TestValue::Array(Array::scalar(1.0_f32)))
+            Ok(TestValue::Array(Array::scalar(1.0_f32).unwrap()))
         );
         let last = reference.reference_dynamic_index(0, &large).unwrap();
-        last.write(&TestValue::Array(Array::scalar(7.0_f32))).unwrap();
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 7.0]))));
+        last.write(&TestValue::Array(Array::scalar(7.0_f32).unwrap())).unwrap();
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 7.0]).unwrap())));
 
         // Empty axes remain well typed, but eager execution cannot select an element from them.
-        let empty = TestValue::Array(Array::vector(Vec::<f32>::new())).reference_new().unwrap();
+        let empty = TestValue::Array(Array::vector(Vec::<f32>::new()).unwrap()).reference_new().unwrap();
         assert_eq!(
             empty.reference_dynamic_index(0, &negative),
             Err(TypeError::invalid("cannot dynamically index an empty reference axis").into())
@@ -2520,10 +2527,10 @@ mod tests {
         type TestContext = EagerContext<TestValue, TestOperation>;
 
         let inputs = (
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-            TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
-            TestValue::Array(Array::vector(vec![5.0_f32, 6.0])),
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
         );
         let (eager_outputs, program) = TestContext::new()
             .interpret_and_trace(
@@ -2539,9 +2546,9 @@ mod tests {
             )
             .unwrap();
         let expected = (
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-            TestValue::Array(Array::vector(vec![6.0_f32, 8.0])),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![6.0_f32, 8.0]).unwrap()),
         );
         assert_eq!(eager_outputs, expected);
         assert_eq!(program.interpret(inputs), Ok(expected));
@@ -2552,22 +2559,22 @@ mod tests {
     fn test_array_ir_reference_jvp_read_modify_write() {
         // The tangent of a read-modify-write is the tangent reference's contents plus the update's tangent, and both
         // the primal and the tangent references observe their respective stores.
-        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestValue::Array(Array::vector(vec![0.5_f32, 0.25])).reference_new().unwrap();
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestValue::Array(Array::vector(vec![0.5_f32, 0.25]).unwrap()).reference_new().unwrap();
         let (primal, tangent) =
-            differentiate_at((reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))))
+            differentiate_at((reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())))
                 .jvp::<_, TestValue, _, _>(
-                    (tangent_reference.clone(), TestValue::Array(Array::vector(vec![5.0_f32, 6.0]))),
+                    (tangent_reference.clone(), TestValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())),
                     |(reference, value)| {
                         reference.add_update(&value)?;
                         reference.read()
                     },
                 )
                 .unwrap();
-        assert_eq!(primal, TestValue::Array(Array::vector(vec![4.0_f32, 6.0])));
-        assert_eq!(tangent, TestValue::Array(Array::vector(vec![5.5_f32, 6.25])));
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 6.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![5.5_f32, 6.25]))));
+        assert_eq!(primal, TestValue::Array(Array::vector(vec![4.0_f32, 6.0]).unwrap()));
+        assert_eq!(tangent, TestValue::Array(Array::vector(vec![5.5_f32, 6.25]).unwrap()));
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 6.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![5.5_f32, 6.25]).unwrap())));
     }
 
     #[test]
@@ -2599,16 +2606,16 @@ mod tests {
         assert_eq!(jvp.output_types(), discharged_jvp.output_types());
 
         let inputs = vec![
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-            TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
-            TestValue::Array(Array::vector(vec![5.0_f32, 6.0])),
-            TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
         ];
         let expected = vec![
-            TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
-            TestValue::Array(Array::vector(vec![4.0_f32, 6.0])),
-            TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
-            TestValue::Array(Array::vector(vec![12.0_f32, 14.0])),
+            TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![4.0_f32, 6.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![12.0_f32, 14.0]).unwrap()),
         ];
         assert_eq!(jvp.interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(discharged_jvp.interpret(inputs), Ok(expected));
@@ -2625,13 +2632,13 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![external], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let reference = initial.reference_new().unwrap();
         let outputs = program
-            .interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))])
+            .interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())])
             .unwrap();
         assert_eq!(outputs, vec![reference.clone()]);
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
     }
 
     #[test]
@@ -2671,12 +2678,15 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]));
+        let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]).unwrap());
         assert_eq!(
-            program.interpret(vec![TestValue::Array(Array::scalar(true)), value.clone()]),
+            program.interpret(vec![TestValue::Array(Array::scalar(true).unwrap()), value.clone()]),
             Ok(vec![value.clone()]),
         );
-        assert_eq!(program.interpret(vec![TestValue::Array(Array::scalar(false)), value.clone()]), Ok(vec![value]));
+        assert_eq!(
+            program.interpret(vec![TestValue::Array(Array::scalar(false).unwrap()), value.clone()]),
+            Ok(vec![value])
+        );
     }
 
     #[test]
@@ -2713,16 +2723,17 @@ mod tests {
             .unwrap();
 
         let context = EagerContext::<TestValue, TestOperation>::new();
-        let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]));
+        let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]).unwrap());
         for predicate in [true, false] {
             assert_eq!(
-                program.interpret(vec![TestValue::Array(Array::scalar(predicate)), value.clone()]),
+                program.interpret(vec![TestValue::Array(Array::scalar(predicate).unwrap()), value.clone()]),
                 Ok(vec![value.clone()]),
             );
             assert_eq!(
-                program
-                    .entry_region_ref()
-                    .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(predicate)), value.clone()],),
+                program.entry_region_ref().interpret_in_context(
+                    &context,
+                    vec![TestValue::Array(Array::scalar(predicate).unwrap()), value.clone()],
+                ),
                 Ok(vec![value.clone()]),
             );
         }
@@ -2747,10 +2758,10 @@ mod tests {
             let state = builder.add_input(array_type.clone().into());
             builder.add_input(boolean_type.clone().into());
             let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![state], None).unwrap()[0];
-            let update = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+            let update = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
             builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
             let state = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            let done = builder.add_constant(TestValue::Array(Array::scalar(false)));
+            let done = builder.add_constant(TestValue::Array(Array::scalar(false).unwrap()));
             builder
                 .build::<Values, Values>(vec![state, done], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -2772,10 +2783,13 @@ mod tests {
         let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
         assert_eq!(
             program.interpret(vec![
-                TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-                TestValue::Array(Array::scalar(true)),
+                TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+                TestValue::Array(Array::scalar(true).unwrap()),
             ]),
-            Ok(vec![TestValue::Array(Array::vector(vec![2.0_f32, 3.0])), TestValue::Array(Array::scalar(false)),]),
+            Ok(vec![
+                TestValue::Array(Array::vector(vec![2.0_f32, 3.0]).unwrap()),
+                TestValue::Array(Array::scalar(false).unwrap()),
+            ]),
         );
     }
 
@@ -2809,12 +2823,12 @@ mod tests {
 
         assert_eq!(
             program.interpret(vec![
-                TestValue::Array(Array::scalar(1.0_f32)),
-                TestValue::Array(Array::vector(vec![1.0_f32, 3.0, 4.0])),
+                TestValue::Array(Array::scalar(1.0_f32).unwrap()),
+                TestValue::Array(Array::vector(vec![1.0_f32, 3.0, 4.0]).unwrap()),
             ]),
             Ok(vec![
-                TestValue::Array(Array::scalar(9.0_f32)),
-                TestValue::Array(Array::vector(vec![2.0_f32, 5.0, 9.0])),
+                TestValue::Array(Array::scalar(9.0_f32).unwrap()),
+                TestValue::Array(Array::vector(vec![2.0_f32, 5.0, 9.0]).unwrap()),
             ]),
         );
     }

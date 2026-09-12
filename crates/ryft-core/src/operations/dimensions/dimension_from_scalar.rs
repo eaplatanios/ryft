@@ -229,7 +229,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// # use ryft_core::{ArrayIrValue, DimensionFromScalar, DimensionValue, Mul, ProgramError};
 /// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
+/// let scalar = ArrayIrValue::Array(Array::scalar(5_i32).unwrap());
 /// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
 /// let dimension = scalar.to_dimension(batch)?;
 /// let ArrayIrValue::Dimension(dimension) = dimension else {
@@ -250,7 +250,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// # use ryft_core::{DimensionFromScalar, ProgramError, Reshape, Slice};
 /// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let extents = Array::vector(vec![3_i32, 5_i32]);
+/// let extents = Array::vector(vec![3_i32, 5_i32]).unwrap();
 /// let sequence = extents.slice(&[1], &[2], &[1])?.reshape(Shape::scalar())?;
 /// let sequence = sequence.to_dimension(DimensionVariable::new(
 ///     "sequence",
@@ -397,30 +397,30 @@ mod tests {
 
         // Every integer element type uses the same checked conversion contract.
         for array in [
-            Array::scalar(7_i8),
-            Array::scalar(7_i16),
-            Array::scalar(7_i32),
-            Array::scalar(7_i64),
-            Array::scalar(7_u8),
-            Array::scalar(7_u16),
-            Array::scalar(7_u32),
-            Array::scalar(7_u64),
+            Array::scalar(7_i8).unwrap(),
+            Array::scalar(7_i16).unwrap(),
+            Array::scalar(7_i32).unwrap(),
+            Array::scalar(7_i64).unwrap(),
+            Array::scalar(7_u8).unwrap(),
+            Array::scalar(7_u16).unwrap(),
+            Array::scalar(7_u32).unwrap(),
+            Array::scalar(7_u64).unwrap(),
         ] {
             assert_eq!(array.to_dimension(variable.clone()).unwrap().extent(), 7);
         }
-        assert_eq!(Array::scalar(0_i32).to_dimension(variable.clone()).unwrap().extent(), 0);
+        assert_eq!(Array::scalar(0_i32).unwrap().to_dimension(variable.clone()).unwrap().extent(), 0);
         let bounded_variable = DimensionVariable::new("bounded", DimensionBounds::new(2, Some(5)).unwrap());
-        assert_eq!(Array::scalar(2_i32).to_dimension(bounded_variable.clone()).unwrap().extent(), 2);
-        assert_eq!(Array::scalar(4_i32).to_dimension(bounded_variable.clone()).unwrap().extent(), 4);
+        assert_eq!(Array::scalar(2_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap().extent(), 2);
+        assert_eq!(Array::scalar(4_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap().extent(), 4);
         assert_eq!(
-            Array::scalar(-1_i32).to_dimension(variable.clone()),
+            Array::scalar(-1_i32).unwrap().to_dimension(variable.clone()),
             Err(ProgramError::InvalidArgument {
                 message: "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is \
                           -1"
                 .to_string(),
             }),
         );
-        let error = Array::scalar(5_i32).to_dimension(bounded_variable.clone()).unwrap_err();
+        let error = Array::scalar(5_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::BindingOutOfBounds {
@@ -431,6 +431,7 @@ mod tests {
         );
         if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
             let error = Array::scalar(u64::try_from(unrepresentable).unwrap())
+                .unwrap()
                 .to_dimension(DimensionVariable::new("wide", DimensionBounds::at_least(0)))
                 .unwrap_err();
             assert_eq!(
@@ -444,7 +445,7 @@ mod tests {
 
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
-            context.bind(operation.clone(), Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i32))],),
+            context.bind(operation.clone(), Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i32).unwrap())],),
             Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)]),
         );
         assert_eq!(
@@ -461,7 +462,7 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@known, ArrayIrValue::Array(Array::scalar(7_i32))),
+                        (@known, ArrayIrValue::Array(Array::scalar(7_i32).unwrap())),
                     ],
                     outputs = [
                         (@known, ArrayIrValue::Dimension(
@@ -474,7 +475,7 @@ mod tests {
                     inputs = [
                         (@unknown(
                             type = scalar_type.clone(),
-                            replay = ArrayIrValue::Array(Array::scalar(7_i32))
+                            replay = ArrayIrValue::Array(Array::scalar(7_i32).unwrap())
                         )),
                     ],
                     outputs = [
@@ -694,13 +695,13 @@ mod tests {
         for extent in [1_usize, 5, 8] {
             assert_eq!(
                 program.interpret(vec![
-                    ArrayIrValue::Array(Array::scalar(i32::try_from(extent).unwrap())),
-                    ArrayIrValue::Array(Array::scalar(2.0_f64)),
-                    ArrayIrValue::Array(Array::scalar(3.0_f64)),
+                    ArrayIrValue::Array(Array::scalar(i32::try_from(extent).unwrap()).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
                 ]),
                 Ok(vec![
-                    ArrayIrValue::Array(Array::vector(vec![2.0_f64; extent])),
-                    ArrayIrValue::Array(Array::vector(vec![3.0_f64; extent])),
+                    ArrayIrValue::Array(Array::vector(vec![2.0_f64; extent]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![3.0_f64; extent]).unwrap()),
                 ]),
             );
         }

@@ -418,12 +418,12 @@ impl ElementType for ArrayType {
 /// # use ryft_core::{Array, ConvertElementType, DataType, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let input = Array::vector(vec![1.75_f64, -2.5]);
+/// let input = Array::vector(vec![1.75_f64, -2.5]).unwrap();
 /// let output = input.convert_element_type(DataType::I32)?;
-/// assert_eq!(output, Array::vector(vec![1_i32, -2]));
+/// assert_eq!(output, Array::vector(vec![1_i32, -2]).unwrap());
 ///
-/// let input = Array::vector(vec![1.0_f32, 2.0]);
-/// assert_eq!(input.promote_element_type(DataType::F64)?, Array::vector(vec![1.0_f64, 2.0]));
+/// let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+/// assert_eq!(input.promote_element_type(DataType::F64)?, Array::vector(vec![1.0_f64, 2.0]).unwrap());
 /// # Ok(())
 /// # }
 /// ```
@@ -458,9 +458,9 @@ pub trait ConvertElementType: Sized {
     ///
     /// ```
     /// # use ryft_core::{Array, ConvertElementType, DataType};
-    /// let pieces = Array::scalar(0x12345678_u32).bitcast_element_type(DataType::U16)?;
-    /// assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]));
-    /// assert_eq!(pieces.bitcast_element_type(DataType::U32)?, Array::scalar(0x12345678_u32));
+    /// let pieces = Array::scalar(0x12345678_u32).unwrap().bitcast_element_type(DataType::U16)?;
+    /// assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]).unwrap());
+    /// assert_eq!(pieces.bitcast_element_type(DataType::U32)?, Array::scalar(0x12345678_u32).unwrap());
     /// # Ok::<(), ryft_core::ProgramError>(())
     /// ```
     fn bitcast_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
@@ -810,9 +810,9 @@ mod tests {
     #[test]
     fn test_convert_element_type_interpretation() {
         let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false)
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0_f64)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0_f64).unwrap()])
             .unwrap();
-        assert_eq!(output, vec![Array::scalar(2.0_f32)]);
+        assert_eq!(output, vec![Array::scalar(2.0_f32).unwrap()]);
     }
 
     #[test]
@@ -826,7 +826,11 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
         assert!(matches!(
-            operation.interpret(&context, &EmptyRegionDriver, &[Array::scalar(2.0_f64), Array::scalar(3.0_f64)]),
+            operation.interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0_f64).unwrap(), Array::scalar(3.0_f64).unwrap()]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
         ));
 
@@ -844,7 +848,7 @@ mod tests {
             ConvertElementTypeOperation::<ArrayType>::new(DataType::Token, false).interpret(
                 &context,
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0_f64)],
+                &[Array::scalar(2.0_f64).unwrap()],
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot convert values to or from the `token` data type",
@@ -854,7 +858,7 @@ mod tests {
     #[test]
     fn test_convert_element_type_interpretation_bitcast() {
         // Signed zero and NaN payloads survive without numeric conversion or canonicalization.
-        let input = Array::vector(vec![0x80000000_u32, 0x7fc01234]);
+        let input = Array::vector(vec![0x80000000_u32, 0x7fc01234]).unwrap();
         let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true)
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone()])
             .unwrap()
@@ -862,9 +866,9 @@ mod tests {
         assert_eq!(output.logical_bytes(), input.logical_bytes());
         assert_eq!(output.bitcast_element_type(DataType::U32), Ok(input));
 
-        let pieces = Array::scalar(0x12345678_u32).bitcast_element_type(DataType::U16).unwrap();
-        assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]));
-        assert_eq!(pieces.bitcast_element_type(DataType::U32), Ok(Array::scalar(0x12345678_u32)));
+        let pieces = Array::scalar(0x12345678_u32).unwrap().bitcast_element_type(DataType::U16).unwrap();
+        assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]).unwrap());
+        assert_eq!(pieces.bitcast_element_type(DataType::U32), Ok(Array::scalar(0x12345678_u32).unwrap()));
     }
 
     #[test]
@@ -875,20 +879,23 @@ mod tests {
         let input = Array::from_elements(input_type, &[0x12345678_u32, 0x89abcdef]).unwrap();
         assert_eq!(
             input.bitcast_element_type(DataType::U16),
-            Ok(Array::matrix(2, 2, vec![0x5678_u16, 0x1234, 0xcdef, 0x89ab])),
+            Ok(Array::matrix(2, 2, vec![0x5678_u16, 0x1234, 0xcdef, 0x89ab]).unwrap()),
         );
         assert_eq!(
-            Array::vector(Vec::<u32>::new()).bitcast_element_type(DataType::U16),
-            Ok(Array::matrix(0, 2, Vec::<u16>::new())),
+            Array::vector(Vec::<u32>::new()).unwrap().bitcast_element_type(DataType::U16),
+            Ok(Array::matrix(0, 2, Vec::<u16>::new()).unwrap()),
         );
     }
 
     #[test]
     fn test_convert_element_type_interpretation_bitcast_subbyte() {
-        let pieces = Array::scalar(0xab_u8).bitcast_element_type(DataType::U4).unwrap();
+        let pieces = Array::scalar(0xab_u8).unwrap().bitcast_element_type(DataType::U4).unwrap();
         assert_eq!(pieces.elements::<u4>().unwrap(), vec![u4::new(11).unwrap(), u4::new(10).unwrap()]);
-        assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xab_u8)));
-        assert_eq!(Array::scalar(true).bitcast_element_type(DataType::Boolean), Ok(Array::scalar(true)));
+        assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xab_u8).unwrap()));
+        assert_eq!(
+            Array::scalar(true).unwrap().bitcast_element_type(DataType::Boolean),
+            Ok(Array::scalar(true).unwrap())
+        );
     }
 
     #[test]
@@ -898,8 +905,8 @@ mod tests {
         // Known inputs fold to converted values; unknown inputs retain the conversion.
         check_operation_partial_evaluation!(
             operation = array_operation,
-            inputs = [Array::scalar(2.0_f64)],
-            expected = Array::scalar(2.0_f32),
+            inputs = [Array::scalar(2.0_f64).unwrap()],
+            expected = Array::scalar(2.0_f32).unwrap(),
         );
     }
 
@@ -907,8 +914,8 @@ mod tests {
     fn test_convert_element_type_partial_evaluation_bitcast() {
         check_operation_partial_evaluation!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
-            inputs = [Array::scalar(1.0_f32)],
-            expected = Array::scalar(0x3f800000_u32),
+            inputs = [Array::scalar(1.0_f32).unwrap()],
+            expected = Array::scalar(0x3f800000_u32).unwrap(),
         );
     }
 
@@ -921,13 +928,13 @@ mod tests {
             operation = array_operation,
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
                 outputs = [(
                     @mapped(axis = 0),
                     Array::from_f64s(
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
                         vec![1.0, 2.0],
-                    )
+                    ).unwrap()
                 )],
             }],
         );
@@ -937,8 +944,8 @@ mod tests {
             operation = array_operation,
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f64, 2.0]))],
-                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, 2.0]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f64, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, 2.0]).unwrap())],
             }],
         );
     }
@@ -950,8 +957,8 @@ mod tests {
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0x5678_u16, 0xcdef, 0x1234, 0x89ab]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0x12345678_u32, 0x89abcdef]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0x5678_u16, 0xcdef, 0x1234, 0x89ab]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0x12345678_u32, 0x89abcdef]).unwrap())],
             }],
         );
         // Equal-width reinterpretation keeps the mapped position unchanged.
@@ -960,8 +967,8 @@ mod tests {
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, -0.0]))],
-                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x3f800000_u32, 0x80000000]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, -0.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x3f800000_u32, 0x80000000]).unwrap())],
             }],
         );
         // Narrowing appends the encoding-piece axis after the existing mapped axis.
@@ -970,7 +977,7 @@ mod tests {
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x12345678_u32, 0x89abcdef]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x12345678_u32, 0x89abcdef]).unwrap())],
                 outputs = [(@mapped(axis = 1), Array::from_elements(
                     ArrayType::new_static(DataType::U16, [1, 2, 2]),
                     &[0x5678_u16, 0x1234, 0xcdef, 0x89ab],
@@ -986,10 +993,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-6),
             operation = ConvertElementTypeOperation::new(DataType::F64, false),
             cases = [{
-                primals = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])],
-                tangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])],
-                primal_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
-                tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
+                primals = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap()],
+                tangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap()],
+                primal_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap()],
+                tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap()],
             }],
         );
     }
@@ -997,19 +1004,19 @@ mod tests {
     #[test]
     fn test_convert_element_type_differentiation_low_precision() {
         // Low-precision primals use their wider differential representations in both conversion directions.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (output, output_tangent) =
             differentiate_at(primal).jvp(tangent, |value| value.convert_element_type(DataType::F32)).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
 
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap();
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (_, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::F8E8M0FNU))
             .unwrap();
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
     }
 
     #[test]
@@ -1022,52 +1029,56 @@ mod tests {
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
         let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f32.clone(), vec![2.0]))
-            .jvp(Array::from_f64s(laid_out_f32.clone(), vec![3.0]), |value| {
+        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f32.clone(), vec![2.0]).unwrap())
+            .jvp(Array::from_f64s(laid_out_f32.clone(), vec![3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F8E8M0FNU)
             })
             .unwrap();
-        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap());
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f8.clone(), vec![2.0]))
-            .jvp(Array::from_f64s(plain_f32.clone(), vec![3.0]), |value| value.convert_element_type(DataType::F32))
+        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f8.clone(), vec![2.0]).unwrap())
+            .jvp(Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap(), |value| {
+                value.convert_element_type(DataType::F32)
+            })
             .unwrap();
-        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_narrowing() {
         // Narrowing real and complex primals also narrows their concrete tangent values.
-        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]))
-            .jvp(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]), |value| {
+        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap())
+            .jvp(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F32)
             })
             .unwrap();
-        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]))
-            .jvp(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]), |value| {
+        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]).unwrap())
+            .jvp(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::C64)
             })
             .unwrap();
-        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_complex() {
         // Real-to-complex conversion inserts zero imaginary components in both primal and tangent values.
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0_f32))
-            .jvp(Array::scalar(3.0_f32), |value| value.convert_element_type(DataType::C64))
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0_f32).unwrap())
+            .jvp(Array::scalar(3.0_f32).unwrap(), |value| value.convert_element_type(DataType::C64))
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)));
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0_f32, 0.0)));
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)).unwrap());
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0_f32, 0.0)).unwrap());
 
         // Complex-to-real conversion discards the imaginary primal and tangent components independently.
-        let (primal, tangent) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)))
-            .jvp(Array::scalar(ComplexNumber::new(3.0_f32, -7.0)), |value| value.convert_element_type(DataType::F32))
+        let (primal, tangent) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)).unwrap())
+            .jvp(Array::scalar(ComplexNumber::new(3.0_f32, -7.0)).unwrap(), |value| {
+                value.convert_element_type(DataType::F32)
+            })
             .unwrap();
-        assert_eq!(primal, Array::scalar(2.0_f32));
-        assert_eq!(tangent, Array::scalar(3.0_f32));
+        assert_eq!(primal, Array::scalar(2.0_f32).unwrap());
+        assert_eq!(tangent, Array::scalar(3.0_f32).unwrap());
     }
 
     #[test]
@@ -1090,27 +1101,27 @@ mod tests {
     #[test]
     fn test_convert_element_type_differentiation_discrete_intermediate() {
         // Passing through an element type with a zero-dimensional tangent space erases the incoming tangent.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]);
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]).unwrap();
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap();
         let (output, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64))
             .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_bitcast() {
         // Even identity bit reinterpretation declares a structural zero derivative.
-        let (output, tangent) = differentiate_at(Array::scalar(2.0_f32))
-            .jvp(Array::scalar(3.0_f32), |value| value.bitcast_element_type(DataType::F32))
+        let (output, tangent) = differentiate_at(Array::scalar(2.0_f32).unwrap())
+            .jvp(Array::scalar(3.0_f32).unwrap(), |value| value.bitcast_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(output, Array::scalar(2.0_f32));
-        assert_eq!(tangent, Array::scalar(0.0_f32));
-        let gradient = differentiate_at(Array::scalar(2.0_f32))
+        assert_eq!(output, Array::scalar(2.0_f32).unwrap());
+        assert_eq!(tangent, Array::scalar(0.0_f32).unwrap());
+        let gradient = differentiate_at(Array::scalar(2.0_f32).unwrap())
             .gradient(|value| value.bitcast_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(gradient, Array::scalar(0.0_f32));
+        assert_eq!(gradient, Array::scalar(0.0_f32).unwrap());
     }
 
     #[test]
@@ -1121,12 +1132,12 @@ mod tests {
             cases = [
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
-                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap()],
+                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap()],
                 },
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap()],
                     input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
                 },
             ],
@@ -1148,8 +1159,8 @@ mod tests {
             operation = ConvertElementTypeOperation::new(DataType::F8E8M0FNU, false),
             cases = [{
                 inputs = [(@linear(type = laid_out_f32.clone()))],
-                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0])],
-                input_cotangents = [Array::from_f64s(laid_out_f32.clone(), vec![3.0])],
+                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap()],
+                input_cotangents = [Array::from_f64s(laid_out_f32.clone(), vec![3.0]).unwrap()],
             }],
         );
 
@@ -1158,8 +1169,8 @@ mod tests {
             operation = ConvertElementTypeOperation::new(DataType::F32, false),
             cases = [{
                 inputs = [(@linear(type = laid_out_f8))],
-                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0])],
-                input_cotangents = [Array::from_f64s(plain_f32, vec![3.0])],
+                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap()],
+                input_cotangents = [Array::from_f64s(plain_f32, vec![3.0]).unwrap()],
             }],
         );
     }
@@ -1167,18 +1178,24 @@ mod tests {
     #[test]
     fn test_convert_element_type_transposition_complex() {
         // Pulling a complex cotangent back through real-to-complex conversion discards its imaginary component.
-        let (primal, pullback) = differentiate_at(Array::scalar(2.0_f32))
+        let (primal, pullback) = differentiate_at(Array::scalar(2.0_f32).unwrap())
             .vjp(|value| value.convert_element_type(DataType::C64))
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)));
-        assert_eq!(pullback.apply(Array::scalar(ComplexNumber::new(3.0_f32, -7.0))).unwrap(), Array::scalar(3.0_f32));
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)).unwrap());
+        assert_eq!(
+            pullback.apply(Array::scalar(ComplexNumber::new(3.0_f32, -7.0)).unwrap()).unwrap(),
+            Array::scalar(3.0_f32).unwrap()
+        );
 
         // Pulling back through complex-to-real conversion inserts a zero imaginary cotangent.
-        let (primal, pullback) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)))
+        let (primal, pullback) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)).unwrap())
             .vjp(|value| value.convert_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(primal, Array::scalar(2.0_f32));
-        assert_eq!(pullback.apply(Array::scalar(3.0_f32)).unwrap(), Array::scalar(ComplexNumber::new(3.0_f32, 0.0)));
+        assert_eq!(primal, Array::scalar(2.0_f32).unwrap());
+        assert_eq!(
+            pullback.apply(Array::scalar(3.0_f32).unwrap()).unwrap(),
+            Array::scalar(ComplexNumber::new(3.0_f32, 0.0)).unwrap()
+        );
     }
 
     #[test]
@@ -1264,8 +1281,11 @@ mod tests {
     #[test]
     fn test_convert_element_type_convert_element_type() {
         // Explicit conversion permits narrowing independently of the promotion lattice.
-        assert_eq!(Array::scalar(2.75_f64).convert_element_type(DataType::I32), Ok(Array::scalar(2_i32)));
-        let input = Array::vector(vec![1.0_f64, 2.0]);
+        assert_eq!(
+            Array::scalar(2.75_f64).unwrap().convert_element_type(DataType::I32),
+            Ok(Array::scalar(2_i32).unwrap())
+        );
+        let input = Array::vector(vec![1.0_f64, 2.0]).unwrap();
         assert_eq!(input.convert_element_type(DataType::F64), Ok(input));
     }
 
@@ -1295,7 +1315,10 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_bitcast_element_type() {
-        assert_eq!(Array::scalar(1.0_f32).bitcast_element_type(DataType::U32), Ok(Array::scalar(0x3f800000_u32)));
+        assert_eq!(
+            Array::scalar(1.0_f32).unwrap().bitcast_element_type(DataType::U32),
+            Ok(Array::scalar(0x3f800000_u32).unwrap())
+        );
         // Identity bitcasts remain explicit in staged code so their zero derivative cannot become an identity map.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
@@ -1307,25 +1330,28 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_promote_element_type() {
-        assert_eq!(Array::scalar(2.0_f32).promote_element_type(DataType::F64), Ok(Array::scalar(2.0_f64)));
+        assert_eq!(
+            Array::scalar(2.0_f32).unwrap().promote_element_type(DataType::F64),
+            Ok(Array::scalar(2.0_f64).unwrap())
+        );
 
         // An already-promoted value retains its complete metadata and element contents.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
             .with_memory(Memory::Host { pinned: true });
-        let input = Array::from_f64s(input_type, vec![1.0, 2.0]);
+        let input = Array::from_f64s(input_type, vec![1.0, 2.0]).unwrap();
         assert_eq!(input.promote_element_type(DataType::F32), Ok(input));
     }
 
     #[test]
     fn test_convert_element_type_promote_element_type_disallowed() {
         assert!(matches!(
-            Array::scalar(2.0_f64).promote_element_type(DataType::F32),
+            Array::scalar(2.0_f64).unwrap().promote_element_type(DataType::F32),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot promote type `f64` to type `f32`",
         ));
         assert!(matches!(
-            Array::scalar(2.0_f64).promote_element_type(DataType::I32),
+            Array::scalar(2.0_f64).unwrap().promote_element_type(DataType::I32),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot promote type `f64` to type `i32`",
         ));
@@ -1370,7 +1396,7 @@ mod tests {
             DataType::C128,
         ];
         for source_data_type in data_types {
-            let source = Array::from_f64s(ArrayType::new_static(source_data_type, [1]), vec![1.0]);
+            let source = Array::from_f64s(ArrayType::new_static(source_data_type, [1]), vec![1.0]).unwrap();
             for target_data_type in data_types {
                 let converted = source.convert_element_type(target_data_type).unwrap();
                 assert_eq!(converted.r#type().into_owned(), ArrayType::new_static(target_data_type, [1]));
@@ -1381,9 +1407,9 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_integer_and_boolean() {
         // Representative values pin Boolean truth, integer truncation and sub-byte modular narrowing.
-        let vector = Array::vector(vec![0.0, 1.5]);
-        assert_eq!(vector.convert_element_type(DataType::Boolean).unwrap(), Array::vector(vec![false, true]));
-        assert_eq!(vector.convert_element_type(DataType::I32).unwrap(), Array::vector(vec![0i32, 1]));
+        let vector = Array::vector(vec![0.0, 1.5]).unwrap();
+        assert_eq!(vector.convert_element_type(DataType::Boolean).unwrap(), Array::vector(vec![false, true]).unwrap());
+        assert_eq!(vector.convert_element_type(DataType::I32).unwrap(), Array::vector(vec![0i32, 1]).unwrap());
         let signed = Array::from_elements(
             ArrayType::new_static(DataType::I4, [3]),
             &[i4::new(-8).unwrap(), i4::new(-1).unwrap(), i4::new(7).unwrap()],
@@ -1407,7 +1433,7 @@ mod tests {
     fn test_array_convert_element_type_complex() {
         // Complex conversion preserves both components only for complex destinations and otherwise converts the real
         // component, except that Boolean conversion observes whether either component is nonzero.
-        let complex = Array::vector(vec![ComplexNumber::new(0.0f32, 2.0), ComplexNumber::new(-1.5, 0.0)]);
+        let complex = Array::vector(vec![ComplexNumber::new(0.0f32, 2.0), ComplexNumber::new(-1.5, 0.0)]).unwrap();
         assert_eq!(complex.convert_element_type(DataType::Boolean).unwrap().elements::<bool>(), Ok(vec![true, true]),);
         assert_eq!(complex.convert_element_type(DataType::I32).unwrap().elements::<i32>(), Ok(vec![0, -1]),);
         assert_eq!(
@@ -1418,13 +1444,14 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_low_precision() {
-        let vector = Array::vector(vec![0.0, 1.5]);
+        let vector = Array::vector(vec![0.0, 1.5]).unwrap();
         // Conversions into low-precision floating-point element types produce exact encodings, including their
         // format-specific fallible cases.
         let low_precision = vector.convert_element_type(DataType::F8E5M2).unwrap();
         assert_eq!(low_precision.elements::<f8e5m2>().unwrap()[1].to_bits(), 0x3e);
         assert_eq!(
             Array::scalar(1e9f64)
+                .unwrap()
                 .convert_element_type(DataType::F8E4M3FN)
                 .unwrap()
                 .elements::<f8e4m3fn>()
@@ -1433,7 +1460,7 @@ mod tests {
             0x7f,
         );
         assert!(matches!(
-            Array::scalar(0.0f64).convert_element_type(DataType::F8E8M0FNU),
+            Array::scalar(0.0f64).unwrap().convert_element_type(DataType::F8E8M0FNU),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
@@ -1442,7 +1469,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_encoding_fidelity() {
         // Exactly representable low-precision values survive a widening and narrowing round trip bit-for-bit.
-        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![2.0, 0.5]);
+        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![2.0, 0.5]).unwrap();
         let converted = array.convert_element_type(DataType::BF16).unwrap();
         assert_eq!(converted.to_f64s(), vec![2.0, 0.5]);
         let round_trip = converted.convert_element_type(DataType::F8E8M0FNU).unwrap();
@@ -1500,7 +1527,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_identity() {
         // Same-type conversion shares the original bytes, preserving NaN payloads and every unoccupied layout byte.
-        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
+        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]).unwrap();
         let unchanged = nan.convert_element_type(DataType::F32).unwrap();
         assert!(Arc::ptr_eq(nan.shared_storage(), unchanged.shared_storage()));
         assert_eq!(unchanged.storage_bytes(), nan.storage_bytes());
@@ -1508,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_invalid_types() {
-        let vector = Array::vector(vec![0.0, 1.5]);
+        let vector = Array::vector(vec![0.0, 1.5]).unwrap();
         // Token conversion is always rejected. Structural-zero conversion is valid only when it is a same-type no-op.
         assert!(matches!(
             vector.convert_element_type(DataType::Token),

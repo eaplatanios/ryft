@@ -1479,7 +1479,7 @@ mod tests {
                 Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
             )
             .unwrap();
-        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -1498,20 +1498,20 @@ mod tests {
 
     #[test]
     fn test_array_reduce() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum), Array::vector(vec![6.0, 15.0]));
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]));
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum), Array::vector(vec![6.0, 15.0]).unwrap());
+        assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]).unwrap());
         assert_eq!(
             matrix.reduce(&[0, 1], ReductionKind::Sum),
-            Array::from_f64s(ArrayType::new_static(DataType::F64, []), vec![21.0])
+            Array::from_f64s(ArrayType::new_static(DataType::F64, []), vec![21.0]).unwrap()
         );
         assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
         // Max and min use the data type's reduction identities and ordinary ordering.
-        let integers = Array::vector(vec![3i32, -1, 2]);
+        let integers = Array::vector(vec![3i32, -1, 2]).unwrap();
         assert_eq!(integers.reduce(&[0], ReductionKind::Max).elements::<i32>(), Ok(vec![3]));
         assert_eq!(integers.reduce(&[0], ReductionKind::Min).elements::<i32>(), Ok(vec![-1]));
         // Boolean reductions.
-        let booleans = Array::vector(vec![true, false, true]);
+        let booleans = Array::vector(vec![true, false, true]).unwrap();
         assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
         assert_eq!(booleans.reduce(&[0], ReductionKind::All).elements::<bool>(), Ok(vec![false]));
         assert_eq!(booleans.reduce(&[0], ReductionKind::Max).elements::<bool>(), Ok(vec![true]));
@@ -1532,19 +1532,21 @@ mod tests {
             2,
             2,
             vec![i4::new(7).unwrap(), i4::new(2).unwrap(), i4::new(-8).unwrap(), i4::new(-3).unwrap()],
-        );
+        )
+        .unwrap();
         assert_eq!(
             narrow.reduce(&[1], ReductionKind::Sum).elements::<i4>(),
             Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
         );
-        let low_precision = Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(0.5).unwrap()]);
+        let low_precision =
+            Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(0.5).unwrap()]).unwrap();
         assert_eq!(
             low_precision.reduce(&[0], ReductionKind::Sum).elements::<f8e4m3fn>(),
             Ok(vec![f8e4m3fn::from_f64(1.5).unwrap()]),
         );
 
         // Complex sums and means preserve both components, while empty sums materialize the numeric identity.
-        let complex = Array::vector(vec![ComplexNumber::new(2.0f32, 4.0), ComplexNumber::new(4.0, 8.0)]);
+        let complex = Array::vector(vec![ComplexNumber::new(2.0f32, 4.0), ComplexNumber::new(4.0, 8.0)]).unwrap();
         assert_eq!(
             complex.reduce(&[0], ReductionKind::Sum).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(6.0, 12.0)]),
@@ -1557,9 +1559,9 @@ mod tests {
         assert_eq!(empty.reduce(&[1], ReductionKind::Sum).elements::<i32>(), Ok(vec![0, 0]));
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
-        let nan = Array::vector(vec![1.0f32, f32::NAN]);
+        let nan = Array::vector(vec![1.0f32, f32::NAN]).unwrap();
         assert!(nan.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].is_nan());
-        let zeros = Array::vector(vec![-0.0f32, 0.0]);
+        let zeros = Array::vector(vec![-0.0f32, 0.0]).unwrap();
         assert_eq!(zeros.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].to_bits(), 0.0f32.to_bits(),);
         assert_eq!(zeros.reduce(&[0], ReductionKind::Min).elements::<f32>().unwrap()[0].to_bits(), (-0.0f32).to_bits(),);
 
@@ -1568,7 +1570,8 @@ mod tests {
             ComplexNumber::new(1.0f32, 5.0),
             ComplexNumber::new(2.0, -3.0),
             ComplexNumber::new(2.0, 4.0),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             complex.reduce(&[0], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(2.0, 4.0)]),
@@ -1601,8 +1604,8 @@ mod tests {
             operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::matrix(2, 3, vec![1.0; 6]))],
-                outputs = [(@replicated, Array::vector(vec![3.0, 3.0]))],
+                inputs = [(@replicated, Array::matrix(2, 3, vec![1.0; 6]).unwrap())],
+                outputs = [(@replicated, Array::vector(vec![3.0, 3.0]).unwrap())],
             }],
         );
     }
@@ -1621,10 +1624,10 @@ mod tests {
                 ), Array::from_f64s(
                     ArrayType::new_static(DataType::F64, [3, 2, 3]),
                     (0..18).map(|index| index as f64).collect(),
-                ))],
+                ).unwrap())],
                 outputs = [(@mapped(
                     axis = 0
-                ), Array::matrix(3, 2, vec![3.0, 12.0, 21.0, 30.0, 39.0, 48.0]))],
+                ), Array::matrix(3, 2, vec![3.0, 12.0, 21.0, 30.0, 39.0, 48.0]).unwrap())],
             }],
         );
     }
@@ -1636,8 +1639,8 @@ mod tests {
             operation = ReduceOperation::new(vec![0], ReductionKind::Sum),
             axis_size = 3,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(3, 2, vec![1.0; 6]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 2.0, 2.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(3, 2, vec![1.0; 6]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 2.0, 2.0]).unwrap())],
             }],
         );
     }
@@ -1657,9 +1660,9 @@ mod tests {
     #[test]
     fn test_reduce_differentiation() {
         for kind in [ReductionKind::Max, ReductionKind::Min] {
-            let input = Array::vector(vec![1.0, 1.0]);
+            let input = Array::vector(vec![1.0, 1.0]).unwrap();
             let (primal, tangent) = differentiate_at(input.clone())
-                .jvp(Array::vector(vec![1.0, 3.0]), |input| Ok(input.reduce(&[0], kind)))
+                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.reduce(&[0], kind)))
                 .unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_eq!(tangent.to_f64s(), vec![2.0]);
@@ -1710,7 +1713,9 @@ mod tests {
 
         // Linearization retains that extent as a first-class dimension residual, so the same reductions transpose
         // through the composite universe and their pullbacks replay at more than one concrete extent.
-        for (axes, cotangent) in [(vec![0], Array::vector(vec![1.0, 2.0])), (vec![0, 1], Array::scalar(3.0))] {
+        for (axes, cotangent) in
+            [(vec![0], Array::vector(vec![1.0, 2.0]).unwrap()), (vec![0, 1], Array::scalar(3.0).unwrap())]
+        {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
@@ -1738,7 +1743,7 @@ mod tests {
                 let values = (0..rows * 2).map(|index| index as f64).collect::<Vec<_>>();
                 let mut primal_outputs = linearization
                     .primal()
-                    .interpret(vec![ArrayIrValue::Array(Array::matrix(rows, 2, values))])
+                    .interpret(vec![ArrayIrValue::Array(Array::matrix(rows, 2, values).unwrap())])
                     .unwrap();
                 let residuals = primal_outputs.split_off(1);
                 let mut pullback_inputs = vec![ArrayIrValue::Array(cotangent.clone())];
@@ -1750,7 +1755,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(
                     pullback.interpret(pullback_inputs),
-                    Ok(vec![ArrayIrValue::Array(Array::matrix(rows, 2, expected))]),
+                    Ok(vec![ArrayIrValue::Array(Array::matrix(rows, 2, expected).unwrap())]),
                 );
             }
         }
@@ -1798,7 +1803,7 @@ mod tests {
             .into_inner();
         let transpose_program =
             transpose_builder.build::<Array, Array>(vec![contribution_atom], Placeholder, Placeholder).unwrap();
-        let result = transpose_program.interpret(Array::scalar(1.0)).unwrap();
+        let result = transpose_program.interpret(Array::scalar(1.0).unwrap()).unwrap();
         assert_eq!(result.r#type().shape(), &input_shape);
         for value in result.to_f64s() {
             let delta = (value - 0.25).abs();

@@ -2163,7 +2163,7 @@ mod tests {
         ]);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(2.0f64));
+        let constant = builder.add_constant(Array::scalar(2.0f64).unwrap());
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(nested)).unwrap()[0];
         let shifted = builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant], Some(fused))
@@ -2197,7 +2197,7 @@ mod tests {
         // Test simple program with one argument.
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c0 = builder.add_constant(Array::scalar(3.0f64));
+        let c0 = builder.add_constant(Array::scalar(3.0f64).unwrap());
         let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![ArrayType::scalar(DataType::F64)]);
@@ -2229,7 +2229,10 @@ mod tests {
         assert_eq!(program.output_types(), vec![ArrayType::scalar(DataType::F64)]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
-        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(1.0)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(1.0).unwrap())
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -2396,7 +2399,7 @@ mod tests {
     fn test_program_instruction_by_output() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(3.0f64));
+        let constant = builder.add_constant(Array::scalar(3.0f64).unwrap());
         let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, constant], None).unwrap()[0];
         let dead_output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -2420,8 +2423,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let live_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let live_constant = builder.add_constant(Array::scalar(3.0f64));
-        let dead_constant = builder.add_constant(Array::scalar(5.0f64));
+        let live_constant = builder.add_constant(Array::scalar(3.0f64).unwrap());
+        let dead_constant = builder.add_constant(Array::scalar(5.0f64).unwrap());
         let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![live_input], None).unwrap()[0];
         let output =
             builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, live_constant], None).unwrap()[0];
@@ -2535,7 +2538,7 @@ mod tests {
     fn test_program_map_operations() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(3.0f64));
+        let constant = builder.add_constant(Array::scalar(3.0f64).unwrap());
         let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let combined =
             builder.add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant], None).unwrap()[0];
@@ -2566,10 +2569,10 @@ mod tests {
             .unwrap();
 
         // Original: `(-input + 3) < 3`, so for `input = 2` this is `1 < 3 = true`.
-        assert_eq!(program.interpret(Array::scalar(2.0f64)), Ok(Array::scalar(true)));
+        assert_eq!(program.interpret(Array::scalar(2.0f64).unwrap()), Ok(Array::scalar(true).unwrap()));
         // Mapped: `(-input * 3) > 3`, so for `input = 2` this is `-6 > 3 = false`.
 
-        assert_eq!(mapped.interpret(Array::scalar(2.0f64)), Ok(Array::scalar(false)));
+        assert_eq!(mapped.interpret(Array::scalar(2.0f64).unwrap()), Ok(Array::scalar(false).unwrap()));
 
         assert_eq!(
             program.to_string(),
@@ -2611,12 +2614,18 @@ mod tests {
         let flat_program = program.to_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]), Ok(vec![Array::scalar(1.0)]));
+        assert_eq!(
+            flat_program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
+            Ok(vec![Array::scalar(1.0).unwrap()])
+        );
 
         let flat_program = program.into_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]), Ok(vec![Array::scalar(1.0)]));
+        assert_eq!(
+            flat_program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
+            Ok(vec![Array::scalar(1.0).unwrap()])
+        );
     }
 
     #[test]
@@ -2674,7 +2683,7 @@ mod tests {
         // carriers. The scan capture additionally pins value lifting and capture-order preservation.
         let mut while_condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let while_condition_input = while_condition_builder.add_input(ArrayType::scalar(DataType::F64));
-        let false_predicate = while_condition_builder.add_constant(Array::scalar(false));
+        let false_predicate = while_condition_builder.add_constant(Array::scalar(false).unwrap());
         let while_condition = while_condition_builder
             .build::<Vec<Array>, Vec<Array>>(vec![false_predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2714,9 +2723,9 @@ mod tests {
         let branch_input = branch_builder.add_input(array_type.clone());
         let branch_output =
             branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input], None).unwrap()[0];
-        let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64));
-        let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]));
-        let scan_capture = Array::vector(vec![5.0_f64, 6.0]);
+        let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64).unwrap());
+        let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]).unwrap());
+        let scan_capture = Array::vector(vec![5.0_f64, 6.0]).unwrap();
         let scan_body_region = branch_builder.import_program(scan_body);
         branch_builder
             .add_instruction(
@@ -2737,7 +2746,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let operand = builder.add_input(array_type.clone());
-        let constant = builder.add_constant(Array::scalar(2.0_f64));
+        let constant = builder.add_constant(Array::scalar(2.0_f64).unwrap());
         let shared_branch = builder.import_program(branch);
         let output = builder
             .add_instruction(
@@ -2816,7 +2825,7 @@ mod tests {
         assert!(matches!(entry.instructions()[0].operation(), ArrayIrOperation::Condition(_),));
         assert!(matches!(
             &entry.atoms()[constant.index()],
-            Atom::Constant(ArrayIrValue::Array(value)) if value == &Array::scalar(2.0_f64),
+            Atom::Constant(ArrayIrValue::Array(value)) if value == &Array::scalar(2.0_f64).unwrap(),
         ));
         let branch = composite.region(branch_region).unwrap();
         assert!(matches!(branch.instructions()[0].operation(), ArrayIrOperation::Array(ArrayOperation::Neg(_))));
@@ -2847,8 +2856,8 @@ mod tests {
     fn test_program_simplified() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c0 = builder.add_constant(Array::scalar(2.0f64));
-        let c1 = builder.add_constant(Array::scalar(3.0f64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64).unwrap());
+        let c1 = builder.add_constant(Array::scalar(3.0f64).unwrap());
         let _ = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1], None).unwrap()[0];
         let program = builder
@@ -2857,7 +2866,10 @@ mod tests {
         let simplified = program.simplified().unwrap();
 
         assert_eq!(c0, AtomId::new(1));
-        assert_eq!(simplified.interpret(Array::scalar(2.0f64)), Ok((Array::scalar(5.0f64), Array::scalar(5.0f64))));
+        assert_eq!(
+            simplified.interpret(Array::scalar(2.0f64).unwrap()),
+            Ok((Array::scalar(5.0f64).unwrap(), Array::scalar(5.0f64).unwrap()))
+        );
         assert_eq!(
             simplified.to_string(),
             indoc! {"
@@ -3502,7 +3514,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c0 = builder.add_constant(Array::scalar(2.0f64));
+        let c0 = builder.add_constant(Array::scalar(2.0f64).unwrap());
         let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0], None).unwrap()[0];
         let program =
@@ -3513,20 +3525,20 @@ mod tests {
         let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1], &[]).unwrap();
         assert_eq!(pruned_live, vec![0]);
         assert_eq!(pruned.input_ids().len(), 1);
-        assert_eq!(pruned.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-2.0)]));
+        assert_eq!(pruned.interpret(vec![Array::scalar(4.0).unwrap()]), Ok(vec![Array::scalar(-2.0).unwrap()]));
 
         // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
         // and the now-dead constant.
         let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0], &[]).unwrap();
         assert_eq!(intermediate_live, vec![0]);
         assert_eq!(intermediate.instructions().len(), 1);
-        assert_eq!(intermediate.interpret(vec![Array::scalar(5.0)]), Ok(vec![Array::scalar(-5.0)]));
+        assert_eq!(intermediate.interpret(vec![Array::scalar(5.0).unwrap()]), Ok(vec![Array::scalar(-5.0).unwrap()]));
 
         // Forwarding an input directly as an output yields an instruction-free program over only that input.
         let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0], &[]).unwrap();
         assert_eq!(forwarded_live, vec![0]);
         assert_eq!(forwarded.instructions().len(), 0);
-        assert_eq!(forwarded.interpret(vec![Array::scalar(7.0)]), Ok(vec![Array::scalar(7.0)]));
+        assert_eq!(forwarded.interpret(vec![Array::scalar(7.0).unwrap()]), Ok(vec![Array::scalar(7.0).unwrap()]));
 
         // Reaching a variable that is neither a selected input nor produced by an instruction is rejected:
         // `v1` depends on `i0`, which is omitted from the selected inputs here.
@@ -3542,13 +3554,16 @@ mod tests {
         assert_eq!(kept_live, vec![0]);
         assert_eq!(kept.instructions().len(), 2);
         assert_eq!(kept.output_ids().len(), 1);
-        assert_eq!(kept.interpret(vec![Array::scalar(5.0)]), Ok(vec![Array::scalar(-5.0)]));
+        assert_eq!(kept.interpret(vec![Array::scalar(5.0).unwrap()]), Ok(vec![Array::scalar(-5.0).unwrap()]));
 
         // A keep-alive entry naming a dead input pins it as a live public input instead of pruning it.
         let (pinned, pinned_live) = program.filtered(&[i0, i1], &[v1], &[i1]).unwrap();
         assert_eq!(pinned_live, vec![0, 1]);
         assert_eq!(pinned.input_ids().len(), 2);
-        assert_eq!(pinned.interpret(vec![Array::scalar(4.0), Array::scalar(9.0)]), Ok(vec![Array::scalar(-2.0)]),);
+        assert_eq!(
+            pinned.interpret(vec![Array::scalar(4.0).unwrap(), Array::scalar(9.0).unwrap()]),
+            Ok(vec![Array::scalar(-2.0).unwrap()]),
+        );
 
         // Observable effects are implicit roots even when neither their results nor their operands are explicitly
         // kept alive.
@@ -3646,7 +3661,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
             let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
             let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
-            let c0 = builder.add_constant(Array::scalar(2.0f64));
+            let c0 = builder.add_constant(Array::scalar(2.0f64).unwrap());
             let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
             let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0], None).unwrap()[0];
             let program =
@@ -3663,7 +3678,7 @@ mod tests {
         assert_eq!(owned_live, vec![0]);
         assert_eq!(owned_live, borrowed_live);
         assert_eq!(owned.input_ids().len(), 1);
-        assert_eq!(owned.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-2.0)]));
+        assert_eq!(owned.interpret(vec![Array::scalar(4.0).unwrap()]), Ok(vec![Array::scalar(-2.0).unwrap()]));
         assert_eq!(owned.to_string(), borrowed.to_string());
 
         // Keep-alive entries follow the same contract as the borrowing `filtered`: keeping `v1` alive moves its
@@ -3673,7 +3688,7 @@ mod tests {
         assert_eq!(kept_live, vec![0]);
         assert_eq!(kept.instructions().len(), 2);
         assert_eq!(kept.output_ids().len(), 1);
-        assert_eq!(kept.interpret(vec![Array::scalar(4.0)]), Ok(vec![Array::scalar(-4.0)]));
+        assert_eq!(kept.interpret(vec![Array::scalar(4.0).unwrap()]), Ok(vec![Array::scalar(-4.0).unwrap()]));
 
         let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3707,7 +3722,10 @@ mod tests {
         let (program, _, _) = build();
         let simplified = program.simplified().unwrap();
         assert_eq!(simplified.instructions().len(), CHAIN_LENGTH);
-        assert_eq!(simplified.interpret(Array::scalar(1.0f64)), Ok(Array::scalar(1.0 + CHAIN_LENGTH as f64)));
+        assert_eq!(
+            simplified.interpret(Array::scalar(1.0f64).unwrap()),
+            Ok(Array::scalar(1.0 + CHAIN_LENGTH as f64).unwrap())
+        );
         assert_eq!(build().0.into_simplified().unwrap().instructions().len(), CHAIN_LENGTH);
         let (program, input, output) = build();
         let (filtered, live) = program.filtered(&[input], &[output], &[]).unwrap();
@@ -3716,7 +3734,10 @@ mod tests {
         let (program, input, output) = build();
         let (filtered, live) = program.into_filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
-        assert_eq!(filtered.interpret(vec![Array::scalar(1.0f64)]), Ok(vec![Array::scalar(1.0 + CHAIN_LENGTH as f64)]));
+        assert_eq!(
+            filtered.interpret(vec![Array::scalar(1.0f64).unwrap()]),
+            Ok(vec![Array::scalar(1.0 + CHAIN_LENGTH as f64).unwrap()])
+        );
     }
 
     #[test]
@@ -3782,7 +3803,7 @@ mod tests {
         fn build(constant: f64) -> Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> {
             let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
             region_builder.add_input(ArrayType::scalar(DataType::F64));
-            let region_constant = region_builder.add_constant(Array::scalar(constant));
+            let region_constant = region_builder.add_constant(Array::scalar(constant).unwrap());
             let region_program = region_builder
                 .build::<Vec<Array>, Vec<Array>>(vec![region_constant], vec![Placeholder], vec![Placeholder])
                 .unwrap();

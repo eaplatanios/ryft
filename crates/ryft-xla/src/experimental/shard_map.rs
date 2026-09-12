@@ -2991,12 +2991,12 @@ mod tests {
                 operand.ragged_all_to_all("x", &output, &input_offsets, &send_sizes, &output_offsets, &receive_sizes)
             },
             (
-                CpuArray::matrix(2, 3, vec![1_i32, 2, 2, 3, 4, 0]),
-                CpuArray::matrix(2, 4, vec![0_i32; 8]),
-                CpuArray::matrix(2, 2, vec![0_i32, 1, 0, 1]),
-                CpuArray::matrix(2, 2, vec![1_i32, 2, 1, 1]),
-                CpuArray::matrix(2, 2, vec![0_i32, 0, 1, 2]),
-                CpuArray::matrix(2, 2, vec![1_i32, 1, 2, 1]),
+                CpuArray::matrix(2, 3, vec![1_i32, 2, 2, 3, 4, 0]).unwrap(),
+                CpuArray::matrix(2, 4, vec![0_i32; 8]).unwrap(),
+                CpuArray::matrix(2, 2, vec![0_i32, 1, 0, 1]).unwrap(),
+                CpuArray::matrix(2, 2, vec![1_i32, 2, 1, 1]).unwrap(),
+                CpuArray::matrix(2, 2, vec![0_i32, 0, 1, 2]).unwrap(),
+                CpuArray::matrix(2, 2, vec![1_i32, 1, 2, 1]).unwrap(),
             ),
             (
                 BatchAxis::new(0),

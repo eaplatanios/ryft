@@ -2851,8 +2851,8 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let destination = builder.add_input(reference_type.clone());
         let source = builder.add_input(reference_type);
-        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true).unwrap()));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let true_branch = builder.import_program(branch.clone());
         let false_branch = builder.import_program(branch);
         builder
@@ -2897,10 +2897,10 @@ mod tests {
     fn test_partial_evaluation_known_reference_inputs() {
         // Forward a mixture of known arrays, known references, and unknown references through a valid residual
         // boundary. Only the known reference positions are reported.
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         let inputs = vec![
             PartialEvaluationInput::Unknown(0),
-            PartialEvaluationInput::Known(ArrayIrValue::Array(Array::scalar(2.0_f32))),
+            PartialEvaluationInput::Known(ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap())),
             PartialEvaluationInput::Known(reference.clone()),
             PartialEvaluationInput::Unknown(1),
             PartialEvaluationInput::Known(reference.clone()),
@@ -2934,15 +2934,21 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let r = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(3.0));
+        let c = builder.add_constant(Array::scalar(3.0).unwrap());
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, r], None).unwrap()[0];
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let evaluation = PartialEvaluation::<TestArrayContext> {
             program: program.clone(),
-            inputs: vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(2.0))],
-            outputs: vec![PartialEvaluationOutput::Known(Array::scalar(5.0)), PartialEvaluationOutput::Unknown(0)],
+            inputs: vec![
+                PartialEvaluationInput::Unknown(1),
+                PartialEvaluationInput::Known(Array::scalar(2.0).unwrap()),
+            ],
+            outputs: vec![
+                PartialEvaluationOutput::Known(Array::scalar(5.0).unwrap()),
+                PartialEvaluationOutput::Unknown(0),
+            ],
         };
 
         // Interpretation takes exactly one value per `Unknown` feeder, feeds `Known` feeders from their carried
@@ -2950,15 +2956,15 @@ mod tests {
         // `(5, 4 * 2 + 3) = (5, 11)`.
         let context = TestArrayContext::new();
         assert_eq!(
-            evaluation.interpret(&context, &[Array::scalar(4.0)]),
-            Ok(vec![Array::scalar(5.0), Array::scalar(11.0)]),
+            evaluation.interpret(&context, &[Array::scalar(4.0).unwrap()]),
+            Ok(vec![Array::scalar(5.0).unwrap(), Array::scalar(11.0).unwrap()]),
         );
         assert!(matches!(
             evaluation.interpret(&context, &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ),);
         assert!(matches!(
-            evaluation.interpret(&context, &[Array::scalar(4.0), Array::scalar(5.0)]),
+            evaluation.interpret(&context, &[Array::scalar(4.0).unwrap(), Array::scalar(5.0).unwrap()]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
         ),);
 
@@ -2970,7 +2976,7 @@ mod tests {
             outputs: vec![PartialEvaluationOutput::Unknown(1)],
         };
         assert!(matches!(
-            evaluation.interpret(&context, &[Array::scalar(4.0)]),
+            evaluation.interpret(&context, &[Array::scalar(4.0).unwrap()]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "partial evaluation output references residual output 1 but the residual program \
                     produced 1 output(s)",
@@ -2983,7 +2989,7 @@ mod tests {
         let outer = TestArrayTracingContext::new();
         let folded = outer.input(ArrayType::scalar(DataType::F64));
         let unknown = outer.input(ArrayType::scalar(DataType::F64));
-        let feeder = outer.constant(Array::scalar(2.0));
+        let feeder = outer.constant(Array::scalar(2.0).unwrap());
         let evaluation = PartialEvaluation::<TestArrayTracingContext> {
             program,
             inputs: vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(feeder)],
@@ -3219,9 +3225,11 @@ mod tests {
         let evaluation = restored.into_evaluation(outputs).unwrap();
         assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0)]);
         assert_eq!(evaluation.program.instructions().len(), 1);
-        let outputs = evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(3.0_f32))]).unwrap();
+        let outputs = evaluation
+            .interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(3.0_f32).unwrap())])
+            .unwrap();
         assert!(
-            matches!(&outputs[0], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(3.0_f32))),
+            matches!(&outputs[0], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(3.0_f32).unwrap())),
         );
     }
 
@@ -3236,21 +3244,23 @@ mod tests {
         assert!(restored.allow_effect_folding);
         assert!(!configured.allow_effect_folding);
         // Enabling folding again must restore behavior, while preserving the previously created residual input.
-        let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
+        let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         let allocated =
             restored.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial.clone()]).unwrap();
         assert!(
-            matches!(allocated[0].as_known(), Some(TestValue::Reference(reference)) if reference.read() == Ok(Array::scalar(2.0_f32))),
+            matches!(allocated[0].as_known(), Some(TestValue::Reference(reference)) if reference.read() == Ok(Array::scalar(2.0_f32).unwrap())),
         );
         let deferred = configured.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial]).unwrap();
         assert!(deferred[0].is_unknown());
         drop((configured, restored));
         let evaluation = context.into_evaluation(vec![input, deferred[0].clone()]).unwrap();
         assert_eq!(evaluation.inputs.len(), 2);
-        let outputs = evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(5.0_f32))]).unwrap();
-        assert_eq!(outputs[0], TestValue::Array(Array::scalar(5.0_f32)));
+        let outputs = evaluation
+            .interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(5.0_f32).unwrap())])
+            .unwrap();
+        assert_eq!(outputs[0], TestValue::Array(Array::scalar(5.0_f32).unwrap()));
         assert!(
-            matches!(&outputs[1], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(2.0_f32))),
+            matches!(&outputs[1], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(2.0_f32).unwrap())),
         );
     }
 
@@ -3263,7 +3273,7 @@ mod tests {
         assert!(Rc::ptr_eq(&context.parent, &context.clone().parent));
         assert!(!Rc::ptr_eq(&source.builder, &context.builder));
         assert!(!Rc::ptr_eq(&source.parent, &PartialEvaluationContext::new(parent.clone()).parent));
-        let zero = context.lift(TestValue::Array(Array::scalar(0.0_f32))).unwrap();
+        let zero = context.lift(TestValue::Array(Array::scalar(0.0_f32).unwrap())).unwrap();
         let allocated = context.bind(ReferenceNewOperation::new(), Vec::new(), &[zero.clone()]).unwrap();
         assert!(allocated[0].value().unwrap().is_unknown());
         assert!(parent.builder().borrow().instructions().is_empty());
@@ -3281,7 +3291,7 @@ mod tests {
             .with_reference_placement(ReferencePlacement::Stage);
         let target = source.deferred_sibling();
         assert_eq!(target.reference_placement(), ReferencePlacement::Stage);
-        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let source_reference = source.lift(TestValue::Reference(reference)).unwrap();
         let target_reference = target.import_known(&source_reference).unwrap();
         let viewed = target.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[target_reference]).unwrap();
@@ -3293,8 +3303,12 @@ mod tests {
     fn test_partial_evaluation_context_parent() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(
-            context.parent().bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)]),
-            Ok(vec![Array::scalar(3.0)]),
+            context.parent().bind(
+                AddOperation::new(),
+                Vec::new(),
+                &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()]
+            ),
+            Ok(vec![Array::scalar(3.0).unwrap()]),
         );
     }
 
@@ -3353,7 +3367,8 @@ mod tests {
     fn test_partial_evaluation_context_import_known_deduplicates_eager_inputs() {
         let source = PartialEvaluationContext::new(TestArrayContext::new());
         let target = source.deferred_sibling();
-        let input = PartialTracer::new(source.clone(), PartialEvaluationValue::known_input(Array::scalar(3.0)));
+        let input =
+            PartialTracer::new(source.clone(), PartialEvaluationValue::known_input(Array::scalar(3.0).unwrap()));
         let first = target.import_known(&input).unwrap();
         let second = target.import_known(&input).unwrap();
         assert_eq!(first, second);
@@ -3367,16 +3382,16 @@ mod tests {
         drop(first);
         drop(second);
         let evaluation = target.into_evaluation(outputs).unwrap();
-        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Known(Array::scalar(3.0))]);
+        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Known(Array::scalar(3.0).unwrap())]);
         assert_eq!(evaluation.program().inputs().count(), 1);
-        assert_eq!(evaluation.interpret(source.parent(), &[]), Ok(vec![Array::scalar(6.0)]));
+        assert_eq!(evaluation.interpret(source.parent(), &[]), Ok(vec![Array::scalar(6.0).unwrap()]));
     }
 
     #[test]
     fn test_partial_evaluation_context_import_known_retains_discarded_errors() {
         let source = PartialEvaluationContext::new(TestArrayContext::new());
         let target = source.deferred_sibling();
-        let known = source.lift(Array::scalar(3.0)).unwrap();
+        let known = source.lift(Array::scalar(3.0).unwrap()).unwrap();
         assert_eq!(
             source.bind(AddOperation::new(), Vec::new(), &[known.clone()]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
@@ -3395,33 +3410,38 @@ mod tests {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
         // are known values with no residual materialization decision yet.
-        let inputs =
-            [PartialEvaluationValue::known(Array::scalar(2.0)), PartialEvaluationValue::known(Array::scalar(3.0))];
+        let inputs = [
+            PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
+            PartialEvaluationValue::known(Array::scalar(3.0).unwrap()),
+        ];
         let folded = context.fold_or_residualize(MulOperation::new(), Vec::new(), &inputs).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(folded[0].is_known());
         assert!(!folded[0].is_unknown());
-        assert_eq!(folded[0].as_known(), Some(&Array::scalar(6.0)));
+        assert_eq!(folded[0].as_known(), Some(&Array::scalar(6.0).unwrap()));
         assert_eq!(folded[0].materialization(), PartialValueMaterialization::Undecided);
         assert_eq!(folded[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert!(matches!(folded[0].value(), PartialValue::Known(value) if *value == Array::scalar(6.0)));
+        assert!(matches!(folded[0].value(), PartialValue::Known(value) if *value == Array::scalar(6.0).unwrap()));
 
         let unknown = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
         let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[unknown]).unwrap();
         let evaluation = context.into_evaluation(mixed).unwrap();
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0)]), Ok(vec![Array::scalar(-7.0)]));
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0).unwrap()]),
+            Ok(vec![Array::scalar(-7.0).unwrap()])
+        );
     }
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_preserves_order_for_unrooted_state() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
-        let known = [PartialEvaluationValue::known(Array::scalar(1.0))];
+        let known = [PartialEvaluationValue::known(Array::scalar(1.0).unwrap())];
         let unknown = [context.unknown_input(scalar_type, 0)];
 
         // Ordered state folds like any other all-known operation before any ordered effect has been deferred.
         let folded = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
-        assert_eq!(folded[0].as_known(), Some(&Array::scalar(1.0)));
+        assert_eq!(folded[0].as_known(), Some(&Array::scalar(1.0).unwrap()));
 
         // A state access with an unknown operand stages. All later ordered operations must then stage too, even
         // with known operands and no shared reference allocation. Pure work keeps folding.
@@ -3430,11 +3450,11 @@ mod tests {
         let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
         assert!(later[0].is_unknown());
         let pure = context.fold_or_residualize(TestOrderedStateOperation::Pure, Vec::new(), &known).unwrap();
-        assert_eq!(pure[0].as_known(), Some(&Array::scalar(1.0)));
+        assert_eq!(pure[0].as_known(), Some(&Array::scalar(1.0).unwrap()));
         let evaluation = context.into_evaluation(vec![later[0].clone()]).unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(1.0))],
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(1.0).unwrap())],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -3450,7 +3470,7 @@ mod tests {
         // Direct residual emission also records that ordered work was deferred, so later ordered operations
         // remain residual just as they do after the default rule defers an operation.
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
-        let known = [PartialEvaluationValue::known(Array::scalar(1.0))];
+        let known = [PartialEvaluationValue::known(Array::scalar(1.0).unwrap())];
         context.residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
         let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
         assert!(later[0].is_unknown());
@@ -3458,7 +3478,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_stages_reference_operations_under_stage_placement() {
-        let live = ArrayReference::new(Array::scalar(1.0_f32));
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
             .with_reference_placement(ReferencePlacement::Stage);
@@ -3471,8 +3491,8 @@ mod tests {
         // Under the specialization placement every reference operation stages, all-known operands notwithstanding:
         // the update leaves the live state untouched, the allocation is deferred to the residual program, and only
         // reference-free work (pure or ordered) folds.
-        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
-        let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32)));
+        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
+        let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32).unwrap()));
         let add_update = TestOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new());
         assert!(
             context
@@ -3480,13 +3500,13 @@ mod tests {
                 .unwrap()
                 .is_empty(),
         );
-        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
         let allocation = TestOperation::ReferenceNew(ReferenceNewOperation::new());
         let allocated = context.fold_or_residualize(allocation, Vec::new(), &[initial.clone()]).unwrap();
         assert!(allocated[0].is_unknown());
         let product = TestOperation::from(ArrayOperation::from(MulOperation::new()));
         let folded = context.fold_or_residualize(product, Vec::new(), &[initial.clone(), initial.clone()]).unwrap();
-        assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(9.0_f32))));
+        assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(9.0_f32).unwrap())));
 
         // The live handle crosses into the residual program by identity as a residual reference, so replaying the
         // residual program performs the deferred accesses against the same allocation.
@@ -3503,11 +3523,11 @@ mod tests {
             .trim_end(),
         );
         let outputs = evaluation.interpret(&EagerContext::<TestValue, TestOperation>::new(), &[]).unwrap();
-        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
         let TestValue::Reference(allocated) = &outputs[0] else {
             panic!("residual replay returned {:?} instead of the deferred allocation", outputs[0]);
         };
-        assert_eq!(allocated.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(allocated.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
@@ -3515,7 +3535,7 @@ mod tests {
         use crate::programs::ReferenceError;
 
         // An unused read can fail, so later I/O must not execute during specialization ahead of that failure.
-        let frozen = ArrayReference::new(Array::scalar(1.0_f32));
+        let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         frozen.freeze().unwrap();
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
             .with_reference_placement(ReferencePlacement::Stage);
@@ -3523,7 +3543,7 @@ mod tests {
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
         let output = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
         assert!(output[0].is_unknown());
-        let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(42.0_f32)));
+        let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(42.0_f32).unwrap()));
         let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("after_read")));
         let printed = context.fold_or_residualize(print, Vec::new(), &[value]).unwrap();
         assert!(printed[0].is_unknown());
@@ -3547,22 +3567,22 @@ mod tests {
 
         // The default execution policy must also preserve order when the earlier reference is an unknown input.
         // Its failure prevents a later write to another root, including when that write has entirely known operands.
-        let frozen = ArrayReference::new(Array::scalar(1.0_f32));
+        let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         frozen.freeze().unwrap();
-        let other = ArrayReference::new(Array::scalar(2.0_f32));
+        let other = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let context = PartialEvaluationContext::new(TestArrayIrContext::new());
         let reference = context.unknown_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into(), 0);
         let read = TestArrayIrOperation::ReferenceRead(ReferenceReadOperation::new());
         let output = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
         let target = PartialEvaluationValue::known(TestValue::Reference(other.clone()));
-        let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7.0_f32)));
+        let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7.0_f32).unwrap()));
         let write = TestArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new());
         assert!(context.fold_or_residualize(write, Vec::new(), &[target, value]).unwrap().is_empty());
-        assert_eq!(other.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(other.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         let evaluation = context.into_evaluation(output).unwrap();
         let error = evaluation.interpret(&TestArrayIrContext::new(), &[TestValue::Reference(frozen)]).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        assert_eq!(other.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(other.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
@@ -3591,8 +3611,8 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_executes_reference_operations_under_execute_placement() {
-        let live = ArrayReference::new(Array::scalar(1.0_f32));
-        let other = ArrayReference::new(Array::scalar(5.0_f32));
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let other = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
         let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let other_reference = PartialEvaluationValue::known(TestValue::Reference(other.clone()));
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
@@ -3603,20 +3623,20 @@ mod tests {
 
         // Under the execution placement an all-known reference operation executes at partial-evaluation time like any
         // other known ordered effect. This is the known side of an eager linearization (i.e., the forward pass).
-        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
+        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         assert!(
             context
                 .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update])
                 .unwrap()
                 .is_empty(),
         );
-        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
         assert!(context.builder.borrow().instructions().is_empty());
 
         // A write of the unknown value stages and prevents later ordered effects from folding: later known reads stage
         // even on a different allocation, preserving failure and synchronization order.
         assert!(context.fold_or_residualize(write, Vec::new(), &[reference.clone(), u]).unwrap().is_empty());
-        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
         let staged = context.fold_or_residualize(read.clone(), Vec::new(), &[reference]).unwrap();
         assert!(staged[0].is_unknown());
         let other_read = context.fold_or_residualize(read, Vec::new(), &[other_reference]).unwrap();
@@ -3628,7 +3648,7 @@ mod tests {
         // A write of an unknown `f64` into an `f32` reference fails at residual emission (type inference rejects the
         // mismatch) after recording that later ordered effects must remain residual, so a later all-known read of that
         // root stages instead of executing against state the failed write attempted to mutate.
-        let live = ArrayReference::new(Array::scalar(1.0_f32));
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let mismatched = context.unknown_input(ArrayType::scalar(DataType::F64).into(), 0);
@@ -3642,14 +3662,16 @@ mod tests {
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
         let staged = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
         assert!(staged[0].is_unknown());
-        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
     }
 
     #[test]
     fn test_partial_evaluation_context_residualize() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
-        let inputs =
-            [PartialEvaluationValue::known(Array::scalar(2.0)), PartialEvaluationValue::known(Array::scalar(3.0))];
+        let inputs = [
+            PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
+            PartialEvaluationValue::known(Array::scalar(3.0).unwrap()),
+        ];
         // `residualize` emits the operation into the residual program, materializing each known input as a fresh
         // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
         // (i.e., atom 2).
@@ -3671,7 +3693,7 @@ mod tests {
         // Materializing the same known value twice reuses the residual atom assigned on first materialization through
         // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
         // single residual input.
-        let shared = PartialEvaluationValue::known_input(Array::scalar(4.0));
+        let shared = PartialEvaluationValue::known_input(Array::scalar(4.0).unwrap());
         let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
         let second = context.residualize(AddOperation::new(), Vec::new(), &[shared.clone(), shared.clone()]).unwrap();
         assert_eq!(
@@ -3690,7 +3712,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(1.0));
+        let c = builder.add_constant(Array::scalar(1.0).unwrap());
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
         let program =
@@ -3699,20 +3721,20 @@ mod tests {
             .inline_program(
                 &program,
                 vec![
-                    PartialEvaluationValue::known(Array::scalar(2.0)),
-                    PartialEvaluationValue::known(Array::scalar(3.0)),
+                    PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
+                    PartialEvaluationValue::known(Array::scalar(3.0).unwrap()),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(7.0)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(7.0).unwrap()));
 
         // Mixed seeds fold the known work and residualize the rest, and so the walk returns residual variables.
         let outputs = context
             .inline_program(
                 &program,
                 vec![
-                    PartialEvaluationValue::known(Array::scalar(2.0)),
+                    PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
                     context.unknown_input(ArrayType::scalar(DataType::F64), 0),
                 ],
             )
@@ -3722,7 +3744,10 @@ mod tests {
         assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
 
         let evaluation = context.into_evaluation(outputs).unwrap();
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0)]), Ok(vec![Array::scalar(11.0)]));
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0).unwrap()]),
+            Ok(vec![Array::scalar(11.0).unwrap()])
+        );
     }
 
     #[test]
@@ -3808,7 +3833,7 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[
-                    PartialEvaluationValue::known(Array::scalar(2.0)),
+                    PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
                     context.unknown_input(ArrayType::scalar(DataType::F64), 0),
                 ],
                 |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
@@ -3822,13 +3847,13 @@ mod tests {
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(-2.0_f64))],
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(-2.0_f64).unwrap())],
         );
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(evaluation.program.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(1)]);
         assert_eq!(
-            evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0)]),
-            Ok(vec![Array::scalar(5.0 - (-2.0_f64))]),
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0).unwrap()]),
+            Ok(vec![Array::scalar(5.0 - (-2.0_f64)).unwrap()]),
         );
     }
 
@@ -3848,20 +3873,20 @@ mod tests {
         let outputs = context
             .inline_partitioned_program(
                 partition,
-                &[PartialEvaluationValue::known(Array::scalar(2.0))],
+                &[PartialEvaluationValue::known(Array::scalar(2.0).unwrap())],
                 |_| (ArrayOperation::Neg(NegOperation::new()), Vec::new()),
                 |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0_f64)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0_f64).unwrap()));
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert!(evaluation.inputs.is_empty());
-        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(Array::scalar(-2.0_f64))]);
+        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(Array::scalar(-2.0_f64).unwrap())]);
         assert!(evaluation.program.instructions().is_empty());
         assert!(evaluation.program.input_ids().is_empty());
         assert!(evaluation.program.output_ids().is_empty());
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(vec![Array::scalar(-2.0_f64)]));
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(vec![Array::scalar(-2.0_f64).unwrap()]));
     }
 
     #[test]
@@ -3869,12 +3894,12 @@ mod tests {
         // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
         // constant, while under a staging known-side context only literal-backed tracers do.
         let context = PartialEvaluationContext::new(TestArrayContext::new());
-        assert_eq!(context.known_constant(&Array::scalar(5.0)), Ok(Array::scalar(5.0)));
+        assert_eq!(context.known_constant(&Array::scalar(5.0).unwrap()), Ok(Array::scalar(5.0).unwrap()));
         let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
-        let literal = staging.constant(Array::scalar(4.0));
-        assert_eq!(staging_context.known_constant(&literal), Ok(Array::scalar(4.0)));
+        let literal = staging.constant(Array::scalar(4.0).unwrap());
+        assert_eq!(staging_context.known_constant(&literal), Ok(Array::scalar(4.0).unwrap()));
         assert!(matches!(
             staging_context.known_constant(&symbolic),
             Err(ProgramError::MalformedProgram(message))
@@ -3889,7 +3914,7 @@ mod tests {
         let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
-        let literal = staging.constant(Array::scalar(4.0));
+        let literal = staging.constant(Array::scalar(4.0).unwrap());
 
         // A known feeder still occupies an input of the residual program.
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
@@ -3899,8 +3924,11 @@ mod tests {
 
         assert!(context.all_knowns_are_constants(&PartialEvaluation::<TestArrayContext> {
             program: program.clone(),
-            inputs: vec![PartialEvaluationInput::Known(Array::scalar(1.0))],
-            outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(Array::scalar(2.0))],
+            inputs: vec![PartialEvaluationInput::Known(Array::scalar(1.0).unwrap())],
+            outputs: vec![
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Known(Array::scalar(2.0).unwrap())
+            ],
         }),);
 
         assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<TestArrayTracingContext> {
@@ -3929,11 +3957,11 @@ mod tests {
         let staging = TestArrayTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
         let symbolic = staging.input(ArrayType::scalar(DataType::F64));
-        let literal = staging.constant(Array::scalar(4.0));
+        let literal = staging.constant(Array::scalar(4.0).unwrap());
 
         // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
         // resolve to a program constant counts, and so eager knowns and unknowns never do.
-        assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Array::scalar(1.0))]));
+        assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Array::scalar(1.0).unwrap())]));
         assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
         assert!(staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
         assert!(
@@ -3945,23 +3973,23 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_lift() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
-        let lifted = context.lift(Array::scalar(2.0)).unwrap();
+        let lifted = context.lift(Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(
             lifted.value().unwrap().materialization(),
             PartialValueMaterialization::Constant { residual_atom: None },
         );
-        assert_eq!(lifted.value().unwrap().as_known(), Some(&Array::scalar(2.0)));
-        let truth = context.lift(Array::scalar(true)).unwrap();
+        assert_eq!(lifted.value().unwrap().as_known(), Some(&Array::scalar(2.0).unwrap()));
+        let truth = context.lift(Array::scalar(true).unwrap()).unwrap();
         assert_eq!(truth.concretize(), Ok(true));
     }
 
     #[test]
     fn test_partial_evaluation_context_bind() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
-        let lifted = context.lift(Array::scalar(2.0)).unwrap();
+        let lifted = context.lift(Array::scalar(2.0).unwrap()).unwrap();
         let folded = context.bind(AddOperation::new(), Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
-        assert_eq!(folded[0].value().unwrap().as_known(), Some(&Array::scalar(4.0)));
+        assert_eq!(folded[0].value().unwrap().as_known(), Some(&Array::scalar(4.0).unwrap()));
         assert_eq!(folded[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         // A mixed bind retains the known operand as a feeder and stages the multiplication.
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
@@ -3972,7 +4000,7 @@ mod tests {
         let evaluation = context.into_evaluation(vec![output]).unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(4.0))],
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(4.0).unwrap())],
         );
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
@@ -3984,7 +4012,10 @@ mod tests {
         "}
             .trim_end(),
         );
-        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(3.0)]), Ok(vec![Array::scalar(12.0)]));
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(3.0).unwrap()]),
+            Ok(vec![Array::scalar(12.0).unwrap()])
+        );
     }
 
     #[test]
@@ -4048,20 +4079,20 @@ mod tests {
     fn test_partial_evaluation_context_bind_retains_zero_output_failure() {
         use crate::programs::ReferenceError;
 
-        let frozen = ArrayReference::new(Array::scalar(1.0_f32));
-        assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32)));
-        let live = ArrayReference::new(Array::scalar(2.0_f32));
+        let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
+        let live = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let failed_reference = context.lift(TestValue::Reference(frozen)).unwrap();
         let later_reference = context.lift(TestValue::Reference(live.clone())).unwrap();
-        let update = context.lift(TestValue::Array(Array::scalar(3.0_f32))).unwrap();
+        let update = context.lift(TestValue::Array(Array::scalar(3.0_f32).unwrap())).unwrap();
         let failed = context.bind(ReferenceWriteOperation::new(), Vec::new(), &[failed_reference, update.clone()]);
         assert!(failed.unwrap().is_empty());
 
         // Clones retain the same failure and prevent unrelated later mutations, even without a poisoned operand.
         let later = context.clone().bind(ReferenceWriteOperation::new(), Vec::new(), &[later_reference, update]);
         assert!(later.unwrap().is_empty());
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         let error = context.into_evaluation(Vec::new()).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
@@ -4070,9 +4101,9 @@ mod tests {
     fn test_partial_evaluation_context_bind_retains_discarded_output_failure() {
         use crate::programs::ReferenceError;
 
-        let frozen = ArrayReference::new(Array::scalar(1.0_f32));
-        assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32)));
-        let live = ArrayReference::new(Array::scalar(2.0_f32));
+        let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
+        let live = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let failed_reference = context.lift(TestValue::Reference(frozen)).unwrap();
         let poisoned = context.bind(ReferenceReadOperation::new(), Vec::new(), &[failed_reference]).unwrap();
@@ -4081,13 +4112,13 @@ mod tests {
         drop(poisoned);
 
         let later_reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
-        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32)));
+        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32).unwrap()));
         let error = context
             .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[later_reference, update])
             .unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
-        let output = PartialEvaluationValue::known(TestValue::Array(Array::scalar(4.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));
+        let output = PartialEvaluationValue::known(TestValue::Array(Array::scalar(4.0_f32).unwrap()));
         let error = context.into_evaluation(vec![output]).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
@@ -4124,8 +4155,10 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_resolve() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
-        let lifted = context.lift(Array::scalar(2.0)).unwrap();
-        assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Array::scalar(2.0)));
+        let lifted = context.lift(Array::scalar(2.0).unwrap()).unwrap();
+        assert!(
+            matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Array::scalar(2.0).unwrap())
+        );
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
         assert!(matches!(context.resolve(&unknown), ValueResolution::Opaque));
         assert!(matches!(unknown.concretize(), Err(ProgramError::Concretization { message })
@@ -4203,7 +4236,7 @@ mod tests {
     fn test_partial_evaluation_context_zero() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         let zero = context.zero(&ArrayType::scalar(DataType::Boolean)).unwrap();
-        assert_eq!(zero.value().unwrap().as_known(), Some(&Array::scalar(false)));
+        assert_eq!(zero.value().unwrap().as_known(), Some(&Array::scalar(false).unwrap()));
         assert_eq!(zero.concretize(), Ok(false));
     }
 
@@ -4213,7 +4246,7 @@ mod tests {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let primal = builder.add_input(scalar_type.clone());
         let tangent = builder.add_input(scalar_type);
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
@@ -4232,22 +4265,22 @@ mod tests {
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(partition.known_reference_inputs().collect::<Vec<_>>(), Vec::<usize>::new());
         assert_eq!(
-            partition.known_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
-            Ok(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+            partition.known_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(3.0_f32).unwrap())]),
         );
 
         // Each invocation starts from zero, including when an earlier tangent value is used again.
         assert_eq!(
-            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32))]),
-            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
         assert_eq!(
-            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32))]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())]),
         );
         assert_eq!(
-            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32))]),
-            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
         assert!(
             matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[1])),
@@ -4264,9 +4297,9 @@ mod tests {
             .partition_with_configuration(&[true, false], true, false, None)
             .unwrap()
             .0;
-        let destination = ArrayReference::new(Array::scalar(2.0_f32));
-        let source = ArrayReference::new(Array::scalar(1.0_f32));
-        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32)));
+        let destination = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
+        let source = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
         let known = partition.known_program().interpret(vec![TestValue::Reference(destination.clone())]).unwrap();
         let residual_inputs = partition
             .residual_inputs()
@@ -4284,7 +4317,7 @@ mod tests {
             error.downcast_custom::<crate::programs::ReferenceError>(),
             Some(&crate::programs::ReferenceError::Frozen),
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
@@ -4292,9 +4325,9 @@ mod tests {
         let program = reference_ordering_program();
         let partition =
             program.entry_region_ref().partition_with_configuration(&[true, false], true, true, None).unwrap().0;
-        let destination = ArrayReference::new(Array::scalar(2.0_f32));
-        let source = ArrayReference::new(Array::scalar(1.0_f32));
-        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32)));
+        let destination = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
+        let source = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
         let known = partition.known_program().interpret(vec![TestValue::Reference(destination.clone())]).unwrap();
         let residual_inputs = partition
             .residual_inputs()
@@ -4312,7 +4345,7 @@ mod tests {
             error.downcast_custom::<crate::programs::ReferenceError>(),
             Some(&crate::programs::ReferenceError::Frozen),
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32).unwrap()));
     }
 
     #[test]
@@ -4321,7 +4354,7 @@ mod tests {
         let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = branch.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         branch.add_input(scalar_type.clone());
-        let one = branch.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        let one = branch.add_constant(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
         branch
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, one], None)
             .unwrap();
@@ -4332,8 +4365,8 @@ mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let unused = builder.add_input(scalar_type);
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
+        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true).unwrap()));
         let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let true_branch = builder.import_program(branch.clone());
         let false_branch = builder.import_program(branch);
@@ -4352,14 +4385,17 @@ mod tests {
             program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
         assert!(partition.residual_program().instructions().is_empty());
-        assert_eq!(partition.known_program().interpret(Vec::new()), Ok(vec![TestValue::Array(Array::scalar(1.0_f32))]));
+        assert_eq!(
+            partition.known_program().interpret(Vec::new()),
+            Ok(vec![TestValue::Array(Array::scalar(1.0_f32).unwrap())])
+        );
     }
 
     #[test]
     fn test_region_partition_with_configuration_repeated_residual_tracks_empty_output_effects() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("deferred")));
         builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap();
@@ -4433,7 +4469,7 @@ mod tests {
     fn test_region_partition_with_configuration_repeated_residual_rejects_shared_local_state() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let initial =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -4474,7 +4510,7 @@ mod tests {
     fn test_region_partition_with_configuration_discovers_allocations_across_retries() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let first = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let second = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let read = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None).unwrap()[0];
@@ -4510,11 +4546,11 @@ mod tests {
             vec!["reference_new", "reference_read", "print", "reference_new", "reference_write", "reference_write"],
         );
         assert_eq!(
-            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32).unwrap())]),
             Ok(Vec::new()),
         );
         assert_eq!(
-            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())]),
             Ok(Vec::new()),
         );
     }
@@ -4524,7 +4560,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32).unwrap()));
         let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         let initial = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
         builder
@@ -4551,7 +4587,7 @@ mod tests {
     fn test_region_partition_with_configuration_allows_shared_read_only_local_state() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let initial = builder.add_constant(TestValue::Array(Array::scalar(2.0_f32)));
+        let initial = builder.add_constant(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
         builder
@@ -4571,7 +4607,7 @@ mod tests {
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(partition.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
         let known = partition.known_program().interpret(Vec::new()).unwrap();
-        assert_eq!(known[0], TestValue::Array(Array::scalar(2.0_f32)));
+        assert_eq!(known[0], TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         assert_eq!(
             partition.residual_inputs(),
             &[PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(0)],
@@ -4579,14 +4615,14 @@ mod tests {
         assert_eq!(
             partition
                 .residual_program()
-                .interpret(vec![TestValue::Array(Array::scalar(3.0_f32)), known[1].clone()]),
-            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+                .interpret(vec![TestValue::Array(Array::scalar(3.0_f32).unwrap()), known[1].clone()]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
         assert_eq!(
             partition
                 .residual_program()
-                .interpret(vec![TestValue::Array(Array::scalar(5.0_f32)), known[1].clone()]),
-            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+                .interpret(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap()), known[1].clone()]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
     }
 
@@ -4598,7 +4634,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(1.0));
+        let c = builder.add_constant(Array::scalar(1.0).unwrap());
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
         let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
@@ -4608,18 +4644,18 @@ mod tests {
             .unwrap();
         let evaluation = program
             .partially_evaluate(&[
-                PartialValue::Known(Array::scalar(3.0)),
+                PartialValue::Known(Array::scalar(3.0).unwrap()),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
             ])
             .unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(9.0)),],
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(9.0).unwrap()),],
         );
         assert_eq!(
             evaluation.outputs,
             vec![
-                PartialEvaluationOutput::Known(Array::scalar(9.0)),
+                PartialEvaluationOutput::Known(Array::scalar(9.0).unwrap()),
                 PartialEvaluationOutput::Unknown(0),
                 PartialEvaluationOutput::Unknown(1),
             ],
@@ -4639,25 +4675,28 @@ mod tests {
 
         // Replaying the partial evaluation at a concrete unknown input matches interpreting the original program.
         assert_eq!(
-            evaluation.interpret(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[Array::scalar(4.0)]),
-            Ok(vec![Array::scalar(9.0), Array::scalar(37.0), Array::scalar(13.0)]),
+            evaluation.interpret(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[Array::scalar(4.0).unwrap()]),
+            Ok(vec![Array::scalar(9.0).unwrap(), Array::scalar(37.0).unwrap(), Array::scalar(13.0).unwrap()]),
         );
         assert_eq!(
-            program.interpret(vec![Array::scalar(3.0), Array::scalar(4.0)]),
-            Ok(vec![Array::scalar(9.0), Array::scalar(37.0), Array::scalar(13.0)]),
+            program.interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()]),
+            Ok(vec![Array::scalar(9.0).unwrap(), Array::scalar(37.0).unwrap(), Array::scalar(13.0).unwrap()]),
         );
 
         // All-known inputs fold the whole program away: every output is known and the residual program is empty.
         let evaluation = program
-            .partially_evaluate(&[PartialValue::Known(Array::scalar(3.0)), PartialValue::Known(Array::scalar(4.0))])
+            .partially_evaluate(&[
+                PartialValue::Known(Array::scalar(3.0).unwrap()),
+                PartialValue::Known(Array::scalar(4.0).unwrap()),
+            ])
             .unwrap();
         assert_eq!(evaluation.inputs, Vec::new());
         assert_eq!(
             evaluation.outputs,
             vec![
-                PartialEvaluationOutput::Known(Array::scalar(9.0)),
-                PartialEvaluationOutput::Known(Array::scalar(37.0)),
-                PartialEvaluationOutput::Known(Array::scalar(13.0)),
+                PartialEvaluationOutput::Known(Array::scalar(9.0).unwrap()),
+                PartialEvaluationOutput::Known(Array::scalar(37.0).unwrap()),
+                PartialEvaluationOutput::Known(Array::scalar(13.0).unwrap()),
             ],
         );
         assert!(evaluation.program.instructions().is_empty());
@@ -4707,13 +4746,13 @@ mod tests {
             .unwrap();
         let evaluation = program
             .partially_evaluate(&[
-                PartialValue::Known(Array::scalar(2.0)),
+                PartialValue::Known(Array::scalar(2.0).unwrap()),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
             ])
             .unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(2.0)),],
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(2.0).unwrap()),],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -4728,7 +4767,7 @@ mod tests {
 
         // The number of provided inputs must match the number of program inputs.
         assert!(matches!(
-            program.partially_evaluate(&[PartialValue::Known(Array::scalar(1.0))]),
+            program.partially_evaluate(&[PartialValue::Known(Array::scalar(1.0).unwrap())]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         ),);
     }
@@ -4742,7 +4781,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let one = builder.add_constant(Array::scalar(1.0));
+        let one = builder.add_constant(Array::scalar(1.0).unwrap());
         let squared =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], Some(scoped("known"))).unwrap()[0];
         let scaled = builder
@@ -4759,7 +4798,7 @@ mod tests {
             .unwrap();
         let evaluation = program
             .partially_evaluate(&[
-                PartialValue::Known(Array::scalar(3.0)),
+                PartialValue::Known(Array::scalar(3.0).unwrap()),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
             ])
             .unwrap();
@@ -4784,7 +4823,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type.clone().into());
         let x = builder.add_input(scalar_type.clone().into());
-        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, one], None)
             .unwrap();
@@ -4799,14 +4838,14 @@ mod tests {
 
         // Specialization never touches live state: every reference operation residualizes even though the reference is
         // known, and the live handle becomes a residual reference threaded by identity.
-        let live = ArrayReference::new(Array::scalar(2.0_f32));
+        let live = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let evaluation = program
             .partially_evaluate(&[
                 PartialValue::Known(TestValue::Reference(live.clone())),
                 PartialValue::Unknown(scalar_type.clone().into()),
             ])
             .unwrap();
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         assert_eq!(
             evaluation.inputs,
             vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(TestValue::Reference(live.clone()))],
@@ -4831,11 +4870,11 @@ mod tests {
         assert_eq!(
             evaluation.interpret(
                 &EagerContext::<TestValue, TestOperation>::new(),
-                &[TestValue::Array(Array::scalar(5.0_f32))],
+                &[TestValue::Array(Array::scalar(5.0_f32).unwrap())],
             ),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())]),
         );
-        assert_eq!(live.read(), Ok(Array::scalar(5.0_f32)));
+        assert_eq!(live.read(), Ok(Array::scalar(5.0_f32).unwrap()));
     }
 
     #[test]
@@ -4846,7 +4885,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(1.0));
+        let c = builder.add_constant(Array::scalar(1.0).unwrap());
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
         let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
@@ -4913,7 +4952,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type.clone().into());
         let x = builder.add_input(scalar_type.clone().into());
-        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, one], None)
             .unwrap();
@@ -5007,7 +5046,7 @@ mod tests {
             .partially_evaluate_in_context(
                 &outer,
                 &[
-                    PartialValue::Known(outer.constant(TestValue::Array(Array::scalar(true)))),
+                    PartialValue::Known(outer.constant(TestValue::Array(Array::scalar(true).unwrap()))),
                     PartialValue::Known(a.clone()),
                     PartialValue::Known(b.clone()),
                     PartialValue::Unknown(scalar_type.clone().into()),
@@ -5027,25 +5066,28 @@ mod tests {
             "}
             .trim_end(),
         );
-        let first = ArrayReference::new(Array::scalar(2.0_f32));
-        let second = ArrayReference::new(Array::scalar(3.0_f32));
+        let first = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
+        let second = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             evaluation.program.interpret(vec![
-                TestValue::Array(Array::scalar(5.0_f32)),
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
                 TestValue::Reference(first.clone()),
                 TestValue::Reference(second.clone()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(3.0_f32).unwrap())
+            ]),
         );
-        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32)));
-        assert_eq!(second.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32).unwrap()));
+        assert_eq!(second.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
         // Specializing a false predicate selects the other root before the residual program is built.
         let false_evaluation = program
             .partially_evaluate_in_context(
                 &outer,
                 &[
-                    PartialValue::Known(outer.constant(TestValue::Array(Array::scalar(false)))),
+                    PartialValue::Known(outer.constant(TestValue::Array(Array::scalar(false).unwrap()))),
                     PartialValue::Known(a.clone()),
                     PartialValue::Known(b.clone()),
                     PartialValue::Unknown(scalar_type.clone().into()),
@@ -5100,15 +5142,18 @@ mod tests {
         // Taking the other branch at runtime must update the second root and preserve the first root.
         assert_eq!(
             evaluation.program.interpret(vec![
-                TestValue::Array(Array::scalar(false)),
-                TestValue::Array(Array::scalar(7.0_f32)),
+                TestValue::Array(Array::scalar(false).unwrap()),
+                TestValue::Array(Array::scalar(7.0_f32).unwrap()),
                 TestValue::Reference(first.clone()),
                 TestValue::Reference(second.clone()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(7.0_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(7.0_f32).unwrap())
+            ]),
         );
-        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32)));
-        assert_eq!(second.read(), Ok(Array::scalar(7.0_f32)));
+        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32).unwrap()));
+        assert_eq!(second.read(), Ok(Array::scalar(7.0_f32).unwrap()));
     }
 
     #[test]
@@ -5155,11 +5200,13 @@ mod tests {
 
         // The two sides recombine to the original program: interpret the known program at `a`, feed its trailing
         // residual-edge output to the residual program together with `x`, and interleave per the outputs report.
-        let known_outputs = partition.known_program.interpret(vec![Array::scalar(2.0)]).unwrap();
-        let residual_outputs =
-            partition.residual_program.interpret(vec![Array::scalar(3.0), known_outputs[1].clone()]).unwrap();
-        assert_eq!(known_outputs[0], Array::scalar(4.0));
-        assert_eq!(residual_outputs, vec![Array::scalar(3.0 * (-2.0_f64))]);
+        let known_outputs = partition.known_program.interpret(vec![Array::scalar(2.0).unwrap()]).unwrap();
+        let residual_outputs = partition
+            .residual_program
+            .interpret(vec![Array::scalar(3.0).unwrap(), known_outputs[1].clone()])
+            .unwrap();
+        assert_eq!(known_outputs[0], Array::scalar(4.0).unwrap());
+        assert_eq!(residual_outputs, vec![Array::scalar(3.0 * (-2.0_f64)).unwrap()]);
 
         // All-unknown known-ness produces an empty known program and residualizes everything.
         let partition = program.partition(&[false, false]).unwrap();

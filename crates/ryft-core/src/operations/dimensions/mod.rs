@@ -416,7 +416,7 @@ mod tests {
 
         // An array member is not a first-class dimension, so the capability rejects it by kind.
         assert!(matches!(
-            ArrayIrValue::Array(Array::scalar(2.0_f64)).dimension_add(&right),
+            ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()).dimension_add(&right),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "expected dimension type but got array type",
         ));

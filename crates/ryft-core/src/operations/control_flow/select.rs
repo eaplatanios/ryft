@@ -321,9 +321,9 @@ impl_select_differentiation! {
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Array values pair with a Boolean-typed condition array of the same shape.
-/// let condition = Array::vector(vec![true, false, true]);
-/// let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
-/// let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
+/// let condition = Array::vector(vec![true, false, true]).unwrap();
+/// let on_true = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+/// let on_false = Array::vector(vec![4.0, 5.0, 6.0]).unwrap();
 /// let output = Array::select(&condition, &on_true, &on_false)?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 5.0, 3.0]);
 /// # Ok(())
@@ -498,9 +498,9 @@ mod tests {
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[
-                    Array::vector(vec![true, false, true]),
-                    Array::scalar(7.0_f32),
-                    Array::vector(vec![4.0_f64, 5.0, 6.0]),
+                    Array::vector(vec![true, false, true]).unwrap(),
+                    Array::scalar(7.0_f32).unwrap(),
+                    Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap(),
                 ],
             )
             .unwrap()
@@ -514,8 +514,8 @@ mod tests {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = SelectOperation::<ArrayType>::new(),
-            inputs = [Array::scalar(true), Array::scalar(2.0_f32), Array::scalar(3.0_f64)],
-            expected = Array::scalar(2.0_f64),
+            inputs = [Array::scalar(true).unwrap(), Array::scalar(2.0_f32).unwrap(), Array::scalar(3.0_f64).unwrap()],
+            expected = Array::scalar(2.0_f64).unwrap(),
         );
     }
 
@@ -530,11 +530,11 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![true, false])),
-                    (@replicated, Array::scalar(2.0)),
-                    (@mapped(axis = 0), Array::vector(vec![3.0, 4.0])),
+                    (@mapped(axis = 0), Array::vector(vec![true, false]).unwrap()),
+                    (@replicated, Array::scalar(2.0).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![3.0, 4.0]).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 4.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 4.0]).unwrap())],
             }],
         );
     }
@@ -551,37 +551,37 @@ mod tests {
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
 
-        let (primal, tangent) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
-            .jvp((Array::scalar(1.0), Array::scalar(0.0)), |(x, y)| piecewise(x, y))
+        let (primal, tangent) = differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()))
+            .jvp((Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap()), |(x, y)| piecewise(x, y))
             .unwrap();
-        assert_eq!(primal, Array::scalar(6.0));
-        assert_eq!(tangent, Array::scalar(2.0));
-        let (value, gradient) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
+        assert_eq!(primal, Array::scalar(6.0).unwrap());
+        assert_eq!(tangent, Array::scalar(2.0).unwrap());
+        let (value, gradient) = differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()))
             .value_and_gradient(|(x, y)| piecewise(x, y).unwrap())
             .unwrap();
-        assert_eq!(value, Array::scalar(6.0));
-        assert_eq!(gradient.0, Array::scalar(2.0));
-        assert_eq!(gradient.1, Array::scalar(0.0));
+        assert_eq!(value, Array::scalar(6.0).unwrap());
+        assert_eq!(gradient.0, Array::scalar(2.0).unwrap());
+        assert_eq!(gradient.1, Array::scalar(0.0).unwrap());
 
-        let (primal, tangent) = differentiate_at((Array::scalar(1.0), Array::scalar(2.0)))
-            .jvp((Array::scalar(0.0), Array::scalar(1.0)), |(x, y)| piecewise(x, y))
+        let (primal, tangent) = differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()))
+            .jvp((Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()), |(x, y)| piecewise(x, y))
             .unwrap();
-        assert_eq!(primal, Array::scalar(6.0));
-        assert_eq!(tangent, Array::scalar(3.0));
-        let (value, gradient) = differentiate_at((Array::scalar(1.0), Array::scalar(2.0)))
+        assert_eq!(primal, Array::scalar(6.0).unwrap());
+        assert_eq!(tangent, Array::scalar(3.0).unwrap());
+        let (value, gradient) = differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()))
             .value_and_gradient(|(x, y)| piecewise(x, y).unwrap())
             .unwrap();
-        assert_eq!(value, Array::scalar(6.0));
-        assert_eq!(gradient.0, Array::scalar(0.0));
-        assert_eq!(gradient.1, Array::scalar(3.0));
+        assert_eq!(value, Array::scalar(6.0).unwrap());
+        assert_eq!(gradient.0, Array::scalar(0.0).unwrap());
+        assert_eq!(gradient.1, Array::scalar(3.0).unwrap());
     }
 
     #[test]
     fn test_select_transposition() {
         // Check that primitive transposition partitions the cotangent between the two linear branches.
-        let condition = Array::vector(vec![true, false]);
-        let on_true = Array::vector(vec![10.0, 20.0]);
-        let cotangent = Array::vector(vec![5.0, 7.0]);
+        let condition = Array::vector(vec![true, false]).unwrap();
+        let on_true = Array::vector(vec![10.0, 20.0]).unwrap();
+        let cotangent = Array::vector(vec![5.0, 7.0]).unwrap();
         let branch_type = on_true.r#type().into_owned();
         check_operation_transposition!(
             @exact,
@@ -593,22 +593,28 @@ mod tests {
                     (@linear(type = branch_type)),
                 ],
                 output_cotangents = [cotangent],
-                input_cotangents = [Array::vector(vec![5.0, 0.0]), Array::vector(vec![0.0, 7.0])],
+                input_cotangents = [Array::vector(vec![5.0, 0.0]).unwrap(), Array::vector(vec![0.0, 7.0]).unwrap()],
             }],
         );
     }
 
     #[test]
     fn test_array_select() {
-        let condition = Array::vector(vec![true, false, true]);
-        let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
-        let on_false = Array::vector(vec![-1.0, -2.0, -3.0]);
-        assert_eq!(Array::select(&condition, &on_true, &on_false).unwrap(), Array::vector(vec![1.0, -2.0, 3.0]));
+        let condition = Array::vector(vec![true, false, true]).unwrap();
+        let on_true = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let on_false = Array::vector(vec![-1.0, -2.0, -3.0]).unwrap();
+        assert_eq!(
+            Array::select(&condition, &on_true, &on_false).unwrap(),
+            Array::vector(vec![1.0, -2.0, 3.0]).unwrap()
+        );
         // The condition broadcasts against the branches, and the branch data types promote together.
-        let broadcast =
-            Array::select(&Array::scalar(true), &Array::vector(vec![1.0f32, 2.0]), &Array::vector(vec![-1.0f64, -2.0]))
-                .unwrap();
-        assert_eq!(broadcast, Array::vector(vec![1.0f64, 2.0]));
+        let broadcast = Array::select(
+            &Array::scalar(true).unwrap(),
+            &Array::vector(vec![1.0f32, 2.0]).unwrap(),
+            &Array::vector(vec![-1.0f64, -2.0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(broadcast, Array::vector(vec![1.0f64, 2.0]).unwrap());
 
         // General broadcasting reads every input through its physical layout and writes one dense output without
         // converting equal-typed branch elements through an intermediate representation.

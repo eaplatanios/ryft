@@ -468,7 +468,7 @@ pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 /// #
 /// let indices: Array = batch(
 ///     |item| item.context().axis_index("items"),
-///     Array::vector(vec![10.0, 20.0, 30.0]),
+///     Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
 ///     BatchAxis::new(0),
 ///     BatchAxis::new(0),
 ///     BatchAxisSpecification::named("items"),
@@ -711,7 +711,7 @@ mod tests {
         // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
         let output: Array = batch(
             |item| item.context().axis_index("i"),
-            Array::vector(vec![10.0, 20.0, 30.0]),
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("i"),
@@ -728,7 +728,7 @@ mod tests {
         // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
         // vary over inner items). The inner output is therefore declared replicated, and the outer level stacks the
         // per-row outer index, giving the `u64` vector `[0, 1]`.
-        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap();
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |row| {
@@ -757,7 +757,7 @@ mod tests {
         // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
         let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
             |item| item.context().axis_index("j"),
-            Array::vector(vec![10.0, 20.0, 30.0]),
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("i"),

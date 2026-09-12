@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn test_print_interpretation() {
         let context = EagerContext::<Array>::new();
-        let input = Array::scalar(3.0);
+        let input = Array::scalar(3.0).unwrap();
         let outputs =
             PrintOperation::new("x").interpret(&context.clone(), &EmptyRegionDriver, &[input.clone()]).unwrap();
         assert_eq!(outputs, vec![input]);
@@ -283,7 +283,7 @@ mod tests {
         // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
         // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
         // the gradient) exercises the effect keep-alive of the partition projections.
-        let (value, gradient) = differentiate_at(Array::scalar(3.0)).value_and_gradient(print_square).unwrap();
+        let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap()).value_and_gradient(print_square).unwrap();
         assert_eq!(value.to_f64s()[0], 9.0);
         assert_eq!(gradient.to_f64s()[0], 6.0);
     }

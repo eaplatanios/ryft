@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_not_interpretation() {
         // Check the operation-specific eager value semantics.
-        assert_eq!((!Array::vector(vec![true, false, true])).elements::<bool>(), Ok(vec![false, true, false]));
+        assert_eq!((!Array::vector(vec![true, false, true]).unwrap()).elements::<bool>(), Ok(vec![false, true, false]));
     }
 
     #[test]
@@ -148,8 +148,8 @@ mod tests {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = NotOperation::new(),
-            inputs = [Array::scalar(true)],
-            expected = Array::scalar(false),
+            inputs = [Array::scalar(true).unwrap()],
+            expected = Array::scalar(false).unwrap(),
         );
     }
 
@@ -162,12 +162,12 @@ mod tests {
             axis_size = 2,
             cases = [
                 {
-                    inputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
+                    inputs = [(@mapped(axis = 0), Array::vector(vec![true, false]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]).unwrap())],
                 },
                 {
-                    inputs = [(@replicated, Array::scalar(true))],
-                    outputs = [(@replicated, Array::scalar(false))],
+                    inputs = [(@replicated, Array::scalar(true).unwrap())],
+                    outputs = [(@replicated, Array::scalar(false).unwrap())],
                 },
             ],
         );
@@ -179,11 +179,11 @@ mod tests {
             .jvp(
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
-                &[DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap()],
+                &[DifferentiationDual::new_with_zero_tangent(Array::scalar(true).unwrap()).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(false));
+        assert_eq!(outputs[0].primal(), &Array::scalar(false).unwrap());
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
@@ -216,11 +216,11 @@ mod tests {
 
     #[test]
     fn test_not_for_array() {
-        let left = Array::vector(vec![true, true, false, false]);
-        assert_eq!(left.not().unwrap(), Array::vector(vec![false, false, true, true]));
-        assert_eq!(Array::vector(vec![0x00ff_i16, -1]).not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
+        let left = Array::vector(vec![true, true, false, false]).unwrap();
+        assert_eq!(left.not().unwrap(), Array::vector(vec![false, false, true, true]).unwrap());
+        assert_eq!(Array::vector(vec![0x00ff_i16, -1]).unwrap().not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
         // Sub-byte negation complements only the declared low bits, retaining a valid sign-extended encoding.
-        let signed_sub_byte = Array::vector(vec![i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]);
+        let signed_sub_byte = Array::vector(vec![i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]).unwrap();
         assert_eq!(
             signed_sub_byte.not().unwrap().elements::<i2>(),
             Ok(vec![i2::MAX, i2::new(0).unwrap(), i2::new(-1).unwrap(), i2::MIN]),
@@ -233,6 +233,6 @@ mod tests {
         assert_eq!(strided.storage_bytes(), [0, 0, 1]);
         assert_eq!(strided.elements::<bool>(), Ok(vec![false, true]));
         // The `std::ops` sugar delegates to the fallible capability.
-        assert_eq!(!left.clone(), Array::vector(vec![false, false, true, true]));
+        assert_eq!(!left.clone(), Array::vector(vec![false, false, true, true]).unwrap());
     }
 }

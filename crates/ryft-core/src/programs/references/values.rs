@@ -1811,14 +1811,14 @@ mod tests {
 
     #[test]
     fn test_reference_id_is_not_reused_after_allocation_drop() {
-        let first = ArrayReference::new(Array::scalar(1.0_f32)).id();
-        let second = ArrayReference::new(Array::scalar(2.0_f32)).id();
+        let first = ArrayReference::new(Array::scalar(1.0_f32).unwrap()).id();
+        let second = ArrayReference::new(Array::scalar(2.0_f32).unwrap()).id();
         assert!(first < second);
     }
 
     #[test]
     fn test_reference_new_rejects_an_immediate_reference_referent() {
-        let nested = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let nested = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         assert!(matches!(
             Reference::new(nested),
             Err(ReferenceError::NestedReferent { referent_type }) if referent_type == "ref<f32[]>"
@@ -1827,7 +1827,7 @@ mod tests {
 
     #[test]
     fn test_reference_clone_preserves_allocation_identity_equality_and_hashing() {
-        let initial = Array::vector(vec![1.0_f32, 2.0]);
+        let initial = Array::vector(vec![1.0_f32, 2.0]).unwrap();
         let reference = Reference::new(initial.clone()).unwrap();
         let alias = reference.clone();
         let distinct = Reference::new(initial).unwrap();
@@ -1837,7 +1837,7 @@ mod tests {
         assert_ne!(reference, distinct);
         assert_eq!(reference.id(), alias.id());
         assert_ne!(reference.id(), distinct.id());
-        assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         assert_eq!(reference.r#type(), alias.r#type());
         assert_eq!(reference.r#type(), distinct.r#type());
         assert!(reference.uses_storage_type_identities());
@@ -1857,8 +1857,8 @@ mod tests {
 
     #[test]
     fn test_reference_display_and_debug_render_type_and_allocation_identity() {
-        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0])).unwrap();
-        let distinct = Reference::new(Array::vector(vec![3.0_f32, 4.0])).unwrap();
+        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()).unwrap();
+        let distinct = Reference::new(Array::vector(vec![3.0_f32, 4.0]).unwrap()).unwrap();
 
         // Display is deterministic and type-based, while Debug also exposes process-local allocation identity.
         assert_eq!(reference.to_string(), "ref<f32[2]>");
@@ -1883,68 +1883,73 @@ mod tests {
 
     #[test]
     fn test_reference_read_write_swap_and_update_preserve_value_ownership() {
-        let initializer = Array::vector(vec![1.0_f32, 2.0]);
+        let initializer = Array::vector(vec![1.0_f32, 2.0]).unwrap();
         let first = Reference::new(initializer.clone()).unwrap();
         let read_snapshot = first.read().unwrap();
-        let replacement = Array::vector(vec![3.0_f32, 4.0]);
+        let replacement = Array::vector(vec![3.0_f32, 4.0]).unwrap();
         let retained_replacement = replacement.clone();
         assert_eq!(first.write(replacement), Ok(()));
-        assert_eq!(first.swap(Array::vector(vec![7.0_f32, 8.0])), Ok(Array::vector(vec![3.0_f32, 4.0])));
+        assert_eq!(
+            first.swap(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
+            Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap())
+        );
         assert_eq!(
             first.update(|current| {
-                current.add(&Array::vector(vec![10.0_f32, 20.0])).map(|updated| (updated, "updated"))
+                current.add(&Array::vector(vec![10.0_f32, 20.0]).unwrap()).map(|updated| (updated, "updated"))
             }),
             Ok("updated"),
         );
-        assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]));
-        assert_eq!(first.read(), Ok(Array::vector(vec![17.0_f32, 28.0])));
+        assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]).unwrap());
+        assert_eq!(first.read(), Ok(Array::vector(vec![17.0_f32, 28.0]).unwrap()));
     }
 
     #[test]
     fn test_reference_mutations_do_not_affect_distinct_allocations() {
-        let initializer = Array::vector(vec![1.0_f32, 2.0]);
+        let initializer = Array::vector(vec![1.0_f32, 2.0]).unwrap();
         let first = Reference::new(initializer.clone()).unwrap();
         let second = Reference::new(initializer.clone()).unwrap();
-        assert_eq!(first.write(Array::vector(vec![3.0_f32, 4.0])), Ok(()));
+        assert_eq!(first.write(Array::vector(vec![3.0_f32, 4.0]).unwrap()), Ok(()));
         assert_eq!(second.read(), Ok(initializer.clone()));
-        assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer));
-        assert_eq!(first.read(), Ok(Array::vector(vec![3.0_f32, 4.0])));
-        assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0])));
+        assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0]).unwrap()), Ok(initializer));
+        assert_eq!(first.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
+        assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0]).unwrap()));
     }
 
     #[test]
     fn test_reference_rejected_replacements_and_updates_preserve_state() {
-        let initial = Array::vector(vec![1.0_f32, 2.0]);
+        let initial = Array::vector(vec![1.0_f32, 2.0]).unwrap();
         let reference = Reference::new(initial.clone()).unwrap();
         let mismatch =
             ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() };
 
-        assert_eq!(reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])), Err(mismatch.clone()));
+        assert_eq!(reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0]).unwrap()), Err(mismatch.clone()));
         assert_eq!(reference.read(), Ok(initial.clone()));
-        assert_eq!(reference.write(Array::vector(vec![3.0_f32, 4.0, 5.0])), Err(mismatch.clone()));
+        assert_eq!(reference.write(Array::vector(vec![3.0_f32, 4.0, 5.0]).unwrap()), Err(mismatch.clone()));
         assert_eq!(reference.read(), Ok(initial.clone()));
 
         let update_error = ProgramError::InvalidArgument { message: "test update failed".to_string() };
         assert_eq!(reference.update::<(), _>(|_| Err(update_error.clone())), Err(update_error));
         assert_eq!(reference.read(), Ok(initial.clone()));
 
-        let error = reference.update(|_| Ok((Array::vector(vec![3.0_f32, 4.0, 5.0]), ()))).unwrap_err();
+        let error = reference.update(|_| Ok((Array::vector(vec![3.0_f32, 4.0, 5.0]).unwrap(), ()))).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&mismatch));
         assert_eq!(reference.read(), Ok(initial));
     }
 
     #[test]
     fn test_reference_write_commits_calls_from_multiple_threads() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let initial_generation = reference.lock().unwrap().observe().unwrap().generation();
         let first_reference = reference.clone();
         let second_reference = reference.clone();
         let (sender, receiver) = channel();
         let first_sender = sender.clone();
-        let first = thread::spawn(move || first_sender.send(first_reference.write(Array::scalar(2.0_f32))).unwrap());
-        let second = thread::spawn(move || sender.send(second_reference.write(Array::scalar(3.0_f32))).unwrap());
+        let first =
+            thread::spawn(move || first_sender.send(first_reference.write(Array::scalar(2.0_f32).unwrap())).unwrap());
+        let second =
+            thread::spawn(move || sender.send(second_reference.write(Array::scalar(3.0_f32).unwrap())).unwrap());
 
         assert_eq!(
             receiver
@@ -1961,19 +1966,22 @@ mod tests {
         first.join().unwrap();
         second.join().unwrap();
         assert!(
-            matches!(reference.read(), Ok(value) if value == Array::scalar(2.0_f32) || value == Array::scalar(3.0_f32))
+            matches!(reference.read(), Ok(value) if value == Array::scalar(2.0_f32).unwrap() || value == Array::scalar(3.0_f32).unwrap())
         );
         assert_eq!(reference.lock().unwrap().observe().unwrap().generation().0, initial_generation.0 + 2);
     }
 
     #[test]
     fn test_reference_read_waits_for_pending_completion_without_holding_the_lock() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let backend = ControlledCompletion::new();
         let guard = reference.lock().unwrap();
-        let (guard, _) =
-            commit_pending_replacement(guard, ReferenceCompletion::new(backend.clone()), Array::scalar(2.0_f32))
-                .unwrap();
+        let (guard, _) = commit_pending_replacement(
+            guard,
+            ReferenceCompletion::new(backend.clone()),
+            Array::scalar(2.0_f32).unwrap(),
+        )
+        .unwrap();
         assert!(guard.observe().unwrap().dependency().is_some());
         drop(guard);
 
@@ -1988,25 +1996,29 @@ mod tests {
             receiver
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap_or_else(|error| panic!("reference read result within {TEST_TIMEOUT:?}: {error}")),
-            Ok(Array::scalar(2.0_f32)),
+            Ok(Array::scalar(2.0_f32).unwrap()),
         );
         reader.join().unwrap();
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_write_waits_for_pending_completion_without_holding_the_lock() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let backend = ControlledCompletion::new();
         let guard = reference.lock().unwrap();
-        let (guard, _) =
-            commit_pending_replacement(guard, ReferenceCompletion::new(backend.clone()), Array::scalar(2.0_f32))
-                .unwrap();
+        let (guard, _) = commit_pending_replacement(
+            guard,
+            ReferenceCompletion::new(backend.clone()),
+            Array::scalar(2.0_f32).unwrap(),
+        )
+        .unwrap();
         drop(guard);
 
         let (sender, receiver) = channel();
         let writing_reference = Arc::clone(&reference);
-        let writer = thread::spawn(move || sender.send(writing_reference.write(Array::scalar(3.0_f32))).unwrap());
+        let writer =
+            thread::spawn(move || sender.send(writing_reference.write(Array::scalar(3.0_f32).unwrap())).unwrap());
         backend.wait_until_awaited();
         assert!(reference.lock().unwrap().observe().unwrap().dependency().is_some());
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
@@ -2018,17 +2030,20 @@ mod tests {
             Ok(()),
         );
         writer.join().unwrap();
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_read_reports_a_failed_pending_completion_as_execution_poisoned() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let backend = ControlledCompletion::new();
         let guard = reference.lock().unwrap();
-        let (guard, _) =
-            commit_pending_replacement(guard, ReferenceCompletion::new(backend.clone()), Array::scalar(2.0_f32))
-                .unwrap();
+        let (guard, _) = commit_pending_replacement(
+            guard,
+            ReferenceCompletion::new(backend.clone()),
+            Array::scalar(2.0_f32).unwrap(),
+        )
+        .unwrap();
         drop(guard);
 
         // The completion resolves before the read reaches it, so the read observes the failure through the same lazy
@@ -2036,14 +2051,14 @@ mod tests {
         backend.complete(Err("device execution failed".into()));
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "device execution failed".to_string() };
         assert_eq!(reference.read(), Err(poisoned.clone()));
-        assert_eq!(reference.write(Array::scalar(3.0_f32)), Err(poisoned.clone()));
-        assert_eq!(reference.swap(Array::scalar(3.0_f32)), Err(poisoned.clone()));
+        assert_eq!(reference.write(Array::scalar(3.0_f32).unwrap()), Err(poisoned.clone()));
+        assert_eq!(reference.swap(Array::scalar(3.0_f32).unwrap()), Err(poisoned.clone()));
         assert_eq!(reference.freeze(), Err(poisoned));
     }
 
     #[test]
     fn test_reference_read_ignores_a_stale_pending_completion() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let first_backend = ControlledCompletion::new();
         let second_backend = ControlledCompletion::new();
 
@@ -2052,7 +2067,7 @@ mod tests {
             let (guard, generation) = commit_pending_replacement(
                 guard,
                 ReferenceCompletion::new(first_backend.clone()),
-                Array::scalar(2.0_f32),
+                Array::scalar(2.0_f32).unwrap(),
             )
             .unwrap();
             drop(guard);
@@ -2075,7 +2090,8 @@ mod tests {
                 observation.dependency().unwrap().clone(),
                 ReferenceCompletion::new(second_backend.clone()),
             ]);
-            let (guard, generation) = commit_pending_replacement(guard, completion, Array::scalar(3.0_f32)).unwrap();
+            let (guard, generation) =
+                commit_pending_replacement(guard, completion, Array::scalar(3.0_f32).unwrap()).unwrap();
             drop(guard);
             generation
         };
@@ -2091,19 +2107,19 @@ mod tests {
             receiver
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap_or_else(|error| panic!("reference read result within {TEST_TIMEOUT:?}: {error}")),
-            Ok(Array::scalar(3.0_f32)),
+            Ok(Array::scalar(3.0_f32).unwrap()),
         );
         reader.join().unwrap();
 
         let observation = reference.lock().unwrap().observe().unwrap();
         assert_eq!(observation.generation(), second_generation);
-        assert_eq!(observation.snapshot(), &Array::scalar(3.0_f32));
+        assert_eq!(observation.snapshot(), &Array::scalar(3.0_f32).unwrap());
         assert!(observation.dependency().is_none());
     }
 
     #[test]
     fn test_reference_write_waits_until_the_preserved_value_is_released() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let preservation = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.preserve_value_until(ReferenceCompletion::new(preservation.clone()));
@@ -2111,7 +2127,8 @@ mod tests {
 
         let (sender, receiver) = channel();
         let writing_reference = Arc::clone(&reference);
-        let writer = thread::spawn(move || sender.send(writing_reference.write(Array::scalar(2.0_f32))).unwrap());
+        let writer =
+            thread::spawn(move || sender.send(writing_reference.write(Array::scalar(2.0_f32).unwrap())).unwrap());
         preservation.wait_until_awaited();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         preservation.complete(Ok(()));
@@ -2122,12 +2139,12 @@ mod tests {
             Ok(()),
         );
         writer.join().unwrap();
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_swap_waits_until_the_preserved_value_is_released() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let preservation = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.preserve_value_until(ReferenceCompletion::new(preservation.clone()));
@@ -2136,7 +2153,8 @@ mod tests {
         // Preserving the current value prevents the replacement from committing until the completion resolves.
         let (sender, receiver) = channel();
         let swapping_reference = Arc::clone(&reference);
-        let swapper = thread::spawn(move || sender.send(swapping_reference.swap(Array::scalar(2.0_f32))).unwrap());
+        let swapper =
+            thread::spawn(move || sender.send(swapping_reference.swap(Array::scalar(2.0_f32).unwrap())).unwrap());
         preservation.wait_until_awaited();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         preservation.complete(Ok(()));
@@ -2144,15 +2162,15 @@ mod tests {
             receiver
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap_or_else(|error| panic!("reference swap result within {TEST_TIMEOUT:?}: {error}")),
-            Ok(Array::scalar(1.0_f32)),
+            Ok(Array::scalar(1.0_f32).unwrap()),
         );
         swapper.join().unwrap();
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_freeze_waits_until_the_preserved_value_is_released() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let preservation = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.preserve_value_until(ReferenceCompletion::new(preservation.clone()));
@@ -2169,7 +2187,7 @@ mod tests {
             receiver
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap_or_else(|error| panic!("reference freeze result within {TEST_TIMEOUT:?}: {error}")),
-            Ok(Array::scalar(1.0_f32)),
+            Ok(Array::scalar(1.0_f32).unwrap()),
         );
         freezer.join().unwrap();
         assert_eq!(reference.read(), Err(ReferenceError::Frozen));
@@ -2177,20 +2195,20 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_invalidates_every_alias_before_running_later_updates() {
-        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0])).unwrap();
+        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()).unwrap();
         let alias = reference.clone();
-        assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
 
         assert_eq!(alias.read(), Err(ReferenceError::Frozen));
-        assert_eq!(alias.write(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
-        assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
+        assert_eq!(alias.write(Array::vector(vec![3.0_f32, 4.0]).unwrap()), Err(ReferenceError::Frozen));
+        assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0]).unwrap()), Err(ReferenceError::Frozen));
         assert_eq!(reference.freeze(), Err(ReferenceError::Frozen));
 
         let update_executed = Cell::new(false);
         let error = alias
             .update(|_| {
                 update_executed.set(true);
-                Ok((Array::vector(vec![3.0_f32, 4.0]), ()))
+                Ok((Array::vector(vec![3.0_f32, 4.0]).unwrap(), ()))
             })
             .unwrap_err();
         assert!(!update_executed.get());
@@ -2199,17 +2217,17 @@ mod tests {
 
     #[test]
     fn test_reference_generation_advances_only_after_committed_mutations() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let initial_generation = reference.lock().unwrap().observe().unwrap().generation();
 
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32).unwrap()));
         assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), initial_generation);
 
-        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.swap(Array::scalar(2.0_f32).unwrap()), Ok(Array::scalar(1.0_f32).unwrap()));
         let swapped_generation = reference.lock().unwrap().observe().unwrap().generation();
         assert_eq!(swapped_generation, ReferenceGeneration(initial_generation.0 + 1));
 
-        assert_eq!(reference.write(Array::scalar(3.0_f32)), Ok(()));
+        assert_eq!(reference.write(Array::scalar(3.0_f32).unwrap()), Ok(()));
         let written_generation = reference.lock().unwrap().observe().unwrap().generation();
         assert_eq!(written_generation, ReferenceGeneration(swapped_generation.0 + 1));
 
@@ -2217,14 +2235,14 @@ mod tests {
         assert_eq!(reference.update::<(), _>(|_| Err(rejected.clone())), Err(rejected));
         assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), written_generation);
 
-        assert_eq!(reference.update(|_| Ok((Array::scalar(4.0_f32), "updated"))), Ok("updated"));
+        assert_eq!(reference.update(|_| Ok((Array::scalar(4.0_f32).unwrap(), "updated"))), Ok("updated"));
         let updated_generation = reference.lock().unwrap().observe().unwrap().generation();
         assert_eq!(updated_generation, ReferenceGeneration(written_generation.0 + 1));
     }
 
     #[test]
     fn test_reference_mutations_preserve_state_when_the_generation_is_exhausted() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         {
             let mut state = reference.handle.holder.state.lock().unwrap();
             let ReferenceState::Ready { generation, .. } = &mut *state else {
@@ -2233,19 +2251,19 @@ mod tests {
             *generation = ReferenceGeneration(u64::MAX);
         }
 
-        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::GenerationExhausted));
+        assert_eq!(reference.write(Array::scalar(2.0_f32).unwrap()), Err(ReferenceError::GenerationExhausted));
         assert!(matches!(reference.lock().unwrap().prepare_replacement(), Err(ReferenceError::GenerationExhausted),));
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         assert!(matches!(ready.take(), Err(ReferenceError::GenerationExhausted)));
         let observation = reference.lock().unwrap().observe().unwrap();
         assert_eq!(observation.generation(), ReferenceGeneration(u64::MAX));
-        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32));
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32).unwrap());
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_access_reports_unexpected_mutex_poisoning() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let allocation = Arc::clone(&reference.handle.holder);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2255,7 +2273,7 @@ mod tests {
             .is_err(),
         );
         assert_eq!(reference.read(), Err(ReferenceError::Poisoned));
-        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::Poisoned));
+        assert_eq!(reference.write(Array::scalar(2.0_f32).unwrap()), Err(ReferenceError::Poisoned));
     }
 
     #[test]
@@ -2347,42 +2365,45 @@ mod tests {
 
     #[test]
     fn test_reference_observation_tracks_allocation_and_generation() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let alias = reference.clone();
-        let distinct = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let distinct = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
 
         let observation = reference.lock().unwrap().observe().unwrap();
         assert_eq!(observation.generation(), ReferenceGeneration(0));
-        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32));
+        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32).unwrap());
         assert!(observation.dependency().is_none());
         assert!(observation.is_current(&reference.lock().unwrap()));
         assert!(observation.is_current(&alias.lock().unwrap()));
         assert!(!observation.is_current(&distinct.lock().unwrap()));
 
-        assert_eq!(reference.write(Array::scalar(2.0_f32)), Ok(()));
+        assert_eq!(reference.write(Array::scalar(2.0_f32).unwrap()), Ok(()));
         assert!(!observation.is_current(&reference.lock().unwrap()));
         let current = reference.lock().unwrap().observe().unwrap();
         assert_eq!(current.generation(), ReferenceGeneration(1));
-        assert_eq!(current.snapshot(), &Array::scalar(2.0_f32));
+        assert_eq!(current.snapshot(), &Array::scalar(2.0_f32).unwrap());
         assert!(current.dependency().is_none());
     }
 
     #[test]
     fn test_reference_observation_remains_current_when_pending_value_becomes_ready() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let completion = ControlledCompletion::new();
         let guard = reference.lock().unwrap();
-        let (guard, generation) =
-            commit_pending_replacement(guard, ReferenceCompletion::new(completion.clone()), Array::scalar(2.0_f32))
-                .unwrap();
+        let (guard, generation) = commit_pending_replacement(
+            guard,
+            ReferenceCompletion::new(completion.clone()),
+            Array::scalar(2.0_f32).unwrap(),
+        )
+        .unwrap();
         let pending = guard.observe().unwrap();
         assert_eq!(pending.generation(), generation);
-        assert_eq!(pending.snapshot(), &Array::scalar(2.0_f32));
+        assert_eq!(pending.snapshot(), &Array::scalar(2.0_f32).unwrap());
         assert!(pending.dependency().is_some());
         drop(guard);
 
         completion.complete(Ok(()));
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
 
         // Reconciliation changes only the lifecycle variant, so the pending observation remains current while a new
         // observation no longer carries an already-completed dependency.
@@ -2393,7 +2414,7 @@ mod tests {
 
     #[test]
     fn test_ready_or_pending_reference_guard_preserve_value_until_releases_terminal_completions() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
         let third = ControlledCompletion::new();
@@ -2430,19 +2451,19 @@ mod tests {
 
     #[test]
     fn test_ready_or_pending_reference_guard_prepare_replacement_prunes_terminal_preservation_records() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let mut guard = reference.lock().unwrap();
         guard.preserve_value_until(ReferenceCompletion::ready(Ok(())));
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("completed preservation unexpectedly blocked replacement preparation")
         };
         drop(prepared);
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32).unwrap()));
     }
 
     #[test]
     fn test_ready_or_pending_reference_guard_prepare_replacement_returns_active_preservation_completions() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let preservation = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.preserve_value_until(ReferenceCompletion::new(preservation.clone()));
@@ -2458,21 +2479,24 @@ mod tests {
 
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (value, taken) = ready.take().unwrap();
-        assert_eq!(value, Array::scalar(1.0_f32));
-        let ready = taken.replace(Array::scalar(4.0_f32)).unwrap();
+        assert_eq!(value, Array::scalar(1.0_f32).unwrap());
+        let ready = taken.replace(Array::scalar(4.0_f32).unwrap()).unwrap();
         drop(ready);
-        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32).unwrap()));
     }
 
     #[test]
     fn test_ready_or_pending_reference_guard_wait_until_ready_releases_the_mutex_while_waiting() {
-        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap());
         let pending = ControlledCompletion::new();
         let preservation = ControlledCompletion::new();
         let guard = reference.lock().unwrap();
-        let (mut guard, generation) =
-            commit_pending_replacement(guard, ReferenceCompletion::new(pending.clone()), Array::scalar(2.0_f32))
-                .unwrap();
+        let (mut guard, generation) = commit_pending_replacement(
+            guard,
+            ReferenceCompletion::new(pending.clone()),
+            Array::scalar(2.0_f32).unwrap(),
+        )
+        .unwrap();
         guard.preserve_value_until(ReferenceCompletion::new(preservation.clone()));
 
         // While `wait_until_ready` awaits each completion, another thread must be able to acquire the same reference
@@ -2496,29 +2520,29 @@ mod tests {
         assert_eq!(receiver.recv_timeout(TEST_TIMEOUT), Ok((generation, false)));
         waiter.join().unwrap();
         drop(ready);
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_ready_reference_guard_take_and_replace_advance_the_generation() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (value, taken) = ready.take().unwrap();
-        assert_eq!(value, Array::scalar(1.0_f32));
+        assert_eq!(value, Array::scalar(1.0_f32).unwrap());
 
-        let ready = taken.replace(Array::scalar(2.0_f32)).unwrap();
+        let ready = taken.replace(Array::scalar(2.0_f32).unwrap()).unwrap();
         drop(ready);
         let observation = reference.lock().unwrap().observe().unwrap();
         assert_eq!(observation.generation(), ReferenceGeneration(1));
-        assert_eq!(observation.snapshot(), &Array::scalar(2.0_f32));
+        assert_eq!(observation.snapshot(), &Array::scalar(2.0_f32).unwrap());
     }
 
     #[test]
     fn test_taken_reference_guard_replace_validation_failure_poisons_reference() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (_, taken) = ready.take().unwrap();
-        let error = match taken.replace(Array::vector(vec![2.0_f32])) {
+        let error = match taken.replace(Array::vector(vec![2.0_f32]).unwrap()) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -2531,8 +2555,8 @@ mod tests {
 
     #[test]
     fn test_taken_reference_guard_poison_affects_only_the_taken_reference() {
-        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
-        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let first = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32).unwrap()).unwrap();
         let first_guard = first.lock().unwrap().wait_until_ready().unwrap();
         let second_guard = second.lock().unwrap();
         let (_, taken) = first_guard.take().unwrap();
@@ -2542,15 +2566,15 @@ mod tests {
             first.read(),
             Err(ReferenceError::ExecutionPoisoned { reason: "test execution failed".to_string() }),
         );
-        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_taken_reference_guard_drop_poisons_reference() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (value, taken) = ready.take().unwrap();
-        assert_eq!(value, Array::scalar(1.0_f32));
+        assert_eq!(value, Array::scalar(1.0_f32).unwrap());
         drop(taken);
         assert_eq!(
             reference.read(),
@@ -2562,26 +2586,28 @@ mod tests {
 
     #[test]
     fn test_reference_replacement_transaction_commits_its_prepared_generation() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let guard = reference.lock().unwrap();
         let (guard, first) =
-            commit_pending_replacement(guard, ReferenceCompletion::ready(Ok(())), Array::scalar(2.0_f32)).unwrap();
+            commit_pending_replacement(guard, ReferenceCompletion::ready(Ok(())), Array::scalar(2.0_f32).unwrap())
+                .unwrap();
         let (guard, second) =
-            commit_pending_replacement(guard, ReferenceCompletion::ready(Ok(())), Array::scalar(3.0_f32)).unwrap();
+            commit_pending_replacement(guard, ReferenceCompletion::ready(Ok(())), Array::scalar(3.0_f32).unwrap())
+                .unwrap();
         assert_eq!(first.next(), Some(second));
         drop(guard);
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
     fn test_reference_replacement_transaction_validate_failure_poisons_reference() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let guard = reference.lock().unwrap();
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("new reference unexpectedly has a preserved reader")
         };
         let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
-        let error = match transaction.validate(Array::vector(vec![2.0_f32])) {
+        let error = match transaction.validate(Array::vector(vec![2.0_f32]).unwrap()) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly validated"),
             Err(error) => error,
         };
@@ -2594,13 +2620,13 @@ mod tests {
 
     #[test]
     fn test_validated_pending_replacement_transaction_drop_poisons_reference() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         let guard = reference.lock().unwrap();
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("new reference unexpectedly has a preserved reader")
         };
         let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
-        let validated = transaction.validate(Array::scalar(2.0_f32)).unwrap();
+        let validated = transaction.validate(Array::scalar(2.0_f32).unwrap()).unwrap();
         drop(validated);
         assert_eq!(
             reference.read(),
@@ -2612,8 +2638,8 @@ mod tests {
 
     #[test]
     fn test_reference_replacement_transactions_poison_every_replacement_after_validation_failure() {
-        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
-        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let first = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32).unwrap()).unwrap();
         let first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         let ReferenceReplacementPreparation::Prepared(first_prepared) = first_guard.prepare_replacement().unwrap()
@@ -2626,8 +2652,8 @@ mod tests {
         };
         let first_transaction = first_prepared.begin(ReferenceCompletion::ready(Ok(())));
         let second_transaction = second_prepared.begin(ReferenceCompletion::ready(Ok(())));
-        let first_validated = first_transaction.validate(Array::scalar(3.0_f32)).unwrap();
-        let error = match second_transaction.validate(Array::vector(vec![4.0_f32])) {
+        let first_validated = first_transaction.validate(Array::scalar(3.0_f32).unwrap()).unwrap();
+        let error = match second_transaction.validate(Array::vector(vec![4.0_f32]).unwrap()) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly validated"),
             Err(error) => error,
         };
@@ -2639,7 +2665,7 @@ mod tests {
 
     #[test]
     fn test_reference_replacement_transaction_drop_during_unwind_poisons_reference() {
-        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let reference = Reference::new(Array::scalar(1.0_f32).unwrap()).unwrap();
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let guard = reference.lock().unwrap();
@@ -2795,8 +2821,8 @@ mod tests {
     #[test]
     fn test_reference_boundary_new() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
+        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32).unwrap()));
         let boundary = ReferenceBoundary::new(
             &context,
             [(ReferenceBoundaryPosition::Input(0), &first), (ReferenceBoundaryPosition::Capture(0), &second)],
@@ -2829,7 +2855,7 @@ mod tests {
         struct Position(String);
 
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let value = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let value = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         let Ok(boundary) = ReferenceBoundary::new(&context, [(Position("original".to_string()), &value)]) else {
             panic!("a single reference must form a valid boundary");
         };
@@ -2925,19 +2951,19 @@ mod tests {
     #[test]
     fn test_validate_reference_boundary_accepts_distinct_references_and_values() {
         let inputs = [
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
-            ArrayIrValue::Array(Array::scalar(2.0_f32)),
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
         ];
-        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)))];
+        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()))];
         assert_eq!(validate_reference_boundary(inputs.iter(), captures.iter()), Ok(()));
         assert_eq!(validate_reference_boundary(inputs.iter(), std::iter::empty()), Ok(()));
     }
 
     #[test]
     fn test_validate_reference_boundary_rejects_the_same_reference_at_two_inputs() {
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let inputs = [reference.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32)), reference];
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let inputs = [reference.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()), reference];
         assert_eq!(
             validate_reference_boundary(inputs.iter(), std::iter::empty()),
             Err(ReferenceBoundaryError::Aliased {
@@ -2949,7 +2975,7 @@ mod tests {
 
     #[test]
     fn test_validate_reference_boundary_rejects_a_reference_that_is_both_captured_and_passed() {
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         assert_eq!(
             validate_reference_boundary([reference.clone()].iter(), [reference.clone(), reference.clone()].iter()),
             Err(ReferenceBoundaryError::Aliased {
@@ -2976,7 +3002,7 @@ mod tests {
     fn test_validate_reference_boundary_rejects_a_non_reference_value_reporting_an_identity() {
         let detached = DetachedValue {
             r#type: ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-            identity: Some(ArrayReference::new(Array::scalar(1.0_f32))),
+            identity: Some(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
         };
         assert_eq!(
             validate_reference_boundary([detached].iter(), std::iter::empty()),

@@ -343,7 +343,7 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayI
 impl DimensionToScalar<Array> for DimensionValue {
     fn to_scalar(&self) -> Result<Array, ProgramError> {
         // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
-        Ok(Array::scalar(i64::try_from(self.extent()).unwrap()))
+        Array::scalar(i64::try_from(self.extent()).unwrap())
     }
 }
 

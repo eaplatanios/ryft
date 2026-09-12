@@ -757,8 +757,9 @@ mod tests {
     fn test_jacobian_forward() {
         // A vector identity function packs every input coordinate direction into one replay and reconstructs the
         // complete identity matrix as a single output/input block.
-        let jacobian =
-            differentiate_at(Array::vector(vec![1.0, 2.0, 3.0])).jacobian_forward(|input| Ok(input)).unwrap();
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
+            .jacobian_forward(|input| Ok(input))
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
             block.value().r#type().into_owned(),
@@ -767,7 +768,7 @@ mod tests {
         assert_eq!(block.value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 
         // Structured inputs and outputs produce blocks in output-major/input-minor order.
-        let jacobian = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+        let jacobian = differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .jacobian_forward(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -786,7 +787,7 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // An output independent of one input retains an explicit zero block in the Cartesian product.
-        let jacobian = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+        let jacobian = differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .jacobian_forward(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -799,21 +800,24 @@ mod tests {
         assert_abs_diff_eq!(blocks[5].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Forward replay follows primal control flow and selects the tangent of the branch taken at the primal point.
-        let jacobian = differentiate_at(Array::scalar(2.0)).jacobian_forward(|x| Ok(piecewise_select(x))).unwrap();
+        let jacobian =
+            differentiate_at(Array::scalar(2.0).unwrap()).jacobian_forward(|x| Ok(piecewise_select(x))).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = differentiate_at(Array::scalar(-2.0)).jacobian_forward(|x| Ok(piecewise_select(x))).unwrap();
+        let jacobian = differentiate_at(Array::scalar(-2.0).unwrap())
+            .jacobian_forward(|x| Ok(piecewise_select(x)))
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
         let jacobian = differentiate_at(input).jacobian_forward(|value| value.sin()).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
         assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
-        let jacobian = differentiate_at((Array::scalar(2.0), Array::vector(vec![3.0, 4.0])))
+        let jacobian = differentiate_at((Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap()))
             .jacobian_forward(|(scalar, vector)| Ok(scalar.clone() * vector + scalar))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -825,7 +829,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()))
+        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()).unwrap())
             .jacobian_forward(|input| Ok(input.clone() + input))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -835,7 +839,7 @@ mod tests {
         assert!(block.value().storage_bytes().is_empty());
 
         // The holomorphic entry point treats a complex derivative as complex linear.
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
         let jacobian = differentiate_at(input).holomorphic().jacobian_forward(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
@@ -846,7 +850,7 @@ mod tests {
     #[test]
     fn test_jacobian_reverse() {
         // Structured inputs and outputs produce the same output-major/input-minor blocks as forward mode.
-        let jacobian = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+        let jacobian = differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .jacobian_reverse(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -865,15 +869,18 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Reverse replay routes output cotangents through the branch selected at the primal point.
-        let jacobian = differentiate_at(Array::scalar(2.0)).jacobian_reverse(|x| Ok(piecewise_select(x))).unwrap();
+        let jacobian =
+            differentiate_at(Array::scalar(2.0).unwrap()).jacobian_reverse(|x| Ok(piecewise_select(x))).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = differentiate_at(Array::scalar(-2.0)).jacobian_reverse(|x| Ok(piecewise_select(x))).unwrap();
+        let jacobian = differentiate_at(Array::scalar(-2.0).unwrap())
+            .jacobian_reverse(|x| Ok(piecewise_select(x)))
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Per-element masking over a vector input makes the Jacobian diagonal, with entries 2 for positive inputs and
         // 3 otherwise.
-        let jacobian = differentiate_at(Array::vector(vec![1.0, -1.0]))
+        let jacobian = differentiate_at(Array::vector(vec![1.0, -1.0]).unwrap())
             .jacobian_reverse(|x| Ok(piecewise_select(x)))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -885,9 +892,10 @@ mod tests {
         assert_abs_diff_eq!(block.value().to_f64s()[3], 3.0, epsilon = 1e-9);
 
         // Pullback replay unbroadcasts a selected scalar branch and preserves each input's differential data type.
-        let scalar = Array::from_f64s(ArrayType::scalar(F32), vec![5.0]);
+        let scalar = Array::from_f64s(ArrayType::scalar(F32), vec![5.0]).unwrap();
         let f32_vector_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]));
-        let vector = Array::from_f64s(ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)])), vec![2.0, -3.0]);
+        let vector =
+            Array::from_f64s(ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)])), vec![2.0, -3.0]).unwrap();
 
         let jacobian = differentiate_at((scalar.clone(), vector.clone()))
             .jacobian_reverse(|(scalar, vector)| {
@@ -922,8 +930,8 @@ mod tests {
         assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
 
         // Promoted elementwise cotangents are converted back to the differential type of each input leaf.
-        let f32 = Array::from_f64s(ArrayType::scalar(F32), vec![2.0]);
-        let f64 = Array::from_f64s(ArrayType::scalar(F64), vec![3.0]);
+        let f32 = Array::from_f64s(ArrayType::scalar(F32), vec![2.0]).unwrap();
+        let f64 = Array::from_f64s(ArrayType::scalar(F64), vec![3.0]).unwrap();
         let jacobian = differentiate_at((f32.clone(), f64.clone()))
             .jacobian_reverse(|(left, right)| Ok(left + right))
             .unwrap();
@@ -947,14 +955,14 @@ mod tests {
         assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
         let jacobian = differentiate_at(input).jacobian_reverse(|value| value.sin()).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
         assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
-        let jacobian = differentiate_at((Array::scalar(2.0), Array::vector(vec![3.0, 4.0])))
+        let jacobian = differentiate_at((Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap()))
             .jacobian_reverse(|(scalar, vector)| Ok(scalar.clone() * vector + scalar))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -966,7 +974,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()))
+        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()).unwrap())
             .jacobian_reverse(|input| Ok(input.clone() + input))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -976,7 +984,7 @@ mod tests {
         assert!(block.value().storage_bytes().is_empty());
 
         // The holomorphic entry point transposes a complex-linear pushforward without conjugating it.
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
         let jacobian = differentiate_at(input).holomorphic().jacobian_reverse(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
@@ -987,7 +995,7 @@ mod tests {
     #[test]
     fn test_jacobian_with_auxiliary_outputs() {
         let forward_evaluations = Cell::new(0);
-        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
+        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
             .with_captures(())
             .with_auxiliary_output()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
@@ -1001,7 +1009,7 @@ mod tests {
         assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
         let reverse_evaluations = Cell::new(0);
-        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
+        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0).unwrap())
             .with_captures(())
             .with_auxiliary_output()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
@@ -1014,7 +1022,7 @@ mod tests {
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
-        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
+        let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0)).unwrap();
         let (jacobian, auxiliary) = differentiate_at(input.clone())
             .with_captures(())
             .with_auxiliary_output()
@@ -1054,7 +1062,7 @@ mod tests {
             DifferentiationError::EmptyInput,
         );
 
-        let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]);
+        let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]).unwrap();
         assert_eq!(
             context.differentiate_at(integer).jacobian_forward(|x| Ok(x)).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {
@@ -1065,7 +1073,7 @@ mod tests {
             },
         );
 
-        let complex = Array::scalar(ComplexNumber::new(2.0f32, 0.0));
+        let complex = Array::scalar(ComplexNumber::new(2.0f32, 0.0)).unwrap();
         assert_eq!(
             context.differentiate_at(complex).jacobian_forward(Ok).unwrap_err(),
             DifferentiationError::ComplexParameter {
@@ -1076,7 +1084,7 @@ mod tests {
             },
         );
         assert_eq!(
-            differentiate_at(Array::scalar(2.0))
+            differentiate_at(Array::scalar(2.0).unwrap())
                 .holomorphic()
                 .in_context(&context)
                 .jacobian_reverse(Ok)
@@ -1090,8 +1098,10 @@ mod tests {
         );
 
         let complex_output_error = context
-            .differentiate_at(Array::scalar(2.0))
-            .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)))?))
+            .differentiate_at(Array::scalar(2.0).unwrap())
+            .jacobian_reverse(|input| {
+                Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)).unwrap())?)
+            })
             .unwrap_err();
         assert_eq!(
             complex_output_error,
@@ -1119,7 +1129,7 @@ mod tests {
         );
         assert_eq!(
             context
-                .differentiate_at(Array::scalar(1.0))
+                .differentiate_at(Array::scalar(1.0).unwrap())
                 .jacobian_forward(|input| Ok(input
                     .context()
                     .lift(Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec()))?))
@@ -1136,7 +1146,7 @@ mod tests {
         assert_eq!(
             context
                 .differentiate_at(dynamic)
-                .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0))?))
+                .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0).unwrap())?))
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianReverse,
@@ -1157,7 +1167,7 @@ mod tests {
                     .jacobian_forward(|value| Ok(value.clone() * value))
                     .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
             },
-            Array::vector(vec![1.0, 2.0, 3.0]),
+            Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
@@ -1176,7 +1186,7 @@ mod tests {
                     .jacobian_reverse(|value| Ok(value.clone() * value))
                     .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
             },
-            Array::vector(vec![1.0, 2.0, 3.0]),
+            Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
@@ -1189,7 +1199,7 @@ mod tests {
     fn test_jacobian_forward_nested_in_jacobian_reverse() {
         // For f(x) = x², the forward Jacobian is f′(x) = 2x. Differentiating that materialized Jacobian with a
         // reverse Jacobian computes the second derivative f″(x) = 2.
-        let derivative = differentiate_at(Array::scalar(3.0))
+        let derivative = differentiate_at(Array::scalar(3.0).unwrap())
             .jacobian_reverse(|input| {
                 let context = input.context().clone();
                 let jacobian = context
@@ -1207,7 +1217,7 @@ mod tests {
         // This is the opposite nesting order from the one in `test_jacobian_forward_nested_in_jacobian_reverse`. The
         // reverse Jacobian materializes 2x, and the enclosing forward Jacobian differentiates that primitive-only basis
         // replay to obtain 2.
-        let derivative = differentiate_at(Array::scalar(3.0))
+        let derivative = differentiate_at(Array::scalar(3.0).unwrap())
             .jacobian_forward(|input| {
                 let context = input.context().clone();
                 let jacobian = context

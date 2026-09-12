@@ -1202,8 +1202,8 @@ where
 /// // Pad [1, 2, 3] with one leading zero, two trailing zeros, and one zero between adjacent elements. With
 /// // d = 3, low = 1, high = 2, and interior = 1, the output dimension is 1 + (3 - 1) * 2 + 1 + 2 = 8 and the
 /// // input elements land at output positions 1, 3, and 5.
-/// let x = Array::vector(vec![1.0, 2.0, 3.0]);
-/// let y = x.pad(&Array::scalar(0.0), &[1], &[2], &[1])?;
+/// let x = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+/// let y = x.pad(&Array::scalar(0.0).unwrap(), &[1], &[2], &[1])?;
 /// assert_eq!(y.to_f64s(), vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
 /// # Ok(())
 /// # }
@@ -1852,9 +1852,9 @@ mod tests {
 
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let output = operation
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input, Array::scalar(9.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input, Array::scalar(9.0).unwrap()])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
@@ -1863,13 +1863,16 @@ mod tests {
             &EagerContext::new(),
             &EmptyRegionDriver,
             &[
-                ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0])),
-                ArrayIrValue::Array(Array::scalar(9.0)),
+                ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(9.0).unwrap()),
                 ArrayIrValue::Dimension(output_extent),
             ],
         )
         .unwrap();
-        assert_eq!(output, vec![ArrayIrValue::Array(Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0,]))],);
+        assert_eq!(
+            output,
+            vec![ArrayIrValue::Array(Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0,]).unwrap())],
+        );
 
         // Empty input axes hold only the edge padding (the `d == 0` case skips interior padding entirely) and
         // rank-0 inputs pass through unchanged.
@@ -1878,9 +1881,12 @@ mod tests {
             empty_type.pad(&padding_value_type, &[1], &[2], &[1]),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         );
-        let empty = Array::from_f64s(empty_type, vec![]).pad(&Array::scalar(7.0), &[1], &[2], &[1]).unwrap();
+        let empty = Array::from_f64s(empty_type, vec![])
+            .unwrap()
+            .pad(&Array::scalar(7.0).unwrap(), &[1], &[2], &[1])
+            .unwrap();
         assert_eq!(empty.to_f64s(), vec![7.0, 7.0, 7.0]);
-        let scalar = Array::scalar(42.0).pad(&Array::scalar(7.0), &[], &[], &[]).unwrap();
+        let scalar = Array::scalar(42.0).unwrap().pad(&Array::scalar(7.0).unwrap(), &[], &[], &[]).unwrap();
         assert_eq!(scalar.to_f64s(), vec![42.0]);
 
         // Invalid construction and inputs report precise operation and interpreter errors.
@@ -1929,9 +1935,9 @@ mod tests {
         );
 
         // Check standard partial evaluation with known and residual operands.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        let padding_value = Array::scalar(9.0);
-        let expected = Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let padding_value = Array::scalar(9.0).unwrap();
+        let expected = Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
@@ -1976,54 +1982,54 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@replicated, Array::scalar(0.0)),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@replicated, Array::scalar(0.0).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         3,
                         vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@replicated, Array::scalar(0.0)),
+                        (@replicated, Array::vector(vec![1.0, 2.0]).unwrap()),
+                        (@replicated, Array::scalar(0.0).unwrap()),
                     ],
-                    outputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0]))],
+                    outputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0]).unwrap())],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         3,
                         vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                        (@replicated, Array::vector(vec![1.0, 2.0]).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         3,
                         vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 1), Array::matrix(
                         3,
                         2,
                         vec![8.0, 9.0, 1.0, 2.0, 3.0, 4.0],
-                    ))],
+                    ).unwrap())],
                 },
             ],
         );
@@ -2034,10 +2040,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0]), Array::scalar(9.0)],
-                tangents = [Array::vector(vec![0.1, 0.2, 0.3]), Array::scalar(0.5)],
-                primal_outputs = [Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0])],
-                tangent_outputs = [Array::vector(vec![0.5, 0.1, 0.5, 0.2, 0.5, 0.3, 0.5, 0.5])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Array::scalar(9.0).unwrap()],
+                tangents = [Array::vector(vec![0.1, 0.2, 0.3]).unwrap(), Array::scalar(0.5).unwrap()],
+                primal_outputs = [Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![0.5, 0.1, 0.5, 0.2, 0.5, 0.3, 0.5, 0.5]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -2049,24 +2055,24 @@ mod tests {
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
                         (@linear(type = ArrayType::scalar(DataType::F64))),
                     ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
-                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]), Array::scalar(24.0)],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
+                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]).unwrap(), Array::scalar(24.0).unwrap()],
                 },
                 {
                     inputs = [
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
-                        (@known, Array::scalar(9.0)),
+                        (@known, Array::scalar(9.0).unwrap()),
                     ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
-                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0])],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
+                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]).unwrap()],
                 },
                 {
                     inputs = [
-                        (@known, Array::vector(vec![1.0, 2.0, 3.0])),
+                        (@known, Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
                         (@linear(type = ArrayType::scalar(DataType::F64))),
                     ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
-                    input_cotangents = [Array::scalar(24.0)],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
+                    input_cotangents = [Array::scalar(24.0).unwrap()],
                 },
             ],
         );
@@ -2081,16 +2087,16 @@ mod tests {
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                         (@linear(type = ArrayType::scalar(DataType::F64))),
                     ],
-                    output_cotangents = [Array::vector(vec![5.0, f64::INFINITY, 7.0])],
-                    input_cotangents = [Array::vector(vec![f64::INFINITY, 7.0]), Array::scalar(5.0)],
+                    output_cotangents = [Array::vector(vec![5.0, f64::INFINITY, 7.0]).unwrap()],
+                    input_cotangents = [Array::vector(vec![f64::INFINITY, 7.0]).unwrap(), Array::scalar(5.0).unwrap()],
                 },
                 {
                     inputs = [
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                         (@linear(type = ArrayType::scalar(DataType::F64))),
                     ],
-                    output_cotangents = [Array::vector(vec![3.0, 1e20, -1e20])],
-                    input_cotangents = [Array::vector(vec![1e20, -1e20]), Array::scalar(3.0)],
+                    output_cotangents = [Array::vector(vec![3.0, 1e20, -1e20]).unwrap()],
+                    input_cotangents = [Array::vector(vec![1e20, -1e20]).unwrap(), Array::scalar(3.0).unwrap()],
                 },
             ],
         );
@@ -2102,8 +2108,8 @@ mod tests {
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::vector(vec![2.0, 3.0, 5.0])],
-                input_cotangents = [Array::vector(vec![0.0, 2.0, 3.0]), Array::scalar(5.0)],
+                output_cotangents = [Array::vector(vec![2.0, 3.0, 5.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![0.0, 2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -2114,8 +2120,8 @@ mod tests {
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
-                input_cotangents = [Array::vector(Vec::<f64>::new()), Array::scalar(6.0)],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                input_cotangents = [Array::vector(Vec::<f64>::new()).unwrap(), Array::scalar(6.0).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -2126,8 +2132,8 @@ mod tests {
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::scalar(f64::INFINITY)],
-                input_cotangents = [Array::scalar(f64::INFINITY), Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(f64::INFINITY).unwrap()],
+                input_cotangents = [Array::scalar(f64::INFINITY).unwrap(), Array::scalar(0.0).unwrap()],
             }],
         );
 
@@ -2172,10 +2178,10 @@ mod tests {
             cases = [{
                 inputs = [
                     (@linear(type = crop_input_type.clone())),
-                    (@known, Array::from_f64s(crop_padding_type, vec![9.0])),
+                    (@known, Array::from_f64s(crop_padding_type, vec![9.0]).unwrap()),
                 ],
-                output_cotangents = [Array::from_f64s(crop_output_type, vec![2.0, 3.0])],
-                input_cotangents = [Array::from_f64s(crop_input_type, vec![0.0, 2.0, 3.0])],
+                output_cotangents = [Array::from_f64s(crop_output_type, vec![2.0, 3.0]).unwrap()],
+                input_cotangents = [Array::from_f64s(crop_input_type, vec![0.0, 2.0, 3.0]).unwrap()],
             }],
         );
 
@@ -2197,10 +2203,10 @@ mod tests {
                 output_cotangents = [Array::from_f64s(
                     output_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                )],
+                ).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![2.0, 4.0, 6.0]),
-                    Array::from_f64s(padding_type, vec![24.0]),
+                    Array::from_f64s(input_type, vec![2.0, 4.0, 6.0]).unwrap(),
+                    Array::from_f64s(padding_type, vec![24.0]).unwrap(),
                 ],
             }],
         );
@@ -2210,8 +2216,8 @@ mod tests {
     fn test_array_pad() {
         // A rank-2 pad exercises the odometer across axes with different padding amounts: rows gain one interior
         // row and columns gain asymmetric edge padding.
-        let input = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        let output = input.pad(&Array::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
+        let input = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let output = input.pad(&Array::scalar(0.0).unwrap(), &[0, 1], &[1, 0], &[1, 0]).unwrap();
         assert_eq!(
             *output.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
@@ -2222,21 +2228,30 @@ mod tests {
         // dilation, and must not be elided merely because the output shape happens to equal the input shape.
         assert_eq!(
             Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])
-                .pad(&Array::scalar(0.0), &[-1], &[-2], &[0])
+                .unwrap()
+                .pad(&Array::scalar(0.0).unwrap(), &[-1], &[-2], &[0])
                 .unwrap()
                 .to_f64s(),
             vec![2.0, 3.0],
         );
         assert_eq!(
-            Array::vector(vec![1.0, 2.0, 3.0]).pad(&Array::scalar(9.0), &[-1], &[1], &[1]).unwrap().to_f64s(),
+            Array::vector(vec![1.0, 2.0, 3.0])
+                .unwrap()
+                .pad(&Array::scalar(9.0).unwrap(), &[-1], &[1], &[1])
+                .unwrap()
+                .to_f64s(),
             vec![9.0, 2.0, 9.0, 3.0, 9.0],
         );
         assert_eq!(
-            Array::vector(vec![1.0, 2.0, 3.0]).pad(&Array::scalar(9.0), &[-1], &[1], &[0]).unwrap().to_f64s(),
+            Array::vector(vec![1.0, 2.0, 3.0])
+                .unwrap()
+                .pad(&Array::scalar(9.0).unwrap(), &[-1], &[1], &[0])
+                .unwrap()
+                .to_f64s(),
             vec![2.0, 3.0, 9.0],
         );
         assert_eq!(
-            Array::vector(vec![1.0]).pad(&Array::scalar(0.0), &[-2], &[0], &[0]),
+            Array::vector(vec![1.0]).unwrap().pad(&Array::scalar(0.0).unwrap(), &[-2], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid("`pad` output size is negative (-1) on axis 0".to_string()))),
         );
 
@@ -2244,14 +2259,14 @@ mod tests {
         // the complete type and avoid overflowing `interior + 1` for a value that can never be used as a stride.
         let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![7])));
-        let singleton = Array::from_f64s(singleton_type.clone(), vec![3.0]);
-        let identity = singleton.pad(&Array::scalar(0.0), &[0], &[0], &[usize::MAX]).unwrap();
+        let singleton = Array::from_f64s(singleton_type.clone(), vec![3.0]).unwrap();
+        let identity = singleton.pad(&Array::scalar(0.0).unwrap(), &[0], &[0], &[usize::MAX]).unwrap();
         assert_eq!(*identity.r#type(), singleton_type);
         assert_eq!(identity.to_f64s(), vec![3.0]);
 
         // The kernel validates the padding value shape eagerly.
         assert_eq!(
-            Array::vector(vec![1.0, 2.0]).pad(&Array::vector(vec![0.0]), &[0], &[0], &[0]),
+            Array::vector(vec![1.0, 2.0]).unwrap().pad(&Array::vector(vec![0.0]).unwrap(), &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`pad` padding value must be a scalar but has type f64[1]".to_string()
             ))),
@@ -2354,7 +2369,8 @@ mod tests {
                     .with_sharding(physical_sharding)
                     .unwrap();
             let input =
-                ArrayBatch::new(Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
+                    .unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2363,7 +2379,8 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let padding = ArrayBatch::new(Array::from_f64s(padding_type, vec![8.0, 9.0]), BatchAxis::new(0)).unwrap();
+            let padding =
+                ArrayBatch::new(Array::from_f64s(padding_type, vec![8.0, 9.0]).unwrap(), BatchAxis::new(0)).unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -2395,7 +2412,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]))
                     .with_sharding(physical_sharding.clone())
                     .unwrap();
-            let input = ArrayBatch::new(Array::from_f64s(input_type, Vec::new()), BatchAxis::new(0)).unwrap();
+            let input = ArrayBatch::new(Array::from_f64s(input_type, Vec::new()).unwrap(), BatchAxis::new(0)).unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2404,7 +2421,8 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let padding = ArrayBatch::new(Array::from_f64s(padding_type, Vec::new()), BatchAxis::new(0)).unwrap();
+            let padding =
+                ArrayBatch::new(Array::from_f64s(padding_type, Vec::new()).unwrap(), BatchAxis::new(0)).unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 0)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -2438,17 +2456,20 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     ArrayIrBatch::new(
-                        ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                        ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()),
                         BatchAxis::new(0),
                     )?,
-                    ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![8.0_f32, 9.0])), BatchAxis::new(0))?,
+                    ArrayIrBatch::new(
+                        ArrayIrValue::Array(Array::vector(vec![8.0_f32, 9.0]).unwrap()),
+                        BatchAxis::new(0)
+                    )?,
                     ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3)?)),
                 ],
             )?
             .into_parts()
             .0,
             vec![ArrayIrBatch::new(
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![8.0_f32, 1.0, 2.0, 9.0, 3.0, 4.0])),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![8.0_f32, 1.0, 2.0, 9.0, 3.0, 4.0]).unwrap()),
                 BatchAxis::new(0),
             )?],
         );
@@ -2505,15 +2526,15 @@ mod tests {
 
     #[test]
     fn test_array_pad_layouts() {
-        let vector = Array::vector(vec![1.0, 2.0]);
-        let padded = vector.pad(&Array::scalar(0.5), &[1], &[2], &[1]).unwrap();
-        assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]));
+        let vector = Array::vector(vec![1.0, 2.0]).unwrap();
+        let padded = vector.pad(&Array::scalar(0.5).unwrap(), &[1], &[2], &[1]).unwrap();
+        assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]).unwrap());
 
         // Padding copies both the reversed input layout and the rank-zero padding element by their exact bytes.
         let input_type =
             ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let vector = Array::from_elements(input_type, &[1u16, 2]).unwrap();
-        let padded = vector.pad(&Array::scalar(9u16), &[1], &[1], &[1]).unwrap();
+        let padded = vector.pad(&Array::scalar(9u16).unwrap(), &[1], &[1], &[1]).unwrap();
         assert_eq!(padded.r#type().into_owned(), ArrayType::new_static(DataType::U16, [5]));
         assert_eq!(padded.elements::<u16>(), Ok(vec![9, 1, 9, 2, 9]));
         assert_eq!(padded.storage_bytes(), [9, 0, 1, 0, 9, 0, 2, 0, 9, 0]);

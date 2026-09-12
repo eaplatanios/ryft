@@ -1490,7 +1490,8 @@ mod tests {
     fn test_untiled_collectives_over_batched_axis_materialize_rank_changes() {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
-        let mapped_matrix = || ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]), Some(0)).unwrap();
+        let mapped_matrix =
+            || ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Some(0)).unwrap();
 
         let gathered = AllGatherOperation::new(
             "x".to_string(),
@@ -1504,7 +1505,7 @@ mod tests {
         .into_parts()
         .0;
         assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
+        assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
 
         let scattered = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
             .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
@@ -1512,7 +1513,7 @@ mod tests {
             .into_parts()
             .0;
         assert_eq!(scattered[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(scattered[0].value(), &Array::vector(vec![4.0_f32, 6.0]));
+        assert_eq!(scattered[0].value(), &Array::vector(vec![4.0_f32, 6.0]).unwrap());
         assert_eq!(scattered[0].unbatched_type(), ArrayType::scalar(DataType::F32));
 
         let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
@@ -1521,7 +1522,7 @@ mod tests {
             .into_parts()
             .0;
         assert_eq!(exchanged[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
+        assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
     }
 
     #[test]

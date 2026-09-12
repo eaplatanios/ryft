@@ -920,7 +920,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
-        let three = builder.add_constant(Array::scalar(3.0));
+        let three = builder.add_constant(Array::scalar(3.0).unwrap());
         let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual], None).unwrap()[0];
         let gradient =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent], None).unwrap()[0];
@@ -965,7 +965,7 @@ mod tests {
         let identity = array_ir_identity_program(&scalar_type);
         let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let cotangent = backward.add_input(scalar_type.clone());
-        let three = backward.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f32)));
+        let three = backward.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()));
         let scaled = backward
             .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![three, cotangent], None)
             .unwrap()[0];
@@ -1002,15 +1002,15 @@ mod tests {
             .unwrap();
         assert_eq!(program.instructions()[0].regions().len(), 3);
         assert!(!program.entry_region_ref().contains_references_in_closure());
-        let input = ArrayIrValue::Array(Array::scalar(5.0_f32));
+        let input = ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap());
         assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![input.clone()]));
         let linearization = program.linearize().unwrap();
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
-        let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0_f32))];
+        let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap())];
         cotangents.extend(primal_outputs.split_off(1));
         assert_eq!(
             linearization.pullback().unwrap().interpret(cotangents),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))])
+            Ok(vec![ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap())])
         );
     }
 
@@ -1188,7 +1188,7 @@ mod tests {
         // Interpretation replays the lean primal region only, so an un-differentiated call produces just the primal
         // output and never pays for the forward region's residual computation.
         let outputs = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .bind(operation, operation_regions, &[Array::scalar(2.0)])
+            .bind(operation, operation_regions, &[Array::scalar(2.0).unwrap()])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
@@ -1222,7 +1222,7 @@ mod tests {
         // The reverse-mode analogue of the custom-JVP batching test: the (deliberately tripled) custom backward rule
         // governs the gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::vector(vec![0.5, 1.0]))
+            .differentiate_at(Array::vector(vec![0.5, 1.0]).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn test_custom_vjp_governs_reverse_mode() {
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
                 x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
@@ -1274,8 +1274,8 @@ mod tests {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
             },
-            Array::scalar(2.0),
-            Array::scalar(1.0),
+            Array::scalar(2.0).unwrap(),
+            Array::scalar(1.0).unwrap(),
             (),
         );
         assert!(matches!(
@@ -1409,8 +1409,8 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let context = ArrayIrContext::new();
         let input = DifferentiationDual::new(
-            ArrayIrValue::Array(Array::scalar(1.0_f32)),
-            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()),
         )
         .unwrap();
 
@@ -1454,13 +1454,13 @@ mod tests {
             },
         );
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let ((sine, cosine), pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.5), ()).unwrap();
+        let ((sine, cosine), pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.5).unwrap(), ()).unwrap();
         assert_abs_diff_eq!(sine.to_f64s()[0], 0.5f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(cosine.to_f64s()[0], 0.5f64.cos(), epsilon = 1e-9);
 
-        let first_cotangent = pullback.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap();
+        let first_cotangent = pullback.apply((Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap())).unwrap();
         assert_abs_diff_eq!(first_cotangent.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
-        let second_cotangent = pullback.apply((Array::scalar(0.0), Array::scalar(1.0))).unwrap();
+        let second_cotangent = pullback.apply((Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap())).unwrap();
         assert_abs_diff_eq!(second_cotangent.to_f64s()[0], 3.0 * 0.5f64.sin(), epsilon = 1e-9);
     }
 
@@ -1477,9 +1477,9 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         );
-        let (_, pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.7), ()).unwrap();
+        let (_, pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.7).unwrap(), ()).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
-        let mut pullback_inputs = vec![Array::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0).unwrap()];
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret(pullback_inputs).unwrap();
         assert_abs_diff_eq!(input_cotangents[0].to_f64s()[0], 0.7f64.cos(), epsilon = 1e-9);
@@ -1491,7 +1491,7 @@ mod tests {
         // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal
         // matrix `diag(3 * cos(x))`.
         let vector = test_type(&[2]);
-        let jacobian = differentiate_at(Array::from_f64s(vector, vec![0.5, 1.0]))
+        let jacobian = differentiate_at(Array::from_f64s(vector, vec![0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
@@ -1517,7 +1517,7 @@ mod tests {
             },
         );
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
@@ -1546,37 +1546,40 @@ mod tests {
             },
         )
         .with_non_differentiated_count(1);
-        let stash = ArrayReference::new(Array::scalar(0.0_f32));
+        let stash = ArrayReference::new(Array::scalar(0.0_f32).unwrap());
         let (value, pullback) = ArrayIrContext::new()
-            .differentiate_at((ArrayIrValue::Reference(stash.clone()), ArrayIrValue::Array(Array::scalar(0.5_f32))))
+            .differentiate_at((
+                ArrayIrValue::Reference(stash.clone()),
+                ArrayIrValue::Array(Array::scalar(0.5_f32).unwrap()),
+            ))
             .vjp(|(stash, x)| function.call((stash, x)))
             .unwrap();
         let ArrayIrValue::Array(value) = value else { panic!("expected an array output") };
         assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin(), epsilon = 1e-6);
         // Linearization replays only the forward rule, which does not touch the stash.
-        assert_eq!(stash.read(), Ok(Array::scalar(0.0_f32)));
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0_f32).unwrap()));
 
         // The stash is a plumbing input, so its own cotangent is ignored, while applying the pullback replays the
         // backward rule: `x̄` is the custom gradient and the stash now holds the cotangent that was pulled back.
         let (stash_cotangent, x_cotangent) = pullback
             .apply_with_destinations(
-                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(2.0_f32))),
+                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             )
             .unwrap();
         assert_eq!(stash_cotangent, None);
         let Some(ArrayIrValue::Array(x_cotangent)) = x_cotangent else { panic!("expected an array cotangent") };
         assert_abs_diff_eq!(x_cotangent.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-6);
-        assert_eq!(stash.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(stash.read(), Ok(Array::scalar(2.0_f32).unwrap()));
 
         // Every application writes the stash anew.
         pullback
             .apply_with_destinations(
-                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(3.0_f32))),
+                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
             )
             .unwrap();
-        assert_eq!(stash.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(stash.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
@@ -1676,7 +1679,7 @@ mod tests {
             },
         );
         let (value, (gradient_x, gradient_y)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(2.0), Array::scalar(5.0)))
+            .differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()))
             .value_and_gradient(|(x, y)| function.call((x, y)).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 10.0, epsilon = 1e-9);
@@ -1696,7 +1699,7 @@ mod tests {
             |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(cotangent.clone() + cotangent),
         );
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
@@ -1721,7 +1724,7 @@ mod tests {
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |(x, y)| function.call((x, y)),
-                (Array::vector(vec![2.0, 3.0, 4.0]), Array::scalar(5.0)),
+                (Array::vector(vec![2.0, 3.0, 4.0]).unwrap(), Array::scalar(5.0).unwrap()),
                 (BatchAxis::new(0), BatchAxis::replicated()),
                 BatchAxis::new(0),
                 None,
@@ -1791,8 +1794,10 @@ mod tests {
             "the cotangent of the replicated input must be summed across the mapped axis",
         );
         assert_eq!(
-            batched.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::scalar(5.0)]).unwrap(),
-            vec![Array::vector(vec![10.0, 15.0])],
+            batched
+                .interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()])
+                .unwrap(),
+            vec![Array::vector(vec![10.0, 15.0]).unwrap()],
         );
     }
 

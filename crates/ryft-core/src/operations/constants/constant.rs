@@ -249,10 +249,10 @@ mod tests {
     #[test]
     fn test_constant() {
         // Verify the operation's literal value, identity, and rendering.
-        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
         assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
-        assert_eq!(operation.value(), &Array::scalar(3.5));
+        assert_eq!(operation.value(), &Array::scalar(3.5).unwrap());
 
         // Verify the operation's textual form when it appears in a program.
         let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
@@ -271,13 +271,13 @@ mod tests {
 
     #[test]
     fn test_constant_type_inference() {
-        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
     }
 
     #[test]
     fn test_constant_interpretation() {
-        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
         // Eager interpretation returns the literal value unchanged.
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -286,7 +286,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
             ),
-            Ok(vec![Array::scalar(3.5)]),
+            Ok(vec![Array::scalar(3.5).unwrap()]),
         );
 
         // Staged interpretation records the payload as a constant atom without emitting an instruction.
@@ -303,16 +303,16 @@ mod tests {
         assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
         let staged_builder = context.builder().borrow();
         assert!(staged_builder.instructions().is_empty());
-        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5)));
+        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5).unwrap()));
     }
 
     #[test]
     fn test_constant_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = ConstantOperation::new(Array::scalar(3.5)),
+            operation = ConstantOperation::new(Array::scalar(3.5).unwrap()),
             cases = [{
                 inputs = [],
-                outputs = [(@known, Array::scalar(3.5))],
+                outputs = [(@known, Array::scalar(3.5).unwrap())],
                 residual_instructions = 0,
             }],
         );
@@ -322,11 +322,11 @@ mod tests {
     fn test_constant_batching() {
         check_operation_batching!(
             @exact,
-            operation = ConstantOperation::new(Array::scalar(3.5)),
+            operation = ConstantOperation::new(Array::scalar(3.5).unwrap()),
             axis_size = 2,
             cases = [{
                 inputs = [],
-                outputs = [(@replicated, Array::scalar(3.5))],
+                outputs = [(@replicated, Array::scalar(3.5).unwrap())],
             }],
         );
     }
@@ -334,8 +334,8 @@ mod tests {
     #[test]
     fn test_constant_differentiation() {
         let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output = context.constant(Array::scalar(3.5)).unwrap();
-        assert_eq!(output.primal(), &Array::scalar(3.5));
+        let output = context.constant(Array::scalar(3.5).unwrap()).unwrap();
+        assert_eq!(output.primal(), &Array::scalar(3.5).unwrap());
         assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
     }
 
@@ -343,7 +343,7 @@ mod tests {
     fn test_constant_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
-        let input_cotangents = ConstantOperation::new(Array::scalar(3.5))
+        let input_cotangents = ConstantOperation::new(Array::scalar(3.5).unwrap())
             .transpose(
                 &mut TranspositionContext::new(context),
                 &EmptyRegionDriver,

@@ -458,8 +458,8 @@ where
     fn from(operation: ArrayIrOperation<Constant::Projected>) -> Self {
         match operation {
             ArrayIrOperation::Zero(operation) => Self::Zero(operation),
-            ArrayIrOperation::DynamicOne(operation) => Self::DynamicOne(operation),
-            ArrayIrOperation::DynamicIota(operation) => Self::DynamicIota(operation),
+            ArrayIrOperation::One(operation) => Self::DynamicOne(operation),
+            ArrayIrOperation::Iota(operation) => Self::DynamicIota(operation),
             ArrayIrOperation::Array(operation) => Self::Array(operation),
             ArrayIrOperation::Dimension(operation) => Self::Dimension(operation),
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
@@ -722,8 +722,8 @@ where
     pub(crate) fn to_core_operation(&self) -> Option<ArrayIrOperation<Constant::Projected>> {
         Some(match self {
             Self::Zero(operation) => ArrayIrOperation::Zero(operation.clone()),
-            Self::DynamicOne(operation) => ArrayIrOperation::DynamicOne(operation.clone()),
-            Self::DynamicIota(operation) => ArrayIrOperation::DynamicIota(operation.clone()),
+            Self::DynamicOne(operation) => ArrayIrOperation::One(operation.clone()),
+            Self::DynamicIota(operation) => ArrayIrOperation::Iota(operation.clone()),
             Self::Array(operation) => ArrayIrOperation::Array(operation.clone()),
             Self::Dimension(operation) => ArrayIrOperation::Dimension(operation.clone()),
             Self::Compare(operation) => ArrayIrOperation::Compare(operation.clone()),

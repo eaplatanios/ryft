@@ -873,8 +873,8 @@ where
 /// # use ryft_core::programs::ProgramError;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let left = Array::matrix(2, 1, vec![1.0, 2.0]);
-/// let right = Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0]);
+/// let left = Array::matrix(2, 1, vec![1.0, 2.0]).unwrap();
+/// let right = Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let output = left.concatenate_with([&right], -1)?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 3.0, 4.0, 2.0, 5.0, 6.0]);
 /// # Ok(())
@@ -1543,8 +1543,8 @@ mod tests {
 
         // Interpretation joins the row-major payloads along axis 0, while the sole-input fast path returns its input
         // without inspecting the axis.
-        let first = Array::matrix(1, 2, vec![1.0, 2.0]);
-        let second = Array::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let first = Array::matrix(1, 2, vec![1.0, 2.0]).unwrap();
+        let second = Array::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let output = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first.clone(), second.clone()])
             .unwrap();
@@ -1578,9 +1578,9 @@ mod tests {
         );
 
         // Check standard partial evaluation with known and residual operands.
-        let first = Array::vector(vec![1.0, 2.0]);
-        let second = Array::vector(vec![3.0, 4.0, 5.0]);
-        let expected = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let first = Array::vector(vec![1.0, 2.0]).unwrap();
+        let second = Array::vector(vec![3.0, 4.0, 5.0]).unwrap();
+        let expected = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = ConcatenateOperation::new(0, 1).unwrap(),
@@ -1617,54 +1617,54 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         4,
                         vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@replicated, Array::vector(vec![8.0, 9.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@replicated, Array::vector(vec![8.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         4,
                         vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@replicated, Array::vector(vec![3.0])),
+                        (@replicated, Array::vector(vec![1.0, 2.0]).unwrap()),
+                        (@replicated, Array::vector(vec![3.0]).unwrap()),
                     ],
-                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 6.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 6.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         3,
                         vec![0.0, 1.0, 4.0, 2.0, 3.0, 6.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 5.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 5.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 1), Array::matrix(
                         3,
                         2,
                         vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-                    ))],
+                    ).unwrap())],
                 },
             ],
         );
@@ -1674,10 +1674,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = ConcatenateOperation::new(0, 1).unwrap(),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
-                tangents = [Array::vector(vec![0.5, 1.0]), Array::vector(vec![1.5, 2.0, 2.5])],
-                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
-                tangent_outputs = [Array::vector(vec![0.5, 1.0, 1.5, 2.0, 2.5])],
+                primals = [Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![0.5, 1.0]).unwrap(), Array::vector(vec![1.5, 2.0, 2.5]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![0.5, 1.0, 1.5, 2.0, 2.5]).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[2], %1:f64[3], %2:f64[2], %3:f64[3] .
                     let %4:f64[5] = concatenate [axis=0] %0 %1
@@ -1705,8 +1705,8 @@ mod tests {
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
                     ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
-                    input_cotangents = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                    input_cotangents = [Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[5] .
                         let %1:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
@@ -1722,10 +1722,10 @@ mod tests {
                     output_cotangents = [Array::from_f64s(
                         placed_output_type,
                         vec![1.0, 2.0, 3.0, 4.0, 5.0],
-                    )],
+                    ).unwrap()],
                     input_cotangents = [
-                        Array::from_f64s(placed_left_type, vec![1.0, 2.0]),
-                        Array::from_f64s(placed_right_type, vec![3.0, 4.0, 5.0]),
+                        Array::from_f64s(placed_left_type, vec![1.0, 2.0]).unwrap(),
+                        Array::from_f64s(placed_right_type, vec![3.0, 4.0, 5.0]).unwrap(),
                     ],
                 },
                 {
@@ -1733,13 +1733,13 @@ mod tests {
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
                         (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                     ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0])],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0]).unwrap()],
                     input_cotangents = [
                         Array::from_f64s(
                             ArrayType::new(DataType::F64, Shape::new(vec![0.into()])),
                             Vec::new(),
-                        ),
-                        Array::vector(vec![1.0, 2.0]),
+                        ).unwrap(),
+                        Array::vector(vec![1.0, 2.0]).unwrap(),
                     ],
                 },
             ],
@@ -1753,10 +1753,10 @@ mod tests {
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into()])))),
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into()])))),
                 ],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
                 input_cotangents = [
-                    Array::matrix(2, 1, vec![1.0, 4.0]),
-                    Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]),
+                    Array::matrix(2, 1, vec![1.0, 4.0]).unwrap(),
+                    Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
                 ],
             }],
         );
@@ -1970,13 +1970,13 @@ mod tests {
                         (@mapped(axis = 0), Array::from_f64s(
                             physical_type,
                             vec![1.0, 2.0, 3.0, 4.0],
-                        )),
-                        (@replicated, Array::from_f64s(replicated_type, vec![5.0])),
+                        ).unwrap()),
+                        (@replicated, Array::from_f64s(replicated_type, vec![5.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::from_f64s(
                         expected_type,
                         vec![1.0, 2.0, 5.0, 3.0, 4.0, 5.0],
-                    ))],
+                    ).unwrap())],
                 }],
             );
         }
@@ -2010,12 +2010,12 @@ mod tests {
                     &RecursiveBatchingDriver::new(&EmptyRegionDriver),
                     &[
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0])),
+                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap()),
                             BatchAxis::new(1),
                         )
                         .unwrap(),
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 1, vec![5.0_f32, 6.0])),
+                            ArrayIrValue::Array(Array::matrix(2, 1, vec![5.0_f32, 6.0]).unwrap()),
                             BatchAxis::new(0)
                         )
                         .unwrap(),
@@ -2027,7 +2027,7 @@ mod tests {
                 .0,
             vec![
                 ArrayIrBatch::new(
-                    ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0])),
+                    ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0]).unwrap()),
                     BatchAxis::new(1),
                 )
                 .unwrap()
@@ -2040,11 +2040,11 @@ mod tests {
                     &RecursiveBatchingDriver::new(&EmptyRegionDriver),
                     &[
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()),
                             BatchAxis::new(0),
                         )
                         .unwrap(),
-                        ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![5.0_f32]))),
+                        ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![5.0_f32]).unwrap())),
                         ArrayIrBatch::replicated(extent),
                     ],
                 )
@@ -2053,7 +2053,7 @@ mod tests {
                 .0,
             vec![
                 ArrayIrBatch::new(
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0])),
+                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0]).unwrap()),
                     BatchAxis::new(0),
                 )
                 .unwrap()
@@ -2219,18 +2219,24 @@ mod tests {
     fn test_array_concatenate() {
         // Three operands joined along axis 0 preserve their order.
         let concatenated = Array::concatenate(
-            [&Array::vector(vec![1.0]), &Array::vector(vec![2.0, 3.0]), &Array::vector(vec![4.0])],
+            [
+                &Array::vector(vec![1.0]).unwrap(),
+                &Array::vector(vec![2.0, 3.0]).unwrap(),
+                &Array::vector(vec![4.0]).unwrap(),
+            ],
             0,
         )
         .unwrap();
-        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap());
 
         // A rank-3 middle-axis concatenation exercises the row-major block odometer.
-        let first = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let first =
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let second = Array::from_f64s(
             ArrayType::new_static(DataType::F64, [2, 2, 2]),
             vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-        );
+        )
+        .unwrap();
         let concatenated = Array::concatenate([&first, &second], 1).unwrap();
         assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3, 2]));
         assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);

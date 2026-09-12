@@ -731,7 +731,7 @@ mod tests {
         let parent =
             TracingContext::<CaptureReference<ArrayIrType>, ArrayIrOperation<Array>, ArrayIrValue<Array>>::new();
         let array_context = ProjectedContext::<_, ArrayType>::new(parent.clone());
-        let array = Array::scalar(3.0_f32);
+        let array = Array::scalar(3.0_f32).unwrap();
         let array_reference = array_context.capture(array.clone()).unwrap();
         assert_eq!(array_reference.index(), 0);
         assert_eq!(array_reference.r#type(), array.r#type());
@@ -759,7 +759,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            ClosedProgram::new(program, vec![Array::scalar(3.0)]),
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap()]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "captured constant atom %0 references missing capture #1",
         ));
@@ -775,7 +775,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            ClosedProgram::new(program, vec![Array::scalar(3.0)]),
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap()]),
             Err(ProgramError::MalformedProgram(message))
                 if message
                     == "captured constant atom %0 references capture #0 with type f64[], but the atom has type i64[]",
@@ -794,9 +794,10 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(99.0)]).unwrap();
+        let program =
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap(), Array::scalar(99.0).unwrap()]).unwrap();
         let pruned = program.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(99.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(99.0).unwrap()]);
         let capture_indices = pruned
             .program()
             .atoms()
@@ -824,14 +825,14 @@ mod tests {
         let output = pruned
             .program()
             .interpret_with(
-                vec![Array::scalar(2.0)],
+                vec![Array::scalar(2.0).unwrap()],
                 |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()].clone()),
                 |instruction, inputs| {
                     instruction.operation().interpret(&TestArrayContext::new(), &EmptyRegionDriver, inputs)
                 },
             )
             .unwrap();
-        assert_eq!(output, vec![Array::scalar(101.0)]);
+        assert_eq!(output, vec![Array::scalar(101.0).unwrap()]);
     }
 
     #[test]
@@ -859,7 +860,7 @@ mod tests {
                     vec![Placeholder],
                 )
                 .unwrap();
-            ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(99.0)]).unwrap()
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap(), Array::scalar(99.0).unwrap()]).unwrap()
         }
 
         // Dropping an unused trailing capture shifts no surviving capture, so no constant atom is rewritten and every
@@ -867,7 +868,7 @@ mod tests {
         let closed = closed_program(0);
         let retained = closed.program().entry_region_ref().retained_identity_transform();
         let pruned = closed.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(3.0).unwrap()]);
         let artifact = pruned.program().entry_region_ref().retained_identity_transform();
         assert!(Arc::ptr_eq(&artifact, &retained));
 
@@ -876,7 +877,7 @@ mod tests {
         let closed = closed_program(1);
         let retained = closed.program().entry_region_ref().retained_identity_transform();
         let pruned = closed.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(99.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(99.0).unwrap()]);
         let artifact = pruned.program().entry_region_ref().retained_identity_transform();
         assert!(!Arc::ptr_eq(&artifact, &retained));
     }
@@ -926,8 +927,11 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let closed =
-            ClosedProgram::new(program, vec![Array::scalar(1.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        let closed = ClosedProgram::new(
+            program,
+            vec![Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+        )
+        .unwrap();
         let unchanged_retained = closed.program().region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
         let renumbered_retained = closed.program().region_ref(RegionId::new(1)).unwrap().retained_identity_transform();
         let entry_retained = closed.program().entry_region_ref().retained_identity_transform();
@@ -935,7 +939,7 @@ mod tests {
         // The untouched sibling keeps both its reference and its retained transform, while the rewritten sibling and
         // the entry region that attaches it discard theirs.
         let pruned = closed.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(1.0), Array::scalar(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(1.0).unwrap(), Array::scalar(3.0).unwrap()]);
         assert_eq!(pruned.program().regions()[0].atoms()[0].as_constant().map(CaptureReference::index), Some(0));
         assert_eq!(pruned.program().regions()[1].atoms()[0].as_constant().map(CaptureReference::index), Some(1));
         let unchanged = pruned.program().region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
@@ -978,10 +982,13 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let program =
-            ClosedProgram::new(program, vec![Array::scalar(1.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        let program = ClosedProgram::new(
+            program,
+            vec![Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+        )
+        .unwrap();
         let pruned = program.without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(2.0), Array::scalar(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]);
         let nested_indices = pruned.program().regions()[0]
             .atoms()
             .iter()
@@ -1013,7 +1020,8 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(7.0)]).unwrap();
+        let program =
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap(), Array::scalar(7.0).unwrap()]).unwrap();
 
         // Captures become leading inputs in capture-table order (one per capture, dead ones included), followed by
         // the original program input, and no captured-constant atoms remain. The shared constant atom maps to a
@@ -1039,14 +1047,14 @@ mod tests {
         // The lifted program interprets with arguments supplied in `[captures..., public inputs...]` order.
         let output = lifted
             .interpret_with::<Array, ProgramError, _, _>(
-                vec![Array::scalar(3.0), Array::scalar(7.0), Array::scalar(2.0)],
+                vec![Array::scalar(3.0).unwrap(), Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
                 |_, _| unreachable!("the lifted program contains no captured-constant atoms"),
                 |instruction, inputs| {
                     instruction.operation().interpret(&TestArrayContext::new(), &EmptyRegionDriver, inputs)
                 },
             )
             .unwrap();
-        assert_eq!(output, vec![Array::scalar(8.0)]);
+        assert_eq!(output, vec![Array::scalar(8.0).unwrap()]);
     }
 
     #[test]
@@ -1135,7 +1143,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestConstant, TestArrayOperation>::new();
         let input = builder.add_input(scalar_type.clone());
         let capture = builder.add_constant(TestConstant::Captured(CaptureReference::new(1, scalar_type.clone())));
-        let immediate = builder.add_constant(TestConstant::Immediate(Array::scalar(5.0)));
+        let immediate = builder.add_constant(TestConstant::Immediate(Array::scalar(5.0).unwrap()));
         let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, immediate], None).unwrap()[0];
         let program = builder
@@ -1143,18 +1151,19 @@ mod tests {
             .unwrap();
 
         // Construction validates only the capture-referencing constant, so an immediate never has to name a slot.
-        let closed = ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(7.0)]).unwrap();
+        let closed =
+            ClosedProgram::new(program, vec![Array::scalar(3.0).unwrap(), Array::scalar(7.0).unwrap()]).unwrap();
 
         // Dead-capture elimination renumbers the surviving reference and leaves the immediate untouched.
         let closed = closed.without_unused_captures().unwrap();
-        assert_eq!(closed.captures(), &[Array::scalar(7.0)]);
+        assert_eq!(closed.captures(), &[Array::scalar(7.0).unwrap()]);
         let constants =
             closed.program().atoms().iter().filter_map(|atom| atom.as_constant()).cloned().collect::<Vec<_>>();
         assert_eq!(
             constants,
             vec![
                 TestConstant::Captured(CaptureReference::new(0, scalar_type)),
-                TestConstant::Immediate(Array::scalar(5.0)),
+                TestConstant::Immediate(Array::scalar(5.0).unwrap()),
             ],
         );
 
@@ -1175,7 +1184,7 @@ mod tests {
         );
         let output = lifted
             .interpret_with::<Array, ProgramError, _, _>(
-                vec![Array::scalar(7.0), Array::scalar(2.0)],
+                vec![Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
                 |_, constant| match constant {
                     TestConstant::Captured(_) => unreachable!("capture references are lifted into inputs"),
                     TestConstant::Immediate(value) => Ok(value.clone()),
@@ -1185,7 +1194,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(output, vec![Array::scalar(14.0)]);
+        assert_eq!(output, vec![Array::scalar(14.0).unwrap()]);
     }
 
     #[test]
@@ -1219,7 +1228,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Array::scalar(1.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(1.0).unwrap()]).unwrap();
         let lifted = program.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.regions().len(), 2);
         assert_eq!(lifted.input_ids().len(), 1);
@@ -1254,7 +1263,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let program = ClosedProgram::new(program, vec![Array::scalar(1.0)]).unwrap();
+        let program = ClosedProgram::new(program, vec![Array::scalar(1.0).unwrap()]).unwrap();
         let lifted = program.to_program_with_lifted_captures().unwrap();
         assert_eq!(lifted.input_ids().len(), 2);
         assert_eq!(lifted.instructions()[0].regions(), &[RegionId::new(0)]);
@@ -1289,7 +1298,7 @@ mod tests {
             root.clone(),
             |inputs: Vec<Tracer<_>>| {
                 let context = inputs[0].context().clone();
-                let reference = context.capture(Array::scalar(3.0))?;
+                let reference = context.capture(Array::scalar(3.0).unwrap())?;
                 let captured = StagingContext::constant(&context, reference);
                 context.bind(AddOperation::new(), Vec::new(), &[inputs[0].clone(), captured])
             },
@@ -1314,11 +1323,11 @@ mod tests {
             .unwrap();
         let closed = ClosedProgram::new(program, captures).unwrap();
         assert!(closed.program().atoms().iter().all(|atom| !atom.is_constant()));
-        assert_eq!(closed.captures(), &[Array::scalar(3.0)]);
+        assert_eq!(closed.captures(), &[Array::scalar(3.0).unwrap()]);
 
         // The while body is an attached region, so capture-use discovery walks into it and pruning keeps the
         // nested-only capture.
         let pruned = closed.clone().without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[Array::scalar(3.0)]);
+        assert_eq!(pruned.captures(), &[Array::scalar(3.0).unwrap()]);
     }
 }

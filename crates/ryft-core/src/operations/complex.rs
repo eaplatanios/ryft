@@ -432,9 +432,9 @@ mod tests {
                 &ComplexOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(1.5f32), Array::scalar(-2.0f32)],
+                &[Array::scalar(1.5f32).unwrap(), Array::scalar(-2.0f32).unwrap()],
             ),
-            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32))]),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32)).unwrap()]),
         );
     }
 
@@ -442,8 +442,8 @@ mod tests {
     fn test_complex_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ComplexOperation::new(),
-            inputs = [Array::scalar(1.5f64), Array::scalar(-2.0f64)],
-            expected = Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)),
+            inputs = [Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()],
+            expected = Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap(),
         );
     }
 
@@ -454,9 +454,9 @@ mod tests {
             operation = ComplexOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64])),
-                    (@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]).unwrap())],
             }],
         );
     }
@@ -465,19 +465,21 @@ mod tests {
     fn test_complex_differentiation() {
         // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
         // structural zero that must be materialized to keep the staged `complex` arity.
-        let (primal, tangent) = differentiate_at((Array::scalar(1.5f64), Array::scalar(-2.0f64)))
-            .jvp((Array::scalar(0.25f64), Array::scalar(4.0f64)), |(real, imaginary)| real.complex(&imaginary))
+        let (primal, tangent) = differentiate_at((Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()))
+            .jvp((Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()), |(real, imaginary)| {
+                real.complex(&imaginary)
+            })
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)));
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 4.0f64)));
-        let (_, tangent) = differentiate_at((Array::scalar(1.5f64), Array::scalar(-2.0f64)))
-            .jvp((Array::scalar(0.25f64), Array::scalar(4.0f64)), |(real, imaginary)| {
-                let constant = imaginary.context().lift(Array::scalar(0.0f64))?;
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap());
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 4.0f64)).unwrap());
+        let (_, tangent) = differentiate_at((Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()))
+            .jvp((Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()), |(real, imaginary)| {
+                let constant = imaginary.context().lift(Array::scalar(0.0f64).unwrap())?;
                 let _ = imaginary;
                 real.complex(&constant)
             })
             .unwrap();
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 0.0f64)));
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 0.0f64)).unwrap());
     }
 
     #[test]
@@ -488,18 +490,18 @@ mod tests {
         // z̄ (from the `z` factor) plus conjugate(z) (from the transposed conjugation branch), so the gradient is
         // 2·z̄ — the same value JAX's `grad` returns for real-valued functions of complex inputs.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let gradient = differentiate_at(Array::scalar(z))
+        let gradient = differentiate_at(Array::scalar(z).unwrap())
             .gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap())
             .unwrap();
-        assert_eq!(gradient, Array::scalar(z.conj() + z.conj()));
+        assert_eq!(gradient, Array::scalar(z.conj() + z.conj()).unwrap());
 
         // Forward and reverse agree through the ℝ-linear rules: the jvp of f at tangent ż is 2·Re(z̄ · ż).
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-        let (primal, tangent) = differentiate_at(Array::scalar(z))
-            .jvp(Array::scalar(tangent_seed), |x| Ok((x.clone() * x.conjugate()?).real()?))
+        let (primal, tangent) = differentiate_at(Array::scalar(z).unwrap())
+            .jvp(Array::scalar(tangent_seed).unwrap(), |x| Ok((x.clone() * x.conjugate()?).real()?))
             .unwrap();
-        assert_eq!(primal, Array::scalar(z.norm_sqr()));
-        assert_eq!(tangent, Array::scalar((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
+        assert_eq!(primal, Array::scalar(z.norm_sqr()).unwrap());
+        assert_eq!(tangent, Array::scalar((tangent_seed * z.conj() + z * tangent_seed.conj()).re).unwrap());
     }
 
     #[test]
@@ -510,8 +512,8 @@ mod tests {
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64))),
                     (@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
-                input_cotangents = [Array::scalar(3.0f64), Array::scalar(4.0f64)],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
+                input_cotangents = [Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()],
             }],
         );
     }
@@ -546,9 +548,12 @@ mod tests {
                 &ConjugateOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
+                    .unwrap()],
             ),
-            Ok(vec![Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)])]),
+            Ok(vec![
+                Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)]).unwrap()
+            ]),
         );
     }
 
@@ -556,8 +561,8 @@ mod tests {
     fn test_conjugate_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ConjugateOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
-            expected = Array::scalar(ComplexNumber::new(1.5f64, 2.0f64)),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
+            expected = Array::scalar(ComplexNumber::new(1.5f64, 2.0f64)).unwrap(),
         );
     }
 
@@ -568,8 +573,8 @@ mod tests {
             operation = ConjugateOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)]).unwrap())],
             }],
         );
     }
@@ -580,10 +585,11 @@ mod tests {
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
         // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.conjugate()).unwrap();
-        assert_eq!(primal, Array::scalar(z.conj()));
-        assert_eq!(tangent, Array::scalar(tangent_seed.conj()));
+        let (primal, tangent) = differentiate_at(Array::scalar(z).unwrap())
+            .jvp(Array::scalar(tangent_seed).unwrap(), |x| x.conjugate())
+            .unwrap();
+        assert_eq!(primal, Array::scalar(z.conj()).unwrap());
+        assert_eq!(tangent, Array::scalar(tangent_seed.conj()).unwrap());
     }
 
     #[test]
@@ -593,8 +599,8 @@ mod tests {
             operation = ConjugateOperation::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
-                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
-                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 4.0f64))],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 4.0f64)).unwrap()],
             }],
         );
     }
@@ -633,9 +639,10 @@ mod tests {
                 &RealOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
+                    .unwrap()],
             ),
-            Ok(vec![Array::vector(vec![1.5f64, 0.5f64])]),
+            Ok(vec![Array::vector(vec![1.5f64, 0.5f64]).unwrap()]),
         );
     }
 
@@ -643,8 +650,8 @@ mod tests {
     fn test_real_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = RealOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
-            expected = Array::scalar(1.5f64),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
+            expected = Array::scalar(1.5f64).unwrap(),
         );
     }
 
@@ -655,8 +662,8 @@ mod tests {
             operation = RealOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]).unwrap())],
             }],
         );
     }
@@ -667,10 +674,11 @@ mod tests {
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
         // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.real()).unwrap();
-        assert_eq!(primal, Array::scalar(z.re));
-        assert_eq!(tangent, Array::scalar(tangent_seed.re));
+        let (primal, tangent) = differentiate_at(Array::scalar(z).unwrap())
+            .jvp(Array::scalar(tangent_seed).unwrap(), |x| x.real())
+            .unwrap();
+        assert_eq!(primal, Array::scalar(z.re).unwrap());
+        assert_eq!(tangent, Array::scalar(tangent_seed.re).unwrap());
     }
 
     #[test]
@@ -680,8 +688,8 @@ mod tests {
             operation = RealOperation::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
-                output_cotangents = [Array::scalar(3.0f64)],
-                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0f64))],
+                output_cotangents = [Array::scalar(3.0f64).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0f64)).unwrap()],
             }],
         );
     }
@@ -716,9 +724,10 @@ mod tests {
                 &ImaginaryOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
+                    .unwrap()],
             ),
-            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64])]),
+            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64]).unwrap()]),
         );
     }
 
@@ -726,8 +735,8 @@ mod tests {
     fn test_imaginary_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ImaginaryOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
-            expected = Array::scalar(-2.0f64),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
+            expected = Array::scalar(-2.0f64).unwrap(),
         );
     }
 
@@ -738,8 +747,8 @@ mod tests {
             operation = ImaginaryOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]).unwrap())],
             }],
         );
     }
@@ -749,10 +758,11 @@ mod tests {
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.imaginary()).unwrap();
-        assert_eq!(primal, Array::scalar(z.im));
-        assert_eq!(tangent, Array::scalar(tangent_seed.im));
+        let (primal, tangent) = differentiate_at(Array::scalar(z).unwrap())
+            .jvp(Array::scalar(tangent_seed).unwrap(), |x| x.imaginary())
+            .unwrap();
+        assert_eq!(primal, Array::scalar(z.im).unwrap());
+        assert_eq!(tangent, Array::scalar(tangent_seed.im).unwrap());
     }
 
     #[test]
@@ -762,8 +772,8 @@ mod tests {
             operation = ImaginaryOperation::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
-                output_cotangents = [Array::scalar(3.0f64)],
-                input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0f64))],
+                output_cotangents = [Array::scalar(3.0f64).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0f64)).unwrap()],
             }],
         );
     }

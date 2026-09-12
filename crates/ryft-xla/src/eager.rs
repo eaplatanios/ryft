@@ -494,8 +494,8 @@ mod tests {
         let right_values = [4.0f32, 0.25, -1.5, 2.5];
         let left = f32_vector(&client, &mesh, &left_values);
         let right = f32_vector(&client, &mesh, &right_values);
-        let reference_left = CpuArray::vector(left_values.to_vec());
-        let reference_right = CpuArray::vector(right_values.to_vec());
+        let reference_left = CpuArray::vector(left_values.to_vec()).unwrap();
+        let reference_right = CpuArray::vector(right_values.to_vec()).unwrap();
 
         // Both backends compute in `f32`, so agreement is checked within a small `f32`-scale tolerance (the two
         // implementations may round transcendental functions differently in the last unit of precision).
@@ -560,7 +560,8 @@ mod tests {
         assert_eq!(device_values[2], f32::INFINITY);
         assert!(device_values[3].is_nan(), "{device_values:?}");
         let reference_values = CpuArray::vector(infinite_values.to_vec())
-            .log_add_exp(&CpuArray::vector(guarded_values.to_vec()))
+            .unwrap()
+            .log_add_exp(&CpuArray::vector(guarded_values.to_vec()).unwrap())
             .unwrap()
             .to_f64s();
         assert_eq!(reference_values[0], f64::INFINITY);
@@ -596,7 +597,7 @@ mod tests {
         // Selection agrees.
         let condition_values = [true, false, true, false];
         let condition = boolean_vector(&client, &mesh, &condition_values);
-        let reference_condition = CpuArray::vector(condition_values.to_vec());
+        let reference_condition = CpuArray::vector(condition_values.to_vec()).unwrap();
         assert_parity(
             &Select::select(&condition, &left, &right).unwrap(),
             &Select::select(&reference_condition, &reference_left, &reference_right).unwrap(),
@@ -634,8 +635,10 @@ mod tests {
         let complex_left = c64_scalar(&client, &mesh, complex_left_value);
         let complex_right = c64_scalar(&client, &mesh, complex_right_value);
         let device_product = read_c64s(&complex_left.mul(&complex_right).unwrap())[0];
-        let reference_product =
-            CpuArray::scalar(complex_left_value).mul(&CpuArray::scalar(complex_right_value)).unwrap();
+        let reference_product = CpuArray::scalar(complex_left_value)
+            .unwrap()
+            .mul(&CpuArray::scalar(complex_right_value).unwrap())
+            .unwrap();
         let reference_product = reference_product.elements::<num_complex::Complex<f32>>().unwrap()[0];
         assert!((device_product - reference_product).norm() < 1e-5);
     }
@@ -715,7 +718,7 @@ mod tests {
             256.0,
         ];
         let input = f32_vector(&client, &mesh, &values);
-        let reference = CpuArray::vector(values.to_vec());
+        let reference = CpuArray::vector(values.to_vec()).unwrap();
         // Sub-byte conversion saturates at the byte carrier limits and then narrows modularly to the logical width.
         for data_type in [DataType::I2, DataType::I4, DataType::U2, DataType::U4] {
             let output = input.convert_element_type(data_type).unwrap();
@@ -814,8 +817,8 @@ mod tests {
             values_to_bytes(&right_values).as_slice(),
         )
         .unwrap();
-        let reference_left = CpuArray::vector(left_values.to_vec());
-        let reference_right = CpuArray::vector(right_values.to_vec());
+        let reference_left = CpuArray::vector(left_values.to_vec()).unwrap();
+        let reference_right = CpuArray::vector(right_values.to_vec()).unwrap();
         let output = left.min(&right).unwrap();
         assert_eq!(
             shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
@@ -848,7 +851,11 @@ mod tests {
         assert_eq!(output.shape().dimensions(), &[2]);
         assert_eq!(
             shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            CpuArray::vector(complex_values.to_vec()).min(&CpuArray::scalar(2.0f64)).unwrap().logical_bytes(),
+            CpuArray::vector(complex_values.to_vec())
+                .unwrap()
+                .min(&CpuArray::scalar(2.0f64).unwrap())
+                .unwrap()
+                .logical_bytes(),
         );
     }
 
@@ -890,8 +897,8 @@ mod tests {
             values_to_bytes(&right_values).as_slice(),
         )
         .unwrap();
-        let reference_left = CpuArray::vector(left_values.to_vec());
-        let reference_right = CpuArray::vector(right_values.to_vec());
+        let reference_left = CpuArray::vector(left_values.to_vec()).unwrap();
+        let reference_right = CpuArray::vector(right_values.to_vec()).unwrap();
         let output = left.max(&right).unwrap();
         assert_eq!(
             shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
@@ -924,7 +931,11 @@ mod tests {
         assert_eq!(output.shape().dimensions(), &[2]);
         assert_eq!(
             shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            CpuArray::vector(complex_values.to_vec()).max(&CpuArray::scalar(2.0f64)).unwrap().logical_bytes(),
+            CpuArray::vector(complex_values.to_vec())
+                .unwrap()
+                .max(&CpuArray::scalar(2.0f64).unwrap())
+                .unwrap()
+                .logical_bytes(),
         );
     }
 
@@ -1030,7 +1041,7 @@ mod tests {
             1.0, 1.2, 1.25, 2.0, 2.9, 3.0, 4.0, 6.5,
         ];
         let device_values = read_f32s(&f32_vector(&client, &mesh, &values).erf().unwrap());
-        let reference_values = CpuArray::vector(values.to_vec()).erf().unwrap().to_f64s();
+        let reference_values = CpuArray::vector(values.to_vec()).unwrap().erf().unwrap().to_f64s();
         assert_eq!(device_values.len(), reference_values.len());
         for ((input, device_value), reference_value) in
             values.iter().zip(device_values.iter()).zip(reference_values.iter())
@@ -1299,8 +1310,8 @@ mod tests {
         let payload_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
         let keys = f32_vector(&client, &mesh, &key_values);
         let payloads = f32_vector(&client, &mesh, &payload_values);
-        let reference_keys = CpuArray::vector(key_values.to_vec());
-        let reference_payloads = CpuArray::vector(payload_values.to_vec());
+        let reference_keys = CpuArray::vector(key_values.to_vec()).unwrap();
+        let reference_payloads = CpuArray::vector(payload_values.to_vec()).unwrap();
 
         for direction in [SortDirection::Ascending, SortDirection::Descending] {
             let sorted = Sort::sort(&[keys.clone(), payloads.clone()], 0, direction).unwrap();
@@ -1326,7 +1337,7 @@ mod tests {
 
         let nan_values = [1.0f32, f32::NAN, 3.0];
         let nan_keys = f32_vector(&client, &mesh, &nan_values);
-        let reference_nan_keys = CpuArray::vector(nan_values.to_vec());
+        let reference_nan_keys = CpuArray::vector(nan_values.to_vec()).unwrap();
         assert_eq!(read_i32s(&nan_keys.argmax(0).unwrap()), vec![1]);
         assert_eq!(reference_nan_keys.argmax(0).unwrap().to_f64s(), vec![1.0]);
         assert_eq!(read_i32s(&nan_keys.argmin(0).unwrap()), vec![0]);
@@ -1365,8 +1376,10 @@ mod tests {
             &primary_values,
         )
         .unwrap();
-        let reference_secondary = CpuArray::vector(secondary_values.iter().map(|value| f64::from(*value)).collect());
-        let reference_passenger = CpuArray::vector(passenger_values.iter().map(|value| f64::from(*value)).collect());
+        let reference_secondary =
+            CpuArray::vector(secondary_values.iter().map(|value| f64::from(*value)).collect()).unwrap();
+        let reference_passenger =
+            CpuArray::vector(passenger_values.iter().map(|value| f64::from(*value)).collect()).unwrap();
 
         let cases = [
             // Ascending: primary 1s precede 2s, ties resolve by the secondary key, and the full `(2, 0.5)` tie
@@ -1584,6 +1597,7 @@ mod tests {
         let logit_values = [0.0f32, 10.0, -3.0, 2.0];
         let device_logits = f32_vector(&client, &mesh, &logit_values);
         let reference_logits = CpuArray::vector(logit_values.iter().map(|value| f64::from(*value)).collect())
+            .unwrap()
             .convert_element_type(DataType::F32)
             .unwrap();
         let (_, device_samples) = state.categorical(&device_logits, 0).unwrap();
@@ -1619,8 +1633,8 @@ mod tests {
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let lhs_values = [0.5f64, 1.0, 1.5, 2.0];
         let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
-        let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec());
-        let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec());
+        let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec()).unwrap();
+        let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec()).unwrap();
         let lhs_bytes = reference_lhs.logical_bytes();
         let rhs_bytes = reference_rhs.logical_bytes();
         let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
@@ -1657,10 +1671,10 @@ mod tests {
         const F4_CANDIDATES: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let element_values =
             |seed: usize| (0..32).map(|index| F4_CANDIDATES[(index * 5 + seed) % 8]).collect::<Vec<_>>();
-        let reference_lhs = CpuArray::from_f64s(element_type.clone(), element_values(0));
-        let reference_rhs = CpuArray::from_f64s(element_type.clone(), element_values(3));
-        let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]);
-        let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]);
+        let reference_lhs = CpuArray::from_f64s(element_type.clone(), element_values(0)).unwrap();
+        let reference_rhs = CpuArray::from_f64s(element_type.clone(), element_values(3)).unwrap();
+        let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]).unwrap();
+        let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]).unwrap();
         let bits = CpuArray::logical_bytes;
         let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
         let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
@@ -1723,7 +1737,7 @@ mod tests {
                 .unwrap()
         };
         let reference = |values: &[f32]| {
-            CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect())
+            CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect()).unwrap()
         };
 
         for configuration in [
@@ -1750,7 +1764,7 @@ mod tests {
 
         // The compiled composition also preserves the complete structural surface: a broadcast scalar bias, an
         // arbitrary mask, independent length vectors, the default scale, an asymmetric window, and the residual.
-        let reference_bias = CpuArray::from_f64s(ArrayType::scalar(DataType::F32), vec![0.25]);
+        let reference_bias = CpuArray::from_f64s(ArrayType::scalar(DataType::F32), vec![0.25]).unwrap();
         let reference_mask = CpuArray::from_elements(
             ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)])),
             &[true, false, false, true, true, false, true, true, true],
@@ -1825,7 +1839,7 @@ mod tests {
         let host_type =
             ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()));
         let reference =
-            || CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect());
+            || CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect()).unwrap();
         let configuration = AttentionConfiguration::new().with_scale(0.5).with_causal(true);
 
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;

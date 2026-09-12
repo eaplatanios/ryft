@@ -2782,7 +2782,7 @@ mod tests {
 
     /// Wraps a scalar `f32` array into the composite value used by the reference tests.
     fn reference_test_scalar(value: f32) -> ReferenceTestValue {
-        ArrayIrValue::Array(Array::scalar(value))
+        ArrayIrValue::Array(Array::scalar(value).unwrap())
     }
 
     /// Stages `left · right` in the array IR universe through the tracers' context.
@@ -2876,7 +2876,7 @@ mod tests {
     #[test]
     fn test_rematerialization_matches_the_unrematerialized_gradient_under_every_policy() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (direct_value, direct_gradient) =
             domain.differentiate_at(input.clone()).value_and_gradient(|x| dot_sine(x)).unwrap();
@@ -2936,7 +2936,8 @@ mod tests {
         let stacked = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             rows.iter().flatten().copied().collect(),
-        );
+        )
+        .unwrap();
         let scan_body = |carry: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let context = carry.context().clone();
             let xs = StagingContext::constant(&context, stacked.clone());
@@ -2972,7 +2973,7 @@ mod tests {
             );
 
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-                .differentiate_at(Array::scalar(2.0))
+                .differentiate_at(Array::scalar(2.0).unwrap())
                 .value_and_gradient(|carry| function.call(carry).unwrap())
                 .unwrap();
             assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * expected_gradient, epsilon = 1e-9);
@@ -3101,7 +3102,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(vector_type.clone());
             builder.add_input(vector_type.clone());
-            let output = builder.add_constant(Array::scalar(0.0));
+            let output = builder.add_constant(Array::scalar(0.0).unwrap());
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -3168,8 +3169,9 @@ mod tests {
             let false_branch = branch(true);
             let body = move |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let context = input.dispatch_domain();
-                let predicate =
-                    context.lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]))?;
+                let predicate = context.lift(
+                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]).unwrap(),
+                )?;
                 let mut outputs = context.bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![true_branch.clone(), false_branch.clone()],
@@ -3181,7 +3183,7 @@ mod tests {
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy);
             let forward_output_count = staged_operation(&function, vector_type(2)).forward().output_types().len();
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-                .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.5]))
+                .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap())
                 .value_and_gradient(|input| function.call(input).unwrap())
                 .unwrap();
             (forward_output_count, value.to_f64s()[0], gradient.to_f64s())
@@ -3240,16 +3242,21 @@ mod tests {
     fn test_tag_is_transparent_to_differentiation() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (primal, tangent) = domain
-            .jvp(|x, ()| Ok((x.clone() * x).tag("square")), Array::scalar(2.0), Array::scalar(1.0), ())
+            .jvp(
+                |x, ()| Ok((x.clone() * x).tag("square")),
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(1.0).unwrap(),
+                (),
+            )
             .unwrap();
-        assert_eq!(primal, Array::scalar(4.0));
-        assert_eq!(tangent, Array::scalar(4.0));
+        assert_eq!(primal, Array::scalar(4.0).unwrap());
+        assert_eq!(tangent, Array::scalar(4.0).unwrap());
         let (value, gradient) = domain
-            .differentiate_at(Array::scalar(3.0))
+            .differentiate_at(Array::scalar(3.0).unwrap())
             .value_and_gradient(|x| (x.clone() * x).tag("square"))
             .unwrap();
-        assert_eq!(value, Array::scalar(9.0));
-        assert_eq!(gradient, Array::scalar(6.0));
+        assert_eq!(value, Array::scalar(9.0).unwrap());
+        assert_eq!(gradient, Array::scalar(6.0).unwrap());
     }
 
     #[test]
@@ -3263,7 +3270,7 @@ mod tests {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
             Ok(u.clone() * u.sin()?)
         }
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         // Forward output counts: 2 base outputs (output + input), plus the residuals each policy saves.
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, input: &Array, expected: &[f64]) {
@@ -3299,8 +3306,8 @@ mod tests {
         let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x, ()| function.call(x),
-                Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
-                Array::from_f64s(vector_type(2), vec![1.0, 0.0]),
+                Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap(),
+                Array::from_f64s(vector_type(2), vec![1.0, 0.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -3331,7 +3338,7 @@ mod tests {
         .with_policy(EverythingSaveable);
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (value, gradient) = domain
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
@@ -3458,7 +3465,7 @@ mod tests {
             },
         );
         // f(x) = Σᵢ sin(xᵢ²) xᵢ, so ∂f/∂xⱼ = sin(xⱼ²) + 2 xⱼ² cos(xⱼ²).
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
         let (value, gradient) = domain.differentiate_at(input).value_and_gradient(|x| outer.call(x).unwrap()).unwrap();
@@ -3516,8 +3523,8 @@ mod tests {
         let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x, ()| outer.call(x),
-                Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
-                Array::from_f64s(vector_type(2), vec![1.0, 0.0]),
+                Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap(),
+                Array::from_f64s(vector_type(2), vec![1.0, 0.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -3543,8 +3550,10 @@ mod tests {
             },
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
-        let (value, gradient) =
-            domain.differentiate_at(Array::scalar(0.7)).value_and_gradient(|x| outer.call(x).unwrap()).unwrap();
+        let (value, gradient) = domain
+            .differentiate_at(Array::scalar(0.7).unwrap())
+            .value_and_gradient(|x| outer.call(x).unwrap())
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.49f64.sin() * 0.7, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos(), epsilon = 1e-9);
     }
@@ -3627,12 +3636,13 @@ mod tests {
             );
         }
 
-        let input = Array::matrix(3, 2, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
+        let input = Array::matrix(3, 2, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]).unwrap();
         let expected = Array::matrix(
             3,
             2,
             vec![0.0f64.sin(), 0.5f64.sin(), 1.0f64.sin(), 1.5f64.sin(), 2.0f64.sin(), 2.5f64.sin()],
-        );
+        )
+        .unwrap();
         assert_eq!(batched.interpret(vec![input]).unwrap(), vec![expected]);
     }
 
@@ -3649,7 +3659,7 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (value, gradient) = domain
-            .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]))
+            .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
@@ -3707,12 +3717,12 @@ mod tests {
         // Cache hits still differentiate correctly: the second gradient call reuses the derivation staged by the
         // first one.
         let (_, first_gradient) = domain
-            .differentiate_at(Array::scalar(0.7))
+            .differentiate_at(Array::scalar(0.7).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         let derivations_after_first_gradient = trace_count.get();
         let (_, second_gradient) = domain
-            .differentiate_at(Array::scalar(0.7))
+            .differentiate_at(Array::scalar(0.7).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
@@ -3827,7 +3837,7 @@ mod tests {
                 "unexpected forward output count for policy {policy:?}",
             );
             // Custom policies only change the save/recompute split, never the gradient.
-            let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+            let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
             let (_, gradient) =
                 domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
@@ -3847,7 +3857,7 @@ mod tests {
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let hessian = domain.differentiate_at(Array::scalar(0.7)).hessian(|x| function.call(x)).unwrap();
+        let hessian = domain.differentiate_at(Array::scalar(0.7).unwrap()).hessian(|x| function.call(x)).unwrap();
         let block = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(
@@ -3866,7 +3876,7 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (gradient, second_derivative) = domain
-            .differentiate_at(Array::scalar(0.7))
+            .differentiate_at(Array::scalar(0.7).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 context.differentiate_at(x).gradient(|y| function.call(y).unwrap()).unwrap()
@@ -3891,9 +3901,9 @@ mod tests {
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let (_, pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.7), ()).unwrap();
+        let (_, pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.7).unwrap(), ()).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
-        let mut pullback_inputs = vec![Array::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0).unwrap()];
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();
         let x: f64 = 0.7;
@@ -3907,7 +3917,7 @@ mod tests {
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let jacobian = differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]))
+        let jacobian = differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| function.call(x))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -3945,7 +3955,7 @@ mod tests {
         // `u`). Offloaded residuals are emitted behind a staged transfer — the saved forward output carries the
         // destination memory, and the backward and tangent programs transfer it back before consuming it — while
         // residuals saved in place stay in their own memory with no transfers anywhere.
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let offload_u = SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST);
         let save_u = SaveAndOffloadOnlyTheseNames::new(["u"], [] as [&str; 0], PINNED_HOST);
@@ -4014,7 +4024,7 @@ mod tests {
         assert_eq!(forward_output_types.len(), 3);
         assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
 
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (value, gradient) =
             domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
@@ -4066,7 +4076,7 @@ mod tests {
         assert!(saved_memories.contains(&PINNED_HOST), "expected a host-parked saved residual");
 
         // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (_, gradient) = domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
@@ -4108,7 +4118,7 @@ mod tests {
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
         let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
         let (_, gradient) = domain
-            .differentiate_at(Array::from_f64s(matrix_type, rows.as_flattened().to_vec()))
+            .differentiate_at(Array::from_f64s(matrix_type, rows.as_flattened().to_vec()).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
@@ -4618,7 +4628,7 @@ mod tests {
 
         // f(x) = x² · x = x³, so f'(x) = 3x².
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(2.0))
+            .differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
@@ -5068,7 +5078,7 @@ mod tests {
 
         // The gradient with respect to the array input is the reference contents, and the cotangent of the
         // reference's initial state is the array input times the output cotangent.
-        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let (value, pullback) = differentiate_at((ArrayIrValue::Reference(reference), reference_test_scalar(3.0)))
             .vjp(|input| function.call(input))
             .unwrap();
@@ -5080,7 +5090,7 @@ mod tests {
             ),
             Ok((None, Some(reference_test_scalar(2.0)))),
         );
-        let destination = ArrayReference::new(Array::scalar(0.0_f32));
+        let destination = ArrayReference::new(Array::scalar(0.0_f32).unwrap());
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(1.0)),
@@ -5091,13 +5101,13 @@ mod tests {
             ),
             Ok((None, Some(reference_test_scalar(2.0)))),
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
     fn test_rematerialization_linearize_preserves_reference_boundary_and_saved_reads() {
         let function = rematerialize::<ReferenceTestContext, _, _, _>(external_read_body);
-        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let (value, pushforward) =
             differentiate_at((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(3.0)))
                 .linearize(|input| function.call(input))
@@ -5112,19 +5122,19 @@ mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "tangent 0 aliases a reference bound at the primal boundary of the differentiated function",
         ));
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32).unwrap()));
 
         // External primal reads were saved during linearization, so even consuming the original allocation cannot
         // affect a later pushforward. Only the distinct tangent reference is read on each invocation:
         // df(r, x)[dr, dx] = dr * x + saved_read(r) * dx = 3 * dr + 2.
-        assert_eq!(reference.freeze(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.freeze(), Ok(Array::scalar(2.0_f32).unwrap()));
         for (direction, expected) in [(2.0_f32, 8.0_f32), (5.0, 17.0), (2.0, 8.0)] {
-            let tangent = ArrayReference::new(Array::scalar(direction));
+            let tangent = ArrayReference::new(Array::scalar(direction).unwrap());
             assert_eq!(
                 pushforward.apply((ArrayIrValue::Reference(tangent.clone()), reference_test_scalar(1.0))),
                 Ok(reference_test_scalar(expected)),
             );
-            assert_eq!(tangent.read(), Ok(Array::scalar(direction)));
+            assert_eq!(tangent.read(), Ok(Array::scalar(direction).unwrap()));
         }
     }
 
@@ -5151,7 +5161,7 @@ mod tests {
     fn test_rematerialization_rejects_captured_references() {
         // A reference the body closes over would have to enter the traced body as a reference-typed constant, which
         // the trace rejects: references reach a rematerialized function only as inputs.
-        let captured = ArrayReference::new(Array::scalar(2.0_f32));
+        let captured = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let function = rematerialize::<ReferenceTestContext, _, _, _>(move |x: ReferenceTestTracer| {
             let context = x.context().clone();
             let reference = StagingContext::constant(&context, ArrayIrValue::Reference(captured.clone()));
@@ -5300,7 +5310,7 @@ mod tests {
 
         // f(x) = (x²)² · x = x⁵, so f'(x) = 5x⁴.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(1.5))
+            .differentiate_at(Array::scalar(1.5).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 1.5f64.powi(5), epsilon = 1e-9);
@@ -5349,7 +5359,7 @@ mod tests {
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
-            let bound = builder.add_constant(Array::scalar(8.0));
+            let bound = builder.add_constant(Array::scalar(8.0).unwrap());
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),
@@ -5394,13 +5404,13 @@ mod tests {
         )
         .with_policy(policy);
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(1.1))
+            .differentiate_at(Array::scalar(1.1).unwrap())
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         // At x = 1.1 the predicate stays true through all three squarings, so the iteration bound stops at x^8.
         // Compare with direct execution to verify both the bounded value and its derivative.
         let direct = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(1.1))
+            .differentiate_at(Array::scalar(1.1).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
@@ -5444,7 +5454,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
             builder.add_input(scalar_type.clone());
-            let bound = builder.add_constant(Array::scalar(8.0));
+            let bound = builder.add_constant(Array::scalar(8.0).unwrap());
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),

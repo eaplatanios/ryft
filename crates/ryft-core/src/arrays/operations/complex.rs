@@ -118,8 +118,8 @@ mod tests {
 
     #[test]
     fn test_array_complex_parts() {
-        let real = Array::vector(vec![1.0, 2.0]);
-        let imaginary = Array::vector(vec![3.0, -4.0]);
+        let real = Array::vector(vec![1.0, 2.0]).unwrap();
+        let imaginary = Array::vector(vec![3.0, -4.0]).unwrap();
         let complex = real.complex(&imaginary).unwrap();
         assert_eq!(complex.r#type().into_owned(), ArrayType::new_static(DataType::C128, [2]));
         assert_eq!(
@@ -131,7 +131,7 @@ mod tests {
         let conjugate = complex.conjugate().unwrap();
         assert_eq!(conjugate.imaginary().unwrap(), imaginary.neg().unwrap());
         // Complex construction requires identical part types.
-        assert!(real.complex(&Array::vector(vec![1.0f32])).is_err());
-        assert!(Array::vector(vec![1i32]).complex(&Array::vector(vec![2i32])).is_err());
+        assert!(real.complex(&Array::vector(vec![1.0f32]).unwrap()).is_err());
+        assert!(Array::vector(vec![1i32]).unwrap().complex(&Array::vector(vec![2i32]).unwrap()).is_err());
     }
 }

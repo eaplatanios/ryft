@@ -692,11 +692,12 @@ mod tests {
     #[test]
     fn test_array_ir_parallel_sum_scatter_rejects_ragged_input_before_mapped_extents() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]));
-        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8])), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-            .unwrap();
+        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]).unwrap());
+        let input =
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8]).unwrap()), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+                .unwrap();
         let output_extent =
             ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable)).unwrap();
         let context = BatchingContext::new(
@@ -750,7 +751,7 @@ mod tests {
         // `[10, 20, 30, 40]` the sum is `[11, 22, 33, 44]`, so item 0 receives `[11, 22]` and item 1 receives
         // `[33, 44]`, matching the verified cross-device `shard_map` execution semantics of StableHLO's
         // `reduce_scatter`.
-        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]).unwrap();
         let output: ArrayIrValue<Array> = batch(
             |item: BatchingTracer<
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,

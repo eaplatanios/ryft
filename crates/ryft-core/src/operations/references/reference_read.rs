@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn test_reference_read_operation_jvp() {
         let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
 
         // Reading an active reference reads its tangent reference alongside.
         let input = DifferentiationTracer::new(
@@ -298,14 +298,17 @@ mod tests {
         );
         let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])));
-        assert_eq!(outputs[0].tangent().as_value(), Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
+        assert_eq!(
+            outputs[0].tangent().as_value(),
+            Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
+        );
 
         // Reading a plumbing reference yields a symbolic zero tangent of the referent's tangent type.
         let input =
             DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(reference).unwrap(), context.clone());
         let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         assert!(matches!(
             outputs[0].tangent(),
             MaybeZero::Zero(r#type) if *r#type == ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
@@ -323,7 +326,7 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let reference = packed.reference_new().unwrap();
 
         // Reading a batched reference yields the packed referent at the reference's batch axis.

@@ -151,27 +151,27 @@ mod tests {
         };
 
         // Forward scans accumulate prefixes and reverse scans accumulate suffixes, along the selected axis only.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             interpret(&CumulativeProductOperation::new(1), &input),
-            Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]),
+            Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeProductOperation::new(1).with_reverse(true), &input),
-            Array::matrix(2, 3, vec![6.0, 6.0, 3.0, 120.0, 30.0, 6.0]),
+            Array::matrix(2, 3, vec![6.0, 6.0, 3.0, 120.0, 30.0, 6.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeProductOperation::new(0), &input),
-            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 10.0, 18.0]),
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 10.0, 18.0]).unwrap(),
         );
 
         // A zero absorbs every later prefix going forward and every earlier suffix going backward.
-        let with_zero = Array::vector(vec![2.0, 0.0, 3.0, 4.0]);
-        let zeroed = Array::vector(vec![2.0, 0.0, 0.0, 0.0]);
+        let with_zero = Array::vector(vec![2.0, 0.0, 3.0, 4.0]).unwrap();
+        let zeroed = Array::vector(vec![2.0, 0.0, 0.0, 0.0]).unwrap();
         assert_eq!(interpret(&CumulativeProductOperation::new(0), &with_zero), zeroed);
         assert_eq!(
             interpret(&CumulativeProductOperation::new(0).with_reverse(true), &with_zero),
-            Array::vector(vec![0.0, 0.0, 12.0, 4.0]),
+            Array::vector(vec![0.0, 0.0, 12.0, 4.0]).unwrap(),
         );
 
         // A zero-length scanned axis has nothing to accumulate and keeps the operand's exact type.
@@ -179,10 +179,10 @@ mod tests {
         assert_eq!(interpret(&CumulativeProductOperation::new(0), &empty), empty);
 
         // Complex payloads multiply as complex numbers.
-        let complex = Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0), ComplexNumber::new(0.0, 1.0)]);
+        let complex = Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0), ComplexNumber::new(0.0, 1.0)]).unwrap();
         assert_eq!(
             interpret(&CumulativeProductOperation::new(0), &complex),
-            Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0), ComplexNumber::new(-1.0, 0.0)]),
+            Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0), ComplexNumber::new(-1.0, 0.0)]).unwrap(),
         );
     }
 
@@ -194,8 +194,8 @@ mod tests {
             operation = CumulativeProductOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
-                outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 6.0]))],
+                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
+                outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 6.0]).unwrap())],
             }],
         );
 
@@ -206,8 +206,8 @@ mod tests {
             operation = CumulativeProductOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]).unwrap())],
             }],
         );
 
@@ -217,8 +217,8 @@ mod tests {
             operation = CumulativeProductOperation::new(0),
             axis_size = 3,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
-                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 10.0, 18.0]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 10.0, 18.0]).unwrap())],
             }],
         );
     }
@@ -229,9 +229,9 @@ mod tests {
         // policy to neutralize that padding with the multiplicative identity first. Static array batching cannot,
         // and says so rather than silently scanning padding.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         assert_eq!(
             CumulativeProductOperation::new(0).batch(
@@ -319,20 +319,20 @@ mod tests {
             @approx(step = 1e-4, epsilon = 1e-6),
             operation = CumulativeProductOperation::new(0),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
-                tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0])],
-                primal_outputs = [Array::vector(vec![1.0, 2.0, 6.0, 24.0])],
-                tangent_outputs = [Array::vector(vec![1.0, 3.0, 11.0, 50.0])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap()],
             }],
         );
         check_operation_differentiation!(
             @approx(step = 1e-4, epsilon = 1e-6),
             operation = CumulativeProductOperation::new(0).with_reverse(true),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
-                tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0])],
-                primal_outputs = [Array::vector(vec![24.0, 24.0, 12.0, 4.0])],
-                tangent_outputs = [Array::vector(vec![50.0, 26.0, 7.0, 1.0])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap()],
             }],
         );
     }
@@ -341,9 +341,9 @@ mod tests {
     fn test_cumulative_product_capability_over_eager_arrays() {
         // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
         // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0])));
-        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0])));
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0]).unwrap()));
         assert_eq!(
             input.cumulative_product(1),
             Err(ProgramError::Type(TypeError::invalid(

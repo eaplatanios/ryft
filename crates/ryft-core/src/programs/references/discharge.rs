@@ -8792,8 +8792,8 @@ mod tests {
         // exists: a program with nothing to rewrite keeps its atoms exactly.
         let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let update = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(2.0)));
-        let unused = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(5.0)));
+        let update = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(2.0).unwrap()));
+        let unused = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(5.0).unwrap()));
         let allocation =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         builder
@@ -8819,8 +8819,8 @@ mod tests {
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(
-            discharged.program().interpret(vec![DischargeValue::Array(Array::scalar::<f32>(1.0))]),
-            Ok(vec![DischargeValue::Array(Array::scalar::<f32>(3.0))])
+            discharged.program().interpret(vec![DischargeValue::Array(Array::scalar::<f32>(1.0).unwrap())]),
+            Ok(vec![DischargeValue::Array(Array::scalar::<f32>(3.0).unwrap())])
         );
     }
 
@@ -8926,7 +8926,7 @@ mod tests {
                                     .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
                                     .unwrap()[0],
                             );
-                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state).unwrap()));
                         }
                         Step::Write => {
                             builder
@@ -8950,7 +8950,7 @@ mod tests {
                                     )
                                     .unwrap()[0],
                             );
-                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state).unwrap()));
                             oracle_state = 7.0;
                         }
                         Step::AddUpdate => {
@@ -8971,7 +8971,7 @@ mod tests {
                         .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
                         .unwrap()[0],
                 );
-                oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state).unwrap()));
                 let output_count = outputs.len();
                 let source = builder
                     .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
@@ -8981,9 +8981,9 @@ mod tests {
                     )
                     .unwrap();
                 let inputs = vec![
-                    DischargeValue::Array(Array::scalar::<f32>(2.0)),
-                    DischargeValue::Array(Array::scalar::<f32>(7.0)),
-                    DischargeValue::Array(Array::scalar::<f32>(3.0)),
+                    DischargeValue::Array(Array::scalar::<f32>(2.0).unwrap()),
+                    DischargeValue::Array(Array::scalar::<f32>(7.0).unwrap()),
+                    DischargeValue::Array(Array::scalar::<f32>(3.0).unwrap()),
                 ];
                 let eager = source.clone().interpret(inputs.clone()).unwrap();
 
@@ -9056,14 +9056,14 @@ mod tests {
         );
         assert_eq!(
             discharged.program().interpret(vec![
-                DischargeValue::Array(Array::scalar::<f32>(10.0)),
-                DischargeValue::Array(Array::scalar::<f32>(20.0)),
-                DischargeValue::Array(Array::scalar::<f32>(7.0))
+                DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(7.0).unwrap())
             ]),
             Ok(vec![
-                DischargeValue::Array(Array::scalar::<f32>(20.0)),
-                DischargeValue::Array(Array::scalar::<f32>(10.0)),
-                DischargeValue::Array(Array::scalar::<f32>(7.0))
+                DischargeValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(7.0).unwrap())
             ]),
         );
     }
@@ -9559,14 +9559,14 @@ mod tests {
 
         // Eager reference semantics stay the oracle: the mixed program computes exactly what the source program does.
         let inputs = vec![
-            DischargeValue::Array(Array::scalar::<f32>(10.0)),
-            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0])),
-            DischargeValue::Array(Array::scalar::<f32>(7.0)),
+            DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]).unwrap()),
+            DischargeValue::Array(Array::scalar::<f32>(7.0).unwrap()),
         ];
         let expected = vec![
-            DischargeValue::Array(Array::scalar::<f32>(2.0)),
-            DischargeValue::Array(Array::scalar::<f32>(17.0)),
-            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 7.0, 3.0])),
+            DischargeValue::Array(Array::scalar::<f32>(2.0).unwrap()),
+            DischargeValue::Array(Array::scalar::<f32>(17.0).unwrap()),
+            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 7.0, 3.0]).unwrap()),
         ];
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
@@ -9676,14 +9676,14 @@ mod tests {
 
         for (predicate, kernel_final) in [(true, 10.0_f32), (false, 3.0)] {
             let inputs = vec![
-                DischargeValue::Array(Array::scalar(predicate)),
-                DischargeValue::Array(Array::scalar::<f32>(10.0)),
-                DischargeValue::Array(Array::scalar::<f32>(3.0)),
+                DischargeValue::Array(Array::scalar(predicate).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(3.0).unwrap()),
             ];
             let outputs = vec![
-                DischargeValue::Array(Array::scalar::<f32>(10.0)),
-                DischargeValue::Array(Array::scalar::<f32>(10.0)),
-                DischargeValue::Array(Array::scalar::<f32>(kernel_final)),
+                DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                DischargeValue::Array(Array::scalar::<f32>(kernel_final).unwrap()),
             ];
             assert_eq!(source.clone().interpret(inputs.clone()), Ok(outputs.clone()));
             assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
@@ -9991,10 +9991,10 @@ mod tests {
         let program = builder
             .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
             .unwrap();
-        let reference = ArrayReference::new(Array::scalar(4.0f32));
+        let reference = ArrayReference::new(Array::scalar(4.0f32).unwrap());
         let closed = ClosedProgram::new(
             program,
-            vec![ArrayIrValue::Reference(reference), DischargeValue::Array(Array::scalar(true))],
+            vec![ArrayIrValue::Reference(reference), DischargeValue::Array(Array::scalar(true).unwrap())],
         )
         .unwrap();
 

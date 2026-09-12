@@ -912,13 +912,13 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Slice the middle 1x2 block out of a 2x3 matrix.
-/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let y = x.slice(&[1, 1], &[2, 3], &[1, 1])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
 /// assert_eq!(y.to_f64s(), vec![5.0, 6.0]);
 ///
 /// // A non-unit stride keeps every other element, like `x[0:6:2]` in NumPy.
-/// let x = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+/// let x = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 /// let y = x.slice(&[1], &[6], &[2])?;
 /// assert_eq!(y.to_f64s(), vec![1.0, 3.0, 5.0]);
 /// # Ok(())
@@ -1356,8 +1356,8 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
-/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-/// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
+/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+/// let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
 /// let y = x.update_slice(&update, &[0, 1])?;
 /// assert_eq!(y.to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
@@ -1922,9 +1922,9 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
-/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
-/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
+/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
+/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
 /// let y = x.dynamic_slice(&[i, j], &[1, 2])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
 /// assert_eq!(y.to_f64s(), vec![5.0, 6.0]);
@@ -2488,10 +2488,10 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
-/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-/// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
-/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![0.0]);
-/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
+/// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+/// let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
+/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![0.0]).unwrap();
+/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
 /// let y = x.dynamic_update_slice(&update, &[i, j])?;
 /// assert_eq!(y.to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
@@ -2911,7 +2911,7 @@ mod tests {
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
     fn index(value: f64) -> Array {
-        Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value])
+        Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]).unwrap()
     }
 
     /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
@@ -2922,7 +2922,7 @@ mod tests {
     {
         exemplar
             .dispatch_domain()
-            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]))
+            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]).unwrap())
             .unwrap()
     }
 
@@ -2930,7 +2930,8 @@ mod tests {
     fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
         let length = values.len();
         let value =
-            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])), values);
+            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])), values)
+                .unwrap();
         ArrayBatch::new(value, Some(0)).unwrap()
     }
 
@@ -2951,7 +2952,7 @@ mod tests {
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap()),
             BatchAxis::new(0),
         )
         .unwrap();
@@ -2966,7 +2967,10 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 5.0, 6.0])),);
+        assert_eq!(
+            outputs[0].value(),
+            &ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 5.0, 6.0]).unwrap()),
+        );
     }
 
     #[test]
@@ -3005,8 +3009,8 @@ mod tests {
         );
 
         // Interpretation overwrites the block at the in-band start indices.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let update = Array::matrix(1, 2, vec![8.0, 9.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
         let output = operation
             .interpret(
                 &EagerContext::<Array>::new(),
@@ -3159,10 +3163,10 @@ mod tests {
         );
 
         // Partial evaluation folds known updates and residualizes an unknown operand with captured start indices.
-        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
-        let update = Array::vector(vec![8.0, 9.0]);
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        let update = Array::vector(vec![8.0, 9.0]).unwrap();
         let start = index(1.0);
-        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]);
+        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = DynamicUpdateSliceOperation,
@@ -3195,7 +3199,7 @@ mod tests {
                         2,
                         4,
                         vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-                    )),
+                    ).unwrap()),
                     (@replicated, update),
                     (@replicated, start),
                 ],
@@ -3203,7 +3207,7 @@ mod tests {
                     2,
                     4,
                     vec![0.0, 8.0, 9.0, 3.0, 4.0, 8.0, 9.0, 7.0],
-                ))],
+                ).unwrap())],
             }],
         );
     }
@@ -3212,9 +3216,9 @@ mod tests {
     fn test_dynamic_update_slice_batching_expands_batch_varying_indices() {
         // A batched update with batch-varying start indices over a replicated input expands per item: item 0
         // writes `[9, 9]` at offset 0 and item 1 writes `[8, 8]` at offset 2 of the shared input.
-        let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         let update = {
-            let value = Array::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]);
+            let value = Array::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -3234,11 +3238,11 @@ mod tests {
 
         // A batched input with a replicated update writes the same block at each batch item's own offset.
         let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
-        let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
+        let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]).unwrap());
         let outputs = DynamicUpdateSliceOperation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
@@ -3258,7 +3262,7 @@ mod tests {
         // start indices are the known operands. The output and its cotangent have shape [2, 3].
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
-        let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 
         check_operation_transposition!(
             @exact,
@@ -3272,8 +3276,8 @@ mod tests {
                 ],
                 output_cotangents = [cotangent],
                 input_cotangents = [
-                    Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]),
-                    Array::matrix(1, 2, vec![2.0, 3.0]),
+                    Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]).unwrap(),
+                    Array::matrix(1, 2, vec![2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -3285,7 +3289,8 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
         let start =
-            Array::from_f64s(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }), vec![1.0]);
+            Array::from_f64s(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }), vec![1.0])
+                .unwrap();
         check_operation_transposition!(
             @exact,
             operation = DynamicUpdateSliceOperation,
@@ -3295,23 +3300,25 @@ mod tests {
                     (@linear(type = update_type.clone())),
                     (@known, start),
                 ],
-                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0])],
+                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]),
-                    Array::from_f64s(update_type, vec![2.0, 3.0]),
+                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]).unwrap(),
+                    Array::from_f64s(update_type, vec![2.0, 3.0]).unwrap(),
                 ],
             }],
         );
 
         // Composing JVP and transposition must retain the captured start index: the input gradient is the output
         // cotangent with the update window zeroed, while the update gradient is that window of the cotangent.
-        let (value, (input_gradient, update_gradient)) =
-            differentiate_at((Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])))
-                .value_and_gradient(|(x, update)| {
-                    let start = index_constant(&x, 1.0);
-                    x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
-                })
-                .unwrap();
+        let (value, (input_gradient, update_gradient)) = differentiate_at((
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![7.0, 8.0]).unwrap(),
+        ))
+        .value_and_gradient(|(x, update)| {
+            let start = index_constant(&x, 1.0);
+            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+        })
+        .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
@@ -3358,7 +3365,7 @@ mod tests {
         );
 
         // Interpretation extracts the block at the in-band start indices.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(1.0), index(1.0)])
             .unwrap();
@@ -3502,9 +3509,9 @@ mod tests {
         );
 
         // Partial evaluation folds known starts and residualizes the read when the operand remains unknown.
-        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
         let start = index(1.0);
-        let expected = Array::vector(vec![1.0, 2.0]);
+        let expected = Array::vector(vec![1.0, 2.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = DynamicSliceOperation::new(vec![2]),
@@ -3536,10 +3543,10 @@ mod tests {
                         2,
                         4,
                         vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-                    )),
+                    ).unwrap()),
                     (@replicated, start),
                 ],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]).unwrap())],
             }],
         );
     }
@@ -3548,7 +3555,7 @@ mod tests {
     fn test_dynamic_slice_batching_expands_batch_varying_indices() {
         // Batch-varying start indices over a replicated operand expand per item: item 0 reads `x[0..2]` and item 1
         // reads `x[2..4]` of the shared operand, restacked along a fresh leading batch axis.
-        let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
@@ -3566,7 +3573,7 @@ mod tests {
         // A batched operand pairs item `i` of the operand with item `i` of the indices; item 1's start index 3 is
         // clamped to 2 so the extracted block stays in bounds.
         let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -3585,7 +3592,7 @@ mod tests {
         // An operand batched on a non-leading axis is realigned to the fresh leading batch axis first: the physical
         // `[4, 2]` operand carries per-item vectors `[0, 1, 2, 3]` and `[4, 5, 6, 7]` along axis 1.
         let trailing = {
-            let value = Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
+            let value = Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]).unwrap();
             ArrayBatch::new(value, Some(1))
         }
         .unwrap();
@@ -3609,14 +3616,17 @@ mod tests {
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let starts = context
-                    .lift(Array::from_f64s(
-                        ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])),
-                        vec![1.0, 2.0],
-                    ))
+                    .lift(
+                        Array::from_f64s(
+                            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])),
+                            vec![1.0, 2.0],
+                        )
+                        .unwrap(),
+                    )
                     .unwrap();
                 let stacked = batch(
                     |(item, start)| item.dynamic_slice(&[start], &[2]),
@@ -3626,7 +3636,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()).unwrap();
                 (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
             })
             .unwrap();
@@ -3640,7 +3650,7 @@ mod tests {
         // Slice a [1, 2] block at start (1, 1) of a [2, 3] operand: the operand is linear and the scalar start indices
         // are the known operands. The sliced output and its cotangent have shape [1, 2].
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]);
+        let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]).unwrap();
         let sizes = vec![1, 2];
 
         check_operation_transposition!(
@@ -3653,13 +3663,13 @@ mod tests {
                     (@known, index(1.0)),
                 ],
                 output_cotangents = [cotangent],
-                input_cotangents = [Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0])],
+                input_cotangents = [Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0]).unwrap()],
             }],
         );
 
         // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
         // batched basis tangents.
-        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
             .jacobian_forward(|x| {
                 let start = index_constant(&x, 1.0);
                 Ok(x.dynamic_slice(&[start], &[2]).unwrap())
@@ -3674,12 +3684,12 @@ mod tests {
     #[test]
     fn test_dynamic_slice_differentiation_pullback_batching_orders() {
         // Batching a pullback and pulling back a batched function must preserve the same indexed linear map.
-        let input = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let batched_pullback = batch(
             |value| {
-                let seed = value.context().constant(Array::vector(vec![2.0_f32]))?;
+                let seed = value.context().constant(Array::vector(vec![2.0_f32]).unwrap())?;
                 let (_, pullback) = differentiate_at(value).vjp(|value| {
-                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     value.dynamic_slice(&[start], &[1])
                 })?;
                 pullback.apply(seed)
@@ -3689,13 +3699,13 @@ mod tests {
             BatchAxis::new(0),
             None,
         );
-        assert_eq!(batched_pullback, Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0])));
+        assert_eq!(batched_pullback, Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0]).unwrap()));
 
         let (_, pullback) = differentiate_at(input)
             .vjp(|value| {
                 Ok(batch(
                     |value| {
-                        let start = value.context().constant(Array::scalar(1_i32))?;
+                        let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                         value.dynamic_slice(&[start], &[1])
                     },
                     value,
@@ -3706,8 +3716,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            pullback.apply(Array::matrix(2, 1, vec![2.0_f32, 2.0])),
-            Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0])),
+            pullback.apply(Array::matrix(2, 1, vec![2.0_f32, 2.0]).unwrap()),
+            Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0]).unwrap()),
         );
     }
 
@@ -3715,30 +3725,33 @@ mod tests {
     fn test_dynamic_slice_differentiation_pullback_higher_order() {
         // Squaring before indexing leaves the primal value as a runtime coefficient of the pullback. Its derivative
         // must survive expanding the indexed backward rule, in both forward-over-reverse and reverse-over-reverse.
-        let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]))
-            .jvp(Array::vector(vec![1.0_f32; 3]), |value| {
-                let seed = value.context().constant(Array::vector(vec![1.0_f32]))?;
+        let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap())
+            .jvp(Array::vector(vec![1.0_f32; 3]).unwrap(), |value| {
+                let seed = value.context().constant(Array::vector(vec![1.0_f32]).unwrap())?;
                 let (_, pullback) = differentiate_at(value).vjp(|value| {
-                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     (value.clone() * value).dynamic_slice(&[start], &[1])
                 })?;
                 pullback.apply(seed)
             })
             .unwrap();
-        assert_eq!(gradient, Array::vector(vec![0.0_f32, 10.0, 0.0]));
-        assert_eq!(tangent, Array::vector(vec![0.0_f32, 2.0, 0.0]));
+        assert_eq!(gradient, Array::vector(vec![0.0_f32, 10.0, 0.0]).unwrap());
+        assert_eq!(tangent, Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap());
 
-        let (_, pullback) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]))
+        let (_, pullback) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap())
             .vjp(|value| {
-                let seed = value.context().constant(Array::vector(vec![1.0_f32]))?;
+                let seed = value.context().constant(Array::vector(vec![1.0_f32]).unwrap())?;
                 let (_, pullback) = differentiate_at(value).vjp(|value| {
-                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    let start = value.context().constant(Array::scalar(1_i32).unwrap())?;
                     (value.clone() * value).dynamic_slice(&[start], &[1])
                 })?;
                 pullback.apply(seed)
             })
             .unwrap();
-        assert_eq!(pullback.apply(Array::vector(vec![1.0_f32; 3])), Ok(Array::vector(vec![0.0_f32, 2.0, 0.0])));
+        assert_eq!(
+            pullback.apply(Array::vector(vec![1.0_f32; 3]).unwrap()),
+            Ok(Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap())
+        );
     }
 
     #[test]
@@ -3770,30 +3783,39 @@ mod tests {
 
         // Different runtime starts share one transformed program, including the forward operation's clamping at
         // either end. Repeated calls add to the prepopulated buffer instead of resetting earlier contributions.
-        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5])).reference_new().unwrap();
-        let seed = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]));
+        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5]).unwrap()).reference_new().unwrap();
+        let seed = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
         assert_eq!(
-            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(1_i32))]),
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(1_i32).unwrap())]),
             Ok(vec![]),
         );
-        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 10.0, 10.0]))));
         assert_eq!(
-            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(20_i32))]),
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 10.0, 10.0]).unwrap()))
+        );
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(20_i32).unwrap())]),
             Ok(vec![]),
         );
-        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 12.0, 13.0]))));
         assert_eq!(
-            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(-1_i32))]),
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 12.0, 13.0]).unwrap()))
+        );
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(-1_i32).unwrap())]),
             Ok(vec![]),
         );
-        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![12.0_f64, 15.0, 13.0, 12.0, 13.0]))));
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![12.0_f64, 15.0, 13.0, 12.0, 13.0]).unwrap()))
+        );
 
         // The same retained rule returns a dense value when requested, while Ignore constructs no scratch buffer
         // and emits no arithmetic at all.
         let returned = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
-            returned.interpret(vec![seed, ArrayIrValue::Array(Array::scalar(1_i32))]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 2.0, 3.0, 0.0, 0.0]))]),
+            returned.interpret(vec![seed, ArrayIrValue::Array(Array::scalar(1_i32).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 2.0, 3.0, 0.0, 0.0]).unwrap())]),
         );
         let ignored = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
         assert!(ignored.instructions().is_empty());
@@ -3802,12 +3824,12 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_transpose_in_parent_batching() {
-        let destination = ArrayReference::new(Array::matrix(2, 3, vec![10.0_f32; 6]));
+        let destination = ArrayReference::new(Array::matrix(2, 3, vec![10.0_f32; 6]).unwrap());
         let result = batch(
             |(value, destination)| {
-                let seed = value.context().lift(ArrayIrValue::Array(Array::vector(vec![2.0_f32])))?;
+                let seed = value.context().lift(ArrayIrValue::Array(Array::vector(vec![2.0_f32]).unwrap()))?;
                 let (_, pullback) = differentiate_at(value).vjp(|value| {
-                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32).unwrap()))?;
                     Ok(value
                         .context()
                         .bind(
@@ -3824,7 +3846,7 @@ mod tests {
                 destination.read()
             },
             (
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
                 ArrayIrValue::Reference(destination.clone()),
             ),
             (BatchAxis::new(0), BatchAxis::new(0)),
@@ -3833,17 +3855,21 @@ mod tests {
         );
         // Each mapped buffer keeps its existing contents outside the selected coordinate, and batching preserves
         // additive updates to the selected coordinate rather than sharing one member's temporary storage.
-        assert_eq!(result, Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]))));
-        assert_eq!(destination.read(), Ok(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0])));
+        assert_eq!(
+            result,
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]).unwrap()))
+        );
+        assert_eq!(destination.read(), Ok(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]).unwrap()));
     }
 
     #[test]
     fn test_dynamic_slice_transpose_in_parent_higher_order() {
-        let (output, pullback) = differentiate_at(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 5.0, 7.0])))
+        let (output, pullback) = differentiate_at(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap()))
             .vjp(|value| {
-                let initial = value.context().constant(ArrayIrValue::Array(Array::vector(vec![10.0_f32; 3])))?;
+                let initial =
+                    value.context().constant(ArrayIrValue::Array(Array::vector(vec![10.0_f32; 3]).unwrap()))?;
                 let destination = initial.reference_new()?;
-                let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32).unwrap()))?;
                 let selected = value
                     .context()
                     .bind(
@@ -3861,7 +3887,7 @@ mod tests {
                     )?
                     .remove(0);
                 let (_, pullback) = differentiate_at(value).vjp(|value| {
-                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32).unwrap()))?;
                     Ok(value
                         .context()
                         .bind(
@@ -3878,12 +3904,12 @@ mod tests {
                 destination.read()
             })
             .unwrap();
-        assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10.0_f32, 35.0, 10.0])));
+        assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10.0_f32, 35.0, 10.0]).unwrap()));
         // The inner slice receives the caller's buffer directly. Its seed depends on the differentiated value, so
         // the outer pullback must differentiate the emitted buffer read/update/write operations as well.
         assert_eq!(
-            pullback.apply(ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]))),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 10.0, 0.0]))),
+            pullback.apply(ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 10.0, 0.0]).unwrap())),
         );
     }
 
@@ -3928,14 +3954,14 @@ mod tests {
         );
 
         // Interpretation overwrites the selected block of the row-major payload.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let update = Array::matrix(1, 2, vec![8.0, 9.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
         let output = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input, update]).unwrap();
         assert_eq!(*output[0].r#type(), input_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
         // Rank-0 updates replace the input entirely.
-        let scalar = Array::scalar(1.0).update_slice(&Array::scalar(7.0), &[]).unwrap();
+        let scalar = Array::scalar(1.0).unwrap().update_slice(&Array::scalar(7.0).unwrap(), &[]).unwrap();
         assert_eq!(scalar.to_f64s(), vec![7.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
@@ -4027,9 +4053,9 @@ mod tests {
         );
 
         // Check standard partial evaluation with known and residual operands.
-        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
-        let update = Array::vector(vec![8.0, 9.0]);
-        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]);
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        let update = Array::vector(vec![8.0, 9.0]).unwrap();
+        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = UpdateSliceOperation::new(vec![1]),
@@ -4062,25 +4088,25 @@ mod tests {
                             2,
                             4,
                             vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-                        )),
-                        (@replicated, Array::vector(vec![9.0, 9.0])),
+                        ).unwrap()),
+                        (@replicated, Array::vector(vec![9.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         4,
                         vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0])),
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0])),
+                        (@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0]).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         4,
                         vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0],
-                    ))],
+                    ).unwrap())],
                 },
             ],
         );
@@ -4091,15 +4117,15 @@ mod tests {
             operation = UpdateSliceOperation::new(vec![1]),
             cases = [{
                 primals = [
-                    Array::vector(vec![0.0, 1.0, 2.0, 3.0]),
-                    Array::vector(vec![8.0, 9.0]),
+                    Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap(),
+                    Array::vector(vec![8.0, 9.0]).unwrap(),
                 ],
                 tangents = [
-                    Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-                    Array::vector(vec![5.0, 6.0]),
+                    Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    Array::vector(vec![5.0, 6.0]).unwrap(),
                 ],
-                primal_outputs = [Array::vector(vec![0.0, 8.0, 9.0, 3.0])],
-                tangent_outputs = [Array::vector(vec![1.0, 5.0, 6.0, 4.0])],
+                primal_outputs = [Array::vector(vec![0.0, 8.0, 9.0, 3.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 5.0, 6.0, 4.0]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -4110,10 +4136,10 @@ mod tests {
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![4.into()])))),
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                 ],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::vector(vec![1.0, 0.0, 0.0, 4.0]),
-                    Array::vector(vec![2.0, 3.0]),
+                    Array::vector(vec![1.0, 0.0, 0.0, 4.0]).unwrap(),
+                    Array::vector(vec![2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -4129,10 +4155,10 @@ mod tests {
             operation = UpdateSliceOperation::new(vec![1]),
             cases = [{
                 inputs = [(@linear(type = input_type.clone())), (@linear(type = update_type.clone()))],
-                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0])],
+                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]),
-                    Array::from_f64s(update_type, vec![2.0, 3.0]),
+                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]).unwrap(),
+                    Array::from_f64s(update_type, vec![2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -4158,12 +4184,12 @@ mod tests {
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
-                    Array::from_f64s(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+                    Array::from_f64s(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
                     BatchAxis::new(0),
                 )
                 .unwrap()
             };
-            let make_update = || ArrayBatch::replicated(Array::from_f64s(update_type.clone(), vec![9.0, 9.0]));
+            let make_update = || ArrayBatch::replicated(Array::from_f64s(update_type.clone(), vec![9.0, 9.0]).unwrap());
 
             let static_outputs = UpdateSliceOperation::new(vec![1])
                 .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
@@ -4225,7 +4251,7 @@ mod tests {
         assert_eq!(input_type.slice(&[1, 1], &[2, 3], &[1, 1]), Ok(output_type.clone()));
 
         // Interpretation copies the selected block out of the row-major payload.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -4233,9 +4259,12 @@ mod tests {
         assert_eq!(output[0].to_f64s(), vec![5.0, 6.0]);
 
         // Empty slices produce empty payloads and rank-0 slices pass through.
-        let empty = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).slice(&[1, 1], &[1, 3], &[1, 1]).unwrap();
+        let empty = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .slice(&[1, 1], &[1, 3], &[1, 1])
+            .unwrap();
         assert_eq!(empty.to_f64s(), Vec::<f64>::new());
-        let scalar = Array::scalar(42.0).slice(&[], &[], &[]).unwrap();
+        let scalar = Array::scalar(42.0).unwrap().slice(&[], &[], &[]).unwrap();
         assert_eq!(scalar.to_f64s(), vec![42.0]);
 
         // Strided operations carry their strides through the builder, accessors, rendering, and inference: the
@@ -4250,16 +4279,16 @@ mod tests {
         );
 
         // Strided interpretation keeps the elements at `start + i * stride`.
-        let vector = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let vector = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         let strided_output = strided
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&vector))
             .unwrap();
         assert_eq!(strided_output[0].to_f64s(), vec![1.0, 3.0, 5.0]);
 
         // A stride larger than the sliced extent keeps a single element, and `start == limit` keeps none.
-        let single = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[1], &[4], &[5]).unwrap();
+        let single = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap().slice(&[1], &[4], &[5]).unwrap();
         assert_eq!(single.to_f64s(), vec![1.0]);
-        let strided_empty = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[2], &[2], &[2]).unwrap();
+        let strided_empty = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap().slice(&[2], &[2], &[2]).unwrap();
         assert_eq!(*strided_empty.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
         assert_eq!(strided_empty.to_f64s(), Vec::<f64>::new());
 
@@ -4330,8 +4359,8 @@ mod tests {
         );
 
         // Check standard partial evaluation with known and residual operands.
-        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
-        let expected = Array::vector(vec![1.0, 2.0]);
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+        let expected = Array::vector(vec![1.0, 2.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = SliceOperation::new(vec![1], vec![3]),
@@ -4360,12 +4389,12 @@ mod tests {
                         2,
                         4,
                         vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-                    ))],
-                    outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
+                    ).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]).unwrap())],
                 },
                 {
-                    inputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]))],
-                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0]))],
+                    inputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap())],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0]).unwrap())],
                 },
             ],
         );
@@ -4375,10 +4404,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = SliceOperation::new(vec![1], vec![3]),
             cases = [{
-                primals = [Array::vector(vec![0.0, 1.0, 2.0, 3.0])],
-                tangents = [Array::vector(vec![4.0, 5.0, 6.0, 7.0])],
-                primal_outputs = [Array::vector(vec![1.0, 2.0])],
-                tangent_outputs = [Array::vector(vec![5.0, 6.0])],
+                primals = [Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![4.0, 5.0, 6.0, 7.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 2.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![5.0, 6.0]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -4386,8 +4415,8 @@ mod tests {
             operation = SliceOperation::new(vec![1], vec![3]),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![4.into()]))))],
-                output_cotangents = [Array::vector(vec![5.0, 7.0])],
-                input_cotangents = [Array::vector(vec![0.0, 5.0, 7.0, 0.0])],
+                output_cotangents = [Array::vector(vec![5.0, 7.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![0.0, 5.0, 7.0, 0.0]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -4396,8 +4425,8 @@ mod tests {
             cases = [
                 {
                     inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
-                    input_cotangents = [Array::vector(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0])],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                    input_cotangents = [Array::vector(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]).unwrap()],
                 },
                 {
                     inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
@@ -4407,13 +4436,13 @@ mod tests {
                         ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
                             .with_memory(Memory::Host { pinned: true }),
                         vec![1.0, 2.0, 3.0],
-                    )],
+                    ).unwrap()],
                     input_cotangents = [Array::from_f64s(
                         ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
                             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
                             .with_memory(Memory::Host { pinned: true }),
                         vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
-                    )],
+                    ).unwrap()],
                 },
             ],
         );
@@ -4539,20 +4568,26 @@ mod tests {
             pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec!["reference_slice", "reference_add_update", "reference_slice", "reference_add_update"],
         );
-        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5])).reference_new().unwrap();
+        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5]).unwrap()).reference_new().unwrap();
         let seeds = [
-            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
-            ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap()),
         ];
         assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
-        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0, 16.0, 18.0, 16.0]))));
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0, 16.0, 18.0, 16.0]).unwrap()))
+        );
         assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
-        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 22.0, 26.0, 22.0]))));
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 22.0, 26.0, 22.0]).unwrap()))
+        );
 
         let returned = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             returned.interpret(seeds.to_vec()),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 6.0, 8.0, 6.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 6.0, 8.0, 6.0]).unwrap())]),
         );
     }
 
@@ -4565,6 +4600,7 @@ mod tests {
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
         let output = Array::from_f64s(input_type.clone(), values.clone())
+            .unwrap()
             .slice(&[0, 1, 2], &[2, 3, 4], &[1, 1, 1])
             .unwrap();
         assert_eq!(
@@ -4583,8 +4619,9 @@ mod tests {
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
             ),
             vec![-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
-        );
-        let updated = Array::from_f64s(input_type, values).update_slice(&update, &[0, 1, 2]).unwrap();
+        )
+        .unwrap();
+        let updated = Array::from_f64s(input_type, values).unwrap().update_slice(&update, &[0, 1, 2]).unwrap();
         assert_eq!(
             updated.to_f64s(),
             vec![
@@ -4602,6 +4639,7 @@ mod tests {
             ),
             (0..24).map(|value| value as f64).collect(),
         )
+        .unwrap()
         .slice(&[0, 0, 0], &[2, 3, 4], &[2, 2, 3])
         .unwrap();
         assert_eq!(
@@ -4614,15 +4652,15 @@ mod tests {
         assert_eq!(strided.to_f64s(), vec![0.0, 3.0, 8.0, 11.0]);
 
         // The dynamic kernels validate their index operand shapes eagerly.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
-            input.dynamic_slice(&[index(0.0), Array::vector(vec![1.0, 2.0])], &[1, 2]),
+            input.dynamic_slice(&[index(0.0), Array::vector(vec![1.0, 2.0]).unwrap()], &[1, 2]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`dynamic_slice` start index 1 must be a scalar integer but has type f64[2]".to_string()
             ))),
         );
         assert_eq!(
-            input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]), &[index(0.0)]),
+            input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]).unwrap(), &[index(0.0)]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`dynamic_update_slice` expects one start index per input axis (2) but got 1".to_string()
             ))),
@@ -4758,8 +4796,8 @@ mod tests {
 
     #[test]
     fn test_array_slice_layouts() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap(), Array::vector(vec![2.0, 4.0]));
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap(), Array::vector(vec![2.0, 4.0]).unwrap());
 
         // Static slicing traverses the logical coordinates of a reversed source layout.
         let input_type =
@@ -4770,10 +4808,10 @@ mod tests {
 
     #[test]
     fn test_array_update_slice_layouts() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         assert_eq!(
-            vector.update_slice(&Array::vector(vec![10.0, 20.0]), &[1]).unwrap(),
-            Array::vector(vec![1.0, 10.0, 20.0, 4.0, 5.0]),
+            vector.update_slice(&Array::vector(vec![10.0, 20.0]).unwrap(), &[1]).unwrap(),
+            Array::vector(vec![1.0, 10.0, 20.0, 4.0, 5.0]).unwrap(),
         );
 
         // Updating traverses arbitrary source and update layouts while preserving the destination layout.
@@ -4791,30 +4829,36 @@ mod tests {
 
     #[test]
     fn test_array_dynamic_slice_clamping() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         // Dynamic start indices clamp so the block stays in bounds.
-        let start = [Array::scalar(4i64)];
-        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]));
+        let start = [Array::scalar(4i64).unwrap()];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap());
         // Index decoding is typed and supports sub-byte integers directly; a negative start still clamps to zero.
-        let start = [Array::scalar(i4::new(-1).unwrap())];
-        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]));
+        let start = [Array::scalar(i4::new(-1).unwrap()).unwrap()];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap());
     }
 
     #[test]
     fn test_array_dynamic_slice_unsigned_extreme() {
-        let input = Array::vector(vec![1_i32, 2, 3]);
-        assert_eq!(input.dynamic_slice(&[Array::scalar(u64::MAX)], &[1]), Ok(Array::vector(vec![3_i32])));
-        assert_eq!(input.dynamic_slice(&[Array::scalar(i64::MIN)], &[1]), Ok(Array::vector(vec![1_i32])));
+        let input = Array::vector(vec![1_i32, 2, 3]).unwrap();
+        assert_eq!(
+            input.dynamic_slice(&[Array::scalar(u64::MAX).unwrap()], &[1]),
+            Ok(Array::vector(vec![3_i32]).unwrap())
+        );
+        assert_eq!(
+            input.dynamic_slice(&[Array::scalar(i64::MIN).unwrap()], &[1]),
+            Ok(Array::vector(vec![1_i32]).unwrap())
+        );
     }
 
     #[test]
     fn test_array_dynamic_update_slice_clamping() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         // Dynamic start indices clamp so the block stays in bounds.
-        let start = [Array::scalar(4i64)];
+        let start = [Array::scalar(4i64).unwrap()];
         assert_eq!(
-            vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]), &start).unwrap(),
-            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]),
+            vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]).unwrap(), &start).unwrap(),
+            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]).unwrap(),
         );
     }
 }

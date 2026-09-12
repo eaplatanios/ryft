@@ -127,38 +127,47 @@ mod tests {
 
     #[test]
     fn test_sign_interpretation() {
-        assert_eq!(Array::scalar(-3i32).sign().unwrap(), Array::scalar(-1i32));
-        assert_eq!(Array::scalar(0i32).sign().unwrap(), Array::scalar(0i32));
-        assert_eq!(Array::scalar(5i64).sign().unwrap(), Array::scalar(1i64));
-        assert_eq!(Array::scalar(-2.5f32).sign().unwrap(), Array::scalar(-1.0f32));
-        assert_eq!(Array::scalar(2.5f64).sign().unwrap(), Array::scalar(1.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(-4.0)).sign().unwrap(), Array::scalar(bf16::from_f32(-1.0)));
-        assert_eq!(Array::scalar(f16::from_f32(4.0)).sign().unwrap(), Array::scalar(f16::from_f32(1.0)));
+        assert_eq!(Array::scalar(-3i32).unwrap().sign().unwrap(), Array::scalar(-1i32).unwrap());
+        assert_eq!(Array::scalar(0i32).unwrap().sign().unwrap(), Array::scalar(0i32).unwrap());
+        assert_eq!(Array::scalar(5i64).unwrap().sign().unwrap(), Array::scalar(1i64).unwrap());
+        assert_eq!(Array::scalar(-2.5f32).unwrap().sign().unwrap(), Array::scalar(-1.0f32).unwrap());
+        assert_eq!(Array::scalar(2.5f64).unwrap().sign().unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(-4.0)).unwrap().sign().unwrap(),
+            Array::scalar(bf16::from_f32(-1.0)).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(4.0)).unwrap().sign().unwrap(),
+            Array::scalar(f16::from_f32(1.0)).unwrap()
+        );
         // Signed zeros and NaNs pass through unchanged.
-        assert_eq!(Array::scalar(0.0f64).sign().unwrap(), Array::scalar(0.0f64));
-        assert!(Array::scalar(-0.0f64).sign().unwrap().to_f64s()[0].is_sign_negative());
-        assert!(Array::scalar(f64::NAN).sign().unwrap().to_f64s()[0].is_nan());
+        assert_eq!(Array::scalar(0.0f64).unwrap().sign().unwrap(), Array::scalar(0.0f64).unwrap());
+        assert!(Array::scalar(-0.0f64).unwrap().sign().unwrap().to_f64s()[0].is_sign_negative());
+        assert!(Array::scalar(f64::NAN).unwrap().sign().unwrap().to_f64s()[0].is_nan());
         // Complex signs normalize to `z / |z|` and map the origin to itself.
         let input = ComplexNumber::new(3.0f64, -4.0f64);
         assert_abs_diff_eq!(
-            Array::scalar(input).sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.6, -0.8)),
+            Array::scalar(input).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.8)).unwrap(),
             epsilon = 1e-12,
         );
         assert_eq!(
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap().sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap(),
         );
 
-        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.0]).sign().unwrap(), Array::vector(vec![-1.0, 0.0, 1.0]),);
+        assert_eq!(
+            Array::vector(vec![-0.7, 0.0, 2.0]).unwrap().sign().unwrap(),
+            Array::vector(vec![-1.0, 0.0, 1.0]).unwrap(),
+        );
     }
 
     #[test]
     fn test_sign_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = SignOperation::new(),
-            inputs = [Array::scalar(-0.7)],
-            expected = Array::scalar(-1.0),
+            inputs = [Array::scalar(-0.7).unwrap()],
+            expected = Array::scalar(-1.0).unwrap(),
         );
     }
 
@@ -169,8 +178,8 @@ mod tests {
             operation = SignOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]).unwrap())],
             }],
         );
     }
@@ -181,10 +190,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = SignOperation::new(),
             cases = [{
-                primals = [Array::scalar(-2.0)],
-                tangents = [Array::scalar(1.0)],
-                primal_outputs = [Array::scalar(-1.0)],
-                tangent_outputs = [Array::scalar(0.0)],
+                primals = [Array::scalar(-2.0).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(-1.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
             }],
         );
     }
@@ -196,8 +205,8 @@ mod tests {
             operation = SignOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
             }],
         );
     }

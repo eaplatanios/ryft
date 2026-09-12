@@ -1163,7 +1163,7 @@ mod tests {
         let derived_program = program.entry_region_ref().to_program().to_string();
         let mut different_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         different_builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = different_builder.add_constant(Array::scalar(1.0));
+        let constant = different_builder.add_constant(Array::scalar(1.0).unwrap());
         let different = different_builder.build(vec![constant], vec![Placeholder], vec![Placeholder]).unwrap();
         let cached_program = different.to_string();
         program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(

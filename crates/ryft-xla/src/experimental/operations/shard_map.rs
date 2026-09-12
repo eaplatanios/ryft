@@ -1566,7 +1566,7 @@ fn transpose_shard_map_body<
                     let count =
                         axes.iter().map(|axis| shard_map.mesh().axis_size(axis).unwrap() as f64).product::<f64>();
                     let r#type = boundary_array_type(&r#type)?;
-                    let literal = CpuArray::scalar(count).convert_element_type(r#type.data_type())?;
+                    let literal = CpuArray::scalar(count)?.convert_element_type(r#type.data_type())?;
                     let denominator =
                         builder.add_instruction(ConstantOperation::new(literal), Vec::new(), Vec::new(), None)?[0];
                     let denominator = builder.add_instruction(

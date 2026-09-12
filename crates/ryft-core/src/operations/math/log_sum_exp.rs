@@ -333,16 +333,16 @@ mod tests {
         // The expected values below spell out the guarded construction the primitive documents (shift by the safe
         // maximum, sum the exponentials, take the logarithm, add the shift back) so that they pin that construction
         // rather than an equivalent-in-exact-arithmetic alternative.
-        let values = Array::vector(vec![1.0, 2.0, 3.0]);
+        let values = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let expected = ((1.0f64 - 3.0).exp() + (2.0f64 - 3.0).exp() + 1.0).ln() + 3.0;
-        assert_eq!(values.log_sum_exp(&[0]), Ok(Array::scalar(expected)));
+        assert_eq!(values.log_sum_exp(&[0]), Ok(Array::scalar(expected).unwrap()));
         assert_abs_diff_eq!(expected, (1.0f64.exp() + 2.0f64.exp() + 3.0f64.exp()).ln(), epsilon = 1e-12);
 
         // Reducing along no axes is the identity, matching `log(exp(x)) = x`, but only for the operands the staged
         // operation accepts: the shortcut still validates the element data type.
         assert_eq!(values.log_sum_exp(&[]), Ok(values.clone()));
         assert_eq!(
-            Array::vector(vec![1_i32, 2]).log_sum_exp(&[]),
+            Array::vector(vec![1_i32, 2]).unwrap().log_sum_exp(&[]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`log_sum_exp` requires real floating-point inputs but got i32".to_string(),
             ))),
@@ -350,36 +350,42 @@ mod tests {
 
         // Two equal operands add exactly `log(2)`, at any magnitude: the shift keeps the exponentials at one where
         // the naive composition would already have overflowed.
-        assert_eq!(Array::vector(vec![0.0, 0.0]).log_sum_exp(&[0]), Ok(Array::scalar(std::f64::consts::LN_2)));
         assert_eq!(
-            Array::vector(vec![1000.0, 1000.0]).log_sum_exp(&[0]),
-            Ok(Array::scalar(1000.0 + std::f64::consts::LN_2)),
+            Array::vector(vec![0.0, 0.0]).unwrap().log_sum_exp(&[0]),
+            Ok(Array::scalar(std::f64::consts::LN_2).unwrap())
+        );
+        assert_eq!(
+            Array::vector(vec![1000.0, 1000.0]).unwrap().log_sum_exp(&[0]),
+            Ok(Array::scalar(1000.0 + std::f64::consts::LN_2).unwrap()),
         );
         assert!((1000.0f64.exp() + 1000.0f64.exp()).ln().is_infinite());
 
         // The guard's reason to exist: an all-`-∞` slice and an empty reduction both pin to `-∞` (`log(0) + 0`)
         // instead of the `-∞ - -∞ = NaN` that shifting by the raw maximum would produce.
         assert_eq!(
-            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY]).log_sum_exp(&[0]),
-            Ok(Array::scalar(f64::NEG_INFINITY)),
+            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY]).unwrap().log_sum_exp(&[0]),
+            Ok(Array::scalar(f64::NEG_INFINITY).unwrap()),
         );
         assert_eq!(
             Array::new(ArrayType::new_static(DataType::F64, [0]), Vec::new()).unwrap().log_sum_exp(&[0]),
-            Ok(Array::scalar(f64::NEG_INFINITY)),
+            Ok(Array::scalar(f64::NEG_INFINITY).unwrap()),
         );
 
         // A `+∞` element saturates the result, and NaN propagates.
-        assert_eq!(Array::vector(vec![1.0, f64::INFINITY]).log_sum_exp(&[0]), Ok(Array::scalar(f64::INFINITY)));
-        assert!(Array::vector(vec![1.0, f64::NAN]).log_sum_exp(&[0]).unwrap().to_f64s()[0].is_nan());
+        assert_eq!(
+            Array::vector(vec![1.0, f64::INFINITY]).unwrap().log_sum_exp(&[0]),
+            Ok(Array::scalar(f64::INFINITY).unwrap())
+        );
+        assert!(Array::vector(vec![1.0, f64::NAN]).unwrap().log_sum_exp(&[0]).unwrap().to_f64s()[0].is_nan());
 
         // Reducing one axis of a matrix leaves the other, in order.
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let row = |maximum: f64, values: [f64; 3]| {
             (values.iter().map(|value| (value - maximum).exp()).sum::<f64>()).ln() + maximum
         };
         assert_eq!(
             matrix.log_sum_exp(&[1]),
-            Ok(Array::vector(vec![row(3.0, [1.0, 2.0, 3.0]), row(6.0, [4.0, 5.0, 6.0])])),
+            Ok(Array::vector(vec![row(3.0, [1.0, 2.0, 3.0]), row(6.0, [4.0, 5.0, 6.0])]).unwrap()),
         );
 
         // Validation errors are reported rather than panicking.
@@ -390,7 +396,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            Array::vector(vec![1_i32, 2]).log_sum_exp(&[0]),
+            Array::vector(vec![1_i32, 2]).unwrap().log_sum_exp(&[0]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`log_sum_exp` requires real floating-point inputs but got i32".to_string(),
             ))),
@@ -401,8 +407,8 @@ mod tests {
     fn test_log_sum_exp_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogSumExpOperation::new(vec![0]),
-            inputs = [Array::vector(vec![0.0, 0.0])],
-            expected = Array::scalar(std::f64::consts::LN_2),
+            inputs = [Array::vector(vec![0.0, 0.0]).unwrap()],
+            expected = Array::scalar(std::f64::consts::LN_2).unwrap(),
         );
     }
 
@@ -415,10 +421,10 @@ mod tests {
             operation = LogSumExpOperation::new(vec![0]),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 0.0, 1000.0, 1000.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 0.0, 1000.0, 1000.0]).unwrap())],
                 outputs = [(@mapped(
                     axis = 0
-                ), Array::vector(vec![std::f64::consts::LN_2, 1000.0 + std::f64::consts::LN_2]))],
+                ), Array::vector(vec![std::f64::consts::LN_2, 1000.0 + std::f64::consts::LN_2]).unwrap())],
             }],
         );
     }
@@ -430,8 +436,8 @@ mod tests {
             operation = LogSumExpOperation::new(vec![0]),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]))],
-                outputs = [(@replicated, Array::scalar(std::f64::consts::LN_2))],
+                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]).unwrap())],
+                outputs = [(@replicated, Array::scalar(std::f64::consts::LN_2).unwrap())],
             }],
         );
     }
@@ -441,9 +447,14 @@ mod tests {
         // Static array batching cannot neutralize ragged padding, and says so rather than summing the padding's
         // exponentials into the live result.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![0.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                Array::vector(vec![1_i32, 3]).unwrap(),
+                variable.clone(),
+                vec![0],
+            )])
             .unwrap();
         assert_eq!(
             LogSumExpOperation::new(vec![0]).batch(
@@ -533,10 +544,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = LogSumExpOperation::new(vec![0]),
             cases = [{
-                primals = [Array::vector(primals.to_vec())],
-                tangents = [Array::vector(tangents.to_vec())],
-                primal_outputs = [Array::scalar(output)],
-                tangent_outputs = [Array::scalar(tangent)],
+                primals = [Array::vector(primals.to_vec()).unwrap()],
+                tangents = [Array::vector(tangents.to_vec()).unwrap()],
+                primal_outputs = [Array::scalar(output).unwrap()],
+                tangent_outputs = [Array::scalar(tangent).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3] .
                     let %2:f64[] = log_sum_exp [axes=[0]] %0

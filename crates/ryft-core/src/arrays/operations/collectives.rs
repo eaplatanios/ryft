@@ -327,12 +327,12 @@ mod tests {
             RaggedAllToAllOperation::new("x".to_string(), 1),
             Vec::new(),
             &[
-                Array::vector(vec![1.0_f32, 2.0, 3.0]),
-                Array::vector(vec![9.0_f32, 9.0, 9.0, 9.0]),
-                Array::vector(input_offsets),
-                Array::vector(send_sizes),
-                Array::vector(output_offsets),
-                Array::vector(receive_sizes),
+                Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap(),
+                Array::vector(vec![9.0_f32, 9.0, 9.0, 9.0]).unwrap(),
+                Array::vector(input_offsets).unwrap(),
+                Array::vector(send_sizes).unwrap(),
+                Array::vector(output_offsets).unwrap(),
+                Array::vector(receive_sizes).unwrap(),
             ],
         )?;
         Ok(outputs.remove(0))
@@ -362,7 +362,7 @@ mod tests {
     fn test_array_ragged_all_to_all_eager_metadata_validation() {
         assert_eq!(
             interpret_single_participant_ragged_all_to_all(vec![1], vec![2], vec![0], vec![2]),
-            Ok(Array::vector(vec![2.0_f32, 3.0, 9.0, 9.0])),
+            Ok(Array::vector(vec![2.0_f32, 3.0, 9.0, 9.0]).unwrap()),
         );
         assert_eq!(
             interpret_single_participant_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
@@ -401,7 +401,7 @@ mod tests {
         );
         assert_eq!(
             interpret_single_participant_ragged_all_to_all(vec![0, 0], vec![1, 1], vec![0, 1], vec![1, 1]),
-            Ok(Array::vector(vec![1.0_f32, 1.0, 9.0, 9.0])),
+            Ok(Array::vector(vec![1.0_f32, 1.0, 9.0, 9.0]).unwrap()),
         );
 
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -411,12 +411,12 @@ mod tests {
                     RaggedAllToAllOperation::new("x".to_string(), 1),
                     Vec::new(),
                     &[
-                        Array::vector(vec![1.0_f32]),
-                        Array::vector(vec![0.0_f32]),
-                        Array::vector(vec![u64::MAX]),
-                        Array::vector(vec![1_u64]),
-                        Array::vector(vec![0_u64]),
-                        Array::vector(vec![1_u64]),
+                        Array::vector(vec![1.0_f32]).unwrap(),
+                        Array::vector(vec![0.0_f32]).unwrap(),
+                        Array::vector(vec![u64::MAX]).unwrap(),
+                        Array::vector(vec![1_u64]).unwrap(),
+                        Array::vector(vec![0_u64]).unwrap(),
+                        Array::vector(vec![1_u64]).unwrap(),
                     ],
                 )
                 .unwrap_err(),
@@ -443,12 +443,18 @@ mod tests {
                 inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             vec![
-                ArrayIrValue::Array(Array::matrix(2, 3, operand.clone())),
-                ArrayIrValue::Array(Array::matrix(2, 4, output_seed.clone())),
-                ArrayIrValue::Array(Array::matrix(2, 2, input_offsets.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(2, 2, send_sizes.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(2, 2, output_offsets.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(2, 2, receive_sizes)),
+                ArrayIrValue::Array(Array::matrix(2, 3, operand.clone()).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 4, output_seed.clone()).unwrap()),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(Array::matrix(2, 2, receive_sizes).unwrap()),
             ],
             vec![BatchAxis::new(0); 6],
             BatchAxis::new(0),
@@ -463,7 +469,7 @@ mod tests {
             1,
             &[(0, 0, 0, 0, 1), (0, 1, 1, 0, 2), (1, 0, 0, 1, 1), (1, 1, 1, 2, 1)],
         );
-        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 4, expected)));
+        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 4, expected).unwrap()));
 
         // Reversed noncontiguous groups, two slices per peer, and width-two rows exercise every routing index and
         // prove that the byte kernel preserves trailing dimensions.
@@ -498,10 +504,16 @@ mod tests {
                     Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), output_seed.as_slice())
                         .unwrap(),
                 ),
-                ArrayIrValue::Array(Array::matrix(4, 4, input_offsets.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(4, 4, send_sizes.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(4, 4, output_offsets.iter().map(|value| *value as i32).collect())),
-                ArrayIrValue::Array(Array::matrix(4, 4, receive_sizes)),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(Array::matrix(4, 4, receive_sizes).unwrap()),
             ],
             vec![BatchAxis::new(0); 6],
             BatchAxis::new(0),
@@ -544,7 +556,7 @@ mod tests {
     #[test]
     fn test_array_ir_explicit_collective_eager_contracts() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
 
         assert_eq!(
@@ -582,12 +594,12 @@ mod tests {
                 AllToAllOperation::new("x".to_string(), 1, 0, 1, CollectiveOptions::tiled()),
                 Vec::new(),
                 &[
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],)),
+                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
                 ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap())]),
         );
 
         assert_eq!(
@@ -684,8 +696,8 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let primal = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let primal = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
         let result_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
         let jvp = program.jvp().unwrap();
         assert_eq!(
@@ -701,19 +713,19 @@ mod tests {
         assert_eq!(linearization.residual_count(), 1);
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])), result_extent])
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()), result_extent])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
         let zero_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
         let zero_array = || {
-            ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])),
-                Vec::new(),
-            ))
+            ArrayIrValue::Array(
+                Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])), Vec::new())
+                    .unwrap(),
+            )
         };
         let mut primal_outputs = linearization.primal().interpret(vec![zero_array(), zero_extent]).unwrap();
         let residuals = primal_outputs.split_off(1);
@@ -764,16 +776,16 @@ mod tests {
         let rendered_tangent = linearization.tangent().to_string();
         assert!(rendered_tangent.contains("dynamic_shape_slice"));
         assert!(rendered_tangent.contains("reshape"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
         let mut pullback_inputs = vec![cotangent];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())]),
         );
 
         // A nondegenerate untiled invariant gather selects the current participant's size-one slice and reshapes
@@ -844,11 +856,11 @@ mod tests {
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
@@ -873,10 +885,10 @@ mod tests {
             .unwrap();
         let linearization = program.linearize().unwrap();
         assert!(linearization.tangent().to_string().contains("linear_call"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]));
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
         let mut pullback_inputs = vec![cotangent.clone()];
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));

@@ -93,22 +93,31 @@ mod tests {
 
     #[test]
     fn test_floor_interpretation() {
-        assert_eq!(Array::scalar(2.7f32).floor().unwrap(), Array::scalar(2.0f32));
-        assert_eq!(Array::scalar(-2.3f64).floor().unwrap(), Array::scalar(-3.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.7)).floor().unwrap(), Array::scalar(bf16::from_f32(2.7f32.floor())),);
-        assert_eq!(Array::scalar(f16::from_f32(2.7)).floor().unwrap(), Array::scalar(f16::from_f32(2.7f32.floor())),);
+        assert_eq!(Array::scalar(2.7f32).unwrap().floor().unwrap(), Array::scalar(2.0f32).unwrap());
+        assert_eq!(Array::scalar(-2.3f64).unwrap().floor().unwrap(), Array::scalar(-3.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.7)).unwrap().floor().unwrap(),
+            Array::scalar(bf16::from_f32(2.7f32.floor())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.7)).unwrap().floor().unwrap(),
+            Array::scalar(f16::from_f32(2.7f32.floor())).unwrap(),
+        );
         // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).floor().unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(f64::NAN).unwrap().floor().unwrap().to_f64s()[0].is_nan());
 
-        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.5]).floor().unwrap(), Array::vector(vec![-1.0, 0.0, 2.0]),);
+        assert_eq!(
+            Array::vector(vec![-0.7, 0.0, 2.5]).unwrap().floor().unwrap(),
+            Array::vector(vec![-1.0, 0.0, 2.0]).unwrap(),
+        );
     }
 
     #[test]
     fn test_floor_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = FloorOperation::new(),
-            inputs = [Array::scalar(2.7)],
-            expected = Array::scalar(2.0),
+            inputs = [Array::scalar(2.7).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
         );
     }
 
@@ -119,8 +128,8 @@ mod tests {
             operation = FloorOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.0, -2.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.0, -2.0]).unwrap())],
             }],
         );
     }
@@ -131,10 +140,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = FloorOperation::new(),
             cases = [{
-                primals = [Array::scalar(-2.5)],
-                tangents = [Array::scalar(1.0)],
-                primal_outputs = [Array::scalar(-3.0)],
-                tangent_outputs = [Array::scalar(0.0)],
+                primals = [Array::scalar(-2.5).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(-3.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
             }],
         );
     }
@@ -146,8 +155,8 @@ mod tests {
             operation = FloorOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
             }],
         );
     }

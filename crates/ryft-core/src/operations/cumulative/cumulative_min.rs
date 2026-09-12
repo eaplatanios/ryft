@@ -150,42 +150,42 @@ mod tests {
         };
 
         // Forward scans accumulate prefixes and reverse scans accumulate suffixes, along the selected axis only.
-        let input = Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]);
+        let input = Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap();
         assert_eq!(
             interpret(&CumulativeMinOperation::new(1), &input),
-            Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeMinOperation::new(1).with_reverse(true), &input),
-            Array::matrix(2, 3, vec![1.0, 1.0, 4.0, 1.0, 5.0, 9.0]),
+            Array::matrix(2, 3, vec![1.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeMinOperation::new(0), &input),
-            Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 1.0, 4.0]),
+            Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 1.0, 4.0]).unwrap(),
         );
 
         // A monotonically ordered operand pins the two directions against each other: a descending sequence is its
         // own forward running minimum, and an ascending one is its own reverse running minimum.
-        let ascending = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(interpret(&CumulativeMinOperation::new(0), &ascending), Array::vector(vec![1.0; 5]));
+        let ascending = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert_eq!(interpret(&CumulativeMinOperation::new(0), &ascending), Array::vector(vec![1.0; 5]).unwrap());
         assert_eq!(interpret(&CumulativeMinOperation::new(0).with_reverse(true), &ascending), ascending.clone(),);
-        let descending = Array::vector(vec![5.0, 4.0, 3.0, 2.0, 1.0]);
+        let descending = Array::vector(vec![5.0, 4.0, 3.0, 2.0, 1.0]).unwrap();
         assert_eq!(interpret(&CumulativeMinOperation::new(0), &descending), descending.clone());
         assert_eq!(
             interpret(&CumulativeMinOperation::new(0).with_reverse(true), &descending),
-            Array::vector(vec![1.0; 5]),
+            Array::vector(vec![1.0; 5]).unwrap(),
         );
 
         // Integer payloads select in their own element type, and a zero-length scanned axis keeps the exact operand.
         assert_eq!(
-            interpret(&CumulativeMinOperation::new(0), &Array::vector(vec![7_i32, -2, 3])),
-            Array::vector(vec![7_i32, -2, -2]),
+            interpret(&CumulativeMinOperation::new(0), &Array::vector(vec![7_i32, -2, 3]).unwrap()),
+            Array::vector(vec![7_i32, -2, -2]).unwrap(),
         );
         let empty = Array::new(ArrayType::new_static(DataType::F32, [0, 2]), Vec::new()).unwrap();
         assert_eq!(interpret(&CumulativeMinOperation::new(0), &empty), empty);
 
         // NaNs propagate through the elementwise extremum, so every later prefix of a NaN is NaN.
-        let scanned = interpret(&CumulativeMinOperation::new(0), &Array::vector(vec![1.0, f64::NAN, 2.0]));
+        let scanned = interpret(&CumulativeMinOperation::new(0), &Array::vector(vec![1.0, f64::NAN, 2.0]).unwrap());
         let values = scanned.to_f64s();
         assert_eq!(values[0], 1.0);
         assert!(values[1].is_nan());
@@ -200,8 +200,8 @@ mod tests {
             operation = CumulativeMinOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::vector(vec![3.0, 1.0, 4.0]))],
-                outputs = [(@replicated, Array::vector(vec![3.0, 1.0, 1.0]))],
+                inputs = [(@replicated, Array::vector(vec![3.0, 1.0, 4.0]).unwrap())],
+                outputs = [(@replicated, Array::vector(vec![3.0, 1.0, 1.0]).unwrap())],
             }],
         );
 
@@ -212,8 +212,8 @@ mod tests {
             operation = CumulativeMinOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]))],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0]).unwrap())],
             }],
         );
 
@@ -223,8 +223,8 @@ mod tests {
             operation = CumulativeMinOperation::new(0),
             axis_size = 3,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]))],
-                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 1.0, 4.0]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 1.0, 4.0]).unwrap())],
             }],
         );
     }
@@ -235,9 +235,9 @@ mod tests {
         // neutralize that padding with the highest representable value first. Static array batching cannot, and says
         // so rather than silently scanning padding.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         assert_eq!(
             CumulativeMinOperation::new(0).batch(
@@ -323,20 +323,20 @@ mod tests {
             @approx(step = 1e-3, epsilon = 1e-6),
             operation = CumulativeMinOperation::new(0),
             cases = [{
-                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0])],
-                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
-                primal_outputs = [Array::vector(vec![3.0, 1.0, 1.0, 1.0, 1.0])],
-                tangent_outputs = [Array::vector(vec![1.0, 2.0, 2.0, 2.0, 2.0])],
+                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![3.0, 1.0, 1.0, 1.0, 1.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 2.0, 2.0, 2.0, 2.0]).unwrap()],
             }],
         );
         check_operation_differentiation!(
             @approx(step = 1e-3, epsilon = 1e-6),
             operation = CumulativeMinOperation::new(0).with_reverse(true),
             cases = [{
-                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0])],
-                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
-                primal_outputs = [Array::vector(vec![1.0, 1.0, 1.5, 1.5, 5.0])],
-                tangent_outputs = [Array::vector(vec![2.0, 2.0, 4.0, 4.0, 5.0])],
+                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 1.0, 1.5, 1.5, 5.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![2.0, 2.0, 4.0, 4.0, 5.0]).unwrap()],
             }],
         );
     }
@@ -345,9 +345,9 @@ mod tests {
     fn test_cumulative_min_capability_over_eager_arrays() {
         // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
         // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![3.0, 1.0, 4.0]);
-        assert_eq!(input.cumulative_min(0), Ok(Array::vector(vec![3.0, 1.0, 1.0])));
-        assert_eq!(input.reverse_cumulative_min(0), Ok(Array::vector(vec![1.0, 1.0, 4.0])));
+        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
+        assert_eq!(input.cumulative_min(0), Ok(Array::vector(vec![3.0, 1.0, 1.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_min(0), Ok(Array::vector(vec![1.0, 1.0, 4.0]).unwrap()));
         assert_eq!(
             input.cumulative_min(1),
             Err(ProgramError::Type(TypeError::invalid(

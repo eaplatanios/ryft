@@ -133,33 +133,42 @@ mod tests {
 
     #[test]
     fn test_pow_interpretation() {
-        assert_eq!(Array::scalar(2.0f32).pow(&Array::scalar(3.0f32)).unwrap(), Array::scalar(2.0f32.powf(3.0)),);
-        assert_eq!(Array::scalar(2.0f64).pow(&Array::scalar(3.0f64)).unwrap(), Array::scalar(2.0f64.powf(3.0)),);
         assert_eq!(
-            Array::scalar(bf16::from_f32(2.0)).pow(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
-            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))),
+            Array::scalar(2.0f32).unwrap().pow(&Array::scalar(3.0f32).unwrap()).unwrap(),
+            Array::scalar(2.0f32.powf(3.0)).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(2.0)).pow(&Array::scalar(f16::from_f32(3.0))).unwrap(),
-            Array::scalar(f16::from_f32(2.0f32.powf(3.0))),
+            Array::scalar(2.0f64).unwrap().pow(&Array::scalar(3.0f64).unwrap()).unwrap(),
+            Array::scalar(2.0f64.powf(3.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0))
+                .unwrap()
+                .pow(&Array::scalar(bf16::from_f32(3.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).unwrap().pow(&Array::scalar(f16::from_f32(3.0)).unwrap()).unwrap(),
+            Array::scalar(f16::from_f32(2.0f32.powf(3.0))).unwrap(),
         );
         // The complex power is the principal value `exp(y · log(x))`.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let exponent = ComplexNumber::new(2.0f64, 0.0f64);
         assert_abs_diff_eq!(
-            Array::scalar(input).pow(&Array::scalar(exponent)).unwrap(),
-            Array::scalar(input.powc(exponent)),
+            Array::scalar(input).unwrap().pow(&Array::scalar(exponent).unwrap()).unwrap(),
+            Array::scalar(input.powc(exponent)).unwrap(),
             epsilon = 1e-12,
         );
-        assert_eq!(Array::scalar(2.0).pow(&Array::scalar(3.0)).unwrap(), Array::scalar(8.0),);
+        assert_eq!(Array::scalar(2.0).unwrap().pow(&Array::scalar(3.0).unwrap()).unwrap(), Array::scalar(8.0).unwrap(),);
     }
 
     #[test]
     fn test_pow_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = PowOperation::new(),
-            inputs = [Array::scalar(2.0), Array::scalar(3.0)],
-            expected = Array::scalar(8.0),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+            expected = Array::scalar(8.0).unwrap(),
         );
     }
 
@@ -171,10 +180,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![2.0, 3.0])),
-                    (@mapped(axis = 0), Array::vector(vec![3.0, 2.0])),
+                    (@mapped(axis = 0), Array::vector(vec![2.0, 3.0]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![3.0, 2.0]).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![8.0, 9.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![8.0, 9.0]).unwrap())],
             }],
         );
     }
@@ -186,11 +195,11 @@ mod tests {
             operation = PowOperation::new(),
             cases = [
                 {
-                    primals = [Array::scalar(2.0), Array::scalar(3.0)],
-                    tangents = [Array::scalar(3.0), Array::scalar(5.0)],
-                    primal_outputs = [Array::scalar(8.0)],
+                    primals = [Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                    primal_outputs = [Array::scalar(8.0).unwrap()],
                     // d(x^y) = y · x^{y-1} · dx + x^y · ln(x) · dy = 3.0 · (3.0 · 4.0) + 5.0 · (8.0 · ln(2)).
-                    tangent_outputs = [Array::scalar(3.0 * (3.0 * 4.0) + 5.0 * (8.0 * 2.0f64.ln()))],
+                    tangent_outputs = [Array::scalar(3.0 * (3.0 * 4.0) + 5.0 * (8.0 * 2.0f64.ln())).unwrap()],
                 },
             ],
         );
@@ -212,9 +221,14 @@ mod tests {
             .jvp()
             .unwrap();
         let outputs = jvp_program
-            .interpret(vec![Array::scalar(0.0), Array::scalar(2.0), Array::scalar(1.0), Array::scalar(1.0)])
+            .interpret(vec![
+                Array::scalar(0.0).unwrap(),
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(1.0).unwrap(),
+                Array::scalar(1.0).unwrap(),
+            ])
             .unwrap();
-        assert_eq!(outputs, vec![Array::scalar(0.0), Array::scalar(0.0)]);
+        assert_eq!(outputs, vec![Array::scalar(0.0).unwrap(), Array::scalar(0.0).unwrap()]);
     }
 
     #[test]
@@ -222,14 +236,14 @@ mod tests {
         // The holomorphic gradient of z² is 2z.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(input))
+            differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
                 .gradient(|input| {
                     let exponent = input.one_like().unwrap() + input.one_like().unwrap();
                     input.pow(&exponent).unwrap()
                 })
                 .unwrap(),
-            Array::scalar(input * 2.0),
+            Array::scalar(input * 2.0).unwrap(),
             epsilon = 1e-12,
         );
     }

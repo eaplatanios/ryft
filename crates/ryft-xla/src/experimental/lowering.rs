@@ -12385,7 +12385,7 @@ mod tests {
         let context = TracingContext::<CpuArray, ArrayOperation<CpuArray>>::new();
         let operand = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
         let output = context.input(ArrayType::new_static(DataType::F32, [2, 4]));
-        let metadata = context.lift(CpuArray::matrix(2, 2, vec![0_i32; 4])).unwrap();
+        let metadata = context.lift(CpuArray::matrix(2, 2, vec![0_i32; 4]).unwrap()).unwrap();
         let inputs = [operand, output, metadata.clone(), metadata.clone(), metadata.clone(), metadata]
             .into_iter()
             .map(|input| ArrayBatch::new(input, BatchAxis::new(0)).unwrap())
@@ -13190,12 +13190,13 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let group_sizes_values = [1_i32, 0, 3];
-        let lhs = CpuArray::matrix(5, 2, lhs_values.to_vec());
+        let lhs = CpuArray::matrix(5, 2, lhs_values.to_vec()).unwrap();
         let rhs = CpuArray::from_f64s(
             ArrayType::new_static(DataType::F32, [3, 2, 1]),
             rhs_values.iter().map(|value| f64::from(*value)).collect(),
-        );
-        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec())).unwrap();
+        )
+        .unwrap();
+        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![12.0, 32.0, 50.0, 68.0, 0.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -13223,9 +13224,11 @@ mod tests {
         let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let rhs_values = [10.0_f32, 20.0, 30.0, 40.0, 50.0];
         let group_sizes_values = [2_i32, 0, 3];
-        let lhs = CpuArray::matrix(2, 5, lhs_values.to_vec());
-        let rhs = CpuArray::matrix(5, 1, rhs_values.to_vec());
-        let eager = lhs.ragged_dot_general(&rhs, &CpuArray::vector(group_sizes_values.to_vec()), &dimensions).unwrap();
+        let lhs = CpuArray::matrix(2, 5, lhs_values.to_vec()).unwrap();
+        let rhs = CpuArray::matrix(5, 1, rhs_values.to_vec()).unwrap();
+        let eager = lhs
+            .ragged_dot_general(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap(), &dimensions)
+            .unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![50.0, 200.0, 0.0, 0.0, 500.0, 1_100.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -13248,12 +13251,13 @@ mod tests {
         let lhs_values = [1.0_f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
         let rhs_values = [2.0_f32, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0];
         let group_sizes_values = [u64::MAX, u64::MAX, 2, 1];
-        let lhs = CpuArray::matrix(4, 2, lhs_values.to_vec());
+        let lhs = CpuArray::matrix(4, 2, lhs_values.to_vec()).unwrap();
         let rhs = CpuArray::from_f64s(
             ArrayType::new_static(DataType::F32, [4, 2, 1]),
             rhs_values.iter().map(|value| f64::from(*value)).collect(),
-        );
-        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec())).unwrap();
+        )
+        .unwrap();
+        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![2.0, 4.0, 6.0, 8.0]);
         let group_sizes_data = values_to_bytes(&group_sizes_values);
@@ -17688,7 +17692,7 @@ mod tests {
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),
+                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
             )
             .unwrap();
 
@@ -17722,7 +17726,7 @@ mod tests {
                         .gradient(scalar_quartic_plus_sin)
                         .expect("scalar gradient should succeed"))
                 },
-                CpuArray::scalar(2.0),
+                CpuArray::scalar(2.0).unwrap(),
             )
             .unwrap();
 
@@ -18106,7 +18110,11 @@ mod tests {
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]), ())
+            .vjp(
+                |x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()),
+                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                (),
+            )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -18130,7 +18138,7 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
                 |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
-                CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+                CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -18158,7 +18166,7 @@ mod tests {
                     use ryft_core::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
-                (CpuArray::vector(vec![1.0, 2.0, 3.0]), CpuArray::scalar(9.0)),
+                (CpuArray::vector(vec![1.0, 2.0, 3.0]).unwrap(), CpuArray::scalar(9.0).unwrap()),
                 (),
             )
             .unwrap();
@@ -18192,11 +18200,13 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
                 |x, ()| {
-                    let start =
-                        x.context().lift(CpuArray::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0])).unwrap();
+                    let start = x
+                        .context()
+                        .lift(CpuArray::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap())
+                        .unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
-                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -18276,7 +18286,11 @@ mod tests {
         // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
         // explicit arguments.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|inputs, ()| Ok(scalar_bilinear_sin(inputs)), (CpuArray::scalar(2.0), CpuArray::scalar(3.0)), ())
+            .vjp(
+                |inputs, ()| Ok(scalar_bilinear_sin(inputs)),
+                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
+                (),
+            )
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
 
@@ -18563,7 +18577,7 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
+            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
             let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
@@ -18673,7 +18687,7 @@ mod tests {
     #[test]
     fn test_rank_positive_literal_dense_attributes_preserve_exact_payloads() {
         // Boolean values retain their logical order through MLIR's bit-packed dense representation.
-        let boolean = CpuArray::vector(vec![true, false, true]);
+        let boolean = CpuArray::vector(vec![true, false, true]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
         let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
@@ -18686,11 +18700,11 @@ mod tests {
         // One-bit integers use the same packed MLIR representation as Boolean while retaining their Ryft data type.
         for (literal, expected) in [
             (
-                CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]),
+                CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap(), i1::new(-1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
             (
-                CpuArray::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]),
+                CpuArray::vector(vec![u1::new(1).unwrap(), u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(),
                 vec![true, false, true],
             ),
         ] {
@@ -18701,10 +18715,10 @@ mod tests {
 
         // Wider sub-byte integers occupy one MLIR raw-buffer byte per element and preserve only their declared bits.
         for (literal, expected) in [
-            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]), vec![0x02, 0x01]),
-            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]), vec![0x08, 0x07]),
-            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]), vec![0x00, 0x03]),
-            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]), vec![0x01, 0x0f]),
+            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
         ] {
             assert_eq!(test_literal_dense_bytes(&literal, expected.len()), expected);
         }
@@ -18712,18 +18726,24 @@ mod tests {
         // Every byte-aligned integer family preserves signedness, magnitude, and source order without floating-point
         // conversion. The `u64` case deliberately exceeds f64's exact-integer range.
         let integer_cases = vec![
-            (CpuArray::vector(vec![-127_i8, 126]), values_to_bytes(&[-127_i8, 126])),
-            (CpuArray::vector(vec![-0x1234_i16, 0x2345]), values_to_bytes(&[-0x1234_i16, 0x2345])),
-            (CpuArray::vector(vec![-0x1234_567_i32, 0x2345_678]), values_to_bytes(&[-0x1234_567_i32, 0x2345_678])),
+            (CpuArray::vector(vec![-127_i8, 126]).unwrap(), values_to_bytes(&[-127_i8, 126])),
+            (CpuArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                CpuArray::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]),
+                CpuArray::vector(vec![-0x1234_567_i32, 0x2345_678]).unwrap(),
+                values_to_bytes(&[-0x1234_567_i32, 0x2345_678]),
+            ),
+            (
+                CpuArray::vector(vec![-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]).unwrap(),
                 values_to_bytes(&[-0x1234_5678_9abc_def_i64, 0x2345_6789_abcd_ef0]),
             ),
-            (CpuArray::vector(vec![0x12_u8, 0xfe]), values_to_bytes(&[0x12_u8, 0xfe])),
-            (CpuArray::vector(vec![0x1234_u16, 0xfedc]), values_to_bytes(&[0x1234_u16, 0xfedc])),
-            (CpuArray::vector(vec![0x1234_5678_u32, 0xfedc_ba98]), values_to_bytes(&[0x1234_5678_u32, 0xfedc_ba98])),
+            (CpuArray::vector(vec![0x12_u8, 0xfe]).unwrap(), values_to_bytes(&[0x12_u8, 0xfe])),
+            (CpuArray::vector(vec![0x1234_u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234_u16, 0xfedc])),
             (
-                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]),
+                CpuArray::vector(vec![0x1234_5678_u32, 0xfedc_ba98]).unwrap(),
+                values_to_bytes(&[0x1234_5678_u32, 0xfedc_ba98]),
+            ),
+            (
+                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
         ];
@@ -18778,10 +18798,10 @@ mod tests {
         let f64_values =
             [f64::from_bits(0x8000_0000_0000_0000), f64::NEG_INFINITY, f64::from_bits(0x7ff8_0000_0000_1234)];
         for (literal, expected) in [
-            (CpuArray::vector(bf16_values.to_vec()), values_to_bytes(&bf16_values)),
-            (CpuArray::vector(f16_values.to_vec()), values_to_bytes(&f16_values)),
-            (CpuArray::vector(f32_values.to_vec()), values_to_bytes(&f32_values)),
-            (CpuArray::vector(f64_values.to_vec()), values_to_bytes(&f64_values)),
+            (CpuArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (CpuArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (CpuArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (CpuArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
         ] {
             assert_eq!(
                 test_literal_dense_bytes(&literal, expected.len()),
@@ -18797,7 +18817,8 @@ mod tests {
         let c64 = CpuArray::vector(vec![
             ComplexNumber::new(c64_components[0], c64_components[1]),
             ComplexNumber::new(c64_components[2], c64_components[3]),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(test_literal_dense_bytes(&c64, size_of_val(&c64_components)), values_to_bytes(&c64_components),);
         let c128_components = [
             f64::from_bits(0x8000_0000_0000_0000),
@@ -18808,7 +18829,8 @@ mod tests {
         let c128 = CpuArray::vector(vec![
             ComplexNumber::new(c128_components[0], c128_components[1]),
             ComplexNumber::new(c128_components[2], c128_components[3]),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(test_literal_dense_bytes(&c128, size_of_val(&c128_components)), values_to_bytes(&c128_components),);
 
         // Explicit physical layouts are traversed in logical row-major order before constructing the literal.
@@ -18819,7 +18841,7 @@ mod tests {
         assert_eq!(test_literal_dense_bytes(&layout_literal, 8), values_to_bytes(&[1_i16, 2, 3, 4]));
 
         // Empty tensors remain valid dense constants and carry no raw payload bytes.
-        let empty = CpuArray::vector(Vec::<i32>::new());
+        let empty = CpuArray::vector(Vec::<i32>::new()).unwrap();
         let tensor_type = lower_tensor_type(empty.r#type().as_ref(), &context, location).unwrap();
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
@@ -18854,37 +18876,39 @@ mod tests {
         let c128_components =
             [1.5_f64, -2.0, f64::from_bits(0x8000_0000_0000_0000), f64::from_bits(0x7ff8_0000_0000_1234)];
         let cases = vec![
-            (CpuArray::vector(vec![true, false, true]), vec![1_u8, 0, 1]),
-            (CpuArray::vector(vec![-0x1234_i16, 0x2345]), values_to_bytes(&[-0x1234_i16, 0x2345])),
+            (CpuArray::vector(vec![true, false, true]).unwrap(), vec![1_u8, 0, 1]),
+            (CpuArray::vector(vec![-0x1234_i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234_i16, 0x2345])),
             (
-                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]),
+                CpuArray::vector(vec![(1_u64 << 53) + 1, u64::MAX - 1]).unwrap(),
                 values_to_bytes(&[(1_u64 << 53) + 1, u64::MAX - 1]),
             ),
-            (CpuArray::vector(bf16_values.to_vec()), values_to_bytes(&bf16_values)),
-            (CpuArray::vector(f16_values.to_vec()), values_to_bytes(&f16_values)),
-            (CpuArray::vector(f32_values.to_vec()), values_to_bytes(&f32_values)),
-            (CpuArray::vector(f64_values.to_vec()), values_to_bytes(&f64_values)),
+            (CpuArray::vector(bf16_values.to_vec()).unwrap(), values_to_bytes(&bf16_values)),
+            (CpuArray::vector(f16_values.to_vec()).unwrap(), values_to_bytes(&f16_values)),
+            (CpuArray::vector(f32_values.to_vec()).unwrap(), values_to_bytes(&f32_values)),
+            (CpuArray::vector(f64_values.to_vec()).unwrap(), values_to_bytes(&f64_values)),
             (
                 CpuArray::vector(vec![
                     ComplexNumber::new(c64_components[0], c64_components[1]),
                     ComplexNumber::new(c64_components[2], c64_components[3]),
-                ]),
+                ])
+                .unwrap(),
                 values_to_bytes(&c64_components),
             ),
             (
                 CpuArray::vector(vec![
                     ComplexNumber::new(c128_components[0], c128_components[1]),
                     ComplexNumber::new(c128_components[2], c128_components[3]),
-                ]),
+                ])
+                .unwrap(),
                 values_to_bytes(&c128_components),
             ),
-            (CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]), vec![0x01, 0x00]),
-            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]), vec![0x02, 0x01]),
-            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]), vec![0x08, 0x07]),
-            (CpuArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]), vec![0x00, 0x01]),
-            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]), vec![0x00, 0x03]),
-            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]), vec![0x01, 0x0f]),
-            (CpuArray::vector(Vec::<i32>::new()), Vec::new()),
+            (CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap(), vec![0x01, 0x00]),
+            (CpuArray::vector(vec![i2::new(-2).unwrap(), i2::new(1).unwrap()]).unwrap(), vec![0x02, 0x01]),
+            (CpuArray::vector(vec![i4::new(-8).unwrap(), i4::new(7).unwrap()]).unwrap(), vec![0x08, 0x07]),
+            (CpuArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap()]).unwrap(), vec![0x00, 0x01]),
+            (CpuArray::vector(vec![u2::new(0).unwrap(), u2::new(3).unwrap()]).unwrap(), vec![0x00, 0x03]),
+            (CpuArray::vector(vec![u4::new(1).unwrap(), u4::new(15).unwrap()]).unwrap(), vec![0x01, 0x0f]),
+            (CpuArray::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
         ];
 
         let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
@@ -18972,7 +18996,7 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
+            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
             let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder.add_constant(value);
             let program =
@@ -18997,7 +19021,7 @@ mod tests {
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0), ())
+            .vjp(|x, ()| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -19026,7 +19050,7 @@ mod tests {
                         .gradient(scalar_bilinear_sin)
                         .expect("scalar gradient should succeed"))
                 },
-                (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),
+                (CpuArray::scalar(2.0).unwrap(), CpuArray::scalar(3.0).unwrap()),
             )
             .unwrap();
 

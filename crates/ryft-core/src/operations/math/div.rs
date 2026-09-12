@@ -227,18 +227,18 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(7.0f32), Array::scalar(2.0f64)],
+                &[Array::scalar(7.0f32).unwrap(), Array::scalar(2.0f64).unwrap()],
             ),
-            Ok(vec![Array::scalar(3.5f64)]),
+            Ok(vec![Array::scalar(3.5f64).unwrap()]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &DivOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(7.0), Array::scalar(2.0)],
+                &[Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
             ),
-            Ok(vec![Array::scalar(3.5)]),
+            Ok(vec![Array::scalar(3.5).unwrap()]),
         );
         assert_eq!(Div::div(&7_usize, &2), Ok(3));
         assert_eq!(
@@ -252,12 +252,15 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
+                &[
+                    Array::scalar(Complex::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(Complex::new(0.5f64, -1.0)).unwrap()
+                ],
             ) {
                 Ok(outputs) => outputs[0].clone(),
                 Err(error) => panic!("expected a complex quotient but got {error}"),
             },
-            Array::scalar(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
+            Array::scalar(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)).unwrap(),
             epsilon = 1e-12,
         );
     }
@@ -266,8 +269,8 @@ mod tests {
     fn test_div_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = DivOperation::new(),
-            inputs = [Array::scalar(7.0), Array::scalar(2.0)],
-            expected = Array::scalar(3.5),
+            inputs = [Array::scalar(7.0).unwrap(), Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(3.5).unwrap(),
         );
     }
 
@@ -279,10 +282,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![3.0, -6.0])),
-                    (@replicated, Array::scalar(3.0)),
+                    (@mapped(axis = 0), Array::vector(vec![3.0, -6.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap())],
             }],
         );
     }
@@ -293,10 +296,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = DivOperation::new(),
             cases = [{
-                primals = [Array::scalar(6.0), Array::scalar(2.0)],
-                tangents = [Array::scalar(3.0), Array::scalar(4.0)],
-                primal_outputs = [Array::scalar(3.0)],
-                tangent_outputs = [Array::scalar(-4.5)],
+                primals = [Array::scalar(6.0).unwrap(), Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()],
+                primal_outputs = [Array::scalar(3.0).unwrap()],
+                tangent_outputs = [Array::scalar(-4.5).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = div %0 %1
@@ -321,26 +324,27 @@ mod tests {
                 &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
                 &[
-                    DifferentiationDual::new(Array::scalar(0.0), Array::scalar(smallest_positive)).unwrap(),
-                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive)).unwrap(),
+                    DifferentiationDual::new(Array::scalar(0.0).unwrap(), Array::scalar(smallest_positive).unwrap())
+                        .unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive).unwrap()).unwrap(),
                 ],
             )
             .unwrap();
         match outputs[0].tangent() {
-            MaybeZero::Value(tangent) => assert_eq!(tangent, &Array::scalar(1.0)),
+            MaybeZero::Value(tangent) => assert_eq!(tangent, &Array::scalar(1.0).unwrap()),
             MaybeZero::Zero(_) => panic!("expected a live division tangent"),
         }
     }
 
     #[test]
     fn test_div_low_precision_differentiation_uses_widened_tangents() {
-        let left = Array::scalar(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let right = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let left = Array::scalar(4.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let right = Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
         let (primal, tangent) = differentiate_at((left, right))
-            .jvp((Array::scalar(1.0f32), Array::scalar(1.0f32)), |(left, right)| Ok(left / right))
+            .jvp((Array::scalar(1.0f32).unwrap(), Array::scalar(1.0f32).unwrap()), |(left, right)| Ok(left / right))
             .unwrap();
-        assert_eq!(primal, Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
-        assert_eq!(tangent, Array::scalar(-0.5f32));
+        assert_eq!(primal, Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap());
+        assert_eq!(tangent, Array::scalar(-0.5f32).unwrap());
     }
 
     #[test]
@@ -354,10 +358,10 @@ mod tests {
                 {
                     inputs = [
                         (@linear(type = scalar_type.clone())),
-                        (@known, Array::scalar(3.0)),
+                        (@known, Array::scalar(3.0).unwrap()),
                     ],
-                    output_cotangents = [Array::scalar(2.0)],
-                    input_cotangents = [Array::scalar(2.0 / 3.0)],
+                    output_cotangents = [Array::scalar(2.0).unwrap()],
+                    input_cotangents = [Array::scalar(2.0 / 3.0).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = div %0 %1
@@ -367,10 +371,10 @@ mod tests {
                 {
                     inputs = [
                         (@linear(type = scalar_type)),
-                        (@known, Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 5.0])),
+                        (@known, Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 5.0]).unwrap()),
                     ],
-                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 10.0])],
-                    input_cotangents = [Array::scalar(4.0)],
+                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 10.0]).unwrap()],
+                    input_cotangents = [Array::scalar(4.0).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[3], %1:f64[3] .
                         let %2:f64[3] = div %0 %1
@@ -402,32 +406,35 @@ mod tests {
 
     #[test]
     fn test_div_for_array() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(Div::div(&vector, &Array::scalar(2.0)).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            Div::div(&vector, &Array::scalar(2.0).unwrap()).unwrap(),
+            Array::vector(vec![0.5, 1.0, 1.5]).unwrap()
+        );
     }
 
     #[test]
     fn test_div_for_array_low_precision() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
-        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]).unwrap();
         assert_eq!(Div::div(&left, &right).unwrap().to_f64s(), vec![2.0, 8.0]);
     }
 
     #[test]
     fn test_div_for_array_complex() {
         // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
-        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]).unwrap();
         let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
         let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
         assert_abs_diff_eq!(
             Div::div(&left, &right).unwrap(),
-            Array::vector(vec![left_values[0] / right_values[0], left_values[1] / right_values[1]]),
+            Array::vector(vec![left_values[0] / right_values[0], left_values[1] / right_values[1]]).unwrap(),
             epsilon = 1e-12,
         );
         // Ratio-based division can still overflow when both denominator components are near the largest value.
-        let large = Array::scalar(Complex::new(1e308f64, 1e308));
+        let large = Array::scalar(Complex::new(1e308f64, 1e308)).unwrap();
         let quotient = Div::div(&large, &large).unwrap().elements::<Complex<f64>>().unwrap()[0];
         assert!(quotient.re.is_nan());
         assert_eq!(quotient.im.to_bits(), 0.0f64.to_bits());
@@ -438,12 +445,12 @@ mod tests {
         // Exceptional integer division inputs return the same structured errors as native-width array
         // arithmetic rather than panicking.
         assert!(matches!(
-            Div::div(&Array::vector(vec![1i32]), &Array::vector(vec![0i32])),
+            Div::div(&Array::vector(vec![1i32]).unwrap(), &Array::vector(vec![0i32]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot divide an integer scalar of data type `i32` by zero",
         ));
         assert!(matches!(
-            Div::div(&Array::vector(vec![i8::MIN]), &Array::vector(vec![-1i8])),
+            Div::div(&Array::vector(vec![i8::MIN]).unwrap(), &Array::vector(vec![-1i8]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
         ));

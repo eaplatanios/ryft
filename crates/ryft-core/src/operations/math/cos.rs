@@ -115,11 +115,18 @@ mod tests {
 
     #[test]
     fn test_cos_interpretation() {
-        assert_eq!(Array::scalar(0.5f32).cos().unwrap(), Array::scalar(0.5f32.cos()));
-        assert_eq!(Array::scalar(0.5f64).cos().unwrap(), Array::scalar(0.5f64.cos()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).cos().unwrap(), Array::scalar(bf16::from_f32(0.5f32.cos())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).cos().unwrap(), Array::scalar(f16::from_f32(0.5f32.cos())),);
+        assert_eq!(Array::scalar(0.5f32).unwrap().cos().unwrap(), Array::scalar(0.5f32.cos()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().cos().unwrap(), Array::scalar(0.5f64.cos()).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().cos().unwrap(),
+            Array::scalar(bf16::from_f32(0.5f32.cos())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().cos().unwrap(),
+            Array::scalar(f16::from_f32(0.5f32.cos())).unwrap(),
+        );
         let extreme = Array::scalar(ComplexNumber::new(0.0f64, 1000.0))
+            .unwrap()
             .cos()
             .unwrap()
             .elements::<ComplexNumber<f64>>()
@@ -127,15 +134,15 @@ mod tests {
         assert!(extreme.re.is_infinite() && extreme.re.is_sign_positive());
         assert_eq!(extreme.im, 0.0);
 
-        assert_eq!(Array::scalar(0.5).cos().unwrap(), Array::scalar(0.5f64.cos()),);
+        assert_eq!(Array::scalar(0.5).unwrap().cos().unwrap(), Array::scalar(0.5f64.cos()).unwrap(),);
     }
 
     #[test]
     fn test_cos_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = CosOperation::new(),
-            inputs = [Array::scalar(0.5)],
-            expected = Array::scalar(0.5f64.cos()),
+            inputs = [Array::scalar(0.5).unwrap()],
+            expected = Array::scalar(0.5f64.cos()).unwrap(),
         );
     }
 
@@ -146,8 +153,8 @@ mod tests {
             operation = CosOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.cos(), (-1.0f64).cos()]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.cos(), (-1.0f64).cos()]).unwrap())],
             }],
         );
     }
@@ -158,10 +165,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = CosOperation::new(),
             cases = [{
-                primals = [Array::scalar(2.0)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(2.0f64.cos())],
-                tangent_outputs = [Array::scalar(-3.0 * 2.0f64.sin())],
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0f64.cos()).unwrap()],
+                tangent_outputs = [Array::scalar(-3.0 * 2.0f64.sin()).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = cos %0
@@ -178,15 +185,15 @@ mod tests {
     fn test_cos_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.cos().unwrap()),
-            Ok(Array::scalar(-input.sin())),
+            differentiate_at(Array::scalar(input).unwrap()).holomorphic().gradient(|input| input.cos().unwrap()),
+            Ok(Array::scalar(-input.sin()).unwrap()),
         );
     }
 
     #[test]
     fn test_cos_low_precision_differentiation_uses_widened_tangents() {
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![4.0]);
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![4.0]).unwrap();
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.cos()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
@@ -232,18 +239,18 @@ mod tests {
 
     #[test]
     fn test_cos_for_array() {
-        let vector = Array::vector(vec![0.0, 1.0]);
-        assert_abs_diff_eq!(vector.cos().unwrap(), Array::vector(vec![1.0, 1.0f64.cos()]), epsilon = 1e-12);
+        let vector = Array::vector(vec![0.0, 1.0]).unwrap();
+        assert_abs_diff_eq!(vector.cos().unwrap(), Array::vector(vec![1.0, 1.0f64.cos()]).unwrap(), epsilon = 1e-12);
     }
 
     #[test]
     fn test_cos_for_array_complex() {
         // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
         let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
         assert_abs_diff_eq!(
             left.cos().unwrap(),
-            Array::vector(vec![left_values[0].cos(), left_values[1].cos()]),
+            Array::vector(vec![left_values[0].cos(), left_values[1].cos()]).unwrap(),
             epsilon = 1e-12
         );
     }

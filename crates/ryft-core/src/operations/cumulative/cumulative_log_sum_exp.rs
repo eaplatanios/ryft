@@ -209,31 +209,35 @@ mod tests {
         };
 
         // Forward scans accumulate prefixes and reverse scans accumulate suffixes, along the selected axis only.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let forward_second = log_add_exp(1.0, 2.0);
         let reverse_second = log_add_exp(3.0, 2.0);
         assert_eq!(
             interpret(&CumulativeLogSumExpOperation::new(0), &input),
-            Array::vector(vec![1.0, forward_second, log_add_exp(forward_second, 3.0)]),
+            Array::vector(vec![1.0, forward_second, log_add_exp(forward_second, 3.0)]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeLogSumExpOperation::new(0).with_reverse(true), &input),
-            Array::vector(vec![log_add_exp(reverse_second, 1.0), reverse_second, 3.0]),
+            Array::vector(vec![log_add_exp(reverse_second, 1.0), reverse_second, 3.0]).unwrap(),
         );
         assert_eq!(
-            interpret(&CumulativeLogSumExpOperation::new(0), &Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            interpret(
+                &CumulativeLogSumExpOperation::new(0),
+                &Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+            ),
             Array::matrix(
                 2,
                 3,
                 vec![1.0, 2.0, 3.0, log_add_exp(1.0, 4.0), log_add_exp(2.0, 5.0), log_add_exp(3.0, 6.0)],
-            ),
+            )
+            .unwrap(),
         );
 
         // The point of folding the guarded pairwise primitive: two equal operands add exactly `log(2)` at any
         // magnitude, where exponentiating directly would already have overflowed.
         assert_eq!(
-            interpret(&CumulativeLogSumExpOperation::new(0), &Array::vector(vec![1000.0, 1000.0])),
-            Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2]),
+            interpret(&CumulativeLogSumExpOperation::new(0), &Array::vector(vec![1000.0, 1000.0]).unwrap()),
+            Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2]).unwrap(),
         );
         assert!((1000.0f64.exp() + 1000.0f64.exp()).ln().is_infinite());
 
@@ -242,9 +246,9 @@ mod tests {
         assert_eq!(
             interpret(
                 &CumulativeLogSumExpOperation::new(0),
-                &Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]),
+                &Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap(),
             ),
-            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]),
+            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap(),
         );
 
         // A zero-length scanned axis has nothing to accumulate and keeps the operand's exact type.
@@ -260,8 +264,8 @@ mod tests {
             operation = CumulativeLogSumExpOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]))],
-                outputs = [(@replicated, Array::vector(vec![0.0, std::f64::consts::LN_2]))],
+                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]).unwrap())],
+                outputs = [(@replicated, Array::vector(vec![0.0, std::f64::consts::LN_2]).unwrap())],
             }],
         );
 
@@ -272,12 +276,12 @@ mod tests {
             operation = CumulativeLogSumExpOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 0.0, 1000.0, 1000.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 0.0, 1000.0, 1000.0]).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::matrix(
                     2,
                     2,
                     vec![0.0, std::f64::consts::LN_2, 1000.0, 1000.0 + std::f64::consts::LN_2],
-                ))],
+                ).unwrap())],
             }],
         );
 
@@ -287,12 +291,12 @@ mod tests {
             operation = CumulativeLogSumExpOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1000.0, 0.0, 1000.0]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1000.0, 0.0, 1000.0]).unwrap())],
                 outputs = [(@mapped(axis = 1), Array::matrix(
                     2,
                     2,
                     vec![0.0, 1000.0, std::f64::consts::LN_2, 1000.0 + std::f64::consts::LN_2],
-                ))],
+                ).unwrap())],
             }],
         );
     }
@@ -303,9 +307,9 @@ mod tests {
         // neutralize that padding with the combining operator's identity first. Static array batching cannot, and
         // says so rather than silently scanning padding.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         assert_eq!(
             CumulativeLogSumExpOperation::new(0).batch(
@@ -394,28 +398,28 @@ mod tests {
             @approx(step = 1e-4, epsilon = 1e-6),
             operation = CumulativeLogSumExpOperation::new(0),
             cases = [{
-                primals = [Array::vector(vec![0.0, 1.0, 2.0])],
-                tangents = [Array::vector(vec![1.0, 2.0, 3.0])],
-                primal_outputs = [Array::vector(vec![0.0, (1.0 + e).ln(), (1.0 + e + e * e).ln()])],
+                primals = [Array::vector(vec![0.0, 1.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![0.0, (1.0 + e).ln(), (1.0 + e + e * e).ln()]).unwrap()],
                 tangent_outputs = [Array::vector(vec![
                     1.0,
                     (1.0 + 2.0 * e) / (1.0 + e),
                     (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
-                ])],
+                ]).unwrap()],
             }],
         );
         check_operation_differentiation!(
             @approx(step = 1e-4, epsilon = 1e-6),
             operation = CumulativeLogSumExpOperation::new(0).with_reverse(true),
             cases = [{
-                primals = [Array::vector(vec![0.0, 1.0, 2.0])],
-                tangents = [Array::vector(vec![1.0, 2.0, 3.0])],
-                primal_outputs = [Array::vector(vec![(1.0 + e + e * e).ln(), (e + e * e).ln(), 2.0])],
+                primals = [Array::vector(vec![0.0, 1.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![(1.0 + e + e * e).ln(), (e + e * e).ln(), 2.0]).unwrap()],
                 tangent_outputs = [Array::vector(vec![
                     (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
                     (2.0 * e + 3.0 * e * e) / (e + e * e),
                     3.0,
-                ])],
+                ]).unwrap()],
             }],
         );
     }
@@ -424,11 +428,14 @@ mod tests {
     fn test_cumulative_log_sum_exp_capability_over_eager_arrays() {
         // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
         // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![0.0, 0.0]);
-        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2])));
-        assert_eq!(input.reverse_cumulative_log_sum_exp(0), Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0])));
+        let input = Array::vector(vec![0.0, 0.0]).unwrap();
+        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2]).unwrap()));
         assert_eq!(
-            Array::vector(vec![1_i32, 2]).cumulative_log_sum_exp(0),
+            input.reverse_cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0]).unwrap())
+        );
+        assert_eq!(
+            Array::vector(vec![1_i32, 2]).unwrap().cumulative_log_sum_exp(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
             ))),

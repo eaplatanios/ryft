@@ -166,14 +166,14 @@ fn run_core() -> ExampleResult<()> {
         layers: initial_layer_values()
             .into_iter()
             .map(|(input_size, output_size, weights, bias)| {
-                Linear::new(Array::matrix(input_size, output_size, weights), bias.map(Array::vector))
+                Ok(Linear::new(Array::matrix(input_size, output_size, weights)?, bias.map(Array::vector).transpose()?))
             })
-            .collect(),
+            .collect::<Result<Vec<_>, ProgramError>>()?,
     };
-    let inputs = Array::matrix(4, 2, input_values());
-    let targets = Array::matrix(4, 1, target_values());
-    let learning_rate = Array::scalar(0.1_f32);
-    let mean_scale = Array::scalar(0.25_f32);
+    let inputs = Array::matrix(4, 2, input_values())?;
+    let targets = Array::matrix(4, 1, target_values())?;
+    let learning_rate = Array::scalar(0.1_f32)?;
+    let mean_scale = Array::scalar(0.25_f32)?;
     train("core", model, inputs, targets, learning_rate, mean_scale, |array| Ok(array.to_f64s()))
 }
 

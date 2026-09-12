@@ -93,22 +93,31 @@ mod tests {
 
     #[test]
     fn test_ceil_interpretation() {
-        assert_eq!(Array::scalar(2.3f32).ceil().unwrap(), Array::scalar(3.0f32));
-        assert_eq!(Array::scalar(-2.7f64).ceil().unwrap(), Array::scalar(-2.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.3)).ceil().unwrap(), Array::scalar(bf16::from_f32(2.3f32.ceil())),);
-        assert_eq!(Array::scalar(f16::from_f32(2.3)).ceil().unwrap(), Array::scalar(f16::from_f32(2.3f32.ceil())),);
+        assert_eq!(Array::scalar(2.3f32).unwrap().ceil().unwrap(), Array::scalar(3.0f32).unwrap());
+        assert_eq!(Array::scalar(-2.7f64).unwrap().ceil().unwrap(), Array::scalar(-2.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.3)).unwrap().ceil().unwrap(),
+            Array::scalar(bf16::from_f32(2.3f32.ceil())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.3)).unwrap().ceil().unwrap(),
+            Array::scalar(f16::from_f32(2.3f32.ceil())).unwrap(),
+        );
         // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).ceil().unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(f64::NAN).unwrap().ceil().unwrap().to_f64s()[0].is_nan());
 
-        assert_eq!(Array::vector(vec![0.7, 1.0, -1.5]).ceil().unwrap(), Array::vector(vec![1.0, 1.0, -1.0]),);
+        assert_eq!(
+            Array::vector(vec![0.7, 1.0, -1.5]).unwrap().ceil().unwrap(),
+            Array::vector(vec![1.0, 1.0, -1.0]).unwrap(),
+        );
     }
 
     #[test]
     fn test_ceil_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = CeilOperation::new(),
-            inputs = [Array::scalar(2.3)],
-            expected = Array::scalar(3.0),
+            inputs = [Array::scalar(2.3).unwrap()],
+            expected = Array::scalar(3.0).unwrap(),
         );
     }
 
@@ -119,8 +128,8 @@ mod tests {
             operation = CeilOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.5]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -1.0]).unwrap())],
             }],
         );
     }
@@ -131,10 +140,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = CeilOperation::new(),
             cases = [{
-                primals = [Array::scalar(2.5)],
-                tangents = [Array::scalar(1.0)],
-                primal_outputs = [Array::scalar(3.0)],
-                tangent_outputs = [Array::scalar(0.0)],
+                primals = [Array::scalar(2.5).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(3.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
             }],
         );
     }
@@ -146,8 +155,8 @@ mod tests {
             operation = CeilOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
             }],
         );
     }

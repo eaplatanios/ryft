@@ -671,12 +671,12 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
 /// # fn main() -> Result<(), ProgramError> {
 /// // Add two row updates into rows 0 and 2 of a 3x2 zero matrix. Each query is a scalar row index, so the indices
 /// // have shape [2, 1] and each update window is a full row (update window axis 1).
-/// let operand = Array::matrix(3, 2, vec![0.0; 6]);
+/// let operand = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
 /// let indices = Array::from_f64s(
 ///     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)])),
 ///     vec![0.0, 2.0],
-/// );
-/// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+/// ).unwrap();
+/// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 /// let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
 /// let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
 /// let result = operand.scatter(&indices, &updates, &operation)?;
@@ -1004,7 +1004,7 @@ mod tests {
         V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
         let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
-        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
+        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values).unwrap()).unwrap()
     }
 
     #[test]
@@ -1082,12 +1082,13 @@ mod tests {
 
         // Interpretation applies each supported combiner and accumulates repeated additive updates.
         let scalar_dimensions = || ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let scalar_indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 3.0]);
+        let scalar_indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 3.0]).unwrap();
         let run = |kind| {
             Array::vector(vec![1.0, 2.0, 3.0, 4.0])
+                .unwrap()
                 .scatter(
                     &scalar_indices,
-                    &Array::vector(vec![100.0, 200.0]),
+                    &Array::vector(vec![100.0, 200.0]).unwrap(),
                     &ScatterOperation::new(scalar_dimensions(), kind),
                 )
                 .unwrap()
@@ -1098,21 +1099,22 @@ mod tests {
         assert_eq!(run(ScatterReductionKind::Mul), vec![1.0, 200.0, 3.0, 800.0]);
         assert_eq!(run(ScatterReductionKind::Min), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(run(ScatterReductionKind::Max), vec![1.0, 100.0, 3.0, 200.0]);
-        let repeated = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 1.0]);
+        let repeated = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 1.0]).unwrap();
         let result = Array::vector(vec![1.0, 2.0, 3.0, 4.0])
+            .unwrap()
             .scatter(
                 &repeated,
-                &Array::vector(vec![100.0, 200.0]),
+                &Array::vector(vec![100.0, 200.0]).unwrap(),
                 &ScatterOperation::new(scalar_dimensions(), ScatterReductionKind::Add),
             )
             .unwrap();
         assert_eq!(result.to_f64s(), vec![1.0, 302.0, 3.0, 4.0]);
 
         // Partial evaluation folds fully known scatters and residualizes an unknown data operand.
-        let operand_value = Array::matrix(3, 2, vec![0.0; 6]);
-        let indices_value = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]);
-        let updates_value = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        let expected = Array::matrix(3, 2, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
+        let operand_value = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
+        let indices_value = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]).unwrap();
+        let updates_value = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let expected = Array::matrix(3, 2, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = operation.clone(),
@@ -1145,15 +1147,15 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()),
                     (@replicated, scalar_indices),
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]).unwrap()),
                 ],
                 outputs = [(@mapped(axis = 0), Array::matrix(
                     2,
                     4,
                     vec![1.0, 12.0, 3.0, 24.0, 5.0, 36.0, 7.0, 48.0],
-                ))],
+                ).unwrap())],
             }],
         );
     }
@@ -1217,13 +1219,13 @@ mod tests {
             cases = [{
                 inputs = [
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![4.into()])))),
-                    (@known, Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 3.0])),
+                    (@known, Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 3.0]).unwrap()),
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
                 ],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-                    Array::vector(vec![2.0, 4.0]),
+                    Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    Array::vector(vec![2.0, 4.0]).unwrap(),
                 ],
             }],
         );
@@ -1235,7 +1237,8 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
         let indices =
-            Array::from_f64s(indices_type(vec![2, 1]).with_memory(Memory::Host { pinned: true }), vec![1.0, 3.0]);
+            Array::from_f64s(indices_type(vec![2, 1]).with_memory(Memory::Host { pinned: true }), vec![1.0, 3.0])
+                .unwrap();
         check_operation_transposition!(
             @exact,
             operation = ScatterOperation::new(
@@ -1248,10 +1251,10 @@ mod tests {
                     (@known, indices),
                     (@linear(type = update_type.clone())),
                 ],
-                output_cotangents = [Array::from_f64s(operand_type.clone(), vec![1.0, 2.0, 3.0, 4.0])],
+                output_cotangents = [Array::from_f64s(operand_type.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(operand_type, vec![1.0, 2.0, 3.0, 4.0]),
-                    Array::from_f64s(update_type, vec![2.0, 4.0]),
+                    Array::from_f64s(operand_type, vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    Array::from_f64s(update_type, vec![2.0, 4.0]).unwrap(),
                 ],
             }],
         );
@@ -1259,10 +1262,10 @@ mod tests {
         // Forward mode through `f(x) = scatter_add(x, [[1], [3]], [10, 20])` exercises the captured-index scatter-add
         // under batched basis tangents (the per-item batch rule). Scatter-add is the identity in its operand, so the
         // Jacobian with respect to `x` is the identity matrix.
-        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
             .jacobian_forward(|x| {
                 let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
-                let updates = x.context().lift(Array::vector(vec![10.0, 20.0]))?;
+                let updates = x.context().lift(Array::vector(vec![10.0, 20.0]).unwrap())?;
                 let operation = ScatterOperation::new(
                     ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                     ScatterReductionKind::Add,

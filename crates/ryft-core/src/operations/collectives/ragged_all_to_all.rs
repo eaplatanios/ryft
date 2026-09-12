@@ -1345,7 +1345,7 @@ mod tests {
         let metadata = || {
             PartialTracer::new(
                 partial_context.clone(),
-                PartialEvaluationValue::known_constant(Array::matrix(2, 2, vec![0_i32; 4])),
+                PartialEvaluationValue::known_constant(Array::matrix(2, 2, vec![0_i32; 4]).unwrap()),
             )
         };
         let inputs = [operand, output, metadata(), metadata(), metadata(), metadata()]
@@ -1376,15 +1376,15 @@ mod tests {
                 inputs = [
                     (@linear(type = data_type)),
                     (@linear(type = output_type)),
-                    (@known, Array::matrix(4, 2, vec![0_i32, 1, 0, 1, 0, 1, 0, 1])),
-                    (@known, Array::matrix(4, 2, vec![1_i32; 8])),
-                    (@known, Array::matrix(4, 2, vec![0_i32, 0, 1, 1, 1, 1, 0, 0])),
-                    (@known, Array::matrix(4, 2, vec![1_i32; 8])),
+                    (@known, Array::matrix(4, 2, vec![0_i32, 1, 0, 1, 0, 1, 0, 1]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![1_i32; 8]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![0_i32, 0, 1, 1, 1, 1, 0, 0]).unwrap()),
+                    (@known, Array::matrix(4, 2, vec![1_i32; 8]).unwrap()),
                 ],
-                output_cotangents = [Array::matrix(4, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+                output_cotangents = [Array::matrix(4, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()],
                 input_cotangents = [
-                    Array::matrix(4, 2, vec![1.0_f64, 5.0, 8.0, 4.0, 2.0, 6.0, 7.0, 3.0]),
-                    Array::matrix(4, 2, vec![0.0_f64; 8]),
+                    Array::matrix(4, 2, vec![1.0_f64, 5.0, 8.0, 4.0, 2.0, 6.0, 7.0, 3.0]).unwrap(),
+                    Array::matrix(4, 2, vec![0.0_f64; 8]).unwrap(),
                 ],
             }],
         );
@@ -1400,30 +1400,30 @@ mod tests {
                     inputs = [
                         (@linear(type = ArrayType::new_static(DataType::F64, [2]))),
                         (@linear(type = ArrayType::new_static(DataType::F64, [2]))),
-                        (@known, Array::vector(vec![0_i32, 0])),
-                        (@known, Array::vector(vec![1_i32, 1])),
-                        (@known, Array::vector(vec![0_i32, 1])),
-                        (@known, Array::vector(vec![1_i32, 1])),
+                        (@known, Array::vector(vec![0_i32, 0]).unwrap()),
+                        (@known, Array::vector(vec![1_i32, 1]).unwrap()),
+                        (@known, Array::vector(vec![0_i32, 1]).unwrap()),
+                        (@known, Array::vector(vec![1_i32, 1]).unwrap()),
                     ],
-                    output_cotangents = [Array::vector(vec![3.0_f64, 5.0])],
+                    output_cotangents = [Array::vector(vec![3.0_f64, 5.0]).unwrap()],
                     input_cotangents = [
-                        Array::vector(vec![8.0_f64, 0.0]),
-                        Array::vector(vec![0.0_f64, 0.0]),
+                        Array::vector(vec![8.0_f64, 0.0]).unwrap(),
+                        Array::vector(vec![0.0_f64, 0.0]).unwrap(),
                     ],
                 },
                 {
                     inputs = [
                         (@linear(type = ArrayType::new_static(DataType::F64, [3]))),
                         (@linear(type = ArrayType::new_static(DataType::F64, [3]))),
-                        (@known, Array::vector(vec![0_i32, 1, 1])),
-                        (@known, Array::vector(vec![1_i32, 0, 1])),
-                        (@known, Array::vector(vec![0_i32, 1, 1])),
-                        (@known, Array::vector(vec![1_i32, 0, 1])),
+                        (@known, Array::vector(vec![0_i32, 1, 1]).unwrap()),
+                        (@known, Array::vector(vec![1_i32, 0, 1]).unwrap()),
+                        (@known, Array::vector(vec![0_i32, 1, 1]).unwrap()),
+                        (@known, Array::vector(vec![1_i32, 0, 1]).unwrap()),
                     ],
-                    output_cotangents = [Array::vector(vec![3.0_f64, 5.0, 7.0])],
+                    output_cotangents = [Array::vector(vec![3.0_f64, 5.0, 7.0]).unwrap()],
                     input_cotangents = [
-                        Array::vector(vec![3.0_f64, 5.0, 0.0]),
-                        Array::vector(vec![0.0_f64, 0.0, 7.0]),
+                        Array::vector(vec![3.0_f64, 5.0, 0.0]).unwrap(),
+                        Array::vector(vec![0.0_f64, 0.0, 7.0]).unwrap(),
                     ],
                 },
             ],
@@ -1438,14 +1438,16 @@ mod tests {
         let operand = Array::from_f64s(
             ArrayType::new_static(DataType::F64, [2, 2, 3]),
             vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
-        );
+        )
+        .unwrap();
         let output = Array::from_f64s(
             ArrayType::new_static(DataType::F64, [2, 2, 4]),
             vec![
                 100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
                 212.0, 213.0,
             ],
-        );
+        )
+        .unwrap();
         let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
         let metadata = |elements: &[i8]| Array::from_elements(metadata_type.clone(), elements).unwrap();
         let inputs = vec![
@@ -1559,10 +1561,10 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
         let output = builder.add_input(array_type(DataType::F32, [4]));
-        let input_offsets = builder.add_constant(Array::vector(vec![0_i32, 1, 0, 2]));
-        let send_sizes = builder.add_constant(Array::vector(vec![1_i32, 1, 0, 1]));
-        let output_offsets = builder.add_constant(Array::vector(vec![0_i32, 2, 1, 3]));
-        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32, 0, 1, 1]));
+        let input_offsets = builder.add_constant(Array::vector(vec![0_i32, 1, 0, 2]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![1_i32, 1, 0, 1]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0_i32, 2, 1, 3]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32, 0, 1, 1]).unwrap());
         let result = builder
             .add_instruction(
                 RaggedAllToAllOperation::grouped("x".to_string(), 4, groups.clone()).unwrap(),
@@ -1680,10 +1682,10 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
         let output = builder.add_input(array_type(DataType::F32, [4]));
-        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let send_sizes = builder.add_constant(Array::vector(vec![1_i32]));
-        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]));
+        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
         let result = builder
             .add_instruction(
                 RaggedAllToAllOperation::new("x".to_string(), 1).with_additive_updates(),
@@ -1740,10 +1742,10 @@ mod tests {
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let output =
             builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(output_extent)])));
-        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let send_sizes = builder.add_constant(Array::vector(vec![1_i32]));
-        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]));
+        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
         let result = builder
             .add_instruction(
                 RaggedAllToAllOperation::new("x".to_string(), 1),
@@ -1764,10 +1766,10 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(ArrayType::new_static(DataType::F32, [1]));
         let output = builder.add_input(ArrayType::new_static(DataType::F32, [usize::MAX]));
-        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let send_sizes = builder.add_constant(Array::vector(vec![0_i32]));
-        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-        let receive_sizes = builder.add_constant(Array::vector(vec![0_i32]));
+        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let send_sizes = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+        let receive_sizes = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
         let result = builder
             .add_instruction(
                 RaggedAllToAllOperation::new("x".to_string(), 1),
@@ -1799,10 +1801,10 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let operand = builder.add_input(operand_type.clone());
             let output = builder.add_input(output_type.clone());
-            let input_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-            let send_sizes = builder.add_constant(Array::vector(vec![1_i32]));
-            let output_offsets = builder.add_constant(Array::vector(vec![0_i32]));
-            let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]));
+            let input_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+            let send_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
+            let output_offsets = builder.add_constant(Array::vector(vec![0_i32]).unwrap());
+            let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]).unwrap());
             let result = builder
                 .add_instruction(
                     RaggedAllToAllOperation::new("x".to_string(), 1),
@@ -1990,20 +1992,20 @@ mod tests {
     #[test]
     fn test_ragged_all_to_all_batching_rejects_ragged_operands() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
-        let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0_i32; 4]), BatchAxis::new(0)).unwrap();
+        let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0_i32; 4]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
             RaggedAllToAllOperation::new("x".to_string(), 2).batch(
                 &context,
                 &EmptyRegionDriver,
                 &[
                     ragged_operand,
-                    ArrayBatch::new(Array::matrix(2, 4, vec![0.0_f32; 8]), BatchAxis::new(0)).unwrap(),
+                    ArrayBatch::new(Array::matrix(2, 4, vec![0.0_f32; 8]).unwrap(), BatchAxis::new(0)).unwrap(),
                     metadata(),
                     metadata(),
                     metadata(),
@@ -2019,12 +2021,12 @@ mod tests {
 
     #[test]
     fn test_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
-        let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]);
-        let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]);
-        let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]);
-        let send_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
-        let output_offsets = Array::matrix(2, 2, vec![1_i32, 1, 2, 3]);
-        let receive_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
+        let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap();
+        let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap();
+        let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]).unwrap();
+        let send_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap();
+        let output_offsets = Array::matrix(2, 2, vec![1_i32, 1, 2, 3]).unwrap();
+        let receive_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap();
 
         let (value, gradient) = differentiate_at((operand, output))
             .value_and_gradient(move |(operand, output)| {
@@ -2067,10 +2069,10 @@ mod tests {
         check_gradient!(
             |operand, output| {
                 let context = operand.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]).unwrap())?;
+                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
+                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]).unwrap())?;
+                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
                 let exchanged = batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                         operand.ragged_all_to_all(
@@ -2096,18 +2098,18 @@ mod tests {
                 )?;
                 Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
             },
-            at = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
-            with = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
+            at = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
+            with = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
         check_gradient!(
             |output, operand| {
                 let context = output.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]).unwrap())?;
+                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
+                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]).unwrap())?;
+                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap())?;
                 let exchanged = batch(
                     |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                         operand.ragged_all_to_all(
@@ -2133,8 +2135,8 @@ mod tests {
                 )?;
                 Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
             },
-            at = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0],),
-            with = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
+            at = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0],).unwrap(),
+            with = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -2163,12 +2165,12 @@ mod tests {
                     .map_err(ProgramError::from)
             },
             (
-                Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
-                Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
-                Array::matrix(2, 2, vec![0_i32, 0, 0, 2]),
-                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
-                Array::matrix(2, 2, vec![1_i32, 1, 2, 3]),
-                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
+                Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
+                Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 0, 0, 2]).unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap(),
+                Array::matrix(2, 2, vec![1_i32, 1, 2, 3]).unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]).unwrap(),
             ),
             (
                 BatchAxis::new(0),
@@ -2195,14 +2197,16 @@ mod tests {
             Array::from_f64s(
                 ArrayType::new_static(DataType::F64, [2, 2, 3]),
                 vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
-            ),
+            )
+            .unwrap(),
             Array::from_f64s(
                 ArrayType::new_static(DataType::F64, [2, 2, 4]),
                 vec![
                     100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
                     212.0, 213.0,
                 ],
-            ),
+            )
+            .unwrap(),
             Array::from_elements(metadata_type.clone(), &[0_i8, 1, 2, 0, 0, 2, 1, 2]).unwrap(),
             Array::from_elements(metadata_type.clone(), &[1_i8; 8]).unwrap(),
             Array::from_elements(metadata_type.clone(), &[0_i8, 1, 1, 0, 2, 3, 3, 2]).unwrap(),
@@ -2471,16 +2475,16 @@ mod tests {
     fn test_ragged_all_to_all_jvp_handles_joint_and_structural_zero_tangents() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let operation = RaggedAllToAllOperation::new("x".to_string(), 1);
-        let operand = Array::vector(vec![10.0_f64, 11.0, 12.0]);
-        let output = Array::vector(vec![100.0_f64, 101.0, 102.0, 103.0]);
+        let operand = Array::vector(vec![10.0_f64, 11.0, 12.0]).unwrap();
+        let output = Array::vector(vec![100.0_f64, 101.0, 102.0, 103.0]).unwrap();
         let metadata = [
-            Array::vector(vec![1_i32]),
-            Array::vector(vec![2_i32]),
-            Array::vector(vec![0_i32]),
-            Array::vector(vec![2_i32]),
+            Array::vector(vec![1_i32]).unwrap(),
+            Array::vector(vec![2_i32]).unwrap(),
+            Array::vector(vec![0_i32]).unwrap(),
+            Array::vector(vec![2_i32]).unwrap(),
         ];
-        let operand_tangent = Array::vector(vec![1.0_f64, 2.0, 3.0]);
-        let output_tangent = Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]);
+        let operand_tangent = Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap();
+        let output_tangent = Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap();
         let structural_zero = |primal: &Array| MaybeZero::Zero(primal.r#type().tangent().unwrap());
         let duals = |operand_tangent: MaybeZero<Array>, output_tangent: MaybeZero<Array>| {
             let mut inputs = vec![

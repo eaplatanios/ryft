@@ -1142,7 +1142,7 @@ mod tests {
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
                 ArrayIrBatchingPolicy,
             >| { item.all_gather_tiled("x", 0) },
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
             BatchAxis::new(0),
             BatchAxis::replicated(),
             BatchAxisSpecification::named("i"),
@@ -1161,10 +1161,16 @@ mod tests {
     #[test]
     fn test_untiled_all_gather_co_moves_ragged_extents_onto_the_participant_axis() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
-            .unwrap();
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(
+                    1,
+                    Array::vector(vec![1_i32, 3]).unwrap(),
+                    variable.clone(),
+                    vec![0],
+                )])
+                .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
         let operation = AllGatherOperation::new(
@@ -1179,14 +1185,17 @@ mod tests {
 
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         assert_eq!(output.value().to_f64s(), vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]);
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])],);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])],
+        );
     }
 
     #[test]
     fn test_untiled_all_gather_materializes_replicated_ragged_extents() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::replicated(Array::vector(vec![1.0_f32, 2.0, 0.0]))
-            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2_i32), variable.clone(), Vec::new())])
+        let input = ArrayBatch::replicated(Array::vector(vec![1.0_f32, 2.0, 0.0]).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2_i32).unwrap(), variable.clone(), Vec::new())])
             .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
@@ -1202,15 +1211,18 @@ mod tests {
 
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         assert_eq!(output.value().to_f64s(), vec![1.0, 2.0, 0.0, 1.0, 2.0, 0.0]);
-        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![2_i32, 2]), variable, vec![0])],);
+        assert_eq!(
+            output.ragged_axes(),
+            &[RaggedAxis::new(1, Array::vector(vec![2_i32, 2]).unwrap(), variable, vec![0])],
+        );
     }
 
     #[test]
     fn test_tiled_all_gather_rejects_unrepresentable_ragged_chunks() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
@@ -1235,9 +1247,9 @@ mod tests {
     #[test]
     fn test_array_ir_all_gather_preserves_untiled_ragged_metadata_and_rejects_tiled() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(8)).unwrap());
-        let extents = ArrayIrValue::Array(Array::vector(vec![1_i32, 3]));
+        let extents = ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap());
         let input = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0])),
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
             BatchAxis::new(0),
         )
         .unwrap()
@@ -1266,7 +1278,10 @@ mod tests {
             .into_parts()
             .0
             .remove(0);
-        assert_eq!(output.value(), &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0])),);
+        assert_eq!(
+            output.value(),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0]).unwrap()),
+        );
         assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, extents, variable.clone(), vec![0])]);
 
         let tiled = AllGatherOperation::new(
@@ -1289,10 +1304,10 @@ mod tests {
     #[test]
     fn test_array_ir_untiled_all_gather_materializes_replicated_ragged_extents() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 0.0])))
+        let input = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 0.0]).unwrap()))
             .with_ragged_axes(vec![RaggedAxis::new(
                 0,
-                ArrayIrValue::Array(Array::scalar(2_i32)),
+                ArrayIrValue::Array(Array::scalar(2_i32).unwrap()),
                 variable.clone(),
                 Vec::new(),
             )])
@@ -1320,10 +1335,13 @@ mod tests {
         .0
         .remove(0);
 
-        assert_eq!(output.value(), &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 0.0, 1.0, 2.0, 0.0])),);
+        assert_eq!(
+            output.value(),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 0.0, 1.0, 2.0, 0.0]).unwrap()),
+        );
         assert_eq!(
             output.ragged_axes(),
-            &[RaggedAxis::new(1, ArrayIrValue::Array(Array::vector(vec![2_i32, 2])), variable, vec![0],)],
+            &[RaggedAxis::new(1, ArrayIrValue::Array(Array::vector(vec![2_i32, 2]).unwrap()), variable, vec![0],)],
         );
     }
 
@@ -1340,7 +1358,7 @@ mod tests {
             CollectiveOptions::tiled(),
             AllGatherOutputVariance::Varying,
         )
-        .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]))])
+        .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap())])
         .unwrap()
         .into_parts()
         .0;
@@ -1515,7 +1533,7 @@ mod tests {
         .interpret(
             &EagerContext::<Array, ArrayOperation<Array>>::new(),
             &crate::EmptyRegionDriver,
-            &[Array::vector(vec![1.0, 2.0])],
+            &[Array::vector(vec![1.0, 2.0]).unwrap()],
         )
         .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1532,7 +1550,7 @@ mod tests {
         .interpret(
             &EagerContext::<Array, ArrayOperation<Array>>::new(),
             &crate::EmptyRegionDriver,
-            &[Array::vector(vec![1.0, 2.0])],
+            &[Array::vector(vec![1.0, 2.0]).unwrap()],
         )
         .unwrap_err();
         assert!(matches!(
@@ -1555,7 +1573,7 @@ mod tests {
                 EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
                 ArrayIrBatchingPolicy,
             >| { item.all_gather_tiled("x", 0) },
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
             BatchAxis::new(0),
             BatchAxis::replicated(),
             BatchAxisSpecification::named("x"),

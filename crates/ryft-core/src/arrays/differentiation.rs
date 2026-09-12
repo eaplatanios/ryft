@@ -667,14 +667,14 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
+        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap());
         let outputs = program.interpret(vec![ArrayIrValue::Reference(reference.clone())]).unwrap();
         let [ArrayIrValue::Dimension(dimension)] = outputs.as_slice() else {
             panic!("expected one dimension residual");
         };
         assert_eq!(dimension.extent(), 3);
         assert_eq!(dimension.r#type().extent(), Some(3));
-        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0, 7.0])));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap()));
     }
 
     #[test]
@@ -766,12 +766,12 @@ mod tests {
         assert_eq!(zero.inputs(), &[AtomId::new(1), AtomId::new(1)]);
         assert_eq!(
             pullback.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(2.0_f64)),
+                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::matrix(3, 3, vec![0.0_f32; 9])),
-                ArrayIrValue::Array(Array::scalar(2.0_f64)),
+                ArrayIrValue::Array(Array::matrix(3, 3, vec![0.0_f32; 9]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
             ]),
         );
     }
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(residuals.retain(m_value.clone()), 1);
 
         // Ordinary array residuals stay positional, so equal arrays still occupy distinct slots.
-        let array = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]));
+        let array = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
         assert_eq!(residuals.retain(array.clone()), 2);
         assert_eq!(residuals.retain(array), 3);
 

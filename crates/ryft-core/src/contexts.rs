@@ -827,35 +827,35 @@ mod tests {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         assert_eq!(
             domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(bf16::ZERO)])
+            Ok(vec![Array::scalar(bf16::ZERO).unwrap()])
         );
         assert_eq!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::BF16)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(bf16::ONE)])
+            Ok(vec![Array::scalar(bf16::ONE).unwrap()])
         );
         assert_eq!(
             domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(f16::ZERO)])
+            Ok(vec![Array::scalar(f16::ZERO).unwrap()])
         );
         assert_eq!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::F16)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(f16::ONE)])
+            Ok(vec![Array::scalar(f16::ONE).unwrap()])
         );
         assert_eq!(
             domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(0.0f32)])
+            Ok(vec![Array::scalar(0.0f32).unwrap()])
         );
         assert_eq!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(1.0f32)])
+            Ok(vec![Array::scalar(1.0f32).unwrap()])
         );
         assert_eq!(
             domain.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(0.0)])
+            Ok(vec![Array::scalar(0.0).unwrap()])
         );
         assert_eq!(
             domain.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(1.0)])
+            Ok(vec![Array::scalar(1.0).unwrap()])
         );
     }
 
@@ -868,18 +868,18 @@ mod tests {
         assert_eq!(format!("{context:?}"), "EagerContext");
         assert_eq!(format!("{default_context:?}"), "EagerContext");
         assert_eq!(format!("{cloned_context:?}"), "EagerContext");
-        assert_eq!(context.lift(Array::scalar(2.5)), Ok(Array::scalar(2.5)));
+        assert_eq!(context.lift(Array::scalar(2.5).unwrap()), Ok(Array::scalar(2.5).unwrap()));
         assert_eq!(
             context.bind(ZeroOperation::new(ArrayType::scalar(DataType::F64)), [], &[]),
-            Ok(vec![Array::scalar(0.0)])
+            Ok(vec![Array::scalar(0.0).unwrap()])
         );
         assert_eq!(
             context.bind(OneOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), &[]),
-            Ok(vec![Array::scalar(1.0)])
+            Ok(vec![Array::scalar(1.0).unwrap()])
         );
         assert_eq!(
-            context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(2.0), Array::scalar(3.5)]),
-            Ok(vec![Array::scalar(5.5)]),
+            context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()]),
+            Ok(vec![Array::scalar(5.5).unwrap()]),
         );
     }
 
@@ -890,7 +890,7 @@ mod tests {
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-            let eight = builder.add_constant(Array::scalar(8.0));
+            let eight = builder.add_constant(Array::scalar(8.0).unwrap());
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),
@@ -919,7 +919,7 @@ mod tests {
             context.bind(
                 AddOperation::new(),
                 CalleeRegionDriver::new(std::slice::from_ref(&condition)),
-                &[Array::scalar(1.0), Array::scalar(2.0)],
+                &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `add` declares no region slots but 1 regions were attached",
@@ -928,7 +928,7 @@ mod tests {
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
                 CalleeRegionDriver::new(&[]),
-                &[Array::scalar(1.0)],
+                &[Array::scalar(1.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `while` declares 2 region slots but 0 regions were attached",
@@ -937,7 +937,7 @@ mod tests {
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
                 CalleeRegionDriver::new(&[condition.clone(), body.clone(), body.clone()]),
-                &[Array::scalar(1.0)],
+                &[Array::scalar(1.0).unwrap()],
             ),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `while` declares 2 region slots but 3 regions were attached",
@@ -946,9 +946,9 @@ mod tests {
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
                 CalleeRegionDriver::new(&[condition, body]),
-                &[Array::scalar(1.0)],
+                &[Array::scalar(1.0).unwrap()],
             ),
-            Ok(vec![Array::scalar(8.0)]),
+            Ok(vec![Array::scalar(8.0).unwrap()]),
         );
     }
 
@@ -960,10 +960,14 @@ mod tests {
         let sum = context
             .invoke_with_provenance_scope(ProvenanceScope::new("scope"), || {
                 assert_eq!(context.provenance(), Provenance::unknown());
-                context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)])
+                context.bind(
+                    AddOperation::new(),
+                    Vec::new(),
+                    &[Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
+                )
             })
             .unwrap();
-        assert_eq!(sum, vec![Array::scalar(3.0)]);
+        assert_eq!(sum, vec![Array::scalar(3.0).unwrap()]);
     }
 
     #[test]
@@ -1070,7 +1074,7 @@ mod tests {
         let builder = context.builder().clone();
 
         let input = context.input(ArrayType::scalar(DataType::F64));
-        let constant = context.constant(Array::scalar(2.5));
+        let constant = context.constant(Array::scalar(2.5).unwrap());
         let builder_typed = context.tracer(AtomId::new(0), None);
         let cached_typed = context.tracer(AtomId::new(0), Some(ArrayType::scalar(DataType::F64)));
 
@@ -1085,7 +1089,7 @@ mod tests {
         assert_eq!(builder.input_ids(), &[AtomId::new(0)]);
         assert!(builder.instructions().is_empty());
         assert!(matches!(&builder.atoms()[0], Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
-        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == Array::scalar(2.5)));
+        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == Array::scalar(2.5).unwrap()));
     }
 
     #[test]
@@ -1123,7 +1127,10 @@ mod tests {
             .clone()
             .build::<(Array, Array), Array>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.5))), Ok(Array::scalar(5.5)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap())),
+            Ok(Array::scalar(5.5).unwrap())
+        );
     }
 
     #[test]
@@ -1357,14 +1364,14 @@ mod tests {
     fn test_staging_context_resolve() {
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let input = context.input(ArrayType::scalar(DataType::F64));
-        let constant = context.constant(Array::scalar(2.5));
+        let constant = context.constant(Array::scalar(2.5).unwrap());
         let mut add_outputs = context.stage_operation(AddOperation::new(), Vec::new(), &[&input, &constant]).unwrap();
         let sum = add_outputs.remove(0);
 
         // Literal-backed tracers resolve to their program-constant payload, while inputs and operation outputs
         // resolve to their staged atoms.
         assert_eq!(context.resolve(&input), ValueResolution::Staged(AtomId::new(0)));
-        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Array::scalar(2.5)));
+        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Array::scalar(2.5).unwrap()));
         assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
 
         // Tracers belonging to a different builder are opaque, in both directions.

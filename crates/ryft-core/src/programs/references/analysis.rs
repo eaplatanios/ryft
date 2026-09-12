@@ -3685,7 +3685,7 @@ mod tests {
                 condition
                     .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, counter], None)
                     .unwrap();
-                condition.add_constant(TestArrayValue::Array(Array::scalar(3.0f32)))
+                condition.add_constant(TestArrayValue::Array(Array::scalar(3.0f32).unwrap()))
             } else {
                 condition.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0]
             };
@@ -3709,7 +3709,7 @@ mod tests {
             let mut body = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
             let counter = body.add_input(scalar_type.clone().into());
             let reference = body.add_input(reference_type.clone());
-            let step = body.add_constant(TestArrayValue::Array(Array::scalar(1.0f32)));
+            let step = body.add_constant(TestArrayValue::Array(Array::scalar(1.0f32).unwrap()));
             let next = body
                 .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
                 .unwrap()[0];
@@ -3790,7 +3790,7 @@ mod tests {
         let mut condition = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
         condition.add_input(reference_type.clone());
         condition.add_input(reference_type.clone());
-        let predicate = condition.add_constant(TestArrayValue::Array(Array::scalar(false)));
+        let predicate = condition.add_constant(TestArrayValue::Array(Array::scalar(false).unwrap()));
         let condition = condition
             .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -4482,7 +4482,7 @@ mod tests {
             }
         }
 
-        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let mut builder = ProgramBuilder::<ReferenceConstant, TestArrayIrOperation>::new();
         let first = builder.add_constant(ReferenceConstant(ArrayIrValue::Reference(reference.clone())));
         let second = builder.add_constant(ReferenceConstant(ArrayIrValue::Reference(reference)));

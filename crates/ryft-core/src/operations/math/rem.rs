@@ -158,27 +158,48 @@ mod tests {
 
     #[test]
     fn test_rem_interpretation() {
-        assert_eq!(Array::scalar(7i32).rem(&Array::scalar(3i32)).unwrap(), Array::scalar(1i32));
-        // The result takes the sign of the dividend.
-        assert_eq!(Array::scalar(-7i32).rem(&Array::scalar(3i32)).unwrap(), Array::scalar(-1i32));
-        assert_eq!(Array::scalar(7i64).rem(&Array::scalar(-3i64)).unwrap(), Array::scalar(1i64));
-        assert_eq!(Array::scalar(7u32).rem(&Array::scalar(3u32)).unwrap(), Array::scalar(1u32));
-        assert_eq!(Array::scalar(7.5f64).rem(&Array::scalar(2.0f64)).unwrap(), Array::scalar(1.5f64));
-        assert_eq!(Array::scalar(-7.5f32).rem(&Array::scalar(2.0f32)).unwrap(), Array::scalar(-1.5f32));
         assert_eq!(
-            Array::scalar(bf16::from_f32(7.5)).rem(&Array::scalar(bf16::from_f32(2.0))).unwrap(),
-            Array::scalar(bf16::from_f32(7.5f32 % 2.0f32)),
+            Array::scalar(7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
+            Array::scalar(1i32).unwrap()
+        );
+        // The result takes the sign of the dividend.
+        assert_eq!(
+            Array::scalar(-7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
+            Array::scalar(-1i32).unwrap()
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(7.5)).rem(&Array::scalar(f16::from_f32(2.0))).unwrap(),
-            Array::scalar(f16::from_f32(7.5f32 % 2.0f32)),
+            Array::scalar(7i64).unwrap().rem(&Array::scalar(-3i64).unwrap()).unwrap(),
+            Array::scalar(1i64).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(7u32).unwrap().rem(&Array::scalar(3u32).unwrap()).unwrap(),
+            Array::scalar(1u32).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(7.5f64).unwrap().rem(&Array::scalar(2.0f64).unwrap()).unwrap(),
+            Array::scalar(1.5f64).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(-7.5f32).unwrap().rem(&Array::scalar(2.0f32).unwrap()).unwrap(),
+            Array::scalar(-1.5f32).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(7.5))
+                .unwrap()
+                .rem(&Array::scalar(bf16::from_f32(2.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(7.5f32 % 2.0f32)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(7.5)).unwrap().rem(&Array::scalar(f16::from_f32(2.0)).unwrap()).unwrap(),
+            Array::scalar(f16::from_f32(7.5f32 % 2.0f32)).unwrap(),
         );
         // Division by an integer zero reports an error instead of panicking.
-        assert!(matches!(Array::scalar(7i32).rem(&Array::scalar(0i32)), Err(_)));
+        assert!(matches!(Array::scalar(7i32).unwrap().rem(&Array::scalar(0i32).unwrap()), Err(_)));
 
         assert_eq!(
-            Array::vector(vec![7.5, -7.5]).rem(&Array::vector(vec![2.0, 2.0])).unwrap(),
-            Array::vector(vec![1.5, -1.5]),
+            Array::vector(vec![7.5, -7.5]).unwrap().rem(&Array::vector(vec![2.0, 2.0]).unwrap()).unwrap(),
+            Array::vector(vec![1.5, -1.5]).unwrap(),
         );
     }
 
@@ -186,8 +207,8 @@ mod tests {
     fn test_rem_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = RemOperation::new(),
-            inputs = [Array::scalar(7.5), Array::scalar(2.0)],
-            expected = Array::scalar(1.5),
+            inputs = [Array::scalar(7.5).unwrap(), Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(1.5).unwrap(),
         );
     }
 
@@ -199,10 +220,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![7.5, -7.5])),
-                    (@mapped(axis = 0), Array::vector(vec![2.0, 2.0])),
+                    (@mapped(axis = 0), Array::vector(vec![7.5, -7.5]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![2.0, 2.0]).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5, -1.5]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5, -1.5]).unwrap())],
             }],
         );
     }
@@ -213,11 +234,11 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = RemOperation::new(),
             cases = [{
-                primals = [Array::scalar(7.5), Array::scalar(2.0)],
-                tangents = [Array::scalar(3.0), Array::scalar(5.0)],
-                primal_outputs = [Array::scalar(1.5)],
+                primals = [Array::scalar(7.5).unwrap(), Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                primal_outputs = [Array::scalar(1.5).unwrap()],
                 // 3.0 - trunc(7.5 / 2.0) · 5.0 = 3.0 - 3.0 · 5.0 = -12.0.
-                tangent_outputs = [Array::scalar(-12.0)],
+                tangent_outputs = [Array::scalar(-12.0).unwrap()],
             }],
         );
     }

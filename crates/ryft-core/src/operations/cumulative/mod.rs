@@ -820,7 +820,7 @@ mod tests {
         let first = |left: &Array, _right: &Array| Ok(left.clone());
         for extent in 0..=9_usize {
             let values = (1..=extent).map(|value| value as f64).collect::<Vec<_>>();
-            let input = Array::vector(values.clone());
+            let input = Array::vector(values.clone()).unwrap();
             let shape = StaticShape::new(vec![extent]);
             for reverse in [false, true] {
                 assert_eq!(
@@ -837,18 +837,18 @@ mod tests {
         }
 
         // The construction scans one axis of a higher-rank operand independently per row.
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             associative_scan(&matrix, 1, false, &add),
-            Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0])),
+            Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap()),
         );
         assert_eq!(
             associative_scan(&matrix, 1, true, &add),
-            Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0])),
+            Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]).unwrap()),
         );
         assert_eq!(
             associative_scan(&matrix, 0, false, &add),
-            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0])),
+            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap()),
         );
 
         // The construction slices at staging-time positions, so it needs a fully static operand shape and an
@@ -901,8 +901,8 @@ mod tests {
         // implementation for the whole family.
         check_operation_partial_evaluation!(
             operation = CumulativeProductOperation::new(0),
-            inputs = [Array::vector(vec![1.0, 2.0, 3.0])],
-            expected = Array::vector(vec![1.0, 2.0, 6.0]),
+            inputs = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+            expected = Array::vector(vec![1.0, 2.0, 6.0]).unwrap(),
         );
     }
 
@@ -990,11 +990,14 @@ mod tests {
         );
 
         // The staged program is the derivative it claims to be, at concrete values.
-        let primals = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let tangents = Array::vector(vec![1.0, 1.0, 1.0, 1.0]);
+        let primals = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let tangents = Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap();
         assert_eq!(
             jvp.interpret(vec![primals, tangents]),
-            Ok(vec![Array::vector(vec![1.0, 2.0, 6.0, 24.0]), Array::vector(vec![1.0, 3.0, 11.0, 50.0])]),
+            Ok(vec![
+                Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap(),
+                Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap()
+            ]),
         );
     }
 

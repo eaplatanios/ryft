@@ -1074,8 +1074,11 @@ mod tests {
             .unwrap();
         assert_eq!(discharged.instructions()[0].regions().len(), 2);
         assert!(!discharged.entry_region_ref().contains_references_in_closure());
-        let inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f32)), ArrayIrValue::Array(Array::scalar(4.0_f32))];
-        let expected = vec![ArrayIrValue::Array(Array::scalar(12.0_f32))];
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+        ];
+        let expected = vec![ArrayIrValue::Array(Array::scalar(12.0_f32).unwrap())];
         assert_eq!(discharged.interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(discharged.transpose_with_respect_to(&[1], &[]).unwrap().interpret(inputs), Ok(expected));
 
@@ -1107,7 +1110,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]),
+            program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "a transpose-only linear call has no forward program to execute; it supports only \
                                reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
@@ -1193,15 +1196,15 @@ mod tests {
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
-            batched.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::scalar(4.0)]),
-            Ok(vec![Array::vector(vec![8.0, 12.0])]),
+            batched.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(4.0).unwrap()]),
+            Ok(vec![Array::vector(vec![8.0, 12.0]).unwrap()]),
         );
 
         let instruction = &batched.instructions()[0];
         let transpose = batched.region_ref(instruction.regions()[1]).unwrap().to_program();
         assert_eq!(
-            transpose.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::vector(vec![5.0, 7.0])]),
-            Ok(vec![Array::scalar(31.0)]),
+            transpose.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::vector(vec![5.0, 7.0]).unwrap()]),
+            Ok(vec![Array::scalar(31.0).unwrap()]),
         );
 
         // A replicated residual and mapped linear input preserve the mapped cotangent instead of reducing it.
@@ -1216,14 +1219,14 @@ mod tests {
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
-            batched_linear.interpret(vec![Array::scalar(2.0), Array::vector(vec![3.0, 4.0])]),
-            Ok(vec![Array::vector(vec![6.0, 8.0])]),
+            batched_linear.interpret(vec![Array::scalar(2.0).unwrap(), Array::vector(vec![3.0, 4.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![6.0, 8.0]).unwrap()]),
         );
         let instruction = &batched_linear.instructions()[0];
         let transpose = batched_linear.region_ref(instruction.regions()[1]).unwrap().to_program();
         assert_eq!(
-            transpose.interpret(vec![Array::scalar(2.0), Array::vector(vec![5.0, 7.0])]),
-            Ok(vec![Array::vector(vec![10.0, 14.0])]),
+            transpose.interpret(vec![Array::scalar(2.0).unwrap(), Array::vector(vec![5.0, 7.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![10.0, 14.0]).unwrap()]),
         );
 
         // Rebatching an executable linear call composes mapped axes without losing either attached region.
@@ -1238,8 +1241,11 @@ mod tests {
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         assert_eq!(
-            nested.interpret(vec![Array::vector(vec![2.0, 3.0]), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]),]),
-            Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0])]),
+            nested.interpret(vec![
+                Array::vector(vec![2.0, 3.0]).unwrap(),
+                Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]).unwrap(),
+            ]),
+            Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0]).unwrap()]),
         );
     }
 
@@ -1294,13 +1300,13 @@ mod tests {
         // the call unchanged and leave the `axis_index` unresolved (it then reaches eager interpretation and reports
         // "`axis_index` for the device mesh axis `items` has no eager value").
         let outputs = LinearCallOperation::new(0)
-            .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0))])
+            .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0).unwrap())])
             .unwrap()
             .into_parts()
             .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]).unwrap());
     }
 
     #[test]
@@ -1366,14 +1372,17 @@ mod tests {
             .batch(
                 &context,
                 &driver,
-                &[ArrayBatch::replicated(Array::scalar(2.0)), ArrayBatch::replicated(Array::scalar(4.0))],
+                &[
+                    ArrayBatch::replicated(Array::scalar(2.0).unwrap()),
+                    ArrayBatch::replicated(Array::scalar(4.0).unwrap()),
+                ],
             )
             .unwrap()
             .into_parts()
             .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value(), &Array::scalar(8.0));
+        assert_eq!(outputs[0].value(), &Array::scalar(8.0).unwrap());
     }
 
     #[test]
@@ -1429,7 +1438,7 @@ mod tests {
 
         // The rebuilt transpose is the identity over the physical cotangent, taking the relayed batch extent first.
         let transpose = program.region_ref(instruction.regions()[1]).unwrap().to_program();
-        let cotangent = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let cotangent = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             transpose.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::constant(2)?),
@@ -1441,10 +1450,10 @@ mod tests {
         // End to end, the masked sums match the per-item logical extents rather than the packed bound.
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])),
-                ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
             ])?,
-            ArrayIrValue::Array(Array::vector(vec![2.0_f32, 9.0])),
+            ArrayIrValue::Array(Array::vector(vec![2.0_f32, 9.0]).unwrap()),
         );
         Ok(())
     }
@@ -1467,7 +1476,7 @@ mod tests {
         let linear = builder.add_input(array_type.into());
         let transpose: TestProgram = builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])?;
         let residual = ArrayIrValue::Dimension(DimensionValue::new(residual_type, 3)?);
-        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]).unwrap());
         let output: ArrayIrValue<Array> = batch(
             |(residual, linear)| {
                 let outputs = residual.context().bind(
@@ -1507,12 +1516,12 @@ mod tests {
         // `(r, u, ṙ, u̇) = (2, 3, 5, 7)`, the primal is `6` and the tangent is `5 · 3 + 2 · 7 = 29`.
         assert_eq!(
             program.jvp().unwrap().interpret(vec![
-                Array::scalar(2.0),
-                Array::scalar(3.0),
-                Array::scalar(5.0),
-                Array::scalar(7.0),
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(3.0).unwrap(),
+                Array::scalar(5.0).unwrap(),
+                Array::scalar(7.0).unwrap(),
             ]),
-            Ok(vec![Array::scalar(6.0), Array::scalar(29.0)]),
+            Ok(vec![Array::scalar(6.0).unwrap(), Array::scalar(29.0).unwrap()]),
         );
     }
 
@@ -1522,7 +1531,7 @@ mod tests {
         // same map. Hoisting tangent state into the primal program would reuse a consumed reference on the next call.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(Array::scalar(0.0_f32).into());
+        let zero = builder.add_constant(Array::scalar(0.0_f32).unwrap().into());
         let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
@@ -1552,22 +1561,23 @@ mod tests {
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        let mut primal_outputs = linearization.primal().interpret(vec![Array::scalar(3.0_f32).into()]).unwrap();
+        let mut primal_outputs =
+            linearization.primal().interpret(vec![Array::scalar(3.0_f32).unwrap().into()]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        assert_eq!(primal_outputs, vec![Array::scalar(3.0_f32).into()]);
+        assert_eq!(primal_outputs, vec![Array::scalar(3.0_f32).unwrap().into()]);
 
         // Reuse the same primal residuals with different tangents, then repeat the first tangent.
         let outputs = [2.0_f32, 5.0, 2.0].map(|tangent| {
-            let mut inputs = vec![Array::scalar(tangent).into()];
+            let mut inputs = vec![Array::scalar(tangent).unwrap().into()];
             inputs.extend(residuals.clone());
             linearization.tangent().interpret(inputs).unwrap()
         });
         assert_eq!(
             outputs,
             [
-                vec![Array::scalar(2.0_f32).into()],
-                vec![Array::scalar(5.0_f32).into()],
-                vec![Array::scalar(2.0_f32).into()],
+                vec![Array::scalar(2.0_f32).unwrap().into()],
+                vec![Array::scalar(5.0_f32).unwrap().into()],
+                vec![Array::scalar(2.0_f32).unwrap().into()],
             ],
         );
         assert_eq!(
@@ -1588,7 +1598,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let seed = backward.add_input(scalar_type.clone());
-        let invalid_extent = backward.add_constant(Array::scalar(-1_i32).into());
+        let invalid_extent = backward.add_constant(Array::scalar(-1_i32).unwrap().into());
         backward
             .add_instruction(
                 DimensionFromScalarOperation::new(DimensionVariable::new(

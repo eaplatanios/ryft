@@ -11,23 +11,23 @@ include!("support/allocation_measurement.rs");
 
 #[test]
 fn test_reference_elementwise_kernels_allocate_only_one_payload_buffer() {
-    let small_unary = measure_allocations(|| Array::vector(vec![1.0f32]), |array| array.sin().unwrap());
+    let small_unary = measure_allocations(|| Array::vector(vec![1.0f32]).unwrap(), |array| array.sin().unwrap());
     let large_unary = measure_allocations(
-        || Array::vector((0..4096).map(|value| value as f32).collect()),
+        || Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
         |array| array.sin().unwrap(),
     );
     assert_eq!(large_unary.allocation_count, small_unary.allocation_count);
     assert_eq!(large_unary.allocated_byte_count - small_unary.allocated_byte_count, (4096 - 1) * size_of::<f32>());
 
     let small_binary = measure_allocations(
-        || (Array::vector(vec![1.0f32]), Array::vector(vec![2.0f32])),
+        || (Array::vector(vec![1.0f32]).unwrap(), Array::vector(vec![2.0f32]).unwrap()),
         |(left, right)| left.add(&right).unwrap(),
     );
     let large_binary = measure_allocations(
         || {
             (
-                Array::vector((0..4096).map(|value| value as f32).collect()),
-                Array::vector((0..4096).map(|value| value as f32).collect()),
+                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
+                Array::vector((0..4096).map(|value| value as f32).collect()).unwrap(),
             )
         },
         |(left, right)| left.add(&right).unwrap(),
@@ -63,11 +63,21 @@ fn test_reference_constructor_kernels_allocate_only_one_payload_buffer() {
     // Narrow random outputs retain the generated U32 words and construct their output storage directly, without a
     // third payload-sized narrowing buffer.
     let small_random = measure_allocations(
-        || (Array::vector(vec![42u64, 7]), ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(1)]))),
+        || {
+            (
+                Array::vector(vec![42u64, 7]).unwrap(),
+                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(1)])),
+            )
+        },
         |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
     );
     let large_random = measure_allocations(
-        || (Array::vector(vec![42u64, 7]), ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(4096)]))),
+        || {
+            (
+                Array::vector(vec![42u64, 7]).unwrap(),
+                ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(4096)])),
+            )
+        },
         |(state, r#type)| state.rng_bit_generator(RandomAlgorithm::ThreeFry, &r#type).unwrap(),
     );
     assert_eq!(large_random.allocation_count, small_random.allocation_count);

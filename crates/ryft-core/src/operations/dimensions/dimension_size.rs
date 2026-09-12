@@ -278,7 +278,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
 /// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
-/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
+/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]).unwrap());
 /// let columns = array.dimension_size(-1)?;
 /// let ArrayIrValue::Dimension(columns) = columns else {
 ///     unreachable!("dimension_size always returns a dimension member");
@@ -479,9 +479,9 @@ mod tests {
         assert_eq!(renamed_operation.result_type().variable(), &renamed);
 
         // Eager execution reads shape metadata without consuming or copying the array payload.
-        let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]);
+        let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
         assert_eq!(reference_array.dimension_size(-1), Ok(3));
-        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]));
+        let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap());
         let payload = <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
             .unwrap()
             .storage_bytes()
@@ -507,8 +507,9 @@ mod tests {
 
         // A dynamic staged declaration executes against its compatible concrete static refinement.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let result =
-            context.bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]))]).unwrap();
+        let result = context
+            .bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap())])
+            .unwrap();
         let [ArrayIrValue::Dimension(result)] = result.as_slice() else {
             panic!("expected one dimension result");
         };
@@ -556,7 +557,7 @@ mod tests {
                 in (%1, %2)"},
         );
 
-        let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]));
+        let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap());
         let (first, second) = program.interpret(concrete.clone()).unwrap();
         let (ArrayIrValue::Dimension(first), ArrayIrValue::Dimension(second)) = (first, second) else {
             panic!("expected two concrete dimension results");
@@ -677,7 +678,7 @@ mod tests {
         let program = program.to_flat_program();
 
         let known = program
-            .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::vector(vec![0.0f32; 5])))])
+            .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap()))])
             .unwrap();
         assert!(known.program().instructions().is_empty());
         let [PartialEvaluationOutput::Known(ArrayIrValue::Dimension(result))] = known.outputs() else {

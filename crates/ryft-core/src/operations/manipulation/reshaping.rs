@@ -817,7 +817,7 @@ pub(crate) fn lift_output_sharding_for_leading_batch_axis(
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Reshape a length-6 vector to a `[2, 3]` matrix while keeping the row-major payload unchanged.
-/// let x = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// let x = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let y = x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))?;
 /// assert_eq!(y.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
@@ -1216,9 +1216,9 @@ where
 /// use ryft_core::operations::manipulation::DynamicReshape;
 /// use ryft_core::{Array, ArrayIrValue};
 ///
-/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
 /// let output = input.dynamic_reshape_to_sizes(&[2, 3]).unwrap();
-/// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])));
+/// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()));
 /// ```
 ///
 /// Computed or input dimensions remain ordinary SSA operands, which is what makes a runtime-derived output shape
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(input_type.reshape(shape.clone()), Ok(output_type.clone()));
 
         // Interpretation reinterprets the row-major payload under the target shape.
-        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -1418,6 +1418,7 @@ mod tests {
         );
         assert_eq!(
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap()
                 .reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),)
                 .map(|array| array.to_f64s()),
             Ok(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
@@ -1450,8 +1451,8 @@ mod tests {
         );
 
         // Check the standard partial-evaluation contract for both known and residual inputs.
-        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
@@ -1470,11 +1471,12 @@ mod tests {
         );
 
         // Check batching, forward differentiation, and the inverse-reshape pullback.
-        let batched_input = Array::matrix(2, 6, (0..12).map(|value| value as f64).collect());
+        let batched_input = Array::matrix(2, 6, (0..12).map(|value| value as f64).collect()).unwrap();
         let batched_output = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
             (0..12).map(|value| value as f64).collect(),
-        );
+        )
+        .unwrap();
         check_operation_batching!(
             @exact,
             operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
@@ -1493,11 +1495,11 @@ mod tests {
                     6,
                     2,
                     vec![0.0, 6.0, 1.0, 7.0, 2.0, 8.0, 3.0, 9.0, 4.0, 10.0, 5.0, 11.0],
-                ))],
+                ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::from_f64s(
                     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
                     (0..12).map(|value| value as f64).collect(),
-                ))],
+                ).unwrap())],
             }],
         );
         check_operation_batching!(
@@ -1510,22 +1512,22 @@ mod tests {
                 inputs = [(@mapped(axis = 0), Array::from_f64s(
                     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
                     (1..=12).map(|value| value as f64).collect(),
-                ))],
+                ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::matrix(
                     2,
                     6,
                     vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0, 7.0, 10.0, 8.0, 11.0, 9.0, 12.0],
-                ))],
+                ).unwrap())],
             }],
         );
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-9),
             operation = ReshapeOperation::new(Shape::new(vec![2.into(), 2.into()])),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
-                tangents = [Array::vector(vec![5.0, 6.0, 7.0, 8.0])],
-                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])],
-                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangents = [Array::vector(vec![5.0, 6.0, 7.0, 8.0]).unwrap()],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -1533,8 +1535,8 @@ mod tests {
             operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
-                input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -1547,8 +1549,8 @@ mod tests {
                     DataType::F64,
                     Shape::new(vec![2.into(), 3.into()]),
                 )))],
-                output_cotangents = [Array::vector(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])],
-                input_cotangents = [Array::matrix(2, 3, vec![10.0, 30.0, 50.0, 20.0, 40.0, 60.0])],
+                output_cotangents = [Array::vector(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap()],
+                input_cotangents = [Array::matrix(2, 3, vec![10.0, 30.0, 50.0, 20.0, 40.0, 60.0]).unwrap()],
             }],
         );
 
@@ -1568,11 +1570,11 @@ mod tests {
                 output_cotangents = [Array::from_f64s(
                     placed_output_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                )],
+                ).unwrap()],
                 input_cotangents = [Array::from_f64s(
                     placed_input_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                )],
+                ).unwrap()],
             }],
         );
     }
@@ -1580,12 +1582,12 @@ mod tests {
     #[test]
     fn test_dynamic_reshape() {
         // A concrete composite value resolves every explicit extent operand and reshapes its array member directly.
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let rows = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let columns = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
         assert_eq!(
             input.dynamic_reshape(&[rows, columns]).unwrap(),
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
         );
         assert_eq!(input.dynamic_reshape_to_sizes(&[3, 2]).unwrap().r#type().to_string(), "f64[3, 2]");
         assert_eq!(input.dynamic_reshape_to_sizes(&[6]).unwrap(), input);
@@ -1671,7 +1673,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap().reshape(dynamic_shape),
             Err(ProgramError::Type(TypeError::invalid(
                 "`reshape` requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
@@ -2053,7 +2055,7 @@ mod tests {
 
     #[test]
     fn test_array_reshape() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);

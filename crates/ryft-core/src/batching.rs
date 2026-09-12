@@ -2322,8 +2322,8 @@ mod tests {
         .into_parts();
         assert_eq!(program.input_count(), 2);
         assert_eq!(
-            program.interpret(vec![Array::scalar(7.0), Array::vector(vec![2.0, 3.0])]),
-            Ok(vec![Array::vector(vec![2.0, 3.0])]),
+            program.interpret(vec![Array::scalar(7.0).unwrap(), Array::vector(vec![2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![2.0, 3.0]).unwrap()]),
         );
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
 
@@ -2344,8 +2344,8 @@ mod tests {
         .unwrap()
         .into_parts();
         assert_eq!(
-            program.interpret(vec![Array::vector(vec![2.0, 3.0])]),
-            Ok(vec![Array::scalar(5.0), Array::vector(vec![2.0, 3.0])]),
+            program.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::scalar(5.0).unwrap(), Array::vector(vec![2.0, 3.0]).unwrap()]),
         );
         assert_eq!(output_axes, vec![BatchAxis::replicated(), BatchAxis::new(0)]);
 
@@ -2402,8 +2402,8 @@ mod tests {
     #[test]
     fn test_batching_driver_align_batch_axis() -> Result<(), BatchingError> {
         let context = BatchingContext::<TestArrayContext, ArrayBatchingPolicy>::new(TestArrayContext::new(), 2);
-        let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?;
-        let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
+        let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), Some(0))?;
+        let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
 
         // The default accepts a batch that already carries the requested axis and rejects every other request, since a
         // driver without recursive access to the policy cannot broadcast or transpose.
@@ -2426,10 +2426,10 @@ mod tests {
         let driver = RecursiveBatchingDriver::new(&EmptyRegionDriver);
         let moved = driver.align_batch_axis(&context, mapped, Axis::from(1))?;
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
-        assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+        assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap());
         let broadcasted = driver.align_batch_axis(&context, replicated, Axis::from(1))?;
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
-        assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
+        assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]).unwrap());
         Ok(())
     }
 
@@ -2439,8 +2439,8 @@ mod tests {
         // output as an `ArrayBatch` carrying the requested output batch axis. Here two batched length-3 inputs are
         // added elementwise, yielding a single batched sum mapped on axis 0.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
-        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]).unwrap(), Some(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TestArrayContext::new(), 3);
         let outputs = AddOperation::new()
             .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
@@ -2448,11 +2448,11 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(*outputs[0].r#type(), vector_type);
-        assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]).unwrap());
 
         // An `output_batch_axes` length that disagrees with the number of produced outputs is rejected.
-        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
-        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]).unwrap(), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]).unwrap(), Some(0)).unwrap();
         assert!(matches!(
             AddOperation::new().interpret_with_batch_axes(&context, &[left, right], &[]),
             Err(BatchingError::Program(_)),
@@ -2523,8 +2523,8 @@ mod tests {
         assert_eq!(aligned_program.instructions().len(), 1);
         assert!(matches!(aligned_program.instructions()[0].operation(), TestArrayOperation::Transpose(_)));
         assert_eq!(
-            aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])]),
-            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]),
+            aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()]),
         );
     }
 
@@ -2582,7 +2582,7 @@ mod tests {
     #[test]
     fn test_batching_context_prepare_inputs() -> Result<(), BatchingError> {
         let parent = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0])));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         let (context, inputs) = BatchingContext::<_, ArrayIrBatchingPolicy>::prepare_inputs(
             &parent,
             vec![reference.clone()],
@@ -2597,7 +2597,7 @@ mod tests {
                 message: "captured reference aliases batched input 0; pass it as an input instead".to_string(),
             },
         );
-        let distinct = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32)));
+        let distinct = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32).unwrap()));
         for _ in 0..2 {
             assert_eq!(context.lift(distinct.clone())?.batch().batch_axis(), BatchAxis::replicated());
         }
@@ -2725,7 +2725,7 @@ mod tests {
         }
 
         let context = BatchingContext::<TestArrayContext, EvidenceBatching>::with_policy(TestArrayContext::new(), 2);
-        let input = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(1.0_f32)));
+        let input = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(1.0_f32).unwrap()));
 
         // An attesting rule's evidence reaches the validation boundary, which accepts the transition.
         let outputs = context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input.clone()]).unwrap();
@@ -2749,19 +2749,19 @@ mod tests {
         let output: (Array, Array) = TestArrayContext::new()
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
-                (Array::vector(vec![1.0, 3.0]), Array::vector(vec![2.0, 4.0])),
+                (Array::vector(vec![1.0, 3.0]).unwrap(), Array::vector(vec![2.0, 4.0]).unwrap()),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
             )
             .unwrap();
-        assert_eq!(output, (Array::vector(vec![3.0, 7.0]), Array::vector(vec![2.0, 12.0])));
+        assert_eq!(output, (Array::vector(vec![3.0, 7.0]).unwrap(), Array::vector(vec![2.0, 12.0]).unwrap()));
 
         // With no mapped input and no explicit batch size, the batch size is unobservable.
         let error = TestArrayContext::new()
             .batch(
                 |x| Ok(x.clone() * x),
-                Array::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
                 BatchAxis::replicated(),
                 BatchAxis::replicated(),
                 None,

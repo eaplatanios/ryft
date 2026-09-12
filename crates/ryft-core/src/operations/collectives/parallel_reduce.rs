@@ -603,33 +603,39 @@ mod tests {
         )
         .with_axis_name("i".to_string());
 
-        let sum_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 100.0, 100.0, 2.0, 3.0, 100.0]), 0)?
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]), length.clone(), vec![0])])?;
+        let sum_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 100.0, 100.0, 2.0, 3.0, 100.0]).unwrap(), 0)?
+            .with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                Array::vector(vec![1_i32, 2]).unwrap(),
+                length.clone(),
+                vec![0],
+            )])?;
         let sum = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
             .batch(&context, &EmptyRegionDriver, &[sum_input])?
             .into_parts()
             .0
             .remove(0);
         assert_eq!(sum.batch_axis(), BatchAxis::replicated());
-        assert_eq!(sum.value(), &Array::vector(vec![3.0_f32, 3.0, 0.0]));
-        assert_eq!(sum.ragged_axes()[0].extents(), &Array::scalar(2_i32));
+        assert_eq!(sum.value(), &Array::vector(vec![3.0_f32, 3.0, 0.0]).unwrap());
+        assert_eq!(sum.ragged_axes()[0].extents(), &Array::scalar(2_i32).unwrap());
 
-        let max_input = ArrayBatch::new(Array::matrix(2, 3, vec![-5.0_f32, 100.0, 100.0, -3.0, -4.0, 100.0]), 0)?
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]), length, vec![0])])?;
+        let max_input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![-5.0_f32, 100.0, 100.0, -3.0, -4.0, 100.0]).unwrap(), 0)?
+                .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]).unwrap(), length, vec![0])])?;
         let maximum = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Max)
             .batch(&context, &EmptyRegionDriver, &[max_input])?
             .into_parts()
             .0
             .remove(0);
         assert_eq!(maximum.batch_axis(), BatchAxis::replicated());
-        assert_eq!(maximum.value(), &Array::vector(vec![-3.0_f32, -4.0, f32::NEG_INFINITY]));
-        assert_eq!(maximum.ragged_axes()[0].extents(), &Array::scalar(2_i32));
+        assert_eq!(maximum.value(), &Array::vector(vec![-3.0_f32, -4.0, f32::NEG_INFINITY]).unwrap());
+        assert_eq!(maximum.ragged_axes()[0].extents(), &Array::scalar(2_i32).unwrap());
         Ok(())
     }
 
     #[test]
     fn test_parallel_reduce_passes_through_replicated_input() {
-        let input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
             .batch(&batching_context(3), &EmptyRegionDriver, &[input])
             .unwrap()
@@ -656,7 +662,7 @@ mod tests {
             |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_reduce("j", ParallelReductionKind::Sum)
             },
-            Array::vector(vec![1.0, 2.0, 3.0]),
+            Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::replicated(),
             BatchAxisSpecification::named("i"),
@@ -701,7 +707,7 @@ mod tests {
         // Mapped input shape [3] at axis 0: per-item scalar. A `Sum` reduction collapses the batch axis to a
         // replicated scalar holding the total.
         let input = {
-            let value = Array::vector(vec![1.0, 2.0, 3.0]);
+            let value = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -718,7 +724,7 @@ mod tests {
     #[test]
     fn test_parallel_reduce_max_reduces_along_the_batch_axis() {
         let input = {
-            let value = Array::vector(vec![1.0, 4.0, 2.0]);
+            let value = Array::vector(vec![1.0, 4.0, 2.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -739,7 +745,7 @@ mod tests {
         // frame binds the axis name `"data"` to show the rule matches on the collective's own axis name rather than a
         // fixture default.
         let input = {
-            let value = Array::vector(vec![2.0, 4.0, 6.0]);
+            let value = Array::vector(vec![2.0, 4.0, 6.0]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -761,9 +767,9 @@ mod tests {
     #[test]
     fn test_parallel_mean_batching_rejects_ragged_operands_without_a_denominator_definition() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
 
         assert_eq!(
@@ -788,7 +794,7 @@ mod tests {
         // through the self-adjoint `parallel_mean`, which carries the `1/N` factor, so `∂g/∂x_i = 1/N` for every
         // input. With `x = [1, 2, 3]` (so `N = 3`) the value is `2` and the gradient is `[1/3, 1/3, 1/3]`,
         // witnessing the `1/N` scaling that distinguishes `parallel_mean` from `parallel_sum`.
-        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
             .value_and_gradient(|x| {
                 let mean = batch(
                     |item| item.parallel_reduce("i", ParallelReductionKind::Mean),
@@ -812,7 +818,8 @@ mod tests {
         let x = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
-        );
+        )
+        .unwrap();
         let output: Array = batch(
             |row| {
                 Ok(batch(
@@ -843,7 +850,7 @@ mod tests {
         // producing the replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through
         // the self-adjoint `parallel_sum`, which re-broadcasts the cotangent across the batch items, giving
         // `∂g/∂x_i = 1` for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
             .value_and_gradient(|x| {
                 let total = batch(
                     |item| item.parallel_reduce("i", ParallelReductionKind::Sum),

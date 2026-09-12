@@ -117,22 +117,32 @@ mod tests {
 
     #[test]
     fn test_tanh_interpretation() {
-        assert_eq!(Array::scalar(0.5f32).tanh().unwrap(), Array::scalar(0.5f32.tanh()));
-        assert_eq!(Array::scalar(0.5f64).tanh().unwrap(), Array::scalar(0.5f64.tanh()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).tanh().unwrap(), Array::scalar(bf16::from_f32(0.5f32.tanh())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).tanh().unwrap(), Array::scalar(f16::from_f32(0.5f32.tanh())),);
+        assert_eq!(Array::scalar(0.5f32).unwrap().tanh().unwrap(), Array::scalar(0.5f32.tanh()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().tanh().unwrap(), Array::scalar(0.5f64.tanh()).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().tanh().unwrap(),
+            Array::scalar(bf16::from_f32(0.5f32.tanh())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().tanh().unwrap(),
+            Array::scalar(f16::from_f32(0.5f32.tanh())).unwrap(),
+        );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).tanh().unwrap(), Array::scalar(input.tanh()), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().tanh().unwrap(),
+            Array::scalar(input.tanh()).unwrap(),
+            epsilon = 1e-12
+        );
 
-        assert_eq!(Array::scalar(0.7).tanh().unwrap(), Array::scalar(0.7f64.tanh()),);
+        assert_eq!(Array::scalar(0.7).unwrap().tanh().unwrap(), Array::scalar(0.7f64.tanh()).unwrap(),);
     }
 
     #[test]
     fn test_tanh_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = TanhOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.tanh()),
+            inputs = [Array::scalar(0.7).unwrap()],
+            expected = Array::scalar(0.7f64.tanh()).unwrap(),
         );
     }
 
@@ -143,8 +153,8 @@ mod tests {
             operation = TanhOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.tanh(), (-1.0f64).tanh()]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.tanh(), (-1.0f64).tanh()]).unwrap())],
             }],
         );
     }
@@ -156,10 +166,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = TanhOperation::new(),
             cases = [{
-                primals = [Array::scalar(0.7)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(0.7f64.tanh())],
-                tangent_outputs = [Array::scalar(expected_tangent)],
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64.tanh()).unwrap()],
+                tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = tanh %0
@@ -181,8 +191,8 @@ mod tests {
             ComplexNumber::new(1.0, 0.0) - tanh * tanh
         };
         assert_abs_diff_eq!(
-            Array::scalar(expected),
-            differentiate_at(Array::scalar(input))
+            Array::scalar(expected).unwrap(),
+            differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
                 .gradient(|input| { input.tanh().unwrap() })
                 .unwrap(),

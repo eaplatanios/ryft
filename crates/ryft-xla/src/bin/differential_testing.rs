@@ -305,7 +305,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     )
     .with_axis_name("x".to_string());
     let input = ArrayIrBatch::new(
-        ArrayIrValue::Array(CpuArray::matrix(4, 2, (0..8).map(|value| value as f32).collect())),
+        ArrayIrValue::Array(CpuArray::matrix(4, 2, (0..8).map(|value| value as f32).collect())?),
         BatchAxis::new(0),
     )?;
     let output = BatchingTracer::new(context, input).parallel_shuffle("x", &[2, 0, 3, 1])?.into_batch();
@@ -421,8 +421,8 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
     let execute = |mask| -> Result<Vec<Vec<f32>>, Box<dyn Error>> {
         let [ArrayIrValue::Array(output)]: [ArrayIrValue<CpuArray>; 1] = program
             .interpret(vec![
-                ArrayIrValue::Array(CpuArray::vector(mask)),
-                ArrayIrValue::Array(CpuArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])),
+                ArrayIrValue::Array(CpuArray::vector(mask)?),
+                ArrayIrValue::Array(CpuArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?),
             ])?
             .try_into()
             .unwrap()
@@ -445,18 +445,18 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 
 /// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 4]), (1..=8).map(f64::from).collect());
-    let rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [4, 3]), (1..=12).map(f64::from).collect());
-    let lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 0.5, 1.0]);
+    let lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 4]), (1..=8).map(f64::from).collect())?;
+    let rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [4, 3]), (1..=12).map(f64::from).collect())?;
+    let lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 0.5, 1.0])?;
     let rhs_scale =
-        CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
     let values = |value: CpuArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
 
-    let matmul_lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 4]), vec![1.0; 4]);
-    let matmul_rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 4]), vec![1.0; 8]);
-    let matmul_lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 2]), vec![1.0; 2]);
-    let matmul_rhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2]), vec![1.0; 4]);
+    let matmul_lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 4]), vec![1.0; 4])?;
+    let matmul_rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 4]), vec![1.0; 8])?;
+    let matmul_lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 2]), vec![1.0; 2])?;
+    let matmul_rhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2]), vec![1.0; 4])?;
     let observations = BTreeMap::from([
         (
             "both_scales",
@@ -519,10 +519,10 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         .with_local_window((1, 0))
         .with_residual(true);
     let inputs = AttentionInputs {
-        query: CpuArray::from_f64s(query_type.clone(), vec![0.0; 4]),
-        key: CpuArray::from_f64s(key_value_type.clone(), vec![0.0; 2]),
-        value: CpuArray::from_f64s(key_value_type.clone(), vec![3.0, 9.0]),
-        bias: Some(CpuArray::from_f64s(bias_type.clone(), vec![0.0])),
+        query: CpuArray::from_f64s(query_type.clone(), vec![0.0; 4])?,
+        key: CpuArray::from_f64s(key_value_type.clone(), vec![0.0; 2])?,
+        value: CpuArray::from_f64s(key_value_type.clone(), vec![3.0, 9.0])?,
+        bias: Some(CpuArray::from_f64s(bias_type.clone(), vec![0.0])?),
         mask: Some(CpuArray::from_elements(mask_type.clone(), &[true, false, false, true])?),
         query_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
         key_value_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
@@ -533,9 +533,9 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
     let (gqa_output, _) = CpuArray::dot_product_attention(
         AttentionInputs {
-            query: CpuArray::from_f64s(gqa_query_type, vec![0.0; 8]),
-            key: CpuArray::from_f64s(gqa_key_value_type.clone(), vec![0.0; 6]),
-            value: CpuArray::from_f64s(gqa_key_value_type, vec![1.0, 10.0, 2.0, 20.0, 4.0, 40.0]),
+            query: CpuArray::from_f64s(gqa_query_type, vec![0.0; 8])?,
+            key: CpuArray::from_f64s(gqa_key_value_type.clone(), vec![0.0; 6])?,
+            value: CpuArray::from_f64s(gqa_key_value_type, vec![1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
             bias: None,
             mask: None,
             query_sequence_lengths: None,

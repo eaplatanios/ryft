@@ -291,7 +291,7 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 /// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
 /// assert_eq!(
 ///     context.dynamic_one(&output_type, &[dimension]),
-///     Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]))),
+///     Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap())),
 /// );
 /// ```
 pub trait DynamicOne<V: Typed> {
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(
             instantiated
                 .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap())]),
         );
     }
 
@@ -435,26 +435,26 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
             ),
-            Ok(vec![Array::scalar(1.0)]),
+            Ok(vec![Array::scalar(1.0).unwrap()]),
         );
 
         let context = EagerContext::<Array>::new();
 
         // Verify canonical rank-zero one values across every supported data-type family.
         for (r#type, expected) in [
-            (DataType::Boolean, Array::scalar(true)),
-            (DataType::I8, Array::scalar(1i8)),
-            (DataType::I16, Array::scalar(1i16)),
-            (DataType::I32, Array::scalar(1i32)),
-            (DataType::I64, Array::scalar(1i64)),
-            (DataType::U8, Array::scalar(1u8)),
-            (DataType::U16, Array::scalar(1u16)),
-            (DataType::U32, Array::scalar(1u32)),
-            (DataType::U64, Array::scalar(1u64)),
-            (DataType::BF16, Array::scalar(bf16::ONE)),
-            (DataType::F16, Array::scalar(f16::ONE)),
-            (DataType::F32, Array::scalar(1.0f32)),
-            (DataType::F64, Array::scalar(1.0f64)),
+            (DataType::Boolean, Array::scalar(true).unwrap()),
+            (DataType::I8, Array::scalar(1i8).unwrap()),
+            (DataType::I16, Array::scalar(1i16).unwrap()),
+            (DataType::I32, Array::scalar(1i32).unwrap()),
+            (DataType::I64, Array::scalar(1i64).unwrap()),
+            (DataType::U8, Array::scalar(1u8).unwrap()),
+            (DataType::U16, Array::scalar(1u16).unwrap()),
+            (DataType::U32, Array::scalar(1u32).unwrap()),
+            (DataType::U64, Array::scalar(1u64).unwrap()),
+            (DataType::BF16, Array::scalar(bf16::ONE).unwrap()),
+            (DataType::F16, Array::scalar(f16::ONE).unwrap()),
+            (DataType::F32, Array::scalar(1.0f32).unwrap()),
+            (DataType::F64, Array::scalar(1.0f64).unwrap()),
         ] {
             assert_eq!(context.one(&ArrayType::scalar(r#type)), Ok(expected));
         }
@@ -536,7 +536,7 @@ mod tests {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]));
+        let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap());
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = OneOperation::new(ArrayType::new(
@@ -623,8 +623,8 @@ mod tests {
         assert_eq!(
             jvp.interpret(vec![extent]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])),
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0]).unwrap()),
             ]),
         );
         assert_eq!(jvp.instructions().len(), 2);
@@ -650,8 +650,8 @@ mod tests {
                 (),
             )
             .unwrap();
-        assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
-        assert_eq!(tangent, ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])));
+        assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0]).unwrap()));
+        assert_eq!(tangent, ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0]).unwrap()));
     }
 
     #[test]
@@ -660,7 +660,7 @@ mod tests {
         // type through the fallible provider, which constructs the canonical array member encoding. The differentiated
         // function reaches ordinary array math through the array member projection, because homogeneous array
         // capabilities deliberately do not exist at the composite level.
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         let squared_sum = |input: LinearizationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
             let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
             let squared = input.mul(&input)?;
@@ -670,8 +670,8 @@ mod tests {
         };
 
         let (value, gradient) = differentiate_at(input.clone()).value_and_gradient(squared_sum).unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(14.0_f64)));
-        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])));
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(14.0_f64).unwrap()));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0]).unwrap()));
         assert_eq!(differentiate_at(input).gradient(squared_sum).unwrap(), gradient);
     }
 
@@ -851,7 +851,7 @@ mod tests {
         );
         assert_eq!(
             context.dynamic_one(&ArrayType::scalar(DataType::F32), &[]),
-            Ok(ArrayIrValue::Array(Array::scalar(1.0f32))),
+            Ok(ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())),
         );
     }
 
@@ -867,7 +867,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            context.dynamic_one(&output_type, &[ArrayIrValue::Array(Array::scalar(2.0f32))]),
+            context.dynamic_one(&output_type, &[ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
             Err(ProgramError::Type(TypeError::invalid("`one` operand 0 must be a dimension but has type f32[]"))),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -910,15 +910,15 @@ mod tests {
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
         assert_eq!(
             program.interpret(vec![extent.clone()]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap())]),
         );
 
         // The staged operation retains its existing derivative rule: shape inputs receive no live tangent.
         assert_eq!(
             program.jvp().unwrap().interpret(vec![extent]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0f32; 3])),
-                ArrayIrValue::Array(Array::vector(vec![0.0f32; 3])),
+                ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap()),
             ]),
         );
     }

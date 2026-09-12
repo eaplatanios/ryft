@@ -1083,18 +1083,22 @@ mod tests {
         let (output_type, program) =
             TestArrayContext::trace(|x| Ok(x.clone() * x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
-        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(9.0)));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(9.0).unwrap()));
 
         // The free function traces at the abstract signature of example values, which contribute only their types
         // (i.e., the resulting program neither captures nor depends on the example values themselves).
-        let (output_type, program) = trace(|x| Ok(x.clone() * x), Array::scalar(2.0)).unwrap();
+        let (output_type, program) = trace(|x| Ok(x.clone() * x), Array::scalar(2.0).unwrap()).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
-        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(9.0)));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(9.0).unwrap()));
 
         // Structured inputs trace at the structured signature of the example values.
-        let (output_type, program) = trace(|(x, y)| Ok(x * y), (Array::scalar(2.0), Array::scalar(3.0))).unwrap();
+        let (output_type, program) =
+            trace(|(x, y)| Ok(x * y), (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
-        assert_eq!(program.interpret((Array::scalar(4.0), Array::scalar(5.0))), Ok(Array::scalar(20.0)));
+        assert_eq!(
+            program.interpret((Array::scalar(4.0).unwrap(), Array::scalar(5.0).unwrap())),
+            Ok(Array::scalar(20.0).unwrap())
+        );
     }
 
     #[test]
@@ -1105,7 +1109,7 @@ mod tests {
         /// Stages `x + capture#0` with the capture registered through the trace's own context.
         fn capturing_body(x: Tracer<CapturingTrace>) -> Result<Vec<Tracer<CapturingTrace>>, ProgramError> {
             let context = x.context().clone();
-            let reference = context.capture(Array::scalar(3.0))?;
+            let reference = context.capture(Array::scalar(3.0).unwrap())?;
             let captured = StagingContext::constant(&context, reference);
             context.bind(AddOperation::new(), Vec::new(), &[x, captured])
         }
@@ -1126,10 +1130,11 @@ mod tests {
     #[test]
     fn test_context_interpret_and_trace() {
         let domain = TestArrayContext::new();
-        let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0)).unwrap();
-        assert_eq!(output, Array::scalar(2.0 * 2.0 + (-2.0)));
-        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(3.0 * 3.0 + (-3.0))));
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::scalar(2.0 * 2.0 + (-2.0)).unwrap());
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(3.0 * 3.0 + (-3.0)).unwrap()));
     }
 
     #[test]
@@ -1139,7 +1144,7 @@ mod tests {
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
 
         // The free function infers output types at the abstract signature of example values.
-        let output_type = infer_output_type(|x| Ok(-x.clone()), Array::scalar(1.5)).unwrap();
+        let output_type = infer_output_type(|x| Ok(-x.clone()), Array::scalar(1.5).unwrap()).unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
     }
 
@@ -1195,7 +1200,10 @@ mod tests {
             .clone()
             .build::<Array, Vec<Array>>(vec![zero_atom, one_atom], Placeholder, vec![Placeholder, Placeholder])
             .unwrap();
-        assert_eq!(program.interpret(Array::scalar(2.0)), Ok(vec![Array::scalar(0.0), Array::scalar(1.0)]));
+        assert_eq!(
+            program.interpret(Array::scalar(2.0).unwrap()),
+            Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()])
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1217,7 +1225,7 @@ mod tests {
         let output_atom = output.atom_id().expect("unary output should remain live");
         let program =
             builder.borrow().clone().build::<Array, Array>(vec![output_atom], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(Array::scalar(2.0)), Ok(Array::scalar(-2.0)));
+        assert_eq!(program.interpret(Array::scalar(2.0).unwrap()), Ok(Array::scalar(-2.0).unwrap()));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1243,7 +1251,10 @@ mod tests {
             .clone()
             .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1330,7 +1341,7 @@ mod tests {
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
         // Test creating a program constant in the staged program.
-        let constant = tracing_context.constant(Array::scalar(2.5));
+        let constant = tracing_context.constant(Array::scalar(2.5).unwrap());
         assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let constant_atom = constant.atom_id().expect("constant tracer should remain live");
         assert_eq!(constant_atom.index(), 0);
@@ -1339,7 +1350,7 @@ mod tests {
             .clone()
             .build::<Vec<Array>, Array>(vec![constant_atom], Vec::<Placeholder>::new(), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(Array::scalar(2.5)));
+        assert_eq!(program.interpret(Vec::new()), Ok(Array::scalar(2.5).unwrap()));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1384,7 +1395,10 @@ mod tests {
             .clone()
             .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1480,7 +1494,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        assert_eq!(program.interpret(Vec::new()), Ok(vec![Array::scalar(0.0), Array::scalar(1.0)]));
+        assert_eq!(program.interpret(Vec::new()), Ok(vec![Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()]));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1508,7 +1522,7 @@ mod tests {
         assert_ne!(context.reference_identity(&root).unwrap(), context.reference_identity(&other).unwrap());
         let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         assert_eq!(context.reference_identity(&scalar), Ok(None));
-        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         let constant = context.constant(ArrayIrValue::Reference(reference.clone()));
         assert_eq!(context.reference_identity(&constant), Ok(Some(ReferenceIdentity::Runtime(reference.id()))));
     }
@@ -1519,7 +1533,7 @@ mod tests {
             TestArrayContext::trace(|x| Ok(x.clone() * x.clone() + x.one_like()?), ArrayType::scalar(DataType::F64))
                 .unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::F64));
-        assert_eq!(program.interpret(Array::scalar(3.0)), Ok(Array::scalar(10.0)));
+        assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(10.0).unwrap()));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1559,10 +1573,14 @@ mod tests {
     #[test]
     fn test_tracing_context_interpret_and_trace() {
         let domain = TestArrayContext::new();
-        let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0)).unwrap();
-        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + (-2.0)));
-        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.5f64 * 0.5f64 + (-0.5))));
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok(x.clone() * x.clone() + -x.clone()), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::scalar(2.0f64 * 2.0f64 + (-2.0)).unwrap());
+        assert_eq!(
+            program.interpret(Array::scalar(0.5).unwrap()),
+            Ok(Array::scalar(0.5f64 * 0.5f64 + (-0.5)).unwrap())
+        );
         assert_eq!(program.input_ids().len(), 1);
         assert_eq!(
             program.to_string(),
@@ -1578,7 +1596,10 @@ mod tests {
 
         // Test using a function with a tuple argument.
         let (_, compiled) = domain
-            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + -x.clone()), (Array::scalar(2.0), Array::scalar(3.0)))
+            .interpret_and_trace(
+                |(x, y)| Ok(x.clone() * y + -x.clone()),
+                (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+            )
             .unwrap();
         assert_eq!(
             compiled.to_string(),
@@ -1599,11 +1620,11 @@ mod tests {
                     let _ = -x.clone();
                     Ok(x.clone() * x)
                 },
-                Array::scalar(2.0),
+                Array::scalar(2.0).unwrap(),
             )
             .unwrap();
-        assert_eq!(output, Array::scalar(4.0));
-        assert_eq!(program.interpret(Array::scalar(0.5)), Ok(Array::scalar(0.25)));
+        assert_eq!(output, Array::scalar(4.0).unwrap());
+        assert_eq!(program.interpret(Array::scalar(0.5).unwrap()), Ok(Array::scalar(0.25).unwrap()));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1615,9 +1636,10 @@ mod tests {
         );
 
         // Test tracing value-level identity helpers as ordinary operations.
-        let (output, program) =
-            domain.interpret_and_trace(|x| Ok((x.zero_like()?, x.one_like()?)), Array::scalar(2.0)).unwrap();
-        assert_eq!(output, (Array::scalar(0.0), Array::scalar(1.0)));
+        let (output, program) = domain
+            .interpret_and_trace(|x| Ok((x.zero_like()?, x.one_like()?)), Array::scalar(2.0).unwrap())
+            .unwrap();
+        assert_eq!(output, (Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1689,7 +1711,10 @@ mod tests {
             .clone()
             .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((Array::scalar(2.0), Array::scalar(3.0))), Ok(Array::scalar(5.0)));
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok(Array::scalar(5.0).unwrap())
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1704,9 +1729,11 @@ mod tests {
         // so a value captured through the nested context lands in the parent's shared capture table.
         let capturing_parent = TracingContext::<CaptureReference<ArrayType>, NegOperation<ArrayType>, Array>::new();
         let nested = NestedTracingContext::new(capturing_parent.clone());
-        let reference = nested.capture(Array::scalar(7.0)).expect("capture should delegate to the enclosing context");
+        let reference = nested
+            .capture(Array::scalar(7.0).unwrap())
+            .expect("capture should delegate to the enclosing context");
         assert_eq!(reference.r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Array::scalar(7.0)]);
+        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Array::scalar(7.0).unwrap()]);
     }
 
     #[test]
@@ -1720,7 +1747,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_structure, vec![Placeholder, Placeholder]);
-        assert_eq!(program.interpret(vec![Array::scalar(2.0)]), Ok(vec![Array::scalar(4.0), Array::scalar(-2.0)]));
+        assert_eq!(
+            program.interpret(vec![Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(4.0).unwrap(), Array::scalar(-2.0).unwrap()])
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1759,7 +1789,7 @@ mod tests {
             vec![("model".to_string(), NamedAxis::Batched { size: Some(4) })],
         )
         .unwrap();
-        assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(3.0)]));
+        assert_eq!(program.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(3.0).unwrap()]));
     }
 
     #[test]
@@ -1804,7 +1834,10 @@ mod tests {
         let specialized = program.clone().specialize(std::slice::from_ref(&static_type)).unwrap();
         assert_eq!(specialized.input_types(), vec![static_type.clone()]);
         assert_eq!(specialized.output_types(), vec![static_type.clone()]);
-        assert_eq!(specialized.interpret(Array::vector(vec![2.0, 3.0, 4.0])), Ok(Array::vector(vec![4.0, 9.0, 16.0])));
+        assert_eq!(
+            specialized.interpret(Array::vector(vec![2.0, 3.0, 4.0]).unwrap()),
+            Ok(Array::vector(vec![4.0, 9.0, 16.0]).unwrap())
+        );
 
         // Non-refining input types are rejected before the replay begins.
         let unrelated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(7)]));

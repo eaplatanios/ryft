@@ -3982,7 +3982,7 @@ pub(crate) mod tests {
 
     /// Wraps a scalar `f32` array into the composite value used by the reference transposition tests.
     fn reference_test_scalar(value: f32) -> ReferenceTestValue {
-        ArrayIrValue::Array(Array::scalar(value))
+        ArrayIrValue::Array(Array::scalar(value).unwrap())
     }
 
     /// Squares a value in the composite reference test family, preserving the active transform context.
@@ -4099,8 +4099,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cotangent_destinations_references() {
-        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
+        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32).unwrap()));
         let destinations = CotangentDestinations::new(
             vec![
                 CotangentDestinationKind::Reference,
@@ -4118,7 +4118,7 @@ pub(crate) mod tests {
         // A supplied gradient buffer does not turn its non-reference primal input into reference state.
         let destinations = CotangentDestinations::new(
             vec![CotangentDestinationKind::Reference; 2],
-            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))); 2],
+            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap())); 2],
             vec![false, true],
         );
         assert!(!destinations.is_reference_input(0));
@@ -4134,7 +4134,7 @@ pub(crate) mod tests {
                 CotangentDestinationKind::Reference,
                 CotangentDestinationKind::Ignore,
             ],
-            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))); 2],
+            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap())); 2],
             vec![false, false, true, true],
         );
         assert!(destinations.returns_cotangent(0));
@@ -4145,7 +4145,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cotangent_destinations_has_reference_state_destinations() {
-        let references = vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32)))];
+        let references = vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32).unwrap()))];
         let buffer =
             CotangentDestinations::new(vec![CotangentDestinationKind::Reference], references.clone(), vec![false]);
         assert!(!buffer.has_reference_state_destinations());
@@ -4791,25 +4791,25 @@ pub(crate) mod tests {
 
     #[test]
     fn test_pullback_linear_program() {
-        let (_, pullback) = differentiate_at(Array::scalar(1.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (_, pullback) = differentiate_at(Array::scalar(1.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(pullback.linear_program().input_types().len(), 1 + pullback.residuals().len());
         assert_eq!(pullback.linear_program().output_types(), vec![ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]
     fn test_pullback_transposed_program() {
-        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         let transposed = pullback.transposed_program(&[]).unwrap();
-        let mut inputs = vec![Array::scalar(3.0)];
+        let mut inputs = vec![Array::scalar(3.0).unwrap()];
         inputs.extend_from_slice(pullback.residuals());
-        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0).unwrap()]));
         assert!(Arc::ptr_eq(&transposed, &pullback.transposed_program(&[]).unwrap()));
     }
 
     #[test]
     fn test_pullback_transposed_program_omits_unrequested_gradient() {
         let (_, pullback) = TestArrayContext::new()
-            .differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
+            .differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()))
             .vjp(|(left, right)| Ok(left * right))
             .unwrap();
         let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
@@ -4824,38 +4824,38 @@ pub(crate) mod tests {
         );
         assert_eq!(
             pullback.apply_with_destinations(
-                CotangentSeed::Value(Array::scalar(4.0)),
+                CotangentSeed::Value(Array::scalar(4.0).unwrap()),
                 (CotangentDestination::Return, CotangentDestination::Ignore),
             ),
-            Ok((Some(Array::scalar(8.0)), None)),
+            Ok((Some(Array::scalar(8.0).unwrap()), None)),
         );
     }
 
     #[test]
     fn test_pullback_residuals() {
         // Identity needs no saved primal values to evaluate its pullback.
-        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(Ok).unwrap();
+        let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(Ok).unwrap();
         assert_eq!(pullback.residuals(), &[]);
     }
 
     #[test]
     fn test_pullback_into_linear_parts() {
         // At x = 2, the retained pushforward maps a tangent to four times its value.
-        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         let (linear, residuals) = pullback.into_linear_parts();
-        let mut inputs = vec![Array::scalar(3.0)];
+        let mut inputs = vec![Array::scalar(3.0).unwrap()];
         inputs.extend(residuals);
-        assert_eq!(linear.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+        assert_eq!(linear.interpret(inputs), Ok(vec![Array::scalar(12.0).unwrap()]));
     }
 
     #[test]
     fn test_pullback_into_transposed_parts() {
-        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         let (transposed, residuals) = pullback.into_transposed_parts().unwrap();
         assert_eq!(transposed.input_types().len(), 1 + residuals.len());
-        let mut inputs = vec![Array::scalar(3.0)];
+        let mut inputs = vec![Array::scalar(3.0).unwrap()];
         inputs.extend(residuals);
-        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0).unwrap()]));
     }
 
     #[test]
@@ -4864,8 +4864,12 @@ pub(crate) mod tests {
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
         )| Ok(left * right);
-        let (_, pullback) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0))).vjp(function).unwrap();
-        assert_eq!(pullback.apply(Array::scalar(4.0)), Ok((Array::scalar(8.0), Array::scalar(12.0))),);
+        let (_, pullback) =
+            differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap())).vjp(function).unwrap();
+        assert_eq!(
+            pullback.apply(Array::scalar(4.0).unwrap()),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
     }
 
     #[test]
@@ -4876,11 +4880,13 @@ pub(crate) mod tests {
             reference.add_update(&x)?;
             reference.read()
         }
-        let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let (value, pullback) =
-            differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(Array::scalar(3.0_f32))))
-                .vjp(function)
-                .unwrap();
+        let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let (value, pullback) = differentiate_at((
+            ArrayIrValue::Reference(reference.clone()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ))
+        .vjp(function)
+        .unwrap();
         assert_eq!(value, reference_test_scalar(4.0));
         assert_eq!(
             pullback.apply_with_destinations(
@@ -4935,7 +4941,7 @@ pub(crate) mod tests {
                 if message == "pullback destination 1 has type f32[] but its primal input of type f32[] \
                     requires a reference storing the cotangent type f32[]",
         ));
-        let mismatched = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![0.0_f32, 0.0])));
+        let mismatched = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![0.0_f32, 0.0]).unwrap()));
         assert!(matches!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(2.0)),
@@ -4948,7 +4954,7 @@ pub(crate) mod tests {
 
         // A destination must not alias the primal reference, even after the primal advanced generations, because
         // allocation identity rather than generation is compared.
-        reference.write(Array::scalar(9.0_f32)).unwrap();
+        reference.write(Array::scalar(9.0_f32).unwrap()).unwrap();
         assert!(matches!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(2.0)),
@@ -4963,10 +4969,10 @@ pub(crate) mod tests {
         ));
 
         // A destination must not alias a captured reference either, and two destinations must not alias each other.
-        let captured = ArrayReference::new(Array::scalar(1.0_f32));
+        let captured = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let (_, pullback) = differentiate_at((
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
-            ArrayIrValue::Array(Array::scalar(3.0_f32)),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
         ))
         .with_captures(ArrayIrValue::Reference(captured.clone()))
         .vjp(|input, _| function(input))
@@ -4980,10 +4986,10 @@ pub(crate) mod tests {
                 if message == "cotangent 0 aliases a reference bound at the primal boundary of the \
                     differentiated function",
         ));
-        let shared = ArrayReference::new(Array::scalar(0.0_f32));
+        let shared = ArrayReference::new(Array::scalar(0.0_f32).unwrap());
         let (_, pullback) = differentiate_at((
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
-            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32))),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32).unwrap())),
         ))
         .vjp(|(first, second): (ReferenceTestTracer, ReferenceTestTracer)| {
             second.add_update(&first.read()?)?;
@@ -5005,15 +5011,20 @@ pub(crate) mod tests {
 
     #[test]
     fn test_pullback_apply_with_destinations_reference_free_family() {
-        let (_, pullback) = differentiate_at(Array::scalar(3.0_f32)).vjp(|value| Ok(value.clone() * value)).unwrap();
+        let (_, pullback) =
+            differentiate_at(Array::scalar(3.0_f32).unwrap()).vjp(|value| Ok(value.clone() * value)).unwrap();
         assert_eq!(
-            pullback
-                .apply_with_destinations(CotangentSeed::Value(Array::scalar(2.0_f32)), CotangentDestination::Return,),
-            Ok(Some(Array::scalar(12.0_f32)))
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(Array::scalar(2.0_f32).unwrap()),
+                CotangentDestination::Return,
+            ),
+            Ok(Some(Array::scalar(12.0_f32).unwrap()))
         );
         assert_eq!(
-            pullback
-                .apply_with_destinations(CotangentSeed::Value(Array::scalar(2.0_f32)), CotangentDestination::Ignore,),
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(Array::scalar(2.0_f32).unwrap()),
+                CotangentDestination::Ignore,
+            ),
             Ok(None)
         );
     }
@@ -5035,8 +5046,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            program.interpret(vec![Array::scalar(3.0_f32), Array::scalar(2.0_f32)]),
-            Ok(vec![Array::scalar(12.0_f32)]),
+            program.interpret(vec![Array::scalar(3.0_f32).unwrap(), Array::scalar(2.0_f32).unwrap()]),
+            Ok(vec![Array::scalar(12.0_f32).unwrap()]),
         );
     }
 
@@ -5054,7 +5065,7 @@ pub(crate) mod tests {
                     .remove(0))
             })
             .unwrap();
-        let destination = ArrayReference::new(Array::scalar(5.0_f32));
+        let destination = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(2.0)),
@@ -5062,7 +5073,7 @@ pub(crate) mod tests {
             ),
             Ok(None)
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(17.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(17.0_f32).unwrap()));
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(1.0)),
@@ -5070,13 +5081,13 @@ pub(crate) mod tests {
             ),
             Ok(None)
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(23.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(23.0_f32).unwrap()));
     }
 
     #[test]
     fn test_pullback_apply_with_destinations_non_reference_input_reference_batching() {
         // Each batch member adds its own 2x contribution to pre-populated storage without resetting another member.
-        let destination = ArrayReference::new(Array::vector(vec![5.0_f32, 7.0]));
+        let destination = ArrayReference::new(Array::vector(vec![5.0_f32, 7.0]).unwrap());
         let result = batch(
             |(value, destination)| {
                 let seed = value.context().lift(reference_test_scalar(1.0))?;
@@ -5087,13 +5098,16 @@ pub(crate) mod tests {
                 )?;
                 destination.read()
             },
-            (ArrayIrValue::Array(Array::vector(vec![3.0_f32, 5.0])), ArrayIrValue::Reference(destination.clone())),
+            (
+                ArrayIrValue::Array(Array::vector(vec![3.0_f32, 5.0]).unwrap()),
+                ArrayIrValue::Reference(destination.clone()),
+            ),
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
         );
-        assert_eq!(result, Ok(ArrayIrValue::Array(Array::vector(vec![11.0_f32, 17.0]))));
-        assert_eq!(destination.read(), Ok(Array::vector(vec![11.0_f32, 17.0])));
+        assert_eq!(result, Ok(ArrayIrValue::Array(Array::vector(vec![11.0_f32, 17.0]).unwrap())));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![11.0_f32, 17.0]).unwrap()));
     }
 
     #[test]
@@ -5140,16 +5154,16 @@ pub(crate) mod tests {
             vec![reference_type.clone(), reference_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32))],
         )
         .unwrap();
-        let destination = ArrayReference::new(Array::scalar(5.0_f32));
+        let destination = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32))),
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32).unwrap())),
                 ArrayIrValue::Reference(destination.clone()),
                 reference_test_scalar(2.0),
             ]),
             Ok(vec![reference_test_scalar(5.0), reference_test_scalar(2.0)])
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(7.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(7.0_f32).unwrap()));
     }
 
     #[test]
@@ -5161,14 +5175,16 @@ pub(crate) mod tests {
             reference.write(&x)?;
             reference.read()
         }
-        let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let (value, pullback) =
-            differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(Array::scalar(3.0_f32))))
-                .vjp(write_then_read)
-                .unwrap();
+        let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let (value, pullback) = differentiate_at((
+            ArrayIrValue::Reference(reference.clone()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ))
+        .vjp(write_then_read)
+        .unwrap();
         assert_eq!(value, reference_test_scalar(3.0));
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
-        let destination = ArrayReference::new(Array::scalar(5.0_f32));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
+        let destination = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(2.0)),
@@ -5179,20 +5195,22 @@ pub(crate) mod tests {
             ),
             Ok((None, Some(reference_test_scalar(7.0)))),
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32).unwrap()));
 
         // `y = swap(r, x)` swaps `ȳ` into the destination and hands the previous post-state cotangent to `x̄`.
         fn swap<V: ReferenceSwap<V, V>>((reference, x): (V, V)) -> Result<V, ProgramError> {
             reference.swap(&x)
         }
-        let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let (value, pullback) =
-            differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(Array::scalar(3.0_f32))))
-                .vjp(swap)
-                .unwrap();
+        let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let (value, pullback) = differentiate_at((
+            ArrayIrValue::Reference(reference.clone()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ))
+        .vjp(swap)
+        .unwrap();
         assert_eq!(value, reference_test_scalar(1.0));
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
-        let destination = ArrayReference::new(Array::scalar(5.0_f32));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
+        let destination = ArrayReference::new(Array::scalar(5.0_f32).unwrap());
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(2.0)),
@@ -5203,11 +5221,11 @@ pub(crate) mod tests {
             ),
             Ok((None, Some(reference_test_scalar(5.0)))),
         );
-        assert_eq!(destination.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(destination.read(), Ok(Array::scalar(2.0_f32).unwrap()));
 
         // Applications under the same structural mask share one retained transposition even when they supply different
         // destination references, while the `Ignore` variant at the reference leaf is a distinct retained program.
-        let other = ArrayReference::new(Array::scalar(1.0_f32));
+        let other = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         assert_eq!(
             pullback.apply_with_destinations(
                 CotangentSeed::Value(reference_test_scalar(4.0)),
@@ -5215,7 +5233,7 @@ pub(crate) mod tests {
             ),
             Ok((None, Some(reference_test_scalar(1.0)))),
         );
-        assert_eq!(other.read(), Ok(Array::scalar(4.0_f32)));
+        assert_eq!(other.read(), Ok(Array::scalar(4.0_f32).unwrap()));
         let referenced = pullback
             .transposed_program(&[CotangentDestinationKind::Reference, CotangentDestinationKind::Return])
             .unwrap();
@@ -5808,8 +5826,8 @@ pub(crate) mod tests {
         let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let two = builder.add_constant(Array::scalar(2.0));
-        let three = builder.add_constant(Array::scalar(3.0));
+        let two = builder.add_constant(Array::scalar(2.0).unwrap());
+        let three = builder.add_constant(Array::scalar(3.0).unwrap());
         let doubled =
             builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, two], Some(first.clone())).unwrap()[0];
         let tripled = builder
@@ -5838,7 +5856,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![("mul", second.clone()), ("mul", first.clone()), ("add", Provenance::fused([second, first])),],
         );
-        assert_eq!(pullback.interpret(vec![Array::scalar(1.0)]), Ok(vec![Array::scalar(5.0)]));
+        assert_eq!(pullback.interpret(vec![Array::scalar(1.0).unwrap()]), Ok(vec![Array::scalar(5.0).unwrap()]));
     }
 
     #[test]
@@ -5900,8 +5918,8 @@ pub(crate) mod tests {
         );
 
         assert_eq!(
-            reversed.interpret(vec![Array::scalar(3.0), Array::scalar(7.0)]),
-            Ok(vec![Array::scalar(7.0), Array::scalar(3.0)]),
+            reversed.interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(7.0).unwrap()]),
+            Ok(vec![Array::scalar(7.0).unwrap(), Array::scalar(3.0).unwrap()]),
         );
 
         // Out-of-range and duplicate input indices are rejected.
@@ -5937,8 +5955,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
-        let outputs = pullback.interpret(vec![Array::scalar(100.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
-        assert_eq!(outputs, vec![Array::scalar(18.0)]);
+        let outputs = pullback
+            .interpret(vec![Array::scalar(100.0).unwrap(), Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()])
+            .unwrap();
+        assert_eq!(outputs, vec![Array::scalar(18.0).unwrap()]);
     }
 
     #[test]
@@ -6150,8 +6170,8 @@ pub(crate) mod tests {
                 ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
             ]
         );
-        let first_buffer = ArrayReference::new(Array::scalar(10.0_f32));
-        let second_buffer = ArrayReference::new(Array::scalar(20.0_f32));
+        let first_buffer = ArrayReference::new(Array::scalar(10.0_f32).unwrap());
+        let second_buffer = ArrayReference::new(Array::scalar(20.0_f32).unwrap());
         assert_eq!(
             accumulated.interpret(vec![
                 reference_test_scalar(3.0),
@@ -6161,8 +6181,8 @@ pub(crate) mod tests {
             ]),
             Ok(vec![])
         );
-        assert_eq!(first_buffer.read(), Ok(Array::scalar(16.0_f32)));
-        assert_eq!(second_buffer.read(), Ok(Array::scalar(25.0_f32)));
+        assert_eq!(first_buffer.read(), Ok(Array::scalar(16.0_f32).unwrap()));
+        assert_eq!(second_buffer.read(), Ok(Array::scalar(25.0_f32).unwrap()));
 
         let returned = program.transpose_with_respect_to(&[1, 0], &[]).unwrap();
         assert_eq!(
@@ -6195,7 +6215,7 @@ pub(crate) mod tests {
             pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec!["reference_add_update", "reference_add_update"]
         );
-        let buffer = ArrayReference::new(Array::scalar(10.0_f32));
+        let buffer = ArrayReference::new(Array::scalar(10.0_f32).unwrap());
         assert_eq!(
             pullback.interpret(vec![
                 reference_test_scalar(2.0),
@@ -6204,7 +6224,7 @@ pub(crate) mod tests {
             ]),
             Ok(vec![])
         );
-        assert_eq!(buffer.read(), Ok(Array::scalar(15.0_f32)));
+        assert_eq!(buffer.read(), Ok(Array::scalar(15.0_f32).unwrap()));
     }
 
     #[test]
@@ -6245,11 +6265,11 @@ pub(crate) mod tests {
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
-                vec![Array::scalar(2.0_f32)],
-                vec![Array::scalar(0.5_f32)],
+                vec![Array::scalar(2.0_f32).unwrap()],
+                vec![Array::scalar(0.5_f32).unwrap()],
                 vec![]
             ),
-            vec![Array::scalar(2.5_f32)],
+            vec![Array::scalar(2.5_f32).unwrap()],
         );
     }
 
@@ -6292,8 +6312,8 @@ pub(crate) mod tests {
             vec!["zero", "reference_swap"],
         );
         assert_eq!(
-            run_transposed_with_destinations(&transposed, vec![], vec![Array::scalar(5.0_f32)], vec![]),
-            vec![Array::scalar(5.0_f32), Array::scalar(0.0_f32)],
+            run_transposed_with_destinations(&transposed, vec![], vec![Array::scalar(5.0_f32).unwrap()], vec![]),
+            vec![Array::scalar(5.0_f32).unwrap(), Array::scalar(0.0_f32).unwrap()],
         );
     }
 
@@ -6340,11 +6360,11 @@ pub(crate) mod tests {
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
-                vec![Array::scalar(2.0_f32)],
-                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(2.0_f32).unwrap()],
+                vec![Array::scalar(5.0_f32).unwrap()],
                 vec![]
             ),
-            vec![Array::scalar(5.0_f32), Array::scalar(2.0_f32)],
+            vec![Array::scalar(5.0_f32).unwrap(), Array::scalar(2.0_f32).unwrap()],
         );
 
         // A dead swap result with an unallocated accumulator stages nothing: the stored value's cotangent is zero.
@@ -6414,8 +6434,8 @@ pub(crate) mod tests {
             vec!["reference_read"],
         );
         assert_eq!(
-            run_transposed_with_destinations(&transposed, vec![], vec![Array::scalar(5.0_f32)], vec![]),
-            vec![Array::scalar(5.0_f32), Array::scalar(5.0_f32)],
+            run_transposed_with_destinations(&transposed, vec![], vec![Array::scalar(5.0_f32).unwrap()], vec![]),
+            vec![Array::scalar(5.0_f32).unwrap(), Array::scalar(5.0_f32).unwrap()],
         );
     }
 
@@ -6529,15 +6549,15 @@ pub(crate) mod tests {
 
         // A live output cotangent supplies the root extent for the lazy accumulator's zero.
         let transpose = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        let cotangent = ReferenceTestValue::Array(Array::vector(vec![2.0_f32, 3.0, 5.0]));
+        let cotangent = ReferenceTestValue::Array(Array::vector(vec![2.0_f32, 3.0, 5.0]).unwrap());
         assert_eq!(transpose.interpret(vec![cotangent.clone()]), Ok(vec![cotangent]));
 
         // A non-differentiated initializer still allocates a tangent reference with the primal's runtime extent.
         let jvp = program.entry_region_ref().jvp(&[]).unwrap();
-        let primal = ReferenceTestValue::Array(Array::vector(vec![7.0_f32, 11.0, 13.0]));
+        let primal = ReferenceTestValue::Array(Array::vector(vec![7.0_f32, 11.0, 13.0]).unwrap());
         assert_eq!(
             jvp.interpret(vec![primal.clone()]),
-            Ok(vec![primal, ReferenceTestValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))]),
+            Ok(vec![primal, ReferenceTestValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())]),
         );
     }
 
@@ -6562,15 +6582,15 @@ pub(crate) mod tests {
         // A state-only output has no array seed from which to recover runtime dimensions. Clearing the caller's destination
         // obtains its extent from that same live reference and returns the old state cotangent for the replacement.
         let transpose = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        let destination = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
+        let destination = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap());
         assert_eq!(
             transpose.interpret(vec![ReferenceTestValue::Reference(destination.clone())]),
             Ok(vec![
                 ReferenceTestValue::Reference(destination.clone()),
-                ReferenceTestValue::Array(Array::vector(vec![3.0_f32, 5.0, 7.0])),
+                ReferenceTestValue::Array(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap()),
             ]),
         );
-        assert_eq!(destination.read(), Ok(Array::vector(vec![0.0_f32, 0.0, 0.0])));
+        assert_eq!(destination.read(), Ok(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()));
     }
 
     #[test]
@@ -6630,11 +6650,11 @@ pub(crate) mod tests {
         assert_eq!(
             run_transposed_with_destinations(
                 &referenced,
-                vec![Array::scalar(2.0_f32)],
-                vec![Array::scalar(5.0_f32)],
+                vec![Array::scalar(2.0_f32).unwrap()],
+                vec![Array::scalar(5.0_f32).unwrap()],
                 vec![]
             ),
-            vec![Array::scalar(7.0_f32), Array::scalar(0.0_f32)],
+            vec![Array::scalar(7.0_f32).unwrap(), Array::scalar(0.0_f32).unwrap()],
         );
     }
 
@@ -6751,8 +6771,13 @@ pub(crate) mod tests {
             vec!["reference_index", "reference_read"],
         );
         assert_eq!(
-            run_transposed_with_destinations(&transposed, vec![], vec![Array::vector(vec![10.0_f32, 20.0])], vec![]),
-            vec![Array::scalar(20.0_f32), Array::vector(vec![10.0_f32, 20.0])],
+            run_transposed_with_destinations(
+                &transposed,
+                vec![],
+                vec![Array::vector(vec![10.0_f32, 20.0]).unwrap()],
+                vec![]
+            ),
+            vec![Array::scalar(20.0_f32).unwrap(), Array::vector(vec![10.0_f32, 20.0]).unwrap()],
         );
     }
 
@@ -6825,14 +6850,14 @@ pub(crate) mod tests {
         let linearization = program.linearize().unwrap();
         let primal_outputs = linearization
             .primal()
-            .interpret(vec![ReferenceTestValue::Array(Array::vector(vec![7.0_f32, 11.0, 13.0]))])
+            .interpret(vec![ReferenceTestValue::Array(Array::vector(vec![7.0_f32, 11.0, 13.0]).unwrap())])
             .unwrap();
-        assert_eq!(primal_outputs[0], ReferenceTestValue::Array(Array::scalar(31.0_f32)));
-        let mut pullback_inputs = vec![ReferenceTestValue::Array(Array::scalar(5.0_f32))];
+        assert_eq!(primal_outputs[0], ReferenceTestValue::Array(Array::scalar(31.0_f32).unwrap()));
+        let mut pullback_inputs = vec![ReferenceTestValue::Array(Array::scalar(5.0_f32).unwrap())];
         pullback_inputs.extend_from_slice(&primal_outputs[1..]);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ReferenceTestValue::Array(Array::vector(vec![5.0_f32, 5.0, 5.0]))]),
+            Ok(vec![ReferenceTestValue::Array(Array::vector(vec![5.0_f32, 5.0, 5.0]).unwrap())]),
         );
     }
 
@@ -6841,16 +6866,21 @@ pub(crate) mod tests {
         // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = x²` at
         // `x = 2` the primal output is `4`, and the returned pullback maps any number of output cotangents back
         // through the transposed Jacobian without re-tracing or re-differentiating.
-        let (value, pullback) = TestArrayContext::new().vjp(|x, ()| Ok(x.clone() * x), Array::scalar(2.0), ()).unwrap();
+        let (value, pullback) =
+            TestArrayContext::new().vjp(|x, ()| Ok(x.clone() * x), Array::scalar(2.0).unwrap(), ()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Array::scalar(3.0)).unwrap().to_f64s()[0], 3.0 * 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            pullback.apply(Array::scalar(3.0).unwrap()).unwrap().to_f64s()[0],
+            3.0 * 4.0,
+            epsilon = 1e-9
+        );
 
         // The builder's `vjp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
         // declarations: a rank-zero `Array` input recovers the eager array domain.
-        let (value, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (value, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0).unwrap()).unwrap().to_f64s()[0], 4.0, epsilon = 1e-9);
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
@@ -6875,7 +6905,7 @@ pub(crate) mod tests {
             vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 4.0, epsilon = 1e-9);
@@ -6901,7 +6931,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vjp_stages_non_copy_array_pullbacks_into_an_enclosing_trace() {
-        let vector_type = Array::vector(vec![0.0; 3]).r#type().into_owned();
+        let vector_type = Array::vector(vec![0.0; 3]).unwrap().r#type().into_owned();
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(vector_type.clone());
         let cotangent = context.input(vector_type);
@@ -6923,7 +6953,7 @@ pub(crate) mod tests {
         let input = [0.7f64, -1.2, 2.0];
         let output_cotangent = [2.5f64, 1.0, -0.5];
         let outputs = program
-            .interpret(vec![Array::vector(input.to_vec()), Array::vector(output_cotangent.to_vec())])
+            .interpret(vec![Array::vector(input.to_vec()).unwrap(), Array::vector(output_cotangent.to_vec()).unwrap()])
             .unwrap();
         let expected = input
             .into_iter()
@@ -6941,15 +6971,16 @@ pub(crate) mod tests {
         // An explicitly selected context computes both the primal and pullback replay. For `f(x, y) = x * y + x`,
         // the value is `8` and the gradient is `(y + 1, x) = (4, 2)` at `(2, 3)`.
         let (value, gradient): (Array, (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .value_and_gradient(|(x, y)| x.clone() * y + x)
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
-        assert_eq!(gradient, (Array::scalar(4.0), Array::scalar(2.0)));
+        assert_eq!(gradient, (Array::scalar(4.0).unwrap(), Array::scalar(2.0).unwrap()));
 
         // The builder's `value_and_gradient` terminal recovers the eager domain from the concrete primals.
-        let (value, gradient) =
-            differentiate_at(Array::scalar(0.7)).value_and_gradient(|x| x.clone() * x.sin().unwrap()).unwrap();
+        let (value, gradient) = differentiate_at(Array::scalar(0.7).unwrap())
+            .value_and_gradient(|x| x.clone() * x.sin().unwrap())
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
@@ -6964,7 +6995,7 @@ pub(crate) mod tests {
             vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Array::scalar(2.0)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0).unwrap()]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1].to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
@@ -6975,7 +7006,7 @@ pub(crate) mod tests {
         // the untaken branch is never evaluated. Its panic sentinel makes accidental evaluation observable.
         // The Boolean's cotangent remains in the zero space.
         let (value, (predicate_gradient, gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(true), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(true).unwrap(), Array::scalar(3.0).unwrap()))
             .value_and_gradient(|(predicate, x)| {
                 if predicate.concretize().unwrap() { x.clone() * x } else { panic!("untaken branch was evaluated") }
             })
@@ -7016,7 +7047,7 @@ pub(crate) mod tests {
         // A complex scalar output is rejected toward the holomorphic entry points, and inputs with no leaf values
         // report an invalid input count.
         let z = Complex::new(0.7f64, -0.3f64);
-        let error = differentiate_at(Array::scalar(z)).value_and_gradient(|x| x.clone() * x).unwrap_err();
+        let error = differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|x| x.clone() * x).unwrap_err();
         assert!(matches!(error, DifferentiationError::ComplexGradientOutput { .. }));
         let error = differentiate_at(Vec::<Array>::new())
             .value_and_gradient(|x| x.into_iter().next().unwrap())
@@ -7033,7 +7064,7 @@ pub(crate) mod tests {
         const CHAIN_LENGTH: usize = 2000;
         let (expected_value, expected_gradient) =
             (0..CHAIN_LENGTH).fold((0.5f64, 1.0f64), |(value, gradient), _| (value.sin(), gradient * value.cos()));
-        let (value, gradient) = differentiate_at(Array::scalar(0.5f64))
+        let (value, gradient) = differentiate_at(Array::scalar(0.5f64).unwrap())
             .value_and_gradient(|mut value| {
                 for _ in 0..CHAIN_LENGTH {
                     value = value.sin().unwrap();
@@ -7062,7 +7093,7 @@ pub(crate) mod tests {
             vec![ArrayType::scalar(DataType::F64)],
         )
         .unwrap();
-        let outputs = program.interpret(vec![Array::scalar(0.5f64)]).unwrap();
+        let outputs = program.interpret(vec![Array::scalar(0.5f64).unwrap()]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0].to_f64s()[0], expected_value, epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1].to_f64s()[0], expected_gradient, epsilon = 1e-9);
@@ -7070,13 +7101,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_value_and_gradient_reference_inputs() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference.clone()))
                 .value_and_gradient(|reference: ReferenceTestTracer| reference_test_square(reference.read()?)),
             Ok((reference_test_scalar(9.0), reference_test_scalar(6.0))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
         // Each invocation differentiates the current input state with a fresh zero final-state cotangent.
         let function = |reference: ReferenceTestTracer| {
@@ -7090,18 +7121,18 @@ pub(crate) mod tests {
                 .value_and_gradient(function),
             Ok((reference_test_scalar(36.0), reference_test_scalar(24.0))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(6.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(6.0_f32).unwrap()));
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference.clone())).value_and_gradient(function),
             Ok((reference_test_scalar(144.0), reference_test_scalar(48.0))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(12.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(12.0_f32).unwrap()));
     }
 
     #[test]
     fn test_value_and_gradient_reference_inputs_mutations() {
         // Overwriting the state removes dependence on its initial contents and sends the adjoint to the value input.
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(5.0)))
                 .value_and_gradient(|(reference, value): (ReferenceTestTracer, ReferenceTestTracer)| {
@@ -7110,7 +7141,7 @@ pub(crate) mod tests {
                 }),
             Ok((reference_test_scalar(25.0), (reference_test_scalar(0.0), reference_test_scalar(10.0)))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(5.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(5.0_f32).unwrap()));
 
         // Swapping exposes the old state as a value; the replacement contributes only through final-state seeds,
         // which the gradient convenience API sets to zero.
@@ -7121,12 +7152,12 @@ pub(crate) mod tests {
                 }),
             Ok((reference_test_scalar(25.0), (reference_test_scalar(10.0), reference_test_scalar(0.0)))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(7.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(7.0_f32).unwrap()));
     }
 
     #[test]
     fn test_value_and_gradient_reference_inputs_consumed() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference.clone()))
                 .value_and_gradient(|reference: ReferenceTestTracer| reference_test_square(reference.freeze()?)),
@@ -7137,7 +7168,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_value_and_gradient_reference_inputs_unused() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(5.0)))
                 .value_and_gradient(|(_, value): (ReferenceTestTracer, ReferenceTestTracer)| reference_test_square(
@@ -7145,10 +7176,10 @@ pub(crate) mod tests {
                 )),
             Ok((reference_test_scalar(25.0), (reference_test_scalar(0.0), reference_test_scalar(10.0)))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
         // A zero-space referent still needs a reference identity while replaying, then becomes a non-reference zero.
-        let reference = ArrayReference::new(Array::scalar(3_i32));
+        let reference = ArrayReference::new(Array::scalar(3_i32).unwrap());
         let (_, (gradient, _)) = differentiate_at((ArrayIrValue::Reference(reference), reference_test_scalar(5.0)))
             .value_and_gradient(|(_, value): (ReferenceTestTracer, ReferenceTestTracer)| Ok::<_, ProgramError>(value))
             .unwrap();
@@ -7192,21 +7223,23 @@ pub(crate) mod tests {
                 .count(),
             1
         );
-        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
+        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]).unwrap());
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Reference(reference.clone())]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]))])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]).unwrap())])
         );
         assert_eq!(reference.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         assert_eq!(
-            program.interpret(vec![ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![9.0_f32; 4])))]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32; 4]))])
+            program.interpret(vec![ArrayIrValue::Reference(ArrayReference::new(
+                Array::vector(vec![9.0_f32; 4]).unwrap()
+            ))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32; 4]).unwrap())])
         );
     }
 
     #[test]
     fn test_value_and_gradient_reference_inputs_batching() {
-        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0]));
+        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0]).unwrap());
         let result = batch(
             |reference| {
                 differentiate_at(reference)
@@ -7221,16 +7254,16 @@ pub(crate) mod tests {
         assert_eq!(
             result,
             Ok((
-                ArrayIrValue::Array(Array::vector(vec![9.0_f32, 25.0])),
-                ArrayIrValue::Array(Array::vector(vec![6.0_f32, 10.0]))
+                ArrayIrValue::Array(Array::vector(vec![9.0_f32, 25.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0_f32, 10.0]).unwrap())
             ))
         );
-        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0])));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0]).unwrap()));
     }
 
     #[test]
     fn test_value_and_gradient_reference_inputs_rejects_aliases() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Reference(reference.clone())))
                 .value_and_gradient(|(first, _): (ReferenceTestTracer, ReferenceTestTracer)| first.read()),
@@ -7238,7 +7271,7 @@ pub(crate) mod tests {
                 message: "input 1 and input 0 bind the same reference allocation".to_string(),
             })),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
@@ -7258,14 +7291,15 @@ pub(crate) mod tests {
     fn test_gradient() {
         // The builder's `gradient` terminal is the gradient-only counterpart of `value_and_gradient`.
         let method_gradient: (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .gradient(|(x, y)| x.clone() * y + x)
             .unwrap();
-        assert_eq!(method_gradient, (Array::scalar(4.0), Array::scalar(2.0)));
+        assert_eq!(method_gradient, (Array::scalar(4.0).unwrap(), Array::scalar(2.0).unwrap()));
 
         // The builder's `gradient` terminal recovers the eager domain from the concrete primal and agrees with the
         // value-carrying form.
-        let free_gradient = differentiate_at(Array::scalar(0.7)).gradient(|x| x.clone() * x.sin().unwrap()).unwrap();
+        let free_gradient =
+            differentiate_at(Array::scalar(0.7).unwrap()).gradient(|x| x.clone() * x.sin().unwrap()).unwrap();
         assert_abs_diff_eq!(free_gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // With no leaf value to recover a context from, the builder's `gradient` terminal reports that differentiation
@@ -7279,17 +7313,19 @@ pub(crate) mod tests {
         // An explicitly selected builder context recovers `∂z²/∂z = 2z` under the holomorphy promise.
         let z = Complex::new(0.7f64, -0.3f64);
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(z))
+            .differentiate_at(Array::scalar(z).unwrap())
             .holomorphic()
             .value_and_gradient(|x| x.clone() * x)
             .unwrap();
-        assert_eq!(value, Array::scalar(z * z));
-        assert_eq!(gradient, Array::scalar(z + z));
+        assert_eq!(value, Array::scalar(z * z).unwrap());
+        assert_eq!(gradient, Array::scalar(z + z).unwrap());
 
         // The builder recovers the eager domain from the concrete primal, and for real outputs the holomorphy
         // promise changes nothing.
-        let (value, gradient) =
-            differentiate_at(Array::scalar(2.0)).holomorphic().value_and_gradient(|x| x.clone() * x).unwrap();
+        let (value, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
+            .holomorphic()
+            .value_and_gradient(|x| x.clone() * x)
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 4.0, epsilon = 1e-9);
 
@@ -7330,19 +7366,19 @@ pub(crate) mod tests {
         // cotangents, so they do not contribute to the gradient.
         let ((value, aux), gradient): ((Array, Array), (Array, Array)) =
             EagerContext::<Array, ArrayOperation<Array>>::new()
-                .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+                .differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
                 .with_auxiliary_output()
                 .value_and_gradient(|(x, y)| (x.clone() * y.clone(), x + y))
                 .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
-        assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_eq!(gradient, (Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()));
 
         // The builder recovers the eager domain from the concrete primals, and the auxiliary structure can carry
         // multiple leaves (each rides along as a primal value with a zero cotangent seed, so none contributes to the
         // gradient of `x * y`).
         let ((value, aux), gradient): ((Array, (Array, Array)), (Array, Array)) =
-            differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
                 .with_auxiliary_output()
                 .value_and_gradient(|(x, y)| {
                     let value = x.clone() * y.clone();
@@ -7351,34 +7387,37 @@ pub(crate) mod tests {
                 })
                 .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
-        assert_eq!(aux, (Array::scalar(5.0), Array::scalar(4.0)));
-        assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_eq!(aux, (Array::scalar(5.0).unwrap(), Array::scalar(4.0).unwrap()));
+        assert_eq!(gradient, (Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()));
 
         // Auxiliary cotangent seeds use each auxiliary leaf's cotangent type. This matters both for non-differentiable
         // leaves, whose cotangent type is the first-class zero space, and for differentiable storage representations
         // such as E8M0, whose cotangent type is widened to F32 and can represent zero.
-        let ((value, aux), gradient): ((Array, (Array, Array)), Array) = differentiate_at(Array::scalar(2.0))
+        let ((value, aux), gradient): ((Array, (Array, Array)), Array) = differentiate_at(Array::scalar(2.0).unwrap())
             .with_auxiliary_output()
             .value_and_gradient(|x| {
-                let integer = x.context().constant(Array::scalar(7i32))?;
+                let integer = x.context().constant(Array::scalar(7i32).unwrap())?;
                 let e8m0 = x
                     .context()
                     .constant(Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap())?;
                 Ok((x.clone() * x, (integer, e8m0)))
             })
             .unwrap();
-        assert_eq!(value, Array::scalar(4.0));
+        assert_eq!(value, Array::scalar(4.0).unwrap());
         assert_eq!(
             aux,
-            (Array::scalar(7i32), Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap(),),
+            (
+                Array::scalar(7i32).unwrap(),
+                Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap(),
+            ),
         );
-        assert_eq!(gradient, Array::scalar(4.0));
+        assert_eq!(gradient, Array::scalar(4.0).unwrap());
     }
 
     #[test]
     fn test_builder_value_and_gradient_with_auxiliary_output_reference_inputs() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
-        let capture = ArrayReference::new(Array::scalar(2.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
+        let capture = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference.clone()))
                 .with_captures(ArrayIrValue::Reference(capture.clone()))
@@ -7389,13 +7428,13 @@ pub(crate) mod tests {
                 }),
             Ok(((reference_test_scalar(25.0), reference_test_scalar(5.0)), reference_test_scalar(10.0))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(5.0_f32)));
-        assert_eq!(capture.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(5.0_f32).unwrap()));
+        assert_eq!(capture.read(), Ok(Array::scalar(2.0_f32).unwrap()));
     }
 
     #[test]
     fn test_builder_value_and_gradient_with_auxiliary_output_rejects_reference_outputs() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference))
                 .with_auxiliary_output()
@@ -7423,37 +7462,37 @@ pub(crate) mod tests {
         // while the auxiliary value rides along with a zero cotangent seed.
         let z = Complex::new(0.7f64, -0.3f64);
         let ((value, aux), gradient): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(z))
+            .differentiate_at(Array::scalar(z).unwrap())
             .with_auxiliary_output()
             .holomorphic()
             .value_and_gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
-        assert_eq!(value, Array::scalar(z * z));
-        assert_eq!(aux, Array::scalar(z));
-        assert_eq!(gradient, Array::scalar(z + z));
+        assert_eq!(value, Array::scalar(z * z).unwrap());
+        assert_eq!(aux, Array::scalar(z).unwrap());
+        assert_eq!(gradient, Array::scalar(z + z).unwrap());
 
         // The builder recovers the eager domain from the concrete primal and agrees.
-        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
+        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z).unwrap())
             .with_auxiliary_output()
             .holomorphic()
             .value_and_gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
-        assert_eq!(value, Array::scalar(z * z));
-        assert_eq!(aux, Array::scalar(z));
-        assert_eq!(gradient, Array::scalar(z + z));
+        assert_eq!(value, Array::scalar(z * z).unwrap());
+        assert_eq!(aux, Array::scalar(z).unwrap());
+        assert_eq!(gradient, Array::scalar(z + z).unwrap());
 
         // The holomorphic entry point uses the same zero-space cotangent rule for non-differentiable auxiliary leaves.
-        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
+        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z).unwrap())
             .with_auxiliary_output()
             .holomorphic()
             .value_and_gradient(|x| {
-                let aux = x.context().constant(Array::scalar(7i32))?;
+                let aux = x.context().constant(Array::scalar(7i32).unwrap())?;
                 Ok((x.clone() * x, aux))
             })
             .unwrap();
-        assert_eq!(value, Array::scalar(z * z));
-        assert_eq!(aux, Array::scalar(7i32));
-        assert_eq!(gradient, Array::scalar(z + z));
+        assert_eq!(value, Array::scalar(z * z).unwrap());
+        assert_eq!(aux, Array::scalar(7i32).unwrap());
+        assert_eq!(gradient, Array::scalar(z + z).unwrap());
 
         // The holomorphy gate also runs at the type level under an active trace. A complex output with
         // an auxiliary output is accepted end to end and seeds `one` at the complex cotangent type.
@@ -7477,40 +7516,42 @@ pub(crate) mod tests {
         // The holomorphic builder gradient computes `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
         let z = Complex::new(0.7f64, -0.3f64);
         let method_gradient = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(z))
+            .differentiate_at(Array::scalar(z).unwrap())
             .holomorphic()
             .gradient(|x| x.sin().unwrap())
             .unwrap();
-        assert_eq!(method_gradient, Array::scalar(z.cos()));
+        assert_eq!(method_gradient, Array::scalar(z.cos()).unwrap());
 
         // The builder recovers the eager domain from the concrete primal and agrees.
-        let free_gradient = differentiate_at(Array::scalar(z)).holomorphic().gradient(|x| x.sin().unwrap()).unwrap();
-        assert_eq!(free_gradient, Array::scalar(z.cos()));
+        let free_gradient =
+            differentiate_at(Array::scalar(z).unwrap()).holomorphic().gradient(|x| x.sin().unwrap()).unwrap();
+        assert_eq!(free_gradient, Array::scalar(z.cos()).unwrap());
     }
 
     #[test]
     fn test_builder_gradient_with_auxiliary_output() {
         // The auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
         let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
             .with_auxiliary_output()
             .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
             .unwrap();
-        assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_eq!(method_gradient, (Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()));
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
 
         // The builder recovers the eager domain from the concrete primals and agrees.
-        let (free_gradient, aux): ((Array, Array), Array) = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-            .with_auxiliary_output()
-            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
-            .unwrap();
-        assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        let (free_gradient, aux): ((Array, Array), Array) =
+            differentiate_at((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()))
+                .with_auxiliary_output()
+                .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
+                .unwrap();
+        assert_eq!(free_gradient, (Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap()));
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
     }
 
     #[test]
     fn test_builder_gradient_with_auxiliary_output_reference_inputs() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
             differentiate_at(ArrayIrValue::Reference(reference.clone())).with_auxiliary_output().gradient(
                 |reference: ReferenceTestTracer| {
@@ -7519,7 +7560,7 @@ pub(crate) mod tests {
             ),
             Ok((reference_test_scalar(6.0), reference_test_scalar(3.0))),
         );
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32).unwrap()));
     }
 
     #[test]
@@ -7527,22 +7568,22 @@ pub(crate) mod tests {
         // The holomorphic auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
         let z = Complex::new(0.7f64, -0.3f64);
         let (method_gradient, aux): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(z))
+            .differentiate_at(Array::scalar(z).unwrap())
             .with_auxiliary_output()
             .holomorphic()
             .gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
-        assert_eq!(method_gradient, Array::scalar(z + z));
-        assert_eq!(aux, Array::scalar(z));
+        assert_eq!(method_gradient, Array::scalar(z + z).unwrap());
+        assert_eq!(aux, Array::scalar(z).unwrap());
 
         // The builder recovers the eager domain from the concrete primal and agrees.
-        let (free_gradient, aux): (Array, Array) = differentiate_at(Array::scalar(z))
+        let (free_gradient, aux): (Array, Array) = differentiate_at(Array::scalar(z).unwrap())
             .with_auxiliary_output()
             .holomorphic()
             .gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
-        assert_eq!(free_gradient, Array::scalar(z + z));
-        assert_eq!(aux, Array::scalar(z));
+        assert_eq!(free_gradient, Array::scalar(z + z).unwrap());
+        assert_eq!(aux, Array::scalar(z).unwrap());
     }
 
     #[test]
@@ -7557,7 +7598,7 @@ pub(crate) mod tests {
 
         // Reverse-over-reverse through builder terminals: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
-        let (value, second_derivative) = differentiate_at(Array::scalar(x))
+        let (value, second_derivative) = differentiate_at(Array::scalar(x).unwrap())
             .value_and_gradient(|x| differentiate_at(x).gradient(|y| (y.clone() * y).sin()).map_err(Into::into))
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
@@ -7571,7 +7612,7 @@ pub(crate) mod tests {
         // through the trait solver, with every inner transform run through an explicitly recovered context receiver.
         // The outer gradient is the analytic third derivative `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
         let (value, third_derivative) = domain
-            .differentiate_at(Array::scalar(x))
+            .differentiate_at(Array::scalar(x).unwrap())
             .value_and_gradient(|x| {
                 x.clone()
                     .context()
@@ -7592,8 +7633,8 @@ pub(crate) mod tests {
         // Forward-over-reverse through builder terminals: pushing the tangent `v = 2` through the gradient computes the
         // Hessian-vector product `f''(x) · v` without materializing a dense Hessian, because the `jvp` duals' stamped
         // `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests on.
-        let (primal, tangent) = differentiate_at(Array::scalar(x))
-            .jvp(Array::scalar(2.0), |x| Ok(differentiate_at(x).gradient(|y| (y.clone() * y).sin())?))
+        let (primal, tangent) = differentiate_at(Array::scalar(x).unwrap())
+            .jvp(Array::scalar(2.0).unwrap(), |x| Ok(differentiate_at(x).gradient(|y| (y.clone() * y).sin())?))
             .unwrap();
         assert_abs_diff_eq!(primal.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(

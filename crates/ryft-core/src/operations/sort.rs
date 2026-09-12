@@ -724,8 +724,8 @@ mod tests {
         let operation = SortOperation::new(0, SortDirection::Ascending);
         // An ascending key-value sort co-permutes the passenger by the key's order, and the sort is stable: both
         // `3.0` keys keep their original relative order, so the first one's payload `10.0` precedes `30.0`.
-        let keys = Array::vector(vec![3.0, 1.0, 3.0, 2.0]);
-        let payload = Array::vector(vec![10.0, 20.0, 30.0, 40.0]);
+        let keys = Array::vector(vec![3.0, 1.0, 3.0, 2.0]).unwrap();
+        let payload = Array::vector(vec![10.0, 20.0, 30.0, 40.0]).unwrap();
         let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
             &operation,
             &EagerContext::new(),
@@ -734,8 +734,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0], Array::vector(vec![1.0, 2.0, 3.0, 3.0]));
-        assert_eq!(outputs[1], Array::vector(vec![20.0, 40.0, 10.0, 30.0]));
+        assert_eq!(outputs[0], Array::vector(vec![1.0, 2.0, 3.0, 3.0]).unwrap());
+        assert_eq!(outputs[1], Array::vector(vec![20.0, 40.0, 10.0, 30.0]).unwrap());
 
         // Descending reverses the key comparison while keeping equal keys in their original order.
         let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -745,25 +745,25 @@ mod tests {
             &[keys, payload],
         )
         .unwrap();
-        assert_eq!(outputs[0], Array::vector(vec![3.0, 3.0, 2.0, 1.0]));
-        assert_eq!(outputs[1], Array::vector(vec![10.0, 30.0, 40.0, 20.0]));
+        assert_eq!(outputs[0], Array::vector(vec![3.0, 3.0, 2.0, 1.0]).unwrap());
+        assert_eq!(outputs[1], Array::vector(vec![10.0, 30.0, 40.0, 20.0]).unwrap());
     }
 
     #[test]
     fn test_sort_multi_axis() {
-        let input = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]);
+        let input = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]).unwrap();
         // Axis 0 sorts every column independently.
         let sorted = Sort::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending).unwrap().remove(0);
-        assert_eq!(sorted, Array::matrix(2, 3, vec![0.0, 1.0, 2.0, 3.0, 5.0, 4.0]));
+        assert_eq!(sorted, Array::matrix(2, 3, vec![0.0, 1.0, 2.0, 3.0, 5.0, 4.0]).unwrap());
         // Axis 1 sorts every row independently.
         let sorted = Sort::sort(std::slice::from_ref(&input), 1, SortDirection::Ascending).unwrap().remove(0);
-        assert_eq!(sorted, Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 0.0, 4.0, 5.0]));
+        assert_eq!(sorted, Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 0.0, 4.0, 5.0]).unwrap());
     }
 
     #[test]
     fn test_sort_total_order() {
         // Floating-point keys follow the IEEE 754 total order: `-∞ < -0.0 < +0.0 < NaN`.
-        let input = Array::vector(vec![f64::NAN, -0.0, 0.0, f64::NEG_INFINITY]);
+        let input = Array::vector(vec![f64::NAN, -0.0, 0.0, f64::NEG_INFINITY]).unwrap();
         let sorted = Sort::sort(&[input], 0, SortDirection::Ascending).unwrap().remove(0);
         let values = sorted.to_f64s();
         assert_eq!(values[0], f64::NEG_INFINITY);
@@ -776,22 +776,22 @@ mod tests {
     #[test]
     fn test_sort_multi_key() {
         // Two keys compare lexicographically: ties on key 0 fall through to key 1, and the passenger co-permutes.
-        let key0 = Array::vector(vec![2.0, 1.0, 2.0, 1.0]);
-        let key1 = Array::vector(vec![5.0, 9.0, 4.0, 9.0]);
-        let passenger = Array::vector(vec![10.0, 20.0, 30.0, 40.0]);
+        let key0 = Array::vector(vec![2.0, 1.0, 2.0, 1.0]).unwrap();
+        let key1 = Array::vector(vec![5.0, 9.0, 4.0, 9.0]).unwrap();
+        let passenger = Array::vector(vec![10.0, 20.0, 30.0, 40.0]).unwrap();
         let operands = [key0, key1, passenger];
         let sorted = Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 2).unwrap();
-        assert_eq!(sorted[0], Array::vector(vec![1.0, 1.0, 2.0, 2.0]));
+        assert_eq!(sorted[0], Array::vector(vec![1.0, 1.0, 2.0, 2.0]).unwrap());
         // The full tie `(1.0, 9.0)` keeps its original order (element 1 before element 3), which the passenger shows.
-        assert_eq!(sorted[1], Array::vector(vec![9.0, 9.0, 4.0, 5.0]));
-        assert_eq!(sorted[2], Array::vector(vec![20.0, 40.0, 30.0, 10.0]));
+        assert_eq!(sorted[1], Array::vector(vec![9.0, 9.0, 4.0, 5.0]).unwrap());
+        assert_eq!(sorted[2], Array::vector(vec![20.0, 40.0, 30.0, 10.0]).unwrap());
 
         // Descending reverses every key comparison while keeping full ties in their original order, so the result is
         // not simply the ascending result reversed.
         let sorted = Sort::sort_with_key_count(&operands, 0, SortDirection::Descending, 2).unwrap();
-        assert_eq!(sorted[0], Array::vector(vec![2.0, 2.0, 1.0, 1.0]));
-        assert_eq!(sorted[1], Array::vector(vec![5.0, 4.0, 9.0, 9.0]));
-        assert_eq!(sorted[2], Array::vector(vec![10.0, 30.0, 20.0, 40.0]));
+        assert_eq!(sorted[0], Array::vector(vec![2.0, 2.0, 1.0, 1.0]).unwrap());
+        assert_eq!(sorted[1], Array::vector(vec![5.0, 4.0, 9.0, 9.0]).unwrap());
+        assert_eq!(sorted[2], Array::vector(vec![10.0, 30.0, 20.0, 40.0]).unwrap());
 
         // The eager implementation validates the key count like type inference does.
         assert!(matches!(
@@ -811,16 +811,16 @@ mod tests {
             operation = SortOperation::new(0, SortDirection::Ascending),
             cases = [
                 {
-                    inputs = [(@known, Array::vector(vec![3.0, 1.0, 2.0]))],
-                    outputs = [(@known, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    inputs = [(@known, Array::vector(vec![3.0, 1.0, 2.0]).unwrap())],
+                    outputs = [(@known, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
                     residual_instructions = 0,
                 },
                 {
                     inputs = [(@unknown(
                         type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
-                        replay = Array::vector(vec![3.0, 1.0, 2.0])
+                        replay = Array::vector(vec![3.0, 1.0, 2.0]).unwrap()
                     ))],
-                    outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
                     residual_instructions = 1,
                 },
             ],
@@ -832,12 +832,12 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@known, Array::vector(vec![2.0, 1.0, 2.0])),
-                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                        (@known, Array::vector(vec![2.0, 1.0, 2.0]).unwrap()),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0]).unwrap()),
                     ],
                     outputs = [
-                        (@known, Array::vector(vec![1.0, 2.0, 2.0])),
-                        (@known, Array::vector(vec![9.0, 4.0, 5.0])),
+                        (@known, Array::vector(vec![1.0, 2.0, 2.0]).unwrap()),
+                        (@known, Array::vector(vec![9.0, 4.0, 5.0]).unwrap()),
                     ],
                     residual_instructions = 0,
                 },
@@ -845,13 +845,13 @@ mod tests {
                     inputs = [
                         (@unknown(
                             type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
-                            replay = Array::vector(vec![2.0, 1.0, 2.0])
+                            replay = Array::vector(vec![2.0, 1.0, 2.0]).unwrap()
                         )),
-                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0]).unwrap()),
                     ],
                     outputs = [
-                        (@residual, Array::vector(vec![1.0, 2.0, 2.0])),
-                        (@residual, Array::vector(vec![9.0, 4.0, 5.0])),
+                        (@residual, Array::vector(vec![1.0, 2.0, 2.0]).unwrap()),
+                        (@residual, Array::vector(vec![9.0, 4.0, 5.0]).unwrap()),
                     ],
                     residual_instructions = 1,
                 },
@@ -868,8 +868,8 @@ mod tests {
             operation = SortOperation::new(0, SortDirection::Ascending),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 1.0, 2.0, 5.0]))],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 5.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 1.0, 2.0, 5.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 5.0]).unwrap())],
             }],
         );
         // A replicated passenger broadcasts to the batched physical shape and is co-permuted per batch item by its
@@ -880,12 +880,12 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 1.0, 2.0, 5.0])),
-                    (@replicated, Array::vector(vec![7.0, 8.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 1.0, 2.0, 5.0]).unwrap()),
+                    (@replicated, Array::vector(vec![7.0, 8.0]).unwrap()),
                 ],
                 outputs = [
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 5.0])),
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![8.0, 7.0, 7.0, 8.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 5.0]).unwrap()),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![8.0, 7.0, 7.0, 8.0]).unwrap()),
                 ],
             }],
         );
@@ -897,12 +897,12 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 5.0, 2.0])),
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 0.0, 9.0, 8.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 5.0, 2.0]).unwrap()),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 0.0, 9.0, 8.0]).unwrap()),
                 ],
                 outputs = [
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 2.0, 5.0])),
-                    (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 8.0, 9.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 2.0, 5.0]).unwrap()),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 8.0, 9.0]).unwrap()),
                 ],
             }],
         );
@@ -915,10 +915,10 @@ mod tests {
             @approx(step = 1e-3, epsilon = 1e-6),
             operation = SortOperation::new(0, SortDirection::Ascending),
             cases = [{
-                primals = [Array::vector(vec![3.0, 1.0, 2.0])],
-                tangents = [Array::vector(vec![30.0, 10.0, 20.0])],
-                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0])],
-                tangent_outputs = [Array::vector(vec![10.0, 20.0, 30.0])],
+                primals = [Array::vector(vec![3.0, 1.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![30.0, 10.0, 20.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![10.0, 20.0, 30.0]).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3] .
                     let %2:f64[3], %3:f64[3] = sort [axis=0, direction=ascending] %0 %1
@@ -935,24 +935,24 @@ mod tests {
             operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
             cases = [{
                 primals = [
-                    Array::vector(vec![2.0, 1.0, 2.0]),
-                    Array::vector(vec![5.0, 9.0, 4.0]),
-                    Array::vector(vec![7.0, 8.0, 9.0]),
+                    Array::vector(vec![2.0, 1.0, 2.0]).unwrap(),
+                    Array::vector(vec![5.0, 9.0, 4.0]).unwrap(),
+                    Array::vector(vec![7.0, 8.0, 9.0]).unwrap(),
                 ],
                 tangents = [
-                    Array::vector(vec![10.0, 20.0, 10.0]),
-                    Array::vector(vec![100.0, 200.0, 300.0]),
-                    Array::vector(vec![1000.0, 2000.0, 3000.0]),
+                    Array::vector(vec![10.0, 20.0, 10.0]).unwrap(),
+                    Array::vector(vec![100.0, 200.0, 300.0]).unwrap(),
+                    Array::vector(vec![1000.0, 2000.0, 3000.0]).unwrap(),
                 ],
                 primal_outputs = [
-                    Array::vector(vec![1.0, 2.0, 2.0]),
-                    Array::vector(vec![9.0, 4.0, 5.0]),
-                    Array::vector(vec![8.0, 9.0, 7.0]),
+                    Array::vector(vec![1.0, 2.0, 2.0]).unwrap(),
+                    Array::vector(vec![9.0, 4.0, 5.0]).unwrap(),
+                    Array::vector(vec![8.0, 9.0, 7.0]).unwrap(),
                 ],
                 tangent_outputs = [
-                    Array::vector(vec![20.0, 10.0, 10.0]),
-                    Array::vector(vec![200.0, 300.0, 100.0]),
-                    Array::vector(vec![2000.0, 3000.0, 1000.0]),
+                    Array::vector(vec![20.0, 10.0, 10.0]).unwrap(),
+                    Array::vector(vec![200.0, 300.0, 100.0]).unwrap(),
+                    Array::vector(vec![2000.0, 3000.0, 1000.0]).unwrap(),
                 ],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[3], %5:f64[3] .
@@ -974,9 +974,9 @@ mod tests {
 
     #[test]
     fn test_top_k() {
-        let input = Array::vector(vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]);
+        let input = Array::vector(vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]).unwrap();
         let (values, indices) = input.top_k(3, 0).unwrap();
-        assert_eq!(values, Array::vector(vec![3.0, 3.0, 2.0]));
+        assert_eq!(values, Array::vector(vec![3.0, 3.0, 2.0]).unwrap());
         // Ties select the lowest index first because the descending ranking sort is stable.
         assert_eq!(
             indices,
@@ -1100,17 +1100,17 @@ mod tests {
 
         // NaN orders above `+∞` in the descending total order, so `argmax` reports the NaN's index, while `argmin`
         // reports the smallest ordinary value's index (a positive NaN orders last ascending as well).
-        let with_nan = Array::vector(vec![1.0, f64::NAN, 3.0]);
+        let with_nan = Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap();
         assert_eq!(with_nan.argmax(0), Ok(index_array(vec![], vec![1])));
         assert_eq!(with_nan.argmin(0), Ok(index_array(vec![], vec![0])));
 
         // Ties select the lowest index because the ranking sort is stable.
-        let tie = Array::vector(vec![2.0, 2.0]);
+        let tie = Array::vector(vec![2.0, 2.0]).unwrap();
         assert_eq!(tie.argmax(0), Ok(index_array(vec![], vec![0])));
         assert_eq!(tie.argmin(0), Ok(index_array(vec![], vec![0])));
 
         // The reduced axis is dropped from the result shape, and the indices are `i32`.
-        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
         assert_eq!(matrix.argmax(0), Ok(index_array(vec![3], vec![1, 0, 0])));
         assert_eq!(matrix.argmax(1), Ok(index_array(vec![2], vec![1, 0])));
         assert_eq!(matrix.argmin(0), Ok(index_array(vec![3], vec![0, 1, 1])));

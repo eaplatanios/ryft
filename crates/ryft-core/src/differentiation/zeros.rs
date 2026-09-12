@@ -570,7 +570,7 @@ mod tests {
         assert!(builder.instructions().is_empty());
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         assert_eq!(
-            ArrayOperation::<Array>::capture_zero_residual_values(&context, &Array::scalar(3.0), &r#type),
+            ArrayOperation::<Array>::capture_zero_residual_values(&context, &Array::scalar(3.0).unwrap(), &r#type),
             Ok(Vec::new()),
         );
 
@@ -580,7 +580,7 @@ mod tests {
         let zero = builder.add_instruction(operation, Vec::new(), operands, None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
-        assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(0.0)]));
+        assert_eq!(program.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(0.0).unwrap()]));
 
         // The fail-loud default rejects unexpected residuals instead of ignoring them, so a mismatched
         // linearize/transpose pairing cannot be silently accepted.
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn test_zero_space_boundary_reconstruction_reports_stored_boundary() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let primal = Array::scalar(3.0);
+        let primal = Array::scalar(3.0).unwrap();
         let primal_type = ArrayType::scalar(DataType::F64);
 
         // The output-tangent role retained during capture identifies a missing compact-program result without a
@@ -851,7 +851,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            input_cotangent.rebuild(&context, [Array::scalar(1.0), Array::scalar(2.0)]),
+            input_cotangent.rebuild(&context, [Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()]),
             Err(ProgramError::MalformedProgram(
                 "input cotangent boundary produced too many nonzero differential values".to_string(),
             )),

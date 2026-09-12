@@ -103,28 +103,38 @@ mod tests {
 
     #[test]
     fn test_sqrt_interpretation() {
-        assert_eq!(Array::scalar(0.25f32).sqrt().unwrap(), Array::scalar(0.5f32));
-        assert_eq!(Array::scalar(0.25f64).sqrt().unwrap(), Array::scalar(0.5f64));
-        assert_eq!(Array::scalar(bf16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(bf16::from_f32(0.5)));
-        assert_eq!(Array::scalar(f16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(f16::from_f32(0.5)));
+        assert_eq!(Array::scalar(0.25f32).unwrap().sqrt().unwrap(), Array::scalar(0.5f32).unwrap());
+        assert_eq!(Array::scalar(0.25f64).unwrap().sqrt().unwrap(), Array::scalar(0.5f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.25)).unwrap().sqrt().unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.25)).unwrap().sqrt().unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap()
+        );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).sqrt().unwrap(), Array::scalar(input.sqrt()), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().sqrt().unwrap(),
+            Array::scalar(input.sqrt()).unwrap(),
+            epsilon = 1e-12
+        );
         // The principal branch maps the negative real axis to the positive imaginary axis.
         assert_abs_diff_eq!(
-            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).sqrt().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, 2.0)),
+            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).unwrap().sqrt().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 2.0)).unwrap(),
             epsilon = 1e-12,
         );
 
-        assert_eq!(Array::scalar(4.0).sqrt().unwrap(), Array::scalar(2.0),);
+        assert_eq!(Array::scalar(4.0).unwrap().sqrt().unwrap(), Array::scalar(2.0).unwrap(),);
     }
 
     #[test]
     fn test_sqrt_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = SqrtOperation::new(),
-            inputs = [Array::scalar(4.0)],
-            expected = Array::scalar(2.0),
+            inputs = [Array::scalar(4.0).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
         );
     }
 
@@ -135,8 +145,8 @@ mod tests {
             operation = SqrtOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.sqrt(), 2.0f64.sqrt()]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.sqrt(), 2.0f64.sqrt()]).unwrap())],
             }],
         );
     }
@@ -147,10 +157,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = SqrtOperation::new(),
             cases = [{
-                primals = [Array::scalar(2.0)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(2.0f64.sqrt())],
-                tangent_outputs = [Array::scalar(3.0 / (2.0 * 2.0f64.sqrt()))],
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0f64.sqrt()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 / (2.0 * 2.0f64.sqrt())).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = sqrt %0
@@ -166,15 +176,17 @@ mod tests {
     fn test_sqrt_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.sqrt().unwrap()),
-            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt()))),
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| input.sqrt().unwrap()),
+            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt())).unwrap()),
         );
     }
 
     #[test]
     fn test_sqrt_low_precision_differentiation_uses_widened_tangents() {
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.sqrt()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.

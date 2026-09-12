@@ -176,51 +176,72 @@ mod tests {
 
     #[test]
     fn test_max_interpretation() {
-        assert_eq!(Array::scalar(2i32).max(&Array::scalar(5i32)).unwrap(), Array::scalar(5i32));
-        assert_eq!(Array::scalar(-2i64).max(&Array::scalar(-5i64)).unwrap(), Array::scalar(-2i64));
-        assert_eq!(Array::scalar(3u32).max(&Array::scalar(7u32)).unwrap(), Array::scalar(7u32));
-        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(1.5f32)).unwrap(), Array::scalar(2.5f32));
-        // Mixed-precision operands promote before comparing.
-        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(3.5f64)).unwrap(), Array::scalar(3.5f64));
         assert_eq!(
-            Array::scalar(bf16::from_f32(2.0)).max(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
-            Array::scalar(bf16::from_f32(3.0)),
+            Array::scalar(2i32).unwrap().max(&Array::scalar(5i32).unwrap()).unwrap(),
+            Array::scalar(5i32).unwrap()
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(2.0)).max(&Array::scalar(f16::from_f32(3.0))).unwrap(),
-            Array::scalar(f16::from_f32(3.0)),
+            Array::scalar(-2i64).unwrap().max(&Array::scalar(-5i64).unwrap()).unwrap(),
+            Array::scalar(-2i64).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(3u32).unwrap().max(&Array::scalar(7u32).unwrap()).unwrap(),
+            Array::scalar(7u32).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(2.5f32).unwrap().max(&Array::scalar(1.5f32).unwrap()).unwrap(),
+            Array::scalar(2.5f32).unwrap()
+        );
+        // Mixed-precision operands promote before comparing.
+        assert_eq!(
+            Array::scalar(2.5f32).unwrap().max(&Array::scalar(3.5f64).unwrap()).unwrap(),
+            Array::scalar(3.5f64).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0))
+                .unwrap()
+                .max(&Array::scalar(bf16::from_f32(3.0)).unwrap())
+                .unwrap(),
+            Array::scalar(bf16::from_f32(3.0)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).unwrap().max(&Array::scalar(f16::from_f32(3.0)).unwrap()).unwrap(),
+            Array::scalar(f16::from_f32(3.0)).unwrap(),
         );
         // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(Array::scalar(f64::NAN).max(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
-        assert!(Array::scalar(1.0f64).max(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
-        let zero = Array::scalar(-0.0f64).max(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
+        assert!(Array::scalar(f64::NAN).unwrap().max(&Array::scalar(1.0f64).unwrap()).unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(1.0f64).unwrap().max(&Array::scalar(f64::NAN).unwrap()).unwrap().to_f64s()[0].is_nan());
+        let zero = Array::scalar(-0.0f64).unwrap().max(&Array::scalar(0.0f64).unwrap()).unwrap().to_f64s()[0];
         assert!(zero == 0.0 && zero.is_sign_positive());
         assert_eq!(
-            Array::vector(vec![0.7, -1.0]).max(&Array::vector(vec![0.3, 2.0])).unwrap(),
-            Array::vector(vec![0.7, 2.0]),
+            Array::vector(vec![0.7, -1.0]).unwrap().max(&Array::vector(vec![0.3, 2.0]).unwrap()).unwrap(),
+            Array::vector(vec![0.7, 2.0]).unwrap(),
         );
     }
 
     #[test]
     fn test_max_interpretation_complex() {
         // The real component takes precedence, and mixed real/complex inputs promote before selection.
-        let left = Array::scalar(Complex::new(1.0f32, 100.0));
-        let right = Array::scalar(Complex::new(2.0f32, -100.0));
-        assert_eq!(left.max(&right).unwrap(), Array::scalar(Complex::new(2.0f32, -100.0)));
-        assert_eq!(left.max(&Array::scalar(2.0f32)).unwrap(), Array::scalar(Complex::new(2.0f32, 0.0)),);
+        let left = Array::scalar(Complex::new(1.0f32, 100.0)).unwrap();
+        let right = Array::scalar(Complex::new(2.0f32, -100.0)).unwrap();
+        assert_eq!(left.max(&right).unwrap(), Array::scalar(Complex::new(2.0f32, -100.0)).unwrap());
+        assert_eq!(
+            left.max(&Array::scalar(2.0f32).unwrap()).unwrap(),
+            Array::scalar(Complex::new(2.0f32, 0.0)).unwrap(),
+        );
 
         // Equal real components compare imaginary components, with scalar broadcasting across a vector.
-        let values = Array::vector(vec![Complex::new(1.0f64, 1.0), Complex::new(1.0, 3.0)]);
+        let values = Array::vector(vec![Complex::new(1.0f64, 1.0), Complex::new(1.0, 3.0)]).unwrap();
         assert_eq!(
-            values.max(&Array::scalar(Complex::new(1.0f64, 2.0))).unwrap(),
-            Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(1.0, 3.0)]),
+            values.max(&Array::scalar(Complex::new(1.0f64, 2.0)).unwrap()).unwrap(),
+            Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(1.0, 3.0)]).unwrap(),
         );
 
         // Unordered real comparisons and signed-zero ties select the right whole operand.
-        let unordered = Array::scalar(Complex::new(f32::NAN, 1.0));
+        let unordered = Array::scalar(Complex::new(f32::NAN, 1.0)).unwrap();
         assert_eq!(unordered.max(&right).unwrap(), right);
-        let zero = Array::scalar(Complex::new(1.0f32, -0.0));
-        let result = zero.max(&Array::scalar(Complex::new(1.0f32, 0.0))).unwrap();
+        let zero = Array::scalar(Complex::new(1.0f32, -0.0)).unwrap();
+        let result = zero.max(&Array::scalar(Complex::new(1.0f32, 0.0)).unwrap()).unwrap();
         assert_eq!(result.elements::<Complex<f32>>().unwrap()[0].im.to_bits(), 0.0f32.to_bits());
     }
 
@@ -228,8 +249,8 @@ mod tests {
     fn test_max_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = MaxOperation::new(),
-            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
-            expected = Array::scalar(0.7),
+            inputs = [Array::scalar(0.7).unwrap(), Array::scalar(0.3).unwrap()],
+            expected = Array::scalar(0.7).unwrap(),
         );
     }
 
@@ -242,17 +263,17 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
-                        (@mapped(axis = 0), Array::vector(vec![0.3, 2.0])),
+                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![0.3, 2.0]).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(0.0)),
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(0.0).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 0.0]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 0.0]).unwrap())],
                 },
             ],
         );
@@ -265,10 +286,10 @@ mod tests {
             operation = MaxOperation::new(),
             cases = [
                 {
-                    primals = [Array::scalar(2.0), Array::scalar(1.0)],
-                    tangents = [Array::scalar(3.0), Array::scalar(5.0)],
-                    primal_outputs = [Array::scalar(2.0)],
-                    tangent_outputs = [Array::scalar(3.0)],
+                    primals = [Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                    primal_outputs = [Array::scalar(2.0).unwrap()],
+                    tangent_outputs = [Array::scalar(3.0).unwrap()],
                     jvp = indoc! {"
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = max %0 %1
@@ -283,10 +304,10 @@ mod tests {
                     "},
                 },
                 {
-                    primals = [Array::scalar(1.0), Array::scalar(2.0)],
-                    tangents = [Array::scalar(3.0), Array::scalar(5.0)],
-                    primal_outputs = [Array::scalar(2.0)],
-                    tangent_outputs = [Array::scalar(5.0)],
+                    primals = [Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap()],
+                    primal_outputs = [Array::scalar(2.0).unwrap()],
+                    tangent_outputs = [Array::scalar(5.0).unwrap()],
                 },
             ],
         );
@@ -306,9 +327,14 @@ mod tests {
             .jvp()
             .unwrap();
         let outputs = jvp_program
-            .interpret(vec![Array::scalar(2.0), Array::scalar(2.0), Array::scalar(3.0), Array::scalar(5.0)])
+            .interpret(vec![
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(2.0).unwrap(),
+                Array::scalar(3.0).unwrap(),
+                Array::scalar(5.0).unwrap(),
+            ])
             .unwrap();
-        assert_eq!(outputs, vec![Array::scalar(2.0), Array::scalar(3.0)]);
+        assert_eq!(outputs, vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]);
     }
 
     #[test]
@@ -322,32 +348,32 @@ mod tests {
             .unwrap()
             .jvp()
             .unwrap();
-        let left_tangent = Array::scalar(Complex::new(3.0, 4.0));
-        let right_tangent = Array::scalar(Complex::new(5.0, 6.0));
+        let left_tangent = Array::scalar(Complex::new(3.0, 4.0)).unwrap();
+        let right_tangent = Array::scalar(Complex::new(5.0, 6.0)).unwrap();
 
         // The imaginary component decides when the real components agree.
         assert_eq!(
             jvp_program
                 .interpret(vec![
-                    Array::scalar(Complex::new(1.0, 1.0)),
-                    Array::scalar(Complex::new(1.0, 2.0)),
+                    Array::scalar(Complex::new(1.0, 1.0)).unwrap(),
+                    Array::scalar(Complex::new(1.0, 2.0)).unwrap(),
                     left_tangent.clone(),
                     right_tangent.clone(),
                 ])
                 .unwrap(),
-            vec![Array::scalar(Complex::new(1.0, 2.0)), right_tangent.clone()],
+            vec![Array::scalar(Complex::new(1.0, 2.0)).unwrap(), right_tangent.clone()],
         );
         // Complex ties follow the right operand, unlike the existing real tie convention.
         assert_eq!(
             jvp_program
                 .interpret(vec![
-                    Array::scalar(Complex::new(1.0, 2.0)),
-                    Array::scalar(Complex::new(1.0, 2.0)),
+                    Array::scalar(Complex::new(1.0, 2.0)).unwrap(),
+                    Array::scalar(Complex::new(1.0, 2.0)).unwrap(),
                     left_tangent,
                     right_tangent.clone(),
                 ])
                 .unwrap(),
-            vec![Array::scalar(Complex::new(1.0, 2.0)), right_tangent],
+            vec![Array::scalar(Complex::new(1.0, 2.0)).unwrap(), right_tangent],
         );
     }
 

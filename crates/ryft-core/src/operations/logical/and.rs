@@ -129,10 +129,13 @@ mod tests {
     #[test]
     fn test_and_interpretation() {
         // Check elementwise and scalar-broadcast eager value semantics.
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
+        let left = Array::vector(vec![true, true, false, false]).unwrap();
+        let right = Array::vector(vec![true, false, true, false]).unwrap();
         assert_eq!((left & right).elements::<bool>(), Ok(vec![true, false, false, false]));
-        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).elements::<bool>(), Ok(vec![true, false]));
+        assert_eq!(
+            (Array::vector(vec![true, false]).unwrap() & Array::scalar(true).unwrap()).elements::<bool>(),
+            Ok(vec![true, false])
+        );
     }
 
     #[test]
@@ -140,8 +143,8 @@ mod tests {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = AndOperation::new(),
-            inputs = [Array::scalar(true), Array::scalar(false)],
-            expected = Array::scalar(false),
+            inputs = [Array::scalar(true).unwrap(), Array::scalar(false).unwrap()],
+            expected = Array::scalar(false).unwrap(),
         );
     }
 
@@ -155,17 +158,17 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![true, false])),
-                        (@replicated, Array::scalar(true)),
+                        (@mapped(axis = 0), Array::vector(vec![true, false]).unwrap()),
+                        (@replicated, Array::scalar(true).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]).unwrap())],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(false)),
-                        (@mapped(axis = 0), Array::vector(vec![true, false])),
+                        (@replicated, Array::scalar(false).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![true, false]).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, false]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, false]).unwrap())],
                 },
             ],
         );
@@ -175,11 +178,15 @@ mod tests {
     fn test_and_differentiation() {
         // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
         // predicates hold (x > 1) and 3 otherwise.
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), masked_select).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), masked_select)
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-        let (primal, tangent) = differentiate_at(Array::scalar(0.5)).jvp(Array::scalar(1.0), masked_select).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(0.5).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), masked_select)
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![1.5]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
     }
@@ -212,24 +219,27 @@ mod tests {
 
     #[test]
     fn test_and_for_array() {
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
-        assert_eq!(left.and(&right).unwrap(), Array::vector(vec![true, false, false, false]));
+        let left = Array::vector(vec![true, true, false, false]).unwrap();
+        let right = Array::vector(vec![true, false, true, false]).unwrap();
+        assert_eq!(left.and(&right).unwrap(), Array::vector(vec![true, false, false, false]).unwrap());
         // General NumPy-style broadcasting maps each input coordinate into the common output shape.
         assert_eq!(
-            Array::matrix(2, 1, vec![true, false]).and(&Array::matrix(1, 3, vec![true, false, true])).unwrap(),
-            Array::matrix(2, 3, vec![true, false, true, false, false, false]),
+            Array::matrix(2, 1, vec![true, false])
+                .unwrap()
+                .and(&Array::matrix(1, 3, vec![true, false, true]).unwrap())
+                .unwrap(),
+            Array::matrix(2, 3, vec![true, false, true, false, false, false]).unwrap(),
         );
         // Same-data-type integers combine bitwise directly over all bytes of each encoding.
-        let bits = Array::vector(vec![0b1100u8]).and(&Array::vector(vec![0b1010u8])).unwrap();
+        let bits = Array::vector(vec![0b1100u8]).unwrap().and(&Array::vector(vec![0b1010u8]).unwrap()).unwrap();
         assert_eq!(bits.elements::<u8>(), Ok(vec![0b1000]));
         // Real floating-point operands are rejected, matching the scalar reference backend.
         assert!(matches!(
-            Array::vector(vec![1.0]).and(&Array::vector(vec![0.0])),
+            Array::vector(vec![1.0]).unwrap().and(&Array::vector(vec![0.0]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot apply `and` to arrays of element data types `f64` and `f64`",
         ));
         // The `std::ops` sugar delegates to the fallible capability.
-        assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]));
+        assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]).unwrap());
     }
 }

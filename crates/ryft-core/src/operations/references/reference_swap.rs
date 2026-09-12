@@ -368,8 +368,8 @@ mod tests {
     #[test]
     fn test_reference_swap_operation_jvp() {
         let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
         let active = DifferentiationTracer::new(
             DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
             context.clone(),
@@ -379,18 +379,21 @@ mod tests {
         // previous tangent contents.
         let replacement = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])),
-                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[active, replacement]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])));
-        assert_eq!(outputs[0].tangent().as_value(), Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
+        assert_eq!(
+            outputs[0].tangent().as_value(),
+            Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
+        );
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap())));
 
         // Swapping a plumbing reference with a replacement without a live tangent yields a symbolic zero tangent.
         let plumbing = DifferentiationTracer::new(
@@ -398,24 +401,25 @@ mod tests {
             context.clone(),
         );
         let replacement = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]).unwrap()))
+                .unwrap(),
             context.clone(),
         );
         let outputs =
             context.bind(ReferenceSwapOperation::new(), Vec::new(), &[plumbing.clone(), replacement]).unwrap();
-        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()));
         assert!(matches!(
             outputs[0].tangent(),
             MaybeZero::Zero(r#type) if *r#type == ArrayType::new_static(DataType::F32, [2]).into(),
         ));
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap())));
 
         // A live replacement tangent has no tangent reference to land in, and the rejection precedes the primal swap.
         let replacement = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0])),
-                TestIrValue::Array(Array::vector(vec![13.0_f32, 14.0])),
+                TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![13.0_f32, 14.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
@@ -429,7 +433,7 @@ mod tests {
                     .to_string(),
             },
         );
-        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]).unwrap())));
     }
 
     #[test]
@@ -443,14 +447,16 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let initial = TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let initial =
+            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let reference = initial.reference_new().unwrap();
         let batched =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
 
         // A replacement mapped at the reference's batch axis is swapped packed, and the previous packed value is
         // batched at the reference's axis.
-        let aligned = TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]));
+        let aligned =
+            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap());
         let replacement =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(aligned.clone(), BatchAxis::new(1)).unwrap());
         let outputs = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[batched, replacement]).unwrap();
@@ -463,8 +469,11 @@ mod tests {
         let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference.clone()));
         let replacement = BatchingTracer::new(
             context.clone(),
-            ArrayIrBatch::new(TestIrValue::Array(Array::from_f64s(packed_type, vec![0.0; 6])), BatchAxis::new(1))
-                .unwrap(),
+            ArrayIrBatch::new(
+                TestIrValue::Array(Array::from_f64s(packed_type, vec![0.0; 6]).unwrap()),
+                BatchAxis::new(1),
+            )
+            .unwrap(),
         );
         let error = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[replicated, replacement]).unwrap_err();
         assert_eq!(

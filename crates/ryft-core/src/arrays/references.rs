@@ -1625,11 +1625,11 @@ mod tests {
         let view: ArrayReferenceViewPath<NoReferenceViewBinding> = ArrayReferenceViewPath::root()
             .with_view(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
-        let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]);
+        let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
         let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         assert_eq!(
             view.intermediates_in(&mut carrier, root.clone()),
-            Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]), Array::scalar(3.0_f32),]),
+            Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]).unwrap(), Array::scalar(3.0_f32).unwrap(),]),
         );
         assert_eq!(ArrayReferenceViewPath::root().intermediates_in(&mut carrier, root.clone()), Ok(vec![root]));
     }
@@ -1644,14 +1644,14 @@ mod tests {
         assert_eq!(
             view.reconstruct_in(
                 &mut carrier,
-                &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]), Array::vector(vec![2.0_f32, 3.0]),],
-                Array::scalar(7.0_f32)
+                &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![2.0_f32, 3.0]).unwrap(),],
+                Array::scalar(7.0_f32).unwrap()
             ),
-            Ok(Array::vector(vec![1.0_f32, 2.0, 7.0, 4.0])),
+            Ok(Array::vector(vec![1.0_f32, 2.0, 7.0, 4.0]).unwrap()),
         );
         assert_eq!(
-            ArrayReferenceViewPath::root().reconstruct_in(&mut carrier, &[], Array::scalar(7.0_f32)),
-            Ok(Array::scalar(7.0_f32)),
+            ArrayReferenceViewPath::root().reconstruct_in(&mut carrier, &[], Array::scalar(7.0_f32).unwrap()),
+            Ok(Array::scalar(7.0_f32).unwrap()),
         );
     }
 
@@ -1661,7 +1661,7 @@ mod tests {
             .with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) });
         let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         assert_eq!(
-            view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32)),
+            view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32).unwrap()),
             Err(ProgramError::MalformedProgram(
                 "reference view reconstruction requires 1 parent snapshots but received 0".to_string(),
             )),
@@ -1669,8 +1669,8 @@ mod tests {
         assert_eq!(
             view.reconstruct_in(
                 &mut carrier,
-                &[Array::vector(vec![1.0_f32]), Array::scalar(1.0_f32)],
-                Array::scalar(1.0_f32),
+                &[Array::vector(vec![1.0_f32]).unwrap(), Array::scalar(1.0_f32).unwrap()],
+                Array::scalar(1.0_f32).unwrap(),
             ),
             Err(ProgramError::MalformedProgram(
                 "reference view reconstruction requires 1 parent snapshots but received 2".to_string(),
@@ -1680,11 +1680,11 @@ mod tests {
 
     #[test]
     fn test_array_reference_new() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         assert_eq!(root.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         let alias = root.clone();
-        let separate = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let separate = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
@@ -1700,18 +1700,18 @@ mod tests {
 
     #[test]
     fn test_array_reference_id() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         assert_eq!(root.id(), root.clone().id());
         assert_eq!(root.id(), view.id());
-        assert_ne!(root.id(), ArrayReference::new(Array::vector(vec![1.0_f32, 2.0])).id());
+        assert_ne!(root.id(), ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()).id());
     }
 
     #[test]
     fn test_array_reference_is_runtime_root_handle() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
@@ -1721,7 +1721,7 @@ mod tests {
 
     #[test]
     fn test_array_reference_lock_root() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
@@ -1740,11 +1740,11 @@ mod tests {
         // index of the derived view is rejected even though it exists in the root.
         let slice =
             ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] };
-        let handle = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()))
+        let handle = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap())
             .with_transform(slice.clone())
             .unwrap();
         assert_eq!(handle.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
-        assert_eq!(handle.read(), Ok(Array::matrix(2, 3, vec![5.0_f32, 6.0, 7.0, 9.0, 10.0, 11.0])));
+        assert_eq!(handle.read(), Ok(Array::matrix(2, 3, vec![5.0_f32, 6.0, 7.0, 9.0, 10.0, 11.0]).unwrap()));
         assert_eq!(
             handle
                 .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(2) })
@@ -1761,13 +1761,13 @@ mod tests {
         let view: ArrayReferenceViewPath<NoReferenceViewBinding> =
             ArrayReferenceViewPath::root().with_view(symbolic.clone());
         assert_eq!(
-            view.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect())),
+            view.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
             Err(TypeError::invalid(
                 "a symbolic index has no static selection; the operation that creates the view resolves it",
             )
             .into()),
         );
-        let root = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()));
+        let root = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap());
         let error = root.with_transform(symbolic).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ArrayReferenceViewError>(),
@@ -1781,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_array_reference_with_transform_is_structural() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let guard = root.lock_root().unwrap();
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("new reference unexpectedly has active read leases")
@@ -1806,8 +1806,8 @@ mod tests {
         assert_eq!(composed.r#type().as_ref(), &ReferenceType::new(ArrayType::scalar(DataType::F32)));
         assert_eq!(composed.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
 
-        let frozen = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(frozen.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        let frozen = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        assert_eq!(frozen.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         let frozen_view = frozen
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
@@ -1816,21 +1816,21 @@ mod tests {
 
     #[test]
     fn test_array_reference_read() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let derived =
             root.with_transform(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }).unwrap();
 
         // Reading a derived handle applies its selection rather than exposing the complete allocation.
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
-        assert_eq!(derived.read(), Ok(Array::vector(vec![2.0_f32, 3.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
+        assert_eq!(derived.read(), Ok(Array::vector(vec![2.0_f32, 3.0]).unwrap()));
     }
 
     #[test]
     fn test_array_reference_read_root() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let derived =
             root.with_transform(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }).unwrap();
-        assert_eq!(root.read_root(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(root.read_root(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
 
         assert_eq!(
             derived.read_root().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
@@ -1844,21 +1844,21 @@ mod tests {
 
     #[test]
     fn test_array_reference_swap() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
-        assert_eq!(view.swap(Array::scalar(5.0_f32)), Ok(Array::scalar(2.0_f32)));
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0])));
+        assert_eq!(view.swap(Array::scalar(5.0_f32).unwrap()), Ok(Array::scalar(2.0_f32).unwrap()));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0]).unwrap()));
     }
 
     #[test]
     fn test_array_reference_swap_rejects_wrong_referent_type() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let view = root.with_transform(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }).unwrap();
 
         // Reconstruction alone accepts smaller replacements, so the handle checks exact view type equality.
-        let error = view.swap(Array::vector(vec![10.0_f32, 20.0])).unwrap_err();
+        let error = view.swap(Array::vector(vec![10.0_f32, 20.0]).unwrap()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ReferenceError>(),
             Some(&ReferenceError::ReferentTypeMismatch {
@@ -1866,30 +1866,30 @@ mod tests {
                 actual: "f32[2]".to_string(),
             }),
         );
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
 
         // A frozen allocation reports its terminal state before checking a malformed replacement.
         root.freeze().unwrap();
-        let error = view.swap(Array::vector(vec![1.0_f32, 2.0])).unwrap_err();
+        let error = view.swap(Array::vector(vec![1.0_f32, 2.0]).unwrap()).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
     fn test_array_reference_write() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
-        assert_eq!(view.write(Array::scalar(5.0_f32)), Ok(()));
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0])));
+        assert_eq!(view.write(Array::scalar(5.0_f32).unwrap()), Ok(()));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0]).unwrap()));
     }
 
     #[test]
     fn test_array_reference_write_rejects_wrong_referent_type() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let view = root.with_transform(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }).unwrap();
 
-        let error = view.write(Array::vector(vec![10.0_f32, 20.0])).unwrap_err();
+        let error = view.write(Array::vector(vec![10.0_f32, 20.0]).unwrap()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ReferenceError>(),
             Some(&ReferenceError::ReferentTypeMismatch {
@@ -1897,17 +1897,17 @@ mod tests {
                 actual: "f32[2]".to_string(),
             }),
         );
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
 
         // A frozen allocation reports its terminal state before checking a malformed replacement.
         root.freeze().unwrap();
-        let error = view.write(Array::vector(vec![1.0_f32, 2.0])).unwrap_err();
+        let error = view.write(Array::vector(vec![1.0_f32, 2.0]).unwrap()).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
     fn test_array_reference_write_reconstructs_composed_views() {
-        let root = ArrayReference::new(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect()));
+        let root = ArrayReference::new(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect()).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Slice {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
@@ -1918,28 +1918,31 @@ mod tests {
         assert_eq!(view.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
         // A write reconstructs both strict parents and preserves elements outside the composed view.
-        assert_eq!(view.write(Array::vector(vec![70.0_f32, 80.0])), Ok(()));
-        assert_eq!(root.read(), Ok(Array::matrix(3, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 70.0, 80.0, 9.0])));
+        assert_eq!(view.write(Array::vector(vec![70.0_f32, 80.0]).unwrap()), Ok(()));
+        assert_eq!(
+            root.read(),
+            Ok(Array::matrix(3, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 70.0, 80.0, 9.0]).unwrap())
+        );
     }
 
     #[test]
     fn test_array_reference_add_update() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
-        assert_eq!(view.add_update(&Array::scalar(5.0_f32)), Ok(()));
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 7.0, 3.0])));
+        assert_eq!(view.add_update(&Array::scalar(5.0_f32).unwrap()), Ok(()));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 7.0, 3.0]).unwrap()));
     }
 
     #[test]
     fn test_array_reference_add_update_rejects_wrong_referent_type() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let view = root.with_transform(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }).unwrap();
 
         // An additive update whose result type drifts away from the view's element data type is rejected by the same
         // check, after the addition itself succeeded, so the holder still retains its previous value.
-        let error = view.add_update(&Array::vector(vec![1.0_f64, 2.0, 3.0])).unwrap_err();
+        let error = view.add_update(&Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ReferenceError>(),
             Some(&ReferenceError::ReferentTypeMismatch {
@@ -1947,12 +1950,12 @@ mod tests {
                 actual: "f64[3]".to_string(),
             }),
         );
-        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
     }
 
     #[test]
     fn test_array_reference_freeze() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
@@ -1963,14 +1966,14 @@ mod tests {
         );
         assert_eq!(error.to_string(), "cannot freeze a reference view; freeze the root reference instead");
         // Rejecting a derived handle leaves the allocation available for the root's consuming read.
-        assert_eq!(root.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(root.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         assert_eq!(view.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
     fn test_array_reference_type() {
         let root_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let root = ArrayReference::new(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let root = ArrayReference::new(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let slice =
             ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)] };
         let index = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
@@ -2047,12 +2050,12 @@ mod tests {
     #[test]
     fn test_array_reference_discharge_read() {
         let context = EagerContext::<TestValue, TestOperation>::new();
-        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let alias = ArrayReferenceViewPath::root()
             .with_view(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         assert_eq!(
             ArrayReferenceDischarge::read(&context, &current, &alias),
-            Ok(TestValue::Array(Array::vector::<f32>(vec![2.0, 3.0]))),
+            Ok(TestValue::Array(Array::vector::<f32>(vec![2.0, 3.0]).unwrap())),
         );
         assert_eq!(ArrayReferenceDischarge::read(&context, &current, &ArrayReferenceViewPath::root()), Ok(current));
     }
@@ -2092,19 +2095,19 @@ mod tests {
     #[test]
     fn test_array_reference_discharge_swap() {
         let context = EagerContext::<TestValue, TestOperation>::new();
-        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let alias = ArrayReferenceViewPath::root()
             .with_view(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         assert_eq!(
             ArrayReferenceDischarge::swap(
                 &context,
                 &current,
-                TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0])),
+                TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0]).unwrap()),
                 &alias
             ),
             Ok((
-                TestValue::Array(Array::vector::<f32>(vec![2.0, 3.0])),
-                TestValue::Array(Array::vector(vec![1.0_f32, 4.0, 5.0]))
+                TestValue::Array(Array::vector::<f32>(vec![2.0, 3.0]).unwrap()),
+                TestValue::Array(Array::vector(vec![1.0_f32, 4.0, 5.0]).unwrap())
             )),
         );
     }
@@ -2143,12 +2146,16 @@ mod tests {
             )
             .unwrap();
         let inputs = vec![
-            TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])),
-            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0])),
+            TestValue::Array(
+                Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
+            ),
+            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0]).unwrap()),
         ];
         let expected = vec![
-            TestValue::Array(Array::vector::<f32>(vec![7.0, 8.0])),
-            TestValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 9.0])),
+            TestValue::Array(Array::vector::<f32>(vec![7.0, 8.0]).unwrap()),
+            TestValue::Array(
+                Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 9.0]).unwrap(),
+            ),
         ];
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
 
@@ -2171,17 +2178,17 @@ mod tests {
     #[test]
     fn test_array_reference_discharge_accumulate() {
         let context = EagerContext::<TestValue, TestOperation>::new();
-        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let current = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let alias = ArrayReferenceViewPath::root()
             .with_view(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         assert_eq!(
             ArrayReferenceDischarge::accumulate(
                 &context,
                 &current,
-                TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0])),
+                TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0]).unwrap()),
                 &alias
             ),
-            Ok(TestValue::Array(Array::vector(vec![1.0_f32, 6.0, 8.0]))),
+            Ok(TestValue::Array(Array::vector(vec![1.0_f32, 6.0, 8.0]).unwrap())),
         );
     }
 
@@ -2286,9 +2293,9 @@ mod tests {
             )
             .unwrap();
         let inputs = vec![
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])),
-            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0])),
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()),
+            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
         ];
         let expected = source.interpret(inputs.clone()).unwrap();
 
@@ -2342,13 +2349,13 @@ mod tests {
             )
             .unwrap();
         let inputs = vec![
-            TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
-            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0, 30.0])),
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])),
+            TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0, 30.0]).unwrap()),
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()),
         ];
         let expected = vec![
-            TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0, 6.0])),
-            TestValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0])),
+            TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0, 6.0]).unwrap()),
+            TestValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0]).unwrap()),
         ];
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
 
@@ -2406,20 +2413,22 @@ mod tests {
             (1, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
             (80, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
         ] {
-            let selected = TestValue::Array(Array::vector::<f32>(selected));
-            let written = TestValue::Array(Array::from_f64s(matrix_type.clone(), written));
+            let selected = TestValue::Array(Array::vector::<f32>(selected).unwrap());
+            let written = TestValue::Array(Array::from_f64s(matrix_type.clone(), written).unwrap());
             assert_eq!(
                 staged.clone().interpret(vec![
-                    TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
-                    TestValue::Array(Array::scalar::<i32>(index)),
-                    TestValue::Array(Array::vector::<f32>(vec![20.0, 30.0])),
+                    TestValue::Array(
+                        Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+                    ),
+                    TestValue::Array(Array::scalar::<i32>(index).unwrap()),
+                    TestValue::Array(Array::vector::<f32>(vec![20.0, 30.0]).unwrap()),
                 ]),
                 Ok(vec![
                     selected.clone(),
                     written.clone(),
                     selected,
                     written,
-                    TestValue::Array(Array::from_f64s(matrix_type.clone(), accumulated)),
+                    TestValue::Array(Array::from_f64s(matrix_type.clone(), accumulated).unwrap()),
                 ]),
             );
         }

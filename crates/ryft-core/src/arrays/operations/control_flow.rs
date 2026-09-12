@@ -415,7 +415,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let extent = builder.add_input(ArrayIrType::Dimension(dimension_type));
         let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
-        let factor = builder.add_constant(array(Array::scalar(factor)));
+        let factor = builder.add_constant(array(Array::scalar(factor).unwrap()));
         let output = builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(MulOperation::new())),
@@ -474,14 +474,14 @@ mod tests {
         );
 
         // Eager interpretation selects one branch per predicate value and forwards the same dimension either way.
-        let boolean = |value: f64| array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![value]));
+        let boolean = |value: f64| array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![value]).unwrap());
         assert_eq!(
-            program.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
-            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0))]),
+            program.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
         );
         assert_eq!(
-            program.interpret(vec![boolean(0.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
-            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0))]),
+            program.interpret(vec![boolean(0.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0).unwrap())]),
         );
 
         // Relocating the composite program imports both branch regions unchanged, so it renders and executes exactly
@@ -498,8 +498,8 @@ mod tests {
             .unwrap();
         assert_eq!(relocated.to_string(), program.to_string());
         assert_eq!(
-            relocated.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0))]),
-            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0))]),
+            relocated.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
         );
     }
 
@@ -533,10 +533,10 @@ mod tests {
         assert_eq!(jvp.output_count(), 3);
         let outputs = jvp
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 4),
-                array(Array::scalar(5.0)),
-                array(Array::scalar(7.0)),
+                array(Array::scalar(5.0).unwrap()),
+                array(Array::scalar(7.0).unwrap()),
             ])
             .unwrap();
         assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
@@ -548,15 +548,18 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 4),
-                array(Array::scalar(5.0)),
+                array(Array::scalar(5.0).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(2);
-        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]),);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(2.0).unwrap())]),
+        );
     }
 
     #[test]
@@ -595,10 +598,10 @@ mod tests {
         assert_eq!(jvp.output_count(), 2);
         assert_eq!(
             jvp.interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 3),
             ]),
-            Ok(vec![array(Array::vector(vec![0.0_f64; 3])), array(Array::vector(vec![0.0_f64; 3])),]),
+            Ok(vec![array(Array::vector(vec![0.0_f64; 3]).unwrap()), array(Array::vector(vec![0.0_f64; 3]).unwrap()),]),
         );
 
         // Eager direct JVP keeps the operation's all-zero region fast path and derives the concrete output tangent
@@ -611,7 +614,7 @@ mod tests {
                     context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())
                 },
                 vec![
-                    array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                    array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                     dimension(&extent_type, 3),
                 ],
                 vec![
@@ -621,8 +624,8 @@ mod tests {
                 (),
             )
             .unwrap();
-        assert_eq!(primal, vec![array(Array::vector(vec![0.0_f64; 3]))]);
-        assert_eq!(tangent, vec![array(Array::vector(vec![0.0_f64; 3]))]);
+        assert_eq!(primal, vec![array(Array::vector(vec![0.0_f64; 3]).unwrap())]);
+        assert_eq!(tangent, vec![array(Array::vector(vec![0.0_f64; 3]).unwrap())]);
 
         // Split program linearization stages the same extent read on the primal side and forces the shaped zero into
         // the tangent program, rather than folding it into an affine known tangent.
@@ -631,12 +634,15 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 3),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        assert_eq!(linearization.tangent().interpret(residuals), Ok(vec![array(Array::vector(vec![0.0_f64; 3]))]),);
+        assert_eq!(
+            linearization.tangent().interpret(residuals),
+            Ok(vec![array(Array::vector(vec![0.0_f64; 3]).unwrap())]),
+        );
 
         // A known symbolic predicate cannot select a branch during partial evaluation. Because the dynamic output
         // edge refers to the extent identity, the condition remains whole instead of fabricating an opposite-branch
@@ -753,14 +759,17 @@ mod tests {
         assert!(rendered.contains("zero_like"), "{rendered}");
         assert_eq!(
             jvp.interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 3),
-                array(Array::vector(vec![1.0, 2.0, 3.0])),
-                array(Array::vector(vec![10.0, 20.0, 30.0])),
-                array(Array::vector(vec![1.0, 1.0, 1.0])),
-                array(Array::vector(vec![5.0, 5.0, 5.0])),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+                array(Array::vector(vec![5.0, 5.0, 5.0]).unwrap()),
             ]),
-            Ok(vec![array(Array::vector(vec![11.0, 22.0, 33.0])), array(Array::vector(vec![1.0, 1.0, 1.0]))]),
+            Ok(vec![
+                array(Array::vector(vec![11.0, 22.0, 33.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())
+            ]),
         );
     }
 
@@ -842,15 +851,15 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
                 dimension(&extent_type, 3),
-                array(Array::vector(vec![1.0, 2.0, 3.0])),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(vec![2.0, 2.0, 2.0]))]));
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(vec![2.0, 2.0, 2.0]).unwrap())]));
     }
 
     #[test]
@@ -895,7 +904,7 @@ mod tests {
 
         /// Evaluates the unrolled recurrence eagerly, indexing `stack` in the requested iteration order.
         fn unrolled(stack: &ArrayReference<Array>, iterations: &[usize]) -> Result<Vec<TestValue>, ProgramError> {
-            let mut carry = Array::scalar(1.0f32);
+            let mut carry = Array::scalar(1.0f32).unwrap();
             for &iteration in iterations {
                 let element = stack.with_transform(ArrayReferenceView::Index {
                     axis: 0,
@@ -910,33 +919,33 @@ mod tests {
         // The body explicitly indexes the stacked reference on its leading axis, so the body
         // mutates the caller's referent in place exactly as the eager recurrence does, and the final carry observes
         // every updated slice.
-        let scanned_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
-        let unrolled_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let scanned_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let unrolled_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
         let outputs = scanned(ScanOperation::new(1, 3), 3)
-            .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(scanned_stack.clone())]);
-        assert_eq!(outputs, Ok(vec![array(Array::scalar(19.0f32))]));
+            .interpret(vec![array(Array::scalar(1.0f32).unwrap()), TestValue::Reference(scanned_stack.clone())]);
+        assert_eq!(outputs, Ok(vec![array(Array::scalar(19.0f32).unwrap())]));
         assert_eq!(unrolled(&unrolled_stack, &[0, 1, 2]), outputs);
-        assert_eq!(scanned_stack.read(), Ok(Array::vector(vec![2.0f32, 5.0, 11.0])));
+        assert_eq!(scanned_stack.read(), Ok(Array::vector(vec![2.0f32, 5.0, 11.0]).unwrap()));
         assert_eq!(unrolled_stack.read(), scanned_stack.read());
 
         // A reversed scan visits the slices from the last to the first.
-        let reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
-        let unrolled_reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
+        let unrolled_reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
         let outputs = scanned(ScanOperation::new(1, 3).with_reverse(true), 3)
-            .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(reversed_stack.clone())]);
-        assert_eq!(outputs, Ok(vec![array(Array::scalar(25.0f32))]));
+            .interpret(vec![array(Array::scalar(1.0f32).unwrap()), TestValue::Reference(reversed_stack.clone())]);
+        assert_eq!(outputs, Ok(vec![array(Array::scalar(25.0f32).unwrap())]));
         assert_eq!(unrolled(&unrolled_reversed_stack, &[2, 1, 0]), outputs);
-        assert_eq!(reversed_stack.read(), Ok(Array::vector(vec![13.0f32, 7.0, 4.0])));
+        assert_eq!(reversed_stack.read(), Ok(Array::vector(vec![13.0f32, 7.0, 4.0]).unwrap()));
         assert_eq!(unrolled_reversed_stack.read(), reversed_stack.read());
 
         // A zero-length scan runs no iteration, so the carry passes through and the referent is never touched.
-        let empty_stack = ArrayReference::new(Array::vector(Vec::<f32>::new()));
+        let empty_stack = ArrayReference::new(Array::vector(Vec::<f32>::new()).unwrap());
         assert_eq!(
             scanned(ScanOperation::new(1, 0), 0)
-                .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(empty_stack.clone())]),
-            Ok(vec![array(Array::scalar(1.0f32))]),
+                .interpret(vec![array(Array::scalar(1.0f32).unwrap()), TestValue::Reference(empty_stack.clone())]),
+            Ok(vec![array(Array::scalar(1.0f32).unwrap())]),
         );
-        assert_eq!(empty_stack.read(), Ok(Array::vector(Vec::<f32>::new())));
+        assert_eq!(empty_stack.read(), Ok(Array::vector(Vec::<f32>::new()).unwrap()));
     }
 
     #[test]
@@ -995,8 +1004,11 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]),
-            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0])), array(Array::vector(vec![2.0, 2.0, 2.0]))]),
+            pullback.interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]),
+            Ok(vec![
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+                array(Array::vector(vec![2.0, 2.0, 2.0]).unwrap())
+            ]),
         );
     }
 
@@ -1051,11 +1063,11 @@ mod tests {
         let outputs = jvp
             .interpret(vec![
                 dimension(&carry_extent_type, 4),
-                array(Array::scalar(1.0)),
-                array(Array::vector(vec![2.0, 3.0, 4.0])),
+                array(Array::scalar(1.0).unwrap()),
+                array(Array::vector(vec![2.0, 3.0, 4.0]).unwrap()),
                 dimension(&length_type, 3),
-                array(Array::scalar(5.0)),
-                array(Array::vector(vec![0.5, 1.0, 1.5])),
+                array(Array::scalar(5.0).unwrap()),
+                array(Array::vector(vec![0.5, 1.0, 1.5]).unwrap()),
             ])
             .unwrap();
         assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
@@ -1068,17 +1080,18 @@ mod tests {
             .primal()
             .interpret(vec![
                 dimension(&carry_extent_type, 4),
-                array(Array::scalar(1.0)),
-                array(Array::vector(vec![2.0, 3.0, 4.0])),
+                array(Array::scalar(1.0).unwrap()),
+                array(Array::vector(vec![2.0, 3.0, 4.0]).unwrap()),
                 dimension(&length_type, 3),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(3);
-        let mut pullback_inputs = vec![array(Array::scalar(1.0)), array(Array::vector(vec![0.0, 0.0, 0.0]))];
+        let mut pullback_inputs =
+            vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![0.0, 0.0, 0.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![array(Array::scalar(24.0)), array(Array::vector(vec![12.0, 8.0, 6.0]))]),
+            Ok(vec![array(Array::scalar(24.0).unwrap()), array(Array::vector(vec![12.0, 8.0, 6.0]).unwrap())]),
         );
     }
 
@@ -1116,7 +1129,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let one = body_builder.add_constant(array(Array::scalar(1_u64)));
+        let one = body_builder.add_constant(array(Array::scalar(1_u64).unwrap()));
         let next_counter = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -1154,12 +1167,16 @@ mod tests {
         assert!(rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![array(Array::scalar(2.0)), array(Array::scalar(1_u64))])
+            .interpret(vec![array(Array::scalar(2.0).unwrap()), array(Array::scalar(1_u64).unwrap())])
             .unwrap();
         let residuals = primal_outputs.split_off(3);
-        let mut pullback_inputs = vec![array(Array::scalar(1.0)), array(Array::vector(vec![0.0, 0.0]))];
+        let mut pullback_inputs =
+            vec![array(Array::scalar(1.0).unwrap()), array(Array::vector(vec![0.0, 0.0]).unwrap())];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]));
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(2.0).unwrap())])
+        );
     }
 
     fn doubling_while_regions(
@@ -1168,7 +1185,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         let state = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
-        let limit = condition_builder.add_constant(array(Array::scalar(8.0)));
+        let limit = condition_builder.add_constant(array(Array::scalar(8.0).unwrap()));
         let predicate = condition_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -1218,7 +1235,11 @@ mod tests {
         assert_eq!(jvp.input_count(), 3);
         assert_eq!(jvp.output_count(), 3);
         let outputs = jvp
-            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0)), array(Array::scalar(3.0))])
+            .interpret(vec![
+                dimension(&extent_type, 4),
+                array(Array::scalar(1.0).unwrap()),
+                array(Array::scalar(3.0).unwrap()),
+            ])
             .unwrap();
         assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
         assert!(matches!(&outputs[1], TestValue::Array(value) if value.to_f64s() == vec![8.0]));
@@ -1227,12 +1248,15 @@ mod tests {
         let linearization = program.linearize().unwrap();
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0))])
+            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0).unwrap())])
             .unwrap();
         let residuals = primal_outputs.split_off(2);
-        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(8.0))]),);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(8.0).unwrap())]),
+        );
     }
 
     #[test]
@@ -1241,7 +1265,7 @@ mod tests {
 
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
-        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
         let predicate = condition_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -1287,14 +1311,14 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         let mut primal_outputs =
-            linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]).unwrap();
-        assert_eq!(primal_outputs[0], array(Array::vector(vec![2.0, 4.0, 8.0])));
+            linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]).unwrap();
+        assert_eq!(primal_outputs[0], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
-        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]))]),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
         );
     }
 
@@ -1308,7 +1332,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
-        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0])));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
         let predicate = condition_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -1364,27 +1388,27 @@ mod tests {
         let outputs = jvp
             .interpret(vec![
                 dimension(&extent_type, 4),
-                array(Array::vector(vec![1.0, 1.0, 1.0])),
-                array(Array::vector(vec![1.0, 1.0, 1.0])),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
             ])
             .unwrap();
         assert_eq!(outputs[0], dimension(&extent_type, 4));
-        assert_eq!(outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0])));
-        assert_eq!(outputs[2], array(Array::vector(vec![2.0, 4.0, 8.0])));
+        assert_eq!(outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        assert_eq!(outputs[2], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
 
         let linearization = program.linearize().unwrap();
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![dimension(&extent_type, 4), array(Array::vector(vec![1.0, 1.0, 1.0]))])
+            .interpret(vec![dimension(&extent_type, 4), array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())])
             .unwrap();
         assert_eq!(primal_outputs[0], dimension(&extent_type, 4));
-        assert_eq!(primal_outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0])));
+        assert_eq!(primal_outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
         let residuals = primal_outputs.split_off(2);
-        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]))]),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
         );
     }
 
@@ -1398,7 +1422,7 @@ mod tests {
         condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let counter = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
-        let limit = condition_builder.add_constant(array(Array::scalar(2_i64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(2_i64).unwrap()));
         let predicate = condition_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -1423,7 +1447,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let one = body_builder.add_constant(array(Array::scalar(1_i64)));
+        let one = body_builder.add_constant(array(Array::scalar(1_i64).unwrap()));
         let next_counter = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -1469,16 +1493,16 @@ mod tests {
             .primal()
             .interpret(vec![
                 dimension(&extent_type, 3),
-                array(Array::vector(vec![1.0, 2.0, 3.0])),
-                array(Array::scalar(0_i64)),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                array(Array::scalar(0_i64).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(3);
-        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]),
+            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]),
         );
     }
 
@@ -1491,7 +1515,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         condition_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
         let counter = condition_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
-        let limit = condition_builder.add_constant(array(Array::scalar(3_u64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(3_u64).unwrap()));
         let predicate = condition_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -1531,7 +1555,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let one = body_builder.add_constant(array(Array::scalar(1_u64)));
+        let one = body_builder.add_constant(array(Array::scalar(1_u64).unwrap()));
         let next_counter = body_builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
@@ -1573,26 +1597,30 @@ mod tests {
         assert!(rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![array(Array::scalar(2.0)), array(Array::scalar(1_u64))])
+            .interpret(vec![array(Array::scalar(2.0).unwrap()), array(Array::scalar(1_u64).unwrap())])
             .unwrap();
         let residuals = primal_outputs.split_off(2);
-        let mut pullback_inputs = vec![array(Array::scalar(1.0))];
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
         pullback_inputs.extend(residuals);
-        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]));
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(2.0).unwrap())])
+        );
     }
 
     #[test]
     fn test_array_while_predicate() {
-        let predicate = Array::vector(vec![false, true]);
+        let predicate = Array::vector(vec![false, true]).unwrap();
         assert_eq!(predicate.any_true(), Ok(true));
-        assert_eq!(Array::vector(vec![false, false]).any_true(), Ok(false));
-        assert!(Array::vector(vec![1.0]).any_true().is_err());
+        assert_eq!(Array::vector(vec![false, false]).unwrap().any_true(), Ok(false));
+        assert!(Array::vector(vec![1.0]).unwrap().any_true().is_err());
         // Predicate item `i` masks the contiguous per-item block of operand elements it governs.
-        let on_true = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![1.0, 2.0, 3.0, 4.0]);
-        let on_false = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, -3.0, -4.0]);
+        let on_true = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let on_false =
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, -3.0, -4.0]).unwrap();
         assert_eq!(
             predicate.mask_select(&on_true, &on_false).unwrap(),
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, 3.0, 4.0]),
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, 3.0, 4.0]).unwrap(),
         );
 
         // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
@@ -1612,13 +1640,19 @@ mod tests {
 
         // Reference carries are selected wholesale by a scalar predicate: the handle itself is selected, never its
         // contents, so the selected carry aliases the chosen input.
-        let on_true = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let on_false = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
-        assert_eq!(ArrayIrValue::Array(Array::scalar(true)).mask_select(&on_true, &on_false), Ok(on_true.clone()));
-        assert_eq!(ArrayIrValue::Array(Array::scalar(false)).mask_select(&on_true, &on_false), Ok(on_false.clone()));
+        let on_true = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let on_false = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32).unwrap()));
+        assert_eq!(
+            ArrayIrValue::Array(Array::scalar(true).unwrap()).mask_select(&on_true, &on_false),
+            Ok(on_true.clone())
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::scalar(false).unwrap()).mask_select(&on_true, &on_false),
+            Ok(on_false.clone())
+        );
 
         // A batched predicate cannot mask a reference per item, so it accepts only identical carries.
-        let predicate = ArrayIrValue::Array(Array::vector(vec![false, true]));
+        let predicate = ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap());
         assert_eq!(predicate.mask_select(&on_true, &on_true), Ok(on_true.clone()));
         assert_eq!(
             predicate.mask_select(&on_true, &on_false),

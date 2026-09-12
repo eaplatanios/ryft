@@ -279,8 +279,8 @@ pub(crate) mod tests {
     fn test_validate_custom_derivative_replay() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = DifferentiationDual::new(
-            ArrayIrValue::Array(Array::scalar(3.0_f32)),
-            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()),
         )
         .unwrap();
         assert!(matches!(

@@ -36,7 +36,7 @@ mod tests {
         .unwrap();
 
         // Memory transfers re-place the array by updating the memory carried by its type.
-        let array = Array::vector(vec![1.0, 2.0]);
+        let array = Array::vector(vec![1.0, 2.0]).unwrap();
         let transferred = array.transfer_to_memory(Memory::Host { pinned: true });
         assert_eq!(transferred.r#type().memory(), Memory::Host { pinned: true });
         assert_eq!(transferred.r#type().into_owned().with_memory(Memory::Device), array.r#type().into_owned());
@@ -46,7 +46,8 @@ mod tests {
         let input = Array::from_f64s(
             ArrayType::new_static(DataType::F64, [2]).with_sharding(input_sharding).unwrap(),
             vec![1.0, 2.0],
-        );
+        )
+        .unwrap();
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         // The sharding-constraint hint is untracked, so constraining leaves the value (type included) unchanged.

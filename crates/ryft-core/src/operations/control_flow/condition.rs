@@ -1724,7 +1724,7 @@ mod tests {
 
         let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
-        let update = true_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        let update = true_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
         true_builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -1741,7 +1741,7 @@ mod tests {
 
         let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = false_builder.add_input(reference_type.into());
-        let replacement = false_builder.add_constant(ArrayIrValue::Array(Array::scalar(9.0_f32)));
+        let replacement = false_builder.add_constant(ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap()));
         let snapshot = false_builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
@@ -1801,7 +1801,7 @@ mod tests {
     fn boolean_branch() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_constant(Array::scalar(0.0));
+        let zero = builder.add_constant(Array::scalar(0.0).unwrap());
         let output = builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::GreaterThan),
@@ -1817,7 +1817,7 @@ mod tests {
     fn scalar_scale_branch(factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let factor = builder.add_constant(Array::scalar(factor));
+        let factor = builder.add_constant(Array::scalar(factor).unwrap());
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1826,7 +1826,7 @@ mod tests {
     fn vector_scale_branch(size: usize, factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)])));
-        let factor = builder.add_constant(Array::scalar(factor));
+        let factor = builder.add_constant(Array::scalar(factor).unwrap());
         let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1835,7 +1835,7 @@ mod tests {
     fn constant_vector_branch(values: Vec<f64>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(values.len())])));
-        let output = builder.add_constant(Array::vector(values));
+        let output = builder.add_constant(Array::vector(values).unwrap());
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1847,8 +1847,10 @@ mod tests {
         );
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
         let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
-        let predicate = ArrayBatch::new(Array::from_f64s(predicate_type, predicate_values), BatchAxis::new(0)).unwrap();
-        let operand = ArrayBatch::new(Array::from_f64s(batched_type, input_values), BatchAxis::new(0)).unwrap();
+        let predicate =
+            ArrayBatch::new(Array::from_f64s(predicate_type, predicate_values).unwrap(), BatchAxis::new(0)).unwrap();
+        let operand =
+            ArrayBatch::new(Array::from_f64s(batched_type, input_values).unwrap(), BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
         let mut outputs = context
             .bind(
@@ -1867,7 +1869,7 @@ mod tests {
         V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
         let context = input.dispatch_domain();
-        let zero = context.lift(Array::scalar(0.0))?;
+        let zero = context.lift(Array::scalar(0.0).unwrap())?;
         let mut predicates = context.bind(
             ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
             Vec::new(),
@@ -2002,12 +2004,12 @@ mod tests {
         // Eager binding interprets the predicate-selected branch through detached region access, and interpretation
         // without a predicate input is rejected.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let predicate = |value: f64| Array::from_f64s(predicate_type.clone(), vec![value]);
+        let predicate = |value: f64| Array::from_f64s(predicate_type.clone(), vec![value]).unwrap();
         let outputs = context
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(1.0), Array::scalar(4.0)],
+                &[predicate(1.0), Array::scalar(4.0).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![8.0]);
@@ -2015,7 +2017,7 @@ mod tests {
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(0.0), Array::scalar(4.0)],
+                &[predicate(0.0), Array::scalar(4.0).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0]);
@@ -2149,19 +2151,19 @@ mod tests {
             run_transposed_with_destinations(
                 &transposed,
                 vec![],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(true)]
+                vec![Array::scalar(5.0_f32).unwrap()],
+                vec![Array::scalar(true).unwrap()]
             ),
-            vec![Array::scalar(5.0_f32), Array::scalar(5.0_f32)],
+            vec![Array::scalar(5.0_f32).unwrap(), Array::scalar(5.0_f32).unwrap()],
         );
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
                 vec![],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(false)]
+                vec![Array::scalar(5.0_f32).unwrap()],
+                vec![Array::scalar(false).unwrap()]
             ),
-            vec![Array::scalar(5.0_f32), Array::scalar(0.0_f32)],
+            vec![Array::scalar(5.0_f32).unwrap(), Array::scalar(0.0_f32).unwrap()],
         );
     }
 
@@ -2227,11 +2229,11 @@ mod tests {
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
-                vec![Array::scalar(3.0_f32)],
+                vec![Array::scalar(3.0_f32).unwrap()],
                 vec![],
-                vec![Array::scalar(true)],
+                vec![Array::scalar(true).unwrap()],
             ),
-            vec![Array::scalar(3.0_f32)],
+            vec![Array::scalar(3.0_f32).unwrap()],
         );
 
         // Under a `Reference` destination the operand's state cotangent is live, so both branches receive the
@@ -2260,20 +2262,20 @@ mod tests {
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
-                vec![Array::scalar(3.0_f32)],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(true)],
+                vec![Array::scalar(3.0_f32).unwrap()],
+                vec![Array::scalar(5.0_f32).unwrap()],
+                vec![Array::scalar(true).unwrap()],
             ),
-            vec![Array::scalar(8.0_f32), Array::scalar(0.0_f32)],
+            vec![Array::scalar(8.0_f32).unwrap(), Array::scalar(0.0_f32).unwrap()],
         );
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
-                vec![Array::scalar(3.0_f32)],
-                vec![Array::scalar(5.0_f32)],
-                vec![Array::scalar(false)],
+                vec![Array::scalar(3.0_f32).unwrap()],
+                vec![Array::scalar(5.0_f32).unwrap()],
+                vec![Array::scalar(false).unwrap()],
             ),
-            vec![Array::scalar(8.0_f32), Array::scalar(5.0_f32)],
+            vec![Array::scalar(8.0_f32).unwrap(), Array::scalar(5.0_f32).unwrap()],
         );
     }
 
@@ -2328,8 +2330,12 @@ mod tests {
         let staged = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let inputs = vec![Array::scalar(5.0_f32).into(), Array::scalar(3.0_f32).into(), Array::scalar(true).into()];
-        let expected = vec![Array::scalar(11.0_f32).into()];
+        let inputs = vec![
+            Array::scalar(5.0_f32).unwrap().into(),
+            Array::scalar(3.0_f32).unwrap().into(),
+            Array::scalar(true).unwrap().into(),
+        ];
+        let expected = vec![Array::scalar(11.0_f32).unwrap().into()];
         assert_eq!(staged.interpret(inputs.clone()).unwrap(), expected);
         let discharged = staged.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
         assert_eq!(discharged.interpret(inputs).unwrap(), expected);
@@ -2431,7 +2437,7 @@ mod tests {
         // state it received, which is what keeps the two branch interfaces agreeing after the rewrite.
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
-        let replacement = true_builder.add_constant(TestValue::Array(Array::scalar(7.0f32)));
+        let replacement = true_builder.add_constant(TestValue::Array(Array::scalar(7.0f32).unwrap()));
         let snapshot = true_builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
@@ -2489,7 +2495,7 @@ mod tests {
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let first = true_builder.add_input(reference_type.clone().into());
         let second = true_builder.add_input(reference_type.clone().into());
-        let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
+        let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0f32).unwrap()));
         let snapshot =
             true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
         true_builder
@@ -2534,22 +2540,28 @@ mod tests {
         // The true branch reports the first root's state and accumulates into the second; the false branch reports the
         // second root's state and writes nothing, so its appended final state is the value that entered.
         let inputs = vec![
-            TestValue::Array(Array::scalar(true)),
-            TestValue::Array(Array::scalar(10.0f32)),
-            TestValue::Array(Array::scalar(20.0f32)),
+            TestValue::Array(Array::scalar(true).unwrap()),
+            TestValue::Array(Array::scalar(10.0f32).unwrap()),
+            TestValue::Array(Array::scalar(20.0f32).unwrap()),
         ];
         assert_eq!(
             discharged.program().interpret(inputs),
-            Ok(vec![TestValue::Array(Array::scalar(10.0f32)), TestValue::Array(Array::scalar(21.0f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(10.0f32).unwrap()),
+                TestValue::Array(Array::scalar(21.0f32).unwrap())
+            ]),
         );
         let inputs = vec![
-            TestValue::Array(Array::scalar(false)),
-            TestValue::Array(Array::scalar(10.0f32)),
-            TestValue::Array(Array::scalar(20.0f32)),
+            TestValue::Array(Array::scalar(false).unwrap()),
+            TestValue::Array(Array::scalar(10.0f32).unwrap()),
+            TestValue::Array(Array::scalar(20.0f32).unwrap()),
         ];
         assert_eq!(
             discharged.program().interpret(inputs),
-            Ok(vec![TestValue::Array(Array::scalar(20.0f32)), TestValue::Array(Array::scalar(20.0f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(20.0f32).unwrap()),
+                TestValue::Array(Array::scalar(20.0f32).unwrap())
+            ]),
         );
     }
 
@@ -2638,14 +2650,14 @@ mod tests {
         // Eager reference semantics stay the oracle on both sides of the rewrite.
         for (predicate, expected) in [(true, 13.0_f32), (false, 10.0)] {
             let inputs = vec![
-                TestValue::Array(Array::scalar(predicate)),
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(3.0)),
+                TestValue::Array(Array::scalar(predicate).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
             ];
             let outputs = vec![
-                TestValue::Array(Array::scalar::<f32>(3.0)),
-                TestValue::Array(Array::scalar::<f32>(expected)),
-                TestValue::Array(Array::scalar::<f32>(3.0)),
+                TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(expected).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
             ];
             assert_eq!(source.clone().interpret(inputs.clone()), Ok(outputs.clone()));
             assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
@@ -2774,11 +2786,14 @@ mod tests {
         );
 
         let inputs = vec![
-            TestValue::Array(Array::scalar(true)),
-            TestValue::Array(Array::scalar::<f32>(10.0)),
-            TestValue::Array(Array::scalar::<f32>(3.0)),
+            TestValue::Array(Array::scalar(true).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
         ];
-        let outputs = vec![TestValue::Array(Array::scalar::<f32>(3.0)), TestValue::Array(Array::scalar::<f32>(13.0))];
+        let outputs = vec![
+            TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(13.0).unwrap()),
+        ];
         assert_eq!(source.interpret(inputs.clone()), Ok(outputs.clone()));
         assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
     }
@@ -2905,21 +2920,27 @@ mod tests {
         // The true branch writes and then reads, so both the public snapshot and final state are the replacement.
         assert_eq!(
             discharged.program().interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(7.0))
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(7.0).unwrap())
             ]),
-            Ok(vec![TestValue::Array(Array::scalar::<f32>(7.0)), TestValue::Array(Array::scalar::<f32>(7.0))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar::<f32>(7.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(7.0).unwrap())
+            ]),
         );
 
         // The false branch only reads, so the entering state is both the snapshot and the final state.
         assert_eq!(
             discharged.program().interpret(vec![
-                TestValue::Array(Array::scalar(false)),
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(7.0))
+                TestValue::Array(Array::scalar(false).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(7.0).unwrap())
             ]),
-            Ok(vec![TestValue::Array(Array::scalar::<f32>(10.0)), TestValue::Array(Array::scalar::<f32>(10.0))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap())
+            ]),
         );
     }
 
@@ -2998,37 +3019,37 @@ mod tests {
         // The true branch swaps only the second allocation, leaving the first allocation's final state at its entering
         // value.
         let inputs = vec![
-            TestValue::Array(Array::scalar(true)),
-            TestValue::Array(Array::scalar::<f32>(10.0)),
-            TestValue::Array(Array::scalar::<f32>(20.0)),
-            TestValue::Array(Array::scalar::<f32>(11.0)),
-            TestValue::Array(Array::scalar::<f32>(22.0)),
+            TestValue::Array(Array::scalar(true).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(11.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(22.0).unwrap()),
         ];
         assert_eq!(
             discharged.program().interpret(inputs),
             Ok(vec![
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(20.0)),
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(22.0))
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(22.0).unwrap())
             ]),
         );
 
         // The false branch swaps only the first allocation, which mirrors the same contract on the other position.
         let inputs = vec![
-            TestValue::Array(Array::scalar(false)),
-            TestValue::Array(Array::scalar::<f32>(10.0)),
-            TestValue::Array(Array::scalar::<f32>(20.0)),
-            TestValue::Array(Array::scalar::<f32>(11.0)),
-            TestValue::Array(Array::scalar::<f32>(22.0)),
+            TestValue::Array(Array::scalar(false).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(11.0).unwrap()),
+            TestValue::Array(Array::scalar::<f32>(22.0).unwrap()),
         ];
         assert_eq!(
             discharged.program().interpret(inputs),
             Ok(vec![
-                TestValue::Array(Array::scalar::<f32>(10.0)),
-                TestValue::Array(Array::scalar::<f32>(20.0)),
-                TestValue::Array(Array::scalar::<f32>(11.0)),
-                TestValue::Array(Array::scalar::<f32>(20.0))
+                TestValue::Array(Array::scalar::<f32>(10.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(20.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(11.0).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(20.0).unwrap())
             ]),
         );
     }
@@ -3042,7 +3063,7 @@ mod tests {
         let branch = |amount: f32| {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = builder.add_input(reference_type.clone().into());
-            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(amount)));
+            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(amount).unwrap()));
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
@@ -3103,10 +3124,25 @@ mod tests {
                 in (%4, %3)"},
         );
         for (predicate, expected) in [
-            (true, vec![TestValue::Array(Array::scalar::<f32>(6.0)), TestValue::Array(Array::scalar::<f32>(3.0))]),
-            (false, vec![TestValue::Array(Array::scalar::<f32>(24.0)), TestValue::Array(Array::scalar::<f32>(12.0))]),
+            (
+                true,
+                vec![
+                    TestValue::Array(Array::scalar::<f32>(6.0).unwrap()),
+                    TestValue::Array(Array::scalar::<f32>(3.0).unwrap()),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    TestValue::Array(Array::scalar::<f32>(24.0).unwrap()),
+                    TestValue::Array(Array::scalar::<f32>(12.0).unwrap()),
+                ],
+            ),
         ] {
-            let inputs = vec![TestValue::Array(Array::scalar(predicate)), TestValue::Array(Array::scalar::<f32>(2.0))];
+            let inputs = vec![
+                TestValue::Array(Array::scalar(predicate).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(2.0).unwrap()),
+            ];
             assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
             assert_eq!(discharged.program().interpret(inputs), Ok(expected));
         }
@@ -3209,16 +3245,18 @@ mod tests {
         assert!(!discharged.external_reference_bindings()[0].is_mutated());
         assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
         assert_eq!(
-            discharged
-                .program()
-                .interpret(vec![TestValue::Array(Array::scalar(true)), TestValue::Array(Array::scalar::<f32>(4.0))]),
-            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0))])
+            discharged.program().interpret(vec![
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(4.0).unwrap())
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0).unwrap())])
         );
         assert_eq!(
-            discharged
-                .program()
-                .interpret(vec![TestValue::Array(Array::scalar(false)), TestValue::Array(Array::scalar::<f32>(4.0))]),
-            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0))])
+            discharged.program().interpret(vec![
+                TestValue::Array(Array::scalar(false).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(4.0).unwrap())
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0).unwrap())])
         );
     }
 
@@ -3248,7 +3286,7 @@ mod tests {
         let program = builder
             .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let reference = ArrayReference::new(Array::scalar(4.0f32));
+        let reference = ArrayReference::new(Array::scalar(4.0f32).unwrap());
         let closed = ClosedProgram::new(program, vec![ArrayIrValue::Reference(reference)]).unwrap();
 
         let discharged = closed.discharge_references().unwrap();
@@ -3272,7 +3310,7 @@ mod tests {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
-        let update = true_builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0)));
+        let update = true_builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0).unwrap()));
         true_builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -3285,7 +3323,7 @@ mod tests {
 
         let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = false_builder.add_input(reference_type.clone().into());
-        let replacement = false_builder.add_constant(TestValue::Array(Array::scalar::<f32>(9.0)));
+        let replacement = false_builder.add_constant(TestValue::Array(Array::scalar::<f32>(9.0).unwrap()));
         let snapshot = false_builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
@@ -3319,10 +3357,25 @@ mod tests {
         let discharged = source.clone().discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings(), &[]);
         for (predicate, expected) in [
-            (true, vec![TestValue::Array(Array::scalar::<f32>(5.0)), TestValue::Array(Array::scalar::<f32>(5.0))]),
-            (false, vec![TestValue::Array(Array::scalar::<f32>(4.0)), TestValue::Array(Array::scalar::<f32>(9.0))]),
+            (
+                true,
+                vec![
+                    TestValue::Array(Array::scalar::<f32>(5.0).unwrap()),
+                    TestValue::Array(Array::scalar::<f32>(5.0).unwrap()),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    TestValue::Array(Array::scalar::<f32>(4.0).unwrap()),
+                    TestValue::Array(Array::scalar::<f32>(9.0).unwrap()),
+                ],
+            ),
         ] {
-            let inputs = vec![TestValue::Array(Array::scalar(predicate)), TestValue::Array(Array::scalar::<f32>(4.0))];
+            let inputs = vec![
+                TestValue::Array(Array::scalar(predicate).unwrap()),
+                TestValue::Array(Array::scalar::<f32>(4.0).unwrap()),
+            ];
             let eager = source.clone().interpret(inputs.clone()).unwrap();
             assert_eq!(eager, expected);
             assert_eq!(discharged.program().interpret(inputs), Ok(eager));
@@ -3339,7 +3392,7 @@ mod tests {
             let view = builder
                 .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
                 .unwrap()[0];
-            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0)));
+            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0).unwrap()));
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update], None)
                 .unwrap();
@@ -3376,27 +3429,31 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let true_inputs =
-            vec![TestValue::Array(Array::scalar(true)), TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))];
-        let false_inputs =
-            vec![TestValue::Array(Array::scalar(false)), TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))];
+        let true_inputs = vec![
+            TestValue::Array(Array::scalar(true).unwrap()),
+            TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]).unwrap()),
+        ];
+        let false_inputs = vec![
+            TestValue::Array(Array::scalar(false).unwrap()),
+            TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]).unwrap()),
+        ];
         assert_eq!(
             source.clone().interpret(true_inputs.clone()),
-            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]))])
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]).unwrap())])
         );
         assert_eq!(
             source.clone().interpret(false_inputs.clone()),
-            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))])
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]).unwrap())])
         );
 
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().interpret(true_inputs),
-            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]))])
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]).unwrap())])
         );
         assert_eq!(
             discharged.program().interpret(false_inputs),
-            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))])
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]).unwrap())])
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -3437,7 +3494,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
             builder.add_instruction(PrintOperation::new(label), Vec::new(), vec![input], None).unwrap();
-            let output = builder.add_constant(Array::scalar(1.0));
+            let output = builder.add_constant(Array::scalar(1.0).unwrap());
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let true_branch = branch("true");
@@ -3565,7 +3622,7 @@ mod tests {
         let divide_branch = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
-            let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]));
+            let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]).unwrap());
             let output = builder
                 .add_instruction(ArrayOperation::Div(DivOperation::new()), Vec::new(), vec![one, input], None)
                 .unwrap()[0];
@@ -3597,7 +3654,7 @@ mod tests {
         // back to residualizing the conditional whole.
         let knowledge = vec![
             PartialValue::Unknown(predicate_type),
-            PartialValue::Known(Array::from_f64s(operand_type.clone(), vec![0.0])),
+            PartialValue::Known(Array::from_f64s(operand_type.clone(), vec![0.0]).unwrap()),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
         assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
@@ -3609,7 +3666,9 @@ mod tests {
             .inputs
             .iter()
             .map(|input| match input {
-                PartialEvaluationInput::Unknown(_) => Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]),
+                PartialEvaluationInput::Unknown(_) => {
+                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap()
+                }
                 PartialEvaluationInput::Known(value) => value.clone(),
             })
             .collect::<Vec<_>>();
@@ -3631,7 +3690,7 @@ mod tests {
                     .with_sharding(batched_sharding)
                     .unwrap();
             let operand = ArrayBatch::new(
-                Array::from_f64s(batched_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                Array::from_f64s(batched_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
                 BatchAxis::new(0),
             )
             .unwrap();
@@ -3641,7 +3700,8 @@ mod tests {
                     .unwrap();
             let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let predicate = ArrayBatch::replicated(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+            let predicate =
+                ArrayBatch::replicated(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap());
 
             let outputs = context
                 .bind(
@@ -3702,9 +3762,9 @@ mod tests {
             .filter(|instruction| instruction.operation().name() == "condition")
             .count();
         assert_eq!(condition_count, 1, "{program}");
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]).unwrap();
         assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
         assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![3.0, 12.0, 27.0]);
     }
@@ -3712,9 +3772,9 @@ mod tests {
     #[test]
     fn test_condition_batching_reuses_naturally_aligned_branch_programs() {
         let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let operand_values = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
+        let operand_values = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 
         // Both branches scale the batched operand per batch item, so both discover axis 0 and the joined layout equals
         // each branch's discovered layout: the rule batches each branch exactly once.
@@ -3820,7 +3880,7 @@ mod tests {
         // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
         let mut constant_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         constant_builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant_output = constant_builder.add_constant(Array::scalar(7.0));
+        let constant_output = constant_builder.add_constant(Array::scalar(7.0).unwrap());
         let constant_branch = constant_builder
             .build::<Vec<Array>, Vec<Array>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3855,9 +3915,9 @@ mod tests {
             .unwrap();
         let rendered = program.to_string();
         assert!(rendered.contains("broadcast"), "{rendered}");
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]).unwrap();
         assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
         assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![7.0, 7.0, 7.0]);
     }
@@ -3873,7 +3933,7 @@ mod tests {
                 )?;
                 Ok(outputs.into_iter().next().unwrap())
             },
-            (Array::vector(vec![true, false, true]), Array::vector(vec![1.0, 4.0, 9.0])),
+            (Array::vector(vec![true, false, true]).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]).unwrap()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
@@ -3904,8 +3964,9 @@ mod tests {
         let batch_size = 2;
         let item_size = 3;
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
-        let predicate = ArrayBatch::new(Array::from_f64s(predicate_type, vec![1.0, 0.0]), BatchAxis::new(0)).unwrap();
-        let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let predicate =
+            ArrayBatch::new(Array::from_f64s(predicate_type, vec![1.0, 0.0]).unwrap(), BatchAxis::new(0)).unwrap();
+        let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let operand = ArrayBatch::new(operand, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
 
@@ -3943,7 +4004,7 @@ mod tests {
                 )?;
                 Ok(outputs.into_iter().next().unwrap())
             },
-            (Array::vector(vec![true, false]), Array::vector(vec![1.0, 2.0])),
+            (Array::vector(vec![true, false]).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
@@ -4099,13 +4160,13 @@ mod tests {
         for (predicate, expected) in [(true, vec![2.0_f32, 4.0]), (false, vec![1.0_f32, 2.0])] {
             let inputs = vec![
                 TestValue::Dimension(axis_extent.clone()),
-                TestValue::Array(Array::scalar(predicate)),
-                TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+                TestValue::Array(Array::scalar(predicate).unwrap()),
+                TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
             ];
             let expected = vec![
                 TestValue::Dimension(axis_extent.clone()),
-                TestValue::Array(Array::vector(expected.clone())),
-                TestValue::Array(Array::vector(expected)),
+                TestValue::Array(Array::vector(expected.clone()).unwrap()),
+                TestValue::Array(Array::vector(expected).unwrap()),
             ];
             assert_eq!(discharged.interpret(inputs), Ok(expected));
         }
@@ -4131,7 +4192,7 @@ mod tests {
             Parent::new(),
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let error = context
             .bind(
                 TestOperation::Condition(ConditionOperation::new()),
@@ -4139,8 +4200,11 @@ mod tests {
                 &[
                     BatchingTracer::new(
                         context.clone(),
-                        ArrayIrBatch::new(TestValue::Array(Array::vector(vec![true, false])), BatchAxis::new(0))
-                            .unwrap(),
+                        ArrayIrBatch::new(
+                            TestValue::Array(Array::vector(vec![true, false]).unwrap()),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
                     ),
                     BatchingTracer::new(
                         context.clone(),
@@ -4191,7 +4255,7 @@ mod tests {
             Parent::new(),
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let outputs = context
             .bind(
                 TestOperation::Condition(ConditionOperation::new()),
@@ -4199,8 +4263,11 @@ mod tests {
                 &[
                     BatchingTracer::new(
                         context.clone(),
-                        ArrayIrBatch::new(TestValue::Array(Array::vector(vec![true, false])), BatchAxis::new(0))
-                            .unwrap(),
+                        ArrayIrBatch::new(
+                            TestValue::Array(Array::vector(vec![true, false]).unwrap()),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
                     ),
                     BatchingTracer::new(
                         context.clone(),
@@ -4208,8 +4275,11 @@ mod tests {
                     ),
                     BatchingTracer::new(
                         context.clone(),
-                        ArrayIrBatch::new(TestValue::Array(Array::vector(vec![3.0_f32, 4.0])), BatchAxis::new(0))
-                            .unwrap(),
+                        ArrayIrBatch::new(
+                            TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
                     ),
                 ],
             )
@@ -4218,8 +4288,8 @@ mod tests {
         assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].batch().value(), &TestValue::Reference(reference.clone()));
         assert_eq!(outputs[1].batch().batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[1].batch().value(), &TestValue::Array(Array::vector(vec![6.0_f32, 4.0])));
-        assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(outputs[1].batch().value(), &TestValue::Array(Array::vector(vec![6.0_f32, 4.0]).unwrap()));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
     }
 
     #[test]
@@ -4227,12 +4297,12 @@ mod tests {
         for (predicate, expected_value, expected_tangent) in
             [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
         {
-            let (value, pushforward) = differentiate_at(Array::scalar(0.7))
+            let (value, pushforward) = differentiate_at(Array::scalar(0.7).unwrap())
                 .linearize(move |input| {
-                    let predicate = input.context().lift(Array::from_f64s(
-                        ArrayType::scalar(DataType::Boolean),
-                        vec![if predicate { 1.0 } else { 0.0 }],
-                    ))?;
+                    let predicate = input.context().lift(
+                        Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![if predicate { 1.0 } else { 0.0 }])
+                            .unwrap(),
+                    )?;
                     let mut outputs = input.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
                         vec![
@@ -4244,8 +4314,8 @@ mod tests {
                     Ok(outputs.remove(0))
                 })
                 .unwrap();
-            assert_eq!(value, Array::scalar(expected_value));
-            assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
+            assert_eq!(value, Array::scalar(expected_value).unwrap());
+            assert_eq!(pushforward.apply(Array::scalar(1.5).unwrap()), Ok(Array::scalar(expected_tangent).unwrap()));
         }
     }
 
@@ -4280,14 +4350,14 @@ mod tests {
             batched
                 .interpret(vec![
                     ArrayIrValue::Dimension(axis_extent.clone()),
-                    ArrayIrValue::Array(Array::vector(vec![true, false])),
-                    ArrayIrValue::Array(Array::vector(vec![4.0_f32, 7.0])),
+                    ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![4.0_f32, 7.0]).unwrap()),
                 ])
                 .unwrap(),
             vec![
                 ArrayIrValue::Dimension(axis_extent),
-                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 7.0])),
-                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 9.0])),
+                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 7.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![5.0_f32, 9.0]).unwrap()),
             ],
         );
     }
@@ -4352,12 +4422,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             runnable.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(3.0_f32)),
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Array(Array::scalar(2.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(3.0_f32).unwrap()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(7.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(3.0_f32).unwrap())
+            ]),
         );
 
         // With the reference active the branches receive its tangent reference too (`[x, r, ẋ, ṛ]`) and the read's
@@ -4383,13 +4456,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             runnable.interpret(vec![
-                TestValue::Array(Array::scalar(false)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(3.0_f32)),
-                TestValue::Array(Array::scalar(0.5_f32)),
+                TestValue::Array(Array::scalar(false).unwrap()),
+                TestValue::Array(Array::scalar(2.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(3.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(0.5_f32).unwrap()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.5_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(7.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(3.5_f32).unwrap())
+            ]),
         );
     }
 
@@ -4432,10 +4508,13 @@ mod tests {
         assert_eq!(inactive_jvp.output_ids().len(), 2);
         assert_eq!(
             inactive_jvp.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32).unwrap())),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.0_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(0.0_f32).unwrap())
+            ]),
         );
 
         // An active reference is forwarded together with its tangent reference, and the read pairs them back up. The
@@ -4458,11 +4537,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             runnable.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(0.5_f32)),
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(0.5_f32).unwrap()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.5_f32))]),
+            Ok(vec![
+                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestValue::Array(Array::scalar(0.5_f32).unwrap())
+            ]),
         );
     }
 
@@ -4494,57 +4576,75 @@ mod tests {
         }
 
         // The true branch accumulates the input, so both public outputs remain differentiable.
-        let predicate = ArrayIrValue::Array(Array::scalar(true));
-        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        let predicate = ArrayIrValue::Array(Array::scalar(true).unwrap());
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap());
         assert_eq!(
-            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            jvp.interpret(vec![
+                predicate.clone(),
+                initial.clone(),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap())
+            ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::scalar(5.0_f32)),
-                ArrayIrValue::Array(Array::scalar(5.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
             ]),
         );
         let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
         assert_eq!(
             primal_outputs[..2],
-            [ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(5.0_f32))],
+            [
+                ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap())
+            ],
         );
-        let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        let mut pullback_inputs = vec![
+            ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ];
         pullback_inputs.extend_from_slice(&primal_outputs[2..]);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32))]));
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32).unwrap())]));
 
         // The false branch replaces the state with a constant, so the frozen output has zero tangent and contributes
         // no cotangent to the input.
-        let predicate = ArrayIrValue::Array(Array::scalar(false));
-        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        let predicate = ArrayIrValue::Array(Array::scalar(false).unwrap());
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap());
         assert_eq!(
-            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            jvp.interpret(vec![
+                predicate.clone(),
+                initial.clone(),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap())
+            ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::scalar(4.0_f32)),
-                ArrayIrValue::Array(Array::scalar(9.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-                ArrayIrValue::Array(Array::scalar(0.0_f32)),
+                ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(0.0_f32).unwrap()),
             ]),
         );
         let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
         assert_eq!(
             primal_outputs[..2],
-            [ArrayIrValue::Array(Array::scalar(4.0_f32)), ArrayIrValue::Array(Array::scalar(9.0_f32))],
+            [
+                ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap())
+            ],
         );
-        let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        let mut pullback_inputs = vec![
+            ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+            ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap()),
+        ];
         pullback_inputs.extend_from_slice(&primal_outputs[2..]);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f32))]));
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap())]));
     }
 
     #[test]
     fn test_condition_jvp_preserves_zero_space_output_tangents() {
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0))
-            .jvp(Array::scalar(3.0), |input| {
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
+            .jvp(Array::scalar(3.0).unwrap(), |input| {
                 let predicate =
-                    input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                    input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap())?;
                 let mut outputs = input.context().bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![boolean_branch(), boolean_branch()],
@@ -4553,7 +4653,7 @@ mod tests {
                 Ok(outputs.remove(0))
             })
             .unwrap();
-        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap());
         assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
     }
 
@@ -4562,22 +4662,22 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         let forward = context
-            .differentiate_at(Array::scalar(4.0))
+            .differentiate_at(Array::scalar(4.0).unwrap())
             .jacobian_forward(stage_runtime_predicate_condition)
             .unwrap();
         let reverse = context
-            .differentiate_at(Array::scalar(4.0))
+            .differentiate_at(Array::scalar(4.0).unwrap())
             .jacobian_reverse(stage_runtime_predicate_condition)
             .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
         assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
 
         let forward = context
-            .differentiate_at(Array::scalar(-4.0))
+            .differentiate_at(Array::scalar(-4.0).unwrap())
             .jacobian_forward(stage_runtime_predicate_condition)
             .unwrap();
         let reverse = context
-            .differentiate_at(Array::scalar(-4.0))
+            .differentiate_at(Array::scalar(-4.0).unwrap())
             .jacobian_reverse(stage_runtime_predicate_condition)
             .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
@@ -4600,11 +4700,14 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]), Array::scalar(4.0)),
+                (
+                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap(),
+                    Array::scalar(4.0).unwrap(),
+                ),
                 (),
             )
             .unwrap();
-        let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
+        let cotangents = pullback.apply(Array::scalar(5.0).unwrap()).unwrap();
         assert_eq!(output.to_f64s(), vec![8.0]);
         assert!(cotangents.0.storage_bytes().is_empty());
         assert_eq!(cotangents.1.to_f64s(), vec![10.0]);
@@ -4619,11 +4722,14 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]), Array::scalar(4.0)),
+                (
+                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap(),
+                    Array::scalar(4.0).unwrap(),
+                ),
                 (),
             )
             .unwrap();
-        let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
+        let cotangents = pullback.apply(Array::scalar(5.0).unwrap()).unwrap();
         assert_eq!(output.to_f64s(), vec![12.0]);
         assert!(cotangents.0.storage_bytes().is_empty());
         assert_eq!(cotangents.1.to_f64s(), vec![15.0]);
@@ -4651,7 +4757,7 @@ mod tests {
         ) -> Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let factor = builder.add_constant(Array::scalar(factor));
+            let factor = builder.add_constant(Array::scalar(factor).unwrap());
             let mut value =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
             for _ in 1..operation_count {

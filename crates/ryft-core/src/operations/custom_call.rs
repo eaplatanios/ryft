@@ -2744,7 +2744,7 @@ mod tests {
             &operation,
             &EagerContext::new(),
             &EmptyRegionDriver,
-            &[Array::vector(vec![1.0, 2.0])],
+            &[Array::vector(vec![1.0, 2.0]).unwrap()],
         );
         assert!(matches!(
             result,
@@ -2764,8 +2764,8 @@ mod tests {
             vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "rhs".to_string(), axis: 0 }],
         );
         let active = vec![
-            ("lhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32), length.clone(), Vec::new())),
-            ("rhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32), length.clone(), Vec::new())),
+            ("lhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32).unwrap(), length.clone(), Vec::new())),
+            ("rhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32).unwrap(), length.clone(), Vec::new())),
         ];
         assert!(contract.consumed_dimensions(active.as_slice()).is_empty());
 
@@ -3001,9 +3001,9 @@ mod tests {
     #[test]
     fn test_custom_call_batch_rejects_ragged_operands_before_binding() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         let operation = CustomCallOperation::new("ryft.test.side_effect", vec![vector_type()])
             .with_batching(CustomCallBatching::BroadcastAll)
@@ -3637,7 +3637,7 @@ mod tests {
         );
         let inputs = [
             ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
-            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32))),
+            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32).unwrap())),
         ];
         assert!(matches!(
             operation.batch_in_parent(&context, &EmptyRegionDriver, &inputs),
@@ -3929,7 +3929,7 @@ mod tests {
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let mapped = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()),
             BatchAxis::new(0),
         )
         .unwrap();

@@ -525,19 +525,23 @@ mod tests {
         let lhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let rhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
             (1..=12).map(|value| value as f64).collect(),
-        );
+        )
+        .unwrap();
         let lhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
             vec![1.0, 2.0, 0.5, 1.0],
-        );
+        )
+        .unwrap();
         let rhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
-        );
+        )
+        .unwrap();
         let product = lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)).unwrap();
         assert_eq!(
             product.r#type().as_ref(),
@@ -616,19 +620,23 @@ mod tests {
         let lhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into(), 6.into()])),
             vec![1.0; 48],
-        );
+        )
+        .unwrap();
         let rhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 4.into(), 6.into(), 3.into()])),
             vec![1.0; 72],
-        );
+        )
+        .unwrap();
         let lhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 2.into()])),
             vec![1.0; 8],
-        );
+        )
+        .unwrap();
         let rhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 3.into()])),
             vec![1.0; 12],
-        );
+        )
+        .unwrap();
         let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
         let output = lhs
             .scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
@@ -640,19 +648,23 @@ mod tests {
         let lhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 4.into()])),
             vec![1.0; 4],
-        );
+        )
+        .unwrap();
         let rhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into()])),
             vec![1.0; 8],
-        );
+        )
+        .unwrap();
         let lhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 2.into()])),
             vec![1.0; 2],
-        );
+        )
+        .unwrap();
         let rhs_scale = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into()])),
             vec![1.0; 4],
-        );
+        )
+        .unwrap();
         let output = lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, None).unwrap();
         assert_eq!(output.r#type().data_type(), DataType::F32);
         assert_eq!(output.r#type().shape(), &Shape::new(vec![1.into(), 1.into(), 2.into()]));
@@ -663,7 +675,8 @@ mod tests {
         let independently_scaled_rhs = Array::from_f64s(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 1.into()])),
             vec![1.0; 2],
-        );
+        )
+        .unwrap();
         let output = lhs.scaled_matmul(&rhs, &lhs_scale, &independently_scaled_rhs, None).unwrap();
         assert_eq!(output.to_f64s(), vec![4.0; 2]);
     }
@@ -674,10 +687,12 @@ mod tests {
         // operands follow the same rule, so each example retains its own block scales.
         let elements = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 4.into()]));
         let scales = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
-        let lhs = ArrayBatch::new(Array::from_f64s(elements.clone(), vec![1.0; 8]), BatchAxis::new(0)).unwrap();
-        let rhs = ArrayBatch::new(Array::from_f64s(elements, vec![1.0; 8]), BatchAxis::new(0)).unwrap();
-        let lhs_scale = ArrayBatch::new(Array::from_f64s(scales.clone(), vec![1.0; 4]), BatchAxis::new(0)).unwrap();
-        let rhs_scale = ArrayBatch::new(Array::from_f64s(scales, vec![1.0; 4]), BatchAxis::new(0)).unwrap();
+        let lhs =
+            ArrayBatch::new(Array::from_f64s(elements.clone(), vec![1.0; 8]).unwrap(), BatchAxis::new(0)).unwrap();
+        let rhs = ArrayBatch::new(Array::from_f64s(elements, vec![1.0; 8]).unwrap(), BatchAxis::new(0)).unwrap();
+        let lhs_scale =
+            ArrayBatch::new(Array::from_f64s(scales.clone(), vec![1.0; 4]).unwrap(), BatchAxis::new(0)).unwrap();
+        let rhs_scale = ArrayBatch::new(Array::from_f64s(scales, vec![1.0; 4]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, true);
 
         let outputs = operation

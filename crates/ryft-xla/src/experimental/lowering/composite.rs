@@ -325,10 +325,10 @@ where
         ArrayIrOperation::Zero(operation) => {
             lower_dynamic_constructor(operation.name(), 0, input_values, output_types, block, context, location)
         }
-        ArrayIrOperation::DynamicOne(operation) => {
+        ArrayIrOperation::One(operation) => {
             lower_dynamic_constructor(operation.name(), 1, input_values, output_types, block, context, location)
         }
-        ArrayIrOperation::DynamicIota(operation) => {
+        ArrayIrOperation::Iota(operation) => {
             let (output_type, physical_type) =
                 dynamic_constructor_types(operation.name(), input_values.len(), output_types)?;
             let tensor_type = lower_tensor_type(&physical_type, context, location)?;

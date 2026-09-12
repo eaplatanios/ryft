@@ -139,10 +139,10 @@ mod tests {
 
     #[test]
     fn test_array_ir_reshape_partial_evaluation() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let output = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let output = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let input_type = input.r#type().into_owned();
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -169,7 +169,7 @@ mod tests {
             ],
         );
 
-        let identity_input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let identity_input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let identity_input_type = identity_input.r#type().into_owned();
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -207,19 +207,21 @@ mod tests {
         assert_eq!(jvp.input_types().len(), 2);
         assert_eq!(
             jvp.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
-                ArrayIrValue::Array(Array::vector(vec![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0])),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap()),
             ]),
         );
 
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
-            pullback.interpret(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],))]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]))]),
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]).unwrap())]),
         );
 
         // The inverse cannot recover `n` from the `[2, 2*n]` output shape without division. The reshape JVP must
@@ -281,12 +283,12 @@ mod tests {
             let tangent_values = (element_count..2 * element_count).map(|value| value as f64).collect::<Vec<_>>();
             assert_eq!(
                 jvp.interpret(vec![
-                    ArrayIrValue::Array(Array::matrix(size, 4, primal_values.clone())),
-                    ArrayIrValue::Array(Array::matrix(size, 4, tangent_values.clone())),
+                    ArrayIrValue::Array(Array::matrix(size, 4, primal_values.clone()).unwrap()),
+                    ArrayIrValue::Array(Array::matrix(size, 4, tangent_values.clone()).unwrap()),
                 ]),
                 Ok(vec![
-                    ArrayIrValue::Array(Array::matrix(2, 2 * size, primal_values)),
-                    ArrayIrValue::Array(Array::matrix(2, 2 * size, tangent_values)),
+                    ArrayIrValue::Array(Array::matrix(2, 2 * size, primal_values).unwrap()),
+                    ArrayIrValue::Array(Array::matrix(2, 2 * size, tangent_values).unwrap()),
                 ]),
             );
         }
@@ -341,18 +343,20 @@ in (%4)
         );
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect()))])
+            .interpret(vec![ArrayIrValue::Array(
+                Array::matrix(3, 4, (0..12).map(|value| value as f64).collect()).unwrap(),
+            )])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
         assert_eq!(residuals.len(), linearization.residual_count());
         assert_eq!(residuals.len(), 2);
 
         let tangent_values = (12..24).map(|value| value as f64).collect::<Vec<_>>();
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs.clone()),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 6, tangent_values))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 6, tangent_values).unwrap())]),
         );
 
         // The executable linear boundary remains structural when imported, including both attached regions and every
@@ -382,24 +386,25 @@ in (%4)
 
         let nested_jvp = linearization.tangent().jvp().unwrap();
         let mut nested_inputs =
-            vec![ArrayIrValue::Array(Array::matrix(3, 4, (12..24).map(|value| value as f64).collect()))];
+            vec![ArrayIrValue::Array(Array::matrix(3, 4, (12..24).map(|value| value as f64).collect()).unwrap())];
         nested_inputs.extend(residuals.clone());
-        nested_inputs.push(ArrayIrValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect())));
+        nested_inputs
+            .push(ArrayIrValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect()).unwrap()));
         assert_eq!(nested_jvp.input_ids().len(), 2 + residuals.len());
         assert_eq!(
             nested_jvp.interpret(nested_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::matrix(2, 6, (12..24).map(|value| value as f64).collect(),)),
-                ArrayIrValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect(),)),
+                ArrayIrValue::Array(Array::matrix(2, 6, (12..24).map(|value| value as f64).collect(),).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect(),).unwrap()),
             ]),
         );
 
         let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect()))];
+            vec![ArrayIrValue::Array(Array::matrix(2, 6, (24..36).map(|value| value as f64).collect()).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect(),))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, (24..36).map(|value| value as f64).collect(),).unwrap())]),
         );
 
         // A matching explicit output-extent operand is already the authoritative SSA value for the source axis, so
@@ -503,42 +508,43 @@ in (%4)
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::matrix(3, 4, primal_values.clone())),
-                ArrayIrValue::Array(Array::scalar(12_i32)),
+                ArrayIrValue::Array(Array::matrix(3, 4, primal_values.clone()).unwrap()),
+                ArrayIrValue::Array(Array::scalar(12_i32).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        assert_eq!(primal_outputs, vec![ArrayIrValue::Array(Array::vector(primal_values))]);
+        assert_eq!(primal_outputs, vec![ArrayIrValue::Array(Array::vector(primal_values).unwrap())]);
         assert_eq!(residuals.len(), 2);
 
         let tangent_values = (12..24).map(|value| value as f64).collect::<Vec<_>>();
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(tangent_values.clone()))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(tangent_values.clone()).unwrap())]),
         );
 
         let cotangent_values = (24..36).map(|value| value as f64).collect::<Vec<_>>();
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(cotangent_values.clone()))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(cotangent_values.clone()).unwrap())];
         pullback_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, cotangent_values))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, cotangent_values).unwrap())]),
         );
 
         // Nested forward differentiation of the linear program treats only the array input as differentiable, so the
         // two residual dimensions pass through the second-order boundary unchanged rather than acquiring tangents.
         let nested_jvp = linearization.tangent().jvp().unwrap();
         assert_eq!(nested_jvp.input_ids().len(), 2 + residuals.len());
-        let mut nested_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        let mut nested_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()).unwrap())];
         nested_inputs.extend(residuals);
-        nested_inputs.push(ArrayIrValue::Array(Array::matrix(3, 4, (36..48).map(|value| value as f64).collect())));
+        nested_inputs
+            .push(ArrayIrValue::Array(Array::matrix(3, 4, (36..48).map(|value| value as f64).collect()).unwrap()));
         assert_eq!(
             nested_jvp.interpret(nested_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(tangent_values)),
-                ArrayIrValue::Array(Array::vector((36..48).map(|value| value as f64).collect())),
+                ArrayIrValue::Array(Array::vector(tangent_values).unwrap()),
+                ArrayIrValue::Array(Array::vector((36..48).map(|value| value as f64).collect()).unwrap()),
             ]),
         );
     }
@@ -576,43 +582,39 @@ in (%4)
         // though the linear call consumes it in multiple operand positions.
         assert_eq!(linearization.residual_count(), 1);
         assert_eq!(linearization.primal().to_string().matches("dimension_size").count(), 1);
-        let input = ArrayIrValue::Array(Array::matrix(3, 3, (0..9).map(|value| value as f64).collect()));
+        let input = ArrayIrValue::Array(Array::matrix(3, 3, (0..9).map(|value| value as f64).collect()).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let tangent = ArrayIrValue::Array(Array::matrix(3, 3, (9..18).map(|value| value as f64).collect()));
+        let tangent = ArrayIrValue::Array(Array::matrix(3, 3, (9..18).map(|value| value as f64).collect()).unwrap());
         let mut tangent_inputs = vec![tangent];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(
-                3,
-                3,
-                vec![9.0, 12.0, 15.0, 10.0, 13.0, 16.0, 11.0, 14.0, 17.0],
-            ))]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::matrix(3, 3, vec![9.0, 12.0, 15.0, 10.0, 13.0, 16.0, 11.0, 14.0, 17.0],).unwrap()
+            )]),
         );
         let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::matrix(3, 3, (18..27).map(|value| value as f64).collect()))];
+            vec![ArrayIrValue::Array(Array::matrix(3, 3, (18..27).map(|value| value as f64).collect()).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(
-                3,
-                3,
-                vec![18.0, 21.0, 24.0, 19.0, 22.0, 25.0, 20.0, 23.0, 26.0],
-            ))]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::matrix(3, 3, vec![18.0, 21.0, 24.0, 19.0, 22.0, 25.0, 20.0, 23.0, 26.0],).unwrap()
+            )]),
         );
 
         // The same compiled programs accept the lower-bound zero without inventing an extent tangent input.
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))])
+            .interpret(vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()).unwrap())])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()).unwrap())];
         tangent_inputs.extend(residuals);
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()).unwrap())]),
         );
     }
 
@@ -673,13 +675,12 @@ in (%4)
             .unwrap();
 
         assert_eq!(
-            program
-                .transpose_with_respect_to(&[0, 1], &[])
-                .unwrap()
-                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,]))]),
+            program.transpose_with_respect_to(&[0, 1], &[]).unwrap().interpret(vec![ArrayIrValue::Array(
+                Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,]).unwrap()
+            )]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])),
-                ArrayIrValue::Array(Array::scalar(24.0_f64)),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(24.0_f64).unwrap()),
             ]),
         );
 
@@ -711,54 +712,54 @@ in (%4)
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
         assert!(linearization.pullback().unwrap().to_string().contains("dynamic_shape_slice [strides=[2]]"));
 
-        let input = ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0]));
-        let padding_value = ArrayIrValue::Array(Array::scalar(-1.0_f64));
+        let input = ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0]).unwrap());
+        let padding_value = ArrayIrValue::Array(Array::scalar(-1.0_f64).unwrap());
         let output_extent = ArrayIrValue::Dimension(DimensionValue::new(result_type.clone(), 8).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input, padding_value, output_extent]).unwrap();
         assert_eq!(
             primal_outputs[0],
-            ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 10.0, -1.0, 20.0, -1.0, 30.0, -1.0, -1.0])),
+            ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 10.0, -1.0, 20.0, -1.0, 30.0, -1.0, -1.0]).unwrap()),
         );
         let residuals = primal_outputs.split_off(1);
 
         let mut tangent_inputs = vec![
-            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
-            ArrayIrValue::Array(Array::scalar(4.0_f64)),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()),
+            ArrayIrValue::Array(Array::scalar(4.0_f64).unwrap()),
         ];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f64, 1.0, 4.0, 2.0, 4.0, 3.0, 4.0, 4.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f64, 1.0, 4.0, 2.0, 4.0, 3.0, 4.0, 4.0]).unwrap())]),
         );
 
         let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))];
+            vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])),
-                ArrayIrValue::Array(Array::scalar(24.0_f64)),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(24.0_f64).unwrap()),
             ]),
         );
 
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(Vec::<f64>::new())),
-                ArrayIrValue::Array(Array::scalar(-1.0_f64)),
+                ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-1.0_f64).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(result_type, 3).unwrap()),
             ])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![-1.0_f64, -1.0, -1.0])),);
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![-1.0_f64, -1.0, -1.0]).unwrap()),);
         let residuals = primal_outputs.split_off(1);
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(Vec::<f64>::new())),
-                ArrayIrValue::Array(Array::scalar(6.0_f64)),
+                ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap()),
+                ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()),
             ]),
         );
 
@@ -793,20 +794,20 @@ in (%4)
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0])),
-                ArrayIrValue::Array(Array::scalar(-1.0_f64)),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-1.0_f64).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(padded_columns_type, 4).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
         let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))];
+            vec![ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f64, 3.0, 6.0, 7.0])),
-                ArrayIrValue::Array(Array::scalar(18.0_f64)),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f64, 3.0, 6.0, 7.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(18.0_f64).unwrap()),
             ]),
         );
     }
@@ -857,13 +858,13 @@ in (%4)
         assert_eq!(
             jvp.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(source_type, 2).unwrap()),
-                ArrayIrValue::Array(Array::scalar(-1.0_f64)),
+                ArrayIrValue::Array(Array::scalar(-1.0_f64).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(result_type, 4).unwrap()),
-                ArrayIrValue::Array(Array::scalar(1.0_f64)),
+                ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 0.0, 1.0, -1.0])),
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 1.0])),
+                ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 0.0, 1.0, -1.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 1.0]).unwrap()),
             ]),
         );
     }
@@ -908,13 +909,13 @@ in (%4)
         assert_eq!(
             jvp.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(left_extent_type, 2).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![30.0_f64])),
+                ArrayIrValue::Array(Array::vector(vec![30.0_f64]).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(result_type, 3).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64]).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 30.0])),
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 1.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 30.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 1.0]).unwrap()),
             ]),
         );
     }
@@ -949,24 +950,24 @@ in (%4)
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
-                ArrayIrValue::Array(Array::scalar(1_i32)),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1_i32).unwrap()),
             ])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
 
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]).unwrap())]),
         );
 
         let extent = DimensionVariable::new("strided_extent", DimensionBounds::new(4, Some(7)).unwrap());
@@ -993,21 +994,21 @@ in (%4)
         let linearization = program.linearize().unwrap();
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))])
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 3.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 3.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 11.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 11.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 0.0, 7.0, 0.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 0.0, 7.0, 0.0]).unwrap())]),
         );
     }
 
@@ -1038,21 +1039,21 @@ in (%4)
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))])
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 10.0, 11.0, 12.0]).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![5.0_f64, 7.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 7.0, 0.0]).unwrap())]),
         );
     }
 
@@ -1082,28 +1083,28 @@ in (%4)
 
         assert_eq!(linearization.residual_count(), 0);
         let primal = vec![
-            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
-            ArrayIrValue::Array(Array::vector(vec![9.0_f64, 8.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![9.0_f64, 8.0]).unwrap()),
         ];
         assert_eq!(
             linearization.primal().interpret(primal),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0]).unwrap())]),
         );
         assert_eq!(
             linearization.tangent().interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
-                ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0]).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]).unwrap())]),
         );
         assert_eq!(
             linearization
                 .pullback()
                 .unwrap()
-                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0,]))]),
+                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0,]).unwrap())]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0])),
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()),
             ]),
         );
     }
@@ -1138,30 +1139,30 @@ in (%4)
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
-                ArrayIrValue::Array(Array::vector(vec![9.0_f64, 8.0])),
-                ArrayIrValue::Array(Array::scalar(1_i32)),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![9.0_f64, 8.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1_i32).unwrap()),
             ])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0])));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::vector(vec![1.0_f64, 9.0, 8.0, 4.0]).unwrap()));
         let residuals = primal_outputs.split_off(1);
 
         let mut tangent_inputs = vec![
-            ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
-            ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0])),
+            ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5.0_f64, 6.0]).unwrap()),
         ];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 5.0, 6.0, 40.0]).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0])),
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()),
             ]),
         );
     }
@@ -1237,10 +1238,10 @@ in (%4)
 
     #[test]
     fn test_array_ir_broadcast() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
         let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
         let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]));
+        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
             context.bind(
@@ -1257,12 +1258,12 @@ in (%4)
                 DynamicBroadcastOperation::new(vec![1]),
                 Vec::new(),
                 &[
-                    ArrayIrValue::Array(Array::vector(vec![7.0_f64])),
+                    ArrayIrValue::Array(Array::vector(vec![7.0_f64]).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::new(eager_dynamic_type, 3).unwrap()),
                     ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
                 ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 1, vec![7.0_f64, 7.0, 7.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 1, vec![7.0_f64, 7.0, 7.0]).unwrap())]),
         );
 
         let input_type = input.r#type().into_owned();
@@ -1291,7 +1292,7 @@ in (%4)
             ],
         );
 
-        let identity_input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]));
+        let identity_input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = DynamicBroadcastOperation::new(vec![0]),
@@ -1331,17 +1332,20 @@ in (%4)
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0])),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]).unwrap()),
             ]),
-            Ok(
-                vec![expected_output, ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f64, 4.0, 3.0, 4.0, 3.0, 4.0])),]
-            ),
+            Ok(vec![
+                expected_output,
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f64, 4.0, 3.0, 4.0, 3.0, 4.0]).unwrap()),
+            ]),
         );
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
-            pullback.interpret(vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],))]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 12.0]))]),
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::matrix(3, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 12.0]).unwrap())]),
         );
 
         let dynamic_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -1364,11 +1368,11 @@ in (%4)
         let linearization = dynamic_program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dynamic_extent, 3).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
         let residuals = primal_outputs.split_off(1);
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]));
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap());
         let mut tangent_inputs = vec![tangent.clone()];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![tangent.clone()]));
@@ -1430,14 +1434,15 @@ in (%4)
     #[test]
     fn test_array_ir_dynamic_shape_slice() -> Result<(), ProgramError> {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = ArrayIrValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect::<Vec<_>>()));
+        let input =
+            ArrayIrValue::Array(Array::matrix(3, 4, (0..12).map(|value| value as f64).collect::<Vec<_>>()).unwrap());
         let dimension = |extent| Ok::<_, ProgramError>(ArrayIrValue::Dimension(DimensionValue::constant(extent)?));
         let output = context.bind(
             DynamicShapeSliceOperation::new(2),
             Vec::new(),
             &[input, dimension(1)?, dimension(1)?, dimension(2)?, dimension(2)?],
         )?;
-        assert_eq!(output, vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![5.0, 6.0, 9.0, 10.0]))]);
+        assert_eq!(output, vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![5.0, 6.0, 9.0, 10.0]).unwrap())]);
 
         // The slice geometry is discrete, but the array operand remains linear: JVP applies the same runtime slice to
         // the primal and tangent instead of treating the complete mixed operation as a constant.
@@ -1454,12 +1459,12 @@ in (%4)
         )?;
         assert_eq!(
             program.jvp().unwrap().interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])),
-                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0])),
-                ArrayIrValue::Array(Array::vector(vec![20.0_f64, 30.0])),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![20.0_f64, 30.0]).unwrap()),
             ]),
         );
         assert!(matches!(
@@ -1530,17 +1535,17 @@ in (%4)
 
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![true, false, true, false])),
-                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])),
+                ArrayIrValue::Array(Array::vector(vec![true, false, true, false]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0]).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0]).unwrap())]),
         );
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![false, false, false, false])),
-                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])),
+                ArrayIrValue::Array(Array::vector(vec![false, false, false, false]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0]).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f32>::new()))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())]),
         );
 
         Ok(())
@@ -1550,10 +1555,10 @@ in (%4)
     fn test_array_ir_broadcast_to_first_class_dimensions() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let eager = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let eager = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         assert_eq!(
             eager.dynamic_broadcast_leading_sizes(&[2]),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],).unwrap())),
         );
 
         let context = TestContext::new();
@@ -1565,9 +1570,9 @@ in (%4)
         // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
         // tracing retains the operation even though its input and output types are equal.
         let square_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]));
+        let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
         let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]));
+        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]).unwrap());
         assert_eq!(square.dynamic_broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
 
         let context = TestContext::new();
@@ -1623,18 +1628,18 @@ in (%4)
         );
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(2.5_f64)),
+                ArrayIrValue::Array(Array::scalar(2.5_f64).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5]).unwrap())]),
         );
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()),
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f64))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())]),
         );
 
         let context = TestContext::new();
@@ -1653,8 +1658,8 @@ in (%4)
             )
             .unwrap();
         assert_eq!(
-            program.interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64]))]),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0_f64; 6]))]),
+            program.interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64]).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0_f64; 6]).unwrap())]),
         );
 
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
@@ -1688,10 +1693,10 @@ in (%4)
 
     #[test]
     fn test_array_ir_concatenate() {
-        let left = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
-        let right = ArrayIrValue::Array(Array::vector(vec![3.0_f32]));
+        let left = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        let right = ArrayIrValue::Array(Array::vector(vec![3.0_f32]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+        let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
@@ -1856,12 +1861,12 @@ in (%4)
         assert_eq!(tangent_call.inputs()[0], transformed_result_extent);
         assert_eq!(
             jvp.interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f32])),
-                ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0])),
-                ArrayIrValue::Array(Array::vector(vec![6.0_f32])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f32]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0_f32]).unwrap()),
             ]),
-            Ok(vec![output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0])),]),
+            Ok(vec![output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap()),]),
         );
 
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -1878,7 +1883,7 @@ in (%4)
                     BatchingTracer::new(
                         batching_context.clone(),
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 4.0, 5.0])),
+                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 4.0, 5.0]).unwrap()),
                             BatchAxis::new(0),
                         )
                         .unwrap(),
@@ -1886,7 +1891,7 @@ in (%4)
                     BatchingTracer::new(
                         batching_context.clone(),
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 1, vec![3.0_f32, 6.0])),
+                            ArrayIrValue::Array(Array::matrix(2, 1, vec![3.0_f32, 6.0]).unwrap()),
                             BatchAxis::new(0),
                         )
                         .unwrap(),
@@ -1898,7 +1903,7 @@ in (%4)
         assert_eq!(batched_outputs[0].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(
             batched_outputs[0].batch().value(),
-            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],)),
+            &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()),
         );
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 3);
@@ -1907,18 +1912,18 @@ in (%4)
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f32])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f32]).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(1);
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),
-                ArrayIrValue::Array(Array::vector(vec![9.0_f32])),
+                ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![9.0_f32]).unwrap()),
             ]),
         );
     }
@@ -1948,24 +1953,24 @@ in (%4)
 
         assert_eq!(
             program.jvp().unwrap().interpret(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0])),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64])),
-                ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0])),
-                ArrayIrValue::Array(Array::vector(vec![6.0_f64])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f64]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![6.0_f64]).unwrap()),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
-                ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap()),
             ]),
         );
         assert_eq!(
             program
                 .transpose_with_respect_to(&[0, 1], &[])
                 .unwrap()
-                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64, 8.0, 9.0]))]),
+                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64, 8.0, 9.0]).unwrap())]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![7.0_f64, 8.0])),
-                ArrayIrValue::Array(Array::vector(vec![9.0_f64])),
+                ArrayIrValue::Array(Array::vector(vec![7.0_f64, 8.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![9.0_f64]).unwrap()),
             ]),
         );
     }
@@ -2024,19 +2029,28 @@ in (%4)
             .trim_end(),
         );
         assert_eq!(
-            pullback.interpret(vec![ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            ))]),
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )
+                .unwrap()
+            )]),
             Ok(vec![
-                ArrayIrValue::Array(Array::from_f64s(
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-                    vec![1.0, 2.0, 3.0, 4.0],
-                )),
-                ArrayIrValue::Array(Array::from_f64s(
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
-                    vec![5.0, 6.0],
-                )),
+                ArrayIrValue::Array(
+                    Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                        vec![1.0, 2.0, 3.0, 4.0],
+                    )
+                    .unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
+                        vec![5.0, 6.0],
+                    )
+                    .unwrap()
+                ),
             ]),
         );
     }

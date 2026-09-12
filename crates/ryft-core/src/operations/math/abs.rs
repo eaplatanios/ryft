@@ -296,18 +296,18 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(-2.0)],
+                &[Array::scalar(-2.0).unwrap()],
             ),
-            Ok(vec![Array::scalar(2.0)]),
+            Ok(vec![Array::scalar(2.0).unwrap()]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
+                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
             ),
-            Ok(vec![Array::scalar(5.0)]),
+            Ok(vec![Array::scalar(5.0).unwrap()]),
         );
     }
 
@@ -315,8 +315,8 @@ mod tests {
     fn test_abs_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = AbsOperation::new(),
-            inputs = [Array::scalar(-2.0)],
-            expected = Array::scalar(2.0),
+            inputs = [Array::scalar(-2.0).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
         );
     }
 
@@ -327,8 +327,8 @@ mod tests {
             operation = AbsOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]).unwrap())],
             }],
         );
     }
@@ -340,10 +340,10 @@ mod tests {
             operation = AbsOperation::new(),
             cases = [
                 {
-                    primals = [Array::scalar(0.7)],
-                    tangents = [Array::scalar(3.0)],
-                    primal_outputs = [Array::scalar(0.7)],
-                    tangent_outputs = [Array::scalar(3.0)],
+                    primals = [Array::scalar(0.7).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap()],
+                    primal_outputs = [Array::scalar(0.7).unwrap()],
+                    tangent_outputs = [Array::scalar(3.0).unwrap()],
                     jvp = indoc! {"
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = abs %0
@@ -355,10 +355,10 @@ mod tests {
                     "},
                 },
                 {
-                    primals = [Array::scalar(-2.5)],
-                    tangents = [Array::scalar(2.0)],
-                    primal_outputs = [Array::scalar(2.5)],
-                    tangent_outputs = [Array::scalar(-2.0)],
+                    primals = [Array::scalar(-2.5).unwrap()],
+                    tangents = [Array::scalar(2.0).unwrap()],
+                    primal_outputs = [Array::scalar(2.5).unwrap()],
+                    tangent_outputs = [Array::scalar(-2.0).unwrap()],
                 },
             ],
         );
@@ -368,15 +368,15 @@ mod tests {
     fn test_abs_differentiation_at_zero() {
         // The real rule chooses the right derivative at zero and remains constant under another derivative.
         assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(0.0f64)).gradient(|x| x.abs().unwrap()).unwrap(),
-            Array::scalar(1.0),
+            differentiate_at(Array::scalar(0.0f64).unwrap()).gradient(|x| x.abs().unwrap()).unwrap(),
+            Array::scalar(1.0).unwrap(),
             epsilon = 1e-9,
         );
         assert_abs_diff_eq!(
-            differentiate_at(Array::scalar(0.0f64))
+            differentiate_at(Array::scalar(0.0f64).unwrap())
                 .gradient(|x| { differentiate_at(x).gradient(|x| x.abs().unwrap()).unwrap() })
                 .unwrap(),
-            Array::scalar(0.0),
+            Array::scalar(0.0).unwrap(),
             epsilon = 1e-9,
         );
     }
@@ -388,16 +388,16 @@ mod tests {
         // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let (value, gradient_value) =
-            differentiate_at(Array::scalar(z)).value_and_gradient(|z| z.abs().unwrap()).unwrap();
-        assert_eq!(value, Array::scalar(z.norm()));
+            differentiate_at(Array::scalar(z).unwrap()).value_and_gradient(|z| z.abs().unwrap()).unwrap();
+        assert_eq!(value, Array::scalar(z.norm()).unwrap());
         let expected = z.conj() / z.norm();
-        assert_abs_diff_eq!(gradient_value, Array::scalar(expected), epsilon = 1e-12);
+        assert_abs_diff_eq!(gradient_value, Array::scalar(expected).unwrap(), epsilon = 1e-12);
 
         // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
         // finite-difference oracle perturbs each element's real and imaginary parts independently.
         check_gradient!(
             |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
-            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]),
+            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -405,13 +405,13 @@ mod tests {
         // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
         // zero tangent and gradient at the origin.
         assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)))
-                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)), |z| z.abs()),
-            Ok((Array::scalar(0.0f64), Array::scalar(0.0f64))),
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(0.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
         );
         assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))).gradient(|z| z.abs().unwrap()),
-            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))),
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()).gradient(|z| z.abs().unwrap()),
+            Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).unwrap()),
         );
     }
 
@@ -420,17 +420,17 @@ mod tests {
         // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
         // directional derivative `Re((conj(z) / |z|) * dz)`.
         assert_eq!(
-            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)))
-                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)), |z| z.abs()),
-            Ok((Array::scalar(1e308f64), Array::scalar(2.0f64))),
+            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)).unwrap())
+                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(), |z| z.abs()),
+            Ok((Array::scalar(1e308f64).unwrap(), Array::scalar(2.0f64).unwrap())),
         );
     }
 
     #[test]
     fn test_abs_low_precision_differentiation_uses_widened_tangents() {
         // The coefficient and tangent are computed in the widened differential representation.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_eq!(tangent.to_f64s(), vec![3.0]);
@@ -458,31 +458,31 @@ mod tests {
 
     #[test]
     fn test_abs_for_array() {
-        assert_eq!(Array::vector(vec![-1.5, 2.5]).abs().unwrap(), Array::vector(vec![1.5, 2.5]));
+        assert_eq!(Array::vector(vec![-1.5, 2.5]).unwrap().abs().unwrap(), Array::vector(vec![1.5, 2.5]).unwrap());
         // The absolute value of a complex array is its elementwise magnitude with a real element data type.
-        let complex = Array::vector(vec![3.0]).complex(&Array::vector(vec![4.0])).unwrap();
+        let complex = Array::vector(vec![3.0]).unwrap().complex(&Array::vector(vec![4.0]).unwrap()).unwrap();
         let magnitude = complex.abs().unwrap();
         assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
-        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]), epsilon = 1e-12);
+        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]).unwrap(), epsilon = 1e-12);
     }
 
     #[test]
     fn test_abs_for_array_low_precision() {
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
-        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]);
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
+        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]).unwrap();
         assert_eq!(negative.abs().unwrap(), left);
     }
 
     #[test]
     fn test_abs_for_array_complex() {
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
         let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
         // The absolute value is the elementwise magnitude with a real element data type.
         let magnitude = left.abs().unwrap();
         assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
         assert_abs_diff_eq!(
             magnitude,
-            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),
+            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]).unwrap(),
             epsilon = 1e-12,
         );
     }
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn test_abs_for_array_integers() {
         // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
-        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
         assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
     }
 }

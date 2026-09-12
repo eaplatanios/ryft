@@ -118,31 +118,37 @@ mod tests {
     #[test]
     fn test_log1p_interpretation() {
         // Ordinary values in every supported floating-point width, each evaluated in its own precision.
-        assert_eq!(Array::scalar(0.5f32).log1p().unwrap(), Array::scalar(0.5f32.ln_1p()));
-        assert_eq!(Array::scalar(0.5f64).log1p().unwrap(), Array::scalar(0.5f64.ln_1p()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).log1p().unwrap(), Array::scalar(bf16::from_f32(0.5f32.ln_1p())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).log1p().unwrap(), Array::scalar(f16::from_f32(0.5f32.ln_1p())));
+        assert_eq!(Array::scalar(0.5f32).unwrap().log1p().unwrap(), Array::scalar(0.5f32.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().log1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().log1p().unwrap(),
+            Array::scalar(bf16::from_f32(0.5f32.ln_1p())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().log1p().unwrap(),
+            Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap()
+        );
 
         // The fixed point and the boundary values of the real domain.
-        assert_eq!(Array::scalar(0.0f64).log1p().unwrap(), Array::scalar(0.0f64));
-        assert_eq!(Array::scalar(-1.0f64).log1p().unwrap(), Array::scalar(f64::NEG_INFINITY));
-        assert!(Array::scalar(-2.0f64).log1p().unwrap().to_f64s()[0].is_nan());
+        assert_eq!(Array::scalar(0.0f64).unwrap().log1p().unwrap(), Array::scalar(0.0f64).unwrap());
+        assert_eq!(Array::scalar(-1.0f64).unwrap().log1p().unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap());
+        assert!(Array::scalar(-2.0f64).unwrap().log1p().unwrap().to_f64s()[0].is_nan());
 
         // The accuracy the primitive exists for: near zero, `log1p` keeps full relative precision while the naive
         // composition through `1 + x` has already lost most of it.
-        assert_eq!(Array::scalar(1e-10f64).log1p().unwrap(), Array::scalar(1e-10f64.ln_1p()));
+        assert_eq!(Array::scalar(1e-10f64).unwrap().log1p().unwrap(), Array::scalar(1e-10f64.ln_1p()).unwrap());
         assert_ne!(1e-10f64.ln_1p(), (1.0f64 + 1e-10).ln());
         assert!((1e-10f64.ln_1p() - 1e-10).abs() < 1e-20);
 
-        assert_eq!(Array::scalar(0.5).log1p().unwrap(), Array::scalar(0.5f64.ln_1p()));
+        assert_eq!(Array::scalar(0.5).unwrap().log1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
     }
 
     #[test]
     fn test_log1p_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = Log1pOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.ln_1p()),
+            inputs = [Array::scalar(0.7).unwrap()],
+            expected = Array::scalar(0.7f64.ln_1p()).unwrap(),
         );
     }
 
@@ -153,8 +159,8 @@ mod tests {
             operation = Log1pOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -0.5]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.ln_1p(), (-0.5f64).ln_1p()]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -0.5]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.ln_1p(), (-0.5f64).ln_1p()]).unwrap())],
             }],
         );
     }
@@ -165,10 +171,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = Log1pOperation::new(),
             cases = [{
-                primals = [Array::scalar(0.7)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(0.7f64.ln_1p())],
-                tangent_outputs = [Array::scalar(3.0 / 1.7)],
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64.ln_1p()).unwrap()],
+                tangent_outputs = [Array::scalar(3.0 / 1.7).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = log1p %0

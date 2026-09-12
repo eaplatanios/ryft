@@ -608,12 +608,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// use ryft_core::{Array, ArrayIrValue, Mul, ProgramError, ValueProjection};
 ///
 /// # fn main() -> Result<(), ProgramError> {
-/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]));
-/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]));
+/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
+/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]).unwrap());
 /// let product = ValueProjection::<ArrayType>::into_projected(left)?
 ///     .mul(&ValueProjection::<ArrayType>::into_projected(right)?)?;
 /// let product = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::from_projected(product);
-/// assert_eq!(product, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0])));
+/// assert_eq!(product, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0]).unwrap()));
 /// # Ok(())
 /// # }
 /// ```
@@ -1119,9 +1119,12 @@ mod tests {
             value.reference_new()?.freeze()
         }
 
-        let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let (square, elements) = square_and_element_count(&input).unwrap();
-        assert_eq!(square, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 4.0, 9.0, 16.0, 25.0, 36.0])));
+        assert_eq!(
+            square,
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 4.0, 9.0, 16.0, 25.0, 36.0]).unwrap())
+        );
         let ArrayIrValue::Dimension(elements) = elements else {
             panic!("expected a first-class dimension member");
         };
@@ -1202,7 +1205,7 @@ mod tests {
             ArrayIrOperation::While(operation)
                 if operation.iteration_bound() == while_operation.iteration_bound()
         ));
-        let capture = Array::vector(vec![3.0_f32, 4.0, 5.0, 6.0]);
+        let capture = Array::vector(vec![3.0_f32, 4.0, 5.0, 6.0]).unwrap();
         let scan_operation = ScanOperation::<Array>::new(1, 4)
             .with_reverse(true)
             .with_unroll(2)
@@ -1502,11 +1505,11 @@ mod tests {
                 ArrayOperation::Add(AddOperation::new()),
                 Vec::new(),
                 &[
-                    ArrayIrValue::Array(Array::vector(vec![1.0, 2.0])),
-                    ArrayIrValue::Array(Array::vector(vec![3.0, 4.0])),
+                    ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![3.0, 4.0]).unwrap()),
                 ],
             ),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0, 6.0]).unwrap())]),
         );
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
@@ -1528,7 +1531,7 @@ mod tests {
         };
         assert_eq!(result.extent(), 7);
 
-        let reshape_input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let reshape_input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let reshape = context
             .bind(
                 DynamicReshapeOperation::new(),
@@ -1540,7 +1543,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(reshape, vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],))],);
+        assert_eq!(
+            reshape,
+            vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap())],
+        );
 
         let rows = DimensionValue::constant(2).unwrap();
         let columns = DimensionValue::constant(3).unwrap();
@@ -1557,7 +1563,7 @@ mod tests {
                 &[ArrayIrValue::Dimension(rows), ArrayIrValue::Dimension(columns)],
             )
             .unwrap();
-        assert_eq!(zero, vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))]);
+        assert_eq!(zero, vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())]);
 
         let extent = DimensionValue::constant(3).unwrap();
         let one = context
@@ -1570,17 +1576,17 @@ mod tests {
                 &[ArrayIrValue::Dimension(extent)],
             )
             .unwrap();
-        assert_eq!(one, vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]);
+        assert_eq!(one, vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap())]);
         // Explicit static mixed constructors consume no dimension operands and interpret identically to their
         // preferred homogeneous encodings.
         let static_float_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
             context.bind(ArrayIrOperation::Zero(ZeroOperation::new(static_float_type.clone())), Vec::new(), &[],),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())]),
         );
         assert_eq!(
             context.bind(ArrayIrOperation::One(OneOperation::new(static_float_type)), Vec::new(), &[],),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]),
         );
         let static_iota_type = ArrayType::new_static(DataType::I32, [3]);
         assert_eq!(
@@ -1992,7 +1998,7 @@ mod tests {
 
     /// Stages `input * scale` in `builder` and returns its result atom.
     fn composite_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
-        let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale)));
+        let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale).unwrap()));
         builder
             .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale], None)
             .unwrap()[0]
@@ -2237,7 +2243,7 @@ mod tests {
             let linear = builder.add_input(array_type.clone().into());
             builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder]).unwrap()
         };
-        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]).unwrap());
         let output: TestValue = batch(
             |(residual, linear): (
                 BatchingTracer<_, ArrayIrBatchingPolicy>,
@@ -2252,7 +2258,7 @@ mod tests {
                     )?
                     .remove(0))
             },
-            (ArrayIrValue::Array(Array::scalar(3.0_f64)), linear.clone()),
+            (ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()), linear.clone()),
             (BatchAxis::replicated(), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
@@ -2312,13 +2318,13 @@ mod tests {
                         )?
                         .remove(0))
                 },
-                ArrayIrValue::Array(Array::scalar(5.0_f64)),
+                ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap()),
                 (),
             )
             .unwrap();
-        let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64))).unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64)));
-        assert_eq!(gradient, ArrayIrValue::Array(Array::scalar(3.0_f64)));
+        let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64).unwrap())).unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64).unwrap()));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()));
 
         // Transposing the raw, un-linearized call directly is still rejected, but now by the composite payload's own
         // non-transposable rule instead of by a projected adapter that never received its regions.
@@ -2339,7 +2345,7 @@ mod tests {
             .jvp(
                 |input, ()| {
                     let context = input.context().clone();
-                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64)))?;
+                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()))?;
                     Ok(context
                         .bind(
                             ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
@@ -2348,13 +2354,13 @@ mod tests {
                         )?
                         .remove(0))
                 },
-                ArrayIrValue::Array(Array::scalar(2.0_f64)),
-                ArrayIrValue::Array(Array::scalar(4.0_f64)),
+                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(4.0_f64).unwrap()),
                 (),
             )
             .unwrap();
-        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64)));
-        assert_eq!(tangent, ArrayIrValue::Array(Array::scalar(12.0_f64)));
+        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()));
+        assert_eq!(tangent, ArrayIrValue::Array(Array::scalar(12.0_f64).unwrap()));
 
         // Reverse mode composes the same projected JVP with projected transposition. The constant factor is a known
         // replay input to the homogeneous multiply transpose rule.
@@ -2362,7 +2368,7 @@ mod tests {
             .vjp(
                 |input, ()| {
                     let context = input.context().clone();
-                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64)))?;
+                    let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()))?;
                     Ok(context
                         .bind(
                             ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
@@ -2371,19 +2377,19 @@ mod tests {
                         )?
                         .remove(0))
                 },
-                ArrayIrValue::Array(Array::scalar(2.0_f64)),
+                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
                 (),
             )
             .unwrap();
-        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64)));
+        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap()));
         assert_eq!(
-            pullback.apply(ArrayIrValue::Array(Array::scalar(5.0_f64))),
-            Ok(ArrayIrValue::Array(Array::scalar(15.0_f64))),
+            pullback.apply(ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())),
+            Ok(ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap())),
         );
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let factor = builder.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f64)));
+        let factor = builder.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()));
         let output = builder
             .add_instruction(
                 ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
@@ -2399,8 +2405,8 @@ mod tests {
             program
                 .transpose_with_respect_to(&[0], &[])
                 .unwrap()
-                .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64))]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64))]),
+                .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64).unwrap())]),
         );
     }
 
@@ -2446,14 +2452,16 @@ mod tests {
         let primal = Array::from_f64s(
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
             vec![1.0, 2.0, 4.0],
-        );
-        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]);
+        )
+        .unwrap();
+        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap();
         let expected_primal = primal.clone();
         assert_eq!(
             jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
-            Ok(
-                vec![ArrayIrValue::Array(expected_primal), ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])),]
-            ),
+            Ok(vec![
+                ArrayIrValue::Array(expected_primal),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()),
+            ]),
         );
     }
 
@@ -2487,25 +2495,23 @@ mod tests {
             assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
             let mut primal_outputs = linearization
                 .primal()
-                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]))])
+                .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap())])
                 .unwrap();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal)));
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
             let residuals = primal_outputs.split_off(1);
-            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]))];
+            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap())];
             tangent_inputs.extend(residuals.clone());
             assert_eq!(
                 linearization.tangent().interpret(tangent_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent))]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
             );
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(6.0_f64))];
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
                 linearization.pullback().unwrap().interpret(pullback_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::vector(vec![
-                    expected_cotangent,
-                    expected_cotangent,
-                    expected_cotangent,
-                ]))]),
+                Ok(vec![ArrayIrValue::Array(
+                    Array::vector(vec![expected_cotangent, expected_cotangent, expected_cotangent,]).unwrap()
+                )]),
             );
         }
 
@@ -2529,21 +2535,21 @@ mod tests {
         let linearization = program.linearize().unwrap();
         let mut primal_outputs = linearization
             .primal()
-            .interpret(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()))])
+            .interpret(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())])
             .unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(0.0_f64)));
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(0.0_f64).unwrap()));
         let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()))];
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())];
         tangent_inputs.extend(residuals.clone());
         assert_eq!(
             linearization.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0_f64))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0_f64).unwrap())]),
         );
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f64))];
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap())]),
         );
 
         for (kind, values, expected_primal, expected_tangent, expected_cotangent) in [
@@ -2573,20 +2579,21 @@ mod tests {
 
             assert_eq!(linearization.residual_count(), 2);
             let mut primal_outputs =
-                linearization.primal().interpret(vec![ArrayIrValue::Array(Array::vector(values))]).unwrap();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal)));
+                linearization.primal().interpret(vec![ArrayIrValue::Array(Array::vector(values).unwrap())]).unwrap();
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));
             let residuals = primal_outputs.split_off(1);
-            let mut tangent_inputs = vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]))];
+            let mut tangent_inputs =
+                vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap())];
             tangent_inputs.extend(residuals.clone());
             assert_eq!(
                 linearization.tangent().interpret(tangent_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent))]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(expected_tangent).unwrap())]),
             );
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(8.0_f64))];
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(8.0_f64).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
                 linearization.pullback().unwrap().interpret(pullback_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::vector(expected_cotangent))]),
+                Ok(vec![ArrayIrValue::Array(Array::vector(expected_cotangent).unwrap())]),
             );
         }
     }
@@ -2666,8 +2673,8 @@ mod tests {
         );
 
         let extent_value = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
-        let input_value = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
-        let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        let input_value = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(program.interpret(vec![input_value.clone(), extent_value.clone()]), Ok(vec![expected.clone()]));
 
         // Known dimension arithmetic folds during partial evaluation while the two shape operations retain their
@@ -2691,8 +2698,9 @@ mod tests {
 
         // Forward differentiation replays both shape operations over the live array tangent while every dimension
         // value remains structural.
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]));
-        let expected_tangent = ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0_f64, 5.0, 6.0, 4.0, 5.0, 6.0]));
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap());
+        let expected_tangent =
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0_f64, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap());
         assert_eq!(
             program.jvp().unwrap().interpret(vec![input_value.clone(), extent_value.clone(), tangent,]),
             Ok(vec![expected.clone(), expected_tangent]),
@@ -2706,7 +2714,7 @@ mod tests {
         let batched_input = BatchingTracer::new(
             batching_context.clone(),
             ArrayIrBatch::new(
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),
@@ -2720,13 +2728,16 @@ mod tests {
         assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(
             batched_output.batch().value(),
-            &ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
-                ),
-                vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0],
-            )),
+            &ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
+                    ),
+                    vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0],
+                )
+                .unwrap()
+            ),
         );
 
         // Instantiation and import rename the boundary identity while preserving the internal arithmetic result and
@@ -2881,14 +2892,20 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            batched_program.interpret(vec![ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            ))]),
-            Ok(vec![ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                vec![12.0, 24.0, 36.0, 48.0, 60.0, 72.0],
-            ))]),
+            batched_program.interpret(vec![ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )
+                .unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    vec![12.0, 24.0, 36.0, 48.0, 60.0, 72.0],
+                )
+                .unwrap()
+            )]),
         );
     }
 

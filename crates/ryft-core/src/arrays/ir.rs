@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_projection() {
-        let array = Array::vector((0..4096).map(|value| value as f32).collect());
+        let array = Array::vector((0..4096).map(|value| value as f32).collect()).unwrap();
         let payload = array.storage_bytes().as_ptr();
         let stored = ArrayIrValue::Array(array);
         let projected = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored).unwrap();
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_reference_projection_preserves_holder_identity() {
-        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let stored = ArrayIrValue::Reference(reference.clone());
         assert_eq!(
             <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::projected(&stored),
@@ -366,7 +366,8 @@ mod tests {
         .into());
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let constant = builder.add_constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))));
+        let constant =
+            builder.add_constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())));
         assert_eq!(
             builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -380,7 +381,7 @@ mod tests {
 
         let reference_region = || {
             Region::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(
-                vec![Atom::Constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))))],
+                vec![Atom::Constant(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())))],
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -404,7 +405,7 @@ mod tests {
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
                 |input: Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
                     let context = input.context().clone();
-                    context.lift(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))))
+                    context.lift(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap())))
                 },
                 ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
             )

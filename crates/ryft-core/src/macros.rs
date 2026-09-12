@@ -3588,8 +3588,8 @@ macro_rules! check_operation_type_inference {
 /// # use ryft_core::{Array, NegOperation, check_operation_partial_evaluation};
 /// check_operation_partial_evaluation!(
 ///     operation = NegOperation::new(),
-///     inputs = [Array::scalar(2.0)],
-///     expected = Array::scalar(-2.0),
+///     inputs = [Array::scalar(2.0).unwrap()],
+///     expected = Array::scalar(-2.0).unwrap(),
 /// );
 /// ```
 ///
@@ -3606,10 +3606,10 @@ macro_rules! check_operation_type_inference {
 ///     operation = AddOperation::new(),
 ///     cases = [{
 ///         inputs = [
-///             (@known, Array::scalar(2.0)),
-///             (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.0))),
+///             (@known, Array::scalar(2.0).unwrap()),
+///             (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.0).unwrap())),
 ///         ],
-///         outputs = [(@residual, Array::scalar(5.0))],
+///         outputs = [(@residual, Array::scalar(5.0).unwrap())],
 ///         residual_instructions = 1,
 ///     }],
 /// );
@@ -3830,11 +3830,11 @@ macro_rules! check_operation_partial_evaluation {
 ///     cases = [
 ///         {
 ///             inputs = [
-///                 (@mapped(axis = 0), Array::vector(vec![1.0, 2.0])),
-///                 (@replicated, Array::scalar(3.0)),
+///                 (@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap()),
+///                 (@replicated, Array::scalar(3.0).unwrap()),
 ///             ],
 ///             outputs = [
-///                 (@mapped(axis = 0), Array::vector(vec![4.0, 5.0])),
+///                 (@mapped(axis = 0), Array::vector(vec![4.0, 5.0]).unwrap()),
 ///             ],
 ///         },
 ///     ],
@@ -4047,10 +4047,10 @@ macro_rules! check_operation_batching {
 ///     @approx(step = 1e-6, epsilon = 1e-6),
 ///     operation = MulOperation::new(),
 ///     cases = [{
-///         primals = [Array::scalar(2.0), Array::scalar(5.0)],
-///         tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
-///         primal_outputs = [Array::scalar(10.0)],
-///         tangent_outputs = [Array::scalar(13.0)],
+///         primals = [Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()],
+///         tangents = [Array::scalar(3.0).unwrap(), Array::scalar(-1.0).unwrap()],
+///         primal_outputs = [Array::scalar(10.0).unwrap()],
+///         tangent_outputs = [Array::scalar(13.0).unwrap()],
 ///         jvp = indoc! {"
 ///             lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
 ///             let %4:f64[] = mul %0 %1
@@ -4242,11 +4242,11 @@ macro_rules! check_operation_differentiation {
 ///     operation = MulOperation::new(),
 ///     cases = [{
 ///         inputs = [
-///             (@known, Array::scalar(4.0)),
+///             (@known, Array::scalar(4.0).unwrap()),
 ///             (@linear(type = ArrayType::scalar(DataType::F64))),
 ///         ],
-///         output_cotangents = [Array::scalar(3.0)],
-///         input_cotangents = [Array::scalar(12.0)],
+///         output_cotangents = [Array::scalar(3.0).unwrap()],
+///         input_cotangents = [Array::scalar(12.0).unwrap()],
 ///         pullback = indoc! {"
 ///             lambda %0:f64[], %1:f64[] .
 ///             let %2:f64[] = mul %1 %0
@@ -4637,12 +4637,12 @@ macro_rules! check_gradient {
                 let perturbed = |index: usize, delta: f64| {
                     let mut values = input.to_f64s();
                     values[index] += delta;
-                    $crate::Array::from_f64s(input_type.clone(), values)
+                    $crate::Array::from_f64s(input_type.clone(), values).unwrap()
                 };
                 let estimates = (0..element_count)
                     .map(|index| central_difference(perturbed(index, step), perturbed(index, -step)))
                     .collect::<Vec<_>>();
-                let estimate = $crate::Array::from_f64s(input_type.clone(), estimates);
+                let estimate = $crate::Array::from_f64s(input_type.clone(), estimates).unwrap();
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             $crate::arrays::DataType::C128 => {
@@ -4657,8 +4657,8 @@ macro_rules! check_gradient {
                     real_values[index] += real_delta;
                     imaginary_values[index] += imaginary_delta;
                     $crate::operations::complex::Complex::complex(
-                        &$crate::Array::from_f64s(part_type.clone(), real_values),
-                        &$crate::Array::from_f64s(part_type.clone(), imaginary_values),
+                        &$crate::Array::from_f64s(part_type.clone(), real_values).unwrap(),
+                        &$crate::Array::from_f64s(part_type.clone(), imaginary_values).unwrap(),
                     )
                     .unwrap()
                 };
@@ -4675,8 +4675,8 @@ macro_rules! check_gradient {
                     ));
                 }
                 let estimate = $crate::operations::complex::Complex::complex(
-                    &$crate::Array::from_f64s(part_type.clone(), real_estimates),
-                    &$crate::Array::from_f64s(part_type, imaginary_estimates),
+                    &$crate::Array::from_f64s(part_type.clone(), real_estimates).unwrap(),
+                    &$crate::Array::from_f64s(part_type, imaginary_estimates).unwrap(),
                 )
                 .unwrap();
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
@@ -5127,7 +5127,7 @@ mod tests {
             inputs: &[Array],
         ) -> Result<Vec<Array>, ProgramError> {
             check_count!("input", inputs, 0, ProgramError);
-            Ok(vec![Array::scalar(3.0), Array::scalar(4.0)])
+            Ok(vec![Array::scalar(3.0).unwrap(), Array::scalar(4.0).unwrap()])
         }
     }
 
@@ -5570,9 +5570,9 @@ mod tests {
                 &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0f32)],
+                &[Array::scalar(2.0f32).unwrap()],
             ),
-            Ok(vec![Array::scalar(-2.0f32)]),
+            Ok(vec![Array::scalar(-2.0f32).unwrap()]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, TestUnaryOperation<ArrayType>>>::interpret(
@@ -5585,10 +5585,14 @@ mod tests {
         );
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
         let outputs = array_operation
-            .partially_evaluate(&context, &EmptyRegionDriver, &[PartialEvaluationValue::known(Array::scalar(2.0f32))])
+            .partially_evaluate(
+                &context,
+                &EmptyRegionDriver,
+                &[PartialEvaluationValue::known(Array::scalar(2.0f32).unwrap())],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f32)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f32).unwrap()));
     }
 
     #[test]
@@ -5650,9 +5654,9 @@ mod tests {
                 &array_operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0f32), Array::scalar(3.0f32)],
+                &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.0f32).unwrap()],
             ),
-            Ok(vec![Array::scalar(5.0f32)]),
+            Ok(vec![Array::scalar(5.0f32).unwrap()]),
         );
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
         let outputs = array_operation
@@ -5660,13 +5664,13 @@ mod tests {
                 &context,
                 &EmptyRegionDriver,
                 &[
-                    PartialEvaluationValue::known(Array::scalar(2.0f32)),
-                    PartialEvaluationValue::known(Array::scalar(3.0f32)),
+                    PartialEvaluationValue::known(Array::scalar(2.0f32).unwrap()),
+                    PartialEvaluationValue::known(Array::scalar(3.0f32).unwrap()),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(5.0f32)));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(5.0f32).unwrap()));
     }
 
     #[test]
@@ -5763,13 +5767,13 @@ mod tests {
             EagerContext<Array, TestUnaryOperation<ArrayType>>,
             TestArrayReferenceDischarge,
         >::new(EagerContext::new());
-        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32))];
+        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32).unwrap())];
 
         // A reference-free, region-free application replays verbatim through the destination, which executes it and
         // returns its outputs as ordinary carriers.
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(-2.0f32))]),
+            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(-2.0f32).unwrap())]),
         );
 
         // An operand that is a live reference handle is rejected too, because a reference-touching operation owns
@@ -5777,7 +5781,7 @@ mod tests {
         // environment identity is minted process-globally and is therefore not stable across runs.
         let reference = ReferenceDischargeValue::from(
             context
-                .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
+                .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32).unwrap())
                 .unwrap(),
         );
         assert_eq!(
@@ -5794,13 +5798,13 @@ mod tests {
             TestArrayReferenceDischarge,
         >::new(EagerContext::new());
         let operation = TestBinaryOperation::<ArrayType>::new();
-        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32))];
+        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32).unwrap())];
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[inputs[0].clone(), inputs[0].clone()]),
-            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(4.0f32))]),
+            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(4.0f32).unwrap())]),
         );
         let reference = context
-            .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
+            .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32).unwrap())
             .unwrap();
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.into(), inputs[0].clone()]),
@@ -5817,8 +5821,8 @@ mod tests {
         // The generic macro forwards every differentiation dual to the caller-provided JVP body without imposing
         // elementwise alignment or structural-zero handling.
         let inputs = [
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestDifferentiableOperation::<ArrayType>::new()
             .jvp(
@@ -5828,8 +5832,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32).unwrap())
+        );
 
         // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
         // supplied body and preserves the driver's static dispatch.
@@ -5854,8 +5860,8 @@ mod tests {
     #[test]
     fn test_impl_differentiable_elementwise_operation_linear() {
         let inputs = [
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = AddOperation::new()
             .jvp(
@@ -5865,8 +5871,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(5.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(9.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(5.0f32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(9.0f32).unwrap())
+        );
 
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
@@ -5906,50 +5914,60 @@ mod tests {
         // tangent. The primal values come from the stand-in `Sub` interpretation and are irrelevant to the rule.
         let context = EagerContext::<Array, TestReversedSubOperation<ArrayType>>::new();
         let inputs = [
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
             .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32)));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32).unwrap())
+        );
         let inputs = [
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
             .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32)));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32).unwrap())
+        );
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
             .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32)));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32).unwrap())
+        );
 
         // A `[@negative, @negative]` rule combines both live tangents as `-(left + right)`.
         let context = EagerContext::<Array, TestNegatedAddOperation<ArrayType>>::new();
         let inputs = [
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
             .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32)));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32).unwrap())
+        );
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32).unwrap()).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
             .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32)));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32).unwrap())
+        );
     }
 
     #[test]
@@ -6033,23 +6051,27 @@ mod tests {
             .jvp(
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
-                &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(4.0f32)).unwrap()],
+                &[DifferentiationDual::new(Array::scalar(0.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(0.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(0.0f32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(4.0f32).unwrap())
+        );
 
         let outputs = ExpOperation::new()
             .jvp(
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
-                &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(3.0f32)).unwrap()],
+                &[DifferentiationDual::new(Array::scalar(0.0f32).unwrap(), Array::scalar(3.0f32).unwrap()).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(1.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(3.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(1.0f32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(3.0f32).unwrap())
+        );
     }
 
     #[test]
@@ -6059,14 +6081,16 @@ mod tests {
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
-                    DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-                    DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
+                    DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(4.0f32).unwrap()).unwrap(),
+                    DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(5.0f32).unwrap()).unwrap(),
                 ],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(6.0f32));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(22.0f32)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(6.0f32).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(22.0f32).unwrap())
+        );
     }
 
     #[test]
@@ -6222,7 +6246,8 @@ mod tests {
     #[test]
     fn test_impl_non_differentiable_operation() {
         // The basic form replays the primal operation and replaces its live tangent with a structural zero.
-        let inputs = [DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap()];
+        let inputs =
+            [DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(1.0f32).unwrap()).unwrap()];
         let outputs = TestUnaryOperation::<ArrayType>::new()
             .jvp(
                 &DifferentiationContext::fused(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new()),
@@ -6231,7 +6256,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &Array::scalar(-2.0f32));
+        assert_eq!(outputs[0].primal(), &Array::scalar(-2.0f32).unwrap());
         assert!(matches!(
             outputs[0].tangent(),
             MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
@@ -6353,8 +6378,8 @@ mod tests {
         .into_parts()
         .0;
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].value(), &Array::scalar(3.0));
-        assert_eq!(outputs[1].value(), &Array::scalar(4.0));
+        assert_eq!(outputs[0].value(), &Array::scalar(3.0).unwrap());
+        assert_eq!(outputs[1].value(), &Array::scalar(4.0).unwrap());
         assert!(outputs[0].batch_axis().is_replicated());
         assert!(outputs[1].batch_axis().is_replicated());
         assert!(matches!(
@@ -6362,7 +6387,7 @@ mod tests {
                 EagerContext<Array, TestNullaryOperation<ArrayType>>,
                 ArrayBatchingPolicy,
             >>::batch(
-                &operation, &context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::scalar(1.0))],
+                &operation, &context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::scalar(1.0).unwrap())],
             ),
             Err(BatchingError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));
@@ -6401,22 +6426,22 @@ mod tests {
         drop(builder);
 
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
-        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(2.0f32)));
-        assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Array::scalar(-2.0f32)));
+        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(2.0f32).unwrap()));
+        assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Array::scalar(-2.0f32).unwrap()));
 
         let context = BatchingContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new(), 2);
-        let input = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(2.0f32)));
+        let input = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(2.0f32).unwrap()));
         let output = input.apply_unary().into_batch();
-        assert_eq!(output.value(), &Array::scalar(-2.0f32));
+        assert_eq!(output.value(), &Array::scalar(-2.0f32).unwrap());
         assert!(output.batch_axis().is_replicated());
 
         let context = DifferentiationContext::fused(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
         let input = DifferentiationTracer::new(
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(1.0f32).unwrap()).unwrap(),
             context,
         );
         let output = input.apply_unary().into_dual();
-        assert_eq!(output.primal(), &Array::scalar(-2.0f32));
+        assert_eq!(output.primal(), &Array::scalar(-2.0f32).unwrap());
         assert!(matches!(
             output.tangent(),
             MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
@@ -6448,28 +6473,28 @@ mod tests {
         drop(builder);
 
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
-        let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Array::scalar(2.0f32)));
-        let right = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(3.0f32)));
-        assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Array::scalar(5.0f32)),);
+        let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Array::scalar(2.0f32).unwrap()));
+        let right = PartialTracer::new(context, PartialEvaluationValue::known(Array::scalar(3.0f32).unwrap()));
+        assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Array::scalar(5.0f32).unwrap()),);
 
         let context = BatchingContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new(), 2);
-        let left = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(2.0f32)));
-        let right = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(3.0f32)));
+        let left = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(2.0f32).unwrap()));
+        let right = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(3.0f32).unwrap()));
         let output = left.apply_binary(right).into_batch();
-        assert_eq!(output.value(), &Array::scalar(5.0f32));
+        assert_eq!(output.value(), &Array::scalar(5.0f32).unwrap());
         assert!(output.batch_axis().is_replicated());
 
         let context = DifferentiationContext::fused(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
         let left = DifferentiationTracer::new(
-            DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(2.0f32).unwrap(), Array::scalar(1.0f32).unwrap()).unwrap(),
             context.clone(),
         );
         let right = DifferentiationTracer::new(
-            DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(1.0f32)).unwrap(),
+            DifferentiationDual::new(Array::scalar(3.0f32).unwrap(), Array::scalar(1.0f32).unwrap()).unwrap(),
             context,
         );
         let output = left.apply_binary(right).into_dual();
-        assert_eq!(output.primal(), &Array::scalar(5.0f32));
+        assert_eq!(output.primal(), &Array::scalar(5.0f32).unwrap());
         assert!(matches!(
             output.tangent(),
             MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F32),
@@ -6641,49 +6666,49 @@ mod tests {
     fn test_check_operation_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = NegOperation::new(),
-            inputs = [Array::scalar(2.0)],
-            expected = Array::scalar(-2.0),
+            inputs = [Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(-2.0).unwrap(),
         );
         check_operation_partial_evaluation!(
             operation = AddOperation::new(),
             cases = [
                 {
                     inputs = [
-                        (@known, Array::scalar(2.0)),
-                        (@known, Array::scalar(3.5)),
+                        (@known, Array::scalar(2.0).unwrap()),
+                        (@known, Array::scalar(3.5).unwrap()),
                     ],
                     outputs = [
-                        (@known, Array::scalar(5.5)),
+                        (@known, Array::scalar(5.5).unwrap()),
                     ],
                     residual_instructions = 0,
                 },
                 {
                     inputs = [
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
-                        (@known, Array::scalar(3.5)),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0).unwrap())),
+                        (@known, Array::scalar(3.5).unwrap()),
                     ],
                     outputs = [
-                        (@residual, Array::scalar(5.5)),
+                        (@residual, Array::scalar(5.5).unwrap()),
                     ],
                     residual_instructions = 1,
                 },
                 {
                     inputs = [
-                        (@known, Array::scalar(2.0)),
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
+                        (@known, Array::scalar(2.0).unwrap()),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5).unwrap())),
                     ],
                     outputs = [
-                        (@residual, Array::scalar(5.5)),
+                        (@residual, Array::scalar(5.5).unwrap()),
                     ],
                     residual_instructions = 1,
                 },
                 {
                     inputs = [
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0).unwrap())),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5).unwrap())),
                     ],
                     outputs = [
-                        (@residual, Array::scalar(5.5)),
+                        (@residual, Array::scalar(5.5).unwrap()),
                     ],
                     residual_instructions = 1,
                 },
@@ -6741,7 +6766,7 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [],
-                outputs = [(@replicated, Array::scalar(0.0))],
+                outputs = [(@replicated, Array::scalar(0.0).unwrap())],
             }],
         );
 
@@ -6755,20 +6780,20 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
                     ],
                     outputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()),
                     ],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(3.0).unwrap()),
                     ],
                     outputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(3.0).unwrap()),
+                        (@replicated, Array::scalar(3.0).unwrap()),
                     ],
                 },
             ],
@@ -6781,38 +6806,38 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@replicated, Array::scalar(3.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                        (@replicated, Array::scalar(3.0).unwrap()),
                     ],
                     outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![-2.0, -5.0])),
+                        (@mapped(axis = 0), Array::vector(vec![-2.0, -5.0]).unwrap()),
                     ],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(3.0).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
                     ],
                     outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![2.0, 5.0])),
+                        (@mapped(axis = 0), Array::vector(vec![2.0, 5.0]).unwrap()),
                     ],
                 },
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@mapped(axis = 0), Array::vector(vec![4.0, 1.0])),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                        (@mapped(axis = 0), Array::vector(vec![4.0, 1.0]).unwrap()),
                     ],
                     outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![-3.0, -3.0])),
+                        (@mapped(axis = 0), Array::vector(vec![-3.0, -3.0]).unwrap()),
                     ],
                 },
                 {
                     inputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@replicated, Array::scalar(1.0)),
+                        (@replicated, Array::scalar(3.0).unwrap()),
+                        (@replicated, Array::scalar(1.0).unwrap()),
                     ],
                     outputs = [
-                        (@replicated, Array::scalar(2.0)),
+                        (@replicated, Array::scalar(2.0).unwrap()),
                     ],
                 },
             ],
@@ -6825,10 +6850,10 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
+                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap()),
                     ],
                     outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![0.5f64.sin(), (-1.0f64).sin()])),
+                        (@mapped(axis = 0), Array::vector(vec![0.5f64.sin(), (-1.0f64).sin()]).unwrap()),
                     ],
                 },
             ],
@@ -6843,10 +6868,10 @@ mod tests {
             operation = MulOperation::new(),
             cases = [
                 {
-                    primals = [Array::scalar(2.0), Array::scalar(5.0)],
-                    tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
-                    primal_outputs = [Array::scalar(10.0)],
-                    tangent_outputs = [Array::scalar(13.0)],
+                    primals = [Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()],
+                    tangents = [Array::scalar(3.0).unwrap(), Array::scalar(-1.0).unwrap()],
+                    primal_outputs = [Array::scalar(10.0).unwrap()],
+                    tangent_outputs = [Array::scalar(13.0).unwrap()],
                     jvp = indoc! {"
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                         let %4:f64[] = mul %0 %1
@@ -6857,10 +6882,10 @@ mod tests {
                     "},
                 },
                 {
-                    primals = [Array::scalar(2.0), Array::vector(vec![1.0, 3.0])],
-                    tangents = [Array::scalar(0.5), Array::vector(vec![2.0, -1.0])],
-                    primal_outputs = [Array::vector(vec![2.0, 6.0])],
-                    tangent_outputs = [Array::vector(vec![4.5, -0.5])],
+                    primals = [Array::scalar(2.0).unwrap(), Array::vector(vec![1.0, 3.0]).unwrap()],
+                    tangents = [Array::scalar(0.5).unwrap(), Array::vector(vec![2.0, -1.0]).unwrap()],
+                    primal_outputs = [Array::vector(vec![2.0, 6.0]).unwrap()],
+                    tangent_outputs = [Array::vector(vec![4.5, -0.5]).unwrap()],
                 },
             ],
         );
@@ -6874,11 +6899,11 @@ mod tests {
             operation = MulOperation::new(),
             cases = [{
                 inputs = [
-                    (@known, Array::scalar(4.0)),
+                    (@known, Array::scalar(4.0).unwrap()),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(12.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(12.0).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = mul %1 %0
@@ -6894,8 +6919,8 @@ mod tests {
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(3.0), Array::scalar(3.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(3.0).unwrap(), Array::scalar(3.0).unwrap()],
             }],
         );
         check_operation_transposition!(
@@ -6911,10 +6936,10 @@ mod tests {
             input.clone() * input
         }
 
-        check_gradient!(square, at = Array::scalar(0.7), step = 1e-6, tolerance = 1e-6);
+        check_gradient!(square, at = Array::scalar(0.7).unwrap(), step = 1e-6, tolerance = 1e-6);
         check_gradient!(
             |input| input.abs(),
-            at = Array::scalar(Complex::new(0.7f64, -0.3)),
+            at = Array::scalar(Complex::new(0.7f64, -0.3)).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -6928,13 +6953,13 @@ mod tests {
 
         check_gradient!(
             |input| square(input).reduce(&[0], ReductionKind::Sum),
-            at = Array::vector(vec![0.7f64, -1.3, 2.1]),
+            at = Array::vector(vec![0.7f64, -1.3, 2.1]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
         check_gradient!(
             |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
-            at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]),
+            at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -6948,8 +6973,8 @@ mod tests {
 
         check_gradient!(
             scaled_sum_squares,
-            at = Array::vector(vec![0.7f64, -1.3, 2.1]),
-            with = Array::scalar(2.5),
+            at = Array::vector(vec![0.7f64, -1.3, 2.1]).unwrap(),
+            with = Array::scalar(2.5).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
@@ -6958,7 +6983,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
     fn test_check_gradient_rank_zero_array_unsupported_input_type() {
-        check_gradient!(|input| input, at = Array::scalar(0.7f32), step = 1e-3, tolerance = 1e-3);
+        check_gradient!(|input| input, at = Array::scalar(0.7f32).unwrap(), step = 1e-3, tolerance = 1e-3);
     }
 
     #[test]
@@ -6966,7 +6991,7 @@ mod tests {
     fn test_check_gradient_array_unsupported_input_type() {
         check_gradient!(
             |input| input.reduce(&[0], ReductionKind::Sum),
-            at = Array::vector(vec![0.7f32, -1.3]),
+            at = Array::vector(vec![0.7f32, -1.3]).unwrap(),
             step = 1e-3,
             tolerance = 1e-3,
         );

@@ -94,24 +94,33 @@ mod tests {
     #[test]
     fn test_round_interpretation() {
         // Ties resolve toward the nearest even integer.
-        assert_eq!(Array::scalar(2.5f64).round().unwrap(), Array::scalar(2.0f64));
-        assert_eq!(Array::scalar(3.5f64).round().unwrap(), Array::scalar(4.0f64));
-        assert_eq!(Array::scalar(-2.5f32).round().unwrap(), Array::scalar(-2.0f32));
-        assert_eq!(Array::scalar(2.3f64).round().unwrap(), Array::scalar(2.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.5)).round().unwrap(), Array::scalar(bf16::from_f32(2.0)));
-        assert_eq!(Array::scalar(f16::from_f32(3.5)).round().unwrap(), Array::scalar(f16::from_f32(4.0)));
+        assert_eq!(Array::scalar(2.5f64).unwrap().round().unwrap(), Array::scalar(2.0f64).unwrap());
+        assert_eq!(Array::scalar(3.5f64).unwrap().round().unwrap(), Array::scalar(4.0f64).unwrap());
+        assert_eq!(Array::scalar(-2.5f32).unwrap().round().unwrap(), Array::scalar(-2.0f32).unwrap());
+        assert_eq!(Array::scalar(2.3f64).unwrap().round().unwrap(), Array::scalar(2.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.5)).unwrap().round().unwrap(),
+            Array::scalar(bf16::from_f32(2.0)).unwrap()
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(3.5)).unwrap().round().unwrap(),
+            Array::scalar(f16::from_f32(4.0)).unwrap()
+        );
         // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).round().unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(f64::NAN).unwrap().round().unwrap().to_f64s()[0].is_nan());
 
-        assert_eq!(Array::vector(vec![0.5, 1.5, -2.5]).round().unwrap(), Array::vector(vec![0.0, 2.0, -2.0]),);
+        assert_eq!(
+            Array::vector(vec![0.5, 1.5, -2.5]).unwrap().round().unwrap(),
+            Array::vector(vec![0.0, 2.0, -2.0]).unwrap(),
+        );
     }
 
     #[test]
     fn test_round_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = RoundOperation::new(),
-            inputs = [Array::scalar(2.5)],
-            expected = Array::scalar(2.0),
+            inputs = [Array::scalar(2.5).unwrap()],
+            expected = Array::scalar(2.0).unwrap(),
         );
     }
 
@@ -122,8 +131,8 @@ mod tests {
             operation = RoundOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 1.5]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0.0, 2.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 1.5]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.0, 2.0]).unwrap())],
             }],
         );
     }
@@ -134,10 +143,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = RoundOperation::new(),
             cases = [{
-                primals = [Array::scalar(2.4)],
-                tangents = [Array::scalar(1.0)],
-                primal_outputs = [Array::scalar(2.0)],
-                tangent_outputs = [Array::scalar(0.0)],
+                primals = [Array::scalar(2.4).unwrap()],
+                tangents = [Array::scalar(1.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0).unwrap()],
+                tangent_outputs = [Array::scalar(0.0).unwrap()],
             }],
         );
     }
@@ -149,8 +158,8 @@ mod tests {
             operation = RoundOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
             }],
         );
     }

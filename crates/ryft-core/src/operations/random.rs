@@ -1356,7 +1356,7 @@ mod tests {
     fn test_categorical() {
         // With a logit gap of 10, a non-peak draw has probability ~9e-5 per sample, so all 64 samples must pick the
         // peak category.
-        let logits = Array::vector(vec![0.0, 10.0, 0.0]);
+        let logits = Array::vector(vec![0.0, 10.0, 0.0]).unwrap();
         let mut state = state(42, 0);
         for _ in 0..64 {
             let (advanced, sample) = state.categorical(&logits, 0).unwrap();

@@ -184,12 +184,12 @@ mod tests {
 
     #[test]
     fn test_atom() {
-        let constant = Atom::<Array>::Constant(Array::scalar(3.0));
+        let constant = Atom::<Array>::Constant(Array::scalar(3.0).unwrap());
         let variable = Atom::<Array>::Variable(ArrayType::scalar(DataType::F64));
 
         assert!(constant.is_constant());
         assert!(!constant.is_variable());
-        assert_eq!(constant.as_constant(), Some(&Array::scalar(3.0)));
+        assert_eq!(constant.as_constant(), Some(&Array::scalar(3.0).unwrap()));
         assert_eq!(constant.r#type().into_owned(), ArrayType::scalar(DataType::F64));
 
         assert!(variable.is_variable());

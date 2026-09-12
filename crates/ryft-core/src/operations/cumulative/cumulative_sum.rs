@@ -394,18 +394,18 @@ mod tests {
         };
 
         // Forward scans accumulate prefixes and reverse scans accumulate suffixes, along the selected axis only.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             interpret(&CumulativeSumOperation::new(1), &input),
-            Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]),
+            Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeSumOperation::new(1).with_reverse(true), &input),
-            Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]),
+            Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]).unwrap(),
         );
         assert_eq!(
             interpret(&CumulativeSumOperation::new(0), &input),
-            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]),
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap(),
         );
 
         // A zero-length scanned axis has nothing to accumulate and keeps the operand's exact type.
@@ -414,10 +414,11 @@ mod tests {
 
         // Low-precision payloads accumulate in their own encoding, so each partial sum is rounded to it: `f8e4m3fn`
         // cannot represent 7 and rounds the third prefix to the nearest representable value.
-        let low_precision = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 2.0, 4.0, 8.0]);
+        let low_precision =
+            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 2.0, 4.0, 8.0]).unwrap();
         assert_eq!(
             interpret(&CumulativeSumOperation::new(0), &low_precision),
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 3.0, 7.0, 15.0]),
+            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 3.0, 7.0, 15.0]).unwrap(),
         );
 
         // Complex payloads accumulate both components.
@@ -425,14 +426,16 @@ mod tests {
             ComplexNumber::new(1.0_f64, 1.0),
             ComplexNumber::new(2.0, -1.0),
             ComplexNumber::new(3.0, 5.0),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             interpret(&CumulativeSumOperation::new(0), &complex),
             Array::vector(vec![
                 ComplexNumber::new(1.0_f64, 1.0),
                 ComplexNumber::new(3.0, 0.0),
                 ComplexNumber::new(6.0, 5.0),
-            ]),
+            ])
+            .unwrap(),
         );
     }
 
@@ -445,8 +448,8 @@ mod tests {
             operation = CumulativeSumOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]))],
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap())],
             }],
         );
 
@@ -456,8 +459,8 @@ mod tests {
             operation = CumulativeSumOperation::new(0),
             axis_size = 3,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
-                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]))],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap())],
             }],
         );
     }
@@ -469,8 +472,8 @@ mod tests {
             operation = CumulativeSumOperation::new(0),
             axis_size = 2,
             cases = [{
-                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
-                outputs = [(@replicated, Array::vector(vec![1.0, 3.0, 6.0]))],
+                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
+                outputs = [(@replicated, Array::vector(vec![1.0, 3.0, 6.0]).unwrap())],
             }],
         );
     }
@@ -481,9 +484,10 @@ mod tests {
         // scanned one: nothing needs masking, the axis rides through onto the result unchanged, and — because the
         // scan consumes no axis — the rule claims no consumption evidence.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let extents = Array::vector(vec![1_i32, 3]);
+        let extents = Array::vector(vec![1_i32, 3]).unwrap();
         let input = ArrayBatch::new(
-            Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3, 2]), (1..=12).map(f64::from).collect()),
+            Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3, 2]), (1..=12).map(f64::from).collect())
+                .unwrap(),
             BatchAxis::new(0),
         )
         .unwrap()
@@ -508,9 +512,9 @@ mod tests {
         // policy to neutralize that padding first. Static array batching cannot, and says so rather than silently
         // scanning padding.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]).unwrap(), variable, vec![0])])
             .unwrap();
         assert_eq!(
             CumulativeSumOperation::new(0).batch(
@@ -594,20 +598,20 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-6),
             operation = CumulativeSumOperation::new(0),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0])],
-                tangents = [Array::vector(vec![1.0, 1.0, 1.0])],
-                primal_outputs = [Array::vector(vec![1.0, 3.0, 6.0])],
-                tangent_outputs = [Array::vector(vec![1.0, 2.0, 3.0])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 3.0, 6.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
             }],
         );
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-6),
             operation = CumulativeSumOperation::new(0).with_reverse(true),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0, 3.0])],
-                tangents = [Array::vector(vec![1.0, 1.0, 1.0])],
-                primal_outputs = [Array::vector(vec![6.0, 5.0, 3.0])],
-                tangent_outputs = [Array::vector(vec![3.0, 2.0, 1.0])],
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![6.0, 5.0, 3.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
             }],
         );
     }
@@ -617,14 +621,14 @@ mod tests {
         // Summing the prefix sums weights each input by the number of outputs it contributes to.
         // Finite differences independently confirm these reverse-mode weights.
         assert_eq!(
-            differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+            differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
                 .gradient(|xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)))
                 .unwrap(),
-            Array::vector(vec![3.0, 2.0, 1.0]),
+            Array::vector(vec![3.0, 2.0, 1.0]).unwrap(),
         );
         check_gradient!(
             |xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)),
-            at = Array::vector(vec![1.0, 2.0, 3.0]),
+            at = Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             step = 1e-3,
             tolerance = 1e-6,
         );
@@ -639,8 +643,8 @@ mod tests {
             operation = CumulativeSumOperation::new(0),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new_static(DataType::F64, [3])))],
-                output_cotangents = [Array::vector(vec![1.0, 1.0, 1.0])],
-                input_cotangents = [Array::vector(vec![3.0, 2.0, 1.0])],
+                output_cotangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[3] .
                     let %1:f64[3] = cumulative_sum [axis=0, reverse=true] %0
@@ -653,8 +657,8 @@ mod tests {
             operation = CumulativeSumOperation::new(0).with_reverse(true),
             cases = [{
                 inputs = [(@linear(type = ArrayType::new_static(DataType::F64, [3])))],
-                output_cotangents = [Array::vector(vec![1.0, 1.0, 1.0])],
-                input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
+                output_cotangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[3] .
                     let %1:f64[3] = cumulative_sum [axis=0] %0
@@ -668,9 +672,9 @@ mod tests {
     fn test_cumulative_sum_capability_over_eager_arrays() {
         // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
         // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0])));
-        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0])));
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0]).unwrap()));
         assert_eq!(
             input.cumulative_sum(1),
             Err(ProgramError::Type(TypeError::invalid(

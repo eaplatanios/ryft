@@ -106,29 +106,42 @@ mod tests {
 
     #[test]
     fn test_logistic_interpretation() {
-        assert_eq!(Array::scalar(0.5f32).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f32).exp())),);
-        assert_eq!(Array::scalar(0.5f64).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f64).exp())),);
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).logistic().unwrap(),
-            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
+            Array::scalar(0.5f32).unwrap().logistic().unwrap(),
+            Array::scalar(1.0 / (1.0 + (-0.5f32).exp())).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).logistic().unwrap(),
-            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
+            Array::scalar(0.5f64).unwrap().logistic().unwrap(),
+            Array::scalar(1.0 / (1.0 + (-0.5f64).exp())).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().logistic().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().logistic().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap(),
         );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let expected = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
-        assert_abs_diff_eq!(Array::scalar(input).logistic().unwrap(), Array::scalar(expected), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().logistic().unwrap(),
+            Array::scalar(expected).unwrap(),
+            epsilon = 1e-12
+        );
 
-        assert_eq!(Array::scalar(0.7).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),);
+        assert_eq!(
+            Array::scalar(0.7).unwrap().logistic().unwrap(),
+            Array::scalar(1.0 / (1.0 + (-0.7f64).exp())).unwrap(),
+        );
     }
 
     #[test]
     fn test_logistic_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogisticOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),
+            inputs = [Array::scalar(0.7).unwrap()],
+            expected = Array::scalar(1.0 / (1.0 + (-0.7f64).exp())).unwrap(),
         );
     }
 
@@ -139,10 +152,10 @@ mod tests {
             operation = LogisticOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![1.0 / (1.0 + (-0.5f64).exp()), 1.0 / (1.0 + 1.0f64.exp())])
+                    Array::vector(vec![1.0 / (1.0 + (-0.5f64).exp()), 1.0 / (1.0 + 1.0f64.exp())]).unwrap()
                 )],
             }],
         );
@@ -156,10 +169,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = LogisticOperation::new(),
             cases = [{
-                primals = [Array::scalar(0.7)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(logistic)],
-                tangent_outputs = [Array::scalar(expected_tangent)],
+                primals = [Array::scalar(0.7).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(logistic).unwrap()],
+                tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
             }],
         );
     }
@@ -172,8 +185,8 @@ mod tests {
             logistic * (ComplexNumber::new(1.0, 0.0) - logistic)
         };
         assert_abs_diff_eq!(
-            Array::scalar(expected),
-            differentiate_at(Array::scalar(input))
+            Array::scalar(expected).unwrap(),
+            differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
                 .gradient(|input| { input.logistic().unwrap() })
                 .unwrap(),

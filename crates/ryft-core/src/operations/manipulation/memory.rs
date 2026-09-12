@@ -288,7 +288,7 @@ mod tests {
         let operation = TransferToMemoryOperation::new(PINNED_HOST);
         // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
         // the value's carried type in the destination so that it matches the declared output type.
-        let input = Array::vector(vec![1.0, 2.0]);
+        let input = Array::vector(vec![1.0, 2.0]).unwrap();
         let outputs = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_partial_evaluation() {
-        let input = Array::vector(vec![1.0, 2.0]);
+        let input = Array::vector(vec![1.0, 2.0]).unwrap();
         check_operation_partial_evaluation!(
             operation = TransferToMemoryOperation::new(PINNED_HOST),
             inputs = [input.clone()],
@@ -329,7 +329,7 @@ mod tests {
         // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
         // destination — exactly like interpretation — and preserves the batch axis.
         let input = {
-            let value = Array::matrix(2, 3, vec![1.0; 6]);
+            let value = Array::matrix(2, 3, vec![1.0; 6]).unwrap();
             ArrayBatch::new(value, Some(0))
         }
         .unwrap();
@@ -345,9 +345,9 @@ mod tests {
 
         // Memory placement changes neither logical geometry nor the values carrying per-item extents.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0; 6]), BatchAxis::new(0))
+        let ragged_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1.0, 3.0]), variable, vec![0])])
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1.0, 3.0]).unwrap(), variable, vec![0])])
             .unwrap();
         let ragged_outputs = operation
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&ragged_input))
@@ -387,8 +387,8 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_differentiation() {
         // Eagerly the transfer is the identity on both the primal and the tangent.
-        let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]))
-            .jvp(Array::vector(vec![1.0, 0.5]), |x| Ok(x.transfer_to_memory(PINNED_HOST)))
+        let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
+            .jvp(Array::vector(vec![1.0, 0.5]).unwrap(), |x| Ok(x.transfer_to_memory(PINNED_HOST)))
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
         assert_eq!(tangent.to_f64s(), vec![1.0, 0.5]);
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = differentiate_at(Array::vector(vec![0.5, 1.5]))
+        let (value, gradient) = differentiate_at(Array::vector(vec![0.5, 1.5]).unwrap())
             .value_and_gradient(|x| {
                 let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
                 let back = on_host.transfer_to_memory(Memory::Device);
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_transposition() {
-        let (output, pullback) = differentiate_at(Array::vector(vec![2.0, 3.0]))
+        let (output, pullback) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
             .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)))
             .unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();

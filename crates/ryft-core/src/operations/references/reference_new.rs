@@ -410,11 +410,12 @@ mod tests {
     #[test]
     fn test_reference_new_operation_jvp() {
         let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
 
         // A live initial tangent seeds an independent tangent reference beside the primal allocation.
         let input = DifferentiationTracer::new(
-            DifferentiationDual::new(initial.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))).unwrap(),
+            DifferentiationDual::new(initial.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
+                .unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
@@ -425,8 +426,8 @@ mod tests {
         );
         assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
         let tangent_reference = outputs[0].tangent().as_value().unwrap();
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
-        tangent_reference.write(&TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))).unwrap();
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
+        tangent_reference.write(&TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())).unwrap();
         assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
 
         // A symbolic zero initial tangent is instantiated as a zero-filled tangent reference, because a reference type
@@ -436,7 +437,7 @@ mod tests {
         let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(
             outputs[0].tangent().as_value().unwrap().read(),
-            Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]))),
+            Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap())),
         );
     }
 
@@ -453,7 +454,7 @@ mod tests {
 
         // A mapped initial value allocates a reference batched at the same axis.
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let initial = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let initial = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let input =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(initial.clone(), BatchAxis::new(1)).unwrap());
         let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
@@ -467,7 +468,7 @@ mod tests {
 
         // A replicated initial value is broadcast along a new leading batch axis, so the allocation is always batched
         // and can later receive batched values.
-        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(initial));
         let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
         assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
@@ -477,10 +478,9 @@ mod tests {
         );
         assert_eq!(
             outputs[0].batch().value().read(),
-            Ok(TestIrValue::Array(Array::from_f64s(
-                ArrayType::new_static(DataType::F32, [2, 2]),
-                vec![1.0, 2.0, 1.0, 2.0],
-            ))),
+            Ok(TestIrValue::Array(
+                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 1.0, 2.0],).unwrap()
+            )),
         );
     }
 }

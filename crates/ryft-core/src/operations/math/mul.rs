@@ -217,7 +217,7 @@ impl std::ops::Mul<f64> for Array {
     fn mul(self, rhs: f64) -> Self::Output {
         let data_type = self.r#type().data_type();
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
+            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}"))).unwrap()
         });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -356,27 +356,30 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
+                &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
             ),
-            Ok(vec![Array::scalar(7.0f64)]),
+            Ok(vec![Array::scalar(7.0f64).unwrap()]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &MulOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0), Array::scalar(3.5)],
+                &[Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
             ),
-            Ok(vec![Array::scalar(7.0)]),
+            Ok(vec![Array::scalar(7.0).unwrap()]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
+                &[
+                    Array::scalar(Complex::new(1.0f64, 2.0)).unwrap(),
+                    Array::scalar(Complex::new(0.5f64, -1.0)).unwrap()
+                ],
             ),
-            Ok(vec![Array::scalar(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
+            Ok(vec![Array::scalar(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0)).unwrap()]),
         );
         assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
         assert_eq!(
@@ -389,8 +392,8 @@ mod tests {
     fn test_mul_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = MulOperation::new(),
-            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
-            expected = Array::scalar(7.0),
+            inputs = [Array::scalar(2.0).unwrap(), Array::scalar(3.5).unwrap()],
+            expected = Array::scalar(7.0).unwrap(),
         );
     }
 
@@ -402,10 +405,10 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                    (@replicated, Array::scalar(3.0)),
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap()),
+                    (@replicated, Array::scalar(3.0).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -6.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -6.0]).unwrap())],
             }],
         );
     }
@@ -416,10 +419,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = MulOperation::new(),
             cases = [{
-                primals = [Array::scalar(2.0), Array::scalar(5.0)],
-                tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
-                primal_outputs = [Array::scalar(10.0)],
-                tangent_outputs = [Array::scalar(13.0)],
+                primals = [Array::scalar(2.0).unwrap(), Array::scalar(5.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap(), Array::scalar(-1.0).unwrap()],
+                primal_outputs = [Array::scalar(10.0).unwrap()],
+                tangent_outputs = [Array::scalar(13.0).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = mul %0 %1
@@ -440,20 +443,22 @@ mod tests {
         let right = Complex::new(0.5f64, -1.0);
         let left_tangent = Complex::new(-0.5f64, 0.25);
         let right_tangent = Complex::new(2.0f64, 1.0);
-        let (primal, tangent) = differentiate_at((Array::vector(vec![left]), Array::vector(vec![right])))
-            .jvp((Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])), |(left, right)| {
-                Ok(left * right)
-            })
-            .unwrap();
-        assert_eq!(primal, Array::vector(vec![left * right]));
-        assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]));
-        let (_, pullback) = differentiate_at((Array::vector(vec![left]), Array::vector(vec![right])))
+        let (primal, tangent) =
+            differentiate_at((Array::vector(vec![left]).unwrap(), Array::vector(vec![right]).unwrap()))
+                .jvp(
+                    (Array::vector(vec![left_tangent]).unwrap(), Array::vector(vec![right_tangent]).unwrap()),
+                    |(left, right)| Ok(left * right),
+                )
+                .unwrap();
+        assert_eq!(primal, Array::vector(vec![left * right]).unwrap());
+        assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]).unwrap());
+        let (_, pullback) = differentiate_at((Array::vector(vec![left]).unwrap(), Array::vector(vec![right]).unwrap()))
             .vjp(|(left, right)| Ok(left * right))
             .unwrap();
         let cotangent = Complex::new(0.5f64, 3.0);
-        let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent])).unwrap();
-        assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]));
-        assert_eq!(right_cotangent, Array::vector(vec![cotangent * left]));
+        let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent]).unwrap()).unwrap();
+        assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]).unwrap());
+        assert_eq!(right_cotangent, Array::vector(vec![cotangent * left]).unwrap());
     }
 
     #[test]
@@ -466,11 +471,11 @@ mod tests {
             cases = [
                 {
                     inputs = [
-                        (@known, Array::scalar(4.0)),
+                        (@known, Array::scalar(4.0).unwrap()),
                         (@linear(type = scalar_type.clone())),
                     ],
-                    output_cotangents = [Array::scalar(1.0)],
-                    input_cotangents = [Array::scalar(4.0)],
+                    output_cotangents = [Array::scalar(1.0).unwrap()],
+                    input_cotangents = [Array::scalar(4.0).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = mul %1 %0
@@ -479,11 +484,11 @@ mod tests {
                 },
                 {
                     inputs = [
-                        (@known, Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0])),
+                        (@known, Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0]).unwrap()),
                         (@linear(type = scalar_type)),
                     ],
-                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0])],
-                    input_cotangents = [Array::scalar(20.0)],
+                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0]).unwrap()],
+                    input_cotangents = [Array::scalar(20.0).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[3], %1:f64[3] .
                         let %2:f64[3] = mul %1 %0
@@ -507,11 +512,11 @@ mod tests {
 
     #[test]
     fn test_mul_for_array() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(Mul::mul(&vector, &vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]));
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(Mul::mul(&vector, &vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]).unwrap());
         // Scaling by an `f64` preserves the array's element data type.
-        let scaled = Array::vector(vec![1.0f32, 2.0]) * 2.0;
-        assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]));
+        let scaled = Array::vector(vec![1.0f32, 2.0]).unwrap() * 2.0;
+        assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]).unwrap());
     }
 
     #[test]
@@ -550,21 +555,21 @@ mod tests {
     #[test]
     fn test_mul_for_array_low_precision() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
-        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]).unwrap();
         assert_eq!(Mul::mul(&left, &right).unwrap().to_f64s(), vec![0.5, 0.5]);
     }
 
     #[test]
     fn test_mul_for_array_complex() {
         // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
-        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]).unwrap();
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]).unwrap();
         let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
         let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
         assert_eq!(
             Mul::mul(&left, &right).unwrap(),
-            Array::vector(vec![left_values[0] * right_values[0], left_values[1] * right_values[1]]),
+            Array::vector(vec![left_values[0] * right_values[0], left_values[1] * right_values[1]]).unwrap(),
         );
     }
 }

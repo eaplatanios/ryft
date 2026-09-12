@@ -522,33 +522,34 @@ mod tests {
 
     #[test]
     fn test_rank_zero_array_elementwise_derivative_alignment() {
-        let value = Array::scalar(1.5f64);
+        let value = Array::scalar(1.5f64).unwrap();
         assert_eq!(value.align_tangent(&ArrayType::scalar(DataType::F64), &value), Ok(value.clone()));
-        assert_eq!(value.align_tangent(&ArrayType::scalar(DataType::F32), &value), Ok(Array::scalar(1.5f32)));
+        assert_eq!(value.align_tangent(&ArrayType::scalar(DataType::F32), &value), Ok(Array::scalar(1.5f32).unwrap()));
 
-        let value = Array::scalar(1.5f32);
+        let value = Array::scalar(1.5f32).unwrap();
         assert_eq!(value.unalign_cotangent(&ArrayType::scalar(DataType::F32)), Ok(value.clone()));
-        assert_eq!(value.unalign_cotangent(&ArrayType::scalar(DataType::F64)), Ok(Array::scalar(1.5f64)));
+        assert_eq!(value.unalign_cotangent(&ArrayType::scalar(DataType::F64)), Ok(Array::scalar(1.5f64).unwrap()));
     }
 
     #[test]
     fn test_array_elementwise_derivative_alignment() {
-        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let exemplar = Array::from_f64s(target.clone(), vec![0.0; 6]);
+        let exemplar = Array::from_f64s(target.clone(), vec![0.0; 6]).unwrap();
         assert_eq!(
             scalar.align_tangent(&target, &exemplar),
-            Ok(Array::from_f64s(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0])),
+            Ok(Array::from_f64s(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0]).unwrap()),
         );
 
         let cotangent = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        );
+        )
+        .unwrap();
         let target = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        assert_eq!(cotangent.unalign_cotangent(&target), Ok(Array::from_f64s(target, vec![5.0, 7.0, 9.0])),);
+        assert_eq!(cotangent.unalign_cotangent(&target), Ok(Array::from_f64s(target, vec![5.0, 7.0, 9.0]).unwrap()),);
 
-        let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         assert!(matches!(
             value.align_tangent(&target, &value),
@@ -566,9 +567,9 @@ mod tests {
 
         // The exemplar supplies the runtime extents through an operand edge, so one whose shape does not describe the
         // alignment target cannot stand in for it.
-        let value = Array::vector(vec![1.0, 2.0]);
+        let value = Array::vector(vec![1.0, 2.0]).unwrap();
         assert!(matches!(
-            value.align_tangent(&dynamic_type, &Array::scalar(0.0)),
+            value.align_tangent(&dynamic_type, &Array::scalar(0.0).unwrap()),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "cannot align tangent type f64[2] to output type f64[batch, 2] because the exemplar \
                                type f64[] has a different shape",
@@ -614,8 +615,8 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
-                ArrayIrValue::Array(Array::vector(vec![0.5, -0.25])),
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.5, -0.25]).unwrap()),
             ])
             .unwrap();
         let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
@@ -629,7 +630,7 @@ mod tests {
         assert_eq!(extents, vec![3, 2]);
         assert_eq!(
             primal_outputs,
-            vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.5, 1.75, 3.5, 3.75, 5.5, 5.75]))],
+            vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.5, 1.75, 3.5, 3.75, 5.5, 5.75]).unwrap())],
         );
     }
 
@@ -638,11 +639,12 @@ mod tests {
         let cotangent = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        );
+        )
+        .unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 0]),
-            Ok(Array::from_f64s(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])),
+            Ok(Array::from_f64s(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap()),
         );
 
         let cotangent = Array::from_f64s(
@@ -651,11 +653,12 @@ mod tests {
                 Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
             ),
             (1..=24).map(|value| value as f64).collect(),
-        );
+        )
+        .unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 2]),
-            Ok(Array::from_f64s(target, vec![126.0, 174.0]))
+            Ok(Array::from_f64s(target, vec![126.0, 174.0]).unwrap())
         );
 
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
@@ -693,15 +696,15 @@ mod tests {
         let outputs = unary_elementwise_jvp(
             &context,
             &NegOperation::<ArrayType>::new(),
-            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64).unwrap()).unwrap()],
             |_, input| Ok(input.clone()),
             |_| {
                 tangent_calls.set(tangent_calls.get() + 1);
-                Ok(Array::scalar(1.0f64))
+                Ok(Array::scalar(1.0f64).unwrap())
             },
         )
         .unwrap();
-        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64));
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64).unwrap());
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
         assert_eq!(tangent_calls.get(), 0);
 
@@ -709,7 +712,7 @@ mod tests {
         let outputs = unary_elementwise_jvp(
             &context,
             &NegOperation::<ArrayType>::new(),
-            &[DifferentiationDual::new(Array::scalar(2.0f64), Array::scalar(3.0f64)).unwrap()],
+            &[DifferentiationDual::new(Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()).unwrap()],
             |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
@@ -720,17 +723,17 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64));
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(6.0f64)));
+        assert_eq!(outputs[0].primal(), &Array::scalar(2.0f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(6.0f64).unwrap()));
         assert_eq!(tangent_calls.get(), 1);
         assert_eq!(primal_evaluations.get(), 1);
 
         let primal_evaluations = Cell::new(0);
-        let input_primal = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let input_primal = Array::scalar(2.0f32).unwrap().convert_element_type(DataType::F8E8M0FNU).unwrap();
         let outputs = unary_elementwise_jvp(
             &context,
             &NegOperation::<ArrayType>::new(),
-            &[DifferentiationDual::new(input_primal.clone(), Array::scalar(3.0f32)).unwrap()],
+            &[DifferentiationDual::new(input_primal.clone(), Array::scalar(3.0f32).unwrap()).unwrap()],
             |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
@@ -739,20 +742,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs[0].primal(), &input_primal);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(2.0f32)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(2.0f32).unwrap()));
         assert_eq!(primal_evaluations.get(), 2);
 
         let outputs = unary_elementwise_jvp(
             &context,
             &BooleanOutputOperation,
-            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
-            |_, _| Ok(Array::scalar(true)),
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64).unwrap()).unwrap()],
+            |_, _| Ok(Array::scalar(true).unwrap()),
             |_| -> Result<Array, DifferentiationError> {
                 panic!("zero-space output invoked its tangent function for a structural-zero input tangent")
             },
         )
         .unwrap();
-        assert_eq!(outputs[0].primal(), &Array::scalar(true));
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
@@ -761,8 +764,8 @@ mod tests {
             unary_elementwise_jvp(
                 &context,
                 &BooleanOutputOperation,
-                &[DifferentiationDual::new(Array::scalar(2.0f64), Array::scalar(3.0f64)).unwrap()],
-                |_, _| Ok(Array::scalar(true)),
+                &[DifferentiationDual::new(Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()).unwrap()],
+                |_, _| Ok(Array::scalar(true).unwrap()),
                 |_| -> Result<Array, DifferentiationError> { panic!("zero-space output invoked its tangent function") },
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -774,7 +777,7 @@ mod tests {
                 &NegOperation::<ArrayType>::new(),
                 &[],
                 |_, input: &Array| Ok(input.clone()),
-                |_| Ok(Array::scalar(1.0f64)),
+                |_| Ok(Array::scalar(1.0f64).unwrap()),
             ),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
         ));
@@ -785,8 +788,8 @@ mod tests {
         let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let left_calls = Cell::new(0);
         let right_calls = Cell::new(0);
-        let left_primal = Array::scalar(2.0f64);
-        let right_primal = Array::scalar(5.0f64);
+        let left_primal = Array::scalar(2.0f64).unwrap();
+        let right_primal = Array::scalar(5.0f64).unwrap();
         let compare = CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan);
 
         let outputs = binary_elementwise_jvp(
@@ -807,7 +810,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outputs[0].primal(), &Array::scalar(7.0f64));
+        assert_eq!(outputs[0].primal(), &Array::scalar(7.0f64).unwrap());
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
         assert_eq!((left_calls.get(), right_calls.get()), (0, 0));
 
@@ -818,7 +821,7 @@ mod tests {
                 DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
-            |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
+            |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0]).unwrap()),
             |_, _| -> Result<Array, DifferentiationError> {
                 panic!("zero-space output invoked its left tangent term function for structural-zero input tangents")
             },
@@ -827,7 +830,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outputs[0].primal(), &Array::scalar(true));
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
         assert!(
             matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
@@ -836,7 +839,7 @@ mod tests {
             &context,
             &AddOperation::<ArrayType>::new(),
             &[
-                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
+                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
             |_, left, right| Ok(left.clone() + right.clone()),
@@ -850,7 +853,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(3.0f64)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(3.0f64).unwrap()));
         assert_eq!((left_calls.get(), right_calls.get()), (1, 0));
 
         let outputs = binary_elementwise_jvp(
@@ -858,7 +861,7 @@ mod tests {
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
-                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64)).unwrap(),
+                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64).unwrap()).unwrap(),
             ],
             |_, left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
@@ -871,15 +874,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(4.0f64)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(4.0f64).unwrap()));
         assert_eq!((left_calls.get(), right_calls.get()), (1, 1));
 
         let outputs = binary_elementwise_jvp(
             &context,
             &AddOperation::<ArrayType>::new(),
             &[
-                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
-                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64)).unwrap(),
+                DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
+                DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64).unwrap()).unwrap(),
             ],
             |_, left, right| Ok(left.clone() + right.clone()),
             |operands, tangent| {
@@ -892,7 +895,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(23.0f64)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Array::scalar(23.0f64).unwrap()));
         assert_eq!((left_calls.get(), right_calls.get()), (2, 2));
 
         assert!(matches!(
@@ -900,10 +903,10 @@ mod tests {
                 &context,
                 &compare,
                 &[
-                    DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
+                    DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64).unwrap()).unwrap(),
                     DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
                 ],
-                |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
+                |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0]).unwrap()),
                 |_, _| -> Result<Array, DifferentiationError> {
                     panic!("zero-space output invoked its left tangent term function")
                 },
@@ -939,8 +942,8 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, pullback) = context
             .differentiate_at((
-                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
-                Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]),
+                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]).unwrap(),
+                Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]).unwrap(),
             ))
             .vjp(|(left, right)| Ok(left + right))
             .unwrap();
@@ -952,7 +955,8 @@ mod tests {
                 .to_string()
                 .contains("reshard")
         );
-        let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
+        let (left, right) =
+            pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0]).unwrap()).unwrap();
         assert_eq!(left.r#type().as_ref(), &sharded_type);
         assert_eq!(right.r#type().as_ref(), &replicated_type);
     }
@@ -1008,8 +1012,8 @@ mod tests {
             let mut primal_outputs = linearization
                 .primal()
                 .interpret(vec![
-                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone())),
-                    ArrayIrValue::Array(Array::vector(bias_values.clone())),
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone()).unwrap()),
+                    ArrayIrValue::Array(Array::vector(bias_values.clone()).unwrap()),
                 ])
                 .unwrap();
             let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
@@ -1026,15 +1030,15 @@ mod tests {
             ];
             let expected_loss =
                 values.iter().enumerate().map(|(index, value)| (value + bias_values[index % 2]).tanh()).sum::<f64>();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_loss)));
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_loss).unwrap()));
 
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0))];
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())];
             pullback_inputs.extend(residuals);
             assert_eq!(
                 pullback.interpret(pullback_inputs),
                 Ok(vec![
-                    ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents)),
-                    ArrayIrValue::Array(Array::vector(expected_bias_cotangents)),
+                    ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents).unwrap()),
+                    ArrayIrValue::Array(Array::vector(expected_bias_cotangents).unwrap()),
                 ]),
             );
         }
@@ -1083,21 +1087,23 @@ mod tests {
             let mut primal_outputs = linearization
                 .primal()
                 .interpret(vec![
-                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone())),
-                    ArrayIrValue::Array(Array::vector(scale_values.clone())),
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone()).unwrap()),
+                    ArrayIrValue::Array(Array::vector(scale_values.clone()).unwrap()),
                 ])
                 .unwrap();
             let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0))];
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())];
             pullback_inputs.extend(residuals);
 
             // The same computation differentiated eagerly at this concrete extent, which never involves a runtime
             // extent and therefore never takes the replication path.
-            let (eager_loss, eager_pullback) =
-                differentiate_at((Array::matrix(rows, 2, values), Array::vector(scale_values.clone())))
-                    .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)))
-                    .unwrap();
-            let (input_cotangent, scale_cotangent) = eager_pullback.apply(Array::scalar(1.0)).unwrap();
+            let (eager_loss, eager_pullback) = differentiate_at((
+                Array::matrix(rows, 2, values).unwrap(),
+                Array::vector(scale_values.clone()).unwrap(),
+            ))
+            .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)))
+            .unwrap();
+            let (input_cotangent, scale_cotangent) = eager_pullback.apply(Array::scalar(1.0).unwrap()).unwrap();
             assert_eq!(primal_outputs, vec![ArrayIrValue::Array(eager_loss)]);
             assert_eq!(
                 pullback.interpret(pullback_inputs),

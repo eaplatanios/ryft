@@ -608,26 +608,26 @@ mod tests {
     #[test]
     fn test_array_low_precision_float_arithmetic() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
-        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]).unwrap();
         assert_eq!(left.rem(&right).unwrap().to_f64s(), vec![0.0, 0.0]);
     }
 
     #[test]
     fn test_array_math() {
         assert_abs_diff_eq!(
-            Array::vector(vec![1.0, 4.0]).sqrt().unwrap(),
-            Array::vector(vec![1.0, 2.0]),
+            Array::vector(vec![1.0, 4.0]).unwrap().sqrt().unwrap(),
+            Array::vector(vec![1.0, 2.0]).unwrap(),
             epsilon = 1e-12,
         );
         assert_abs_diff_eq!(
-            Array::vector(vec![1.0, std::f64::consts::E]).log().unwrap(),
-            Array::vector(vec![0.0, 1.0]),
+            Array::vector(vec![1.0, std::f64::consts::E]).unwrap().log().unwrap(),
+            Array::vector(vec![0.0, 1.0]).unwrap(),
             epsilon = 1e-12,
         );
         assert_abs_diff_eq!(
-            Array::vector(vec![1.0]).atan2(&Array::vector(vec![1.0])).unwrap(),
-            Array::vector(vec![std::f64::consts::FRAC_PI_4]),
+            Array::vector(vec![1.0]).unwrap().atan2(&Array::vector(vec![1.0]).unwrap()).unwrap(),
+            Array::vector(vec![std::f64::consts::FRAC_PI_4]).unwrap(),
             epsilon = 1e-12,
         );
     }
@@ -656,19 +656,23 @@ mod tests {
                     std::f64::consts::FRAC_PI_4,
                     3.0 * std::f64::consts::FRAC_PI_4
                 ],
-            ),
+            )
+            .unwrap(),
             epsilon = 1e-12,
         );
-        let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]);
-        let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]);
-        assert_eq!(bases.pow(&exponents).unwrap(), Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]),);
+        let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]).unwrap();
+        let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            bases.pow(&exponents).unwrap(),
+            Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]).unwrap(),
+        );
         assert!(matches!(
-            Array::scalar(1i32).atan2(&Array::scalar(1.0f64)),
+            Array::scalar(1i32).unwrap().atan2(&Array::scalar(1.0f64).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`atan2` does not support input data type `i32`",
         ));
         assert!(matches!(
-            Array::scalar(2.0f64).pow(&Array::scalar(3i32)),
+            Array::scalar(2.0f64).unwrap().pow(&Array::scalar(3i32).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`pow` does not support input data type `i32`",
         ));
@@ -676,14 +680,14 @@ mod tests {
 
     #[test]
     fn test_array_real_float_math_uses_typed_storage() {
-        let input = Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]);
-        assert_eq!(input.floor().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 3.0]));
-        assert_eq!(input.ceil().unwrap(), Array::vector(vec![-1.0, -0.0, 3.0, 4.0]));
-        assert_eq!(input.round().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 4.0]));
-        assert_eq!(Array::vector(vec![1.0f64, 4.0]).rsqrt().unwrap(), Array::vector(vec![1.0, 0.5]));
+        let input = Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]).unwrap();
+        assert_eq!(input.floor().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 3.0]).unwrap());
+        assert_eq!(input.ceil().unwrap(), Array::vector(vec![-1.0, -0.0, 3.0, 4.0]).unwrap());
+        assert_eq!(input.round().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 4.0]).unwrap());
+        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().rsqrt().unwrap(), Array::vector(vec![1.0, 0.5]).unwrap());
         assert_abs_diff_eq!(
-            Array::vector(vec![-1.0f64, 0.0, 1.0]).erf().unwrap(),
-            Array::vector(vec![-0.8427007929497149, 0.0, 0.8427007929497149]),
+            Array::vector(vec![-1.0f64, 0.0, 1.0]).unwrap().erf().unwrap(),
+            Array::vector(vec![-0.8427007929497149, 0.0, 0.8427007929497149]).unwrap(),
             epsilon = 1e-12,
         );
     }
@@ -691,8 +695,8 @@ mod tests {
     #[test]
     fn test_array_dot() {
         // Ordinary matrix multiplication uses the generalized contraction order.
-        let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
         let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
         let product = lhs.dot(&rhs, &dimensions);
         assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
@@ -729,8 +733,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lhs.dot(&rhs, &dimensions).elements::<i4>(), Ok(vec![i4::new(-4).unwrap()]));
-        let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]);
-        let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]);
+        let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]).unwrap();
+        let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]).unwrap();
         assert_eq!(
             lhs.dot(&rhs, &dimensions).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(9.5, 14.5)]),
@@ -738,8 +742,8 @@ mod tests {
 
         // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
         // element data type.
-        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]);
-        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]);
+        let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
+        let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
         let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32);
         assert_eq!(product.r#type().data_type(), DataType::F32);
         assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
@@ -753,9 +757,9 @@ mod tests {
     #[test]
     fn test_array_complex_math() {
         // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
         let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
-        let expect = |values: [ComplexNumber<f64>; 2]| Array::vector(values.to_vec());
+        let expect = |values: [ComplexNumber<f64>; 2]| Array::vector(values.to_vec()).unwrap();
         assert_abs_diff_eq!(left.log().unwrap(), expect([left_values[0].ln(), left_values[1].ln()]), epsilon = 1e-12);
         assert_abs_diff_eq!(
             left.sqrt().unwrap(),
@@ -768,7 +772,7 @@ mod tests {
     fn test_array_integer_semantics() {
         // Remainder by zero returns a structured error.
         assert!(matches!(
-            Array::vector(vec![1u8]).rem(&Array::vector(vec![0u8])),
+            Array::vector(vec![1u8]).unwrap().rem(&Array::vector(vec![0u8]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message
                     == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
@@ -799,7 +803,7 @@ mod tests {
             Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
         );
         assert!(matches!(
-            Array::scalar(1u8).sign(),
+            Array::scalar(1u8).unwrap().sign(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot compute the sign of a scalar of data type `u8`",
         ));

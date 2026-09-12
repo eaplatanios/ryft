@@ -108,29 +108,33 @@ mod tests {
 
     #[test]
     fn test_rsqrt_interpretation() {
-        assert_eq!(Array::scalar(0.5f32).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()));
-        assert_eq!(Array::scalar(0.5f64).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()));
+        assert_eq!(Array::scalar(0.5f32).unwrap().rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()).unwrap());
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).rsqrt().unwrap(),
-            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().rsqrt().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).rsqrt().unwrap(),
-            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())),
+            Array::scalar(f16::from_f32(0.5)).unwrap().rsqrt().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())).unwrap(),
         );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let expected = ComplexNumber::new(1.0, 0.0) / input.sqrt();
-        assert_abs_diff_eq!(Array::scalar(input).rsqrt().unwrap(), Array::scalar(expected), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            Array::scalar(input).unwrap().rsqrt().unwrap(),
+            Array::scalar(expected).unwrap(),
+            epsilon = 1e-12
+        );
 
-        assert_eq!(Array::scalar(4.0).rsqrt().unwrap(), Array::scalar(0.5),);
+        assert_eq!(Array::scalar(4.0).unwrap().rsqrt().unwrap(), Array::scalar(0.5).unwrap(),);
     }
 
     #[test]
     fn test_rsqrt_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = RsqrtOperation::new(),
-            inputs = [Array::scalar(4.0)],
-            expected = Array::scalar(0.5),
+            inputs = [Array::scalar(4.0).unwrap()],
+            expected = Array::scalar(0.5).unwrap(),
         );
     }
 
@@ -141,8 +145,8 @@ mod tests {
             operation = RsqrtOperation::new(),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 4.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0 / 0.5f64.sqrt(), 0.5]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 4.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0 / 0.5f64.sqrt(), 0.5]).unwrap())],
             }],
         );
     }
@@ -154,10 +158,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = RsqrtOperation::new(),
             cases = [{
-                primals = [Array::scalar(4.0)],
-                tangents = [Array::scalar(3.0)],
-                primal_outputs = [Array::scalar(0.5)],
-                tangent_outputs = [Array::scalar(expected_tangent)],
+                primals = [Array::scalar(4.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(0.5).unwrap()],
+                tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
             }],
         );
     }
@@ -168,8 +172,8 @@ mod tests {
         // d(1/√z)/dz = -z^{-3/2} / 2 on the principal branch.
         let expected = input.powc(ComplexNumber::new(-1.5, 0.0)) * ComplexNumber::new(-0.5, 0.0);
         assert_abs_diff_eq!(
-            Array::scalar(expected),
-            differentiate_at(Array::scalar(input))
+            Array::scalar(expected).unwrap(),
+            differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
                 .gradient(|input| { input.rsqrt().unwrap() })
                 .unwrap(),

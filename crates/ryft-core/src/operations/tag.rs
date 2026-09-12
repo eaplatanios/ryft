@@ -163,9 +163,9 @@ mod tests {
             TagOperation::new("residual").interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(3.0)],
+                &[Array::scalar(3.0).unwrap()],
             ),
-            Ok(vec![Array::scalar(3.0)]),
+            Ok(vec![Array::scalar(3.0).unwrap()]),
         );
     }
 
@@ -173,8 +173,8 @@ mod tests {
     fn test_tag_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = TagOperation::new("residual"),
-            inputs = [Array::scalar(3.0)],
-            expected = Array::scalar(3.0),
+            inputs = [Array::scalar(3.0).unwrap()],
+            expected = Array::scalar(3.0).unwrap(),
         );
     }
 
@@ -185,8 +185,8 @@ mod tests {
             operation = TagOperation::new("residual"),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]))],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]).unwrap())],
             }],
         );
     }
@@ -197,10 +197,10 @@ mod tests {
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = TagOperation::new("residual"),
             cases = [{
-                primals = [Array::scalar(3.0)],
-                tangents = [Array::scalar(2.0)],
-                primal_outputs = [Array::scalar(3.0)],
-                tangent_outputs = [Array::scalar(2.0)],
+                primals = [Array::scalar(3.0).unwrap()],
+                tangents = [Array::scalar(2.0).unwrap()],
+                primal_outputs = [Array::scalar(3.0).unwrap()],
+                tangent_outputs = [Array::scalar(2.0).unwrap()],
             }],
         );
     }
@@ -212,8 +212,8 @@ mod tests {
             operation = TagOperation::new("residual"),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(2.0)],
-                input_cotangents = [Array::scalar(2.0)],
+                output_cotangents = [Array::scalar(2.0).unwrap()],
+                input_cotangents = [Array::scalar(2.0).unwrap()],
             }],
         );
     }

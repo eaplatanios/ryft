@@ -139,7 +139,7 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 /// let ArrayIrValue::Array(scalar) = scalar else {
 ///     unreachable!("dimension_to_scalar always returns an array member");
 /// };
-/// assert_eq!(scalar, Array::scalar(3_i64));
+/// assert_eq!(scalar, Array::scalar(3_i64).unwrap());
 /// # Ok(())
 /// # }
 /// ```
@@ -216,19 +216,22 @@ mod tests {
         );
 
         let zero = DimensionValue::new(dimension_type.clone(), 0).unwrap();
-        assert_eq!(zero.to_scalar(), Ok(Array::scalar(0_i64)));
+        assert_eq!(zero.to_scalar(), Ok(Array::scalar(0_i64).unwrap()));
         let maximum_type = DimensionType::new(DimensionVariable::new(
             "maximum",
             DimensionBounds::new(0, Some(MAX_DIMENSION_EXTENT + 1)).unwrap(),
         ));
         let maximum = DimensionValue::new(maximum_type, MAX_DIMENSION_EXTENT).unwrap();
-        assert_eq!(maximum.to_scalar(), Ok(Array::scalar(i64::try_from(MAX_DIMENSION_EXTENT).unwrap())));
+        assert_eq!(maximum.to_scalar(), Ok(Array::scalar(i64::try_from(MAX_DIMENSION_EXTENT).unwrap()).unwrap()));
 
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 7).unwrap());
-        assert_eq!(context.bind(operation, Vec::new(), &[input]), Ok(vec![ArrayIrValue::Array(Array::scalar(7_i64))]),);
         assert_eq!(
-            context.bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i64))]),
+            context.bind(operation, Vec::new(), &[input]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(7_i64).unwrap())]),
+        );
+        assert_eq!(
+            context.bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i64).unwrap())]),
             Err(TypeError::invalid("expected dimension type but got array type").into()),
         );
         check_operation_partial_evaluation!(
@@ -242,7 +245,7 @@ mod tests {
                         )),
                     ],
                     outputs = [
-                        (@known, ArrayIrValue::Array(Array::scalar(7_i64))),
+                        (@known, ArrayIrValue::Array(Array::scalar(7_i64).unwrap())),
                     ],
                     residual_instructions = 0,
                 },
@@ -256,7 +259,7 @@ mod tests {
                         )),
                     ],
                     outputs = [
-                        (@residual, ArrayIrValue::Array(Array::scalar(7_i64))),
+                        (@residual, ArrayIrValue::Array(Array::scalar(7_i64).unwrap())),
                     ],
                     residual_instructions = 1,
                 },

@@ -180,17 +180,23 @@ mod tests {
     #[test]
     fn test_array_cumulative_sum() {
         // Forward scans accumulate prefixes along the selected axis only, and reverse scans accumulate suffixes.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(input.cumulative_sum(1), Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0])));
-        assert_eq!(input.reverse_cumulative_sum(1), Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0])));
-        assert_eq!(input.cumulative_sum(0), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0])));
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(input.cumulative_sum(1), Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap()));
+        assert_eq!(
+            input.reverse_cumulative_sum(1),
+            Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]).unwrap())
+        );
+        assert_eq!(input.cumulative_sum(0), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap()));
 
         // Integer payloads accumulate with the element type's own wrapping arithmetic.
-        assert_eq!(Array::vector(vec![1_i32, 2, 3, 4]).cumulative_sum(0), Ok(Array::vector(vec![1_i32, 3, 6, 10])));
+        assert_eq!(
+            Array::vector(vec![1_i32, 2, 3, 4]).unwrap().cumulative_sum(0),
+            Ok(Array::vector(vec![1_i32, 3, 6, 10]).unwrap())
+        );
 
         // A non-numeric payload has no summation, and the scan geometry is validated against the operand type.
         assert_eq!(
-            Array::vector(vec![true, false]).cumulative_sum(0),
+            Array::vector(vec![true, false]).unwrap().cumulative_sum(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_sum` requires numeric inputs but got bool".to_string(),
             ))),
@@ -212,8 +218,10 @@ mod tests {
         let low_precision_type = ArrayType::new_static(DataType::BF16, [5]);
         let increment = f64::from(bf16::from_f64(0.005));
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![1.0, 0.005, 0.005, 0.005, 0.005]).cumulative_sum(0),
-            Ok(Array::from_f64s(low_precision_type, vec![1.0, 1.0078125, 1.015625, 1.0234375, 1.03125])),
+            Array::from_f64s(low_precision_type.clone(), vec![1.0, 0.005, 0.005, 0.005, 0.005])
+                .unwrap()
+                .cumulative_sum(0),
+            Ok(Array::from_f64s(low_precision_type, vec![1.0, 1.0078125, 1.015625, 1.0234375, 1.03125]).unwrap()),
         );
         // Each of those partial sums is the re-encoding of the previous one plus the increment, and the exact sum of
         // all four increments rounds one step below the scan's last element.
@@ -234,20 +242,22 @@ mod tests {
                 ComplexNumber::new(2.0, -1.0),
                 ComplexNumber::new(3.0, 5.0),
             ])
+            .unwrap()
             .cumulative_sum(0),
             Ok(Array::vector(vec![
                 ComplexNumber::new(1.0_f64, 1.0),
                 ComplexNumber::new(3.0, 0.0),
                 ComplexNumber::new(6.0, 5.0),
-            ])),
+            ])
+            .unwrap()),
         );
 
         // The result carries the operand's complete type, including a non-default physical layout.
         let laid_out =
             ArrayType::new_static(DataType::F32, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
         assert_eq!(
-            Array::from_f64s(laid_out.clone(), vec![1.0, 2.0, 3.0, 4.0]).cumulative_sum(1),
-            Ok(Array::from_f64s(laid_out, vec![1.0, 3.0, 3.0, 7.0])),
+            Array::from_f64s(laid_out.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap().cumulative_sum(1),
+            Ok(Array::from_f64s(laid_out, vec![1.0, 3.0, 3.0, 7.0]).unwrap()),
         );
 
         // A zero-length scanned axis has nothing to accumulate.
@@ -258,21 +268,28 @@ mod tests {
     #[test]
     fn test_array_cumulative_product() {
         // Forward scans accumulate prefixes along the selected axis only, and reverse scans accumulate suffixes.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(input.cumulative_product(1), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0])));
-        let reversed = Array::matrix(2, 3, vec![6.0, 6.0, 3.0, 120.0, 30.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            input.cumulative_product(1),
+            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]).unwrap())
+        );
+        let reversed = Array::matrix(2, 3, vec![6.0, 6.0, 3.0, 120.0, 30.0, 6.0]).unwrap();
         assert_eq!(input.reverse_cumulative_product(1), Ok(reversed));
 
         // Integer payloads accumulate with the element type's own arithmetic, and complex payloads multiply as
         // complex numbers.
-        assert_eq!(Array::vector(vec![1_i32, 2, 3, 4]).cumulative_product(0), Ok(Array::vector(vec![1_i32, 2, 6, 24])));
         assert_eq!(
-            Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0); 3]).cumulative_product(0),
+            Array::vector(vec![1_i32, 2, 3, 4]).unwrap().cumulative_product(0),
+            Ok(Array::vector(vec![1_i32, 2, 6, 24]).unwrap())
+        );
+        assert_eq!(
+            Array::vector(vec![ComplexNumber::new(0.0_f64, 1.0); 3]).unwrap().cumulative_product(0),
             Ok(Array::vector(vec![
                 ComplexNumber::new(0.0_f64, 1.0),
                 ComplexNumber::new(-1.0, 0.0),
                 ComplexNumber::new(0.0, -1.0),
-            ])),
+            ])
+            .unwrap()),
         );
 
         // Accumulation happens in the operand's own encoding, so every partial product is re-encoded rather than only
@@ -280,12 +297,14 @@ mod tests {
         // an even mantissa, which drags the fourth prefix one step below the exactly accumulated product.
         let low_precision_type = ArrayType::new_static(DataType::F8E4M3FN, [4]);
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![2.0, 1.25, 1.25, 1.25]).cumulative_product(0),
-            Ok(Array::from_f64s(low_precision_type, vec![2.0, 2.5, 3.0, 3.75])),
+            Array::from_f64s(low_precision_type.clone(), vec![2.0, 1.25, 1.25, 1.25])
+                .unwrap()
+                .cumulative_product(0),
+            Ok(Array::from_f64s(low_precision_type, vec![2.0, 2.5, 3.0, 3.75]).unwrap()),
         );
         assert_eq!(2.0 * 1.25 * 1.25 * 1.25, 3.90625);
         assert_eq!(
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![3.90625]).to_f64s(),
+            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![3.90625]).unwrap().to_f64s(),
             vec![4.0],
         );
 
@@ -295,7 +314,7 @@ mod tests {
 
         // A non-numeric payload has no multiplication, and the scan geometry is validated against the operand type.
         assert_eq!(
-            Array::vector(vec![true, false]).cumulative_product(0),
+            Array::vector(vec![true, false]).unwrap().cumulative_product(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_product` requires numeric inputs but got bool".to_string(),
             ))),
@@ -311,30 +330,39 @@ mod tests {
     #[test]
     fn test_array_cumulative_extrema() {
         // Both extrema scan the selected axis in both directions, selecting rather than combining elements.
-        let input = Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]);
-        assert_eq!(input.cumulative_max(1), Ok(Array::matrix(2, 3, vec![3.0, 3.0, 4.0, 1.0, 5.0, 9.0])));
-        assert_eq!(input.reverse_cumulative_max(1), Ok(Array::matrix(2, 3, vec![4.0, 4.0, 4.0, 9.0, 9.0, 9.0])));
-        assert_eq!(input.cumulative_min(1), Ok(Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0])));
-        assert_eq!(input.reverse_cumulative_min(1), Ok(Array::matrix(2, 3, vec![1.0, 1.0, 4.0, 1.0, 5.0, 9.0])));
+        let input = Array::matrix(2, 3, vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap();
+        assert_eq!(input.cumulative_max(1), Ok(Array::matrix(2, 3, vec![3.0, 3.0, 4.0, 1.0, 5.0, 9.0]).unwrap()));
+        assert_eq!(
+            input.reverse_cumulative_max(1),
+            Ok(Array::matrix(2, 3, vec![4.0, 4.0, 4.0, 9.0, 9.0, 9.0]).unwrap())
+        );
+        assert_eq!(input.cumulative_min(1), Ok(Array::matrix(2, 3, vec![3.0, 1.0, 1.0, 1.0, 1.0, 1.0]).unwrap()));
+        assert_eq!(
+            input.reverse_cumulative_min(1),
+            Ok(Array::matrix(2, 3, vec![1.0, 1.0, 4.0, 1.0, 5.0, 9.0]).unwrap())
+        );
 
         // Selection happens in the operand's own element type, so a low-precision payload is returned bit for bit
         // rather than through a widened intermediate, and signed integers order below zero as expected.
         let low_precision_type = ArrayType::new_static(DataType::F8E5M2, [3]);
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![0.5, 6.0, 1.5]).cumulative_max(0),
-            Ok(Array::from_f64s(low_precision_type, vec![0.5, 6.0, 6.0])),
+            Array::from_f64s(low_precision_type.clone(), vec![0.5, 6.0, 1.5]).unwrap().cumulative_max(0),
+            Ok(Array::from_f64s(low_precision_type, vec![0.5, 6.0, 6.0]).unwrap()),
         );
-        assert_eq!(Array::vector(vec![7_i32, -2, 3]).cumulative_min(0), Ok(Array::vector(vec![7_i32, -2, -2])));
+        assert_eq!(
+            Array::vector(vec![7_i32, -2, 3]).unwrap().cumulative_min(0),
+            Ok(Array::vector(vec![7_i32, -2, -2]).unwrap())
+        );
 
         // Complex numbers are unordered and Booleans are not numeric, so neither has a running extremum.
         assert_eq!(
-            Array::vector(vec![ComplexNumber::new(1.0_f64, 0.0); 2]).cumulative_max(0),
+            Array::vector(vec![ComplexNumber::new(1.0_f64, 0.0); 2]).unwrap().cumulative_max(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_max` requires real numeric inputs but got c128".to_string(),
             ))),
         );
         assert_eq!(
-            Array::vector(vec![true, false]).cumulative_min(0),
+            Array::vector(vec![true, false]).unwrap().cumulative_min(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_min` requires real numeric inputs but got bool".to_string(),
             ))),
@@ -346,34 +374,34 @@ mod tests {
         // Folding the guarded pairwise primitive keeps the scan exact where exponentiating directly would overflow:
         // two equal operands add exactly `log(2)` at any magnitude, in both directions.
         assert_eq!(
-            Array::vector(vec![1000.0, 1000.0]).cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2])),
+            Array::vector(vec![1000.0, 1000.0]).unwrap().cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2]).unwrap()),
         );
         assert_eq!(
-            Array::vector(vec![1000.0, 1000.0]).reverse_cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![1000.0 + std::f64::consts::LN_2, 1000.0])),
+            Array::vector(vec![1000.0, 1000.0]).unwrap().reverse_cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![1000.0 + std::f64::consts::LN_2, 1000.0]).unwrap()),
         );
 
         // Negative infinity is the combining operator's identity, so it neither contributes to nor poisons a later
         // prefix, while a NaN operand propagates.
         assert_eq!(
-            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0])),
+            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap().cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap()),
         );
-        let with_nan = Array::vector(vec![1.0, f64::NAN, 2.0]).cumulative_log_sum_exp(0).unwrap().to_f64s();
+        let with_nan = Array::vector(vec![1.0, f64::NAN, 2.0]).unwrap().cumulative_log_sum_exp(0).unwrap().to_f64s();
         assert_eq!(with_nan[0], 1.0);
         assert!(with_nan[1].is_nan() && with_nan[2].is_nan());
 
         // Accumulation happens in the operand's own encoding, so each partial result is rounded to it.
         let single_precision = ArrayType::new_static(DataType::F32, [2]);
         assert_eq!(
-            Array::from_f64s(single_precision.clone(), vec![0.0, 0.0]).cumulative_log_sum_exp(0),
-            Ok(Array::from_f64s(single_precision, vec![0.0, f64::from(std::f32::consts::LN_2)])),
+            Array::from_f64s(single_precision.clone(), vec![0.0, 0.0]).unwrap().cumulative_log_sum_exp(0),
+            Ok(Array::from_f64s(single_precision, vec![0.0, f64::from(std::f32::consts::LN_2)]).unwrap()),
         );
 
         // The exponential and the logarithm have no meaning for the integer element types.
         assert_eq!(
-            Array::vector(vec![1_i32, 2]).cumulative_log_sum_exp(0),
+            Array::vector(vec![1_i32, 2]).unwrap().cumulative_log_sum_exp(0),
             Err(ProgramError::Type(TypeError::invalid(
                 "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
             ))),

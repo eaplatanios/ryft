@@ -314,10 +314,10 @@ mod tests {
         let (_, program): (Array, Program<Array, TestArrayOperation, Array, Array>) = domain
             .interpret_and_trace(
                 |x| {
-                    let with_constant = x.clone() + x.context().constant(Array::scalar(1.0));
+                    let with_constant = x.clone() + x.context().constant(Array::scalar(1.0).unwrap());
                     with_constant.neg()
                 },
-                Array::scalar(2.0),
+                Array::scalar(2.0).unwrap(),
             )
             .unwrap();
 
@@ -341,7 +341,7 @@ mod tests {
     fn test_statistics_input_and_constant_outputs_have_depth_zero() {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(1.0));
+        let constant = builder.add_constant(Array::scalar(1.0).unwrap());
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![input, constant], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
         let statistics = program.statistics();
@@ -355,8 +355,9 @@ mod tests {
     #[test]
     fn test_statistics_zero_input_instruction_output_has_depth_one() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
-        let produced =
-            builder.add_instruction(ConstantOperation::new(Array::scalar(1.0)), vec![], vec![], None).unwrap()[0];
+        let produced = builder
+            .add_instruction(ConstantOperation::new(Array::scalar(1.0).unwrap()), vec![], vec![], None)
+            .unwrap()[0];
         let program: Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
         let statistics = program.statistics();
@@ -403,7 +404,7 @@ mod tests {
                     let negated = x.neg()?;
                     Ok((negated.clone(), negated))
                 },
-                Array::scalar(2.0),
+                Array::scalar(2.0).unwrap(),
             )
             .unwrap();
         let statistics = program.statistics();
@@ -549,7 +550,7 @@ mod tests {
     fn test_statistics_aggregates_count_shared_regions_once() {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
-        let region_constant = region_builder.add_constant(Array::scalar(1.0));
+        let region_constant = region_builder.add_constant(Array::scalar(1.0).unwrap());
         let region_output = region_builder
             .add_instruction(TestRegionOperation::Add, vec![], vec![region_input, region_constant], None)
             .unwrap()[0];
@@ -596,7 +597,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body = builder.import_region(leaf.entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(1.0));
+        let constant = builder.add_constant(Array::scalar(1.0).unwrap());
         let added = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, constant], None).unwrap()[0];
         let output = builder
             .add_instruction(

@@ -285,7 +285,7 @@ impl_differentiable_operation! {
 /// ```rust
 /// # use ryft_core::{Array, Broadcast, ProgramError, StaticShape};
 /// # fn main() -> Result<(), ProgramError> {
-/// let input = Array::vector(vec![1.0, 2.0, 3.0]);
+/// let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
 /// let output = input.broadcast_to(StaticShape::new(vec![2, 3]))?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 /// assert_eq!(input.broadcast_leading([2])?, output);
@@ -993,11 +993,11 @@ where
 /// # use ryft_core::{Array, ArrayIrValue, DynamicBroadcast, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
 /// let output = input.dynamic_broadcast_to_sizes(&[2, 3])?;
 /// assert_eq!(
 ///     output,
-///     ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
+///     ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()),
 /// );
 /// # Ok(())
 /// # }
@@ -1487,7 +1487,7 @@ mod tests {
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
         // Interpretation replicates the payload along the added axis.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let output = operation
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -1513,34 +1513,40 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(2)]),
         );
-        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).broadcast(target, &[0, 2]).unwrap();
+        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap().broadcast(target, &[0, 2]).unwrap();
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
 
         // Static unit axes stretch to the target extent, and empty target dimensions produce empty payloads.
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let output = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]).broadcast(target, &[0, 1]).unwrap();
+        let output = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]).unwrap().broadcast(target, &[0, 1]).unwrap();
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
-        let output = Array::vector(vec![1.0, 2.0]).broadcast(target, &[1]).unwrap();
+        let output = Array::vector(vec![1.0, 2.0]).unwrap().broadcast(target, &[1]).unwrap();
         assert_eq!(output.to_f64s(), Vec::<f64>::new());
 
         // The eager backend primitive preserves leading and right-aligned axis mappings.
         let output = Array::vector(vec![1.0, 2.0, 3.0])
+            .unwrap()
             .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
             .unwrap();
         assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])));
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
         let output = Array::scalar(7.0)
+            .unwrap()
             .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[])
             .unwrap();
         assert_eq!(output.to_f64s(), vec![7.0; 6]);
         let output = Array::vector(vec![10.0, 20.0, 30.0])
+            .unwrap()
             .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
             .unwrap();
         assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
         assert_eq!(
-            Array::scalar(1.0).broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[],),
-            Ok(Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), Vec::new(),)),
+            Array::scalar(1.0)
+                .unwrap()
+                .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[],),
+            Ok(Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), Vec::new(),)
+                .unwrap()),
         );
 
         // Explicit output types carry placement metadata; an exact identity preserves the complete type.
@@ -1550,7 +1556,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap()
             .with_memory(Memory::Host { pinned: true });
-        let input = Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0]);
+        let input = Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0]).unwrap();
         let identity = input.broadcast(input_type.clone(), &[0]).unwrap();
         assert_eq!(*identity.r#type(), input_type);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))
@@ -1573,7 +1579,7 @@ mod tests {
 
         // Oversized target shapes fail through checked element-count arithmetic instead of panicking or wrapping.
         assert_eq!(
-            Array::scalar(1.0).broadcast(
+            Array::scalar(1.0).unwrap().broadcast(
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]),),
                 &[],
             ),
@@ -1589,8 +1595,8 @@ mod tests {
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
         // Check standard partial evaluation with known and residual operands.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = operation.clone(),
@@ -1621,26 +1627,26 @@ mod tests {
             axis_size = 2,
             cases = [
                 {
-                    inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
                     outputs = [(@replicated, Array::matrix(
                         3,
                         4,
                         vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0],
-                    ))],
+                    ).unwrap())],
                 },
                 {
                     inputs = [(@mapped(axis = 0), Array::matrix(
                         2,
                         3,
                         vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                    ))],
+                    ).unwrap())],
                     outputs = [(@mapped(axis = 0), Array::from_f64s(
                         ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
                         vec![
                             1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
                             4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
                         ],
-                    ))],
+                    ).unwrap())],
                 },
             ],
         );
@@ -1685,14 +1691,14 @@ mod tests {
                 inputs = [(@mapped(axis = 0), Array::from_f64s(
                     input_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                ))],
+                ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::from_f64s(
                     expected_output_type,
                     vec![
                         1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
                         4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
                     ],
-                ))],
+                ).unwrap())],
             }],
         );
 
@@ -1731,14 +1737,14 @@ mod tests {
                 inputs = [(@mapped(axis = 0), Array::from_f64s(
                     input_type,
                     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                ))],
+                ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::from_f64s(
                     expected_output_type,
                     vec![
                         1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
                         4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
                     ],
-                ))],
+                ).unwrap())],
             }],
         );
 
@@ -1754,9 +1760,11 @@ mod tests {
             let input_type = ArrayType::new(DataType::F64, Shape::new(input_dimensions))
                 .with_sharding(Sharding::new(mesh.clone(), input_sharding).unwrap())
                 .unwrap();
-            let input =
-                ArrayBatch::new(Array::from_f64s(input_type, vec![0.0; 12]), BatchAxis::from_position(batch_axis))
-                    .unwrap();
+            let input = ArrayBatch::new(
+                Array::from_f64s(input_type, vec![0.0; 12]).unwrap(),
+                BatchAxis::from_position(batch_axis),
+            )
+            .unwrap();
 
             let output = BroadcastOperation::new(
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
@@ -1791,10 +1799,10 @@ mod tests {
                 vec![1],
             ),
             cases = [{
-                primals = [Array::vector(vec![1.0, 2.0])],
-                tangents = [Array::vector(vec![3.0, 4.0])],
-                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 1.0, 2.0])],
-                tangent_outputs = [Array::matrix(2, 2, vec![3.0, 4.0, 3.0, 4.0])],
+                primals = [Array::vector(vec![1.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![3.0, 4.0]).unwrap()],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 1.0, 2.0]).unwrap()],
+                tangent_outputs = [Array::matrix(2, 2, vec![3.0, 4.0, 3.0, 4.0]).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[2], %1:f64[2] .
                     let %2:f64[2, 2] = broadcast [output_type=f64[2, 2], output_axes=[1]] %0
@@ -1814,8 +1822,8 @@ mod tests {
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let tangent_output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let (primal, tangent) = differentiate_at(Array::from_f64s(primal_type, vec![2.0, 4.0]))
-            .jvp(Array::from_f64s(tangent_type, vec![1.0, 3.0]), |value| {
+        let (primal, tangent) = differentiate_at(Array::from_f64s(primal_type, vec![2.0, 4.0]).unwrap())
+            .jvp(Array::from_f64s(tangent_type, vec![1.0, 3.0]).unwrap(), |value| {
                 value.broadcast(primal_output_type.clone(), &[1])
             })
             .unwrap();
@@ -1837,8 +1845,8 @@ mod tests {
                     DataType::F64,
                     Shape::new(vec![Dimension::Static(3)]),
                 )))],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
-                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0])],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[2, 3] .
                     let %1:f64[3] = reduce_sum [axes=[0]] %0
@@ -1865,8 +1873,8 @@ mod tests {
                 output_cotangents = [Array::from_f64s(
                     output_type,
                     (0..24).map(|value| value as f64).collect(),
-                )],
-                input_cotangents = [Array::matrix(2, 3, vec![12.0, 44.0, 76.0, 16.0, 48.0, 80.0])],
+                ).unwrap()],
+                input_cotangents = [Array::matrix(2, 3, vec![12.0, 44.0, 76.0, 16.0, 48.0, 80.0]).unwrap()],
             }],
         );
     }
@@ -1882,8 +1890,8 @@ mod tests {
             operation = BroadcastOperation::new(output_type, vec![0, 1]),
             cases = [{
                 inputs = [(@linear(type = input_type))],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
-                input_cotangents = [Array::matrix(1, 3, vec![5.0, 7.0, 9.0])],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [Array::matrix(1, 3, vec![5.0, 7.0, 9.0]).unwrap()],
             }],
         );
     }
@@ -1948,25 +1956,25 @@ mod tests {
 
     #[test]
     fn test_broadcast_broadcast_to() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             input.broadcast_to(Shape::new(vec![2.into(), 3.into()])),
-            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
+            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()),
         );
         assert_eq!(
-            Array::scalar(7.0).broadcast_to(Shape::new(vec![2.into(), 3.into()])),
-            Ok(Array::matrix(2, 3, vec![7.0; 6])),
+            Array::scalar(7.0).unwrap().broadcast_to(Shape::new(vec![2.into(), 3.into()])),
+            Ok(Array::matrix(2, 3, vec![7.0; 6]).unwrap()),
         );
         assert_eq!(input.broadcast_to(Shape::new(vec![3.into()])), Ok(input.clone()));
         assert_eq!(
             input.broadcast_to(Shape::new(vec![0.into(), 3.into()])),
-            Ok(Array::matrix(0, 3, Vec::<f64>::new())),
+            Ok(Array::matrix(0, 3, Vec::<f64>::new()).unwrap()),
         );
     }
 
     #[test]
     fn test_broadcast_broadcast_to_incompatible_shape() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             input.broadcast_to(Shape::new(vec![2.into()])),
             Err(ProgramError::Type(TypeError::invalid(
@@ -1988,7 +1996,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap()
             .with_memory(Memory::Host { pinned: true });
-        let input = Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0]);
+        let input = Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.broadcast_to(Shape::new(vec![3.into()])).unwrap().r#type().as_ref(), &input_type);
         let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))
             .with_sharding(
@@ -2001,11 +2009,14 @@ mod tests {
 
     #[test]
     fn test_broadcast_broadcast_leading() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(input.broadcast_leading([2]), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])));
-        assert_eq!(input.broadcast_leading([0]), Ok(Array::matrix(0, 3, Vec::<f64>::new())));
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.broadcast_leading([2]), Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()));
+        assert_eq!(input.broadcast_leading([0]), Ok(Array::matrix(0, 3, Vec::<f64>::new()).unwrap()));
         assert_eq!(input.broadcast_leading([]), Ok(input));
-        assert_eq!(Array::scalar(4.0).broadcast_leading([2, 2]), Ok(Array::matrix(2, 2, vec![4.0; 4])));
+        assert_eq!(
+            Array::scalar(4.0).unwrap().broadcast_leading([2, 2]),
+            Ok(Array::matrix(2, 2, vec![4.0; 4]).unwrap())
+        );
     }
 
     #[test]
@@ -2107,13 +2118,13 @@ mod tests {
     fn test_dynamic_broadcast_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = [
-            ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         ];
         assert_eq!(
             DynamicBroadcastOperation::new(vec![1]).interpret(&context, &EmptyRegionDriver, &inputs),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())]),
         );
         assert_eq!(
             DynamicBroadcastOperation::new(vec![1]).interpret(&context, &EmptyRegionDriver, &[]),
@@ -2123,10 +2134,10 @@ mod tests {
 
     #[test]
     fn test_dynamic_broadcast_partial_evaluation() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let output = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        let output = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = DynamicBroadcastOperation::new(vec![1]),
@@ -2152,7 +2163,7 @@ mod tests {
     #[test]
     fn test_dynamic_broadcast_partial_evaluation_identity() {
         // Exact dimension operands make an identity independent of the unknown array payload.
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -2172,7 +2183,8 @@ mod tests {
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
         let inputs = [
-            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 1, vec![1.0, 2.0])), BatchAxis::new(0)).unwrap(),
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 1, vec![1.0, 2.0]).unwrap()), BatchAxis::new(0))
+                .unwrap(),
             ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
         ];
         let output = DynamicBroadcastOperation::new(vec![0])
@@ -2182,7 +2194,10 @@ mod tests {
             .0
             .remove(0);
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
-        assert_eq!(output.into_value(), ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0])));
+        assert_eq!(
+            output.into_value(),
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).unwrap())
+        );
     }
 
     #[test]
@@ -2256,37 +2271,46 @@ mod tests {
         assert_eq!(
             program.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)])),
-                    vec![1.0, 2.0],
-                )),
+                ArrayIrValue::Array(
+                    Array::from_f64s(
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)])),
+                        vec![1.0, 2.0],
+                    )
+                    .unwrap()
+                ),
             ]),
-            Ok(vec![ArrayIrValue::Array(Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
-            ))]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_f64s(
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+                )
+                .unwrap()
+            )]),
         );
     }
 
     #[test]
     fn test_dynamic_broadcast_differentiation() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
-        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0, 5.0, 6.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0, 5.0, 6.0]).unwrap());
         let (output, output_tangent) =
             differentiate_at(input).jvp(tangent, |value| value.dynamic_broadcast_to_sizes(&[2, 3])).unwrap();
-        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])));
-        assert_eq!(output_tangent, ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0, 5.0, 6.0, 4.0, 5.0, 6.0])));
+        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()));
+        assert_eq!(
+            output_tangent,
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap())
+        );
     }
 
     #[test]
     fn test_dynamic_broadcast_transposition() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let (output, pullback) =
             differentiate_at(input).vjp(|value| value.dynamic_broadcast_to_sizes(&[2, 3])).unwrap();
-        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])));
+        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()));
         assert_eq!(
-            pullback.apply(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
-            Ok(ArrayIrValue::Array(Array::vector(vec![5.0, 7.0, 9.0]))),
+            pullback.apply(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![5.0, 7.0, 9.0]).unwrap())),
         );
     }
 
@@ -2297,7 +2321,7 @@ mod tests {
         let operation = DynamicBroadcastOperation::new(vec![1]).with_output_sharding(sharding.clone());
         assert_eq!(operation.output_axes(), &[1]);
         assert_eq!(operation.output_sharding(), Some(&sharding));
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let dimensions = [
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
@@ -2307,57 +2331,60 @@ mod tests {
             .unwrap();
         assert_eq!(
             input.dynamic_broadcast_with_output_sharding(&dimensions, &[1], Some(sharding)),
-            Ok(ArrayIrValue::Array(Array::from_f64s(output_type, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
+            Ok(ArrayIrValue::Array(Array::from_f64s(output_type, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
     }
 
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_to() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let dimensions = [
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         ];
         assert_eq!(
             input.dynamic_broadcast_to(&dimensions),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
     }
 
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_leading() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let dimensions = [ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];
         assert_eq!(
             input.dynamic_broadcast_leading(&dimensions),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
         assert_eq!(input.dynamic_broadcast_leading(&[]), Ok(input));
     }
 
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_to_sizes() {
-        let input = ArrayIrValue::Array(Array::scalar(7.0));
+        let input = ArrayIrValue::Array(Array::scalar(7.0).unwrap());
         assert_eq!(
             input.dynamic_broadcast_to_sizes(&[2, 3]),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0; 6]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0; 6]).unwrap())),
         );
-        assert_eq!(input.dynamic_broadcast_to_sizes(&[0]), Ok(ArrayIrValue::Array(Array::vector(Vec::<f64>::new()))));
+        assert_eq!(
+            input.dynamic_broadcast_to_sizes(&[0]),
+            Ok(ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap()))
+        );
     }
 
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_leading_sizes() {
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
             input.dynamic_broadcast_leading_sizes(&[2]),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
         assert_eq!(input.dynamic_broadcast_leading_sizes(&[]), Ok(input));
     }
 
     #[test]
     fn test_array_broadcast() {
-        let vector = Array::vector(vec![1.0, 2.0]);
+        let vector = Array::vector(vec![1.0, 2.0]).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 2]);
         let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().into_owned(), output_type);

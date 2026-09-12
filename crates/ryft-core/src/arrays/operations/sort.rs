@@ -191,7 +191,7 @@ mod tests {
     fn test_array_sort() {
         // Non-key operands sort by moving whole element encodings, so sub-byte operands (which have no scalar
         // representation) ride an f32 key without being decoded.
-        let key = Array::vector(vec![3.0f32, 1.0, 2.0]);
+        let key = Array::vector(vec![3.0f32, 1.0, 2.0]).unwrap();
         let passenger = Array::from_elements(
             ArrayType::new_static(DataType::I4, [3]),
             &[i4::new(-8).unwrap(), i4::new(0).unwrap(), i4::new(7).unwrap()],

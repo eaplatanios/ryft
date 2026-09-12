@@ -78,91 +78,65 @@ pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
 };
-// TODO(eaplatanios): We should be importing directly from `operations` and not from nested modules.
-pub use operations::compare::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection};
-pub use operations::constants::{
-    CONSTANT_OPERATION_NAME, Constant, ConstantOperation, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation,
-    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
-};
-pub use operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation,
-    ScanReferenceDischarge, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate,
-    WhileTypeSemantics, transpose_primal_condition, transpose_primal_scan,
-};
-pub use operations::cumulative::{
-    CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
-    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CumulativeLogSumExp,
-    CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
-    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation,
-};
-pub use operations::differentiation::{
-    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
-    LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients, custom_jvp,
-    custom_vjp,
-};
-pub use operations::dot::{
-    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
-};
-pub use operations::logical::{
-    AND_OPERATION_NAME, And, AndOperation, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME, Or, OrOperation,
-    XOR_OPERATION_NAME, Xor, XorOperation,
-};
-pub use operations::manipulation::{
-    BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
-    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType,
-    ConvertElementTypeOperation, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME,
-    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape,
-    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
-    GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, RESHAPE_OPERATION_NAME, Reshape,
-    ReshapeOperation, ReshapeParameters, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, TRANSPOSE_OPERATION_NAME,
-    Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
-};
-pub use operations::math::{
-    ABS_OPERATION_NAME, ADD_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, Atan2,
-    Atan2Operation, CEIL_OPERATION_NAME, COS_OPERATION_NAME, Ceil, CeilOperation, Clamp, Cos, CosOperation,
-    DIV_OPERATION_NAME, Div, DivOperation, ERF_OPERATION_NAME, EXP_OPERATION_NAME, Erf, ErfOperation, Exp,
-    ExpOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
-    LOG_SUM_EXP_OPERATION_NAME, LOG1P_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Log, Log1p, Log1pOperation, LogAddExp,
-    LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME,
-    MIN_OPERATION_NAME, MUL_OPERATION_NAME, Max, MaxOperation, Min, MinOperation, Mul, MulOperation,
-    NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME,
-    ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SQRT_OPERATION_NAME,
-    SUB_OPERATION_NAME, Sign, SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation,
-    TANH_OPERATION_NAME, Tanh, TanhOperation,
-};
-pub use operations::quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
-pub use operations::references::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
-    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation,
-};
-pub use operations::sharding::{
-    ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
-    ShardingConstraintOperation,
-};
 pub use operations::{
-    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,
-    DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
-    DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME,
-    DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
-    DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME,
-    DIMENSION_SATURATING_SUB_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,
-    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation,
+    ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add,
+    AddOperation, And, AndOperation, ArithmeticDimensionOperation, Atan2, Atan2Operation, BROADCAST_OPERATION_NAME,
+    BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, COMPARE_OPERATION_NAME,
+    CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME,
+    COS_OPERATION_NAME, CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME,
+    CUMULATIVE_MIN_OPERATION_NAME, CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME,
+    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, Ceil, CeilOperation, Clamp, Compare, CompareOperation,
+    ComparisonDirection, Concatenate, ConcatenateOperation, ConditionOperation, Constant, ConstantOperation,
+    ConstrainSharding, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, CumulativeLogSumExp,
+    CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
+    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, CustomJvp,
+    CustomJvpOperation, CustomVjp, CustomVjpOperation, DIMENSION_ADD_OPERATION_NAME,
+    DIMENSION_DIV_FLOOR_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
+    DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
+    DIMENSION_REM_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
+    DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
+    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME,
+    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME,
+    DIV_OPERATION_NAME, DOT_OPERATION_NAME, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation,
     DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
     DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
     DimensionRequirement, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, ElementwiseOperation, PRINT_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
-    ParallelReductionKind, Print, PrintOperation, RUNTIME_DIMENSION_DATA_TYPE, TAG_OPERATION_NAME,
-    TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation, TransferToMemory, TransferToMemoryOperation,
-    forward_collective_to_parent,
+    DimensionToScalarOperation, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOps, DynamicBroadcast,
+    DynamicBroadcastOperation, DynamicFill, DynamicIota, DynamicOne, DynamicReshape, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    DynamicZero, ERF_OPERATION_NAME, EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp,
+    ExpOperation, FLOOR_OPERATION_NAME, Fill, Floor, FloorOperation, GATHER_OPERATION_NAME, Gather,
+    GatherDimensionNumbers, GatherOperation, GatherScatterMode, IOTA_OPERATION_NAME, Iota, IotaOperation,
+    LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG_SUM_EXP_OPERATION_NAME, LOG1P_OPERATION_NAME,
+    LOGISTIC_OPERATION_NAME, LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation,
+    LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME,
+    MUL_OPERATION_NAME, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME,
+    NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME,
+    OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
+    POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce, ParallelReduceOperation,
+    ParallelReductionKind, Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
+    RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME,
+    RUNTIME_DIMENSION_DATA_TYPE, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce,
+    ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
+    ReshapeOperation, ReshapeParameters, Reshard, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME,
+    SHARDING_CONSTRAINT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
+    SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation,
+    TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag,
+    TagOperation, Tanh, TanhOperation, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation,
+    WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
+    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp, custom_vjp,
+    forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
