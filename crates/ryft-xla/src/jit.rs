@@ -1855,16 +1855,16 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
-        Compare, ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp, CumulativeSum,
-        DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable,
-        Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice,
-        EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp, LogicalMesh, Logistic,
-        MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder, ProgramError, ProjectedValue,
-        Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
-        ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, CumulativeLogSumExp,
+        CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
+        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
+        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
+        ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
+        StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
         differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -2105,6 +2105,78 @@ mod tests {
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
+    }
+
+    #[test]
+    fn test_compile_converted_broadcast() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let input_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::C64, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |value| value.convert_element_type(DataType::C64).unwrap().broadcast(output_type.clone(), &[1]).unwrap(),
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(compiled.source_program().program().input_ids().len(), 1);
+        assert_eq!(compiled.source_program().captures().len(), 0);
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&[1f32, 2., 3.]).as_slice())
+                .unwrap();
+        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        // Complex storage interleaves real and imaginary components after scalar element conversion.
+        assert_eq!(values_from_bytes::<f32>(&bytes), vec![1., 0., 2., 0., 3., 0., 1., 0., 2., 0., 3., 0.]);
+    }
+
+    #[test]
+    fn test_compile_broadcast_capture() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let value =
+            Array::from_host_buffer(&client, scalar_type, mesh.clone(), values_to_bytes(&[4f32]).as_slice()).unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, exemplar| captures[0].broadcast(exemplar.r#type().into_owned(), &[]).unwrap(),
+            vec![value],
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(compiled.source_program().captures().len(), 1);
+        assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
+        let input = Array::from_host_buffer(&client, input_type, mesh, values_to_bytes(&[9f32; 6]).as_slice()).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![4f32; 6]);
     }
 
     #[test]

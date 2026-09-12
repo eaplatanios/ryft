@@ -124,7 +124,8 @@ impl ZeroLike for Array {
 impl<A: Value<Type = ArrayType> + ZeroLike> ZeroLike for ArrayIrValue<A> {
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
-        Ok(Self::Array(self.projected().zero_like()?))
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Array(input.zero_like()?))
     }
 }
 

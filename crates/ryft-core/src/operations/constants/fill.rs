@@ -23,6 +23,31 @@ use crate::tracing::Tracer;
 /// encode the literal as a rank-zero array, convert it to the requested element [`DataType`](crate::DataType) and
 /// [`Memory`](crate::Memory), and use ordinary broadcasting for every rank-positive result. This keeps the fill value
 /// explicit in Static Single Assignment (SSA) dataflow and avoids the need for a separate array fill operation type.
+///
+/// For a fill value that is already an array or a tracer, compose [`ConvertElementType::convert_element_type`] with
+/// [`Broadcast::broadcast`] or [`Broadcast::broadcast_to`]. A scalar fills the whole result; array inputs follow the
+/// same trailing-axis alignment and size-one expansion as any other broadcast. The value stays in dataflow, so its
+/// tangent is broadcast and its cotangent sums contributions from the replicated axes. If placement differs, compose
+/// [`TransferToMemory::transfer_to_memory`] before broadcasting.
+///
+/// # Example
+///
+/// A runtime input can fill an array without becoming a host literal:
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayOperation, ArrayType, Broadcast, ConvertElementType, DataType, ProgramError, StagingContext,
+/// #     TracingContext, Typed,
+/// # };
+/// # fn main() -> Result<(), ProgramError> {
+/// let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+/// let value = context.input(ArrayType::scalar(DataType::F32));
+/// let output_type = ArrayType::new_static(DataType::F64, [2, 3]);
+/// let output = value.convert_element_type(DataType::F64)?.broadcast(output_type.clone(), &[])?;
+/// assert_eq!(output.r#type().as_ref(), &output_type);
+/// # Ok(())
+/// # }
+/// ```
 pub trait Fill<L, V: Typed> {
     /// Returns a value of [`Type`] `type` with every element it holds set to `value`.
     fn fill(&self, r#type: &V::Type, value: L) -> Result<V, ProgramError>;
@@ -137,6 +162,14 @@ where
 /// `4` produce shape `[3, 2, 4]`. The converted literal is embedded once and broadcast using the existing constant and
 /// broadcast operations. Singleton-bound dynamic axes may refine to static result dimensions but the corresponding
 /// dimension inputs are still required.
+///
+/// When the fill value is already a mixed-domain array value, use
+/// [`DynamicBroadcast::dynamic_broadcast_to`](crate::DynamicBroadcast::dynamic_broadcast_to) directly.
+/// To fill the shape of an exemplar, obtain each output dimension using
+/// [`DimensionSize::dimension_size`](crate::DimensionSize::dimension_size) and pass those values to the broadcast.
+/// This uses the exemplar's runtime geometry, including empty dimensions, without reading its element contents.
+/// Conversion and placement overrides can be applied to the projected array value before broadcasting; no separate
+/// value-fill operation is required.
 ///
 /// # Example
 ///

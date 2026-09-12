@@ -117,7 +117,8 @@ impl OneLike for Array {
 impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
     #[inline]
     fn one_like(&self) -> Result<Self, ProgramError> {
-        Ok(Self::Array(self.projected()?.one_like()?))
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Array(input.one_like()?))
     }
 }
 

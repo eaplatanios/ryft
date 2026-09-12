@@ -2390,6 +2390,49 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_broadcast_dynamic_broadcast_to_exemplar() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+        let value = context.input(ArrayType::scalar(DataType::F32).into());
+        let exemplar = context.input(ArrayType::new(DataType::F32, Shape::new(vec![size.into(), 2.into()])).into());
+        // Filling an exemplar's geometry is an ordinary broadcast with sizes read from that exemplar.
+        let dimensions = [exemplar.dimension_size(0).unwrap(), exemplar.dimension_size(1).unwrap()];
+        let output = value.dynamic_broadcast_to(&dimensions).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let value = ArrayIrValue::Array(Array::scalar(3f32).unwrap());
+        assert_eq!(
+            program.interpret(vec![value.clone(), ArrayIrValue::Array(Array::matrix(2, 2, vec![0f32; 4]).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![3f32; 4]).unwrap())])
+        );
+        assert_eq!(
+            program.interpret(vec![value, ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(0, 2, Vec::<f32>::new()).unwrap())])
+        );
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(3f32).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![0f32; 4]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5f32).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![0f32; 4]).unwrap()),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![3f32; 4]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![5f32; 4]).unwrap()),
+            ])
+        );
+    }
+
+    #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_leading() {
         let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let dimensions = [ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())];

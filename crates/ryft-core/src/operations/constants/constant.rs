@@ -3,7 +3,8 @@ use std::fmt::{Debug, Display};
 
 use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DimensionValue};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+    RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -11,12 +12,12 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Value, ValueProjection,
 };
-use crate::tracing::Tracer;
+use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ConstantOperation`].
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
@@ -152,7 +153,11 @@ impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 /// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
 /// [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing a runtime value from a stored payload
 /// can be context-dependent. For example, [`EagerContext`]s can return the value directly while [`StagingContext`]s
-/// record a builder constant.
+/// record a builder constant. The convenience delegates to [`Context::lift`] wherever its context contract is
+/// available, including partial evaluation and batching over mixed array and dimension values. Like `lift`, it can
+/// also carry runtime captures supported by the context, preserving its validation and capture restrictions rather
+/// than creating a literal instruction. [`ConstantOperation`] validates its payload separately before calling this
+/// capability.
 pub trait Constant<V, C> {
     /// Returns the runtime value represented by `value`.
     fn constant(&self, value: C) -> Result<V, ProgramError>;
@@ -161,6 +166,8 @@ pub trait Constant<V, C> {
 impl<V: Value, O: Operation<Type = V::Type>> Constant<V, V> for EagerContext<V, O> {
     #[inline]
     fn constant(&self, value: V) -> Result<V, ProgramError> {
+        // Eager lifting is the identity. Requiring the full `Context` contract here would make the operation
+        // family's interpretation depend recursively on this same capability.
         Ok(value)
     }
 }
@@ -185,18 +192,27 @@ where
 impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<Tracer<C>, ProgramError> {
-        Ok(StagingContext::constant(self, value))
+        self.lift(value)
     }
 }
 
-impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
-    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C, ArrayBatchingPolicy>
+impl<C: Context> Constant<PartialTracer<C>, C::Constant> for PartialEvaluationContext<C>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
 {
     #[inline]
-    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
-        let value = self.parent().constant(value)?;
-        let batch = ArrayBatch::new(value, BatchAxis::replicated())?;
-        Ok(BatchingTracer::new(self.clone(), batch))
+    fn constant(&self, value: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
+        self.lift(value)
+    }
+}
+
+impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>>
+    Constant<BatchingTracer<C, P>, C::Constant> for BatchingContext<C, P>
+{
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<BatchingTracer<C, P>, ProgramError> {
+        self.lift(value)
     }
 }
 
@@ -205,6 +221,8 @@ impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>>
 {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
+        // Keep the same lifting semantics without requiring the entire operation family's differentiation
+        // and partial evaluation closure merely to materialize a value with a structural zero tangent.
         let dual = DifferentiationDual::new_with_zero_tangent(self.primal().lift(value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
@@ -237,9 +255,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        DimensionOperation,
+        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayType, DataType, DimensionOperation,
     };
+    use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
@@ -346,6 +365,24 @@ mod tests {
         let staged_builder = context.builder().borrow();
         assert!(staged_builder.instructions().is_empty());
         assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5).unwrap()));
+
+        // Direct capability calls also validate through lifting, without an operation's preceding payload check.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = ArrayIrValue::Array(Array::scalar(3.5).unwrap());
+        let output = Constant::constant(&context, value.clone()).unwrap();
+        assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(context.builder().borrow().atoms(), &[Atom::Constant(value)]);
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // Lifting follows the tracing boundary's validation rather than bypassing it through raw staging.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        assert!(matches!(
+            Constant::constant(&context, reference),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. })) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
+        assert_eq!(context.builder().borrow().atoms().len(), 1);
     }
 
     #[test]
@@ -358,6 +395,19 @@ mod tests {
                 residual_instructions = 0,
             }],
         );
+
+        // Direct capability calls lift values as known partial values.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let value = Array::scalar(3.5).unwrap();
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&value));
+
+        // Mixed contexts retain the value's kind rather than projecting every constant to an array.
+        let context =
+            PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = context.constant(dimension.clone()).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&dimension));
     }
 
     #[test]
@@ -371,6 +421,32 @@ mod tests {
                 outputs = [(@replicated, Array::scalar(3.5).unwrap())],
             }],
         );
+
+        // Direct capability calls lift values as replicated batches.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let value = Array::scalar(3.5).unwrap();
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.batch().value(), &value);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+
+        // The mixed policy lifts arrays, dimensions, and runtime reference captures as replicated values.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let value = ArrayIrValue::Array(value);
+        let output = context.constant(value.clone()).unwrap();
+        assert_eq!(output.batch().value(), &value);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = context.constant(dimension.clone()).unwrap();
+        assert_eq!(output.batch().value(), &dimension);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        let output = context.constant(reference.clone()).unwrap();
+        assert_eq!(output.batch().value(), &reference);
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
     }
 
     #[test]
