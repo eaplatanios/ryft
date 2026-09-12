@@ -772,7 +772,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
+    use crate::programs::{EmptyRegionDriver, ProgramError};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(
             AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch(
                 &context,
-                &crate::EmptyRegionDriver,
+                &EmptyRegionDriver,
                 &[input],
             ),
             Err(BatchingError::UnsupportedOperation {
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(
             AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch_in_parent(
                 &context,
-                &crate::EmptyRegionDriver,
+                &EmptyRegionDriver,
                 &[input, output_extent],
             ),
             Err(BatchingError::UnsupportedOperation {

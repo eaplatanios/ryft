@@ -306,6 +306,8 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>, P: DifferentiationPo
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
 /// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
+/// When a dynamic axis has bounds that admit only one extent, the inferred result type represents that axis as static.
+/// Its dimension input is still required because the declared output type contains a dynamic axis.
 ///
 /// # Example
 ///
@@ -966,6 +968,16 @@ mod tests {
             ))),
         );
 
+        // Matching diagnostic names and bounds do not make separately created identities interchangeable.
+        let distinct = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(distinct), 3).unwrap());
+        assert_eq!(
+            context.dynamic_zero(&output_type, &[dimension]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`zero` operand 0 has type dimension<rows ∈ [0, 8)> but the output shape requires dimension<rows ∈ [0, 8)>",
+            ))),
+        );
+
         // Invalid requests fail before staging any instruction or altering the builder.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
@@ -1015,6 +1027,48 @@ mod tests {
             panic!("expected one static-zero instruction");
         };
         assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+    }
+
+    #[test]
+    fn test_dynamic_zero_staging_singleton_dimension() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
+        let dimension_type = DimensionType::new(size.clone());
+        let dimension = context.input(dimension_type.clone().into());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let output = context.dynamic_zero(&output_type, std::slice::from_ref(&dimension)).unwrap();
+
+        // Singleton bounds refine the inferred result without removing the declared dynamic input.
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one dynamic zero instruction");
+        };
+        assert!(
+            matches!(instruction.operation(), ArrayIrOperation::Zero(operation) if operation.r#type() == &output_type)
+        );
+        assert_eq!(instruction.inputs(), &[dimension.atom_id().unwrap()]);
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        assert_eq!(
+            program.interpret(vec![extent.clone()]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap())]),
+        );
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap()),
+            ]),
+        );
     }
 
     #[test]

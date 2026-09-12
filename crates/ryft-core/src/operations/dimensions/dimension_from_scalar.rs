@@ -302,7 +302,7 @@ mod tests {
         DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT, Shape,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::{TransposableOperation, TranspositionContext};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::dimensions::dimension_requirement::{
         DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DimensionRequirementOperation,
@@ -310,8 +310,10 @@ mod tests {
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface};
-    use crate::tracing::TracingContext;
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface, ValueProjection,
+    };
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -551,7 +553,7 @@ mod tests {
         let projected_context = TestContext::new();
         let projected_input = projected_context.input(ArrayType::scalar(DataType::I32).into());
         let projected_input =
-            <crate::Tracer<TestContext> as crate::ValueProjection<ArrayType>>::into_projected(projected_input).unwrap();
+            <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(projected_input).unwrap();
         let projected_variable = DimensionVariable::new("projected", bounds);
         let projected_output = projected_input.to_dimension(projected_variable.clone()).unwrap();
         assert_eq!(projected_output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::new(projected_variable)),);
@@ -577,7 +579,7 @@ mod tests {
                 &[],
                 &[],
             ),
-            Err(crate::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dimension_from_scalar` is not transposable",
         ));
     }

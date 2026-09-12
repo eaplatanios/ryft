@@ -1166,6 +1166,7 @@ mod tests {
     use crate::operations::collectives::all_gather::infer_explicit_all_gather_output_types;
     use crate::operations::collectives::all_to_all::infer_explicit_all_to_all_output_types;
     use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 
@@ -1254,7 +1255,7 @@ mod tests {
         )
         .jvp_in_parent(
             &DifferentiationContext::fused(context.clone()),
-            &crate::EmptyRegionDriver,
+            &EmptyRegionDriver,
             &[
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
                 DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
@@ -1500,7 +1501,7 @@ mod tests {
             CollectiveOptions::default(),
             AllGatherOutputVariance::Varying,
         )
-        .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+        .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
         .unwrap()
         .into_parts()
         .0;
@@ -1508,7 +1509,7 @@ mod tests {
         assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap(),);
 
         let scattered = ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
-            .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+            .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
             .unwrap()
             .into_parts()
             .0;
@@ -1517,7 +1518,7 @@ mod tests {
         assert_eq!(scattered[0].unbatched_type(), ArrayType::scalar(DataType::F32));
 
         let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
-            .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
+            .batch(&context, &EmptyRegionDriver, &[mapped_matrix()])
             .unwrap()
             .into_parts()
             .0;

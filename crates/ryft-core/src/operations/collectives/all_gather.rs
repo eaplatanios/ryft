@@ -1082,7 +1082,7 @@ mod tests {
     use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::operations::collectives::tests::f32_vector;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
+    use crate::programs::{EmptyRegionDriver, ProgramError};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1181,7 +1181,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         );
 
-        let output = operation.batch(&context, &crate::EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
+        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
 
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         assert_eq!(output.value().to_f64s(), vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]);
@@ -1207,7 +1207,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         );
 
-        let output = operation.batch(&context, &crate::EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
+        let output = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0.remove(0);
 
         assert_eq!(output.batch_axis(), BatchAxis::replicated());
         assert_eq!(output.value().to_f64s(), vec![1.0, 2.0, 0.0, 1.0, 2.0, 0.0]);
@@ -1235,7 +1235,7 @@ mod tests {
                 CollectiveOptions::tiled(),
                 AllGatherOutputVariance::Varying,
             )
-            .batch(&context, &crate::EmptyRegionDriver, &[input]),
+            .batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation {
                 message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
                           participant and concatenation axes are fused"
@@ -1273,7 +1273,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         );
         let output = untiled
-            .batch_in_parent(&context, &crate::EmptyRegionDriver, &[input.clone(), extent(2), ragged_extent])
+            .batch_in_parent(&context, &EmptyRegionDriver, &[input.clone(), extent(2), ragged_extent])
             .unwrap()
             .into_parts()
             .0
@@ -1292,7 +1292,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         );
         assert_eq!(
-            tiled.batch_in_parent(&context, &crate::EmptyRegionDriver, &[input, extent(6)]),
+            tiled.batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(6)]),
             Err(BatchingError::UnsupportedOperation {
                 message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
                           participant and concatenation axes are fused"
@@ -1329,7 +1329,7 @@ mod tests {
             CollectiveOptions::default(),
             AllGatherOutputVariance::Varying,
         )
-        .batch_in_parent(&context, &crate::EmptyRegionDriver, &[input, extent(2), ragged_extent])
+        .batch_in_parent(&context, &EmptyRegionDriver, &[input, extent(2), ragged_extent])
         .unwrap()
         .into_parts()
         .0
@@ -1358,7 +1358,7 @@ mod tests {
             CollectiveOptions::tiled(),
             AllGatherOutputVariance::Varying,
         )
-        .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap())])
+        .batch(&context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]).unwrap())])
         .unwrap()
         .into_parts()
         .0;
@@ -1532,7 +1532,7 @@ mod tests {
         )
         .interpret(
             &EagerContext::<Array, ArrayOperation<Array>>::new(),
-            &crate::EmptyRegionDriver,
+            &EmptyRegionDriver,
             &[Array::vector(vec![1.0, 2.0]).unwrap()],
         )
         .unwrap();
@@ -1549,7 +1549,7 @@ mod tests {
         )
         .interpret(
             &EagerContext::<Array, ArrayOperation<Array>>::new(),
-            &crate::EmptyRegionDriver,
+            &EmptyRegionDriver,
             &[Array::vector(vec![1.0, 2.0]).unwrap()],
         )
         .unwrap_err();

@@ -5,7 +5,7 @@
 //! with runtime shapes. [`Constant`] carries an existing value, while [`ZeroLike`] and [`OneLike`] obtain their
 //! geometry from an exemplar and therefore need no separate dynamic capability.
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
@@ -99,6 +99,7 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                     .filter(|dimension| matches!(dimension, $crate::arrays::Dimension::Dynamic(_)))
                     .count();
                 let mut extents = inputs.iter();
+                let mut refinements = $crate::arrays::ArrayTypeRefinements::default();
                 let dimensions = self
                     .r#type()
                     .shape()
@@ -129,6 +130,8 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                                 .into());
                             }
 
+                            // Repeated stored identities must denote one extent even when replay renames inputs.
+                            refinements.bind(variable, extent.extent())?;
                             Ok($crate::arrays::Dimension::Static(extent.extent()))
                         }
                     })
@@ -179,7 +182,8 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 /// contract, which derives *every* output axis from an operand (including exact constants): a constructor's static axes
 /// have no input geometry to relate to, so passing them as operands would only grow the interpreted representation. A
 /// stored type with no dynamic axes is valid with no operands, although canonical operation-family lifts prefer the
-/// equivalent homogeneous nullary constructor inside the array member family.
+/// equivalent homogeneous nullary constructor inside the array member family. Singleton-bounded dynamic axes refine to
+/// their static extent in the inferred result, while the stored descriptor and required input count remain unchanged.
 pub(crate) fn infer_array_ir_constant_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
@@ -209,7 +213,19 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
             )));
         }
     }
-    Ok(vec![ArrayIrType::Array(r#type.clone())])
+
+    // Singleton bounds determine an exact size without changing the stored constructor input signature.
+    let dimensions = r#type
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| match dimension {
+            Dimension::Static(_) => dimension.clone(),
+            Dimension::Dynamic(variable) => DimensionType::new(variable.clone()).to_dimension(),
+        })
+        .collect();
+
+    Ok(vec![ArrayIrType::Array(r#type.clone().with_shape(Shape::new(dimensions)))])
 }
 
 /// Checks that the provided dimension inputs agree with the symbolic shape declared by `output_type` before a dynamic
@@ -266,10 +282,53 @@ pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrValue, DataType, DimensionBounds, DimensionValue, DimensionVariable, Shape};
-    use crate::programs::TypeError;
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
+        DimensionVariable,
+    };
+    use crate::contexts::EagerContext;
+    use crate::interpretation::MemberInterpretableOperation;
+    use crate::programs::{EmptyRegionDriver, TypeError};
 
     use super::*;
+
+    #[test]
+    fn test_array_ir_constant_operation_interpretation_repeated_dimensions() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let variable = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let operation = ZeroOperation::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![variable.clone().into(), variable.clone().into()]),
+        ));
+
+        // Replay may rename an input identity; consistency is enforced against the stored output identity.
+        let renamed = DimensionType::new(DimensionVariable::new("renamed", DimensionBounds::unbounded()));
+        let two = ArrayIrValue::Dimension(DimensionValue::new(renamed.clone(), 2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(renamed, 3).unwrap());
+        assert_eq!(
+            operation.interpret_in_parent(&context, &EmptyRegionDriver, &[two.clone(), two.clone()]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[0.0f32; 4]).unwrap()
+            )]),
+        );
+        assert_eq!(
+            operation.interpret_in_parent(&context, &EmptyRegionDriver, &[two.clone(), three.clone()]),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "size".to_owned(), expected: 2, actual: 3 }.into()
+            )),
+        );
+
+        // Diagnostic names do not establish identity: separately created variables may have different sizes.
+        let other = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let operation =
+            ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![variable.into(), other.into()])));
+        assert_eq!(
+            operation.interpret_in_parent(&context, &EmptyRegionDriver, &[two, three]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[0.0f32; 6]).unwrap()
+            )]),
+        );
+    }
 
     #[test]
     fn test_infer_array_ir_constant_constructor_output_types() {
@@ -331,6 +390,24 @@ mod tests {
             ),
             Err(TypeError::invalid(
                 "`zero` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_infer_array_ir_constant_constructor_output_types_singleton_dimensions() {
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap()));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.variable().clone().into(), 2.into()]));
+        assert_eq!(
+            infer_array_ir_constant_constructor_output_types("zero", &r#type, &[dimension.into()], &[]),
+            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2]))]),
+        );
+
+        // Refining the result does not remove the dimension input required by the stored descriptor.
+        assert_eq!(
+            infer_array_ir_constant_constructor_output_types("zero", &r#type, &[], &[]),
+            Err(TypeError::invalid(
+                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
             )),
         );
     }

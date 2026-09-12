@@ -678,6 +678,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::operations::collectives::tests::f32_vector;
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 
@@ -709,7 +710,7 @@ mod tests {
         assert_eq!(
             ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()).batch_in_parent(
                 &context,
-                &crate::EmptyRegionDriver,
+                &EmptyRegionDriver,
                 &[input, output_extent],
             ),
             Err(BatchingError::UnsupportedOperation {

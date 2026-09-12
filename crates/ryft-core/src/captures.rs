@@ -654,7 +654,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionVariable, Shape,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::contexts::StagingContext;
     use crate::interpretation::InterpretableOperation;
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(array_reference.index(), 0);
         assert_eq!(array_reference.r#type(), array.r#type());
         let dimension_context = ProjectedContext::<_, DimensionType>::new(parent.clone());
-        let dimension = crate::DimensionValue::constant(7).unwrap();
+        let dimension = DimensionValue::constant(7).unwrap();
         let dimension_reference = dimension_context.capture(dimension.clone()).unwrap();
         assert_eq!(dimension_reference.index(), 1);
         assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type().as_ref());

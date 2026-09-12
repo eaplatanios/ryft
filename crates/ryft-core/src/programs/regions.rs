@@ -1849,7 +1849,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let first = builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![region],
                 vec![input],
                 None,
@@ -1857,7 +1857,7 @@ mod tests {
             .unwrap()[0];
         let second = builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![region],
                 vec![first],
                 None,
@@ -1873,7 +1873,7 @@ mod tests {
         let input = root_builder.add_input(ArrayType::scalar(DataType::F64));
         let output = root_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("nested")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("nested")] }),
                 vec![descendant],
                 vec![input],
                 None,
@@ -1894,7 +1894,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
-                    const { &[crate::RegionSlot::computation("first"), crate::RegionSlot::computation("second")] },
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
                 ),
                 vec![first_root, second_root],
                 vec![input],
@@ -2151,7 +2151,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![body],
                 vec![input],
                 None,
@@ -2214,7 +2214,7 @@ mod tests {
             vec![input],
             vec![output],
             vec![Instruction::new(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![input],
                 vec![output],
                 vec![RegionId::new(0)],

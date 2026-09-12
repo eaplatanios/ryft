@@ -729,7 +729,8 @@ mod tests {
     use crate::operations::{AddOperation, BroadcastOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::{
-        AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, RegionInterface, TypeError,
+        AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, RegionId, RegionInterface, RegionSlot,
+        TypeError,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation, TestRegionOperation};
     use crate::tracing::TracingContext;
@@ -777,7 +778,7 @@ mod tests {
         let source_input = source_builder.add_input(ArrayType::scalar(DataType::F64));
         let first = source_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![source_input],
                 None,
@@ -785,7 +786,7 @@ mod tests {
             .unwrap()[0];
         let second = source_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![first],
                 None,
@@ -806,7 +807,7 @@ mod tests {
         assert_eq!(destination.regions().len(), 2);
         assert_eq!(destination.instructions().len(), 2);
         assert_eq!(destination.instructions()[0].regions(), destination.instructions()[1].regions());
-        assert_eq!(destination.instructions()[0].regions(), &[crate::RegionId::new(0)]);
+        assert_eq!(destination.instructions()[0].regions(), &[RegionId::new(0)]);
     }
 
     #[test]

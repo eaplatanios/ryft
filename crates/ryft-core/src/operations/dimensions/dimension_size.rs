@@ -349,8 +349,9 @@ mod tests {
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
         EffectClasses, Operation, ProgramBuilder, RegionInterface, TypeIdentityPosition, TypeIdentityRenaming,
+        ValueProjection,
     };
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -482,7 +483,7 @@ mod tests {
         let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
         assert_eq!(reference_array.dimension_size(-1), Ok(3));
         let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6]).unwrap());
-        let payload = <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
+        let payload = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&array)
             .unwrap()
             .storage_bytes()
             .as_ptr();
@@ -492,14 +493,14 @@ mod tests {
         };
         assert_eq!(result.extent(), 3);
         assert_eq!(
-            <ArrayIrValue<Array> as crate::ValueProjection<ArrayType>>::projected(&array)
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&array)
                 .unwrap()
                 .storage_bytes()
                 .as_ptr(),
             payload,
         );
 
-        let dimension = ArrayIrValue::<Array>::Dimension(crate::DimensionValue::new(dimension_type, 3).unwrap());
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
         assert_eq!(
             dimension.dimension_size(0),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
@@ -525,8 +526,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
         let (output_types, program) = TestContext::trace(
             |array| {
-                let projected =
-                    <crate::Tracer<TestContext> as crate::ValueProjection<ArrayType>>::into_projected(array.clone())?;
+                let projected = <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(array.clone())?;
                 Ok((array.dimension_size(0)?, projected.dimension_size(0)?))
             },
             ArrayIrType::from(input_type.clone()),

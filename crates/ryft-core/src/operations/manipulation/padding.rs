@@ -2389,7 +2389,7 @@ mod tests {
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()
-                .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
+                .batch(&context, &EmptyRegionDriver, &[input, padding])
                 .unwrap()
                 .into_parts()
                 .0;
@@ -2432,7 +2432,7 @@ mod tests {
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()
-                .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
+                .batch(&context, &EmptyRegionDriver, &[input, padding])
                 .unwrap()
                 .into_parts()
                 .0;

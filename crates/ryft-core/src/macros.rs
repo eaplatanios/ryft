@@ -4713,7 +4713,7 @@ mod tests {
     use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
         DifferentiationTracer, TransposableOperation, TranspositionContext,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -4728,8 +4728,8 @@ mod tests {
     };
     use crate::programs::{
         EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceDischargeContext,
-        ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Type,
-        TypeError, TypeIdentityRenaming, Typed, ValueProjection,
+        ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType,
+        RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -4857,7 +4857,7 @@ mod tests {
         TestDifferentiableOperation<ArrayType>,
         jvp<C>
         where
-            C::Type: crate::DifferentiableType,
+            C::Type: DifferentiableType,
         {
             |_operation, _context, _driver, inputs| {
                 check_count!("input", inputs, 2, ProgramError);
@@ -5095,7 +5095,7 @@ mod tests {
         fn infer_output_types(
             &self,
             input_types: &[DataType],
-            _region_interfaces: &[crate::RegionInterface<DataType>],
+            _region_interfaces: &[RegionInterface<DataType>],
         ) -> Result<Vec<DataType>, TypeError> {
             check_count!("input", input_types, 0, TypeError);
             Ok(vec![DataType::F64, DataType::F64])
@@ -5112,7 +5112,7 @@ mod tests {
         fn infer_output_types(
             &self,
             input_types: &[ArrayType],
-            _region_interfaces: &[crate::RegionInterface<ArrayType>],
+            _region_interfaces: &[RegionInterface<ArrayType>],
         ) -> Result<Vec<ArrayType>, TypeError> {
             check_count!("input", input_types, 0, TypeError);
             Ok(vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)])
@@ -5165,7 +5165,7 @@ mod tests {
         fn infer_output_types(
             &self,
             input_types: &[T],
-            _region_interfaces: &[crate::RegionInterface<T>],
+            _region_interfaces: &[RegionInterface<T>],
         ) -> Result<Vec<T>, TypeError> {
             check_count!("input", input_types, 0, TypeError);
             Ok(Vec::new())
@@ -5173,7 +5173,7 @@ mod tests {
     }
 
     impl<C: Domain> InterpretableOperation<C> for TestGenericNullaryOperation<C::Type> {
-        fn interpret<D: crate::InterpretationDriver<C>>(
+        fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,
             _driver: &D,
@@ -5219,7 +5219,7 @@ mod tests {
         fn infer_output_types(
             &self,
             input_types: &[T],
-            _region_interfaces: &[crate::RegionInterface<T>],
+            _region_interfaces: &[RegionInterface<T>],
         ) -> Result<Vec<T>, TypeError> {
             check_count!("input", input_types, 0, TypeError);
             Ok(Vec::new())
@@ -5227,7 +5227,7 @@ mod tests {
     }
 
     impl<C: Domain> InterpretableOperation<C> for TestBoundedNullaryOperation<C::Type> {
-        fn interpret<D: crate::InterpretationDriver<C>>(
+        fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,
             _driver: &D,
@@ -6566,7 +6566,7 @@ mod tests {
             fn infer_output_types(
                 &self,
                 input_types: &[T],
-                _region_interfaces: &[crate::RegionInterface<T>],
+                _region_interfaces: &[RegionInterface<T>],
             ) -> Result<Vec<T>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone(), input_types[0].clone()])
@@ -6731,7 +6731,7 @@ mod tests {
             fn infer_output_types(
                 &self,
                 input_types: &[ArrayType],
-                _region_interfaces: &[crate::RegionInterface<ArrayType>],
+                _region_interfaces: &[RegionInterface<ArrayType>],
             ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone(), input_types[0].clone()])

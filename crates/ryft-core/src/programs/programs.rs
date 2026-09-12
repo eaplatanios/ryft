@@ -2025,6 +2025,7 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
         DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
+    use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
@@ -3405,15 +3406,15 @@ mod tests {
         }
 
         impl Value for CloneCountingValue {
-            type DispatchDomain = crate::EagerContext<Self>;
-            type ExecutionDomain = crate::EagerContext<Self>;
+            type DispatchDomain = EagerContext<Self>;
+            type ExecutionDomain = EagerContext<Self>;
 
-            fn dispatch_domain(&self) -> crate::EagerContext<Self> {
-                crate::EagerContext::new()
+            fn dispatch_domain(&self) -> EagerContext<Self> {
+                EagerContext::new()
             }
 
-            fn execution_domain(&self) -> crate::EagerContext<Self> {
-                crate::EagerContext::new()
+            fn execution_domain(&self) -> EagerContext<Self> {
+                EagerContext::new()
             }
         }
 

@@ -653,6 +653,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::parameters::Placeholder;
+    use crate::programs::regions::RegionSlot;
     use crate::programs::{Operation, ProgramBuilder, Region, RegionId, RegionRef, Value};
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{IdentityTransform, TestRegionOperation};
@@ -1106,7 +1107,7 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![leaf],
                 vec![input],
                 None,

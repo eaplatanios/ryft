@@ -3226,8 +3226,8 @@ mod tests {
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0, 2])],
             )
             .unwrap()
@@ -3247,8 +3247,8 @@ mod tests {
         let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]).unwrap());
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1, 0])],
             )
             .unwrap()
@@ -3562,8 +3562,8 @@ mod tests {
         let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0, 2])],
             )
             .unwrap()
@@ -3583,8 +3583,8 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1, 3])],
             )
             .unwrap()
@@ -3602,8 +3602,8 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1, 2])],
             )
             .unwrap()
@@ -4197,16 +4197,12 @@ mod tests {
                 || ArrayBatch::replicated(Array::from_elements::<f64>(update_type.clone(), &[9.0, 9.0]).unwrap());
 
             let static_outputs = UpdateSliceOperation::new(vec![1])
-                .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
+                .batch(&context, &EmptyRegionDriver, &[make_input(), make_update()])
                 .unwrap()
                 .into_parts()
                 .0;
             let dynamic_outputs = DynamicUpdateSliceOperation
-                .batch(
-                    &context,
-                    &crate::EmptyRegionDriver,
-                    &[make_input(), make_update(), ArrayBatch::replicated(index(1))],
-                )
+                .batch(&context, &EmptyRegionDriver, &[make_input(), make_update(), ArrayBatch::replicated(index(1))])
                 .unwrap()
                 .into_parts()
                 .0;

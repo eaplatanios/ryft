@@ -1441,12 +1441,12 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionVariable, Layout, Shape, StridedLayout,
     };
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, differentiate_at};
     use crate::macros::check_operation_batching;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{MaybeZero, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1481,7 +1481,7 @@ mod tests {
             .unwrap();
         let input = Array::from_elements::<f64>(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         let output = outputs.into_iter().next().unwrap();
         // The payload kernel and abstract rule must agree on the complete result type: reduction projects sharding,

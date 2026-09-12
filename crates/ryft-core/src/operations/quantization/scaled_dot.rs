@@ -514,7 +514,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::operations::dot::DotDimensionNumbers;
-    use crate::programs::{Operation, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, TypeError};
 
     use super::*;
 
@@ -701,7 +701,7 @@ mod tests {
         let outputs = operation
             .batch(
                 &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
+                &EmptyRegionDriver,
                 &[lhs, rhs, lhs_scale, rhs_scale],
             )
             .unwrap()

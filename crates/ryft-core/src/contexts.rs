@@ -810,7 +810,7 @@ mod tests {
     use crate::partial::PartialTracer;
     use crate::programs::{
         Atom, AtomId, CalleeRegionDriver, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
-        RegionInterface, TypeError, Typed, ValueProjection,
+        RegionInterface, RegionSlot, TypeError, Typed, ValueProjection,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -1180,8 +1180,8 @@ mod tests {
                 "staging_region"
             }
 
-            fn region_slots(&self) -> &'static [crate::RegionSlot] {
-                const { &[crate::RegionSlot::computation("body")] }
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
             }
 
             fn infer_region_input_types(
@@ -1223,8 +1223,8 @@ mod tests {
                 "identity_instantiating_region"
             }
 
-            fn region_slots(&self) -> &'static [crate::RegionSlot] {
-                const { &[crate::RegionSlot::computation("body")] }
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
             }
 
             fn infer_region_input_types(

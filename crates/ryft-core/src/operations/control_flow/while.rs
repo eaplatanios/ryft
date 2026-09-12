@@ -2785,18 +2785,22 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::batch;
     use crate::captures::ClosedProgram;
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::{Domain, EagerContext, StagingContext, ValueResolution};
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::constants::constant::Constant;
+    use crate::operations::constants::fill::Fill;
+    use crate::operations::constants::iota::Iota;
     use crate::operations::constants::one::One;
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
+    use crate::operations::constants::zero::Zero;
     use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::debugging::PrintOperation;
@@ -2810,10 +2814,10 @@ mod tests {
     };
     use crate::parameters::Parameter;
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
-        ReferenceRoot, ReferenceSource, ReferenceType,
+        BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
+        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
     };
-    use crate::tracing::DomainTracingContext;
+    use crate::tracing::{DomainTracingContext, TracingContext};
 
     use super::*;
 
@@ -3302,7 +3306,7 @@ mod tests {
         // interpretation, the eager-domain entry point, and the staged dispatch domain (where every mask batch
         // item is true).
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let outputs = crate::EagerContext::<Array, TestDomainOperation>::new()
+        let outputs = EagerContext::<Array, TestDomainOperation>::new()
             .bind(TestDomainOperation::While(while_operation), while_regions, &[Array::scalar(2.0).unwrap()])
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![16.0]);
@@ -5189,7 +5193,7 @@ mod tests {
 
     impl<C: Domain<Type = ArrayType, Value = TestValue>> InterpretableOperation<C> for TestOperation
     where
-        C: crate::operations::constants::Constant<TestValue, TestValue>,
+        C: Constant<TestValue, TestValue>,
     {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
@@ -5549,7 +5553,7 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind<P: Into<Self::Operation>, D: crate::BindingRegionDriver<Self::Constant, Self::Operation>>(
+        fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
             &self,
             operation: P,
             driver: D,
@@ -5557,7 +5561,7 @@ mod tests {
         ) -> Result<Vec<Self::Value>, ProgramError> {
             // Region-carrying binds route through the eager context's own bind, which grants application-scoped region
             // access.
-            crate::EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
+            EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
         fn is_eager(&self) -> bool {
@@ -5569,8 +5573,8 @@ mod tests {
             Provenance::unknown()
         }
 
-        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Constant(value.clone())
+        fn resolve(&self, value: &Array) -> ValueResolution<Array> {
+            ValueResolution::Constant(value.clone())
         }
 
         fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
@@ -5582,33 +5586,33 @@ mod tests {
         }
     }
 
-    // Eager-domain context capabilities, delegating to the zero-state [`crate::EagerContext`] exactly like
+    // Eager-domain context capabilities, delegating to the zero-state [`EagerContext`] exactly like
     // `EagerContext<Array, ArrayOperation<Array>>`'s.
-    impl crate::operations::constants::Zero<Array> for StagedDispatchTestDomain {
+    impl Zero<Array> for StagedDispatchTestDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            crate::operations::constants::Zero::zero(&crate::EagerContext::<Array>::new(), r#type)
+            Zero::zero(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::One<Array> for StagedDispatchTestDomain {
+    impl One<Array> for StagedDispatchTestDomain {
         fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            crate::operations::constants::One::one(&crate::EagerContext::<Array>::new(), r#type)
+            One::one(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl<S: crate::arrays::ArrayElement> crate::operations::constants::Fill<S, Array> for StagedDispatchTestDomain {
+    impl<S: ArrayElement> Fill<S, Array> for StagedDispatchTestDomain {
         fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
-            crate::operations::constants::Fill::fill(&crate::EagerContext::<Array>::new(), r#type, value)
+            Fill::fill(&EagerContext::<Array>::new(), r#type, value)
         }
     }
 
-    impl crate::operations::constants::Iota<Array> for StagedDispatchTestDomain {
+    impl Iota<Array> for StagedDispatchTestDomain {
         fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
-            crate::operations::constants::Iota::iota(&crate::EagerContext::<Array>::new(), r#type, dimension)
+            Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
         }
     }
 
-    impl crate::operations::constants::Constant<Array, Array> for StagedDispatchTestDomain {
+    impl Constant<Array, Array> for StagedDispatchTestDomain {
         fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
@@ -5646,7 +5650,7 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind<P: Into<Self::Operation>, D: crate::BindingRegionDriver<Self::Constant, Self::Operation>>(
+        fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
             &self,
             operation: P,
             driver: D,
@@ -5668,8 +5672,8 @@ mod tests {
             Provenance::unknown()
         }
 
-        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Constant(value.clone())
+        fn resolve(&self, value: &Array) -> ValueResolution<Array> {
+            ValueResolution::Constant(value.clone())
         }
 
         fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
@@ -5681,31 +5685,31 @@ mod tests {
         }
     }
 
-    impl crate::operations::constants::Zero<Array> for CountingPrintContext {
+    impl Zero<Array> for CountingPrintContext {
         fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            crate::operations::constants::Zero::zero(&EagerContext::<Array>::new(), r#type)
+            Zero::zero(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::One<Array> for CountingPrintContext {
+    impl One<Array> for CountingPrintContext {
         fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-            crate::operations::constants::One::one(&EagerContext::<Array>::new(), r#type)
+            One::one(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl<S: crate::arrays::ArrayElement> crate::operations::constants::Fill<S, Array> for CountingPrintContext {
+    impl<S: ArrayElement> Fill<S, Array> for CountingPrintContext {
         fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
-            crate::operations::constants::Fill::fill(&EagerContext::<Array>::new(), r#type, value)
+            Fill::fill(&EagerContext::<Array>::new(), r#type, value)
         }
     }
 
-    impl crate::operations::constants::Iota<Array> for CountingPrintContext {
+    impl Iota<Array> for CountingPrintContext {
         fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
-            crate::operations::constants::Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
+            Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
         }
     }
 
-    impl crate::operations::constants::Constant<Array, Array> for CountingPrintContext {
+    impl Constant<Array, Array> for CountingPrintContext {
         fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
@@ -6158,14 +6162,8 @@ mod tests {
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(state_type.clone());
-            let predicate = builder
-                .add_instruction(
-                    crate::operations::constants::ZeroOperation::new(predicate_type),
-                    Vec::new(),
-                    vec![],
-                    None,
-                )
-                .unwrap()[0];
+            let predicate =
+                builder.add_instruction(ZeroOperation::new(predicate_type), Vec::new(), vec![], None).unwrap()[0];
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let body = {
@@ -6728,10 +6726,7 @@ mod tests {
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
             TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatchingPolicy>
                 + crate::batching::BatchableOperation<
-                    crate::TracingContext<
-                        <V::DispatchDomain as crate::Domain>::Constant,
-                        <V::DispatchDomain as crate::Domain>::Operation,
-                    >,
+                    TracingContext<<V::DispatchDomain as Domain>::Constant, <V::DispatchDomain as Domain>::Operation>,
                     ArrayBatchingPolicy,
                 > + From<crate::operations::manipulation::TransposeOperation>
                 + From<crate::operations::manipulation::BroadcastOperation>,

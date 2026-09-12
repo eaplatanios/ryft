@@ -184,7 +184,7 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::{TransposableOperation, TranspositionContext};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_partial_evaluation;
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface};
@@ -343,7 +343,7 @@ mod tests {
                 &[],
                 &[],
             ),
-            Err(crate::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dimension_to_scalar` is not transposable",
         ));
     }

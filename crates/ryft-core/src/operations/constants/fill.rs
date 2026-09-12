@@ -1,5 +1,6 @@
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, Dimension, DimensionValue,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, Dimension,
+    DimensionValue,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
@@ -109,6 +110,12 @@ where
 {
     fn fill_literal(&self, r#type: &ArrayType, value: L) -> Result<Self::Value, ProgramError> {
         let value = Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+        r#type
+            .clone()
+            .with_sharding(r#type.sharding().cloned())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        BroadcastOperation::new(r#type.clone(), Vec::new()).infer_output_types(&[value.r#type().into_owned()], &[])?;
+        ArrayAddressing::new(r#type.clone())?;
         let mut outputs = self.bind(ConstantOperation::new(value), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         outputs.remove(0).broadcast(r#type.clone(), &[])
@@ -119,7 +126,8 @@ where
 /// runtime) dimensions. Unlike [`Fill`], this capability supplies each dynamic axis with an explicit dimension value.
 /// Static axes retain their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated
 /// dimension identities require a corresponding input for every occurrence. Each input must have the exact dimension
-/// identity declared by its axis. The caller must thus provide the same dimension value for repeated occurrences.
+/// identity declared by its axis. Repeated occurrences must carry the same runtime extent. Inconsistent values are
+/// rejected when interpreted.
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
 /// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
@@ -127,7 +135,8 @@ where
 /// The output type declares the element type, rank, static sizes, and identities and bounds of dynamic axes without
 /// needing their runtime extents. For example, shape `[N, 2, M]` takes dimension values for `[N, M]`; extents `3` and
 /// `4` produce shape `[3, 2, 4]`. The converted literal is embedded once and broadcast using the existing constant and
-/// broadcast operations.
+/// broadcast operations. Singleton-bound dynamic axes may refine to static result dimensions but the corresponding
+/// dimension inputs are still required.
 ///
 /// # Example
 ///
@@ -149,8 +158,10 @@ pub trait DynamicFill<L, V: Typed> {
     /// Constructs an array filled with `value`, using explicit values for its dynamic dimensions. The literal is
     /// converted to the output element type before broadcasting. The result preserves the requested memory and
     /// sharding. Dynamic shapes use the broadcast operation's default layout; an explicit layout with a dynamic shape
-    /// is rejected rather than silently discarded. Static shapes support the same output layouts as [`Fill`]. Invalid
-    /// geometry is rejected before staging the literal.
+    /// is rejected rather than silently discarded. Static shapes support the same output layouts as [`Fill`]. Input
+    /// dimension types, static dimension constants, literal conversion, and broadcast metadata are checked before
+    /// staging the literal. Failures reported by the context while binding or executing operations are not
+    /// transactional.
     ///
     /// # Parameters
     ///
@@ -170,11 +181,52 @@ where
 {
     fn dynamic_fill(&self, r#type: &ArrayType, value: L, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
         validate_dynamic_constant_dimensions("fill", r#type, dimensions)?;
+        r#type
+            .clone()
+            .with_sharding(r#type.sharding().cloned())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         if !dimensions.is_empty() && r#type.layout().is_some() {
             return Err(TypeError::invalid("dynamic fill does not support an explicit output layout").into());
         }
         let literal =
             Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+
+        // Check every locally decidable failure before binding the literal. Static output axes of a dynamic
+        // broadcast need dimension constants too, and their extents must fit the dimension representation.
+        let static_dimensions = if dimensions.is_empty() {
+            BroadcastOperation::new(r#type.clone(), Vec::new())
+                .infer_output_types(&[literal.r#type().into_owned()], &[])?;
+            ArrayAddressing::new(r#type.clone())?;
+            Vec::new()
+        } else {
+            r#type
+                .shape()
+                .dimensions()
+                .iter()
+                .filter_map(|dimension| match dimension {
+                    Dimension::Static(extent) => Some(DimensionValue::constant(*extent)),
+                    Dimension::Dynamic(_) => None,
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let operation = DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(r#type.sharding().cloned());
+        if !dimensions.is_empty() {
+            let mut static_dimensions = static_dimensions.iter();
+            let mut dimensions = dimensions.iter();
+            let mut input_types = Vec::with_capacity(r#type.rank() + 1);
+            input_types.push(ArrayIrType::Array(literal.r#type().into_owned()));
+            for dimension in r#type.shape().dimensions() {
+                input_types.push(match dimension {
+                    Dimension::Static(_) => {
+                        ArrayIrType::Dimension(static_dimensions.next().unwrap().r#type().into_owned())
+                    }
+                    Dimension::Dynamic(_) => dimensions.next().unwrap().r#type().into_owned(),
+                });
+            }
+            operation.infer_output_types(&input_types, &[])?;
+        }
+
         let scalar_operation =
             <C::Operation as OperationProjection<ArrayType>>::Projected::from(ConstantOperation::new(literal));
         let mut outputs = self.bind(scalar_operation, Vec::new(), &[])?;
@@ -196,20 +248,21 @@ where
         // Dynamic broadcast consumes every output axis. Static axes become dimension constants, while the
         // caller's dynamic axes remain explicit operands and retain their declared identity.
         let mut dimensions = dimensions.iter();
+        let mut static_dimensions = static_dimensions.into_iter();
         let mut inputs = Vec::with_capacity(r#type.rank() + 1);
         inputs.push(scalar);
         for dimension in r#type.shape().dimensions() {
             inputs.push(match dimension {
-                Dimension::Static(extent) => {
+                Dimension::Static(_) => {
                     let mut outputs =
-                        self.bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?;
+                        self.bind(ConstantOperation::new(static_dimensions.next().unwrap()), Vec::new(), &[])?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs.remove(0)
                 }
                 Dimension::Dynamic(_) => dimensions.next().unwrap().clone(),
             });
         }
-        let operation = DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(r#type.sharding().cloned());
+
         let mut outputs = self.bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -224,8 +277,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Shape, Sharding, StridedLayout, f6e2m3fn, u4,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, f6e2m3fn, u4,
     };
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::parameters::Placeholder;
@@ -426,6 +479,28 @@ mod tests {
     #[test]
     fn test_dynamic_fill() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.clone().into()]));
+        let dimension_type = DimensionType::new(size);
+        let two = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
+        assert_eq!(
+            context.dynamic_fill(&r#type, 7f32, &[two.clone(), two.clone()]),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![7f32; 4]).unwrap()))
+        );
+        assert_eq!(
+            context.dynamic_fill(&r#type, 7f32, &[two, three]),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "size".to_string(), expected: 2, actual: 3 }.into()
+            ))
+        );
+        let zero = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
+        assert_eq!(
+            context.dynamic_fill(&r#type, 7f32, &[zero.clone(), zero]),
+            Ok(ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f32>::new()).unwrap()))
+        );
+
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 2);
@@ -448,6 +523,32 @@ mod tests {
 
     #[test]
     fn test_dynamic_fill_invalid_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dimension = context.input(DimensionType::new(size.clone()).into());
+        let invalid_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), usize::MAX.into()]));
+        if usize::BITS >= 64 {
+            let error = context.dynamic_fill(&invalid_type, 1f32, &[dimension.clone()]).unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<DimensionError>(),
+                Some(&DimensionError::ExtentExceedsBackendWidth { value: usize::MAX, maximum: i64::MAX as usize })
+            );
+            assert!(context.builder().borrow().instructions().is_empty());
+        }
+        // Shape replacement can invalidate previously valid sharding metadata.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let invalid_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0))
+            .unwrap()
+            .with_shape(Shape::new(vec![size.clone().into()]));
+        assert!(matches!(context.dynamic_fill(&invalid_type, 1f32, &[dimension.clone()]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "sharding rank (0) does not match array rank (1)"));
+        assert!(context.builder().borrow().instructions().is_empty());
+        let invalid_type = ArrayType::new(DataType::Token, Shape::new(vec![size.into()]));
+        assert!(context.dynamic_fill(&invalid_type, 1f32, &[dimension]).is_err());
+        assert!(context.builder().borrow().instructions().is_empty());
+
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into()]));
@@ -494,6 +595,31 @@ mod tests {
                 ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f32; 6]).unwrap()),
                 ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())
             ])
+        );
+    }
+
+    #[test]
+    fn test_dynamic_fill_staging_singleton_dimension() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let dimension_type = DimensionType::new(size);
+        let dimension = context.input(dimension_type.clone().into());
+        let output = context.dynamic_fill(&r#type, 2f32, &[dimension]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2f32; 3]).unwrap())])
         );
     }
 }

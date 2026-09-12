@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals,
-    RaggedAxis, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, ArrayTypeRefinements, Dimension, DimensionType, DimensionValue,
+    LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -585,13 +585,19 @@ where
             .into());
         };
         let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
+        let mut refinements = ArrayTypeRefinements::default();
         let output_shape = Shape::new(
             output_extents
                 .iter()
                 .cloned()
                 .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
-                .map(|result| result.map(|extent| Dimension::Static(extent.extent())))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|result| {
+                    let extent = result?;
+                    // Shared dimension identities denote one size across all output axes.
+                    refinements.bind(extent.r#type().variable(), extent.extent())?;
+                    Ok(Dimension::Static(extent.extent()))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?,
         );
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, self)?;
         Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(
@@ -1305,9 +1311,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
-        StridedLayout, f8e8m0fnu,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension, StridedLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{TransposableOperation, differentiate_at};
@@ -2133,6 +2139,37 @@ mod tests {
         assert_eq!(
             DynamicBroadcastOperation::new(vec![1]).interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::Type(TypeError::invalid("`broadcast` expects an array followed by its output extents"))),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_interpretation_repeated_dimensions() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let input = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(dimension, 3).unwrap());
+        let operation = DynamicBroadcastOperation::new(Vec::new());
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), two.clone(), two.clone()]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0f32; 4]).unwrap()
+            )]),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), two.clone(), three]),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "size".to_owned(), expected: 2, actual: 3 }.into()
+            )),
+        );
+        // Equal diagnostic names do not equate independently created dimension identities.
+        let other = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let three = ArrayIrValue::Dimension(DimensionValue::new(other, 3).unwrap());
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input, two, three]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0f32; 6]).unwrap()
+            )]),
         );
     }
 

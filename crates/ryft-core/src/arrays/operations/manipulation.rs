@@ -10,7 +10,7 @@
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::sharding::shardings::Sharding;
-use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements};
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::EagerContext;
@@ -21,7 +21,7 @@ use crate::operations::{
     Broadcast, DimensionSize, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, PAD_OPERATION_NAME, Pad,
     PadOperation, Permutation, Reshape, ReshapeParameters,
 };
-use crate::programs::{ProgramError, Value, ValueProjection};
+use crate::programs::{ProgramError, Typed, Value, ValueProjection};
 
 impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for PadOperation<ArrayIrType>
@@ -62,12 +62,17 @@ impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroad
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let mut refinements = ArrayTypeRefinements::default();
         let output_shape = Shape::new(
             output_dimensions
                 .iter()
                 .map(<Self as ValueProjection<DimensionType>>::projected)
-                .map(|result| result.map(|dimension| Dimension::Static(dimension.extent())))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|result| {
+                    let dimension = result?;
+                    refinements.bind(dimension.r#type().variable(), dimension.extent())?;
+                    Ok(Dimension::Static(dimension.extent()))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?,
         );
         let operation = DynamicBroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
@@ -117,7 +122,9 @@ mod tests {
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
-    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::dimensions::{
+        Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape,
+    };
     use crate::arrays::types::ir::ArrayIrType;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -1549,6 +1556,26 @@ in (%4)
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_value_dynamic_broadcast_with_output_sharding_repeated_dimensions() {
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let input = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(dimension, 3).unwrap());
+        assert_eq!(
+            input.dynamic_broadcast_with_output_sharding(&[two.clone(), two.clone()], &[], None),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0f32; 4]).unwrap()
+            )),
+        );
+        assert_eq!(
+            input.dynamic_broadcast_with_output_sharding(&[two, three], &[], None),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "size".to_owned(), expected: 2, actual: 3 }.into()
+            )),
+        );
     }
 
     #[test]

@@ -1699,8 +1699,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult, ReferenceSource,
-        ReferenceType, TypeError,
+        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult,
+        ReferenceSource, ReferenceType, TypeError,
     };
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
@@ -2026,7 +2026,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0]);
         assert_eq!(
-            operation.interpret(&context.clone(), &crate::EmptyRegionDriver, &[] as &[Array]),
+            operation.interpret(&context.clone(), &EmptyRegionDriver, &[] as &[Array]),
             Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
         );
 
