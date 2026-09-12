@@ -171,9 +171,9 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::scalar(2.5)],
+                &[Array::scalar(2.5).unwrap()],
             ),
-            Ok(vec![Array::scalar(1.0)]),
+            Ok(vec![Array::scalar(1.0).unwrap()]),
         );
         let input = Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap();
         assert_eq!(
@@ -188,18 +188,18 @@ mod tests {
 
         // Verify value-driven one synthesis across representative rank-zero array data-type families.
         for (input, expected) in [
-            (Array::scalar(false), Array::scalar(true)),
-            (Array::scalar(5i32), Array::scalar(1i32)),
-            (Array::scalar(5u32), Array::scalar(1u32)),
-            (Array::scalar(bf16::from_f32(5.0)), Array::scalar(bf16::ONE)),
-            (Array::scalar(f16::from_f32(5.0)), Array::scalar(f16::ONE)),
-            (Array::scalar(3.0f32), Array::scalar(1.0f32)),
-            (Array::scalar(7.0f64), Array::scalar(1.0f64)),
+            (Array::scalar(false).unwrap(), Array::scalar(true).unwrap()),
+            (Array::scalar(5i32).unwrap(), Array::scalar(1i32).unwrap()),
+            (Array::scalar(5u32).unwrap(), Array::scalar(1u32).unwrap()),
+            (Array::scalar(bf16::from_f32(5.0)).unwrap(), Array::scalar(bf16::ONE).unwrap()),
+            (Array::scalar(f16::from_f32(5.0)).unwrap(), Array::scalar(f16::ONE).unwrap()),
+            (Array::scalar(3.0f32).unwrap(), Array::scalar(1.0f32).unwrap()),
+            (Array::scalar(7.0f64).unwrap(), Array::scalar(1.0f64).unwrap()),
         ] {
             assert_eq!(input.one_like(), Ok(expected));
         }
 
-        let input = Array::vector(vec![1.5f32, -2.5]);
+        let input = Array::vector(vec![1.5f32, -2.5]).unwrap();
         let output = input.one_like().unwrap();
         assert_eq!(output.elements::<f32>(), Ok(vec![1.0, 1.0]));
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
@@ -228,9 +228,10 @@ mod tests {
     #[test]
     fn test_one_like_partial_evaluation() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5])));
+        let input =
+            PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5]).unwrap()));
         let output = input.one_like().unwrap();
-        assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![1.0f32, 1.0])));
+        assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![1.0f32, 1.0]).unwrap()));
     }
 
     #[test]
@@ -239,17 +240,17 @@ mod tests {
             BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let input = BatchingTracer::new(
             context,
-            ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),
+            ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]).unwrap(), BatchAxis::replicated()).unwrap(),
         );
         let output = input.one_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::vector(vec![1.0f32, 1.0]));
+        assert_eq!(output.batch().value(), &Array::vector(vec![1.0f32, 1.0]).unwrap());
     }
 
     #[test]
     fn test_one_like_differentiation() {
         // Dense forward-mode differentiation batches the constant rule while constructing the identity Jacobian.
-        let jacobian = differentiate_at(Array::scalar(2.0))
+        let jacobian = differentiate_at(Array::scalar(2.0).unwrap())
             .jacobian_forward(|input| Ok(input.clone() + input.one_like()?))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -263,8 +264,8 @@ mod tests {
             operation = OneLikeOperation::<ArrayType>::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(0.0)],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(0.0).unwrap()],
             }],
         );
     }

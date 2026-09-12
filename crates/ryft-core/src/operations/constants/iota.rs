@@ -14,7 +14,9 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
-use crate::operations::constants::check_constructor_type_has_no_identity_references;
+use crate::operations::constants::{
+    check_constructor_type_has_no_identity_references, validate_dynamic_constant_dimensions,
+};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
@@ -164,7 +166,7 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
             .iter()
             .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         {
-            Self::DynamicIota(operation)
+            Self::Iota(operation)
         } else {
             Self::Array(ArrayOperation::Iota(operation))
         }
@@ -205,7 +207,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
                 dimension.value().ok_or_else(|| {
                     TypeError::invalid(format!(
                         "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
-                         over `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per \
+                         over `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per \
                          dynamic axis",
                     ))
                 })
@@ -290,6 +292,62 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>>
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C, P>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.primal().iota(r#type, dimension)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
+    }
+}
+
+/// Represents the ability to construct an [`Array`] of coordinates whose shape includes _dynamic_ (i.e., runtime)
+/// dimensions. Unlike [`Iota`], this capability supplies each dynamic axis with an explicit dimension value. Static
+/// axes retain their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension
+/// identities require a corresponding input for every occurrence. Each input must have the exact dimension identity
+/// declared by its axis. The caller must thus provide the same dimension value for repeated occurrences.
+///
+/// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
+/// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
+///
+/// Each element is its zero-based index along the selected axis, converted to the output element data type;
+/// coordinates repeat along the other axes. Complex outputs have zero imaginary components.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+/// #     DimensionValue, DimensionVariable, DynamicIota, EagerContext, Shape,
+/// # };
+/// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+/// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+/// let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// assert_eq!(
+///     context.dynamic_iota(&output_type, 0, &[dimension]),
+///     Ok(ArrayIrValue::Array(Array::vector(vec![0i32, 1, 2]).unwrap())),
+/// );
+/// ```
+pub trait DynamicIota<V: Typed> {
+    /// Constructs an array of coordinates with explicit values for its dynamic dimensions. Returns an error for a
+    /// non-numeric output element type, an out-of-range axis, or dimension inputs that do not match the output type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `type`: Output [`ArrayType`] that may contain dynamic dimensions. Each dynamic axis names the dimension
+    ///     identity that its corresponding input must carry.
+    ///   - `dimension`: Zero-based output axis along which the coordinates increase.
+    ///   - `dimensions`: Contains one dimension value per dynamic axis, in axis order. Static axes do not consume input
+    ///     dimensions provided this way. Repeated identities still consume one input for each axis that uses them.
+    fn dynamic_iota(&self, r#type: &ArrayType, dimension: usize, dimensions: &[V]) -> Result<V, ProgramError>;
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<IotaOperation<ArrayType>>>> DynamicIota<C::Value> for C {
+    #[inline]
+    fn dynamic_iota(
+        &self,
+        r#type: &ArrayType,
+        dimension: usize,
+        dimensions: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        let operation = IotaOperation::new(r#type.clone(), dimension)?;
+        validate_dynamic_constant_dimensions(IOTA_OPERATION_NAME, r#type, dimensions)?;
+        Ok(self.bind(operation, Vec::new(), dimensions)?.remove(0))
     }
 }
 
@@ -398,7 +456,7 @@ mod tests {
         let [instruction] = instantiated.instructions() else {
             panic!("expected one instantiated instruction");
         };
-        let ArrayIrOperation::DynamicIota(instantiated_iota) = instruction.operation() else {
+        let ArrayIrOperation::Iota(instantiated_iota) = instruction.operation() else {
             panic!("expected the instantiated operation to remain a dynamic iota");
         };
         assert_eq!(
@@ -424,7 +482,7 @@ mod tests {
         let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
         // Eager interpretation along axis one varies between columns and repeats across rows.
         let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
-        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
+        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap();
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
                 &operation,
@@ -478,7 +536,7 @@ mod tests {
             context.iota(&dynamic_type, 0),
             Err(ProgramError::Type(TypeError::invalid(
                 "cannot materialize an iota of dynamically sized type f32[size]; stage it in an array program over \
-                 `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
+                 `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per dynamic axis",
             ))),
         );
 
@@ -509,7 +567,7 @@ mod tests {
         assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),
             "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
-             `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
+             `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per dynamic axis",
         );
     }
 
@@ -574,12 +632,12 @@ mod tests {
         assert_eq!(
             jvp.interpret(vec![extent]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 2.0])),
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0]).unwrap()),
             ]),
         );
         assert_eq!(jvp.instructions().len(), 2);
-        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::DynamicIota(_)));
+        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::Iota(_)));
         assert!(matches!(jvp.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
     }
@@ -673,6 +731,93 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_iota() {
+        let extent_type = DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded()));
+        let output_type = ArrayType::new(
+            DataType::I32,
+            Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone()), Dimension::Static(2)]),
+        );
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context.dynamic_iota(&output_type, 0, &[extent]),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3, 2]), &[0i32, 0, 1, 1, 2, 2]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            context.dynamic_iota(&ArrayType::new_static(DataType::I32, [3]), 0, &[]),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0i32, 1, 2]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_iota_invalid_axis() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context.dynamic_iota(&ArrayType::new_static(DataType::I32, [3]), 1, &[]),
+            Err(TypeError::invalid("`iota` dimension 1 is out of bounds for rank 1").into()),
+        );
+    }
+    #[test]
+    fn test_dynamic_iota_invalid_dimensions() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let output_type = ArrayType::new(
+            DataType::I32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("extent", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            context.dynamic_iota(&output_type, 0, &[]),
+            Err(TypeError::invalid(
+                "`iota` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+            )
+            .into()),
+        );
+        assert_eq!(
+            context.dynamic_iota(&output_type, 0, &[ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
+            Err(TypeError::invalid("`iota` operand 0 must be a dimension but has type f32[]").into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_iota_staging() {
+        let extent_type = DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded()));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = context.input(extent_type.clone().into());
+        let output = context.dynamic_iota(&output_type, 0, &[extent]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one dynamic iota instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Iota(_)));
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        assert_eq!(
+            program.interpret(vec![extent.clone()]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())]),
+        );
+        // Transform replay retains the extent operand for both coordinates and their zero tangent.
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0f64, 0.0, 0.0]).unwrap()),
+            ]),
         );
     }
 }
