@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrType, ArrayType, ArrayTypeRefinements, Dimension, DimensionType, DimensionValue,
-    LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension,
+    Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -493,13 +493,16 @@ pub struct DynamicBroadcastOperation {
 
     /// Optional requested output [`Sharding`].
     output_sharding: Option<Sharding>,
+
+    /// Optional requested physical output layout.
+    output_layout: Option<Layout>,
 }
 
 impl DynamicBroadcastOperation {
     /// Creates a broadcast with the supplied input-to-output axis mapping.
     #[inline]
     pub fn new(output_axes: Vec<usize>) -> Self {
-        Self { output_axes, output_sharding: None }
+        Self { output_axes, output_sharding: None, output_layout: None }
     }
 
     /// Returns the output axes. The resulting slice contains, for each input axis, the output axis to which it maps.
@@ -514,10 +517,29 @@ impl DynamicBroadcastOperation {
         self.output_sharding.as_ref()
     }
 
+    /// Returns the requested physical output layout, if any.
+    #[inline]
+    pub fn output_layout(&self) -> Option<&Layout> {
+        self.output_layout.as_ref()
+    }
+
     /// Returns this operation with the requested output `sharding`.
     #[inline]
     pub fn with_output_sharding(mut self, sharding: impl Into<Option<Sharding>>) -> Self {
         self.output_sharding = sharding.into();
+        self
+    }
+
+    /// Returns this operation with the requested physical output `layout`.
+    ///
+    /// Layout rank and structure are validated during type inference. Storage geometry depending on dynamic extents
+    /// is validated once their runtime values are available. Without an explicit layout, shape-changing broadcasts
+    /// use the default layout; identity broadcasts preserve the input layout. Mapped batching supports tiled layouts
+    /// by placing the batch axis outside each item's storage. Explicit strided layouts currently support replicated
+    /// batching only, because a leading batch stride can depend on runtime output sizes.
+    #[inline]
+    pub fn with_output_layout(mut self, layout: impl Into<Option<Layout>>) -> Self {
+        self.output_layout = layout.into();
         self
     }
 }
@@ -556,6 +578,9 @@ impl Operation for DynamicBroadcastOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, BROADCAST_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("output_axes", format_args!("{:?}", self.output_axes))?;
+            if let Some(output_layout) = &self.output_layout {
+                operation.field("output_layout", output_layout)?;
+            }
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
             }
@@ -679,12 +704,24 @@ where
                 .into());
         }
 
+        if matches!(self.output_layout(), Some(Layout::Strided(_))) {
+            return Err(BatchingError::InvalidBatchMetadata {
+                message: "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch stride, which is not supported".to_owned(),
+            });
+        }
         let moved_input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
 
         let mut lifted_output_axes = Vec::with_capacity(self.output_axes().len() + 1);
         lifted_output_axes.push(0);
         lifted_output_axes.extend(self.output_axes().iter().map(|axis| axis + 1));
         let mut operation = Self::new(lifted_output_axes);
+        if let Some(Layout::Tiled(layout)) = self.output_layout() {
+            // Keep each item's tiled storage together by making the leading batch axis most major.
+            let mut minor_to_major = layout.minor_to_major().iter().map(|axis| axis + 1).collect::<Vec<_>>();
+            minor_to_major.push(0);
+            operation =
+                operation.with_output_layout(Layout::Tiled(TiledLayout::new(minor_to_major, layout.tiles().to_vec())));
+        }
         if let Some(output_sharding) = self.output_sharding() {
             operation = operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
                 output_sharding,
@@ -896,7 +933,8 @@ where
                             if contribution_type.shape() == transpose_target_type.shape() {
                                 transpose_context.bind(
                                     DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
-                                        .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        .with_output_sharding(transpose_target_type.sharding().cloned())
+                                        .with_output_layout(transpose_target_type.layout().cloned()),
                                     Vec::new(),
                                     exact_inputs.as_slice(),
                                 )
@@ -1259,14 +1297,36 @@ pub(crate) fn infer_explicit_broadcast_output_type(
             .map_err(|error| TypeError::invalid(error.to_string()))?,
     };
 
-    if input.shape() == &output_shape && operation.output_axes().iter().copied().eq(0..input.rank()) {
-        return input.clone().with_sharding(output_sharding).map_err(|error| TypeError::invalid(error.to_string()));
-    }
-
-    ArrayType::new(input.data_type(), output_shape)
-        .with_memory(input.memory())
+    let mut output_type =
+        if input.shape() == &output_shape && operation.output_axes().iter().copied().eq(0..input.rank()) {
+            input.clone()
+        } else {
+            ArrayType::new(input.data_type(), output_shape).with_memory(input.memory())
+        }
         .with_sharding(output_sharding)
-        .map_err(|error| TypeError::invalid(error.to_string()))
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    if let Some(layout) = operation.output_layout() {
+        output_type = output_type.with_layout(layout.clone());
+        // Lower bounds provide concrete geometry for structural checks without requiring runtime sizes. Actual
+        // extents may expose additional stride aliasing or storage overflow and are checked during interpretation.
+        let dimensions = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                Dimension::Static(extent) => *extent,
+                Dimension::Dynamic(variable) => variable.bounds().lower(),
+            })
+            .collect::<Vec<_>>();
+        ArrayAddressing::new(
+            output_type.clone().with_shape(Shape::new(dimensions.into_iter().map(Dimension::Static).collect())),
+        )
+        .map_err(|error| match error {
+            ProgramError::Type(error) => error,
+            error => TypeError::invalid(error.to_string()),
+        })?;
+    }
+    Ok(output_type)
 }
 
 impl Broadcast for Array {
@@ -2051,6 +2111,9 @@ mod tests {
 
         assert_eq!(operation.output_axes(), &[1]);
         assert_eq!(operation.output_sharding(), None);
+        assert_eq!(operation.output_layout(), None);
+        let layout = Layout::Strided(StridedLayout::new(vec![24, 8]));
+        assert_eq!(operation.with_output_layout(layout.clone()).output_layout(), Some(&layout));
     }
 
     #[test]
@@ -2125,6 +2188,35 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_broadcast_type_inference_layout() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let layout = Layout::Strided(StridedLayout::new(vec![8]));
+        let input_types = [ArrayType::scalar(DataType::F32).into(), DimensionType::new(extent.clone()).into()];
+        assert_eq!(
+            DynamicBroadcastOperation::new(vec![])
+                .with_output_layout(layout.clone())
+                .infer_output_types(&input_types, &[]),
+            Ok(vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+                    .with_layout(layout)
+                    .into()
+            ]),
+        );
+        assert_eq!(
+            DynamicBroadcastOperation::new(vec![])
+                .with_output_layout(Layout::Strided(StridedLayout::new(vec![8, 4])))
+                .infer_output_types(&input_types, &[]),
+            Err(TypeError::invalid("strided layout rank 2 does not match array rank 1")),
+        );
+        assert_eq!(
+            DynamicBroadcastOperation::new(vec![])
+                .with_output_layout(Layout::Tiled(TiledLayout::new(vec![1], vec![])))
+                .infer_output_types(&input_types, &[]),
+            Err(TypeError::invalid("tiled layout minor-to-major dimensions must be a permutation of 0..1")),
+        );
+    }
+
+    #[test]
     fn test_dynamic_broadcast_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = [
@@ -2139,6 +2231,38 @@ mod tests {
         assert_eq!(
             DynamicBroadcastOperation::new(vec![1]).interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::Type(TypeError::invalid("`broadcast` expects an array followed by its output extents"))),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_interpretation_layout() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = [
+            ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        ];
+        let layout = Layout::Strided(StridedLayout::new(vec![-8]));
+        assert_eq!(
+            DynamicBroadcastOperation::new(vec![]).with_output_layout(layout.clone()).interpret(
+                &context,
+                &EmptyRegionDriver,
+                &inputs
+            ),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [3]).with_layout(layout),
+                    &[2.0f32, 2.0, 2.0],
+                )
+                .unwrap()
+            )]),
+        );
+        assert_eq!(
+            DynamicBroadcastOperation::new(vec![])
+                .with_output_layout(Layout::Strided(StridedLayout::new(vec![2])))
+                .interpret(&context, &EmptyRegionDriver, &inputs),
+            Err(ProgramError::Type(TypeError::invalid(
+                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and may alias array elements",
+            ))),
         );
     }
 
@@ -2239,6 +2363,44 @@ mod tests {
             output.into_value(),
             ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).unwrap())
         );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_batching_layout() {
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let inputs = [
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()), BatchAxis::new(0))
+                .unwrap(),
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())),
+        ];
+        let output = DynamicBroadcastOperation::new(vec![])
+            .with_output_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])))
+            .batch(&context, &EmptyRegionDriver, &inputs)
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(
+            output.into_value(),
+            ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [2, 3])
+                        .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]))),
+                    &[1.0f32, 1.0, 1.0, 2.0, 2.0, 2.0],
+                )
+                .unwrap()
+            )
+        );
+        assert!(matches!(
+            DynamicBroadcastOperation::new(vec![])
+                .with_output_layout(Layout::Strided(StridedLayout::new(vec![4])))
+                .batch(&context, &EmptyRegionDriver, &inputs),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message == "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch stride, which is not supported",
+        ));
     }
 
     #[test]

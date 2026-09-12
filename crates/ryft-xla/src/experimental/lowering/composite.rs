@@ -4,12 +4,13 @@
 //!
 //! Eager evaluation and staging allow unbounded dimensions. Executable zero, one, iota, and like constructors need
 //! finite allocation bounds. Their dynamic extents must fit signed 32-bit size carriers; a bound reserves storage,
-//! while the explicit dimension inputs or exemplar sizes determine the runtime shape.
+//! while the explicit dimension inputs or exemplar sizes determine the runtime shape. Explicit constructor layouts
+//! support dense minor-to-major axis permutations; byte-strided layouts and physical tiles are rejected.
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
-    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, EffectClass, Operation, ProgramError,
-    Shape,
+    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, EffectClass, Layout, Operation,
+    ProgramError, Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -28,6 +29,53 @@ use super::{
     lower_static_index_constants, lower_tensor_type, physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
+
+/// Constrains a statically allocated constructor result before attaching its runtime dimensions.
+fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    location: ryft_mlir::LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let Some(layout) = r#type.layout() else {
+        return Ok(value);
+    };
+    let Layout::Tiled(tiled) = layout else {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("dynamic constructor with strided output layout `{layout}`"),
+        });
+    };
+    if !tiled.tiles().is_empty() {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("dynamic constructor with tiled output layout `{layout}`"),
+        });
+    }
+    let axes = tiled.minor_to_major();
+    if axes.len() != r#type.rank()
+        || axes.iter().any(|axis| *axis >= r#type.rank())
+        || axes.iter().collect::<std::collections::HashSet<_>>().len() != r#type.rank()
+    {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("dynamic constructor with invalid output layout `{layout}` for type `{type}`"),
+        });
+    }
+    // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape:
+    // runtime extents are attached afterward, so the call needs no separate dynamic result-shape arguments.
+    let constrained = block.append_operation(stable_hlo::custom_call(
+        &[value],
+        "LayoutConstraint",
+        false,
+        None,
+        stable_hlo::CustomCallApiVersion::Original,
+        &[],
+        Some(stable_hlo::CustomCallMemoryLayouts { operands: vec![axes.to_vec()], results: vec![axes.to_vec()] }),
+        &[],
+        None,
+        &[value.r#type()?],
+        location,
+    )?)?;
+    Ok(constrained.result(0).unwrap().as_ref())
+}
 
 /// Physical lowering plan for one axis of a first-class dynamic shape slice.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -232,6 +280,7 @@ fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: ryft_mlir::LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    result = lower_constructor_layout(result, &refined_type, block, location)?;
     let i32_scalar_type = context
         .tensor_type(context.signless_integer_type(32), &[], None, location)
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
@@ -686,7 +735,8 @@ where
                     operation.output_axes(),
                     location,
                 )?)?;
-                broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
+                let result = broadcast.result(0).unwrap().as_ref();
+                lower_constructor_layout(result, output_type, block, location)?
             } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
                 // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
                 // refined from the explicit result extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
@@ -720,6 +770,11 @@ where
                 )?
                 .remove(0)
             } else {
+                if output_type.layout().is_some() {
+                    return Err(LoweringError::UnsupportedOp {
+                        op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
+                    });
+                }
                 let shape = lower_explicit_shape(output_extents, block, context, location)?;
                 let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
                     *input,

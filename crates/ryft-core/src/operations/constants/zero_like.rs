@@ -91,7 +91,7 @@ impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: ZeroLikeOperation<ArrayIrType>) -> Self {
-        // A `zero_like` reads its complete output type, including every runtime extent, from its exemplar operand, so
+        // A `zero_like` reads its complete output type, including every runtime extent, from its exemplar input, so
         // the composite family needs no mixed encoding for it: the homogeneous member constructor already expresses
         // the dynamic case. This conversion exists so that type-generic transform drivers can name the exemplar-based
         // zero in the composite universe with a plain `From<ZeroLikeOperation<C::Type>>` bound. A first-class dimension
@@ -100,10 +100,26 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
     }
 }
 
-/// Represents the ability to synthesize a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart
-/// to [`Zero`](super::Zero). It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
+/// Represents the ability to construct a _zero_ value with the same type as an exemplar. [`ZeroLike`] is the
+/// value-driven counterpart to [`Zero`](super::Zero) and supplies [`ZeroLikeOperation`]'s interpretation capability.
+/// For arrays, the result preserves the exemplar's element data type, runtime shape, memory placement, layout, and
+/// sharding. Its elements are zeros regardless of the exemplar's values; complex elements have a zero imaginary part.
+/// Empty arrays remain empty, but their element data type must still support zero.
+///
+/// A staged call retains the exemplar as an input so that dynamic extents are read at execution time. It does not
+/// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
+/// result, so differentiation returns zero for its tangent or cotangent.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ZeroLike};
+/// let input = Array::vector(vec![2.0f32, -3.0]).unwrap();
+/// assert_eq!(input.zero_like(), Ok(Array::vector(vec![0.0f32, 0.0]).unwrap()));
+/// ```
 pub trait ZeroLike: Sized {
-    /// Returns a _zero_ value with the same structure as `self`, or an error if that structure cannot represent zero.
+    /// Returns a _zero_ value with the same type and runtime shape as `self`. Returns an error if its element
+    /// data type cannot represent zero, including when the exemplar is empty.
     fn zero_like(&self) -> Result<Self, ProgramError>;
 }
 
@@ -143,10 +159,13 @@ impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation<V::Type>
 mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, DimensionValue, f8e8m0fnu,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        StridedLayout, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
@@ -237,6 +256,18 @@ mod tests {
         assert_eq!(output.elements::<f32>(), Ok(vec![0.0, 0.0]));
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
 
+        // Complex identity values preserve physical layout and memory, including for empty arrays.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let r#type = ArrayType::new_static(DataType::C64, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let input = Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 2]).unwrap();
+        assert_eq!(input.zero_like(), Ok(Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 2]).unwrap()),);
+        let empty = Array::from_elements::<Complex<f32>>(ArrayType::new_static(DataType::C64, [0]), &[]).unwrap();
+        assert_eq!(empty.zero_like(), Ok(empty.clone()));
+
         // Unsupported data types report exact errors instead of fabricating a zero from the exemplar.
         let input = Array::from_elements(
             ArrayType::new_static(DataType::F8E8M0FNU, [2]),
@@ -292,6 +323,22 @@ mod tests {
         let output = input.zero_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::vector(vec![0.0f32, 0.0]).unwrap());
+
+        // A nonleading mapped axis remains mapped rather than turning the result into a replicated constant.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let r#type = ArrayType::new_static(DataType::C64, [2, 3]);
+        let input = BatchingTracer::new(
+            context,
+            ArrayBatch::new(
+                Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 6]).unwrap(),
+                BatchAxis::new(1),
+            )
+            .unwrap(),
+        );
+        let output = input.zero_like().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(output.batch().value(), &Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 6]).unwrap(),);
     }
 
     #[test]
@@ -318,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_zero_like() {
+    fn test_zero_like_staging() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
         let output = input.zero_like().unwrap();
@@ -336,6 +383,47 @@ mod tests {
                 in (%1)
             "}
             .trim_end(),
+        );
+    }
+    #[test]
+    fn test_zero_like_staging_mixed() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let input = context.input(r#type.clone().into());
+        let output = input.zero_like().unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(r#type));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one exemplar-based zero instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::ZeroLike(_))));
+        assert_eq!(instruction.inputs(), &[input.atom_id().unwrap()]);
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0.0f32, 0.0]).unwrap(),
+            )]),
+        );
+        // Runtime zero is a valid extent even though the exemplar's signature is dynamic.
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
         );
     }
 }

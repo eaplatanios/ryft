@@ -10260,8 +10260,9 @@ mod tests {
         LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
         Placeholder, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation, ReshapeOperation,
         ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
-        SliceOperation, StagingContext, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation,
-        WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        SliceOperation, StagingContext, StridedLayout, Tile, TileDimension, TiledLayout, Trace, TracingContext,
+        Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation,
+        ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -18536,6 +18537,88 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_dynamic_broadcast_output_layout() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let rows_input = builder
+            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(rows.clone()), 2).unwrap()));
+        let columns_input = builder
+            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(columns.clone()), 3).unwrap()));
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(Vec::new()).with_output_layout(layout.clone()),
+                Vec::new(),
+                vec![scalar, rows_input, columns_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
+        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone())]);
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &ArrayType::scalar(DataType::F32),
+            &output_type,
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        // Constrain the bounded physical allocation before attaching the two runtime extents.
+        assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 1, "{module}");
+        assert_eq!(module.matches("result_layouts = [dense<[0, 1]> : tensor<2xindex>]").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 2, "{module}");
+    }
+
+    #[test]
+    fn test_lower_dynamic_broadcast_output_layout_unsupported() {
+        for (layout, kind) in [
+            (Layout::Strided(StridedLayout::new(vec![4])), "strided"),
+            (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
+        ] {
+            let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let dimension = builder.add_constant(XlaConstant::Dimension(
+                DimensionValue::new(DimensionType::new(size.clone()), 2).unwrap(),
+            ));
+            let output = builder
+                .add_instruction(
+                    DynamicBroadcastOperation::new(Vec::new()).with_output_layout(layout.clone()),
+                    Vec::new(),
+                    vec![scalar, dimension],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()])).with_layout(layout.clone());
+            assert_eq!(
+                to_mlir_module_for_program(
+                    &program,
+                    &[],
+                    &ArrayType::scalar(DataType::F32),
+                    &output_type,
+                    "main",
+                    None,
+                    None,
+                ),
+                Err(LoweringError::UnsupportedOp {
+                    op: format!("dynamic constructor with {kind} output layout `{layout}`"),
+                }),
+            );
+        }
+    }
+
+    #[test]
     fn test_lower_like_constant_dynamic_geometry() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(5))]));
         let mut builder = XlaProgramBuilder::new();
@@ -18642,7 +18725,8 @@ mod tests {
 
     #[test]
     fn test_lower_like_constant_executes_dynamic_geometry() {
-        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![dynamic_dimension("size", Some(5))]))
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], Vec::new())));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -18655,6 +18739,7 @@ mod tests {
             )
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "like_dynamic").unwrap();
+        assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 2, "{module}");
         // The wrapper supplies an input extent at execution time. Its static physical boundary avoids CPU PJRT's
         // unsupported dynamic buffer boundary; one compiled executable handles both size two and size zero.
         let module = format!(

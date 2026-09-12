@@ -10,9 +10,9 @@ use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdenti
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
 /// constructor. The generated implementation treats the operation's stored [`ArrayType`] as the complete output type
-/// and requires one first-class [`DimensionType`] operand per dynamic axis, in axis order. Static axes remain stored
-/// metadata and consume no operands. This is specialized to constant constructors because they have no data operands
-/// or regions and derive their complete result solely from stored type metadata plus dynamic extent operands.
+/// and requires one first-class [`DimensionType`] input per dynamic axis, in axis order. Static axes remain stored
+/// metadata and consume no inputs. This is specialized to constant constructors because they have no data inputs
+/// or regions and derive their complete result solely from stored type metadata plus dynamic extent inputs.
 macro_rules! impl_member_operation_for_array_ir_constant_operation {
     ($operation:ty $(, $validate:ident)?) => {
         impl $crate::programs::MemberOperation<$crate::arrays::ArrayIrType> for $operation {
@@ -52,11 +52,11 @@ macro_rules! impl_member_operation_for_array_ir_constant_operation {
 }
 
 /// Implements mixed [`MemberInterpretableOperation`](crate::MemberInterpretableOperation) semantics for an array
-/// constant constructor. The generated implementation projects each explicit first-class dimension operand to its
+/// constant constructor. The generated implementation projects each explicit first-class dimension input to its
 /// runtime extent, validates that extent against the corresponding dynamic axis's declared bounds, and replaces the
 /// dynamic axes with static extents before invoking the constructor's eager capability. This runtime concretization is
 /// required because replay deliberately does not refine types stored in operation payloads; concrete shape information
-/// reaches mixed constructors only through their Static Single Assignment (SSA) dimension operands. The final argument
+/// reaches mixed constructors only through their Static Single Assignment (SSA) dimension inputs. The final argument
 /// names the generated eager context, concrete output type, and operation payload for use in an operation-specific
 /// expression that returns the constructed projected value.
 macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation {
@@ -158,8 +158,8 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
 }
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
-/// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
-/// supplies. Such outputs must use a mixed constructor that consumes explicit dimension operands. Definition-position
+/// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no input
+/// supplies. Such outputs must use a mixed constructor that consumes explicit dimension inputs. Definition-position
 /// identities remain valid because the constructed value establishes them itself.
 pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
     name: &str,
@@ -175,13 +175,13 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 }
 
 /// Infers the output type of one mixed [`ArrayIrType`] constant constructor whose stored [`ArrayType`] is the complete
-/// output type. The constructor consumes one first-class dimension operand per _dynamic_ dimension of its stored shape,
-/// in axis order, and each operand's [`DimensionType`] must define exactly the
+/// output type. The constructor consumes one first-class dimension input per _dynamic_ dimension of its stored shape,
+/// in axis order, and each input's [`DimensionType`] must define exactly the
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
-/// stored type metadata and consume no operands. This is deliberately narrower than the mixed reshape/broadcast
-/// contract, which derives *every* output axis from an operand (including exact constants): a constructor's static axes
-/// have no input geometry to relate to, so passing them as operands would only grow the interpreted representation. A
-/// stored type with no dynamic axes is valid with no operands, although canonical operation-family lifts prefer the
+/// stored type metadata and consume no inputs. This is deliberately narrower than the mixed reshape/broadcast
+/// contract, which derives *every* output axis from an input (including exact constants): a constructor's static axes
+/// have no input geometry to relate to, so passing them as inputs would only grow the interpreted representation. A
+/// stored type with no dynamic axes is valid with no inputs, although canonical operation-family lifts prefer the
 /// equivalent homogeneous nullary constructor inside the array member family. Singleton-bounded dynamic axes refine to
 /// their static extent in the inferred result, while the stored descriptor and required input count remain unchanged.
 pub(crate) fn infer_array_ir_constant_constructor_output_types(
@@ -228,7 +228,7 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
     Ok(vec![ArrayIrType::Array(r#type.clone().with_shape(Shape::new(dimensions)))])
 }
 
-/// Checks that the provided dimension inputs agree with the symbolic shape declared by `output_type` before a dynamic
+/// Checks that the provided dimension inputs agree with the symbolic shape declared by `type` before a dynamic
 /// constructor binds any operations. An [`ArrayType`] can describe a shape without knowing all its extents as it stores
 /// static sizes directly and represents each dynamic axis by a [`DimensionVariable`](crate::DimensionVariable),
 /// including its identity and bounds. The inputs supply values for those dynamic axes at runtime.

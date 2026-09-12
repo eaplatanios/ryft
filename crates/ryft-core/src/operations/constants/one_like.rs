@@ -92,10 +92,26 @@ impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIr
     }
 }
 
-/// Represents the ability to synthesize a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart
-/// to [`One`](super::One). It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
+/// Represents the ability to construct a _one_ value with the same type as an exemplar. [`OneLike`] is the
+/// value-driven counterpart to [`One`](super::One) and supplies [`OneLikeOperation`]'s interpretation capability.
+/// For arrays, the result preserves the exemplar's element data type, runtime shape, memory placement, layout, and
+/// sharding. Its elements are ones regardless of the exemplar's values; complex elements have a zero imaginary part.
+/// Empty arrays remain empty, but their element data type must still support one.
+///
+/// A staged call retains the exemplar as an input so that dynamic extents are read at execution time. It does not
+/// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
+/// result, so differentiation returns zero for its tangent or cotangent.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, OneLike};
+/// let input = Array::vector(vec![2.0f32, -3.0]).unwrap();
+/// assert_eq!(input.one_like(), Ok(Array::vector(vec![1.0f32, 1.0]).unwrap()));
+/// ```
 pub trait OneLike: Sized {
-    /// Returns a _one_ value with the same structure as `self`, or an error if that structure cannot represent one.
+    /// Returns a _one_ value with the same type and runtime shape as `self`. Returns an error if its element
+    /// data type cannot represent one, including when the exemplar is empty.
     fn one_like(&self) -> Result<Self, ProgramError>;
 }
 
@@ -136,11 +152,13 @@ impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation<V::Type>>
 mod tests {
     use half::{bf16, f16};
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Shape, f8e8m0fnu,
+        DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, StridedLayout, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
@@ -241,6 +259,18 @@ mod tests {
         assert_eq!(output.elements::<f32>(), Ok(vec![1.0, 1.0]));
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
 
+        // Complex identity values preserve physical layout and memory, including for empty arrays.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let r#type = ArrayType::new_static(DataType::C64, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let input = Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 2]).unwrap();
+        assert_eq!(input.one_like(), Ok(Array::from_elements(r#type, &[Complex::new(1.0f32, 0.0); 2]).unwrap()),);
+        let empty = Array::from_elements::<Complex<f32>>(ArrayType::new_static(DataType::C64, [0]), &[]).unwrap();
+        assert_eq!(empty.one_like(), Ok(empty.clone()));
+
         // `f8e8m0fnu` represents exact one even though it has no zero encoding.
         let input = Array::from_elements(
             ArrayType::new_static(DataType::F8E8M0FNU, [2]),
@@ -298,6 +328,22 @@ mod tests {
         let output = input.one_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::vector(vec![1.0f32, 1.0]).unwrap());
+
+        // A nonleading mapped axis remains mapped rather than turning the result into a replicated constant.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let r#type = ArrayType::new_static(DataType::C64, [2, 3]);
+        let input = BatchingTracer::new(
+            context,
+            ArrayBatch::new(
+                Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 6]).unwrap(),
+                BatchAxis::new(1),
+            )
+            .unwrap(),
+        );
+        let output = input.one_like().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(output.batch().value(), &Array::from_elements(r#type, &[Complex::new(1.0f32, 0.0); 6]).unwrap(),);
     }
 
     #[test]
@@ -324,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_one_like() {
+    fn test_one_like_staging() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
         let output = input.one_like().unwrap();
@@ -346,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_one_like_mixed() {
+    fn test_one_like_staging_mixed() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));

@@ -180,21 +180,21 @@ where
 /// # };
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-/// let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+/// let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
 /// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
 /// assert_eq!(
-///     context.dynamic_fill(&output_type, 2.5f32, &[dimension]),
+///     context.dynamic_fill(&r#type, 2.5f32, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![2.5f32; 3]).unwrap())),
 /// );
 /// ```
 pub trait DynamicFill<L, V: Typed> {
     /// Constructs an array filled with `value`, using explicit values for its dynamic dimensions. The literal is
-    /// converted to the output element type before broadcasting. The result preserves the requested memory and
-    /// sharding. Dynamic shapes use the broadcast operation's default layout; an explicit layout with a dynamic shape
-    /// is rejected rather than silently discarded. Static shapes support the same output layouts as [`Fill`]. Input
-    /// dimension types, static dimension constants, literal conversion, and broadcast metadata are checked before
-    /// staging the literal. Failures reported by the context while binding or executing operations are not
-    /// transactional.
+    /// converted to the output element type before broadcasting. The result preserves the requested memory and sharding
+    /// and explicit layout. Layout structure is validated before staging; byte strides and storage bounds are checked
+    /// against resolved dimensions during eager execution. The XLA backend supports dense minor-to-major permutations
+    /// without tiles and rejects explicit byte-strided or physically tiled results. Input dimension types, static
+    /// dimension constants, literal conversion, and broadcast metadata are checked before staging the literal.
+    /// Failures reported by the context while binding or executing operations are not transactional.
     ///
     /// # Parameters
     ///
@@ -218,9 +218,6 @@ where
             .clone()
             .with_sharding(r#type.sharding().cloned())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if !dimensions.is_empty() && r#type.layout().is_some() {
-            return Err(TypeError::invalid("dynamic fill does not support an explicit output layout").into());
-        }
         let literal =
             Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
 
@@ -243,7 +240,9 @@ where
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        let operation = DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(r#type.sharding().cloned());
+        let operation = DynamicBroadcastOperation::new(Vec::new())
+            .with_output_sharding(r#type.sharding().cloned())
+            .with_output_layout(r#type.layout().cloned());
         if !dimensions.is_empty() {
             let mut static_dimensions = static_dimensions.iter();
             let mut dimensions = dimensions.iter();
@@ -317,7 +316,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
         DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, f6e2m3fn, u4,
+        MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, Tile, TileDimension, TiledLayout, f6e2m3fn, u4,
     };
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::parameters::Placeholder;
@@ -471,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_context_fill() {
+    fn test_fill_staging() {
         // A rank-zero fill is represented by its literal constant alone.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output = context.fill(&ArrayType::scalar(DataType::U32), 2.5f64).unwrap();
@@ -607,11 +606,106 @@ mod tests {
                 if message == "`fill` expects one dimension operand per dynamic output dimension (1) but got 0 operands"));
         assert!(context.builder().borrow().instructions().is_empty());
         let extent = context.input(DimensionType::new(rows).into());
-        let output_type = output_type.with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let output_type = output_type.with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
         assert!(matches!(context.dynamic_fill(&output_type, 1.0_f32, &[extent]),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "dynamic fill does not support an explicit output layout"));
+                if message == "strided layout rank 2 does not match array rank 1"));
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_fill_layout() {
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), 2.into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        let dimension_type = DimensionType::new(size);
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
+        let expected_type = r#type.clone().with_shape(Shape::new(vec![3.into(), 2.into()]));
+        let expected = ArrayIrValue::Array(Array::from_elements(expected_type, &[7f32; 6]).unwrap());
+        let eager = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(eager.dynamic_fill(&r#type, 7f32, &[extent.clone()]), Ok(expected.clone()));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = context.input(dimension_type.clone().into());
+        let output = context.dynamic_fill(&r#type, 7f32, &[dimension]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(r#type.clone()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(vec![extent.clone()]), Ok(vec![expected]));
+
+        // Tiled padding is preserved both eagerly and through a program with runtime extents.
+        let tiled_type = r#type.clone().with_layout(Layout::Tiled(TiledLayout::new(
+            vec![1, 0],
+            vec![Tile::new(vec![TileDimension::Sized(2), TileDimension::Sized(2)])],
+        )));
+        let expected = ArrayIrValue::Array(
+            Array::from_elements(tiled_type.clone().with_shape(Shape::new(vec![3.into(), 2.into()])), &[7f32; 6])
+                .unwrap(),
+        );
+        assert_eq!(eager.dynamic_fill(&tiled_type, 7f32, &[extent.clone()]), Ok(expected.clone()));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = context.input(dimension_type.clone().into());
+        let output = context.dynamic_fill(&tiled_type, 7f32, &[dimension]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(vec![extent.clone()]), Ok(vec![expected]));
+
+        // A zero lower bound cannot establish whether rows alias. Runtime geometry must reject overlapping rows.
+        let invalid_type = r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = context.input(dimension_type.clone().into());
+        let output = context.dynamic_fill(&invalid_type, 7f32, &[dimension]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(program.interpret(vec![extent.clone()]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "strided layout stride 4 on axis 1 is smaller than the 12-byte span occupied \
+                               by more minor axes and may alias array elements",
+        ));
+
+        // A representable stride can still overflow the storage span after resolving a runtime dimension.
+        let overflow_type = r#type.with_layout(Layout::Strided(StridedLayout::new(vec![isize::MAX, 4])));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension = context.input(dimension_type.into());
+        let output = context.dynamic_fill(&overflow_type, 7f32, &[dimension]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let resolved_type = overflow_type.with_shape(Shape::new(vec![3.into(), 2.into()]));
+        assert!(matches!(program.interpret(vec![extent]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == format!("physical storage span for array type {resolved_type} cannot be represented"),
+        ));
     }
 
     #[test]
@@ -643,7 +737,7 @@ mod tests {
             program.jvp().unwrap().interpret(vec![input]),
             Ok(vec![
                 ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f32; 6]).unwrap()),
-                ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap())
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]).unwrap()),
             ])
         );
     }

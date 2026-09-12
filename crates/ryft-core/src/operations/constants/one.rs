@@ -278,7 +278,8 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 /// Unlike [`One`], this capability supplies each dynamic axis with an explicit dimension value. Static axes retain
 /// their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension identities
 /// require a corresponding input for every occurrence. Each input must have the exact dimension identity declared
-/// by its axis. The caller must thus provide the same dimension value for repeated occurrences.
+/// by its axis. Repeated inputs must carry the same runtime extent. Conflicting extents are rejected during
+/// interpretation.
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
 /// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
@@ -294,10 +295,10 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 /// # };
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-/// let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+/// let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
 /// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
 /// assert_eq!(
-///     context.dynamic_one(&output_type, &[dimension]),
+///     context.dynamic_one(&r#type, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap())),
 /// );
 /// ```
@@ -832,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_context_one() {
+    fn test_one_staging() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.one(&output_type).unwrap();
