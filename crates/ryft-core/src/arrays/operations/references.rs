@@ -1,14 +1,12 @@
-//! Array-owned reference views and eager/staging implementations of generic reference capabilities.
+//! Array-owned reference view operations and the view traversal that maps derived handles back onto their roots.
 //!
-//! Indexing and slicing remain here because their [`ArrayReferenceView`] descriptions depend on array
-//! axes and shapes. The generic allocation, read, replacement, additive-update, and freeze payloads live in
-//! [`crate::programs::references`]; this module specializes them to [`ArrayIrType`] and implements their capabilities
-//! for array values and tracers.
-//!
-//! Staged and composite value calls validate the complete operand-type relationship before dispatching the operation.
-//! Their type diagnostics can therefore precede any eager reference-state error. Once an eager reference or derived
-//! view is reached, reference-state errors take precedence over replacement-type validation, as documented on that
-//! runtime API.
+//! Indexing and slicing live here because their [`ArrayReferenceView`] descriptions depend on array axes and shapes.
+//! The generic allocation, read, replacement, additive-update, and freeze primitives live in
+//! [`crate::operations::references`], together with their capability implementations for array values and tracers.
+//! This module owns the view derivations ([`ReferenceIndexOperation`], [`ReferenceDynamicIndexOperation`], and
+//! [`ReferenceSliceOperation`]) with their value-level capabilities, the [`ArrayReferenceViewOperation`] contract
+//! through which eager handles and the array discharge policy stage one shared [`ArrayReferenceViewPath`] traversal,
+//! and the view validation and reapplication helpers that contract relies on.
 
 // TODO(eaplatanios): Review this module.
 
@@ -21,9 +19,8 @@ use ryft_macros::Parameter;
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewPath};
+use crate::arrays::references::{ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewPath};
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::data::DataType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -37,16 +34,14 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::forwarded_tangent;
 use crate::operations::{
-    Add, AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation, Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
+    AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ReshapeOperation, SliceOperation,
+    UpdateSliceOperation,
 };
 use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceView, Concretizable, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter,
-    OperationProvider, ProgramError, ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext,
+    ProgramError, ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, TypeError,
     Typed, Value, ValueProjection,
@@ -860,342 +855,6 @@ where
     Ok(outputs.remove(0))
 }
 
-// Composite families select canonical operations; homogeneous families reject requests for reference state.
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        Ok(ReferenceNewOperation::new().into())
-    }
-}
-
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        Ok(ReferenceFreezeOperation::new().into())
-    }
-}
-
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<DataType, DataType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<DataType, DataType>,
-        _input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference allocation".to_string(),
-        })
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<ArrayType, ArrayType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference allocation".to_string(),
-        })
-    }
-}
-
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<DataType, DataType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<DataType, DataType>,
-        _input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference freezing".to_string(),
-        })
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreezeOperation<ArrayType, ArrayType>>
-    for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference freezing".to_string(),
-        })
-    }
-}
-
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>> for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(ReferenceAddUpdateOperation::new().into())
-    }
-}
-
-// Homogeneous array families can return or ignore cotangents, but their type universe contains no references.
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<ArrayType, ArrayType>>
-    for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "the homogeneous array operation family cannot accumulate into a reference destination"
-                .to_string(),
-        })
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
-{
-    fn reference_new(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
-    }
-}
-
-impl<V> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
-{
-    fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
-        self.value()
-            .dispatch_domain()
-            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0)
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
-{
-    fn read(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
-    }
-}
-
-impl<V> ReferenceRead<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
-{
-    fn read(&self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
-        self.value()
-            .dispatch_domain()
-            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0)
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceWrite<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-{
-    fn write(&self, replacement: &V) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            ReferenceWriteOperation::new(),
-            Vec::new(),
-            &[self.clone(), replacement.clone()],
-        )?;
-        Ok(())
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceWrite<ProjectedValue<ArrayType, V>>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-{
-    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceWriteOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), replacement.value().clone()],
-        )?;
-        Ok(())
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceSwap<V, V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
-{
-    fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceSwapOperation::new(), Vec::new(), &[self.clone(), replacement.clone()])?
-            .remove(0))
-    }
-}
-
-impl<V> ReferenceSwap<ProjectedValue<ArrayType, V>, <V as ValueProjection<ArrayType>>::Projected>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
-{
-    fn swap(
-        &self,
-        replacement: &ProjectedValue<ArrayType, V>,
-    ) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
-        self.value()
-            .dispatch_domain()
-            .bind(ReferenceSwapOperation::new(), Vec::new(), &[self.value().clone(), replacement.value().clone()])?
-            .remove(0)
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<ProjectedValue<ArrayType, V>>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
-{
-    fn add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceAddUpdateOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), update.value().clone()],
-        )?;
-        Ok(())
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceFreeze<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
-{
-    fn freeze(self) -> Result<V, ProgramError> {
-        let domain = self.dispatch_domain();
-        Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
-    }
-}
-
-impl<V> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
-{
-    fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
-        let domain = self.value().dispatch_domain();
-        domain
-            .bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0)
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ReferenceNew for ArrayIrValue<A> {
-    fn reference_new(&self) -> Result<Self, ProgramError> {
-        ReferenceNewOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
-        let value = <Self as ValueProjection<ArrayType>>::projected(self)?.clone();
-        Ok(Self::Reference(ArrayReference::new(value)))
-    }
-}
-
-impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValue<A> {
-    fn read(&self) -> Result<Self, ProgramError> {
-        ReferenceReadOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        Ok(Self::Array(reference.read()?))
-    }
-}
-
-impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceWrite for ArrayIrValue<A> {
-    fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
-        ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
-        reference.write(replacement)
-    }
-}
-
-impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceSwap for ArrayIrValue<A> {
-    fn swap(&self, replacement: &Self) -> Result<Self, ProgramError> {
-        ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
-        Ok(Self::Array(reference.swap(replacement)?))
-    }
-}
-
-impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAddUpdate for ArrayIrValue<A> {
-    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
-        reference.add_update(update)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
-    fn freeze(self) -> Result<Self, ProgramError> {
-        ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(&self)?;
-        Ok(Self::Array(reference.freeze()?))
-    }
-}
-
 impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
     fn reference_index(&self, axis: usize, index: usize) -> Result<Self, ProgramError> {
         // Projection rejects value operands and `with_transform` validates the transform against the handle's
@@ -1247,7 +906,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::references::{ArrayReferenceDischarge, ArrayReferenceViewError};
+    use crate::arrays::references::{ArrayReference, ArrayReferenceDischarge, ArrayReferenceViewError};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::memories::Memory;
@@ -1261,11 +920,17 @@ mod tests {
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::{AddOperation, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME};
+    use crate::operations::{
+        AddOperation, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+        ReferenceWriteOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
+        EffectClass, EffectClasses, EmptyRegionDriver, OperationProvider, ProgramBuilder, ProgramError, ReferenceError,
+        TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
 

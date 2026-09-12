@@ -2,6 +2,10 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -15,60 +19,19 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
 use crate::operations::references::reference_new::ReferenceNewOperation;
-
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Value,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use std::borrow::Cow;
-use std::sync::LazyLock;
 
 use super::forwarded_tangent;
 
 /// Canonical operation name for [`ReferenceFreezeOperation`].
 pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
-
-/// Consumes a reference, returning its final value and invalidating its complete alias family.
-pub trait ReferenceFreeze<Output = Self>: Sized {
-    /// Returns the final stored value and invalidates this reference and all aliases.
-    ///
-    /// The handle is taken by value, because consumption is linear: after this call the reference denotes nothing.
-    /// Passing it by value makes the common single-handle misuse — freezing and then reading through the same
-    /// binding — a compile error rather than a runtime one. Aliases obtained by cloning the handle are a different
-    /// case and remain a dynamic failure, because the type system cannot see them: an eager alias fails at its next
-    /// access against the shared reference state, and a staged alias fails while tracing, because every clone of one
-    /// [`Tracer`](crate::Tracer) names the same staged atom. Freezing through a shared borrow is therefore an
-    /// explicit clone-then-freeze, which reads as the deliberate act it is.
-    ///
-    /// ```compile_fail
-    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
-    ///
-    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
-    /// let frozen = allocation.freeze()?;
-    /// // The handle was consumed, so reading it again does not compile.
-    /// let stale = allocation.read()?;
-    /// # Ok::<(), ryft_core::ProgramError>(())
-    /// ```
-    ///
-    /// ```
-    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
-    ///
-    /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
-    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
-    /// let alias = allocation.clone();
-    /// assert_eq!(allocation.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
-    /// assert_eq!(
-    ///     alias.read().unwrap_err().downcast_custom::<ReferenceError>(),
-    ///     Some(&ReferenceError::Frozen),
-    /// );
-    /// # Ok::<(), ryft_core::ProgramError>(())
-    /// ```
-    fn freeze(self) -> Result<Output, ProgramError>;
-}
 
 static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(
@@ -79,12 +42,11 @@ static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| 
     .unwrap()
 });
 
-define_reference_primitive_payload!(
+define_reference_operation!(
     /// Consumes an allocation reference, returning its final referent and invalidating its complete alias family.
-    ReferenceFreezeOperation
+    ReferenceFreezeOperation,
+    REFERENCE_FREEZE_OPERATION_NAME
 );
-
-impl_reference_primitive_display!(ReferenceFreezeOperation, REFERENCE_FREEZE_OPERATION_NAME);
 
 impl<T, U> Operation for ReferenceFreezeOperation<T, U>
 where
@@ -171,6 +133,30 @@ where
     // before any operation rule runs.
 }
 
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
+    P: BatchingPolicy<C>,
+{
+    // Freezing yields the final packed referent, batched at the reference's own axis.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![P::batch(
+            context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
+            P::batch_axis(&inputs[0]),
+        )?]
+        .into())
+    }
+}
+
 impl<T, U, C> DifferentiableOperation<C> for ReferenceFreezeOperation<T, U>
 where
     T: Type,
@@ -193,30 +179,6 @@ where
         Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
             Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
         })?])
-    }
-}
-
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceFreezeOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
-    P: BatchingPolicy<C>,
-{
-    // Freezing yields the final packed referent, batched at the reference's own axis.
-    fn batch<D: BatchingDriver<C, P>>(
-        &self,
-        context: &BatchingContext<C, P>,
-        _driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![P::batch(
-            context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
-            P::batch_axis(&inputs[0]),
-        )?]
-        .into())
     }
 }
 
@@ -250,6 +212,123 @@ where
             reference.add_update(cotangent)?;
         }
         Ok(())
+    }
+}
+
+// Composite families select canonical operations; homogeneous families reject requests for reference state.
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(ReferenceFreezeOperation::new().into())
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreezeOperation<ArrayType, ArrayType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference freezing".to_string(),
+        })
+    }
+}
+
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<DataType, DataType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<DataType, DataType>,
+        _input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference freezing".to_string(),
+        })
+    }
+}
+
+/// Consumes a reference, returning its final value and invalidating its complete alias family.
+pub trait ReferenceFreeze<Output = Self>: Sized {
+    /// Returns the final stored value and invalidates this reference and all aliases.
+    ///
+    /// The handle is taken by value, because consumption is linear: after this call the reference denotes nothing.
+    /// Passing it by value makes the common single-handle misuse — freezing and then reading through the same
+    /// binding — a compile error rather than a runtime one. Aliases obtained by cloning the handle are a different
+    /// case and remain a dynamic failure, because the type system cannot see them: an eager alias fails at its next
+    /// access against the shared reference state, and a staged alias fails while tracing, because every clone of one
+    /// [`Tracer`](crate::Tracer) names the same staged atom. Freezing through a shared borrow is therefore an
+    /// explicit clone-then-freeze, which reads as the deliberate act it is.
+    ///
+    /// ```compile_fail
+    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
+    ///
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
+    /// let frozen = allocation.freeze()?;
+    /// // The handle was consumed, so reading it again does not compile.
+    /// let stale = allocation.read()?;
+    /// # Ok::<(), ryft_core::ProgramError>(())
+    /// ```
+    ///
+    /// ```
+    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
+    ///
+    /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
+    /// let alias = allocation.clone();
+    /// assert_eq!(allocation.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
+    /// assert_eq!(
+    ///     alias.read().unwrap_err().downcast_custom::<ReferenceError>(),
+    ///     Some(&ReferenceError::Frozen),
+    /// );
+    /// # Ok::<(), ryft_core::ProgramError>(())
+    /// ```
+    fn freeze(self) -> Result<Output, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
+    fn freeze(self) -> Result<Self, ProgramError> {
+        ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(&self)?;
+        Ok(Self::Array(reference.freeze()?))
+    }
+}
+
+impl<V> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
+{
+    fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
+        let domain = self.value().dispatch_domain();
+        domain
+            .bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceFreeze<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
+{
+    fn freeze(self) -> Result<V, ProgramError> {
+        let domain = self.dispatch_domain();
+        Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
 }
 

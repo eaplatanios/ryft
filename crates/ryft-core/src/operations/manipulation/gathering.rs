@@ -839,9 +839,9 @@ pub trait Gather: Sized {
     /// count negative indices backward from the end, this function treats every negative index as out of bounds and
     /// applies `mode` directly. It does not change or wrap index values.
     ///
-    /// All input extents must be statically known because the underlying [`GatherOperation`] stores its window
-    /// sizes as host integers. The index shape must also support the homogeneous [`Reshape`] used to append its
-    /// index-vector axis. Use an explicit operation for dynamic query shapes, partial windows, or a custom fill.
+    /// The selected axis may have a dynamic extent. All other input extents must be statically known because the
+    /// underlying [`GatherOperation`] stores their complete window sizes as host integers. The index shape must also
+    /// support the homogeneous [`Reshape`] used to append its index-vector axis. Use an explicit operation for dynamic query shapes, partial windows, or a custom fill.
     ///
     /// # Parameters
     ///
@@ -866,15 +866,23 @@ pub trait Gather: Sized {
     {
         let input_type = self.r#type();
         let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
-        let input_shape = input_type
-            .static_shape()
-            .ok_or_else(|| TypeError::invalid("`gather_axis` requires statically known input extents"))?;
+        let slice_sizes = input_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(input_axis, dimension)| match dimension {
+                _ if input_axis == axis => Ok(1),
+                Dimension::Static(size) => Ok(*size),
+                _ => Err(TypeError::invalid(format!(
+                    "`gather_axis` requires a static extent on unselected axis {input_axis}",
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let indices_type = indices.r#type();
         let mut indices_dimensions = indices_type.shape().dimensions().to_vec();
         indices_dimensions.push(Dimension::Static(1));
         let expanded_indices = indices.reshape(Shape::new(indices_dimensions))?;
-        let mut slice_sizes = input_shape.dimensions().to_vec();
-        slice_sizes[axis] = 1;
         let offset_dimensions = (0..input_type.rank())
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
@@ -1482,8 +1490,11 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+
+    use crate::tracing::Trace;
 
     use super::*;
 
@@ -1757,6 +1768,26 @@ mod tests {
         let filled = run(GatherScatterMode::FillOrDrop);
         assert_eq!(filled[0], 20.0);
         assert!(filled[1].is_nan());
+
+        // Slicing and reshaping change the gather window geometry without changing the element type.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        )
+        .unwrap();
+        let windows = input
+            .slice(&[0, 1], &[2, 4], &[1, 1])
+            .unwrap()
+            .reshape(Shape::new(vec![3.into(), 2.into()]))
+            .unwrap();
+        let indices = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[2_i32, 0]).unwrap();
+        assert_eq!(
+            windows.gather(
+                &indices,
+                &GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]),
+            ),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[6.0_f32, 7.0, 1.0, 2.0]).unwrap()),
+        );
     }
 
     #[test]
@@ -2426,6 +2457,37 @@ mod tests {
         assert_eq!(
             input.gather_axis(&Array::scalar(0_i32).unwrap(), 2, GatherScatterMode::Clip),
             Err(TypeError::invalid("axis 2 is out of bounds for rank 2").into())
+        );
+
+        // Selecting one element does not require the selected axis's runtime extent as a window parameter.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, indices)| input.gather_axis(&indices, 0, GatherScatterMode::Clip),
+            (input_type, ArrayType::new_static(DataType::I32, [2])),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::I32, [2]));
+        assert_eq!(
+            program.interpret((
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[10_i32, 20, 30]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[2_i32, 0]).unwrap()
+            )),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[30_i32, 10]),
+        );
+
+        // A complete window along an unselected axis still needs a host-known size.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+        let result = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, indices)| input.gather_axis(&indices, 1, GatherScatterMode::Clip),
+            (
+                ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent), Dimension::Static(2)])),
+                ArrayType::new_static(DataType::I32, [2]),
+            ),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            ProgramError::Type(TypeError::invalid("`gather_axis` requires a static extent on unselected axis 0")),
         );
     }
 }

@@ -2,6 +2,10 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -13,30 +17,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::Slice;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
 use crate::operations::references::reference_new::ReferenceNewOperation;
-
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Value,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use std::borrow::Cow;
-use std::sync::LazyLock;
 
 use super::forwarded_tangent;
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
-
-/// Reads an immutable snapshot from a reference value.
-pub trait ReferenceRead<Output = Self>: Sized {
-    /// Returns the reference's current value as an immutable snapshot.
-    fn read(&self) -> Result<Output, ProgramError>;
-}
 
 static REFERENCE_READ_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(
@@ -47,12 +44,11 @@ static REFERENCE_READ_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     .unwrap()
 });
 
-define_reference_primitive_payload!(
+define_reference_operation!(
     /// Reads the current referent snapshot from a reference in the enclosing type universe `U`.
-    ReferenceReadOperation
+    ReferenceReadOperation,
+    REFERENCE_READ_OPERATION_NAME
 );
-
-impl_reference_primitive_display!(ReferenceReadOperation, REFERENCE_READ_OPERATION_NAME);
 
 impl<T, U> Operation for ReferenceReadOperation<T, U>
 where
@@ -132,29 +128,6 @@ where
     // before any operation rule runs.
 }
 
-impl<T, U, C> DifferentiableOperation<C> for ReferenceReadOperation<T, U>
-where
-    T: Type,
-    U: DifferentiableType,
-    ReferenceReadOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
-{
-    // Reading a reference reads its tangent reference alongside. A plumbing reference (i.e., a reference dual whose
-    // tangent is a symbolic zero) carries no tangent reference, so the value read from it has a symbolic zero tangent.
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
-            Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
-        })?])
-    }
-}
-
 impl<T, U, C, P> BatchableOperation<C, P> for ReferenceReadOperation<T, U>
 where
     T: Type,
@@ -176,6 +149,29 @@ where
             P::batch_axis(&inputs[0]),
         )?]
         .into())
+    }
+}
+
+impl<T, U, C> DifferentiableOperation<C> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
+{
+    // Reading a reference reads its tangent reference alongside. A plumbing reference (i.e., a reference dual whose
+    // tangent is a symbolic zero) carries no tangent reference, so the value read from it has a symbolic zero tangent.
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
+            Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
+        })?])
     }
 }
 
@@ -209,6 +205,50 @@ where
             reference.add_update(cotangent)?;
         }
         Ok(())
+    }
+}
+
+/// Reads an immutable snapshot from a reference value.
+pub trait ReferenceRead<Output = Self>: Sized {
+    /// Returns the reference's current value as an immutable snapshot.
+    fn read(&self) -> Result<Output, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValue<A> {
+    fn read(&self) -> Result<Self, ProgramError> {
+        ReferenceReadOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        Ok(Self::Array(reference.read()?))
+    }
+}
+
+impl<V> ReferenceRead<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+{
+    fn read(&self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
+        self.value()
+            .dispatch_domain()
+            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+{
+    fn read(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
     }
 }
 

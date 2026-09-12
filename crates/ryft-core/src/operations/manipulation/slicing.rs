@@ -2647,6 +2647,15 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
 /// differentiation currently returns an unsupported-operation error because its transpose needs a dynamically sized
 /// strided update.
 ///
+/// This capability uses the mixed [`ArrayIrValue`] representation to carry dimensions alongside arrays. Finite
+/// dimension bounds are required by the current XLA lowering; accepting a dynamic shape in the core does not imply
+/// support for unbounded allocation or runtime byte strides. When a variable-sized result is unnecessary, ordinary
+/// program outputs can instead return a padded array together with its lengths as separate values. Such a tuple does
+/// not automatically acquire ragged indexing or batching semantics.
+///
+/// For fixed window sizes, prefer [`DynamicSlice`]. Its mixed-value linearization retains the original runtime input
+/// extent for the pullback; a direct homogeneous transpose does not have those shape residuals.
+///
 /// # Example
 ///
 /// ```
@@ -3216,7 +3225,9 @@ mod tests {
     };
     use crate::operations::constants::constant::Constant;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+    use crate::operations::manipulation::concatenation::Concatenate;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
+    use crate::operations::manipulation::padding::Pad;
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{ReferenceNew, ReferenceRead};
@@ -3387,6 +3398,17 @@ mod tests {
         assert_eq!(empty.to_f64s(), Vec::<f64>::new());
         let scalar = Array::scalar(42.0).unwrap().slice(&[], &[], &[]).unwrap();
         assert_eq!(scalar.to_f64s(), vec![42.0]);
+
+        // A slice can cross concatenation boundaries and retain interior padding in the resulting dense array.
+        let left = Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap();
+        let right = Array::from_elements(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap();
+        let padding = Array::from_elements(ArrayType::scalar(DataType::F32), &[-1.0_f32]).unwrap();
+        let padded = Array::concatenate([&left, &right], 0).unwrap().pad(&padding, &[1], &[1], &[1]).unwrap();
+        assert_eq!(
+            padded.slice(&[1], &[6], &[1]),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F32, [5]), &[1.0_f32, -1.0, 2.0, -1.0, 3.0])
+                .unwrap()),
+        );
 
         let strided = SliceOperation::new(vec![1], vec![6]).with_strides(vec![2]).unwrap();
 

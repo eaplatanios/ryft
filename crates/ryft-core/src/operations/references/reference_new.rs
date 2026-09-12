@@ -2,6 +2,10 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType};
 use crate::axes::Axis;
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -19,33 +23,25 @@ use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceType,
-    RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use std::borrow::Cow;
-use std::sync::LazyLock;
 
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
-
-/// Creates a new reference initialized from this value.
-pub trait ReferenceNew<Output = Self>: Sized {
-    /// Creates an independent reference whose initial state is this value.
-    fn reference_new(&self) -> Result<Output, ProgramError>;
-}
 
 static REFERENCE_NEW_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
 });
 
-define_reference_primitive_payload!(
+define_reference_operation!(
     /// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
-    ReferenceNewOperation
+    ReferenceNewOperation,
+    REFERENCE_NEW_OPERATION_NAME
 );
-
-impl_reference_primitive_display!(ReferenceNewOperation, REFERENCE_NEW_OPERATION_NAME);
 
 impl<T, U> Operation for ReferenceNewOperation<T, U>
 where
@@ -152,6 +148,31 @@ where
     // before any operation rule runs.
 }
 
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
+    P: BatchingPolicy<C>,
+{
+    // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at allocation
+    // time, so the allocation is always batched: a mapped initial value keeps its axis and a replicated one is first
+    // broadcast along a new leading batch axis through the driver.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let batch_axis = P::batch_axis(&inputs[0]).axis().unwrap_or(Axis::from(0));
+        let initial = driver.align_batch_axis(context, inputs[0].clone(), batch_axis)?;
+        let reference = context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&initial)))?.remove(0);
+        Ok(vec![P::batch(reference, P::batch_axis(&initial))?].into())
+    }
+}
+
 impl<T, U, C> DifferentiableOperation<C> for ReferenceNewOperation<T, U>
 where
     T: Type,
@@ -191,31 +212,6 @@ where
     }
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceNewOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
-    P: BatchingPolicy<C>,
-{
-    // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at allocation
-    // time, so the allocation is always batched: a mapped initial value keeps its axis and a replicated one is first
-    // broadcast along a new leading batch axis through the driver.
-    fn batch<D: BatchingDriver<C, P>>(
-        &self,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let batch_axis = P::batch_axis(&inputs[0]).axis().unwrap_or(Axis::from(0));
-        let initial = driver.align_batch_axis(context, inputs[0].clone(), batch_axis)?;
-        let reference = context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&initial)))?.remove(0);
-        Ok(vec![P::batch(reference, P::batch_axis(&initial))?].into())
-    }
-}
-
 impl<T, U, V, O> TransposableOperation<V, O> for ReferenceNewOperation<T, U>
 where
     T: Type,
@@ -247,6 +243,91 @@ where
             None => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
         };
         accumulators[0].accumulate(context, contribution)
+    }
+}
+
+// Composite families select canonical operations; homogeneous families reject requests for reference state.
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(ReferenceNewOperation::new().into())
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<ArrayType, ArrayType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference allocation".to_string(),
+        })
+    }
+}
+
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<DataType, DataType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<DataType, DataType>,
+        _input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference allocation".to_string(),
+        })
+    }
+}
+
+/// Creates a new reference initialized from this value.
+pub trait ReferenceNew<Output = Self>: Sized {
+    /// Creates an independent reference whose initial state is this value.
+    fn reference_new(&self) -> Result<Output, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceNew for ArrayIrValue<A> {
+    fn reference_new(&self) -> Result<Self, ProgramError> {
+        ReferenceNewOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let value = <Self as ValueProjection<ArrayType>>::projected(self)?.clone();
+        Ok(Self::Reference(ArrayReference::new(value)))
+    }
+}
+
+impl<V> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
+{
+    fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+        self.value()
+            .dispatch_domain()
+            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
+{
+    fn reference_new(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
     }
 }
 

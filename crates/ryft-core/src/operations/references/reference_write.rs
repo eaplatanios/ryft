@@ -2,6 +2,10 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -14,28 +18,23 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::Zero;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_swap::ReferenceSwapOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use std::borrow::Cow;
-use std::sync::LazyLock;
 
 use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
 /// Canonical operation name for [`ReferenceWriteOperation`].
 pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
-
-/// Replaces the value stored by a reference without observing the previous value.
-pub trait ReferenceWrite<Replacement = Self>: Sized {
-    /// Replaces the stored value with `replacement` in program order.
-    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
-}
 
 static REFERENCE_WRITE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(
@@ -46,12 +45,11 @@ static REFERENCE_WRITE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     .unwrap()
 });
 
-define_reference_primitive_payload!(
+define_reference_operation!(
     /// Replaces a reference's stored value with an exactly matching referent without observing the old value.
-    ReferenceWriteOperation
+    ReferenceWriteOperation,
+    REFERENCE_WRITE_OPERATION_NAME
 );
-
-impl_reference_primitive_display!(ReferenceWriteOperation, REFERENCE_WRITE_OPERATION_NAME);
 
 impl<T, U> Operation for ReferenceWriteOperation<T, U>
 where
@@ -144,6 +142,31 @@ where
     // before any operation rule runs.
 }
 
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceWriteOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
+    P: BatchingPolicy<C>,
+{
+    // The replacement is aligned with the reference's fixed batch axis before the packed store.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let replacement =
+            align_stored_batch(context, driver, REFERENCE_WRITE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        context
+            .parent()
+            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?;
+        Ok(Vec::new().into())
+    }
+}
+
 impl<T, U, C> DifferentiableOperation<C> for ReferenceWriteOperation<T, U>
 where
     T: Type,
@@ -188,31 +211,6 @@ where
     }
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceWriteOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
-    P: BatchingPolicy<C>,
-{
-    // The replacement is aligned with the reference's fixed batch axis before the packed store.
-    fn batch<D: BatchingDriver<C, P>>(
-        &self,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let replacement =
-            align_stored_batch(context, driver, REFERENCE_WRITE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
-        context
-            .parent()
-            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?;
-        Ok(Vec::new().into())
-    }
-}
-
 impl<T, U, V, O> TransposableOperation<V, O> for ReferenceWriteOperation<T, U>
 where
     T: Type,
@@ -254,6 +252,53 @@ where
         )?;
         let previous = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[accumulator, zero])?.remove(0);
         accumulators[1].accumulate(context, MaybeZero::Value(previous))
+    }
+}
+
+/// Replaces the value stored by a reference without observing the previous value.
+pub trait ReferenceWrite<Replacement = Self>: Sized {
+    /// Replaces the stored value with `replacement` in program order.
+    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceWrite for ArrayIrValue<A> {
+    fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
+        ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
+        reference.write(replacement)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceWrite<ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+{
+    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceWriteOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), replacement.value().clone()],
+        )?;
+        Ok(())
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceWrite<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+{
+    fn write(&self, replacement: &V) -> Result<(), ProgramError> {
+        self.dispatch_domain().bind(
+            ReferenceWriteOperation::new(),
+            Vec::new(),
+            &[self.clone(), replacement.clone()],
+        )?;
+        Ok(())
     }
 }
 

@@ -1046,8 +1046,9 @@ pub trait Scatter: Sized {
     /// input axis in the required updates shape; all other input axes retain their full size and order. Negative
     /// indices are out of bounds and are handled directly by `mode`, without wrapping them from the axis end.
     ///
-    /// This convenience requires static input geometry and an index shape that supports the homogeneous [`Reshape`]
-    /// used to append an index-vector axis. Use an explicit [`ScatterOperation`] for dynamic queries or partial windows.
+    /// The selected input axis may have a dynamic extent. The index shape must support the homogeneous [`Reshape`]
+    /// used to append an index-vector axis; remaining input and update dimensions must satisfy [`ScatterOperation`]'s
+    /// window constraints. Use an explicit operation for dynamic queries or partial windows.
     ///
     /// # Parameters
     ///
@@ -1082,9 +1083,6 @@ pub trait Scatter: Sized {
     {
         let input_type = self.r#type();
         let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
-        if input_type.static_shape().is_none() {
-            return Err(TypeError::invalid("`scatter_axis` requires statically known input extents").into());
-        }
         let indices_type = indices.r#type();
         let mut expected_dimensions = input_type.shape().dimensions()[..axis].to_vec();
         expected_dimensions.extend_from_slice(indices_type.shape().dimensions());
@@ -1685,6 +1683,8 @@ mod tests {
     use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+
+    use crate::tracing::Trace;
 
     use super::*;
 
@@ -2748,5 +2748,25 @@ mod tests {
         assert!(matches!(input.scatter_axis(&indices, &Array::matrix(1, 2, vec![1_i32, 2]).unwrap(), 1,
             ScatterReductionKind::Add, GatherScatterMode::Clip), Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`scatter_axis` updates shape must be `[2, 2]` but got `[1, 2]`"));
+
+        // The update replaces the selected axis, so its window shape does not depend on that input extent.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, indices, updates)| {
+                input.scatter_axis(&indices, &updates, 0, ScatterReductionKind::Add, GatherScatterMode::Clip)
+            },
+            (input_type.clone(), ArrayType::new_static(DataType::I32, [2]), ArrayType::new_static(DataType::I32, [2])),
+        )
+        .unwrap();
+        assert_eq!(output_type, input_type);
+        assert_eq!(
+            program.interpret((
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[10_i32, 20, 30]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[2_i32, 0]).unwrap(),
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap(),
+            )),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[12_i32, 20, 31]),
+        );
     }
 }

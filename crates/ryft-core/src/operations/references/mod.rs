@@ -1,9 +1,11 @@
 //! Generic reference primitive operations and their value-level capabilities.
 //!
-//! Each child module owns one complete primitive: its value-level capability, type-indexed operation payload,
-//! inference and effects, eager interpretation, reference-discharge rewrite, transform behavior, and unit tests.
-//! This facade retains only machinery genuinely shared by multiple primitives and re-exports the established public
-//! operation surface.
+//! Each child module owns one complete primitive, laid out as the type-indexed operation payload with its inference,
+//! effects, reference-discharge rewrite, and transform rules, then the [`OperationProvider`](crate::OperationProvider)
+//! implementations selecting it for the array type universes, then the value-level capability trait with its
+//! implementations for eager array values, projected values, and staged values of every transform, and finally its
+//! unit tests. This facade retains only machinery genuinely shared by multiple primitives and re-exports the
+//! established public operation surface.
 
 // TODO(eaplatanios): Review this module.
 
@@ -15,9 +17,12 @@ use crate::programs::{
     Value,
 };
 
-macro_rules! define_reference_primitive_payload {
-    // Defines one type-indexed zero-sized payload without deriving unnecessary bounds on its phantom type parameters.
-    ($(#[$documentation:meta])* $operation:ident) => {
+macro_rules! define_reference_operation {
+    // Accepts `$(#[doc])* OperationType, OPERATION_NAME` and defines the zero-sized `OperationType<T, U>` payload
+    // indexed by its referent type `T` and enclosing type universe `U`, its constructor, its structural trait
+    // implementations, and its `Display` rendering through the canonical operation name, all without deriving
+    // unnecessary bounds on the phantom type parameters.
+    ($(#[$documentation:meta])* $operation:ident, $name:ident) => {
         $(#[$documentation])*
         pub struct $operation<T: $crate::programs::Type, U: $crate::programs::Type>(
             std::marker::PhantomData<fn() -> (T, U)>,
@@ -46,6 +51,13 @@ macro_rules! define_reference_primitive_payload {
             }
         }
 
+        impl<T: $crate::programs::Type, U: $crate::programs::Type> std::fmt::Display for $operation<T, U> {
+            #[inline]
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str($name)
+            }
+        }
+
         impl<T: $crate::programs::Type, U: $crate::programs::Type> Default for $operation<T, U> {
             #[inline]
             fn default() -> Self {
@@ -70,18 +82,6 @@ macro_rules! define_reference_primitive_payload {
         impl<T: $crate::programs::Type, U: $crate::programs::Type> $crate::parameters::Parameter
             for $operation<T, U>
         {
-        }
-    };
-}
-
-macro_rules! impl_reference_primitive_display {
-    // Renders one payload using its canonical operation name without requiring its conversion seam.
-    ($operation:ident, $name:ident) => {
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> std::fmt::Display for $operation<T, U> {
-            #[inline]
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str($name)
-            }
         }
     };
 }

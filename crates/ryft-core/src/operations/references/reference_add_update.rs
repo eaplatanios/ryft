@@ -2,6 +2,10 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -13,60 +17,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::math::add::AddOperation;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
+use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Value,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use std::borrow::Cow;
-use std::sync::LazyLock;
 
 use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
 /// Canonical operation name for [`ReferenceAddUpdateOperation`].
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
-
-/// Adds an update into the value stored by a reference in program order.
-///
-/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a
-/// [`Context`] use its operation family to select and bind the update operation through
-/// [`OperationProvider<Type, ReferenceAddUpdateOperation<Type, Type>>`](OperationProvider). Here both request
-/// parameters name the enclosing value type family; the selected operation may use a different referent type or
-/// a downstream payload. The provider returns its enclosing operation family, receives the reference and update
-/// types in that order, and may report unsupported construction for families without references.
-pub trait ReferenceAddUpdate<Update = Self>: Sized {
-    /// Adds `update` to the stored value in program order.
-    fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
-}
-
-// Staged values delegate selection to their operation family. The request uses the enclosing type in both slots:
-// it identifies the capability, while the selected operation can use the family's actual referent type or payload.
-impl<V: Value> ReferenceAddUpdate for V
-where
-    V::DispatchDomain: Context<
-        Operation: OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<V::Type, V::Type>,
-            Operation = <V::DispatchDomain as Domain>::Operation,
-        >,
-    >,
-{
-    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        let reference_type = self.r#type();
-        let update_type = update.r#type();
-        let operation = <V::DispatchDomain as Domain>::Operation::provide(
-            ReferenceAddUpdateOperation::<V::Type, V::Type>::new(),
-            &[reference_type.as_ref(), update_type.as_ref()],
-        )?;
-        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
-        Ok(())
-    }
-}
 
 static REFERENCE_ADD_UPDATE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(
@@ -77,12 +44,11 @@ static REFERENCE_ADD_UPDATE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new
     .unwrap()
 });
 
-define_reference_primitive_payload!(
+define_reference_operation!(
     /// Applies an ordered additive update whose result must retain the reference's exact referent type.
-    ReferenceAddUpdateOperation
+    ReferenceAddUpdateOperation,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME
 );
-
-impl_reference_primitive_display!(ReferenceAddUpdateOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME);
 
 impl<T, U> Operation for ReferenceAddUpdateOperation<T, U>
 where
@@ -183,6 +149,31 @@ where
     // before any operation rule runs.
 }
 
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
+    P: BatchingPolicy<C>,
+{
+    // The update is aligned with the reference's fixed batch axis before the packed accumulation.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let update =
+            align_stored_batch(context, driver, REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        context
+            .parent()
+            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&update).clone()])?;
+        Ok(Vec::new().into())
+    }
+}
+
 impl<T, U, C> DifferentiableOperation<C> for ReferenceAddUpdateOperation<T, U>
 where
     T: Type,
@@ -209,31 +200,6 @@ where
             context.tangent().bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?;
         }
         Ok(Vec::new())
-    }
-}
-
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
-    P: BatchingPolicy<C>,
-{
-    // The update is aligned with the reference's fixed batch axis before the packed accumulation.
-    fn batch<D: BatchingDriver<C, P>>(
-        &self,
-        context: &BatchingContext<C, P>,
-        driver: &D,
-        inputs: &[P::Batch],
-    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let update =
-            align_stored_batch(context, driver, REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
-        context
-            .parent()
-            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&update).clone()])?;
-        Ok(Vec::new().into())
     }
 }
 
@@ -267,6 +233,103 @@ where
             let contribution = context.bind(ReferenceReadOperation::new(), Vec::new(), &[accumulator])?.remove(0);
             accumulators[1].accumulate(context, MaybeZero::Value(contribution))?;
         }
+        Ok(())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Ok(ReferenceAddUpdateOperation::new().into())
+    }
+}
+
+// Homogeneous array families can return or ignore cotangents, but their type universe contains no references.
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<ArrayType, ArrayType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "the homogeneous array operation family cannot accumulate into a reference destination"
+                .to_string(),
+        })
+    }
+}
+
+/// Adds an update into the value stored by a reference in program order.
+///
+/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a
+/// [`Context`] use its operation family to select and bind the update operation through
+/// [`OperationProvider<Type, ReferenceAddUpdateOperation<Type, Type>>`](OperationProvider). Here both request
+/// parameters name the enclosing value type family; the selected operation may use a different referent type or
+/// a downstream payload. The provider returns its enclosing operation family, receives the reference and update
+/// types in that order, and may report unsupported construction for families without references. This capability
+/// alone is generic over type universes because reverse-mode differentiation accumulates cotangents through it on
+/// tracers of arbitrary universes; the other five reference capabilities are specific to
+/// [`ArrayIrType`](crate::arrays::ArrayIrType), because no core machinery needs them on arbitrary type universes.
+pub trait ReferenceAddUpdate<Update = Self>: Sized {
+    /// Adds `update` to the stored value in program order.
+    fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAddUpdate for ArrayIrValue<A> {
+    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
+        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
+        reference.add_update(update)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
+{
+    fn add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceAddUpdateOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), update.value().clone()],
+        )?;
+        Ok(())
+    }
+}
+
+// Staged values delegate selection to their operation family. The request uses the enclosing type in both slots:
+// it identifies the capability, while the selected operation can use the family's actual referent type or payload.
+impl<V: Value> ReferenceAddUpdate for V
+where
+    V::DispatchDomain: Context<
+        Operation: OperationProvider<
+            V::Type,
+            ReferenceAddUpdateOperation<V::Type, V::Type>,
+            Operation = <V::DispatchDomain as Domain>::Operation,
+        >,
+    >,
+{
+    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
+        let reference_type = self.r#type();
+        let update_type = update.r#type();
+        let operation = <V::DispatchDomain as Domain>::Operation::provide(
+            ReferenceAddUpdateOperation::<V::Type, V::Type>::new(),
+            &[reference_type.as_ref(), update_type.as_ref()],
+        )?;
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
         Ok(())
     }
 }
