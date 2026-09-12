@@ -67,8 +67,15 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     /// Returns the diagnostic name used for a freshly inferred result variable.
     fn result_name(&self) -> &str;
 
-    /// Returns the bounds of a freshly inferred result variable.
+    /// Returns the result bounds computed from the declared input types when this operation was constructed.
     fn result_bounds(&self) -> DimensionBounds;
+
+    /// Computes result bounds from the actual input types, which may refine the declared input bounds.
+    fn infer_output_bounds(
+        &self,
+        left: &DimensionType,
+        right: &DimensionType,
+    ) -> Result<DimensionBounds, DimensionError>;
 
     /// Infers this operation's one fresh dimension result after validating both operand types.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
@@ -85,7 +92,11 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
                 }
             },
         )?;
-        Ok(vec![DimensionType::new(DimensionVariable::new(self.result_name(), self.result_bounds()))])
+
+        // Reusing an operation with narrower inputs must recompute its bounds formula. Its stored effect metadata
+        // remains conservative: refinement never removes an assertion from the original operation.
+        let bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
+        Ok(vec![DimensionType::new(DimensionVariable::new(self.result_name(), bounds))])
     }
 }
 
@@ -215,7 +226,7 @@ impl ArithmeticDimensionOperationMetadata {
         &self.result_name
     }
 
-    /// Returns the bounds of a freshly inferred result variable.
+    /// Returns the result bounds computed from the declared input types when this operation was constructed.
     #[inline]
     pub(crate) fn result_bounds(&self) -> DimensionBounds {
         self.result_bounds
@@ -319,6 +330,38 @@ mod tests {
         assert_eq!(result[0].bounds(), operation.result_bounds());
         assert_ne!(result[0].variable(), left.variable());
         assert_ne!(result[0].variable(), right.variable());
+
+        // All arithmetic formulas use the actual input bounds when a retained operation is specialized. Results
+        // remain fresh definitions, and conservative assertion effects are preserved on the retained operation.
+        let declared_left = test_dimension_type("left", 1, 9);
+        let declared_right = test_dimension_type("right", 1, 5);
+        let exact_left = test_dimension_type("left", 6, 7);
+        let exact_right = test_dimension_type("right", 2, 3);
+        macro_rules! check_refinement {
+            // Check each concrete arithmetic operation with the same declarations and exact input refinements.
+            ($operation:ident, $extent:literal) => {{
+                let operation = $operation::new(&declared_left, &declared_right).unwrap();
+                let inputs = [exact_left.clone(), exact_right.clone()];
+                let result = Operation::infer_output_types(&operation, &inputs, &[]).unwrap();
+                let repeated = Operation::infer_output_types(&operation, &inputs, &[]).unwrap();
+                assert_eq!(result[0].extent(), Some($extent));
+                assert_ne!(result[0].variable(), repeated[0].variable());
+            }};
+        }
+        check_refinement!(DimensionAddOperation, 8);
+        check_refinement!(DimensionSubOperation, 4);
+        check_refinement!(DimensionSaturatingSubOperation, 4);
+        check_refinement!(DimensionMulOperation, 12);
+        check_refinement!(DimensionPowOperation, 36);
+        check_refinement!(DimensionDivFloorOperation, 3);
+        check_refinement!(DimensionRemOperation, 0);
+        check_refinement!(DimensionMinOperation, 2);
+        check_refinement!(DimensionMaxOperation, 6);
+
+        let checked_subtraction = DimensionSubOperation::new(&declared_left, &declared_right).unwrap();
+        let result = Operation::infer_output_types(&checked_subtraction, &[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(result[0].extent(), Some(4));
+        assert_eq!(checked_subtraction.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion),);
 
         let unexpected = test_dimension_type("unexpected", 0, 6);
         assert_eq!(

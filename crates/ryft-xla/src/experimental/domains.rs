@@ -7269,146 +7269,144 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        // These fixtures use the pinned JAX oracle values. Build the first five mixed graphs at each concrete
-        // signature and replay dynamic-axis capability graphs for the remaining cases. Keep dimension residuals
-        // internal to a fused primal/pullback; no case asserts reuse of one bounded executable across physical shapes.
+        // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in
+        // the pinned JAX oracle. Keep dimension residuals internal to a fused primal/pullback; this verifies retained
+        // graph specialization, without asserting reuse of one bounded executable across physical shapes.
         for name in
             ["reshape", "broadcast", "concatenate", "gather", "slice", "gather_axis", "scatter_axis", "batched_slice"]
         {
-            for size in [4, 5] {
-                let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
-                let mut builder = XlaProgramBuilder::new();
-                let input = builder.add_input(input_type.clone().into());
-                let indices = builder.add_input(ArrayType::new_static(DataType::I32, [3, 1]).into());
-                let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
-                let zero = builder.add_input(ArrayType::scalar(DataType::I32).into());
-                builder.add_input(ArrayType::new_static(DataType::F64, [3, 4]).into());
-                let extent_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
-                let extent_type = extent_operation.result_type().clone();
-                let extent = builder.add_instruction(extent_operation, vec![], vec![input], None).unwrap()[0];
-                let two_value = DimensionValue::constant(2).unwrap();
-                let two_type = two_value.r#type().into_owned();
-                let two = builder.add_constant(XlaConstant::Dimension(two_value));
-                let four = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(4).unwrap()));
-                let output = match name {
-                    "reshape" => {
-                        let doubled = builder
-                            .add_instruction(
-                                DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &two_type).unwrap()),
-                                vec![],
-                                vec![extent, two],
-                                None,
-                            )
-                            .unwrap()[0];
-                        builder
-                            .add_instruction(DynamicReshapeOperation::new(), vec![], vec![input, two, doubled], None)
-                            .unwrap()[0]
-                    }
-                    "broadcast" => builder
+            let input_type = ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![
+                    Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap())),
+                    Dimension::Static(4),
+                ]),
+            );
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let indices = builder.add_input(ArrayType::new_static(DataType::I32, [3, 1]).into());
+            let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
+            let zero = builder.add_input(ArrayType::scalar(DataType::I32).into());
+            builder.add_input(ArrayType::new_static(DataType::F64, [3, 4]).into());
+            let extent_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
+            let extent_type = extent_operation.result_type().clone();
+            let extent = builder.add_instruction(extent_operation, vec![], vec![input], None).unwrap()[0];
+            let two_value = DimensionValue::constant(2).unwrap();
+            let two_type = two_value.r#type().into_owned();
+            let two = builder.add_constant(XlaConstant::Dimension(two_value));
+            let four = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(4).unwrap()));
+            let output = match name {
+                "reshape" => {
+                    let doubled = builder
                         .add_instruction(
-                            DynamicBroadcastOperation::new(vec![1, 2]),
+                            DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &two_type).unwrap()),
                             vec![],
-                            vec![input, two, extent, four],
+                            vec![extent, two],
                             None,
                         )
-                        .unwrap()[0],
-                    "concatenate" => {
-                        let addition = DimensionAddOperation::new(&extent_type, &extent_type).unwrap();
-                        let result_type = DimensionType::new(DimensionVariable::new(
-                            addition.result_name(),
-                            addition.result_bounds(),
-                        ));
-                        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
-                            0,
-                            &[input_type.clone().into(), input_type.clone().into(), result_type.into()],
-                        )
-                        .unwrap();
-                        let doubled = builder
-                            .add_instruction(DimensionOperation::Add(addition), vec![], vec![extent, extent], None)
-                            .unwrap()[0];
-                        builder.add_instruction(operation, vec![], vec![input, input, doubled], None).unwrap()[0]
-                    }
-                    "gather" => {
-                        let operation =
-                            GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 4])
-                                .with_mode(GatherScatterMode::Clip);
-                        builder
-                            .add_instruction(
-                                XlaOperation::Array(ArrayOperation::Gather(operation)),
-                                vec![],
-                                vec![input, indices],
-                                None,
-                            )
-                            .unwrap()[0]
-                    }
-                    "slice" => builder
-                        .add_instruction(
-                            XlaOperation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2, 4]))),
-                            vec![],
-                            vec![input, start, zero],
-                            None,
-                        )
-                        .unwrap()[0],
-                    "gather_axis" | "scatter_axis" | "batched_slice" => input,
-                    _ => unreachable!(),
-                };
-                let program = builder
-                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 5], vec![Placeholder])
+                        .unwrap()[0];
+                    builder
+                        .add_instruction(DynamicReshapeOperation::new(), vec![], vec![input, two, doubled], None)
+                        .unwrap()[0]
+                }
+                "broadcast" => builder
+                    .add_instruction(
+                        DynamicBroadcastOperation::new(vec![1, 2]),
+                        vec![],
+                        vec![input, two, extent, four],
+                        None,
+                    )
+                    .unwrap()[0],
+                "concatenate" => {
+                    let addition = DimensionAddOperation::new(&extent_type, &extent_type).unwrap();
+                    let doubled = builder
+                        .add_instruction(DimensionOperation::Add(addition), vec![], vec![extent, extent], None)
+                        .unwrap()[0];
+                    let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+                        0,
+                        &[
+                            input_type.clone().into(),
+                            input_type.clone().into(),
+                            builder.atoms()[doubled.index()].r#type().into_owned(),
+                        ],
+                    )
                     .unwrap();
-                let program = if matches!(name, "gather_axis" | "scatter_axis" | "batched_slice") {
-                    // Trace the convenience with a dynamic selected axis. Unlike the derived arithmetic shapes
-                    // above, this geometry can be specialized through the existing replay path.
-                    let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
-                        |inputs| {
-                            let indices = inputs[1].reshape(Shape::new(vec![Dimension::Static(3)])).unwrap();
-                            vec![if name == "batched_slice" {
-                                batch(
-                                    |(input, start, zero)| input.dynamic_slice(&[start, zero], &[2, 4]),
-                                    (inputs[0].clone(), indices, inputs[3].clone()),
-                                    (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()),
-                                    BatchAxis::new(0),
-                                    None,
+                    builder.add_instruction(operation, vec![], vec![input, input, doubled], None).unwrap()[0]
+                }
+                "gather" => {
+                    let operation =
+                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 4])
+                            .with_mode(GatherScatterMode::Clip);
+                    builder
+                        .add_instruction(
+                            XlaOperation::Array(ArrayOperation::Gather(operation)),
+                            vec![],
+                            vec![input, indices],
+                            None,
+                        )
+                        .unwrap()[0]
+                }
+                "slice" => builder
+                    .add_instruction(
+                        XlaOperation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2, 4]))),
+                        vec![],
+                        vec![input, start, zero],
+                        None,
+                    )
+                    .unwrap()[0],
+                "gather_axis" | "scatter_axis" | "batched_slice" => input,
+                _ => unreachable!(),
+            };
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 5], vec![Placeholder])
+                .unwrap();
+            let program = if matches!(name, "gather_axis" | "scatter_axis" | "batched_slice") {
+                // The axis conveniences and batching trace use the same symbolic boundary as the mixed graphs.
+                let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                    |inputs| {
+                        let indices = inputs[1].reshape(Shape::new(vec![Dimension::Static(3)])).unwrap();
+                        vec![if name == "batched_slice" {
+                            batch(
+                                |(input, start, zero)| input.dynamic_slice(&[start, zero], &[2, 4]),
+                                (inputs[0].clone(), indices, inputs[3].clone()),
+                                (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()),
+                                BatchAxis::new(0),
+                                None,
+                            )
+                            .unwrap()
+                        } else if name == "gather_axis" {
+                            inputs[0].gather_axis(&indices, 0, GatherScatterMode::Clip).unwrap()
+                        } else {
+                            inputs[0]
+                                .scatter_axis(
+                                    &indices,
+                                    &inputs[4],
+                                    0,
+                                    ScatterReductionKind::Add,
+                                    GatherScatterMode::Clip,
                                 )
                                 .unwrap()
-                            } else if name == "gather_axis" {
-                                inputs[0].gather_axis(&indices, 0, GatherScatterMode::Clip).unwrap()
-                            } else {
-                                inputs[0]
-                                    .scatter_axis(
-                                        &indices,
-                                        &inputs[4],
-                                        0,
-                                        ScatterReductionKind::Add,
-                                        GatherScatterMode::Clip,
-                                    )
-                                    .unwrap()
-                            }]
-                        },
-                        vec![
-                            ArrayType::new(
-                                DataType::F64,
-                                Shape::new(vec![
-                                    Dimension::Dynamic(DimensionVariable::new(
-                                        "n",
-                                        DimensionBounds::new(4, Some(6)).unwrap(),
-                                    )),
-                                    Dimension::Static(4),
-                                ]),
-                            ),
-                            ArrayType::new_static(DataType::I32, [3, 1]),
-                            ArrayType::scalar(DataType::I32),
-                            ArrayType::scalar(DataType::I32),
-                            ArrayType::new_static(DataType::F64, [3, 4]),
-                        ],
-                        &domain,
-                        XlaOptions::new(mesh.clone()),
-                    )
-                    .unwrap()
-                    .into_inner();
-                    staged.source_program().program().clone()
-                } else {
-                    program
-                };
+                        }]
+                    },
+                    vec![
+                        input_type.clone(),
+                        ArrayType::new_static(DataType::I32, [3, 1]),
+                        ArrayType::scalar(DataType::I32),
+                        ArrayType::scalar(DataType::I32),
+                        ArrayType::new_static(DataType::F64, [3, 4]),
+                    ],
+                    &domain,
+                    XlaOptions::new(mesh.clone()),
+                )
+                .unwrap()
+                .into_inner();
+                staged.source_program().program().clone()
+            } else {
+                program
+            };
+            let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+            let pullback = linearization.pullback().unwrap();
+            for size in [4, 5] {
                 let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
                 let (shape, expected) = match name {
                     "reshape" => (vec![2, 2 * size], values.clone()),
@@ -7438,8 +7436,15 @@ mod tests {
                     ArrayType::new_static(DataType::F64, [3, 4]),
                     output_type.clone(),
                 ];
-                let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-                let pullback = linearization.pullback().unwrap();
+                let specialized = program
+                    .clone()
+                    .specialize(&input_types[..5].iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>())
+                    .unwrap();
+                assert_eq!(
+                    specialized.output_types(),
+                    vec![ArrayIrType::from(output_type.clone())],
+                    "{name}, n={size}"
+                );
                 let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
                     |inputs| {
                         let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();

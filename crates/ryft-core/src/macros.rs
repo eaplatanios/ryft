@@ -322,7 +322,8 @@ macro_rules! define_arithmetic_dimension_operation {
                 self.metadata.result_name()
             }
 
-            /// Returns the bounds of a freshly inferred result variable.
+            /// Returns the result bounds computed from the declared input types at construction.
+            /// Output inference recomputes these bounds when the actual inputs have narrower bounds.
             #[inline]
             pub fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
                 self.metadata.result_bounds()
@@ -416,6 +417,16 @@ macro_rules! define_arithmetic_dimension_operation {
             #[inline]
             fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
                 $operation::result_bounds(self)
+            }
+
+            #[inline]
+            fn infer_output_bounds(
+                &self,
+                left: &$crate::arrays::DimensionType,
+                right: &$crate::arrays::DimensionType,
+            ) -> Result<$crate::arrays::DimensionBounds, $crate::arrays::DimensionError> {
+                let bounds: Result<_, $crate::arrays::DimensionError> = ($infer_bounds)(left, right);
+                Ok(bounds?.0)
             }
         }
 

@@ -1017,10 +1017,11 @@ impl<
     /// [`Type::is_refined_by`] for more information on refinement requirements). Anything else is rejected before the
     /// replay begins.
     ///
-    /// Replay refines the boundary and every inferred instruction output type, but never rewrites stored operation
-    /// payloads. An operation whose payload itself stores a type referencing a refined identity re-runs its own
-    /// inference against the refined operands and surfaces its own diagnostic, while payloads that carry geometry
-    /// as explicit operands specialize cleanly.
+    /// Replay tracks the correspondence between source and replayed type-identity definitions, updating downstream
+    /// operation payloads and nested region metadata consistently. Inference can therefore propagate concrete bounds
+    /// through first-class dimension arithmetic and into operations that receive their geometry as explicit inputs.
+    /// This does not replace arbitrary stored geometry with runtime values. Instead, each operation remains responsible
+    /// for validating its payload against the refined inputs, and unsupported refinements retain their diagnostics.
     pub fn specialize(self, input_types: &[T]) -> Result<Self, ProgramError> {
         check_count!("input", input_types, self.input_count(), ProgramError);
         let declared_input_types = self.input_types();

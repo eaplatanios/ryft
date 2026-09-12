@@ -153,7 +153,16 @@ impl Operation for DimensionSizeOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         self.validate_input_type(&input_types[0])?;
-        Ok(vec![self.result_type.clone().into()])
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        let bounds = input_type.shape().dimensions()[self.axis].bounds();
+        // Dimension variables have immutable bounds. A concrete refinement therefore defines a new exact-bound
+        // identity, which program replay relates to the original definition before validating downstream uses.
+        let result_type = if bounds == self.result_type.bounds() {
+            self.result_type.clone()
+        } else {
+            DimensionType::new(DimensionVariable::new(self.result_type.variable().name(), bounds))
+        };
+        Ok(vec![result_type.into()])
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -371,13 +380,12 @@ mod tests {
             operation.infer_output_types(&[dynamic_type.clone().into()], &[]),
             Ok(vec![operation.result_type().clone().into()]),
         );
-        assert_eq!(
-            operation.infer_output_types(
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)])).into()],
-                &[],
-            ),
-            Ok(vec![operation.result_type().clone().into()]),
-        );
+        let refined_result = operation
+            .infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)])).into()], &[])
+            .unwrap();
+        let refined_result = <&DimensionType>::try_from(&refined_result[0]).unwrap();
+        assert_eq!(refined_result.extent(), Some(5));
+        assert_ne!(refined_result.variable(), &variable);
 
         // Static axes produce a fresh exact-bounds dimension.
         let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));

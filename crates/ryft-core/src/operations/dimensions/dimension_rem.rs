@@ -35,7 +35,12 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
     let (_, left_maximum) = representable_extent_range(left.bounds())?;
     let (_, right_maximum) = representable_extent_range(right.bounds())?;
     positive_divisor_lower_bound(right, right_maximum)?;
-    let bounds = DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))?;
+    let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
+        let remainder = left % right;
+        DimensionBounds::new(remainder, remainder.checked_add(1))?
+    } else {
+        DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))?
+    };
     Ok((bounds, right.bounds().lower() == 0))
 }
 

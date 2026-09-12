@@ -3108,6 +3108,41 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
+
+        // Replaying without concrete refinement still creates a fresh arithmetic definition. Its new identity must
+        // be used consistently by the output shape rather than compared with the source definition by name.
+        let (replayed_types, replayed) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)
+            },
+            program.input_types(),
+        )
+        .unwrap();
+        assert_ne!(replayed_types, program.output_types());
+        assert_eq!(replayed_types[0].to_string(), "f64[2, source * 2]");
+
+        // Specialization replays this retained graph rather than retracing its construction closure. Both the
+        // dimension arithmetic and the reshape must acquire the concrete geometry at each independent call.
+        for size in [4, 5] {
+            let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
+            let specialized = program.clone().specialize(&[input_type.clone().into()]).unwrap();
+            let replayed_specialized = replayed.clone().specialize(&[input_type.clone().into()]).unwrap();
+            assert_eq!(replayed_specialized.output_types(), specialized.output_types());
+            assert_eq!(specialized.input_types(), vec![input_type.into()]);
+            assert_eq!(specialized.output_types(), vec![ArrayType::new_static(DataType::F64, [2, 2 * size]).into()]);
+            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
+            assert_eq!(
+                specialized.interpret(vec![ArrayIrValue::Array(Array::matrix(size, 4, values.clone()).unwrap())]),
+                Ok(vec![ArrayIrValue::Array(Array::matrix(2, 2 * size, values).unwrap())]),
+            );
+        }
+        assert!(matches!(
+            program.clone().specialize(&[ArrayType::new_static(DataType::F64, [9, 4]).into()]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "specialized input type f64[9, 4] does not refine declared input type f64[source, 4]",
+        ));
+
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_types().len(), 2);
 

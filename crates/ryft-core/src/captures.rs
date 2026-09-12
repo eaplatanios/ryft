@@ -66,12 +66,11 @@ use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
-use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena,
-    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Atom, AtomId, Instruction, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    RegionArena, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, TracingContext};
 
@@ -588,15 +587,26 @@ impl<
                 capture_inputs.as_slice(),
                 instruction.inputs(),
             )?;
-            let outputs = builder
-                .add_instruction(
+
+            // This relocation does not change any input type or reference identity as capture types were checked
+            // against their declarations when this closed program was constructed. Preserve the accepted output types
+            // instead of running inference again, which can create fresh dimension definitions and leave the verbatim
+            // nested-region signatures referring to the original definitions.
+            let outputs = instruction
+                .outputs()
+                .iter()
+                .map(|id| builder.add_variable(self.program.atoms()[id.index()].r#type().into_owned()))
+                .collect::<Vec<_>>();
+            builder.add_instruction_unchecked(
+                Instruction::new(
                     instruction.operation().clone(),
-                    instruction.regions().to_vec(),
                     inputs,
-                    Some(instruction.provenance().clone()),
-                )?
-                .to_vec();
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                    outputs.clone(),
+                    instruction.regions().to_vec(),
+                )
+                .with_provenance(instruction.provenance().clone()),
+            );
+
             for (source_output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
                 let mapped = mapped_atoms
                     .get_mut(source_output.index())
@@ -658,7 +668,9 @@ mod tests {
     };
     use crate::contexts::StagingContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, WhileOperation};
+    use crate::operations::{
+        AddOperation, CompareOperation, ComparisonDirection, DimensionSizeOperation, WhileOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
@@ -1055,6 +1067,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, vec![Array::scalar(8.0).unwrap()]);
+
+        // Capture lifting is structural, including when fresh inference would allocate a new nominal dimension.
+        // The size payload was constructed for a broad bound, so inferring it again against this static capture
+        // would produce a different definition with the same exact extent.
+        let declared = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "extent",
+                DimensionBounds::non_negative(Some(8)).unwrap(),
+            ))]),
+        );
+        let captured = Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[1_f64, 2., 3.]).unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ArrayIrOperation<Array>>::new();
+        let capture = builder.add_constant(CaptureReference::new(0, captured.r#type().into_owned().into()));
+        let output = builder
+            .add_instruction(DimensionSizeOperation::new(&declared, 0).unwrap(), Vec::new(), vec![capture], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![output],
+                vec![],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let source_types = source.output_types();
+        let closed = ClosedProgram::new(source, vec![ArrayIrValue::Array(captured)]).unwrap();
+        let lifted = closed.to_program_with_lifted_captures().unwrap();
+        assert_eq!(lifted.output_types(), source_types);
+        assert_eq!(closed.program().output_types(), source_types);
     }
 
     #[test]

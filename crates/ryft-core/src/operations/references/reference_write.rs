@@ -93,6 +93,10 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
+        // The effect descriptor is built once and shared by every `<T, U>` instantiation of this operation: the
+        // `static` names no generic parameter, so this generic function owns exactly one instance, and `LazyLock` is
+        // required because `Effects::new` validates and allocates at runtime. Nesting it here scopes it to its only
+        // reader and lets `effects` hand out a borrowed `'static` descriptor without cloning on every query.
         static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
             Effects::new(
                 EffectClasses::NONE,
