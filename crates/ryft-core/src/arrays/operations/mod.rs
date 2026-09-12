@@ -76,7 +76,6 @@ mod attention;
 mod collectives;
 mod compare;
 mod complex;
-mod constants;
 mod control_flow;
 mod cumulative;
 mod custom_call;
@@ -2402,6 +2401,59 @@ mod tests {
                 .unwrap()
                 .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64))]),
             Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64))]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_dynamic_projected_jvp_materializes_source_relative_widened_zero() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The projected constant derivative uses its primal result as the runtime-shape exemplar, then widens the
+        // element type to the tangent representation. No type-only dynamic zero is present in the fused JVP.
+        let jvp = program.jvp().unwrap();
+        assert!(jvp.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
+            ArrayIrOperation::Array(ArrayOperation::ZeroLike(_))
+        )));
+        assert!(jvp.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
+            ArrayIrOperation::Array(ArrayOperation::ConvertElementType(_))
+        )));
+        assert!(
+            !jvp.instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
+        );
+
+        let primal = Array::from_f64s(
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
+            vec![1.0, 2.0, 4.0],
+        );
+        let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]);
+        let expected_primal = primal.clone();
+        assert_eq!(
+            jvp.interpret(vec![ArrayIrValue::Array(primal), ArrayIrValue::Array(tangent)]),
+            Ok(
+                vec![ArrayIrValue::Array(expected_primal), ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])),]
+            ),
         );
     }
 

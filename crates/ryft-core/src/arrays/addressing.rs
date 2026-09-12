@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::elements::{validate_element_bytes, validate_logical_bytes};
+use crate::arrays::elements::validate_element_bytes;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::Dimension;
@@ -363,7 +363,14 @@ impl ArrayAddressing {
         }
 
         if self.is_dense_row_major() {
-            return validate_logical_bytes(self.r#type.data_type(), self.element_byte_width(), bytes);
+            // Dense storage has no holes or padding, so its chunks are the element encodings in logical order.
+            // Arrays without payload bytes have nothing to check.
+            if self.element_byte_width() != 0 {
+                for (element, element_bytes) in bytes.chunks_exact(self.element_byte_width()).enumerate() {
+                    validate_element_bytes(self.r#type.data_type(), element, element_bytes)?;
+                }
+            }
+            return Ok(());
         }
 
         let mut logical_nonzero_byte_count = 0usize;

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType,
-    ArrayIrValue, ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
+    ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -119,6 +119,26 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
     One,
     |context, output_type, _operation| context.one(&output_type),
 );
+
+impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: OneOperation<ArrayType>) -> Self {
+        // Prefer the homogeneous member encoding for identity-free static ones and the mixed dimension-operand
+        // encoding for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts
+        // normalize them to the homogeneous form.
+        if operation
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        {
+            Self::DynamicOne(operation)
+        } else {
+            Self::Array(ArrayOperation::One(operation))
+        }
+    }
+}
 
 impl<T: Type, O: Operation<Type = T> + From<OneOperation<T>>> OperationProvider<T, OneOperation<T>> for O {
     type Operation = Self;
@@ -255,14 +275,20 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionVariable, Shape,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Shape, StridedLayout, i4,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{TransposableOperation, TranspositionContext};
+    use crate::differentiation::{
+        ForwardModeDifferentiate, LinearizationTracer, TransposableOperation, TranspositionContext, differentiate_at,
+    };
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_operation_partial_evaluation;
     use crate::operations::constants::constant::ConstantOperation;
+    use crate::operations::math::mul::Mul;
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
     use crate::tracing::TracingContext;
 
@@ -308,6 +334,46 @@ mod tests {
         );
         let dimension_type = DimensionType::new(rows);
         assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
+    }
+
+    #[test]
+    fn test_one_type_inference_dynamic_identity_instantiation() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
+        let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let output = builder
+            .add_instruction(
+                OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
+                Vec::new(),
+                vec![extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let caller_input = ArrayIrType::Dimension(DimensionType::new(caller.clone()));
+        let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
+        let [instruction] = instantiated.instructions() else {
+            panic!("expected one instantiated instruction");
+        };
+        let ArrayIrOperation::DynamicOne(instantiated_one) = instruction.operation() else {
+            panic!("expected the instantiated operation to remain a dynamic one");
+        };
+        assert_eq!(
+            instantiated_one.r#type(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(caller.clone())])),
+        );
+        assert_eq!(
+            instantiated
+                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]),
+        );
     }
 
     #[test]
@@ -367,6 +433,35 @@ mod tests {
                                values exist only in array programs over `ArrayIrOperation`",
         ));
 
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        assert_eq!(
+            context.one(&r#type),
+            Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!())
+        );
+        // Constructors dispatch over element codecs that have no scalar representation and honor physical layout.
+        let strided_type =
+            ArrayType::new_static(DataType::I4, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let one = context.one(&strided_type).unwrap();
+        assert_eq!(one.elements::<i4>(), Ok(vec![i4::new(1).unwrap(); 3]));
+        assert_eq!(one.storage_bytes(), [1, 1, 1]);
+
+        // Kernels that materialize a payload from a type reject dynamically sized types. `zero` and `one` share the
+        // storage-level rejection raised by `ArrayAddressing::new`, while `iota` names the array-program route that
+        // admits dynamic extents.
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
+        assert!(matches!(
+            context.one(&dynamic_type),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot materialize a value of dynamically sized type f64[dynamic, 3]; dynamically \
+                               shaped values exist only in array programs over `ArrayIrOperation`",
+        ));
+
         // Composite eager one materialization delegates array members and rejects first-class dimensions.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(context.one(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
@@ -385,6 +480,33 @@ mod tests {
         let output = context.one(&output_type).unwrap();
         let expected = Array::from_elements(output_type, &[1.0f32; 2]).unwrap();
         assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_one_partial_evaluation_dynamic() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
+        let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]));
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = OneOperation::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+            )),
+            cases = [
+                {
+                    inputs = [(@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = extent_type.into(), replay = extent))],
+                    outputs = [(@residual, output)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -423,6 +545,88 @@ mod tests {
     }
 
     #[test]
+    fn test_one_differentiation_dynamic() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(extent_type.clone().into());
+        let output = builder
+            .add_instruction(
+                OneOperation::new(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),
+                )),
+                Vec::new(),
+                vec![extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        assert_eq!(
+            jvp.interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+            ]),
+        );
+        assert_eq!(jvp.instructions().len(), 2);
+        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::DynamicOne(_)));
+        assert!(matches!(jvp.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
+        assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
+
+        // The direct transform context must likewise run the explicit rule rather than taking its all-structural-zero
+        // shortcut: a nullary zero cannot recover the dynamic extent after the closure returns.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let (primal, tangent) = context
+            .jvp(
+                move |extent, ()| {
+                    let context = extent.context().clone();
+                    Ok(context.bind(OneOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
+                },
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+                ArrayIrValue::Array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
+                (),
+            )
+            .unwrap();
+        assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
+        assert_eq!(tangent, ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])));
+    }
+
+    #[test]
+    fn test_one_differentiation_composite_gradient_seed() {
+        // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the composite cotangent
+        // type through the fallible provider, which constructs the canonical array member encoding. The differentiated
+        // function reaches ordinary array math through the array member projection, because homogeneous array
+        // capabilities deliberately do not exist at the composite level.
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let squared_sum = |input: LinearizationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
+            let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
+            let squared = input.mul(&input)?;
+            Ok::<_, ProgramError>(ValueProjection::<ArrayType>::from_projected(
+                squared.reduce(&[0], ReductionKind::Sum),
+            ))
+        };
+
+        let (value, gradient) = differentiate_at(input.clone()).value_and_gradient(squared_sum).unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(14.0_f64)));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])));
+        assert_eq!(differentiate_at(input).gradient(squared_sum).unwrap(), gradient);
+    }
+
+    #[test]
     fn test_one_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
@@ -436,6 +640,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input_cotangents, ());
+    }
+
+    #[test]
+    fn test_one_transposition_dynamic() {
+        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
+        // extent receives a structural-zero cotangent regardless of the output cotangent being live.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let operation = ArrayIrOperation::<Array>::from(OneOperation::new(output_type.clone()));
+        let mut context =
+            TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let output_cotangent = context.input(output_type.clone().into());
+        let inputs = [PartialValue::Unknown(extent_type.clone().into())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators)
+            .unwrap();
+        let cotangents = context.take_cotangents(&accumulators).unwrap();
+        let [cotangent] = cotangents.as_slice() else {
+            panic!("expected one cotangent per operation input");
+        };
+        assert!(matches!(cotangent, MaybeZero::Zero(_)));
     }
 
     #[test]

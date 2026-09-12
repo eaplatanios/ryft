@@ -115,10 +115,11 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Memory, Shape, f6e2m3fn, u4,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Memory, Shape, f6e2m3fn, u4,
     };
+    use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::MaybeZero;
+    use crate::programs::{AtomId, MaybeZero, ProgramBuilder};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -195,6 +196,47 @@ mod tests {
         let output = context.fill(&output_type, 5.5f32).unwrap();
         assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[5.5f32; 2]).unwrap());
         assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
+    }
+
+    #[test]
+    fn test_array_ir_dynamic_literal_fill_jvp_materializes_shaped_zero() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(extent_type.clone().into());
+        let scalar = builder
+            .add_instruction(
+                ArrayOperation::from(ConstantOperation::new(Array::scalar(2.5_f64))),
+                Vec::new(),
+                vec![],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let jvp = program.jvp().unwrap();
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        assert_eq!(
+            jvp.interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+            ]),
+        );
+        let dynamic_zero = jvp
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
+            .unwrap();
+        assert_eq!(dynamic_zero.inputs(), &[AtomId::new(0)]);
     }
 
     #[test]

@@ -26,8 +26,6 @@ use crate::operations::{ElementType, Max, Min};
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
 /// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
 /// over multidimensional arrays without depending on an optimized backend such as the Ryft XLA backend. Unit tests,
@@ -41,18 +39,16 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// logical row-major values through checked typed codecs that preserve exact element encodings. Cloning an array shares
 /// its payload without copying it.
 ///
-/// A production [`Array`] always carries a fully static [`ArrayType`]: every constructor that sizes or addresses a
+/// A production [`Array`] always carries a fully static [`ArrayType`]. Every constructor that sizes or addresses a
 /// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
 /// dynamically shaped array value cannot be built. Reference kernels may therefore assume static geometry and read
-/// extents directly off the stored type instead of resolving first-class dimension extents; programs that genuinely
-/// need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
-/// each dynamic axis is carried by an explicit dimension operand. The single bypass is the `#[cfg(test)]`-gated
-/// `Array::with_unchecked_type`, which exists so that transform-validation tests can pin how the dynamic-shape
-/// rejections behave when a deliberately malformed value reaches them.
+/// extents directly off the stored type instead of resolving first-class dimension extent. [`Program`](crate::Program)s
+/// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
+/// each dynamic axis is carried by an explicit dimension operand.
 ///
 /// Host concretization supports scalar Boolean values through [`Concretizable<bool>`] and scalar integers through
 /// [`Concretizable<i128>`]. The wider integer representation preserves all signed and unsigned element values,
-/// including `u64::MAX`, before callers perform range checks or clamping.
+/// including [`u64::MAX`], before callers perform range checks or clamping.
 ///
 /// # Warning
 ///
@@ -72,27 +68,25 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// ```
 #[derive(Clone, Parameter)]
 pub struct Array {
-    /// Staged array type of this array value.
+    /// [`ArrayType`] of this [`Array`].
     r#type: ArrayType,
 
-    /// Shared immutable physical storage, including any layout holes or tile padding.
+    /// Shared immutable physical storage, accounting for any layout "holes" or tile padding.
     bytes: Arc<Vec<u8>>,
 }
 
 impl Array {
-    /// Creates an array from its staged array type and complete physical storage. The storage must have the exact
-    /// layout-derived byte count, contain a valid encoding for every logical element, and contain zero in every layout
-    /// hole or tile-padding byte. Dynamically shaped types are rejected because they cannot describe materialized
-    /// storage.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Staged array type of the array.
-    ///   - `bytes`: Complete physical storage, including any layout holes or tile padding.
+    /// Creates a new [`Array`] with the provided [`ArrayType`] and backed by the provided complete physical storage.
+    /// The provided storage (i.e., `bytes`) must have the exact [`Layout`](crate::Layout)-derived byte count, must
+    /// contain a valid encoding for every logical element of the array, and must contain zero in every layout "hole"
+    /// or padding byte. Dynamically shaped types are rejected because they cannot describe materialized storage.
+    #[inline]
     pub fn new(r#type: ArrayType, bytes: Vec<u8>) -> Result<Self, ProgramError> {
         validate_storage_bytes(&r#type, &bytes)?;
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates an array from its staged array type and shared physical storage without revalidating either. The
     /// caller guarantees what [`Array::new`] would otherwise check: `bytes` has the exact layout-derived byte count

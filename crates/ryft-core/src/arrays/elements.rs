@@ -2564,21 +2564,24 @@ pub fn encode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
         .into());
     }
 
-    // Validate the portable element encodings before their logical boundaries are obscured by physical placement.
     let element_byte_width = addressing.element_byte_width();
-    validate_logical_bytes(r#type.data_type(), element_byte_width, bytes)?;
-    if addressing.is_dense_row_major() {
+    let storage = if addressing.is_dense_row_major() {
         // Logical and physical order coincide, and dense storage contains no holes or padding to initialize.
-        return Ok(bytes.to_vec());
-    }
+        bytes.to_vec()
+    } else {
+        // Zero initialization establishes all unoccupied storage bytes before logical elements are scattered in place.
+        let mut storage = vec![0; addressing.storage_byte_len()];
+        for element in 0..addressing.element_count() {
+            let logical_start = element * element_byte_width;
+            let logical_range = logical_start..logical_start + element_byte_width;
+            storage[addressing.byte_range_for_flat_index(element)].copy_from_slice(&bytes[logical_range]);
+        }
+        storage
+    };
 
-    // Zero initialization establishes all unoccupied storage bytes before logical elements are scattered into place.
-    let mut storage = vec![0; addressing.storage_byte_len()];
-    for element in 0..addressing.element_count() {
-        let logical_start = element * element_byte_width;
-        let logical_range = logical_start..logical_start + element_byte_width;
-        storage[addressing.byte_range_for_flat_index(element)].copy_from_slice(&bytes[logical_range]);
-    }
+    // The scattered storage has the layout's length and zero holes by construction, so validating it checks exactly the
+    // portable element encodings, reported by logical element index.
+    addressing.validate_storage_bytes(&storage)?;
     Ok(storage)
 }
 
@@ -2602,7 +2605,7 @@ pub fn decode_elements<T: ArrayElement>(r#type: &ArrayType, bytes: &[u8]) -> Res
     let addressing = ArrayAddressing::new(r#type.clone())?;
 
     // Validation makes every subsequent codec call infallible and rejects nonzero holes or tile padding.
-    validate_storage_bytes_with_addressing(&addressing, bytes)?;
+    addressing.validate_storage_bytes(bytes)?;
     debug_assert_eq!(T::BYTE_COUNT, addressing.element_byte_width());
     if addressing.is_dense_row_major() {
         // Dense storage can be decoded sequentially without consulting the addressing descriptor per element.
@@ -2628,7 +2631,7 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 
     // Validate before dropping physical-layout information so malformed element encodings and nonzero padding cannot
     // be hidden by the logical projection.
-    validate_storage_bytes_with_addressing(&addressing, bytes)?;
+    addressing.validate_storage_bytes(bytes)?;
     if addressing.is_dense_row_major() {
         // Dense physical storage is already the requested contiguous logical representation.
         return Ok(bytes.to_vec());
@@ -2643,9 +2646,8 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
     Ok(logical_bytes)
 }
 
-/// Validates that `bytes` is a complete physical storage buffer for `r#type`. Validation covers the layout-derived
-/// storage length, every logical element encoding, and the requirement that layout holes and tile padding contain
-/// zero.
+/// Validates that `bytes` is a complete physical storage buffer for `r#type`. Refer to the documentation of
+/// [`ArrayAddressing::validate_storage_bytes`] for more information.
 ///
 /// # Parameters
 ///
@@ -2654,58 +2656,13 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
 ///   - `bytes`: Physical storage bytes, including any holes or tile padding required by `r#type`.
 #[inline]
 pub fn validate_storage_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<(), ProgramError> {
-    let addressing = ArrayAddressing::new(r#type.clone())?;
-    validate_storage_bytes_with_addressing(&addressing, bytes)
-}
-
-/// Validates the storage length, every logical element encoding, and that layout holes and tile padding contain only
-/// zero bytes, using the provided [`ArrayAddressing`].
-fn validate_storage_bytes_with_addressing(addressing: &ArrayAddressing, bytes: &[u8]) -> Result<(), ProgramError> {
-    if bytes.len() != addressing.storage_byte_len() {
-        return Err(TypeError::invalid(format!(
-            "array type {} requires {} physical storage bytes but got {}",
-            addressing.r#type(),
-            addressing.storage_byte_len(),
-            bytes.len(),
-        ))
-        .into());
-    }
-
-    if addressing.is_dense_row_major() {
-        return validate_logical_bytes(addressing.r#type().data_type(), addressing.element_byte_width(), bytes);
-    }
-
-    let mut logical_nonzero_byte_count = 0usize;
-    for element in 0..addressing.element_count() {
-        let element_bytes = &bytes[addressing.byte_range_for_flat_index(element)];
-        validate_element_bytes(addressing.r#type().data_type(), element, element_bytes)?;
-        logical_nonzero_byte_count += element_bytes.iter().filter(|byte| **byte != 0).count();
-    }
-
-    // Validated layouts have disjoint element ranges. Any nonzero byte not counted inside those ranges must therefore
-    // belong to a layout hole or tile padding.
-    if bytes.iter().filter(|byte| **byte != 0).count() != logical_nonzero_byte_count {
-        return Err(TypeError::invalid("array layout holes and tile padding must contain zero bytes").into());
-    }
-
-    Ok(())
-}
-
-/// Validates contiguous logical element encodings.
-fn validate_logical_bytes(data_type: DataType, element_byte_width: usize, bytes: &[u8]) -> Result<(), ProgramError> {
-    if element_byte_width == 0 {
-        return Ok(());
-    }
-    for (element, bytes) in bytes.chunks_exact(element_byte_width).enumerate() {
-        validate_element_bytes(data_type, element, bytes)?;
-    }
-    Ok(())
+    ArrayAddressing::new(r#type.clone())?.validate_storage_bytes(bytes)
 }
 
 /// Validates one element's data-type-specific bit representation. Sub-byte integer encodings are two's complement in
 /// the low bits of one storage byte, matching the [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`] element types in
 /// this module, so all of their higher bits must be zero.
-fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> Result<(), ProgramError> {
+pub(crate) fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> Result<(), ProgramError> {
     let valid = match data_type {
         DataType::Boolean => matches!(bytes, [0 | 1]),
         DataType::I1 | DataType::U1 => bytes[0] & !0b1 == 0,

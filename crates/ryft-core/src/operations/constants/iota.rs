@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrBatchingPolicy, ArrayIrType, ArrayType,
-    dispatch_on_array_element_type,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType,
+    ArrayOperation, ArrayType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -151,6 +151,26 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
     |context, output_type, operation| context.iota(&output_type, operation.dimension()),
 );
 
+impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: IotaOperation<ArrayType>) -> Self {
+        // Prefer the homogeneous member encoding for static iotas and the mixed dimension-operand encoding for dynamic
+        // output types. Explicit mixed static constructors remain valid, but canonical lifts normalize them to the
+        // homogeneous form.
+        if operation
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        {
+            Self::DynamicIota(operation)
+        } else {
+            Self::Array(ArrayOperation::Iota(operation))
+        }
+    }
+}
+
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for
 /// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](crate::Zero), [`One`](super::One), and
@@ -276,17 +296,19 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>>
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape, u4,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, u4,
     };
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
     use crate::tracing::TracingContext;
 
@@ -346,6 +368,53 @@ mod tests {
             Err(TypeError::invalid(format!(
                 "`iota` cannot construct type f64[extent] without operands because it references identity {variable}",
             ))),
+        );
+    }
+
+    #[test]
+    fn test_iota_type_inference_dynamic_identity_instantiation() {
+        let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
+        let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let output = builder
+            .add_instruction(
+                IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(formal)])), 0)
+                    .unwrap(),
+                Vec::new(),
+                vec![extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let caller_input = ArrayIrType::Dimension(DimensionType::new(caller.clone()));
+        let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
+        let [instruction] = instantiated.instructions() else {
+            panic!("expected one instantiated instruction");
+        };
+        let ArrayIrOperation::DynamicIota(instantiated_iota) = instruction.operation() else {
+            panic!("expected the instantiated operation to remain a dynamic iota");
+        };
+        assert_eq!(
+            instantiated_iota.r#type(),
+            &ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(caller.clone())])),
+        );
+        assert_eq!(
+            instantiated
+                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
+                    &[0i32, 1, 2],
+                )
+                .unwrap(),
+            )]),
         );
     }
 
@@ -412,6 +481,36 @@ mod tests {
                  `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
             ))),
         );
+
+        // Iota materializes coordinates along the requested dimension in the declared element data type.
+        assert_eq!(
+            context.iota(&ArrayType::new_static(DataType::I32, [2, 3]), 1).unwrap().elements::<i32>(),
+            Ok(vec![0, 1, 2, 0, 1, 2]),
+        );
+        assert_eq!(context.iota(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
+        assert_eq!(
+            context
+                .iota(&ArrayType::new_static(DataType::C64, [3]), 0)
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
+            Ok(vec![ComplexNumber::new(0.0, 0.0), ComplexNumber::new(1.0, 0.0), ComplexNumber::new(2.0, 0.0),]),
+        );
+
+        // Kernels that materialize a payload from a type reject dynamically sized types. `zero` and `one` share the
+        // storage-level rejection raised by `ArrayAddressing::new`, while `iota` names the array-program route that
+        // admits dynamic extents.
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
+        assert_eq!(
+            context.iota(&dynamic_type, 1).unwrap_err().to_string(),
+            "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
+             `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
+        );
     }
 
     #[test]
@@ -446,6 +545,46 @@ mod tests {
     }
 
     #[test]
+    fn test_iota_differentiation_dynamic() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(extent_type.clone().into());
+        let output = builder
+            .add_instruction(
+                IotaOperation::new(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())])),
+                    0,
+                )
+                .unwrap(),
+                Vec::new(),
+                vec![extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let jvp = program.jvp().unwrap();
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap());
+        assert_eq!(
+            jvp.interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 2.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])),
+            ]),
+        );
+        assert_eq!(jvp.instructions().len(), 2);
+        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::DynamicIota(_)));
+        assert!(matches!(jvp.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
+        assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
+    }
+
+    #[test]
     fn test_iota_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::new_static(DataType::F64, [2]));
@@ -460,6 +599,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input_cotangents, ());
+    }
+
+    #[test]
+    fn test_iota_transposition_dynamic() {
+        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
+        // extent receives a structural zero cotangent regardless of the output cotangent being live.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let operation = ArrayIrOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap());
+        let mut context =
+            TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let output_cotangent = context.input(output_type.clone().into());
+        let inputs = [PartialValue::Unknown(extent_type.clone().into())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators)
+            .unwrap();
+        let cotangents = context.take_cotangents(&accumulators).unwrap();
+        let [cotangent] = cotangents.as_slice() else {
+            panic!("expected one cotangent per operation input");
+        };
+        assert!(matches!(cotangent, MaybeZero::Zero(_)));
     }
 
     #[test]

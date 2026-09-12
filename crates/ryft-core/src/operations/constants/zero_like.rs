@@ -1,7 +1,10 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayElement, ArrayType, DataType, dispatch_on_array_element_type};
+use crate::arrays::{
+    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
+    dispatch_on_array_element_type,
+};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -83,6 +86,18 @@ impl<C: Context<Operation: From<ZeroLikeOperation<C::Type>>>> PartiallyEvaluatab
 }
 
 impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
+
+impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(_: ZeroLikeOperation<ArrayIrType>) -> Self {
+        // A `zero_like` reads its complete output type, including every runtime extent, from its exemplar operand, so
+        // the composite family needs no mixed encoding for it: the homogeneous member constructor already expresses
+        // the dynamic case. This conversion exists so that type-generic transform drivers can name the exemplar-based
+        // zero in the composite universe with a plain `From<ZeroLikeOperation<C::Type>>` bound. A first-class dimension
+        // exemplar is rejected by member type inference, which is correct because a dimension has no zero.
+        Self::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new()))
+    }
+}
 
 /// Represents the ability to synthesize a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart
 /// to [`Zero`](super::Zero). It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
