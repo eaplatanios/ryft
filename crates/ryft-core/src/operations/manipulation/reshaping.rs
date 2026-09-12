@@ -91,7 +91,7 @@ impl DynamicReshapeOperation {
     fn has_identity_dimensions(&self, rank: usize) -> bool {
         self.dimensions
             .as_ref()
-            .is_none_or(|dimensions| dimensions.len() == rank && dimensions.iter().copied().eq(0..rank))
+            .is_none_or(|dimensions| dimensions.normalize(rank).is_ok_and(|axes| axes.into_iter().eq(0..rank)))
     }
 }
 
@@ -132,7 +132,10 @@ impl Operation for DynamicReshapeOperation {
         }
         OperationFormatter::new(formatter, indentation, RESHAPE_OPERATION_NAME)?.bracketed(|operation| {
             if let Some(dimensions) = &self.dimensions {
-                operation.field("dimensions", format_args!("{:?}", dimensions.as_slice()))?;
+                operation.field(
+                    "dimensions",
+                    format_args!("{:?}", dimensions.iter().map(|axis| axis.value()).collect::<Vec<_>>()),
+                )?;
             }
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
@@ -257,7 +260,12 @@ where
         if let Some(dimensions) = self.dimensions() {
             let mut lifted_dimensions = Vec::with_capacity(dimensions.len() + 1);
             lifted_dimensions.push(0);
-            lifted_dimensions.extend(dimensions.iter().map(|dimension| dimension + 1));
+            lifted_dimensions.extend(
+                dimensions
+                    .normalize(<&ArrayType>::try_from(&input.unbatched_type())?.rank())?
+                    .into_iter()
+                    .map(|dimension| dimension + 1),
+            );
             operation = operation.with_dimensions(lifted_dimensions);
         }
         if let Some(output_sharding) = self.output_sharding() {
@@ -339,7 +347,7 @@ where
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
                     let input_shape = residuals.retain_shape(context, array.primal())?;
                     let permuted_input_shape = match self.dimensions() {
-                        Some(dimensions) => input_shape.transposed(dimensions),
+                        Some(dimensions) => input_shape.transposed(dimensions)?,
                         None => input_shape,
                     };
 
@@ -548,7 +556,7 @@ impl ReshapeParameters {
     fn has_identity_dimensions(&self, rank: usize) -> bool {
         self.dimensions
             .as_ref()
-            .is_none_or(|dimensions| dimensions.len() == rank && dimensions.iter().copied().eq(0..rank))
+            .is_none_or(|dimensions| dimensions.normalize(rank).is_ok_and(|axes| axes.into_iter().eq(0..rank)))
     }
 }
 
@@ -633,7 +641,10 @@ impl Operation for ReshapeOperation {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("shape", self.parameters.output_shape())?;
             if let Some(dimensions) = self.parameters.dimensions() {
-                operation.field("dimensions", format_args!("{:?}", dimensions.as_slice()))?;
+                operation.field(
+                    "dimensions",
+                    format_args!("{:?}", dimensions.iter().map(|axis| axis.value()).collect::<Vec<_>>()),
+                )?;
             }
             if let Some(output_sharding) = self.parameters.output_sharding() {
                 operation.field("output_sharding", output_sharding)?;
@@ -691,7 +702,9 @@ where
         if let Some(dimensions) = self.parameters.dimensions() {
             let mut lifted_dimensions = Vec::with_capacity(dimensions.len() + 1);
             lifted_dimensions.push(0);
-            lifted_dimensions.extend(dimensions.iter().map(|dimension| dimension + 1));
+            lifted_dimensions.extend(
+                dimensions.normalize(inputs[0].unbatched_type().rank())?.into_iter().map(|dimension| dimension + 1),
+            );
             lifted_parameters = lifted_parameters.with_dimensions(lifted_dimensions);
         }
         if let Some(output_sharding) = self.parameters.output_sharding() {
@@ -1413,13 +1426,13 @@ mod tests {
 
         // The optional dimensions permutation is applied before the row-major reshape.
         assert_eq!(
-            input.reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),),
+            input.reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([-1, -2]),),
             Err(ProgramError::Type(TypeError::invalid("permutation has length 2 but input has rank 1".to_string()))),
         );
         assert_eq!(
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap()
-                .reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),)
+                .reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([-1, -2]),)
                 .map(|array| array.to_f64s()),
             Ok(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
         );

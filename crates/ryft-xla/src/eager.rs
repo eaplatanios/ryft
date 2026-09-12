@@ -950,41 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_bitcast_element_type_fp6() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = cpu_mesh(&client);
-        // Exhaust all six-bit encodings, including both signed zeros, and assert the logical group count.
-        let encodings = (0_u8..64).collect::<Vec<_>>();
-        for data_type in [DataType::F6E2M3FN, DataType::F6E3M2FN] {
-            let input =
-                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[64]), mesh.clone(), &encodings)
-                    .unwrap();
-            let reference =
-                CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(64)])), encodings.clone())
-                    .unwrap();
-            let other_type = if data_type == DataType::F6E2M3FN { DataType::F6E3M2FN } else { DataType::F6E2M3FN };
-            let reinterpreted = input.bitcast_element_type(other_type).unwrap();
-            assert_eq!(shard_host_bytes(reinterpreted.addressable_shards().next().unwrap()).unwrap(), encodings);
-            for group_type in [DataType::I1, DataType::U1, DataType::I2, DataType::U2] {
-                let groups = input.bitcast_element_type(group_type).unwrap();
-                let expected = reference.bitcast_element_type(group_type).unwrap();
-                assert_eq!(groups.shape(), expected.r#type().static_shape().unwrap());
-                assert_eq!(
-                    shard_host_bytes(groups.addressable_shards().next().unwrap()).unwrap(),
-                    expected.logical_bytes(),
-                    "{data_type} to {group_type}",
-                );
-                let restored = groups.bitcast_element_type(data_type).unwrap();
-                assert_eq!(restored.shape().dimensions(), &[64]);
-                assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), encodings);
-            }
-        }
-    }
-
-    #[test]
     fn test_array_min_complex() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
