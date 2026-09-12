@@ -28,7 +28,7 @@ pub const CONVERT_ELEMENT_TYPE_OPERATION_NAME: &str = "convert_element_type";
 /// Numerical conversion preserves shape, sharding, and memory space. Bit reinterpretation can add or consume a trailing
 /// axis to conserve the number of encoding bits. Refer to [`ConvertElementType`] for value semantics and
 /// [`ElementType`] for metadata rules. Type inference rejects token conversions. Structural zeros permit only numerical
-/// identity conversion; value-dependent representability is checked when numerical conversion executes.
+/// identity conversion. Numerical conversion uses the destination format's explicit saturation and NaN rules.
 ///
 /// The `T` parameter fixes the type universe, so each payload instantiation implements one [`Operation`] contract.
 /// Array batching preserves the mapped position except when widening bits would consume it. Numerical differentiation
@@ -51,7 +51,7 @@ pub struct ConvertElementTypeOperation<T: ElementType> {
 }
 
 impl<T: ElementType> ConvertElementTypeOperation<T> {
-    /// Creates a conversion to `data_type`. The source element type comes from the operand, and validation takes place
+    /// Creates a conversion to `data_type`. The source element type comes from the input, and validation takes place
     /// during type inference and execution. Refer to [`ConvertElementType`] for the conversion contract.
     ///
     /// # Parameters
@@ -400,12 +400,10 @@ impl ElementType for ArrayType {
 /// destination bit widths differ. [`Self::promote_element_type`] additionally checks that the requested conversion is
 /// permitted by the type promotion lattice.
 ///
-/// For the reference [`Array`](crate::arrays::Array) backend,
-/// [`ArrayElement::convert_to`](crate::arrays::ArrayElement::convert_to) defines per-element rounding, truncation,
-/// saturation, and representability checks. Conversion can fail for values unsupported by the destination format.
-/// [`Array::converted_to`](crate::arrays::Array::converted_to) documents the handling of same-type conversions, tokens,
-/// and structural zeros. Type inference rejects token conversions and numerical conversions between structural zero
-/// and materialized element types; value-dependent conversion checks happen during execution.
+/// For the reference [`Array`] backend, [`ArrayElement::convert_to`](crate::ArrayElement::convert_to) defines
+/// per-element rounding, truncation, saturation, and exceptional-value handling. [`Array::converted_to`] documents
+/// the handling of same-type conversions, tokens, and structural zeros. Type inference rejects token conversions and
+/// numerical conversions between structural zero and materialized element types.
 ///
 /// [`ConvertElementType`] fills the same role for [`ConvertElementTypeOperation`] that [`std::ops::Add`] and
 /// [`std::ops::Neg`] fill for their corresponding arithmetic operations. Traced values bind that operation in their
@@ -430,8 +428,12 @@ impl ElementType for ArrayType {
 pub trait ConvertElementType: Sized {
     /// Converts each element to `data_type`, following [`ElementType::with_element_type`] for layout and placement
     /// metadata. Narrowing and conversions between numerical categories are allowed, subject to the backend's element
-    /// conversion rules. The input is unchanged; the result carries the requested element type. Unsupported conversions
-    /// return a [`ProgramError`].
+    /// conversion rules. Real-to-integer conversion truncates toward zero and saturates in the destination range.
+    /// Integer-to-integer narrowing retains the low bits. Complex-to-Boolean conversion tests both components for
+    /// nonzero, while other noncomplex destinations discard the imaginary component. Finite-only microscaling formats
+    /// map NaN to positive maximum finite and saturate infinities. [`f8e8m0fnu`](crate::f8e8m0fnu) maps zero to NaN.
+    /// The input is unchanged and the result carries the requested element type. Unsupported conversions return a
+    /// [`ProgramError`].
     ///
     /// # Parameters
     ///
@@ -448,7 +450,9 @@ pub trait ConvertElementType: Sized {
     /// Widening requires the consumed axis to be replicated when sharding is specified; partitioned or unconstrained
     /// trailing axes must be resharded first so all pieces of each output element are available on the same device.
     /// Boolean and complex elements support only identity reinterpretation. Tokens and structural zeros are rejected.
-    /// Reinterpretation has a zero derivative, including when source and destination element types are equal.
+    /// Reinterpretation has a zero derivative, including when source and destination element types are equal. In the
+    /// Ryft XLA backend, XLA lowering supports equal-width casts without finite dimension bounds. Rank-changing casts
+    /// require finite bounds for physical allocation but this does not restrict core eager or symbolic type inference.
     ///
     /// # Parameters
     ///
@@ -467,8 +471,8 @@ pub trait ConvertElementType: Sized {
 
     /// Converts each element to `data_type` after checking [`DataType::promote_to`]. A conversion outside the promotion
     /// lattice returns a [`TypeError`] before any conversion is dispatched; an accepted conversion delegates to
-    /// [`ConvertElementType::convert_element_type`] and can still fail its value-dependent checks. Promotion follows
-    /// the lattice's numerical-category rules and does not guarantee exact representation of every source value.
+    /// [`ConvertElementType::convert_element_type`]. Promotion follows the lattice's numerical-category rules and does
+    /// not guarantee exact representation of every source value.
     ///
     /// # Parameters
     ///
@@ -499,14 +503,18 @@ impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<Convert
         if input_type.element_type() == data_type {
             return Ok(self.clone());
         }
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 
     #[inline]
     fn bitcast_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         // Even an identity bitcast must be staged: its declared derivative is zero rather than the identity.
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, true);
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -557,8 +565,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayElement, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, f8e4m3fn,
-        f8e5m2, f8e8m0fnu, i4, u2, u4,
+        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16,
+        f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -889,6 +897,24 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_interpretation_bitcast_subbyte() {
+        // FP6 occupies padded host bytes, but only its six meaningful bits participate in reinterpretation.
+        let encodings = (0_u8..64).collect::<Vec<_>>();
+        for data_type in [DataType::F6E2M3FN, DataType::F6E3M2FN] {
+            let input = Array::from_logical_bytes(ArrayType::new_static(data_type, [64]), &encodings).unwrap();
+            for (pieces_type, width) in [(DataType::U1, 1), (DataType::U2, 2)] {
+                let pieces = input.bitcast_element_type(pieces_type).unwrap();
+                let expected = encodings
+                    .iter()
+                    .flat_map(|encoding| {
+                        (0..6 / width).map(move |index| (encoding >> (width * index)) & ((1 << width) - 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(pieces.r#type().as_ref(), &ArrayType::new_static(pieces_type, [64, 6 / width]));
+                assert_eq!(pieces.logical_bytes(), expected);
+                assert_eq!(pieces.bitcast_element_type(data_type), Ok(input.clone()));
+            }
+        }
+
         let pieces = Array::scalar(0xab_u8).unwrap().bitcast_element_type(DataType::U4).unwrap();
         assert_eq!(pieces.elements::<u4>().unwrap(), vec![u4::new(11).unwrap(), u4::new(10).unwrap()]);
         assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xab_u8).unwrap()));
@@ -1442,6 +1468,9 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_integer_and_boolean() {
         // Representative values pin Boolean truth, integer truncation and sub-byte modular narrowing.
+        let boundary = Array::vector(vec![20.0, -20.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN]).unwrap();
+        assert_eq!(boundary.convert_element_type(DataType::I4).unwrap().to_f64s(), vec![7.0, -8.0, 7.0, -8.0, 0.0]);
+        assert_eq!(boundary.convert_element_type(DataType::U4).unwrap().to_f64s(), vec![15.0, 0.0, 15.0, 0.0, 0.0]);
         let vector = Array::vector(vec![0.0, 1.5]).unwrap();
         assert_eq!(vector.convert_element_type(DataType::Boolean).unwrap(), Array::vector(vec![false, true]).unwrap());
         assert_eq!(vector.convert_element_type(DataType::I32).unwrap(), Array::vector(vec![0i32, 1]).unwrap());
@@ -1479,9 +1508,14 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_low_precision() {
+        // Preserve low integer bits when rounding across a BF16 midpoint.
+        let value = (1_u64 << 60) + (1_u64 << 52) + 1;
+        let rounded = Array::scalar(value).unwrap().convert_element_type(DataType::BF16).unwrap();
+        assert_eq!(rounded.elements::<bf16>().unwrap()[0].to_bits(), 0x5d81);
+
+        // Conversions into low-precision floating-point element types produce exact encodings,
+        // including their format-specific exceptional values.
         let vector = Array::vector(vec![0.0, 1.5]).unwrap();
-        // Conversions into low-precision floating-point element types produce exact encodings, including their
-        // format-specific fallible cases.
         let low_precision = vector.convert_element_type(DataType::F8E5M2).unwrap();
         assert_eq!(low_precision.elements::<f8e5m2>().unwrap()[1].to_bits(), 0x3e);
         assert_eq!(
@@ -1494,11 +1528,16 @@ mod tests {
                 .to_bits(),
             0x7f,
         );
-        assert!(matches!(
-            Array::scalar(0.0f64).unwrap().convert_element_type(DataType::F8E8M0FNU),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type `f8e8m0fnu` cannot represent zero",
-        ));
+        assert_eq!(
+            Array::scalar(0.0f64)
+                .unwrap()
+                .convert_element_type(DataType::F8E8M0FNU)
+                .unwrap()
+                .elements::<f8e8m0fnu>()
+                .unwrap()[0]
+                .to_bits(),
+            0xff,
+        );
     }
 
     #[test]
