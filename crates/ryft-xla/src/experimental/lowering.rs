@@ -100,6 +100,10 @@ pub(crate) enum LoweringError {
     #[error("reshape dimension {value} cannot be represented as a StableHLO i{bit_width} shape value")]
     ReshapeDimensionOutOfRange { value: usize, bit_width: u8 },
 
+    /// Error returned when a dynamic allocation bound exceeds StableHLO's signed runtime size carrier.
+    #[error("dynamic dimension bound {value} cannot be represented as a StableHLO i32 size value")]
+    DynamicDimensionOutOfRange { value: usize },
+
     /// Error returned when a pad interior amount cannot be represented by StableHLO's signed attribute type.
     #[error("pad interior padding {value} cannot be represented as a StableHLO i64 attribute")]
     PadInteriorPaddingOutOfRange { value: usize },
@@ -2684,13 +2688,15 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
     Ok(vec![annotate_output_memory(values[0], &output_types[0], block, context, location)?])
 }
 
-fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+/// Lowers a zero or one with its exemplar's runtime geometry.
+fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     integer_value: i64,
-    block: &mut B,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
-    location: L,
+    location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if input_values.len() != 1 {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
@@ -2712,7 +2718,34 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
         }
         _ => {}
     }
-    lower_constant_output(output_types, integer_value, block, context, location)
+    let output_type = &output_types[0];
+    let result = if output_type.static_shape().is_some() {
+        lower_constant_output(output_types, integer_value, block, context, location)?
+    } else {
+        // Allocation uses the declared bounds; logical sizes come from the exemplar, including zero extents.
+        let mut dimensions = Vec::new();
+        for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Dynamic(_)) {
+                let size = block.append_operation(stable_hlo::get_dimension_size(input_values[0], axis, location)?)?;
+                dimensions.push(size.result(0).unwrap().as_ref());
+            }
+        }
+        let name = if integer_value == 0 { "zero_like" } else { "one_like" };
+        composite::lower_dynamic_constructor(
+            name,
+            integer_value,
+            &dimensions,
+            &[output_type.clone().into()],
+            block,
+            context,
+            location,
+        )?
+    };
+    if let Some(sharding) = output_type.sharding() {
+        lower_sharding_constraint(&result, sharding, bound_manual_axes, block, location)
+    } else {
+        Ok(result)
+    }
 }
 
 /// Returns the XLA buffer-placement kind string for `memory`, as consumed by the `_xla_buffer_placement` frontend
@@ -4091,6 +4124,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 input_values,
                 output_types,
                 0,
+                &lowerer.collective_state.bound_manual_axes,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -4099,6 +4133,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 input_values,
                 output_types,
                 1,
+                &lowerer.collective_state.bound_manual_axes,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -10210,32 +10245,35 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-
-    use ryft_mlir::ElementsAttribute;
-    use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
-
     use ryft_core::operations::attention::{
         AttentionConfiguration, AttentionImplementation, AttentionOperandSignature,
     };
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
-        AndOperation, Array as CpuArray, ArrayBatch, ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation,
-        BatchingContext, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
-        ConstantOperation, Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
-        CumulativeProductOperation, CumulativeSumOperation, Differentiate, Dimension, DimensionAddOperation,
-        DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation,
-        Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        EagerContext, EmptyRegionDriver, Fill, LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike,
-        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, Provenance,
-        ProvenanceScope, RaggedDot, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation,
-        SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, Trace,
-        TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
-        ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        AndOperation, Array as CpuArray, ArrayBatch, ArrayIrOperation, ArrayOperation, Atan2Operation, BatchAxis,
+        BatchableOperation, BatchingContext, BroadcastOperation, CompareOperation, ConcatenateOperation,
+        ConditionOperation, ConstantOperation, Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation,
+        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, Differentiate, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
+        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, IotaOperation, LogSumExpOperation,
+        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
+        Placeholder, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation, ReshapeOperation,
+        ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
+        SliceOperation, StagingContext, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation,
+        WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
+    use ryft_mlir::ElementsAttribute;
+    use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
+    use ryft_pjrt::{
+        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+        load_cpu_plugin,
+    };
+    use std::sync::Arc;
 
     use crate::ToPjrt;
     use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
-    use crate::tests::values_to_bytes;
+    use crate::tests::{values_from_bytes, values_to_bytes};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
 
@@ -12350,11 +12388,13 @@ mod tests {
                       %5 = stablehlo.sine %4 : tensor<4x4xf32>
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
                       %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %7 = stablehlo.multiply %5, %6 : tensor<4x4xf32>
+                      %7 = sdy.sharding_constraint %6 <@mesh, [{}, {}]> : tensor<4x4xf32>
+                      %8 = stablehlo.multiply %5, %7 : tensor<4x4xf32>
                       %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                      %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %9 = stablehlo.add %7, %8 : tensor<4x4xf32>
-                      sdy.return %9 : tensor<4x4xf32>
+                      %9 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %10 = sdy.sharding_constraint %9 <@mesh, [{}, {}]> : tensor<4x4xf32>
+                      %11 = stablehlo.add %8, %10 : tensor<4x4xf32>
+                      sdy.return %11 : tensor<4x4xf32>
                     } : (tensor<4x4xf32>) -> tensor<8x4xf32>
                     return %0 : tensor<8x4xf32>
                   }
@@ -14813,7 +14853,9 @@ mod tests {
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let one = builder
+                .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
+                .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
@@ -14884,7 +14926,9 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let carried_extent = builder.add_input(extent_type.into());
             let state = builder.add_input(state_type.clone().into());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let one = builder
+                .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
+                .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![carried_extent, next],
@@ -17589,7 +17633,9 @@ mod tests {
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let one = builder
+                .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
+                .unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
@@ -18435,6 +18481,273 @@ mod tests {
         assert!(stablehlo.contains("func.func @main() -> tensor<3xi1>"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.constant dense<false> : tensor<i1>"), "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.broadcast_in_dim"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_lower_dynamic_constructor_singleton_dimension() {
+        let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let dimension =
+            builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap()));
+        let zero = builder
+            .add_instruction(
+                ArrayIrOperation::<XlaArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let one = builder
+            .add_instruction(
+                ArrayIrOperation::<XlaArrayConstant>::One(OneOperation::new(output_type.clone())),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let iota = builder
+            .add_instruction(
+                ArrayIrOperation::<XlaArrayConstant>::Iota(IotaOperation::new(output_type, 0).unwrap()),
+                Vec::new(),
+                vec![dimension],
+                None,
+            )
+            .unwrap()[0];
+        let one_like = builder
+            .add_instruction(OneLikeOperation::<ArrayIrType>::new(), Vec::new(), vec![zero], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![zero, one, iota, one_like],
+                Vec::new(),
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let static_type = ArrayType::new_static(DataType::F32, [3]);
+        assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone()); 4]);
+        let input_types: [ArrayType; 0] = [];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &vec![static_type; 4], "main", None, None).unwrap();
+        // The stored constructors retain their dimension input, but singleton results need no runtime refinement.
+        assert_eq!(module.matches("stablehlo.broadcast_in_dim").count(), 3, "{module}");
+        assert_eq!(module.matches("stablehlo.iota").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 0, "{module}");
+    }
+
+    #[test]
+    fn test_lower_like_constant_dynamic_geometry() {
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(5))]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![zero, one],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?xf32, #stablehlo.bounds<4>>) -> (tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>) {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %2 = stablehlo.convert %0 : tensor<i32>
+                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %cst_0 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %5 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %6 = stablehlo.convert %4 : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %5, %6, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    return %3, %7 : tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_like_constant_dynamic_metadata() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new(DataType::C128, Shape::new(vec![dynamic_dimension("size", Some(5))]))
+            .with_memory(Memory::Host { pinned: true })
+            .with_layout(Some(TiledLayout::new(vec![0], Vec::new()).into()))
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![zero, one],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        assert_eq!(program.output_types(), vec![input_type.clone(), input_type]);
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 2, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 2, "{module}");
+        assert_eq!(module.matches("_xla_buffer_placement = \"pinned_host\"").count(), 2, "{module}");
+        assert_eq!(module.matches("sdy.sharding_constraint").count(), 2, "{module}");
+    }
+
+    #[test]
+    fn test_lower_like_constant_dynamic_geometry_requires_supported_bound() {
+        for (operation, name) in [
+            (ArrayOperation::ZeroLike(ZeroLikeOperation::new()), "zero_like"),
+            (ArrayOperation::OneLike(OneLikeOperation::new()), "one_like"),
+        ] {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type);
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                to_mlir_module_for_plain_program(&program, "main"),
+                Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "{name} output dimension `size` needs a finite upper bound for physical buffer allocation"
+                    ),
+                }),
+            );
+        }
+
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", Some(i32::MAX as usize + 2))]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::DynamicDimensionOutOfRange { value: i32::MAX as usize + 1 }),
+        );
+    }
+
+    #[test]
+    fn test_lower_like_constant_executes_dynamic_geometry() {
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![zero, one],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "like_dynamic").unwrap();
+        // The wrapper supplies an input extent at execution time. Its static physical boundary avoids CPU PJRT's
+        // unsupported dynamic buffer boundary; one compiled executable handles both size two and size zero.
+        let module = format!(
+            "{}{}",
+            module
+                .strip_suffix("}\n")
+                .unwrap()
+                .replace("func.func @like_dynamic", "func.func private @like_dynamic"),
+            indoc! {r#"
+              func.func @main(%arg0: tensor<4xcomplex<f32>>, %arg1: tensor<i32>) -> (tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>, tensor<i32>, tensor<i32>) {
+                %input = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
+                %zero, %one = func.call @like_dynamic(%input) : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<?xcomplex<f32>, #stablehlo.bounds<4>>)
+                %zero_size = stablehlo.get_dimension_size %zero, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> tensor<i32>
+                %one_size = stablehlo.get_dimension_size %one, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> tensor<i32>
+                %bound = stablehlo.constant dense<4> : tensor<i32>
+                %zero_storage = stablehlo.set_dimension_size %zero, %bound, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f32>>
+                %one_storage = stablehlo.set_dimension_size %one, %bound, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f32>>
+                return %zero_storage, %one_storage, %zero_size, %one_size : tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>, tensor<i32>, tensor<i32>
+              }
+            }
+            "#},
+        );
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        for extent in [2_i32, 0] {
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&[3_f32, 1.0, 5.0, 2.0, 7.0, 3.0, 9.0, 4.0]).as_slice(),
+                                BufferType::C64,
+                                &[4],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&[extent]).as_slice(),
+                                BufferType::I32,
+                                &[],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let execution = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0);
+            let outputs = execution
+                .outputs
+                .iter()
+                .map(|output| output.copy_to_host(None).unwrap().r#await().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &values_from_bytes::<f32>(outputs[0].as_slice())[..2 * extent as usize],
+                vec![0.0; 2 * extent as usize]
+            );
+            assert_eq!(
+                &values_from_bytes::<f32>(outputs[1].as_slice())[..2 * extent as usize],
+                [1.0, 0.0].repeat(extent as usize)
+            );
+            assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![extent]);
+            assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
+        }
     }
 
     #[test]

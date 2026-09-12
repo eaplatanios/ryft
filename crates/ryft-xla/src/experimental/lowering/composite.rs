@@ -1,6 +1,10 @@
 //! StableHLO lowering for programs that mix arrays with first-class dimensions. The composite IR can also store
 //! references, but ordinary XLA lowering rejects any unresolved reference type or operation before entering these
 //! array/dimension lowering rules.
+//!
+//! Eager evaluation and staging allow unbounded dimensions. Executable zero, one, iota, and like constructors need
+//! finite allocation bounds. Their dynamic extents must fit signed 32-bit size carriers; a bound reserves storage,
+//! while the explicit dimension inputs or exemplar sizes determine the runtime shape.
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
@@ -203,16 +207,17 @@ fn dynamic_constructor_types(
         .iter()
         .map(|dimension| match dimension {
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => stable_hlo_dynamic_dimension_bound(dimension)
-                .map(Dimension::Static)
-                .ok_or_else(|| LoweringError::UnsupportedOp {
+            Dimension::Dynamic(variable) => {
+                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| LoweringError::UnsupportedOp {
                     op: format!(
-                        "{name} output dimension `{}` needs a finite upper bound for physical buffer allocation",
-                        variable,
+                        "{name} output dimension `{variable}` needs a finite upper bound for physical buffer allocation",
                     ),
-                }),
+                })?;
+                i32::try_from(bound).map_err(|_| LoweringError::DynamicDimensionOutOfRange { value: bound })?;
+                Ok(Dimension::Static(bound))
+            }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, LoweringError>>()?;
     let physical_type = output_type.clone().with_shape(Shape::new(physical_dimensions));
     Ok((output_type.clone(), physical_type))
 }
@@ -291,7 +296,7 @@ fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension operands.
-fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     name: &str,
     integer_value: i64,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -321,6 +326,21 @@ pub(super) fn lower_array_ir_operation<'b, 'c: 'b, 't: 'c, A>(
 where
     A: MlirLowerableValue,
 {
+    // Singleton-bound constructor inputs remain in the IR signature, but their axes are already static in
+    // the inferred result and no longer need runtime size refinement.
+    let constructor_inputs;
+    let input_values = if matches!(
+        operation,
+        ArrayIrOperation::Zero(_) | ArrayIrOperation::One(_) | ArrayIrOperation::Iota(_)
+    ) {
+        constructor_inputs = input_types.iter().zip(input_values).filter_map(|(r#type, value)| {
+            matches!(r#type, ArrayIrType::Dimension(dimension) if matches!(dimension.to_dimension(), Dimension::Dynamic(_)))
+                .then_some(*value)
+        }).collect::<Vec<_>>();
+        constructor_inputs.as_slice()
+    } else {
+        input_values
+    };
     match operation {
         ArrayIrOperation::Zero(operation) => {
             lower_dynamic_constructor(operation.name(), 0, input_values, output_types, block, context, location)
@@ -1176,6 +1196,34 @@ mod tests {
             panic!("expected an unsupported-operation error but received {error}");
         };
         op
+    }
+
+    #[test]
+    fn test_dynamic_constructor_types() {
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+        let output_type = ArrayType::new(DataType::C64, Shape::new(vec![size.into(), 2.into()]));
+        assert_eq!(
+            dynamic_constructor_types("one_like", 1, &[output_type.clone().into()]),
+            Ok((output_type, ArrayType::new_static(DataType::C64, [4, 2])))
+        );
+
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
+        assert_eq!(
+            dynamic_constructor_types("zero_like", 1, &[output_type.into()]),
+            Err(LoweringError::UnsupportedOp {
+                op: "zero_like output dimension `size` needs a finite upper bound for physical buffer allocation"
+                    .to_string()
+            })
+        );
+
+        let bound = i32::MAX as usize + 1;
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(bound + 1)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
+        assert_eq!(
+            dynamic_constructor_types("one_like", 1, &[output_type.into()]),
+            Err(LoweringError::DynamicDimensionOutOfRange { value: bound })
+        );
     }
 
     #[test]

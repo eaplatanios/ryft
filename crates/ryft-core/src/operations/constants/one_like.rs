@@ -1,13 +1,16 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayElement, ArrayType, DataType, dispatch_on_array_element_type};
+use crate::arrays::{
+    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+    dispatch_on_array_element_type,
+};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
 
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
@@ -80,6 +83,15 @@ impl<C: Context<Operation: From<OneLikeOperation<C::Type>>>> PartiallyEvaluatabl
 
 impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 
+impl<A: Value<Type = ArrayType>> From<OneLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(_: OneLikeOperation<ArrayIrType>) -> Self {
+        // The exemplar supplies the complete output geometry, including runtime extents, so the homogeneous member
+        // already represents dynamic arrays. Projecting that member also rejects dimension and reference inputs.
+        Self::Array(ArrayOperation::OneLike(OneLikeOperation::new()))
+    }
+}
+
 /// Represents the ability to synthesize a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart
 /// to [`One`](super::One). It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait OneLike: Sized {
@@ -102,6 +114,13 @@ impl OneLike for Array {
     }
 }
 
+impl<A: Value<Type = ArrayType> + OneLike> OneLike for ArrayIrValue<A> {
+    #[inline]
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        Ok(Self::Array(self.projected()?.one_like()?))
+    }
+}
+
 impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation<V::Type>>>>> OneLike for V {
     #[inline]
     fn one_like(&self) -> Result<Self, ProgramError> {
@@ -118,7 +137,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Shape, f8e8m0fnu,
+    };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
@@ -161,6 +183,19 @@ mod tests {
                 input_types = [ArrayType::new_static(DataType::F32, [2])],
                 output_types = [ArrayType::new_static(DataType::F32, [2])],
             }],
+        );
+    }
+
+    #[test]
+    fn test_one_like_type_inference_mixed() {
+        let operation = ArrayIrOperation::<Array>::from(OneLikeOperation::<ArrayIrType>::new());
+        assert!(matches!(operation, ArrayIrOperation::Array(ArrayOperation::OneLike(_))));
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        assert_eq!(operation.infer_output_types(&[r#type.clone().into()], &[]), Ok(vec![r#type.into()]));
+        assert_eq!(
+            operation.infer_output_types(&[DimensionType::new(size).into()], &[]),
+            Err(TypeError::invalid("expected array type but got dimension type")),
         );
     }
 
@@ -223,6 +258,22 @@ mod tests {
         assert_eq!(
             zero.one_like(),
             Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
+        );
+    }
+
+    #[test]
+    fn test_one_like_interpretation_mixed() {
+        let input = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+        );
+        let expected = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0f32, 1.0]).unwrap(),
+        );
+        assert_eq!(input.one_like(), Ok(expected));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
     }
 
@@ -290,6 +341,48 @@ mod tests {
                 in (%1)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_staging_one_like_mixed() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let input = context.input(r#type.clone().into());
+        let output = input.one_like().unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(r#type));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one exemplar-based one instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::OneLike(_))));
+        assert_eq!(instruction.inputs(), &[input.atom_id().unwrap()]);
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.0f32, 1.0]).unwrap(),
+            )]),
+        );
+        // Runtime zero is a valid extent even though the exemplar's signature is dynamic.
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
+            )]),
         );
     }
 }

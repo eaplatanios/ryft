@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
-    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType,
+    Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
     dispatch_on_array_element_type,
 };
 use crate::contexts::{Context, Domain};
@@ -10,7 +10,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueProjection};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
@@ -121,6 +121,13 @@ impl ZeroLike for Array {
     }
 }
 
+impl<A: Value<Type = ArrayType> + ZeroLike> ZeroLike for ArrayIrValue<A> {
+    #[inline]
+    fn zero_like(&self) -> Result<Self, ProgramError> {
+        Ok(Self::Array(self.projected().zero_like()?))
+    }
+}
+
 impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation<V::Type>>>>> ZeroLike for V {
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
@@ -137,7 +144,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, DimensionValue, f8e8m0fnu,
+    };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
@@ -244,6 +253,22 @@ mod tests {
         );
         let zero = Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap();
         assert_eq!(zero.zero_like(), Ok(zero.clone()));
+    }
+
+    #[test]
+    fn test_zero_like_interpretation_mixed() {
+        let input = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[2.0f32, 3.0]).unwrap(),
+        );
+        let expected = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[0.0f32, 0.0]).unwrap(),
+        );
+        assert_eq!(input.zero_like(), Ok(expected));
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            dimension.zero_like(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]
