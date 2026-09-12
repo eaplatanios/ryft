@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Checked dimension-subtraction operation used by [`Sub`].
     DimensionSubOperation, DIMENSION_SUB_OPERATION_NAME,
     Sub, sub,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} - {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -62,7 +62,7 @@ mod tests {
         // These operand bounds admit an underflow, so the rendering carries the runtime-assertion classification that
         // makes this instruction effectful.
         assert_eq!(operation.to_string(), format!("{DIMENSION_SUB_OPERATION_NAME} [requires_runtime_assertion=true]"));
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             4,

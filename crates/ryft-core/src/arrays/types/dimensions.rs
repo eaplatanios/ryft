@@ -372,16 +372,18 @@ impl DimensionType {
         self.extent().map_or_else(|| Dimension::Dynamic(self.variable.clone()), Dimension::Static)
     }
 
+    // TODO(eaplatanios): Should this be a `TypeIdentityRenaming::extend` function instead?
     /// Checks that `actual` refines `declared` (i.e., that the actual bounds are contained in the declared bounds)
-    /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming`, failing when that
-    /// variable is already renamed to a different target.
+    /// and records the renaming of `declared`'s [`DimensionVariable`] to `actual`'s in `renaming`. A different existing
+    /// target is accepted only when both targets prove the same single extent. Otherwise, it is a conflicting renaming.
     ///
     /// This is the single-pair step used by the [`Type::derive_identity_renaming`] implementations that fold over
     /// an entire signature like [`DimensionType`]'s own, and [`ArrayIrType`](crate::arrays::ArrayIrType)'s, which
     /// encounters dimension types as individual elements of a mixed signature. It is a separate function so that
     /// those callers can thread one shared [`TypeIdentityRenaming`] through every pair of the signature. Sharing the
     /// accumulator is what makes a declared [`DimensionVariable`] that appears in several signature positions rename
-    /// consistently, and what rejects signatures that would rename it to two different targets.
+    /// consistently. Distinct targets are rejected unless both admit the same single extent, in which case the first
+    /// target is retained as a representative of that concrete instantiation without equating their identities.
     ///
     /// # Example
     ///
@@ -403,6 +405,16 @@ impl DimensionType {
             return Err(TypeError::invalid(format!(
                 "dimension type {actual} cannot instantiate declared type {declared}",
             )));
+        }
+        if let Some(extent) = actual.extent()
+            && let Some((_, existing)) =
+                renaming.replacements().iter().find(|(source, _)| source == declared.variable())
+            && Self::new(existing.clone()).extent() == Some(extent)
+        {
+            // Several first-class reads can reify one source dimension as independently named exact literals.
+            // Keep the first representative when both bounds prove the same single extent. This does not equate
+            // the nominal identities; it only chooses a valid representative for this concrete instantiation.
+            return Ok(());
         }
         renaming.insert(declared.variable.clone(), actual.variable.clone())
     }
@@ -977,6 +989,21 @@ mod tests {
                 "dimension type dimension<wider ∈ [0, 129)> cannot instantiate declared type \
                  dimension<declared ∈ [1, 65)>",
             )),
+        );
+
+        // Separate exact definitions can represent the same proven extent without becoming nominally equal.
+        let second_exact = DimensionType::new(DimensionVariable::new("another_seven", exact_type.bounds()));
+        let renaming = DimensionType::derive_identity_renaming(
+            &[declared.clone(), declared.clone()],
+            &[exact_type.clone(), second_exact.clone()],
+        )
+        .unwrap();
+        assert_eq!(renaming.replacements(), &[(declared_variable.clone(), exact_type.variable().clone())]);
+        assert_ne!(exact_type.variable(), second_exact.variable());
+        let eight = DimensionType::new(DimensionVariable::new("eight", DimensionBounds::new(8, Some(9)).unwrap()));
+        assert!(
+            DimensionType::derive_identity_renaming(&[declared.clone(), declared.clone()], &[exact_type, eight],)
+                .is_err()
         );
 
         // A repeated declared variable must rename consistently across the complete signature.

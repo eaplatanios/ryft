@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Checked dimension-floor-division operation used by [`Div`].
     DimensionDivFloorOperation, DIMENSION_DIV_FLOOR_OPERATION_NAME,
     Div, div,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} // {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -56,7 +56,7 @@ mod tests {
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionDivFloorOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_DIV_FLOOR_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(9)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(9)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().div(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             2,

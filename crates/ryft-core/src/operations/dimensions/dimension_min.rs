@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Refer to [`DimensionMin`] for semantic details and an example.
     DimensionMinOperation, DIMENSION_MIN_OPERATION_NAME,
     DimensionMin, dimension_min,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("min({}, {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -63,7 +63,7 @@ mod tests {
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionMinOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MIN_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(1, Some(5)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(1, Some(5)).unwrap());
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()

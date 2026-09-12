@@ -3,8 +3,8 @@ use std::fmt::Display;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArraySliceAxis, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals,
-    MeshAxisType, ReferenceSliceOperation, Shape, Sharding, ShardingDimension, StaticShape,
+    ArrayIrType, ArrayIrValue, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
+    LinearResiduals, MeshAxisType, ReferenceSliceOperation, Shape, Sharding, ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -20,18 +20,24 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_dischargeable_operation};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
+use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::concatenation::Concatenate;
-use crate::operations::manipulation::gathering::{Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
+use crate::operations::manipulation::gathering::{
+    DynamicGather, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode,
+};
+use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::manipulation::padding::PadOperation;
-use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
+use crate::operations::math::add::{Add, AddOperation};
+use crate::operations::math::mul::Mul;
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -1239,8 +1245,9 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 {
 }
 
-// Batched starts over a shared source are packed into one gather index vector per item. Mapped sources and
-// explicit-layout inputs retain per-item expansion, which extracts each input/start tuple and stacks its slice
+// Batched starts are packed into one gather index vector per item. Mapped sources use paired gather batch
+// dimensions so each item reads only its own source. Explicit-layout inputs retain per-item expansion, which
+// extracts each input/start tuple and stacks its slice
 // along a leading batch axis. Both paths use existing capabilities in eager and tracing contexts.
 //
 // Replicated start indices keep the structural fast path: a batched input keeps its batch axis by slicing it
@@ -1273,11 +1280,9 @@ where
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1..].iter().any(Option::is_some) {
-            // A shared source and rectangular windows are one gather, independent of the number of mapped
-            // starts. Keep each integer index in its original type so clipping preserves unsigned extremes.
+            // Rectangular windows are one gather, independent of the number of mapped starts. Keep each integer index in its original type so clipping preserves unsigned extremes.
             // Explicit layouts retain the existing expansion path, which owns their layout transformations.
-            if batch_axes[0].is_none()
-                && inputs[0].r#type().layout().is_none()
+            if inputs[0].r#type().layout().is_none()
                 && let Some(axis_size) = axis_size
             {
                 let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
@@ -1296,17 +1301,37 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let indices = C::Value::concatenate(&indices, 1)?;
-                let operation = GatherOperation::new(
+                // Paired batching dimensions select source item `i` with index vector `i`, without adding
+                // item numbers to the integer indices. In particular, this does not narrow `u64` starts or
+                // require a batch extent to fit in the index element type. The batch axis contributes no
+                // output window dimension; the index batch axis supplies that leading output dimension.
+                let mapped_source = batch_axes[0].is_some();
+                let source = if mapped_source {
+                    P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone()
+                } else {
+                    inputs[0].value().clone()
+                };
+                let mut sizes = self.sizes.clone();
+                let dimensions = if mapped_source {
+                    // Empty batches need a zero window to stay within the empty source batch axis.
+                    sizes.insert(0, usize::from(axis_size != 0));
+                    GatherDimensionNumbers::new(
+                        (1..=self.sizes.len()).collect(),
+                        Vec::new(),
+                        (1..=self.sizes.len()).collect(),
+                    )
+                    .with_batching_dimensions(vec![0], vec![0])
+                } else {
                     GatherDimensionNumbers::new(
                         (1..=self.sizes.len()).collect(),
                         Vec::new(),
                         (0..self.sizes.len()).collect(),
-                    ),
-                    self.sizes.clone(),
-                )
-                .with_mode(GatherScatterMode::Clip)
-                .with_output_sharding(output_type.sharding().cloned());
-                let output = inputs[0].value().gather(&indices, &operation)?;
+                    )
+                };
+                let operation = GatherOperation::new(dimensions, sizes)
+                    .with_mode(GatherScatterMode::Clip)
+                    .with_output_sharding(output_type.sharding().cloned());
+                let output = source.gather(&indices, &operation)?;
                 return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?].into());
             }
             return Ok(batch_by_item_expansion(
@@ -2717,6 +2742,110 @@ pub trait DynamicShapeSlice: Value<Type = ArrayIrType> + Sized {
         sizes: &[Self],
         strides: &[usize],
     ) -> Result<Self, ProgramError>;
+
+    /// Slices one axis with host-known indices while retaining every other runtime extent. This convenience
+    /// constructs integer queries and uses [`DynamicGather`], so its pullback uses the existing gather/scatter
+    /// rules even though general [`Self::dynamic_shape_slice`] reverse-mode differentiation is unsupported.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Axis to slice; negative axes count backward from the input rank.
+    ///   - `start`: Nonnegative inclusive start, no larger than `limit`.
+    ///   - `limit`: Exclusive limit, which must be proven within the selected axis by its declared bounds.
+    ///   - `stride`: Positive distance between selected elements. Indices do not wrap or clamp.
+    fn dynamic_slice_axis<A: Into<Axis>>(
+        &self,
+        axis: A,
+        start: usize,
+        limit: usize,
+        stride: usize,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: DynamicGather
+            + DimensionToScalar
+            + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
+    {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        if stride == 0 || start > limit {
+            return Err(TypeError::invalid(
+                "`dynamic_slice_axis` requires a positive stride and start no greater than limit",
+            )
+            .into());
+        }
+        let minimum = match input_type.dimension(axis) {
+            Dimension::Static(size) => size,
+            Dimension::Dynamic(variable) => variable.bounds().lower(),
+        };
+        if limit > minimum {
+            return Err(TypeError::invalid(format!(
+                "`dynamic_slice_axis` limit {limit} exceeds the guaranteed extent {minimum} of axis {axis}"
+            ))
+            .into());
+        }
+        let count = (limit - start).div_ceil(stride);
+        let query_type = ArrayType::new_static(DataType::I64, [count]).with_memory(input_type.memory());
+        let context = self.dispatch_domain();
+        let mut queries = context.dynamic_iota(&query_type, 0, &[])?.into_projected()?;
+        // Scalar dimension literals are available in every mixed context, including compiled contexts whose array
+        // constants live in capture tables. Convert and place them before ordinary integer array arithmetic.
+        if stride != 1 {
+            let scale = context
+                .dimension_constant(stride)?
+                .to_scalar()?
+                .into_projected()?
+                .transfer_to_memory(input_type.memory())?
+                .broadcast(query_type.clone(), &[])?;
+            queries = queries.mul(&scale)?;
+        }
+        if start != 0 {
+            let offset = context
+                .dimension_constant(start)?
+                .to_scalar()?
+                .into_projected()?
+                .transfer_to_memory(input_type.memory())?
+                .broadcast(query_type.clone(), &[])?;
+            queries = queries.add(&offset)?;
+        }
+        self.dynamic_gather_axis(&Self::from_projected(queries), axis, GatherScatterMode::PromiseInBounds)
+    }
+
+    /// Selects one nonnegative index on an axis, optionally retaining that axis with size one. Untouched runtime
+    /// dimensions are preserved. This composes [`Self::dynamic_slice_axis`] with [`DynamicReshape`] and has the same
+    /// bounds requirements and gather/scatter differentiation behavior.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Input axis containing the index; negative axes count backward from the end.
+    ///   - `index`: Nonnegative coordinate that must be proven in bounds.
+    ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
+    fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
+    where
+        Self: DynamicGather
+            + DynamicReshape
+            + DimensionSize
+            + DimensionToScalar
+            + ValueProjection<ArrayType, Projected: Add + Mul + Broadcast + TransferToMemory>,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
+    {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let limit = index
+            .checked_add(1)
+            .ok_or_else(|| TypeError::invalid("`dynamic_index_axis` index overflows `usize`"))?;
+        let output = self.dynamic_slice_axis(axis, index, limit, 1)?;
+        if keep_axis {
+            return Ok(output);
+        }
+        let dimensions = (0..input_type.rank())
+            .filter(|input_axis| *input_axis != axis)
+            .map(|axis| self.dimension_size(axis))
+            .collect::<Result<Vec<_>, _>>()?;
+        output.dynamic_reshape(&dimensions)
+    }
 }
 
 impl<A: DimensionSize<usize> + Slice + Value<Type = ArrayType>> DynamicShapeSlice for ArrayIrValue<A> {
@@ -4415,6 +4544,31 @@ mod tests {
             assert_eq!(output.to_f64s(), expected);
         }
 
+        // Paired source/index batching keeps the original integer range. Each extreme selects the clamped
+        // end of its own row, including empty batches; item positions never enter the index element type.
+        for starts in [
+            Array::vector(vec![i64::MIN, i64::MAX]).unwrap(),
+            Array::vector(vec![0_u64, u64::MAX]).unwrap(),
+            Array::vector(Vec::<i32>::new()).unwrap(),
+        ] {
+            let size = starts.r#type().static_shape().unwrap()[0];
+            let source = Array::from_elements(
+                ArrayType::new_static(DataType::F32, [size, 4]),
+                &(0..size * 4).map(|value| value as f32).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let output = batch(
+                |(input, start)| input.dynamic_slice(&[start], &[2]),
+                (source, starts),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.r#type().static_shape().unwrap().as_slice(), &[size, 2]);
+            assert_eq!(output.to_f64s(), if size == 0 { vec![] } else { vec![0., 1., 6., 7.] });
+        }
+
         // Mixed replicated/mapped coordinates form one vector per window; the full-width second coordinate
         // clamps to zero. This also covers concatenating multiple columns and an empty result window.
         for sizes in [vec![1, 3], vec![0, 3]] {
@@ -4434,36 +4588,55 @@ mod tests {
             assert_eq!(output.to_f64s(), if sizes[0] == 0 { vec![] } else { vec![0., 1., 2., 6., 7., 8.] });
         }
 
-        // The gather keeps mapped placement and host memory metadata rather than replicating the result.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F64, [4])
-            .with_memory(Memory::Host { pinned: true })
-            .with_sharding(Sharding::replicated(mesh.clone(), 1))
-            .unwrap();
-        let index_type = ArrayType::new_static(DataType::I32, [2])
-            .with_memory(Memory::Host { pinned: true })
-            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let output = DynamicSliceOperation::new(vec![2])
-            .batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2)
-                    .with_axis_sharding(ShardingDimension::sharded(["x"])),
-                &EmptyRegionDriver,
-                &[
-                    ArrayBatch::replicated(Array::from_elements(input_type, &[0_f64, 1., 2., 3.]).unwrap()),
-                    ArrayBatch::new(Array::from_elements(index_type, &[0_i32, 2]).unwrap(), BatchAxis::new(0)).unwrap(),
-                ],
-            )
-            .unwrap()
-            .into_parts()
-            .0
-            .remove(0);
-        assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
-        assert_eq!(
-            output.r#type().sharding().unwrap(),
-            &Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap()
-        );
-        assert_eq!(output.value().to_f64s(), vec![0., 1., 2., 3.]);
+        // The gather keeps mapped placement and host memory for shared and paired mapped sources.
+        for mapped in [false, true] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let input_type = ArrayType::new_static(DataType::F64, if mapped { vec![2, 4] } else { vec![4] })
+                .with_memory(Memory::Host { pinned: true })
+                .with_sharding(if mapped {
+                    Sharding::new(
+                        mesh.clone(),
+                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                    )
+                    .unwrap()
+                } else {
+                    Sharding::replicated(mesh.clone(), 1)
+                })
+                .unwrap();
+            let index_type = ArrayType::new_static(DataType::I32, [2])
+                .with_memory(Memory::Host { pinned: true })
+                .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+                .unwrap();
+            let output = DynamicSliceOperation::new(vec![2])
+                .batch(
+                    &BatchingContext::new(EagerContext::<Array>::new(), 2)
+                        .with_axis_sharding(ShardingDimension::sharded(["x"])),
+                    &EmptyRegionDriver,
+                    &[
+                        if mapped {
+                            ArrayBatch::new(
+                                Array::from_elements(input_type, &[0_f64, 1., 2., 3., 0., 1., 2., 3.]).unwrap(),
+                                BatchAxis::new(0),
+                            )
+                            .unwrap()
+                        } else {
+                            ArrayBatch::replicated(Array::from_elements(input_type, &[0_f64, 1., 2., 3.]).unwrap())
+                        },
+                        ArrayBatch::new(Array::from_elements(index_type, &[0_i32, 2]).unwrap(), BatchAxis::new(0))
+                            .unwrap(),
+                    ],
+                )
+                .unwrap()
+                .into_parts()
+                .0
+                .remove(0);
+            assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
+            assert_eq!(
+                output.r#type().sharding().unwrap(),
+                &Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap()
+            );
+            assert_eq!(output.value().to_f64s(), vec![0., 1., 2., 3.]);
+        }
 
         // A batched input pairs item `i` of the input with item `i` of the indices; item 1's start index 3 is
         // clamped to 2 so the extracted block stays in bounds.
@@ -4530,29 +4703,78 @@ mod tests {
             )
             .unwrap()),
         );
+
+        // Nested maps pair each index with its own source at both levels. The inner gather's batching
+        // dimensions must be shifted when the outer map adds its source and index axes.
+        let output = batch(
+            |(input, starts)| {
+                Ok(batch(
+                    |(input, start)| input.dynamic_slice(&[start], &[2]),
+                    (input, starts),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            },
+            (
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [2, 2, 4]),
+                    &(0..16).map(|value| value as f32).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+                Array::matrix(2, 2, vec![0_i32, 1, 2, 3]).unwrap(),
+            ),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.r#type().static_shape().unwrap().as_slice(), &[2, 2, 2]);
+        assert_eq!(output.to_f64s(), vec![0., 1., 5., 6., 10., 11., 14., 15.]);
     }
 
     #[test]
     fn test_dynamic_slice_batching_under_tracing() {
-        // The staged graph stays constant-sized as the mapped length grows.
+        // Shared and mapped sources both lower to one gather as the mapped length grows. Explicit layouts
+        // deliberately retain item expansion: gather clears layout metadata, whereas slicing preserves it.
         for size in [2, 256] {
-            let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-                |(input, starts)| {
-                    batch(
-                        |(input, start)| input.dynamic_slice(&[start], &[2]),
-                        (input, starts),
-                        (BatchAxis::replicated(), BatchAxis::new(0)),
-                        BatchAxis::new(0),
-                        None,
+            for mapped in [false, true] {
+                for explicit_layout in [false, true] {
+                    let mut input_type =
+                        ArrayType::new_static(DataType::F32, if mapped { vec![size, 4] } else { vec![4] });
+                    if explicit_layout {
+                        input_type = input_type.with_layout(Layout::Strided(StridedLayout::new(if mapped {
+                            vec![16, 4]
+                        } else {
+                            vec![4]
+                        })));
+                    }
+                    let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+                        |(input, starts)| {
+                            batch(
+                                |(input, start)| input.dynamic_slice(&[start], &[2]),
+                                (input, starts),
+                                (if mapped { BatchAxis::new(0) } else { BatchAxis::replicated() }, BatchAxis::new(0)),
+                                BatchAxis::new(0),
+                                None,
+                            )
+                            .map_err(ProgramError::from)
+                        },
+                        (input_type, ArrayType::new_static(DataType::I32, [size])),
                     )
-                    .map_err(ProgramError::from)
-                },
-                (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::I32, [size])),
-            )
-            .unwrap();
-            let names =
-                program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>();
-            assert_eq!(names, vec!["reshape", "gather"]);
+                    .unwrap();
+                    let names = program
+                        .instructions()
+                        .iter()
+                        .map(|instruction| instruction.operation().name())
+                        .collect::<Vec<_>>();
+                    if explicit_layout {
+                        assert!(!names.contains(&"gather"));
+                    } else {
+                        assert_eq!(names, vec!["reshape", "gather"]);
+                    }
+                }
+            }
         }
 
         // vmap-under-tracing composition: each batch item extracts a window of the differentiated vector at its own
@@ -6055,5 +6277,60 @@ mod tests {
             resized_output_sharding(&input, &[Dimension::Static(0)], "slice"),
             Err(TypeError::invalid("`slice` mesh-axis product overflows `usize`")),
         );
+    }
+
+    #[test]
+    fn test_dynamic_shape_slice_dynamic_slice_axis() {
+        let empty = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F64, [0]), &[] as &[f64]).unwrap(),
+        );
+        let (_, empty_program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.dynamic_slice_axis(0, 0, 0, 1),
+            empty.r#type().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(empty_program.interpret(empty.clone()).unwrap(), empty);
+        check_symbolic_slice_convenience(false);
+    }
+
+    #[test]
+    fn test_dynamic_shape_slice_dynamic_index_axis() {
+        check_symbolic_slice_convenience(true);
+    }
+
+    /// Checks strict host-index convenience composition with a retained symbolic untouched axis.
+    fn check_symbolic_slice_convenience(index: bool) {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
+        {
+            let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input| {
+                    if index { input.dynamic_index_axis(1, 1, false) } else { input.dynamic_slice_axis(1, 1, 4, 2) }
+                },
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(4)]),
+                )),
+            )
+            .unwrap();
+            for rows in [4, 5] {
+                let input = Array::from_elements(
+                    ArrayType::new_static(DataType::F64, [rows, 4]),
+                    &(0..rows * 4).map(|value| value as f64).collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let output = program.interpret(ArrayIrValue::Array(input)).unwrap();
+                let columns = if index { vec![1] } else { vec![1, 3] };
+                let expected = (0..rows)
+                    .flat_map(|row| columns.iter().map(move |column| (row * 4 + column) as f64))
+                    .collect::<Vec<_>>();
+                let shape = if index { vec![rows] } else { vec![rows, 2] };
+                assert_eq!(
+                    output,
+                    ArrayIrValue::Array(
+                        Array::from_elements(ArrayType::new_static(DataType::F64, shape), &expected,).unwrap()
+                    )
+                );
+            }
+        }
     }
 }

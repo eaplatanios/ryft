@@ -22,7 +22,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::DimensionArithmetic;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
@@ -1325,6 +1326,65 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_reshape(output_dimensions.as_slice())
     }
+
+    /// Returns the input as a vector in logical row-major order. Runtime extents are read from the input and
+    /// multiplied using checked first-class dimension arithmetic. A vector retains its existing dimension identity;
+    /// a scalar becomes a vector of size one and an empty array becomes a vector of size zero.
+    fn dynamic_ravel(&self) -> Result<Self, ProgramError>
+    where
+        Self: DimensionSize + DimensionArithmetic,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+    {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        if input_type.rank() == 1 {
+            return Ok(self.clone());
+        }
+        if input_type.shape().dimensions().iter().any(|dimension| dimension.value() == Some(0)) {
+            // A known zero extent makes the complete product zero, even when an earlier partial product would
+            // overflow the dimension ABI. Do not emit arithmetic for dimensions that cannot affect the result.
+            return self.dynamic_reshape_to_sizes(&[0]);
+        }
+        let mut size = self.dispatch_domain().dimension_constant(1)?;
+        for axis in 0..input_type.rank() {
+            size = size.dimension_mul(&self.dimension_size(axis)?)?;
+        }
+        self.dynamic_reshape(&[size])
+    }
+
+    /// Returns a vector in logical row-major order, with the same contract as [`Self::dynamic_ravel`]. This function
+    /// does not require an independent storage allocation.
+    fn dynamic_flatten(&self) -> Result<Self, ProgramError>
+    where
+        Self: DimensionSize + DimensionArithmetic,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+    {
+        self.dynamic_ravel()
+    }
+
+    /// Inserts a size-one axis while preserving all existing extents, including runtime dimensions. The output
+    /// dimensions are explicit inputs to [`Self::dynamic_reshape`], so retained programs can specialize them when
+    /// concrete input shapes become available.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
+    fn dynamic_expand_dims<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
+    where
+        Self: DimensionSize,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+    {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let axis = axis
+            .into()
+            .normalize(input_type.rank() + 1)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let mut dimensions =
+            (0..input_type.rank()).map(|axis| self.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
+        dimensions.insert(axis, self.dispatch_domain().dimension_constant(1)?);
+        self.dynamic_reshape(&dimensions)
+    }
 }
 
 impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
@@ -1766,7 +1826,6 @@ mod tests {
     };
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
-    use crate::operations::{DimensionArithmetic, DimensionSize};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::Trace;
@@ -3567,6 +3626,78 @@ in (%4)
                 .unwrap();
             let linearization = program.linearize().unwrap();
             assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
+        }
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_ravel() {
+        let input = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap(),
+        );
+        assert_eq!(
+            input.dynamic_ravel().unwrap(),
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F64, [6]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],)
+                    .unwrap()
+            )
+        );
+        let empty = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F64, [i64::MAX as usize, 3, 0]), &[] as &[f64])
+                .unwrap(),
+        );
+        assert_eq!(
+            empty.dynamic_ravel().unwrap(),
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F64, [0]), &[] as &[f64],).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_flatten() {
+        check_symbolic_reshape_convenience(true);
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_expand_dims() {
+        check_symbolic_reshape_convenience(false);
+        let input = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap(),
+        );
+        assert_eq!(input.dynamic_expand_dims(-1).unwrap().r#type().to_string(), "f64[2, 3, 1]");
+        assert!(input.dynamic_expand_dims(4).is_err());
+    }
+
+    /// Checks retained symbolic specialization for the two shape-changing convenience compositions.
+    fn check_symbolic_reshape_convenience(flatten: bool) {
+        // Trace each convenience once with a symbolic leading extent, then replay that same program at two
+        // sizes. This catches wrappers that accidentally bake a physical upper bound into the logical shape.
+        {
+            let dimension = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
+            let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input| if flatten { input.dynamic_flatten() } else { input.dynamic_expand_dims(0) },
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(dimension), Dimension::Static(4)]),
+                )),
+            )
+            .unwrap();
+            for size in [4, 5] {
+                let input = Array::from_elements(
+                    ArrayType::new_static(DataType::F64, [size, 4]),
+                    &(0..size * 4).map(|value| value as f64).collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let output = program.interpret(ArrayIrValue::Array(input.clone())).unwrap();
+                let output = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(output).unwrap();
+                assert_eq!(output.to_f64s(), input.to_f64s());
+                assert_eq!(
+                    output.r#type().static_shape().unwrap().dimensions(),
+                    if flatten { vec![size * 4] } else { vec![1, size, 4] }
+                );
+            }
         }
     }
 }

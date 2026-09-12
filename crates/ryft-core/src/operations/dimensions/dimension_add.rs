@@ -17,7 +17,7 @@ define_arithmetic_dimension_operation!(
     DIMENSION_ADD_OPERATION_NAME,
     Add,
     add,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} + {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(operation.to_string(), DIMENSION_ADD_OPERATION_NAME);
         assert_eq!(operation.left_type(), &left);
         assert_eq!(operation.right_type(), &right);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(13)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(3, Some(13)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             10,

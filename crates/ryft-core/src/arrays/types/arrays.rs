@@ -9,7 +9,9 @@ use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::DeviceMesh;
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionVariable, Shape, StaticShape};
+use crate::arrays::types::dimensions::{
+    Dimension, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape,
+};
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
@@ -417,7 +419,11 @@ impl ArrayType {
                 (Dimension::Dynamic(declared), Dimension::Dynamic(actual))
                     if declared.bounds().contains_bounds(actual.bounds()) =>
                 {
-                    renaming.insert(declared.clone(), actual.clone())
+                    DimensionType::extend_identity_renaming(
+                        &DimensionType::new(declared.clone()),
+                        &DimensionType::new(actual.clone()),
+                        renaming,
+                    )
                 }
                 (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
                     refinements.bind(declared, *actual)
@@ -656,6 +662,9 @@ impl ArrayTypeRefinements {
     /// justifying an output signature against them). It first requires that `actual` refines every non-shape component
     /// of `declared` and matches its rank, and then walks the two shapes axis by axis:
     ///
+    ///   - An actual dynamic dimension with singleton bounds supplies the same concrete proof as a static extent.
+    ///     For example, `Array[q]` observed as `Array[t]` with `t` constrained to exactly 2 contributes the fact
+    ///     `q = 2`; it does not establish nominal equality between `q` and `t`.
     ///   - Equal static extents, or dynamic dimensions with the same [`DimensionVariable`], refine trivially and
     ///     contribute no visit, because no new concrete fact is observed.
     ///   - A declared dynamic dimension met by a static extent inside its declared bounds is the refinement this
@@ -686,21 +695,41 @@ impl ArrayTypeRefinements {
             .dimensions()
             .iter()
             .zip(actual.shape().dimensions())
-            .try_for_each(|(declared, actual)| match (declared, actual) {
-                (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => Ok(()),
-                (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) if declared == actual => Ok(()),
-                (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
-                    visitor(declared, *actual)
+            .try_for_each(|(declared, actual)| {
+                if declared == actual {
+                    return Ok(());
                 }
-                (Dimension::Dynamic(declared), Dimension::Static(actual)) => Err(DimensionError::BindingOutOfBounds {
-                    variable: declared.to_string(),
-                    value: *actual,
-                    bounds: declared.bounds(),
+
+                // Dimension-valued constructor inputs retain their nominal identities even after specialization
+                // proves an exact extent. Use that concrete proof just as for a static axis while retaining the
+                // declared variable as the refinement key, so independent observations must still agree.
+                let exact_actual = match actual {
+                    Dimension::Dynamic(variable) => {
+                        DimensionType::new(variable.clone()).extent().map(Dimension::Static)
+                    }
+                    Dimension::Static(_) => None,
+                };
+                let actual = exact_actual.as_ref().unwrap_or(actual);
+                match (declared, actual) {
+                    (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => Ok(()),
+                    (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) if declared == actual => Ok(()),
+                    (Dimension::Dynamic(declared), Dimension::Static(actual))
+                        if declared.bounds().contains(*actual) =>
+                    {
+                        visitor(declared, *actual)
+                    }
+                    (Dimension::Dynamic(declared), Dimension::Static(actual)) => {
+                        Err(DimensionError::BindingOutOfBounds {
+                            variable: declared.to_string(),
+                            value: *actual,
+                            bounds: declared.bounds(),
+                        }
+                        .into())
+                    }
+                    _ => Err(TypeError::invalid(format!(
+                        "dimension {actual} does not refine declared dimension {declared}",
+                    ))),
                 }
-                .into()),
-                _ => Err(TypeError::invalid(format!(
-                    "dimension {actual} does not refine declared dimension {declared}",
-                ))),
             })
     }
 
@@ -1295,6 +1324,30 @@ mod tests {
             refinements.validate(std::slice::from_ref(&declared), std::slice::from_ref(&actual_two), &[]),
             Ok(()),
         );
+        // Exact nominal dimensions prove extents without making distinct non-exact variables interchangeable.
+        for extent in [2, 3] {
+            let exact = DimensionVariable::new("exact", DimensionBounds::new(extent, Some(extent + 1)).unwrap());
+            let actual = ArrayType::new(F32, Shape::new(vec![exact.into()]));
+            let result = refinements.validate(std::slice::from_ref(&declared), &[actual], &[]);
+            if extent == 2 {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().downcast_custom::<DimensionError>(),
+                    Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "batch".to_string(),
+                        expected: 2,
+                        actual: 3,
+                    })
+                );
+            }
+        }
+        let unrelated = ArrayType::new(
+            F32,
+            Shape::new(vec![DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap()).into()]),
+        );
+        assert!(refinements.validate(std::slice::from_ref(&declared), &[unrelated], &[]).is_err());
+
         let error = ArrayTypeRefinements::establish(&[declared.clone(), declared.clone()], &[actual_two, actual_three])
             .unwrap_err();
         assert_eq!(

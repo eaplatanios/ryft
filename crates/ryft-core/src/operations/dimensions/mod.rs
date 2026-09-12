@@ -64,13 +64,13 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     /// Returns the declared right operand type.
     fn right_type(&self) -> &DimensionType;
 
-    /// Returns the diagnostic name used for a freshly inferred result variable.
-    fn result_name(&self) -> &str;
+    /// Returns the diagnostic name used for a freshly inferred output variable.
+    fn output_name(&self) -> &str;
 
-    /// Returns the result bounds computed from the declared input types when this operation was constructed.
-    fn result_bounds(&self) -> DimensionBounds;
+    /// Returns the output bounds computed from the declared input types when this operation was constructed.
+    fn output_bounds(&self) -> DimensionBounds;
 
-    /// Computes result bounds from the actual input types, which may refine the declared input bounds.
+    /// Computes output bounds from the actual input types, which may refine the declared input bounds.
     fn infer_output_bounds(
         &self,
         left: &DimensionType,
@@ -96,7 +96,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
         // Reusing an operation with narrower inputs must recompute its bounds formula. Its stored effect metadata
         // remains conservative: refinement never removes an assertion from the original operation.
         let bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
-        Ok(vec![DimensionType::new(DimensionVariable::new(self.result_name(), bounds))])
+        Ok(vec![DimensionType::new(DimensionVariable::new(self.output_name(), bounds))])
     }
 }
 
@@ -186,11 +186,11 @@ pub(crate) struct ArithmeticDimensionOperationMetadata {
     /// Expected right operand type.
     right: DimensionType,
 
-    /// Diagnostic name assigned to the result variable when output inference creates it.
-    result_name: String,
+    /// Diagnostic name assigned to the output variable when output inference creates it.
+    output_name: String,
 
-    /// Authoritative bounds assigned to the result variable when output inference creates it.
-    result_bounds: DimensionBounds,
+    /// Output bounds computed at construction; inference recomputes them when actual input bounds are narrower.
+    output_bounds: DimensionBounds,
 
     /// Whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
     requires_runtime_assertion: bool,
@@ -201,11 +201,11 @@ impl ArithmeticDimensionOperationMetadata {
     pub(crate) fn new(
         left: &DimensionType,
         right: &DimensionType,
-        result_name: String,
-        result_bounds: DimensionBounds,
+        output_name: String,
+        output_bounds: DimensionBounds,
         requires_runtime_assertion: bool,
     ) -> Self {
-        Self { left: left.clone(), right: right.clone(), result_name, result_bounds, requires_runtime_assertion }
+        Self { left: left.clone(), right: right.clone(), output_name, output_bounds, requires_runtime_assertion }
     }
 
     /// Returns the expected left operand type.
@@ -220,16 +220,16 @@ impl ArithmeticDimensionOperationMetadata {
         &self.right
     }
 
-    /// Returns the diagnostic name used for a freshly inferred result variable.
+    /// Returns the diagnostic name used for a freshly inferred output variable.
     #[inline]
-    pub(crate) fn result_name(&self) -> &str {
-        &self.result_name
+    pub(crate) fn output_name(&self) -> &str {
+        &self.output_name
     }
 
-    /// Returns the result bounds computed from the declared input types when this operation was constructed.
+    /// Returns the output bounds computed from the declared input types when this operation was constructed.
     #[inline]
-    pub(crate) fn result_bounds(&self) -> DimensionBounds {
-        self.result_bounds
+    pub(crate) fn output_bounds(&self) -> DimensionBounds {
+        self.output_bounds
     }
 
     /// Returns whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
@@ -246,8 +246,8 @@ impl ArithmeticDimensionOperationMetadata {
         Ok(Self {
             left: self.left.rename_identities(renaming)?,
             right: self.right.rename_identities(renaming)?,
-            result_name: self.result_name.clone(),
-            result_bounds: self.result_bounds,
+            output_name: self.output_name.clone(),
+            output_bounds: self.output_bounds,
             requires_runtime_assertion: self.requires_runtime_assertion,
         })
     }
@@ -327,7 +327,7 @@ mod tests {
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
         let result = Operation::infer_output_types(&operation, &[left.clone(), right.clone()], &[]).unwrap();
-        assert_eq!(result[0].bounds(), operation.result_bounds());
+        assert_eq!(result[0].bounds(), operation.output_bounds());
         assert_ne!(result[0].variable(), left.variable());
         assert_ne!(result[0].variable(), right.variable());
 

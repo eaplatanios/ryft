@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Checked dimension-multiplication operation used by [`Mul`].
     DimensionMulOperation, DIMENSION_MUL_OPERATION_NAME,
     Mul, mul,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} * {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -61,7 +61,7 @@ mod tests {
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionMulOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MUL_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(2, Some(33)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(2, Some(33)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().mul(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             21,

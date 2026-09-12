@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, LogicalMesh, NumericArrayElement, Sharding, i1, i2, i4,
+    ArrayIrValue, ArrayType, DataType, Dimension, LogicalMesh, NumericArrayElement, Shape, Sharding, i1, i2, i4,
     materialize_array_tangent, u1, u2, u4,
 };
 use crate::axes::Axis;
@@ -21,19 +21,21 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type};
 use crate::operations::compare::{CompareOperation, ComparisonDirection};
+use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::IotaOperation;
 use crate::operations::constants::one_like::OneLikeOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::control_flow::select::SelectOperation;
+use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::gathering::{
     GatherDimensionNumbers, GatherOperation, GatherScatterMode, dimension_has_explicit_axis,
-    validate_sorted_unique_in_range, validate_unique_in_range,
+    dimensions_have_equal_extents, validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use crate::operations::manipulation::reshaping::{
-    Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
+    DynamicReshape, Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
 };
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
@@ -1087,7 +1089,7 @@ pub trait Scatter: Sized {
         let mut expected_dimensions = input_type.shape().dimensions()[..axis].to_vec();
         expected_dimensions.extend_from_slice(indices_type.shape().dimensions());
         expected_dimensions.extend_from_slice(&input_type.shape().dimensions()[axis + 1..]);
-        let expected_shape = crate::arrays::Shape::new(expected_dimensions);
+        let expected_shape = Shape::new(expected_dimensions);
         if updates.r#type().shape() != &expected_shape {
             return Err(TypeError::invalid(format!(
                 "`scatter_axis` updates shape must be `{expected_shape}` but got `{}`",
@@ -1302,7 +1304,7 @@ impl Scatter for ArrayType {
         let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
-            if updates.dimension(update_axis) != indices.dimension(indices_axis) {
+            if !dimensions_have_equal_extents(&updates.dimension(update_axis), &indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` updates scatter axis {update_axis} must match indices batch axis \
                          {indices_axis} in extent"
@@ -1317,7 +1319,7 @@ impl Scatter for ArrayType {
             .iter()
             .zip(dimensions.scatter_indices_batching_dimensions())
         {
-            if input.dimension(operand_axis) != indices.dimension(indices_axis) {
+            if !dimensions_have_equal_extents(&input.dimension(operand_axis), &indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
                          {operand_axis} and indices axis {indices_axis} differ"
@@ -1662,6 +1664,96 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
     Ok(())
 }
 
+/// Scatters complete slices using a first-class query shape.
+///
+/// The query shape replaces the selected input axis in the updates shape, just as in [`Scatter::scatter_axis`].
+/// Unlike that homogeneous convenience, this capability carries the query extents through an explicit
+/// [`DynamicReshape`] before projecting into the existing [`ScatterOperation`]. Both the query shape and the input
+/// shape can therefore retain symbolic dimensions. This introduces no separate scatter operation or bounds policy.
+///
+/// # Examples
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrValue, DynamicScatter, GatherScatterMode, ScatterReductionKind};
+/// let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
+/// let indices = ArrayIrValue::Array(Array::vector(vec![1_i32, 1]).unwrap());
+/// let updates = ArrayIrValue::Array(Array::vector(vec![2_i32, 3]).unwrap());
+/// let output = input.dynamic_scatter_axis(
+///     &indices, &updates, 0, ScatterReductionKind::Add, GatherScatterMode::Clip,
+/// ).unwrap();
+/// assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10_i32, 25, 30]).unwrap()));
+/// ```
+pub trait DynamicScatter: Value<Type = ArrayIrType> + Sized {
+    /// Updates slices along `axis` using raw integer indices. Negative indices are out of bounds rather than
+    /// counting backward from the end; `mode` specifies whether to clip, drop, or assume valid indices.
+    ///
+    /// # Parameters
+    ///
+    ///   - `indices`: Integer query array of any rank. A scalar selects one complete slice.
+    ///   - `updates`: Array with the input element type and the shape obtained by replacing `axis` with the query
+    ///     shape. Shared symbolic extents must have the same identities, rather than merely the same bounds.
+    ///   - `axis`: Input axis to update; negative axes count from the end of the input rank.
+    ///   - `kind`: Reduction combining each update with the existing input value, including overlapping updates.
+    ///   - `mode`: Out-of-bounds handling; see [`GatherScatterMode`].
+    fn dynamic_scatter_axis<A: Into<Axis>>(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        axis: A,
+        kind: ScatterReductionKind,
+        mode: GatherScatterMode,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl<V> DynamicScatter for V
+where
+    V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType, Projected: Scatter>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+{
+    fn dynamic_scatter_axis<A: Into<Axis>>(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        axis: A,
+        kind: ScatterReductionKind,
+        mode: GatherScatterMode,
+    ) -> Result<Self, ProgramError> {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let indices_type = indices.r#type();
+        let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
+        let updates_type = updates.r#type();
+        let updates_type = <&ArrayType>::try_from(updates_type.as_ref())?;
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let mut expected_dimensions = input_type.shape().dimensions()[..axis].to_vec();
+        expected_dimensions.extend_from_slice(indices_type.shape().dimensions());
+        expected_dimensions.extend_from_slice(&input_type.shape().dimensions()[axis + 1..]);
+        let expected_shape = crate::arrays::Shape::new(expected_dimensions);
+        if updates_type.shape() != &expected_shape {
+            return Err(TypeError::invalid(format!(
+                "`dynamic_scatter_axis` updates shape must be `{expected_shape}` but got `{}`",
+                updates_type.shape(),
+            ))
+            .into());
+        }
+        // Only the index-vector axis is new. Reading the other extents from the query supplies the dimension
+        // definitions needed to specialize a retained `[queries] -> [queries, 1]` reshape.
+        let indices = indices.dynamic_expand_dims(-1)?;
+        let window_dimensions = (0..input_type.rank())
+            .filter(|input_axis| *input_axis != axis)
+            .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
+            .collect();
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(window_dimensions, vec![axis], vec![axis]), kind)
+                .with_mode(mode);
+        Ok(V::from_projected(self.clone().into_projected()?.scatter(
+            &indices.into_projected()?,
+            &updates.clone().into_projected()?,
+            &operation,
+        )?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use num_complex::Complex as ComplexNumber;
@@ -1672,6 +1764,7 @@ mod tests {
         DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
         StridedLayout,
     };
+    use crate::batching::batch;
     use crate::contexts::Context;
     use crate::differentiation::differentiate_at;
     use crate::macros::{
@@ -1683,7 +1776,6 @@ mod tests {
     use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
-
     use crate::tracing::Trace;
 
     use super::*;
@@ -2284,6 +2376,39 @@ mod tests {
 
     #[test]
     fn test_array_type_scatter() {
+        let exact = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(1)).unwrap()));
+        let operation = ScatterOperation::new(
+            ScatterDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
+            ScatterReductionKind::Add,
+        );
+        for input_batch in [Dimension::Static(0), exact.clone()] {
+            for query_batch in [Dimension::Static(0), exact.clone()] {
+                for update_batch in [Dimension::Static(0), exact.clone()] {
+                    let input =
+                        ArrayType::new(DataType::F64, Shape::new(vec![input_batch.clone(), Dimension::Static(4)]));
+                    let indices = ArrayType::new(
+                        DataType::I32,
+                        Shape::new(vec![query_batch.clone(), Dimension::Static(2), Dimension::Static(1)]),
+                    );
+                    let updates = ArrayType::new(DataType::F64, Shape::new(vec![update_batch, Dimension::Static(2)]));
+                    assert_eq!(input.scatter(&indices, &updates, &operation).unwrap(), input);
+                }
+            }
+        }
+        // Identically named dimensions with equal non-exact bounds remain independent and must not pass either
+        // the source/query pairing or the query/update shape equality checks.
+        let first = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap()));
+        let second = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap()));
+        let input = ArrayType::new(DataType::F64, Shape::new(vec![first.clone(), Dimension::Static(4)]));
+        for (query_batch, update_batch) in [(second.clone(), second.clone()), (first, second)] {
+            let indices = ArrayType::new(
+                DataType::I32,
+                Shape::new(vec![query_batch, Dimension::Static(2), Dimension::Static(1)]),
+            );
+            let updates = ArrayType::new(DataType::F64, Shape::new(vec![update_batch, Dimension::Static(2)]));
+            assert!(matches!(input.scatter(&indices, &updates, &operation), Err(ProgramError::Type(_))));
+        }
+
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -2767,6 +2892,71 @@ mod tests {
                 Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap(),
             )),
             Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[12_i32, 20, 31]),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_scatter_dynamic_scatter_axis() {
+        // Mapped queries and updates stay paired with each source row through the mixed query reshape and
+        // projected scatter batching rules. Duplicate queries accumulate within their own source item.
+        let input = ArrayIrValue::Array(Array::matrix(2, 4, vec![0_f64, 1., 2., 3., 4., 5., 6., 7.]).unwrap());
+        let queries = ArrayIrValue::Array(Array::matrix(2, 2, vec![1_i32, 1, 0, 3]).unwrap());
+        let updates = ArrayIrValue::Array(Array::matrix(2, 2, vec![10_f64, 20., 30., 40.]).unwrap());
+        let (_, batched_program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, queries, updates)| {
+                batch(
+                    |(input, queries, updates)| {
+                        input.dynamic_scatter_axis(
+                            &queries,
+                            &updates,
+                            0,
+                            ScatterReductionKind::Add,
+                            GatherScatterMode::Clip,
+                        )
+                    },
+                    (input, queries, updates),
+                    (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .map_err(ProgramError::from)
+            },
+            (input.r#type().into_owned(), queries.r#type().into_owned(), updates.r#type().into_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            batched_program.interpret((input, queries, updates)),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 4, vec![0_f64, 31., 2., 3., 34., 5., 6., 47.]).unwrap())),
+        );
+
+        let query = DimensionVariable::new("queries", DimensionBounds::new(2, Some(4)).unwrap());
+        let indices_type = ArrayType::new(DataType::I32, crate::arrays::Shape::new(vec![query.clone().into()]));
+        let updates_type = ArrayType::new(DataType::F64, crate::arrays::Shape::new(vec![query.into()]));
+        let input_type = ArrayType::new_static(DataType::F64, [4]);
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices, updates)| {
+                input.dynamic_scatter_axis(&indices, &updates, 0, ScatterReductionKind::Add, GatherScatterMode::Clip)
+            },
+            (ArrayIrType::from(input_type.clone()), ArrayIrType::from(indices_type), ArrayIrType::from(updates_type)),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::from(input_type));
+        // One retained query shape specializes at both lengths. Duplicate indices accumulate all updates.
+        for count in [2, 3] {
+            let input = ArrayIrValue::Array(Array::vector(vec![10_f64, 20., 30., 40.]).unwrap());
+            let indices = ArrayIrValue::Array(Array::vector(vec![1_i32; count]).unwrap());
+            let updates = ArrayIrValue::Array(Array::vector(vec![2_f64; count]).unwrap());
+            assert_eq!(
+                program.interpret((input, indices, updates)),
+                Ok(ArrayIrValue::Array(Array::vector(vec![10_f64, 20. + 2. * count as f64, 30., 40.]).unwrap())),
+            );
+        }
+        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
+        let indices = ArrayIrValue::Array(Array::vector(vec![0_i32, 2]).unwrap());
+        let updates = ArrayIrValue::Array(Array::vector(vec![1_i32]).unwrap());
+        assert_eq!(
+            input.dynamic_scatter_axis(&indices, &updates, 0, ScatterReductionKind::Add, GatherScatterMode::Clip),
+            Err(TypeError::invalid("`dynamic_scatter_axis` updates shape must be `[2]` but got `[1]`").into()),
         );
     }
 }

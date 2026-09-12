@@ -926,7 +926,7 @@ where
                     let sum = DimensionAddOperation::new(&inferred_extent, extent.result_type())
                         .map_err(ProgramError::from)?;
                     inferred_extent =
-                        DimensionType::new(DimensionVariable::new(sum.result_name(), sum.result_bounds()));
+                        DimensionType::new(DimensionVariable::new(sum.output_name(), sum.output_bounds()));
                 }
                 let mut inferred_dimensions = output_type.shape().dimensions().to_vec();
                 // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.

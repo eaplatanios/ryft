@@ -18,7 +18,9 @@ pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOper
 pub use conversions::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
 };
-pub use gathering::{GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
+pub use gathering::{
+    DynamicGather, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode,
+};
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use padding::{DynamicPad, PAD_OPERATION_NAME, Pad, PadOperation};
 pub use reshaping::{
@@ -26,7 +28,7 @@ pub use reshaping::{
     ReshapeParameters,
 };
 pub use scattering::{
-    SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+    DynamicScatter, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
 };
 pub use slicing::{
     DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,

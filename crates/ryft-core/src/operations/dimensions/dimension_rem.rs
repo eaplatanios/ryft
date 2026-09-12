@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Checked dimension-remainder operation used by [`Rem`].
     DimensionRemOperation, DIMENSION_REM_OPERATION_NAME,
     Rem, rem,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -59,7 +59,7 @@ mod tests {
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionRemOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_REM_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(4)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(4)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             1,

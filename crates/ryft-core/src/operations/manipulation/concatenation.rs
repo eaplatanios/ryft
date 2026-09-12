@@ -1471,7 +1471,7 @@ mod tests {
         let right_size_type = right_size_operation.result_type().clone();
         let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
         let result_extent_type =
-            DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
+            DimensionType::new(DimensionVariable::new(add_operation.output_name(), add_operation.output_bounds()));
         let dynamic_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
             &[left_type.clone().into(), right_type.clone().into(), result_extent_type.into()],

@@ -10813,11 +10813,26 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         dimensions.start_index_map(),
         index_vector_dimension,
     )?;
+    // Paired axes select matching batch coordinates and do not contribute window coordinates. Use the
+    // canonical window entry when the extent proves which form is valid: zero for an empty axis and one for a
+    // nonempty axis. A retained symbolic batch may have used zero to admit an empty extent; leaving that entry zero
+    // after specialization to a nonempty batch can make XLA replace the entire gather with zeros. If the extent can
+    // still be zero or positive, retain the original entry: changing it to one would violate the gather window bound
+    // on a runtime-empty input. This does not add support for unspecialized runtime-zero batching.
+    let mut slice_sizes = operation.slice_sizes().to_vec();
+    for &axis in dimensions.operand_batching_dimensions() {
+        let bounds = input_types[0].dimension(axis).bounds();
+        if bounds.upper() == Some(1) {
+            slice_sizes[axis] = 0;
+        } else if bounds.lower() > 0 {
+            slice_sizes[axis] = 1;
+        }
+    }
     let result = block.append_operation(stable_hlo::gather(
         input_values[0],
         indices,
         attribute,
-        operation.slice_sizes(),
+        &slice_sizes,
         operation.indices_are_sorted(),
         location,
     )?)?;
@@ -21105,7 +21120,7 @@ mod tests {
             DimensionAddOperation::new(first_size_operation.result_type(), second_size_operation.result_type())
                 .unwrap();
         let result_extent_type =
-            DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
+            DimensionType::new(DimensionVariable::new(add_operation.output_name(), add_operation.output_bounds()));
         let concatenate_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],

@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Refer to [`DimensionPow`] for semantic details and an example.
     DimensionPowOperation, DIMENSION_POW_OPERATION_NAME,
     DimensionPow, dimension_pow,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} ^ {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -84,7 +84,7 @@ mod tests {
         let exponent = test_dimension_type("exponent", 0, 3);
         let operation = DimensionPowOperation::new(&base, &exponent).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_POW_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(5)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(5)).unwrap());
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()

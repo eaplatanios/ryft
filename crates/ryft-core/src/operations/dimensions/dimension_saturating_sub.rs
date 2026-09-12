@@ -15,7 +15,7 @@ define_arithmetic_dimension_operation!(
     /// Refer to [`DimensionSaturatingSub`] for semantic details and an example.
     DimensionSaturatingSubOperation, DIMENSION_SATURATING_SUB_OPERATION_NAME,
     DimensionSaturatingSub, dimension_saturating_sub,
-    result_name = |left: &DimensionType, right: &DimensionType| {
+    output_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
@@ -67,7 +67,7 @@ mod tests {
         let right = test_dimension_type("right", 2, 9);
         let operation = DimensionSaturatingSubOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_SATURATING_SUB_OPERATION_NAME);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(3)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(3)).unwrap());
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()
