@@ -1082,7 +1082,7 @@ mod tests {
     fn test_program_interpret_does_not_refine_operation_payloads() {
         // Batching a program with a dynamic per-item dimension stages a homogeneous `broadcast` whose stored output
         // type retains that dynamic extent (refer to `test_program_batched_carries_dynamic_per_item_dimensions`).
-        // The same payload is built directly here so that the limitation is pinned independently of batching.
+        // The same payload is built directly here to verify replay independently of batching.
         let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
@@ -1103,22 +1103,14 @@ mod tests {
             .trim_end(),
         );
 
-        // This pins an accepted limitation. Replay refines only program and region boundaries, never the types stored
-        // inside an `Instruction`'s operation payload, so the boundary identity `n` is refined to `3` while the payload
-        // keeps naming `n`. The payload therefore re-runs its own inference against the refined input and fails with
-        // its own inference diagnostic, phrased purely in terms of the broadcasting rule and not in terms of the
-        // refinement the boundary established. Refining the payload would require substituting extents into stored
-        // types, which the type model deliberately does not provide: extents reach an operation only as explicit
-        // Static Single Assignment (SSA) operands, as in `DynamicBroadcastOperation`. A diagnostic that named the
-        // stale payload would have to originate from a structured operation error that causally identifies the failing
-        // payload constraint, because the surfaced error alone does not establish that cause.
-        let error = program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()]).unwrap_err();
-        assert!(matches!(error, ProgramError::Type(_)));
+        // Broadcasting resolves inherited output dimensions from the concrete input. Interpretation does not
+        // mutate the stored operation payload while computing that concrete result.
+        let original_program = program.to_string();
         assert_eq!(
-            error.to_string(),
-            "broadcasting input axis 0 has size 3 but the output has size n; a dynamic dimension only broadcasts to \
-             an identical dynamic dimension",
+            program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()]),
         );
+        assert_eq!(program.to_string(), original_program);
 
         // A statically typed payload establishes no boundary facts, so ordinary replay is untouched.
         let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();

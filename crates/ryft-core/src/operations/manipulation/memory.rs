@@ -231,53 +231,50 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Make this take a single type and convert its one invocation below to one per type.
 /// Implements placement as an identity for scalar types that have no memory metadata.
 macro_rules! impl_transfer_to_memory_identity {
-    ($($element:ty),* $(,)?) => {
-        $(impl TransferToMemory for $element {
+    ($element:ty) => {
+        impl TransferToMemory for $element {
             #[inline]
             fn transfer_to_memory(&self, _destination: Memory) -> Result<Self, ProgramError> {
                 Ok(*self)
             }
-        })*
+        }
     };
 }
 
-impl_transfer_to_memory_identity!(
-    bool,
-    i8,
-    i16,
-    i32,
-    i64,
-    u8,
-    u16,
-    u32,
-    u64,
-    i1,
-    i2,
-    i4,
-    u1,
-    u2,
-    u4,
-    f4e2m1fn,
-    f6e2m3fn,
-    f6e3m2fn,
-    f8e3m4,
-    f8e4m3,
-    f8e4m3fn,
-    f8e4m3fnuz,
-    f8e4m3b11fnuz,
-    f8e5m2,
-    f8e5m2fnuz,
-    f8e8m0fnu,
-    bf16,
-    f16,
-    f32,
-    f64,
-    Complex<f32>,
-    Complex<f64>,
-);
+impl_transfer_to_memory_identity!(bool);
+impl_transfer_to_memory_identity!(i8);
+impl_transfer_to_memory_identity!(i16);
+impl_transfer_to_memory_identity!(i32);
+impl_transfer_to_memory_identity!(i64);
+impl_transfer_to_memory_identity!(u8);
+impl_transfer_to_memory_identity!(u16);
+impl_transfer_to_memory_identity!(u32);
+impl_transfer_to_memory_identity!(u64);
+impl_transfer_to_memory_identity!(i1);
+impl_transfer_to_memory_identity!(i2);
+impl_transfer_to_memory_identity!(i4);
+impl_transfer_to_memory_identity!(u1);
+impl_transfer_to_memory_identity!(u2);
+impl_transfer_to_memory_identity!(u4);
+impl_transfer_to_memory_identity!(f4e2m1fn);
+impl_transfer_to_memory_identity!(f6e2m3fn);
+impl_transfer_to_memory_identity!(f6e3m2fn);
+impl_transfer_to_memory_identity!(f8e3m4);
+impl_transfer_to_memory_identity!(f8e4m3);
+impl_transfer_to_memory_identity!(f8e4m3fn);
+impl_transfer_to_memory_identity!(f8e4m3fnuz);
+impl_transfer_to_memory_identity!(f8e4m3b11fnuz);
+impl_transfer_to_memory_identity!(f8e5m2);
+impl_transfer_to_memory_identity!(f8e5m2fnuz);
+impl_transfer_to_memory_identity!(f8e8m0fnu);
+impl_transfer_to_memory_identity!(bf16);
+impl_transfer_to_memory_identity!(f16);
+impl_transfer_to_memory_identity!(f32);
+impl_transfer_to_memory_identity!(f64);
+impl_transfer_to_memory_identity!(Complex<f32>);
+impl_transfer_to_memory_identity!(Complex<f64>);
 
 impl TransferToMemory for Array {
     #[inline]

@@ -6001,7 +6001,7 @@ mod tests {
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::experimental::shard_map::ShardMap;
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -7265,10 +7265,7 @@ mod tests {
 
     #[test]
     fn test_production_composite_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
@@ -7482,10 +7479,7 @@ mod tests {
 
     #[test]
     fn test_production_composite_lowering_executes_dynamic_shape_slice() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
@@ -8910,10 +8904,7 @@ mod tests {
 
     #[test]
     fn test_bounded_dynamic_bitcast_element_type_preserves_prefix_extents() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let declared_type = ArrayType::new(
@@ -8994,10 +8985,7 @@ mod tests {
 
     #[test]
     fn test_data_derived_dynamic_shape_slice_checks_runtime_input_and_result_extents() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -10412,10 +10400,7 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_accumulates_slice_cotangents_into_existing_state() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let mut builder = XlaProgramBuilder::new();

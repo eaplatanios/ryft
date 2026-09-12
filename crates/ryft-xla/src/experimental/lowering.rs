@@ -28,15 +28,15 @@ use ryft_core::{
     ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
     DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
     DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
-    ExternalReferenceBinding, FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction,
-    IotaOperation, Layout, Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation,
-    MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
-    ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind,
-    RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME,
-    SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding,
-    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation,
-    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    ExternalReferenceBinding, FloorOperation, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout,
+    Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
+    MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
+    ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
+    Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind, RegionId, RegionRef,
+    RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation,
+    ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
+    SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation,
+    Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers, ReshapeParameters};
@@ -54,7 +54,7 @@ use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
     ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_FLOOR_KIND, ASSERT_DIVISIBLE_BY_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND,
     ASSERT_EQUAL_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_LESS_THAN_OR_EQUAL_KIND, ASSERT_MUL_KIND,
-    ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
+    ASSERT_PAD_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
 };
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -2841,6 +2841,20 @@ fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    lower_physical_bound_value_with_padding(value, r#type, padding_value, None, block, context, location)
+}
+
+/// Exposes bounded storage, masking inactive lanes with either an exact scalar value or a numeric constant.
+#[allow(clippy::too_many_arguments)]
+fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    padding_value: f64,
+    scalar_padding: Option<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     if r#type.static_shape().is_some() {
         return Ok(value);
     }
@@ -2906,7 +2920,13 @@ fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
         });
     }
     let physical_tensor_type = lower_tensor_type(&physical_type, context, location)?;
-    let padding = if physical_type.data_type().is_complex() {
+    let padding = if let Some(padding) = scalar_padding {
+        block
+            .append_operation(stable_hlo::broadcast(padding, physical_tensor_type, &[], location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref()
+    } else if physical_type.data_type().is_complex() {
         // Padding belongs to the complex element type too; construct its real and imaginary components separately.
         let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
             DataType::F32
@@ -2977,7 +2997,16 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PadOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_pad_to_mlir(self, input_values, output_types, &mut lowerer.block, lowerer.context, lowerer.location)
+        lower_pad_to_mlir(
+            self,
+            input_values,
+            lowerer.input_types.as_slice(),
+            output_types,
+            None,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )
     }
 }
 
@@ -2987,33 +3016,189 @@ fn validate_pad_interior_padding(value: usize) -> Result<(), LoweringError> {
 }
 
 /// Lowers a pad through the shared StableHLO path used by plain, generic-array, and shard-map dispatch.
+#[allow(clippy::too_many_arguments)]
 fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     operation: &PadOperation<T>,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
     output_types: &[ArrayType],
+    output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
     block: &mut B,
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 2, ProgramError);
+    check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    operation.interior_padding().iter().copied().try_for_each(validate_pad_interior_padding)?;
-    let pad = block.append_operation(stable_hlo::pad(
-        input_values[0],
-        input_values[1],
-        operation.edge_padding_low(),
-        operation.edge_padding_high(),
-        operation.interior_padding(),
-        location,
-    )?)?;
-    let result = pad.result(0).expect("stablehlo.pad should return one result").as_ref();
-    let output_type = lower_tensor_type(&output_types[0], context, location)?;
-    if result.r#type()? == output_type.as_ref() {
-        Ok(vec![result])
-    } else {
-        let cast = block.append_operation(tensor::cast(result, output_type, location)?)?;
-        Ok(vec![cast.result(0).expect("tensor.cast should return one result").as_ref()])
+    let rank = input_types[0].rank();
+    if let Some(extents) = output_extents {
+        check_count!("output", extents, rank, ProgramError);
     }
+    if operation.interior_padding().len() != rank {
+        return Err(ProgramError::from(TypeError::invalid(
+            "`pad` padding configuration must match the input rank".to_string(),
+        ))
+        .into());
+    }
+    let output_type = &output_types[0];
+    // Keep ordinary static padding in its canonical native form. Interior amounts on zero/one-element axes are
+    // unobservable and need not fit a native attribute. Extreme opposing edges require the safe cropped form below.
+    let interior_padding = operation
+        .interior_padding()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(axis, interior)| {
+            if input_types[0].shape().dimensions()[axis].value().is_some_and(|extent| extent <= 1) {
+                0
+            } else {
+                interior
+            }
+        })
+        .collect::<Vec<_>>();
+    let ordinary_static_padding = input_types[0].static_shape().is_some()
+        && output_type.static_shape().is_some()
+        && input_types[0].shape().dimensions().iter().enumerate().all(|(axis, dimension)| {
+            let extent = dimension.value().unwrap() as i128;
+            let expanded = extent
+                + (extent - 1).max(0) * interior_padding[axis] as i128
+                + i128::from(operation.edge_padding_low()[axis].max(0))
+                + i128::from(operation.edge_padding_high()[axis].max(0));
+            expanded <= i128::from(i64::MAX)
+                && operation.edge_padding_low()[axis] != i64::MIN
+                && operation.edge_padding_high()[axis] != i64::MIN
+        });
+    if ordinary_static_padding {
+        interior_padding.iter().copied().try_for_each(validate_pad_interior_padding)?;
+        let result = block.append_operation(stable_hlo::pad(
+            input_values[0],
+            input_values[1],
+            operation.edge_padding_low(),
+            operation.edge_padding_high(),
+            &interior_padding,
+            location,
+        )?)?;
+        return Ok(vec![result.result(0).unwrap().as_ref()]);
+    }
+
+    let physical_input_type = physical_bound_type(&input_types[0])?;
+    let physical_output_type = physical_bound_type(output_type)?;
+    let mut starts = Vec::with_capacity(rank);
+    let mut limits = Vec::with_capacity(rank);
+    let mut low_padding = Vec::with_capacity(rank);
+    let mut high_padding = Vec::with_capacity(rank);
+    let mut retained_interior = Vec::with_capacity(rank);
+    let mut entirely_padding = false;
+    for axis in 0..rank {
+        let input_extent = physical_input_type.shape().dimensions()[axis].value().unwrap() as i128;
+        let output_extent = physical_output_type.shape().dimensions()[axis].value().unwrap() as i128;
+        let low = i128::from(operation.edge_padding_low()[axis]);
+        let stride = operation.interior_padding()[axis] as i128 + 1;
+        // Input position k lands at low + k * stride. Intersect those positions with the output capacity before
+        // constructing a native pad, so neither huge interior gaps nor opposing edges create oversized temporaries.
+        let first = if low < 0 { (-low + stride - 1) / stride } else { 0 };
+        let limit = if output_extent <= low { 0 } else { ((output_extent - 1 - low) / stride + 1).min(input_extent) };
+        if first >= limit || output_extent == 0 {
+            entirely_padding = true;
+            break;
+        }
+        let retained = limit - first;
+        let first_position = low + first * stride;
+        let last_position = first_position + (retained - 1) * stride;
+        starts.push(first as usize);
+        limits.push(limit as usize);
+        low_padding.push(first_position as i64);
+        high_padding.push((output_extent - last_position - 1) as i64);
+        retained_interior.push(if retained <= 1 { 0 } else { operation.interior_padding()[axis] });
+    }
+    let mut block = block.as_ref();
+    let location = location.as_ref();
+    let mut result = if entirely_padding {
+        block
+            .append_operation(stable_hlo::broadcast(
+                input_values[1],
+                lower_tensor_type(&physical_output_type, context, location)?,
+                &[],
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref()
+    } else {
+        // Inactive input lanes must contain the actual padding scalar, not a converted approximation or zero. This
+        // makes every retained output prefix correct even when the runtime input is smaller than its capacity.
+        let input = lower_physical_bound_value_with_padding(
+            input_values[0],
+            &input_types[0],
+            0.0,
+            Some(input_values[1]),
+            &mut block,
+            context,
+            location,
+        )?;
+        let input = if starts.iter().any(|start| *start != 0)
+            || limits
+                .iter()
+                .enumerate()
+                .any(|(axis, limit)| *limit != physical_input_type.shape().dimensions()[axis].value().unwrap())
+        {
+            block
+                .append_operation(stable_hlo::slice(input, &starts, &limits, &vec![1; rank], location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            input
+        };
+        retained_interior.iter().copied().try_for_each(validate_pad_interior_padding)?;
+        block
+            .append_operation(stable_hlo::pad(
+                input,
+                input_values[1],
+                &low_padding,
+                &high_padding,
+                &retained_interior,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref()
+    };
+    let mut refined_type = physical_output_type;
+    for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+        if matches!(dimension, Dimension::Static(_)) {
+            continue;
+        }
+        let extent = match output_extents {
+            Some(extents) => extents[axis],
+            // Homogeneous padding retains a dynamic axis only when its size is unchanged.
+            None => lower_runtime_dimension_size_i64(input_values[0], axis, &mut block, context, location)?,
+        };
+        let extent = block
+            .append_operation(stable_hlo::convert(
+                extent,
+                lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let mut dimensions = refined_type.shape().dimensions().to_vec();
+        dimensions[axis] = dimension.clone();
+        refined_type = refined_type.with_shape(Shape::new(dimensions));
+        result = block
+            .append_operation(stable_hlo::set_dimension_size(
+                result,
+                extent,
+                lower_tensor_type(&refined_type, context, location)?,
+                axis,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+    }
+    Ok(vec![result])
 }
 
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
@@ -3174,6 +3359,72 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         Ok(vec![result])
     }
+}
+
+/// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping.
+/// Widen unsigned indices before clamping, and only then convert bounded starts to the common signed i64 carrier.
+fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    starts: &[ValueRef<'b, 'c, 't>],
+    start_types: &[ArrayType],
+    sizes: &[usize],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", starts, input_type.rank(), ProgramError);
+    check_count!("input", start_types, input_type.rank(), ProgramError);
+    check_count!("input", sizes, input_type.rank(), ProgramError);
+    // Native clamping already has the right bounds for static inputs and uniformly typed ordinary signed indices.
+    // Keep that common path direct; unsigned extremes, predicate carriers, and mixed scalar types need normalization.
+    if input_type.static_shape().is_some()
+        && start_types.first().is_none_or(|first| {
+            matches!(first.data_type(), DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64)
+                && start_types.iter().all(|r#type| r#type.data_type() == first.data_type())
+        })
+    {
+        return Ok(starts.to_vec());
+    }
+    let signed_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+    starts
+        .iter()
+        .zip(start_types)
+        .zip(sizes)
+        .enumerate()
+        .map(|(axis, ((start, start_type), size))| {
+            let data_type = if start_type.data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
+            let scalar_type = ArrayType::scalar(data_type);
+            let tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let mut start = block
+                .append_operation(stable_hlo::convert(*start, tensor_type, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            if start_type.data_type() == DataType::I1 {
+                start = block.append_operation(stable_hlo::negate(start, location)?)?.result(0).unwrap().as_ref();
+            }
+            let extent = lower_runtime_dimension_size_i64(input, axis, block, context, location)?;
+            let size = lower_static_index_constants(&[*size], block, context, location)?[0];
+            let maximum =
+                block.append_operation(stable_hlo::subtract(extent, size, location)?)?.result(0).unwrap().as_ref();
+            let maximum = block
+                .append_operation(stable_hlo::convert(maximum, tensor_type, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let zero = lower_unplaced_constant_output(&[scalar_type], 0, block, context, location)?[0];
+            let start =
+                block.append_operation(stable_hlo::maximum(start, zero, location)?)?.result(0).unwrap().as_ref();
+            let start =
+                block.append_operation(stable_hlo::minimum(start, maximum, location)?)?.result(0).unwrap().as_ref();
+            Ok(block
+                .append_operation(stable_hlo::convert(start, signed_type, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref())
+        })
+        .collect()
 }
 
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
@@ -3727,6 +3978,87 @@ fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
             .named_attribute(context.identifier(ASSERT_RIGHT_ATTRIBUTE), context.string_attribute(right_name.as_str())),
     ]);
     lower_assertion_custom_call(predicate, &[left, right], backend_config, effect_tokens, block, context, location)
+}
+
+/// Joins inputs using a bounded fan-in tree so very wide concatenations do not create pathological compiler work.
+fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
+    inputs: &[ValueRef<'b, 'c, 't>],
+    axis: usize,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if inputs.is_empty() {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    }
+    let mut values = inputs.to_vec();
+    while values.len() > 1 {
+        values = values
+            .chunks(16)
+            .map(|chunk| {
+                if chunk.len() == 1 {
+                    return Ok(chunk[0]);
+                }
+                let joined = block.append_operation(stable_hlo::concatenate(chunk, axis, location)?)?;
+                Ok(joined.result(0).unwrap().as_ref())
+            })
+            .collect::<Result<Vec<_>, LoweringError>>()?;
+    }
+    Ok(values[0])
+}
+
+/// Checks equality of the input and output logical element counts without overflowing device-side arithmetic.
+fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
+    input_extents: &[ValueRef<'b, 'c, 't>],
+    output_extents: &[ValueRef<'b, 'c, 't>],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let observed = input_extents.iter().chain(output_extents).copied().collect::<Vec<_>>();
+    let seed = match observed.first() {
+        Some(value) => *value,
+        None => lower_static_index_constants(&[1], block, context, location)?[0],
+    };
+    let predicate = lower_deliberately_false_assertion_predicate(seed, block, context, location)?;
+    let input_rank = input_extents.len().to_string();
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("reshape")),
+        context
+            .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_RESHAPE_KIND)),
+        context.named_attribute(
+            context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+            context.string_attribute(input_rank.as_str()),
+        ),
+    ]);
+    lower_assertion_custom_call(predicate, &observed, backend_config, effect_tokens, block, context, location)
+}
+
+/// Checks padding geometry using actual extents and wide host arithmetic before native dimension narrowing.
+#[allow(clippy::too_many_arguments)]
+fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
+    operation: &PadOperation<ArrayIrType>,
+    axis: usize,
+    input: ValueRef<'b, 'c, 't>,
+    output: ValueRef<'b, 'c, 't>,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let predicate = lower_deliberately_false_assertion_predicate(output, block, context, location)?;
+    let detail = format!(
+        "{axis}:{}:{}:{}",
+        operation.edge_padding_low()[axis],
+        operation.edge_padding_high()[axis],
+        operation.interior_padding()[axis]
+    );
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("pad")),
+        context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_PAD_KIND)),
+        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(detail.as_str())),
+    ]);
+    lower_assertion_custom_call(predicate, &[input, output], backend_config, effect_tokens, block, context, location)
 }
 
 /// Lowers the dynamic explicit-result-extent check owned by composite concatenation.
@@ -5097,6 +5429,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.location,
             ),
             ArrayOperation::UpdateSlice(operation) => {
+                check_count!("input", input_values, 2, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
                 let index_values = lower_static_index_constants(
                     operation.start_indices(),
                     &mut lowerer.block,
@@ -5112,55 +5446,108 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
             ArrayOperation::DynamicSlice(operation) => {
+                check_count!("input", input_values, operation.sizes().len() + 1, ProgramError);
+                check_count!("input", lowerer.input_types, operation.sizes().len() + 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
+                let starts = lower_slice_start_indices(
+                    input_values[0],
+                    &lowerer.input_types[0],
+                    &input_values[1..],
+                    &lowerer.input_types[1..],
+                    operation.sizes(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
                 let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
                     input_values[0],
-                    &input_values[1..],
+                    &starts,
                     operation.sizes(),
                     lowerer.location,
                 )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
+                Ok(vec![result.result(0).unwrap().as_ref()])
             }
             ArrayOperation::DynamicUpdateSlice(_) => {
+                check_count!("output", output_types, 1, ProgramError);
+                check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
+                check_count!("input", lowerer.input_types, output_types[0].rank() + 2, ProgramError);
+                let sizes = static_dimensions(&lowerer.input_types[1])?;
+                let starts = lower_slice_start_indices(
+                    input_values[0],
+                    &lowerer.input_types[0],
+                    &input_values[2..],
+                    &lowerer.input_types[2..],
+                    &sizes,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
                 let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
                     input_values[0],
                     input_values[1],
-                    &input_values[2..],
+                    &starts,
                     lowerer.location,
                 )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+                Ok(vec![result.result(0).unwrap().as_ref()])
             }
             ArrayOperation::Pad(operation) => lower_pad_to_mlir(
                 operation,
                 input_values,
+                lowerer.input_types.as_slice(),
                 output_types,
+                None,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
             ),
             ArrayOperation::Concatenate(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::concatenate(
-                    input_values,
-                    operation.axis(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+                Ok(vec![lower_concatenate_tree(input_values, operation.axis(), &mut lowerer.block, lowerer.location)?])
             }
-            ArrayOperation::Gather(operation) => lower_gather_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            ArrayOperation::Scatter(operation) => lower_scatter_to_mlir(
-                operation,
-                input_values,
-                output_types,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
+            ArrayOperation::Gather(operation) => {
+                let values = lower_gather_to_mlir(
+                    operation,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                if operation.output_sharding().is_some() {
+                    lower_sharding_constraint(
+                        &values,
+                        output_types[0].sharding().unwrap(),
+                        &lowerer.collective_state.bound_manual_axes,
+                        &mut lowerer.block,
+                        lowerer.location,
+                    )
+                } else {
+                    Ok(values)
+                }
+            }
+            ArrayOperation::Scatter(operation) => {
+                let values = lower_scatter_to_mlir(
+                    operation,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    lowerer.collective_state.target_platform(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                if operation.output_sharding().is_some() {
+                    lower_sharding_constraint(
+                        &values,
+                        output_types[0].sharding().unwrap(),
+                        &lowerer.collective_state.bound_manual_axes,
+                        &mut lowerer.block,
+                        lowerer.location,
+                    )
+                } else {
+                    Ok(values)
+                }
+            }
             ArrayOperation::RaggedAllToAll(operation) => {
                 let collective_state = lowerer.collective_state.clone();
                 lower_ragged_all_to_all_to_mlir(
@@ -10387,29 +10774,38 @@ fn log_sum_exp_seed_fold_bound(data_type: DataType) -> Option<usize> {
     })
 }
 
-/// Lowers an [`ArrayOperation::Gather`] dispatch to `stablehlo.gather`. StableHLO `gather` clamps out-of-bounds start
-/// indices into range by default, which is exactly [`GatherScatterMode::Clip`] semantics, so both `Clip` and
-/// [`GatherScatterMode::PromiseInBounds`] (whose promise only lets the clamp be a no-op) lower to the bare op.
-/// [`GatherScatterMode::FillOrDrop`] instead fills out-of-bounds windows and needs an explicit out-of-bounds
-/// mask/select that is not yet emitted. The implicit index vector dimension is the last indices axis, which the gather
-/// shape rule fixes at `output_rank - offset_dimensions.len()`.
+/// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode
+/// clamps against logical input sizes even when the allocation is larger. Comparisons preserve index signedness.
 fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &GatherOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
     output_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 2, ProgramError);
+    check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    if operation.mode() == GatherScatterMode::FillOrDrop {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!("{} with mode {}", GATHER_OPERATION_NAME, operation.mode()),
-        });
+    // Native gather expects integer indices; the one-bit MLIR carrier instead denotes a predicate. Widen every
+    // index family without changing its signedness and recover I1's numeric value (-1 or 0) explicitly.
+    let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
+    let indices_type = input_types[1].clone().with_data_type(index_data_type);
+    let mut indices = block
+        .append_operation(stable_hlo::convert(
+            input_values[1],
+            lower_tensor_type(&indices_type, context, location)?,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    if input_types[1].data_type() == DataType::I1 {
+        indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
     }
     let dimensions = operation.dimensions();
-    let index_vector_dimension = output_types[0].rank() - dimensions.offset_dimensions().len();
+    let index_vector_dimension = input_types[1].rank() - 1;
     let attribute = context.stable_hlo_gather_dimensions(
         dimensions.offset_dimensions(),
         dimensions.collapsed_slice_dimensions(),
@@ -10420,13 +10816,149 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     )?;
     let result = block.append_operation(stable_hlo::gather(
         input_values[0],
-        input_values[1],
+        indices,
         attribute,
         operation.slice_sizes(),
         operation.indices_are_sorted(),
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.gather should return one result").as_ref()])
+    let result = result.result(0).unwrap().as_ref();
+    if operation.mode() == GatherScatterMode::PromiseInBounds
+        || (operation.mode() == GatherScatterMode::Clip && input_types[0].static_shape().is_some())
+    {
+        return Ok(vec![result]);
+    }
+
+    // Compute predicates on bounded storage and restore query extents afterwards. This avoids broadcasting scalar
+    // constants to dynamic tensor types without supplying their runtime sizes.
+    let comparison_type = physical_bound_type(&indices_type)?;
+    let physical_output_type = physical_bound_type(&output_types[0])?;
+    let indices = lower_physical_bound_value(indices, &indices_type, 0.0, block, context, location)?;
+
+    // Widen before comparing: a legal input extent can exceed an i8/u8 index's range. In particular, converting u64
+    // indices to i64 would incorrectly turn its largest values into negative indices or wrap a clipping operation.
+    let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
+    for &axis in dimensions.start_index_map() {
+        let extent = match input_types[0].shape().dimensions()[axis] {
+            Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?,
+        };
+        let window = lower_static_index_constants(&[operation.slice_sizes()[axis]], block, context, location)?[0];
+        upper_bounds
+            .push(block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref());
+    }
+    let upper_bounds = composite::lower_explicit_shape(&upper_bounds, block, context, location)?;
+    let upper_bounds_type = ArrayType::new_static(index_data_type, [dimensions.start_index_map().len()]);
+    let upper_bounds = block
+        .append_operation(stable_hlo::convert(
+            upper_bounds,
+            lower_tensor_type(&upper_bounds_type, context, location)?,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let upper_bounds = block
+        .append_operation(stable_hlo::broadcast(
+            upper_bounds,
+            lower_tensor_type(&comparison_type, context, location)?,
+            &[index_vector_dimension],
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let zero = lower_unplaced_constant_output(&[comparison_type], 0, block, context, location)?[0];
+    if operation.mode() == GatherScatterMode::Clip {
+        // Native gather clamps against allocation capacities, which can exceed a dynamic input's logical size.
+        // Clamp explicitly before gathering, then carry query sizes from the original gather's shape computation.
+        let clipped =
+            block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
+        let clipped = block
+            .append_operation(stable_hlo::minimum(clipped, upper_bounds, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        // Componentwise clamping can reorder lexicographically sorted index vectors, so discard the sorting hint.
+        let clipped = block
+            .append_operation(stable_hlo::gather(
+                input_values[0],
+                clipped,
+                attribute,
+                operation.slice_sizes(),
+                false,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let clipped = lower_physical_bound_value(clipped, &output_types[0], 0.0, block, context, location)?;
+        let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
+        return Ok(vec![lower_restore_dynamic_dimensions(
+            clipped,
+            &output_types[0],
+            &sources,
+            block,
+            context,
+            location,
+        )?]);
+    }
+    let upper_mask =
+        lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, indices, upper_bounds, block, location)?;
+    let lower_mask = lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, indices, zero, block, location)?;
+    let mask = block
+        .append_operation(stable_hlo::and(lower_mask, upper_mask, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let initial =
+        lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?[0];
+    let reduction = build_reduce_body_region(ReductionKind::All, DataType::Boolean, context, location)?;
+    let mask = block
+        .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], reduction, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let batch_axes = (0..output_types[0].rank())
+        .filter(|axis| !dimensions.offset_dimensions().contains(axis))
+        .collect::<Vec<_>>();
+    let mask_type = physical_output_type.clone().with_data_type(DataType::Boolean);
+    let mask = block
+        .append_operation(stable_hlo::broadcast(
+            mask,
+            lower_tensor_type(&mask_type, context, location)?,
+            &batch_axes,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+
+    let fill = operation.resolved_fill_value(output_types[0].data_type())?;
+    let scalar_type = lower_tensor_type(&ArrayType::scalar(output_types[0].data_type()), context, location)?;
+    let fill = block
+        .append_operation(stable_hlo::constant(fill.to_dense_elements_attribute(scalar_type, context)?, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let fill = block
+        .append_operation(stable_hlo::broadcast(
+            fill,
+            lower_tensor_type(&physical_output_type, context, location)?,
+            &[],
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let physical_result = lower_physical_bound_value(result, &output_types[0], 0.0, block, context, location)?;
+    let filled = block
+        .append_operation(stable_hlo::select(mask, physical_result, fill, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
+    Ok(vec![lower_restore_dynamic_dimensions(filled, &output_types[0], &sources, block, context, location)?])
 }
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
@@ -10445,74 +10977,320 @@ fn build_scatter_combiner_region<'c, 't>(
     let mut block_ref = region.append_block(block)?;
     let lhs = block_ref.argument(0)?.as_ref();
     let rhs = block_ref.argument(1)?.as_ref();
-    let body_value = match kind {
-        ScatterReductionKind::Overwrite => rhs,
-        ScatterReductionKind::Add => block_ref
-            .append_operation(stable_hlo::add(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.add should return one result")
-            .as_ref(),
-        ScatterReductionKind::Mul => block_ref
-            .append_operation(stable_hlo::multiply(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.multiply should return one result")
-            .as_ref(),
-        ScatterReductionKind::Min | ScatterReductionKind::Max => {
-            lower_extremum_to_mlir(kind == ScatterReductionKind::Max, element_type, lhs, rhs, &mut block_ref, location)?
+    let body_value = if element_type == DataType::Zero {
+        lhs
+    } else if matches!(element_type, DataType::I1 | DataType::U1) {
+        // Predicate carriers need bitwise arithmetic modulo two. Signed I1 reverses the extrema order because its
+        // set bit denotes -1, whereas U1's set bit denotes +1.
+        match kind {
+            ScatterReductionKind::Overwrite => rhs,
+            ScatterReductionKind::Add => {
+                block_ref.append_operation(stable_hlo::xor(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+            }
+            ScatterReductionKind::Mul => {
+                block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+            }
+            ScatterReductionKind::Min | ScatterReductionKind::Max => {
+                let use_or = (kind == ScatterReductionKind::Min) == (element_type == DataType::I1);
+                if use_or {
+                    block_ref.append_operation(stable_hlo::or(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+                } else {
+                    block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+                }
+            }
+        }
+    } else {
+        match kind {
+            ScatterReductionKind::Overwrite => rhs,
+            ScatterReductionKind::Add => block_ref
+                .append_operation(stable_hlo::add(lhs, rhs, location)?)?
+                .result(0)
+                .expect("stablehlo.add should return one result")
+                .as_ref(),
+            ScatterReductionKind::Mul => block_ref
+                .append_operation(stable_hlo::multiply(lhs, rhs, location)?)?
+                .result(0)
+                .expect("stablehlo.multiply should return one result")
+                .as_ref(),
+            ScatterReductionKind::Min | ScatterReductionKind::Max => lower_extremum_to_mlir(
+                kind == ScatterReductionKind::Max,
+                element_type,
+                lhs,
+                rhs,
+                &mut block_ref,
+                location,
+            )?,
         }
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)
 }
 
-/// Lowers an [`ArrayOperation::Scatter`] dispatch to `stablehlo.scatter` with the combiner region selected by the
-/// operation's [`ScatterReductionKind`]. As with gather, StableHLO `scatter` clamps out-of-bounds start indices by
-/// default, so both [`GatherScatterMode::Clip`] and [`GatherScatterMode::PromiseInBounds`] lower to the bare op while
-/// [`GatherScatterMode::FillOrDrop`] (which drops out-of-bounds writes) is not yet emitted. The implicit index vector
-/// dimension is the last indices axis (`indices_rank - 1`).
+/// Broadcasts an index bound or mask while retaining the runtime query dimensions of an indices tensor.
+fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    shape_source: Option<ValueRef<'b, 'c, 't>>,
+    axes: &[usize],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if let Some(exemplar) = shape_source {
+        let input_type = ArrayType::new(
+            output_type.data_type(),
+            Shape::new(axes.iter().map(|axis| output_type.shape().dimensions()[*axis].clone()).collect()),
+        );
+        let value = lower_physical_bound_value(value, &input_type, 0.0, block, context, location)?;
+        let physical_type = physical_bound_type(output_type)?;
+        let result = block
+            .append_operation(stable_hlo::broadcast(
+                value,
+                lower_tensor_type(&physical_type, context, location)?,
+                axes,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
+        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
+    } else {
+        Ok(block
+            .append_operation(stable_hlo::broadcast(
+                value,
+                lower_tensor_type(output_type, context, location)?,
+                axes,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref())
+    }
+}
+
+/// Lowers scatter by clipping explicit starts or dropping complete out-of-bounds windows. Native scatter already
+/// drops windows outside static allocation bounds; dynamic input bounds require an additional logical-size check.
 fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ScatterOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
     output_types: &[ArrayType],
+    target_platform: Option<&str>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 3, ProgramError);
+    check_count!("input", input_types, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    if operation.mode() == GatherScatterMode::FillOrDrop {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!("{} with mode {}", SCATTER_OPERATION_NAME, operation.mode()),
-        });
-    }
-    let indices_rank = input_values[1]
-        .r#type()?
-        .cast::<TensorTypeRef>()
-        .ok_or_else(|| LoweringError::UnsupportedOp {
-            op: format!("{SCATTER_OPERATION_NAME} with non-tensor indices"),
-        })?
-        .rank();
     let dimensions = operation.dimensions();
+    let window_axes = (0..input_types[0].rank())
+        .filter(|axis| {
+            !dimensions.inserted_window_dimensions().contains(axis)
+                && !dimensions.operand_batching_dimensions().contains(axis)
+        })
+        .collect::<Vec<_>>();
+    for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
+        let update_dimension = input_types[2].dimension(update_axis);
+        if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!(
+                    "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently sized dynamic windows are unsupported by XLA",
+                ),
+            });
+        }
+    }
+    let index_vector_dimension = input_types[1].rank() - 1;
+    let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
+    let indices_type = input_types[1].clone().with_data_type(index_data_type);
+    let mut indices = block
+        .append_operation(stable_hlo::convert(
+            input_values[1],
+            lower_tensor_type(&indices_type, context, location)?,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    if input_types[1].data_type() == DataType::I1 {
+        indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
+    }
+    let adjust_indices = operation.mode() == GatherScatterMode::Clip
+        || (operation.mode() == GatherScatterMode::FillOrDrop && input_types[0].static_shape().is_none());
+    if adjust_indices && !dimensions.scatter_dimensions_to_operand_dimensions().is_empty() {
+        let shape_source = indices_type.static_shape().is_none().then_some(input_values[1]);
+        let mut upper_bounds = Vec::new();
+        let mut sentinels = Vec::new();
+        for &axis in dimensions.scatter_dimensions_to_operand_dimensions() {
+            let extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
+            let window = match window_axes.iter().position(|window_axis| *window_axis == axis) {
+                Some(position) => lower_runtime_dimension_size_i64(
+                    input_values[2],
+                    dimensions.update_window_dimensions()[position],
+                    block,
+                    context,
+                    location,
+                )?,
+                None => lower_static_index_constants(&[1], block, context, location)?[0],
+            };
+            upper_bounds.push(
+                block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
+            );
+            if operation.mode() == GatherScatterMode::FillOrDrop {
+                let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
+                else {
+                    unreachable!()
+                };
+                sentinels.push(lower_static_index_constants(&[capacity], block, context, location)?[0]);
+            }
+        }
+        let bound_type = ArrayType::new_static(index_data_type, [upper_bounds.len()]);
+        let upper_bounds = composite::lower_explicit_shape(&upper_bounds, block, context, location)?;
+        let upper_bounds = block
+            .append_operation(stable_hlo::convert(
+                upper_bounds,
+                lower_tensor_type(&bound_type, context, location)?,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let upper_bounds = lower_index_broadcast(
+            upper_bounds,
+            &indices_type,
+            shape_source,
+            &[index_vector_dimension],
+            block,
+            context,
+            location,
+        )?;
+        let zero =
+            lower_unplaced_constant_output(&[ArrayType::scalar(index_data_type)], 0, block, context, location)?[0];
+        let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
+        if operation.mode() == GatherScatterMode::Clip {
+            indices =
+                block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
+            indices = block
+                .append_operation(stable_hlo::minimum(indices, upper_bounds, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+        } else {
+            let lower = lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, indices, zero, block, location)?;
+            let upper =
+                lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, indices, upper_bounds, block, location)?;
+            let mask = block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
+            let initial =
+                lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?
+                    [0];
+            let body = build_reduce_body_region(ReductionKind::All, DataType::Boolean, context, location)?;
+            let mask = block
+                .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], body, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let mask = lower_index_broadcast(
+                mask,
+                &indices_type.clone().with_data_type(DataType::Boolean),
+                shape_source,
+                &(0..index_vector_dimension).collect::<Vec<_>>(),
+                block,
+                context,
+                location,
+            )?;
+            let sentinels = composite::lower_explicit_shape(&sentinels, block, context, location)?;
+            let sentinels = block
+                .append_operation(stable_hlo::convert(
+                    sentinels,
+                    lower_tensor_type(&bound_type, context, location)?,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let sentinels = lower_index_broadcast(
+                sentinels,
+                &indices_type,
+                shape_source,
+                &[index_vector_dimension],
+                block,
+                context,
+                location,
+            )?;
+            indices = block
+                .append_operation(stable_hlo::select(mask, indices, sentinels, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+        }
+    }
     let attribute = context.stable_hlo_scatter_dimensions(
         dimensions.update_window_dimensions(),
         dimensions.inserted_window_dimensions(),
         dimensions.operand_batching_dimensions(),
         dimensions.scatter_indices_batching_dimensions(),
         dimensions.scatter_dimensions_to_operand_dimensions(),
-        indices_rank - 1,
+        index_vector_dimension,
     )?;
+    if target_platform == Some("cuda")
+        && output_types[0].data_type() == DataType::C128
+        && operation.kind() == ScatterReductionKind::Add
+    {
+        // GPU scatter-add lacks a native complex128 atomic update. Accumulate its independent real components
+        // using floating-point atomics, then reconstruct the complex result.
+        let mut components = Vec::with_capacity(2);
+        for imaginary in [false, true] {
+            let input = if imaginary {
+                block.append_operation(stable_hlo::imag(input_values[0], location)?)?.result(0).unwrap().as_ref()
+            } else {
+                block.append_operation(stable_hlo::real(input_values[0], location)?)?.result(0).unwrap().as_ref()
+            };
+            let updates = if imaginary {
+                block.append_operation(stable_hlo::imag(input_values[2], location)?)?.result(0).unwrap().as_ref()
+            } else {
+                block.append_operation(stable_hlo::real(input_values[2], location)?)?.result(0).unwrap().as_ref()
+            };
+            let combiner = build_scatter_combiner_region(ScatterReductionKind::Add, DataType::F64, context, location)?;
+            components.push(
+                block
+                    .append_operation(stable_hlo::scatter(
+                        &[input],
+                        indices,
+                        &[updates],
+                        attribute,
+                        combiner,
+                        !adjust_indices && operation.indices_are_sorted(),
+                        !adjust_indices && operation.unique_indices(),
+                        location,
+                    )?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref(),
+            );
+        }
+        return Ok(vec![
+            block
+                .append_operation(stable_hlo::complex(components[0], components[1], location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+        ]);
+    }
     let combiner = build_scatter_combiner_region(operation.kind(), output_types[0].data_type(), context, location)?;
+    // Clipping can merge formerly unique indices and change their lexicographic order; masked sentinels likewise
+    // introduce duplicates. Do not propagate either promise through that normalization.
     let result = block.append_operation(stable_hlo::scatter(
         &[input_values[0]],
-        input_values[1],
+        indices,
         &[input_values[2]],
         attribute,
         combiner,
-        operation.indices_are_sorted(),
-        operation.unique_indices(),
+        !adjust_indices && operation.indices_are_sorted(),
+        !adjust_indices && operation.unique_indices(),
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.scatter should return one result").as_ref()])
+    Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
 /// Builds a scalar constant equal to the identity element for the given reduction kind, returned
@@ -10889,6 +11667,12 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::experimental::domains::XlaDomain;
+    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::{Array as DeviceArray, CompiledXlaFunction, FromPjrt, ToPjrt, compile};
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::{
@@ -10897,18 +11681,19 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
         AndOperation, Array as CpuArray, ArrayBatch, ArrayIrOperation, ArrayOperation, Atan2Operation, BatchAxis,
-        BatchableOperation, BatchingContext, BroadcastOperation, CompareOperation, ConcatenateOperation,
+        BatchableOperation, BatchingContext, BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation,
         ConditionOperation, ConstantOperation, Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation,
-        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, Differentiate, Dimension,
-        DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
-        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, IotaOperation, LogSumExpOperation,
-        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
-        Placeholder, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation, ReshapeOperation,
-        ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
-        SliceOperation, StagingContext, StridedLayout, Tile, TileDimension, TiledLayout, Trace, TracingContext,
-        Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation,
-        ZeroOperation, i1, i2, i4, u1, u2, u4,
+        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate,
+        Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
+        DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
+        LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
+        PadOperation, Placeholder, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation,
+        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape,
+        Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
+        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
+        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -10916,11 +11701,6 @@ mod tests {
         BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
         load_cpu_plugin,
     };
-    use std::sync::Arc;
-
-    use crate::ToPjrt;
-    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
-    use crate::tests::{values_from_bytes, values_to_bytes};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
 
@@ -11321,10 +12101,7 @@ mod tests {
         .unwrap();
         // The executable ABI exposes physical buffers followed by each input's runtime size, and returns
         // each dynamic output size separately. One executable must handle both populated and empty shapes.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
             .unwrap();
@@ -11481,10 +12258,7 @@ mod tests {
             }
             "#},
         );
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
             .unwrap();
@@ -11575,6 +12349,182 @@ mod tests {
                 assert_eq!(&complex_bits[8..12], &[-0_f32, 0.0, 5.0, -6.0].map(f32::to_bits));
             }
         }
+    }
+
+    #[test]
+    fn test_lower_reshape_element_count_assertion() {
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        for static_output in [false, true] {
+            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![dynamic_dimension("input", Some(5))]));
+            let size_type = ArrayType::scalar(DataType::I64);
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let size = builder.add_input(size_type.clone().into());
+            let dimension_type = if static_output {
+                DimensionValue::constant(4).unwrap().r#type().into_owned()
+            } else {
+                DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(0, Some(5)).unwrap()))
+            };
+            let dimension = if static_output {
+                builder
+                    .add_instruction(
+                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(4).unwrap())),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap()[0]
+            } else {
+                builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(dimension_type.variable().clone()),
+                        Vec::new(),
+                        vec![size],
+                        None,
+                    )
+                    .unwrap()[0]
+            };
+            let operation = DynamicReshapeOperation::new()
+                .with_input_types(&[input_type.clone().into(), dimension_type.into()])
+                .unwrap();
+            let result = builder.add_instruction(operation, Vec::new(), vec![input, dimension], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type, size_type],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let cases = if static_output {
+                vec![(4_i64, 4_i64), (3, 4), (0, 4)]
+            } else {
+                vec![(4, 4), (2, 2), (0, 0), (4, 3), (4, 0)]
+            };
+            // Hidden i32 boundary extents describe the input's logical size separately from its four-element storage.
+            for (input_size, output_size) in cases {
+                let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
+                let inputs = vec![
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(
+                                    values_to_bytes(&values).as_slice(),
+                                    BufferType::I64,
+                                    [4],
+                                    None,
+                                    device.clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(
+                                    values_to_bytes(&[output_size]).as_slice(),
+                                    BufferType::I64,
+                                    [],
+                                    None,
+                                    device.clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(
+                                    values_to_bytes(&[input_size as i32]).as_slice(),
+                                    BufferType::I32,
+                                    [],
+                                    None,
+                                    device.clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                ];
+                let execution = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .and_then(|execution| execution.block_until_ready());
+                if input_size != output_size {
+                    assert!(execution.err().unwrap().to_string().contains("`reshape`"));
+                } else {
+                    let outputs = execution.unwrap().remove(0).outputs;
+                    let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                    assert_eq!(&bytes[..input_size as usize * 8], values_to_bytes(&values[..input_size as usize]));
+                    if !static_output {
+                        assert_eq!(
+                            outputs[1].copy_to_host(None).unwrap().r#await().unwrap(),
+                            values_to_bytes(&[output_size])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_reshape_physical_capacities() {
+        let input_type = ArrayType::new_static(DataType::F32, [4]);
+        let dimension_type =
+            DimensionType::new(DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap()));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let rows = builder
+            .add_instruction(
+                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(2).unwrap())),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(
+                DimensionOperation::from(ConstantOperation::new(DimensionValue::new(dimension_type, 2).unwrap())),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, rows, columns], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+        assert_eq!(to_mlir_module_for_program(
+            &program, &[], &vec![input_type], &vec![output_type], "main", None, None,
+        ), Err(LoweringError::UnsupportedOp {
+            op: "reshape with unequal physical capacities (input 4, output 6); dynamic bounds must preserve the physical element count".to_string(),
+        }));
     }
 
     #[test]
@@ -11693,7 +12643,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_interior_padding_rejects_out_of_range_values() {
+    fn test_validate_pad_interior_padding() {
         if usize::MAX <= i64::MAX as usize {
             return;
         }
@@ -11705,7 +12655,48 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_lowering_casts_inferred_type_to_requested_dynamic_bound() {
+    fn test_lower_pad_to_mlir() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(1)]));
+        let padding_type = ArrayType::scalar(DataType::I64);
+        let output_type = input_type.clone().with_shape(Shape::new(vec![Dimension::Static(3)]));
+        let input_tensor = lower_tensor_type(&input_type, &context, location).unwrap();
+        let padding_tensor = lower_tensor_type(&padding_type, &context, location).unwrap();
+        let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let padding = block.argument(1).unwrap().as_ref();
+        assert_eq!(
+            lower_pad_to_mlir(
+                &PadOperation::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
+                &[input, padding],
+                &[input_type.clone(), padding_type.clone()],
+                &[output_type.clone()],
+                Some(&[]),
+                &mut block,
+                &context,
+                location,
+            )
+            .unwrap_err(),
+            LoweringError::Tracing(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
+        // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
+        let results = lower_pad_to_mlir(
+            &PadOperation::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
+            &[input, padding],
+            &[input_type, padding_type],
+            &[output_type.clone()],
+            None,
+            &mut block,
+            &context,
+            location,
+        )
+        .unwrap();
+        assert_eq!(results[0].r#type().unwrap(), lower_tensor_type(&output_type, &context, location).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_lower_pad_to_mlir_reconciles_requested_dynamic_bound() {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
@@ -11718,10 +12709,14 @@ mod tests {
         let input = block.argument(0).unwrap().as_ref();
         let padding_value = block.argument(1).unwrap().as_ref();
 
+        let output_extent =
+            lower_static_index_constants(&[6], &mut block.as_ref(), &context, location.as_ref()).unwrap()[0];
         let results = lower_pad_to_mlir(
             &PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
             &[input, padding_value],
+            &[input_type, padding_value_type],
             std::slice::from_ref(&requested_output_type),
+            Some(&[output_extent]),
             &mut block,
             &context,
             location,
@@ -11737,7 +12732,288 @@ mod tests {
             .unwrap()
             .map(|operation| operation.unwrap().name().as_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(operation_names, vec!["stablehlo.pad", "tensor.cast"]);
+        assert_eq!(operation_names.iter().filter(|name| *name == "stablehlo.pad").count(), 1);
+        assert!(!operation_names.iter().any(|name| name == "tensor.cast"));
+    }
+
+    #[test]
+    fn test_lower_pad_to_mlir_extreme_edge_padding() {
+        let client = execution_client();
+        for (size, low, high, interior, expected) in [
+            (1_usize, i64::MIN, i64::MAX, 0_usize, Vec::new()),
+            (2, i64::MIN, i64::MAX, 0, vec![i64::MAX]),
+            (2, i64::MIN, 0, i64::MAX as usize, vec![i64::MIN]),
+        ] {
+            let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(size)]));
+            let padding_type = ArrayType::scalar(DataType::I64);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type);
+            let padding = builder.add_input(padding_type);
+            let result = builder
+                .add_instruction(
+                    PadOperation::new(vec![low], vec![high], vec![interior]).unwrap(),
+                    Vec::new(),
+                    vec![input, padding],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![result],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&vec![i64::MIN; size]).as_slice(),
+                                BufferType::I64,
+                                [size as u64],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(values_to_bytes(&[i64::MAX]).as_slice(), BufferType::I64, [], None, device, None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let outputs = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap();
+            let bytes = outputs[0].outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<i64>(&bytes), expected);
+        }
+    }
+
+    #[test]
+    fn test_lower_pad_to_mlir_execution() {
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        // Exact bits survive interior insertion, negative-edge cropping, empty inputs, and changes to allocation
+        // bounds. Static result refinements still check the actual runtime input extent.
+        for data_type in [DataType::I64, DataType::C64] {
+            let element = if data_type == DataType::I64 { "i64" } else { "complex<f32>" };
+            let input = if data_type == DataType::I64 {
+                vec![i64::MAX, i64::MIN, 9_007_199_254_740_993, 4]
+            } else {
+                values_from_bytes::<i64>(&values_to_bytes(&[1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0]))
+            };
+            let padding = if data_type == DataType::I64 {
+                9_007_199_254_740_993
+            } else {
+                values_from_bytes::<i64>(&values_to_bytes(&[-0_f32, 7.0]))[0]
+            };
+            for (size, low, high, interior, expected) in [
+                (0_i32, 1_i64, 2_i64, 1_usize, vec![padding; 3]),
+                (2, 1, 2, 1, vec![padding, input[0], padding, input[1], padding, padding]),
+                (2, -1, 0, 1, vec![padding, input[1]]),
+                (2, -3, 0, 1, Vec::new()),
+                (2, i64::MIN, i64::MAX, 0, vec![padding]),
+                (2, i64::MIN, 0, i64::MAX as usize, vec![input[1]]),
+            ] {
+                for bound in [None, Some(expected.len() + 1), Some(14)] {
+                    let extent = match bound {
+                        None => DimensionValue::constant(expected.len()).unwrap(),
+                        Some(bound) => DimensionValue::new(
+                            DimensionType::new(DimensionVariable::new(
+                                "output",
+                                DimensionBounds::non_negative(Some(bound + 1)).unwrap(),
+                            )),
+                            expected.len(),
+                        )
+                        .unwrap(),
+                    };
+                    let input_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("input", Some(5))]));
+                    let padding_type = ArrayType::scalar(data_type);
+                    let mut builder = CompositeXlaProgramBuilder::new();
+                    let array = builder.add_input(input_type.clone().into());
+                    let scalar = builder.add_input(padding_type.clone().into());
+                    let extent = builder
+                        .add_instruction(
+                            DimensionOperation::from(ConstantOperation::new(extent)),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        )
+                        .unwrap()[0];
+                    let operation = PadOperation::<ArrayIrType>::from(
+                        PadOperation::new(vec![low], vec![high], vec![interior]).unwrap(),
+                    );
+                    let result =
+                        builder.add_instruction(operation, Vec::new(), vec![array, scalar, extent], None).unwrap()[0];
+                    let program = builder
+                        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                            vec![result],
+                            vec![Placeholder; 2],
+                            vec![Placeholder],
+                        )
+                        .unwrap();
+                    let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+                    let module = to_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &vec![input_type, padding_type],
+                        &vec![output_type.clone()],
+                        "pad_dynamic",
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let capacity = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
+                    let storage_type = format!("tensor<{capacity}x{element}>");
+                    let body = if output_type.static_shape().is_some() {
+                        format!(
+                            indoc! {r#"
+                            %result = func.call @pad_dynamic(%input, %padding, %size)
+                                : (tensor<4x{element}>, tensor<{element}>, tensor<i32>) -> {storage_type}
+                            return %result : {storage_type}
+                        "#},
+                            element = element,
+                            storage_type = storage_type
+                        )
+                    } else {
+                        let result_type = format!("tensor<?x{element}, #stablehlo.bounds<{capacity}>>");
+                        format!(
+                            indoc! {r#"
+                            %result, %extent = func.call @pad_dynamic(%input, %padding, %size)
+                                : (tensor<4x{element}>, tensor<{element}>, tensor<i32>) -> ({result_type}, tensor<i64>)
+                            %bound = stablehlo.constant dense<{capacity}> : tensor<i32>
+                            %storage = stablehlo.set_dimension_size %result, %bound, dim = 0
+                                : ({result_type}, tensor<i32>) -> {storage_type}
+                            return %storage : {storage_type}
+                        "#},
+                            element = element,
+                            result_type = result_type,
+                            capacity = capacity,
+                            storage_type = storage_type
+                        )
+                    };
+                    let prefix = module
+                        .strip_suffix("}\n")
+                        .unwrap()
+                        .replace("func.func @pad_dynamic", "func.func private @pad_dynamic");
+                    let module = format!(
+                        indoc! {r#"
+                        {prefix}
+                        func.func @main(%input: tensor<4x{element}>, %padding: tensor<{element}>, %size: tensor<i32>) -> {storage_type} {{
+                          {body}
+                        }}
+                        }}
+                    "#},
+                        prefix = prefix,
+                        element = element,
+                        storage_type = storage_type,
+                        body = body
+                    );
+                    let executable = client
+                        .compile(
+                            &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                            &ragged_dot_cpu_compilation_options(),
+                        )
+                        .unwrap();
+                    let device = executable.addressable_devices().unwrap().remove(0);
+                    for actual_size in [size, size + 1, 0] {
+                        let inputs = vec![
+                            ExecutionInput {
+                                buffer: Arc::new(
+                                    client
+                                        .buffer(
+                                            values_to_bytes(&input).as_slice(),
+                                            data_type.to_pjrt(),
+                                            [4],
+                                            None,
+                                            device.clone(),
+                                            None,
+                                        )
+                                        .unwrap(),
+                                ),
+                                donatable: false,
+                            },
+                            ExecutionInput {
+                                buffer: Arc::new(
+                                    client
+                                        .buffer(
+                                            values_to_bytes(&[padding]).as_slice(),
+                                            data_type.to_pjrt(),
+                                            [],
+                                            None,
+                                            device.clone(),
+                                            None,
+                                        )
+                                        .unwrap(),
+                                ),
+                                donatable: false,
+                            },
+                            ExecutionInput {
+                                buffer: Arc::new(
+                                    client
+                                        .buffer(
+                                            values_to_bytes(&[actual_size]).as_slice(),
+                                            BufferType::I32,
+                                            [],
+                                            None,
+                                            device.clone(),
+                                            None,
+                                        )
+                                        .unwrap(),
+                                ),
+                                donatable: false,
+                            },
+                        ];
+                        let execution = executable
+                            .execute(
+                                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                                Vec::new(),
+                                0,
+                                None,
+                                Some(file!()),
+                                None,
+                                None,
+                            )
+                            .and_then(|execution| execution.block_until_ready());
+                        if actual_size != size {
+                            let error = execution.err().unwrap().to_string();
+                            if actual_size == 0 && low < 0 || interior == i64::MAX as usize {
+                                assert!(error.contains("outside the native dimension range on axis 0"));
+                            } else {
+                                assert!(error.contains("`pad` result extent on axis 0 must equal"));
+                            }
+                        } else {
+                            let outputs = execution.unwrap();
+                            let bytes = outputs[0].outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                            assert_eq!(&values_from_bytes::<i64>(&bytes)[..expected.len()], expected.as_slice());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -15490,6 +16766,413 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_dynamic_slice_indices() {
+        let client = execution_client();
+        for (index_type, index_bytes, negative) in [
+            (DataType::I1, vec![1_u8], true),
+            (DataType::I8, vec![127_u8], false),
+            (DataType::U64, values_to_bytes(&[u64::MAX]), false),
+        ] {
+            let input_type = ArrayType::new(
+                DataType::I64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                    "rows",
+                    DimensionBounds::new(2, Some(5)).unwrap(),
+                ))]),
+            );
+            let update_type = ArrayType::new_static(DataType::I64, [1]);
+            let index_type = ArrayType::scalar(index_type);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let update = builder.add_input(update_type.clone());
+            let index = builder.add_input(index_type.clone());
+            let sliced = builder
+                .add_instruction(DynamicSliceOperation::new(vec![1]), Vec::new(), vec![input, index], None)
+                .unwrap()[0];
+            let updated = builder
+                .add_instruction(DynamicUpdateSliceOperation, Vec::new(), vec![input, update, index], None)
+                .unwrap()[0];
+            let program = unproject_plain_program(
+                builder
+                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        vec![sliced, updated],
+                        vec![Placeholder; 3],
+                        vec![Placeholder; 2],
+                    )
+                    .unwrap(),
+            );
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), update_type.clone(), index_type.clone()],
+                &vec![update_type, input_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
+            for size in [2_i32, 4] {
+                let inputs = [
+                    (values_to_bytes(&values), BufferType::I64, vec![4]),
+                    (values_to_bytes(&[42_i64]), BufferType::I64, vec![1]),
+                    (index_bytes.clone(), DeviceArray::physical_buffer_type(index_type.data_type()), vec![]),
+                    (values_to_bytes(&[size]), BufferType::I32, vec![]),
+                ]
+                .into_iter()
+                .map(|(bytes, data_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+                let outputs = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+                    .remove(0)
+                    .outputs;
+                let axis = if negative { 0 } else { size as usize - 1 };
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[0].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![values[axis]]
+                );
+                let mut expected = values[..size as usize].to_vec();
+                expected[axis] = 42;
+                let bytes = outputs[1].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(values_from_bytes::<i64>(&bytes[..size as usize * 8]), expected);
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[2].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![i64::from(size)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_dynamic_shape_slice_runtime_windows() {
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, [4]);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let mut bounds = Vec::new();
+        for name in ["start", "size"] {
+            let scalar = builder.add_input(scalar_type.clone().into());
+            bounds.push(
+                builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(DimensionVariable::new(
+                            name,
+                            DimensionBounds::new(0, Some(5)).unwrap(),
+                        )),
+                        Vec::new(),
+                        vec![scalar],
+                        None,
+                    )
+                    .unwrap()[0],
+            );
+        }
+        let result = builder
+            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, bounds[0], bounds[1]], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type, scalar_type.clone(), scalar_type],
+            &vec![output_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
+        for (start, size) in [(3_i64, 1_i64), (2, 2), (0, 4), (4, 0), (3, 2)] {
+            let inputs = [
+                (values_to_bytes(&values), vec![4]),
+                (values_to_bytes(&[start]), vec![]),
+                (values_to_bytes(&[size]), vec![]),
+            ]
+            .into_iter()
+            .map(|(bytes, shape)| ExecutionInput {
+                buffer: Arc::new(
+                    client
+                        .buffer(bytes.as_slice(), BufferType::I64, shape.as_slice(), None, device.clone(), None)
+                        .unwrap(),
+                ),
+                donatable: false,
+            })
+            .collect::<Vec<_>>();
+            let result = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .and_then(|execution| execution.block_until_ready());
+            if start + size > 4 {
+                assert!(result.err().unwrap().to_string().contains("dynamic_shape_slice"));
+            } else {
+                let outputs = result.unwrap().remove(0).outputs;
+                let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(
+                    values_from_bytes::<i64>(&bytes[..size as usize * 8]),
+                    &values[start as usize..(start + size) as usize]
+                );
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![size]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_gather_fill_windows() {
+        let client = execution_client();
+        let input =
+            CpuArray::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
+                .unwrap();
+        let fill = 9_007_199_254_740_993_i64;
+        let windows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![3])
+            .with_mode(GatherScatterMode::FillOrDrop);
+        let cases = [
+            (
+                CpuArray::scalar(7_i64).unwrap(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
+                GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![], vec![]), vec![])
+                    .with_mode(GatherScatterMode::FillOrDrop),
+                values_to_bytes(&[7_i64, 7]),
+            ),
+            (
+                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
+                    .unwrap(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
+                GatherOperation::new(
+                    GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
+                    vec![1, 1],
+                )
+                .with_mode(GatherScatterMode::FillOrDrop),
+                values_to_bytes(&[10_i64, 30, 50, i64::MIN]),
+            ),
+            (
+                input.clone(),
+                CpuArray::from_elements(
+                    ArrayType::new_static(DataType::I1, [2, 1]),
+                    &[i1::new(-1).unwrap(), i1::new(0).unwrap()],
+                )
+                .unwrap(),
+                windows.clone(),
+                values_to_bytes(&[i64::MIN, i64::MIN, i64::MIN, 0, 1, 2]),
+            ),
+            (
+                input.clone(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
+                windows.clone().with_fill_value(CpuArray::scalar(fill).unwrap()).unwrap(),
+                values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
+            ),
+            (
+                input.clone(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX]).unwrap(),
+                windows.clone(),
+                values_to_bytes(&[0_i64, 1, 2, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]),
+            ),
+            (
+                input,
+                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
+                windows,
+                values_to_bytes(&[297_i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
+            ),
+            (
+                CpuArray::from_elements(
+                    ArrayType::new_static(DataType::C64, [1]),
+                    &[ComplexNumber::new(2.0_f32, -3.0)],
+                )
+                .unwrap(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
+                GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+                    .with_mode(GatherScatterMode::FillOrDrop)
+                    .with_fill_value(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())
+                    .unwrap(),
+                values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
+            ),
+        ];
+        for (input, indices, operation, expected) in cases {
+            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let input_atom = builder.add_input(input.r#type().into_owned());
+            let indices_atom = builder.add_input(indices.r#type().into_owned());
+            let output =
+                builder.add_instruction(operation, Vec::new(), vec![input_atom, indices_atom], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let inputs = [&input, &indices]
+                .into_iter()
+                .map(|value| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                value.storage_bytes(),
+                                DeviceArray::physical_buffer_type(value.r#type().data_type()),
+                                value
+                                    .r#type()
+                                    .static_shape()
+                                    .unwrap()
+                                    .as_slice()
+                                    .iter()
+                                    .map(|extent| *extent as u64)
+                                    .collect::<Vec<_>>(),
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+            let outputs = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0)
+                .outputs;
+            assert_eq!(outputs[0].copy_to_host(None).unwrap().r#await().unwrap(), expected);
+        }
+        // Bounds checks use logical input extents rather than padded allocation capacity.
+        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+            let input_type = ArrayType::new(
+                DataType::I64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                    "rows",
+                    DimensionBounds::new(1, Some(5)).unwrap(),
+                ))]),
+            );
+            let query = Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(3)).unwrap()));
+            let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![query.clone(), Dimension::Static(1)]));
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let indices = builder.add_input(indices_type.clone());
+            let output = builder
+                .add_instruction(
+                    GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+                        .with_mode(mode),
+                    Vec::new(),
+                    vec![input, indices],
+                    None,
+                )
+                .unwrap()[0];
+            let program = unproject_plain_program(
+                builder
+                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        vec![output],
+                        vec![Placeholder; 2],
+                        vec![Placeholder],
+                    )
+                    .unwrap(),
+            );
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type, indices_type],
+                &vec![ArrayType::new(DataType::I64, Shape::new(vec![query]))],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            for query_size in [2_i32, 1, 0] {
+                let inputs = [
+                    (values_to_bytes(&[10_i64, 20, 30, 40]), BufferType::I64, vec![4]),
+                    (values_to_bytes(&[1_i64, 3]), BufferType::I64, vec![2, 1]),
+                    (values_to_bytes(&[2_i32]), BufferType::I32, vec![]),
+                    (values_to_bytes(&[query_size]), BufferType::I32, vec![]),
+                ]
+                .into_iter()
+                .map(|(bytes, data_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+                let outputs = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+                    .remove(0)
+                    .outputs;
+                let expected = if mode == GatherScatterMode::Clip { vec![20_i64, 20] } else { vec![20, i64::MIN] };
+                let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                let actual = values_from_bytes::<i64>(&bytes[..query_size as usize * 8]);
+                assert_eq!(actual, &expected[..query_size as usize]);
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![i64::from(query_size)]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
         use ryft_core::{Dimension, GatherDimensionNumbers, GatherOperation, GatherScatterMode, Shape};
 
@@ -15516,6 +17199,398 @@ mod tests {
 
         assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
         assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_lower_scatter_index_modes() {
+        let client = execution_client();
+        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+            for (unsigned, dynamic_input, dynamic_query) in
+                [(false, false, false), (true, false, false), (false, true, false), (false, false, true)]
+            {
+                let input_values = [10_i64, 20, 30, 40];
+                let input_type = if dynamic_input {
+                    ArrayType::new(
+                        DataType::I64,
+                        Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                            "rows",
+                            DimensionBounds::new(2, Some(5)).unwrap(),
+                        ))]),
+                    )
+                } else {
+                    ArrayType::new_static(DataType::I64, [4])
+                };
+                let query = if dynamic_query {
+                    Dimension::Dynamic(DimensionVariable::new("query", DimensionBounds::new(0, Some(5)).unwrap()))
+                } else {
+                    Dimension::Static(4)
+                };
+                let index_data_type = if unsigned { DataType::U64 } else { DataType::I64 };
+                let indices_type =
+                    ArrayType::new(index_data_type, Shape::new(vec![query.clone(), Dimension::Static(1)]));
+                let updates_type = ArrayType::new(DataType::I64, Shape::new(vec![query]));
+                let mut builder = XlaProgramBuilder::new();
+                let inputs = [input_type.clone(), indices_type.clone(), updates_type.clone()]
+                    .into_iter()
+                    .map(|r#type| builder.add_input(r#type))
+                    .collect::<Vec<_>>();
+                let operation = ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                )
+                .with_mode(mode);
+                let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
+                let program = unproject_plain_program(
+                    builder
+                        .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                            vec![output],
+                            vec![Placeholder; 3],
+                            vec![Placeholder],
+                        )
+                        .unwrap(),
+                );
+                let module = to_mlir_module_for_program(
+                    &program,
+                    &[],
+                    &vec![input_type.clone(), indices_type, updates_type],
+                    &vec![input_type],
+                    "main",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let executable = client
+                    .compile(
+                        &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                        &ragged_dot_cpu_compilation_options(),
+                    )
+                    .unwrap();
+                let device = executable.addressable_devices().unwrap().remove(0);
+                let mut values = vec![
+                    (values_to_bytes(&input_values), BufferType::I64, vec![4]),
+                    (
+                        if unsigned {
+                            values_to_bytes(&[0_u64, u64::MAX, u64::MAX, 1])
+                        } else {
+                            values_to_bytes(&[-2_i64, -1, 4, 9])
+                        },
+                        index_data_type.to_pjrt(),
+                        vec![4, 1],
+                    ),
+                    (values_to_bytes(&[1_i64, 2, 3, 4]), BufferType::I64, vec![4]),
+                ];
+                if dynamic_input {
+                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
+                }
+                if dynamic_query {
+                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
+                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
+                }
+                let inputs = values
+                    .into_iter()
+                    .map(|(bytes, data_type, shape)| ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    })
+                    .collect::<Vec<_>>();
+                let outputs = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+                    .remove(0)
+                    .outputs;
+                let expected = match (mode, unsigned, dynamic_input, dynamic_query) {
+                    (GatherScatterMode::Clip, true, _, _) => vec![11_i64, 24, 30, 45],
+                    (GatherScatterMode::FillOrDrop, true, _, _) => vec![11, 24, 30, 40],
+                    (GatherScatterMode::Clip, _, true, _) => vec![13, 27],
+                    (GatherScatterMode::Clip, _, _, true) => vec![13, 20, 30, 40],
+                    (GatherScatterMode::Clip, _, _, _) => vec![13, 20, 30, 47],
+                    (_, _, true, _) => vec![10, 20],
+                    _ => vec![10, 20, 30, 40],
+                };
+                let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(
+                    values_from_bytes::<i64>(&bytes[..expected.len() * 8]),
+                    expected,
+                    "mode={mode}, unsigned={unsigned}, dynamic_input={dynamic_input}, dynamic_query={dynamic_query}"
+                );
+            }
+        }
+        // A partially out-of-bounds update is dropped as a whole; Clip moves the complete window into range.
+        let mut literal_cases = Vec::new();
+        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+            literal_cases.push((
+                CpuArray::vector(vec![0_i64; 3]).unwrap(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
+                CpuArray::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                    ScatterReductionKind::Add,
+                )
+                .with_mode(mode),
+                values_to_bytes(if mode == GatherScatterMode::Clip { &[0_i64, 10, 20] } else { &[0_i64, 0, 0] }),
+            ));
+        }
+        // One-bit integers use predicate storage but retain arithmetic modulo two and signed/unsigned extrema.
+        for signed in [false, true] {
+            for kind in [
+                ScatterReductionKind::Overwrite,
+                ScatterReductionKind::Add,
+                ScatterReductionKind::Mul,
+                ScatterReductionKind::Min,
+                ScatterReductionKind::Max,
+            ] {
+                let input = if signed {
+                    CpuArray::vector(vec![i1::new(0).unwrap(), i1::new(-1).unwrap(), i1::new(-1).unwrap()]).unwrap()
+                } else {
+                    CpuArray::vector(vec![u1::new(0).unwrap(), u1::new(1).unwrap(), u1::new(1).unwrap()]).unwrap()
+                };
+                let updates = if signed {
+                    CpuArray::vector(vec![i1::new(-1).unwrap(), i1::new(-1).unwrap(), i1::new(0).unwrap()]).unwrap()
+                } else {
+                    CpuArray::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
+                };
+                let expected = match kind {
+                    ScatterReductionKind::Overwrite => vec![1_u8, 1, 0],
+                    ScatterReductionKind::Add => vec![1, 0, 1],
+                    ScatterReductionKind::Mul => vec![0, 1, 0],
+                    ScatterReductionKind::Min | ScatterReductionKind::Max => {
+                        if (kind == ScatterReductionKind::Min) == signed { vec![1, 1, 1] } else { vec![0, 1, 0] }
+                    }
+                };
+                literal_cases.push((
+                    input,
+                    CpuArray::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
+                    updates,
+                    ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
+                    expected,
+                ));
+            }
+        }
+        for (input, indices, updates, operation, expected) in literal_cases {
+            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+            let inputs = [input, indices, updates]
+                .into_iter()
+                .map(|value| {
+                    builder.add_instruction(ConstantOperation::new(value), Vec::new(), Vec::new(), None).unwrap()[0]
+                })
+                .collect::<Vec<_>>();
+            let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
+            let program =
+                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
+            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let outputs = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &[], ..Default::default() }],
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0)
+                .outputs;
+            assert_eq!(outputs[0].copy_to_host(None).unwrap().r#await().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lower_scatter_complex_add_on_cuda() {
+        let client = execution_client();
+        let execution_platform = client.platform_name().unwrap();
+        for (data_type, platform, scatter_count) in
+            [(DataType::C128, Some("cuda"), 2), (DataType::C128, Some("cpu"), 1), (DataType::C64, Some("cuda"), 1)]
+        {
+            let input_types = vec![
+                ArrayType::new_static(data_type, [4]),
+                ArrayType::new_static(DataType::I32, [2, 1]),
+                ArrayType::new_static(data_type, [2]),
+            ];
+            let output_types = vec![input_types[0].clone()];
+            let mut builder = XlaProgramBuilder::new();
+            let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
+            let output = builder
+                .add_instruction(
+                    ArrayOperation::Scatter(ScatterOperation::new(
+                        ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Add,
+                    )),
+                    Vec::new(),
+                    inputs,
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder; 3],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let module = lower_mlir_module_for_program(
+                &unproject_plain_program(program),
+                &[],
+                &input_types,
+                &output_types,
+                "main",
+                None,
+                None,
+                platform,
+            )
+            .unwrap()
+            .stable_hlo;
+            assert_eq!(
+                module.matches("stablehlo.scatter").count() - module.matches("#stablehlo.scatter").count(),
+                scatter_count
+            );
+            assert_eq!(module.matches("stablehlo.complex ").count(), usize::from(scatter_count == 2));
+
+            // Execute the selected backend's lowering as well as checking its structure. In particular, the CUDA
+            // double-precision complex path must sum real and imaginary updates through its two scatter kernels.
+            if !execution_platform.eq_ignore_ascii_case(platform.unwrap()) {
+                continue;
+            }
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let (input, updates, expected, buffer_type) = if data_type == DataType::C128 {
+                (
+                    values_to_bytes(&[1_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[10_f64, -20.0, 30.0, -40.0]),
+                    values_to_bytes(&[1_f64, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
+                    BufferType::C128,
+                )
+            } else {
+                (
+                    values_to_bytes(&[1_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[10_f32, -20.0, 30.0, -40.0]),
+                    values_to_bytes(&[1_f32, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
+                    BufferType::C64,
+                )
+            };
+            let inputs = [
+                (input, buffer_type, vec![4]),
+                (values_to_bytes(&[1_i32, 1]), BufferType::I32, vec![2, 1]),
+                (updates, buffer_type, vec![2]),
+            ]
+            .into_iter()
+            .map(|(bytes, data_type, shape)| ExecutionInput {
+                buffer: Arc::new(
+                    client.buffer(bytes.as_slice(), data_type, &shape, None, device.clone(), None).unwrap(),
+                ),
+                donatable: false,
+            })
+            .collect::<Vec<_>>();
+            let output = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0)
+                .outputs
+                .remove(0);
+            assert_eq!(output.copy_to_host(None).unwrap().r#await().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lower_indexed_output_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
+        let indices = builder.add_input(ArrayType::new_static(DataType::I32, [2, 1]));
+        let updates = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let gathered = builder
+            .add_instruction(
+                GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+                    .with_output_sharding(sharding.clone()),
+                Vec::new(),
+                vec![input, indices],
+                None,
+            )
+            .unwrap()[0];
+        let scattered = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                )
+                .with_output_sharding(sharding),
+                Vec::new(),
+                vec![input, indices, updates],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(
+                vec![gathered, scattered],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(module.matches("sdy.sharding_constraint").count(), 2);
+    }
+
+    #[test]
+    fn test_lower_scatter_dynamic_window() {
+        let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
+        let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
+        let updates = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(1),
+                Dimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
+            ]),
+        ));
+        let output = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                    ScatterReductionKind::Add,
+                ),
+                Vec::new(),
+                vec![input, indices, updates],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(to_mlir_module_for_plain_program(&program, "main"), Err(LoweringError::UnsupportedOp {
+            op: "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic windows are unsupported by XLA".to_string(),
+        }));
     }
 
     #[test]
@@ -17050,54 +19125,71 @@ mod tests {
     fn test_lower_mlir_module_for_program_retains_dynamic_scaled_dot_requirements_on_cuda() {
         // A dynamic contracting block ratio is a runtime semantic requirement. Keep that case on the logical
         // decomposition instead of erasing its dimension checks merely to reach CUDA's static fused boundary.
-        let elements = DimensionVariable::new("elements", DimensionBounds::new(32, Some(65)).unwrap());
-        let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(3)).unwrap());
-        let element_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(elements)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(blocks)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
-        let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
-        let mut builder = XlaProgramBuilder::new();
-        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-        let output = builder
-            .add_instruction(
-                ScaledDotOperation::new(
-                    DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                    DataType::F32,
-                    true,
-                    true,
-                ),
-                Vec::new(),
-                inputs,
-                None,
-            )
-            .unwrap()[0];
-        let program = unproject_plain_program(
-            builder
-                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
-                    vec![output],
-                    vec![Placeholder; 4],
-                    vec![Placeholder],
+        for block_bound in [2, 3] {
+            let elements = DimensionVariable::new("elements", DimensionBounds::new(32, Some(65)).unwrap());
+            // A single-block allocation keeps the decomposition's reshape capacities equal while its runtime ratio
+            // still varies with `elements` and needs the same semantic assertion.
+            let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(block_bound)).unwrap());
+            let element_type = ArrayType::new(
+                DataType::F8E4M3FN,
+                Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(elements)]),
+            );
+            let scale_type = ArrayType::new(
+                DataType::F8E8M0FNU,
+                Shape::new(vec![
+                    Dimension::Static(1),
+                    if block_bound == 2 { Dimension::Static(1) } else { Dimension::Dynamic(blocks) },
+                ]),
+            );
+            let output_type =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+            let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
+            let mut builder = XlaProgramBuilder::new();
+            let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let output = builder
+                .add_instruction(
+                    ScaledDotOperation::new(
+                        DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                        DataType::F32,
+                        true,
+                        true,
+                    ),
+                    Vec::new(),
+                    inputs,
+                    None,
                 )
-                .unwrap(),
-        );
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &[output_type],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+                .unwrap()[0];
+            let program = unproject_plain_program(
+                builder
+                    .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                        vec![output],
+                        vec![Placeholder; 4],
+                        vec![Placeholder],
+                    )
+                    .unwrap(),
+            );
+            let module = lower_mlir_module_for_program(
+                &program,
+                &[],
+                &input_types,
+                &[output_type],
+                "main",
+                None,
+                None,
+                Some("cuda"),
+            );
+            if block_bound == 3 {
+                assert_eq!(module.err().unwrap(), LoweringError::UnsupportedOp {
+                op: "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must preserve the physical element count".to_string(),
+            });
+                continue;
+            }
+            let module = module.unwrap().stable_hlo;
 
-        assert!(module.contains("call @xla.scaled_dot"));
-        assert!(module.contains("stablehlo.custom_call @ryft.assert"));
-        assert!(!module.contains("stablehlo.composite \"xla.scaled_dot\""));
+            assert!(module.contains("call @xla.scaled_dot"));
+            assert!(module.contains("stablehlo.custom_call @ryft.assert"));
+            assert!(!module.contains("stablehlo.composite \"xla.scaled_dot\""));
+        }
     }
 
     #[test]
@@ -19074,6 +21166,283 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_concatenate_refined_result_extents() {
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        // The actual sum is three, while the input allocation bounds sum to eight. Both tighter and wider declared
+        // output bounds must preserve the logical concatenation, including a fully static result refinement.
+        for data_type in [DataType::I64, DataType::C64] {
+            let element = if data_type == DataType::I64 { "i64" } else { "complex<f32>" };
+            for extent in [
+                DimensionValue::constant(3).unwrap(),
+                DimensionValue::new(
+                    DimensionType::new(DimensionVariable::new("result", DimensionBounds::new(0, Some(5)).unwrap())),
+                    3,
+                )
+                .unwrap(),
+                DimensionValue::new(
+                    DimensionType::new(DimensionVariable::new("result", DimensionBounds::new(0, Some(11)).unwrap())),
+                    3,
+                )
+                .unwrap(),
+            ] {
+                let first_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("first", Some(5))]));
+                let second_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("second", Some(5))]));
+                let extent_type = extent.r#type().into_owned();
+                let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+                    0,
+                    &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
+                )
+                .unwrap();
+                let mut builder = CompositeXlaProgramBuilder::new();
+                let first = builder.add_input(first_type.clone().into());
+                let second = builder.add_input(second_type.clone().into());
+                let extent = builder
+                    .add_instruction(
+                        DimensionOperation::from(ConstantOperation::new(extent)),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap()[0];
+                let result =
+                    builder.add_instruction(operation, Vec::new(), vec![first, second, extent], None).unwrap()[0];
+                let program = builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap();
+                let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+                let module = to_mlir_module_for_program(
+                    &program,
+                    &[],
+                    &vec![first_type, second_type],
+                    &vec![output_type.clone()],
+                    "concatenate_dynamic",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let bound = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
+                // Inputs carry static storage plus hidden i32 extents; dynamic outputs also return hidden i64 extents.
+                let storage_type = format!("tensor<{bound}x{element}>");
+                let body = if output_type.static_shape().is_some() {
+                    format!(
+                        indoc! {r#"
+                        %result = func.call @concatenate_dynamic(%left, %right, %left_size, %right_size)
+                            : (tensor<4x{element}>, tensor<4x{element}>, tensor<i32>, tensor<i32>) -> {storage_type}
+                        return %result : {storage_type}
+                    "#},
+                        element = element,
+                        storage_type = storage_type
+                    )
+                } else {
+                    let result_type = format!("tensor<?x{element}, #stablehlo.bounds<{bound}>>");
+                    format!(
+                        indoc! {r#"
+                        %result, %extent = func.call @concatenate_dynamic(%left, %right, %left_size, %right_size)
+                            : (tensor<4x{element}>, tensor<4x{element}>, tensor<i32>, tensor<i32>)
+                                -> ({result_type}, tensor<i64>)
+                        %bound = stablehlo.constant dense<{bound}> : tensor<i32>
+                        %storage = stablehlo.set_dimension_size %result, %bound, dim = 0
+                            : ({result_type}, tensor<i32>) -> {storage_type}
+                        return %storage : {storage_type}
+                    "#},
+                        element = element,
+                        result_type = result_type,
+                        bound = bound,
+                        storage_type = storage_type
+                    )
+                };
+                let prefix = module
+                    .strip_suffix("}\n")
+                    .unwrap()
+                    .replace("func.func @concatenate_dynamic", "func.func private @concatenate_dynamic");
+                let module = format!(
+                    indoc! {r#"
+                    {prefix}
+                    func.func @main(%left: tensor<4x{element}>, %right: tensor<4x{element}>,
+                                    %left_size: tensor<i32>, %right_size: tensor<i32>) -> {storage_type} {{
+                      {body}
+                    }}
+                    }}
+                "#},
+                    prefix = prefix,
+                    element = element,
+                    storage_type = storage_type,
+                    body = body
+                );
+                let executable = client
+                    .compile(
+                        &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                        &ragged_dot_cpu_compilation_options(),
+                    )
+                    .unwrap();
+                let device = executable.addressable_devices().unwrap().remove(0);
+                // Decode complex fixture bytes as opaque words so assertions compare exact signed-zero and imaginary bits.
+                let left = if data_type == DataType::I64 {
+                    vec![i64::MAX, 13, 14, 15]
+                } else {
+                    values_from_bytes::<i64>(&values_to_bytes(&[1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0]))
+                };
+                let right = if data_type == DataType::I64 {
+                    vec![i64::MIN, 9_007_199_254_740_993, 17, 18]
+                } else {
+                    values_from_bytes::<i64>(&values_to_bytes(&[-0_f32, 0.0, 7.0, -8.0, 9.0, -10.0, 11.0, -12.0]))
+                };
+                for (left_size, right_size) in [(1_i32, 2_i32), (0, 3), (2, 2)] {
+                    let inputs = vec![
+                        ExecutionInput {
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        values_to_bytes(&left).as_slice(),
+                                        data_type.to_pjrt(),
+                                        [4],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
+                            donatable: false,
+                        },
+                        ExecutionInput {
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        values_to_bytes(&right).as_slice(),
+                                        data_type.to_pjrt(),
+                                        [4],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
+                            donatable: false,
+                        },
+                        ExecutionInput {
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        values_to_bytes(&[left_size]).as_slice(),
+                                        BufferType::I32,
+                                        [],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
+                            donatable: false,
+                        },
+                        ExecutionInput {
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        values_to_bytes(&[right_size]).as_slice(),
+                                        BufferType::I32,
+                                        [],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
+                            donatable: false,
+                        },
+                    ];
+                    let execution = executable
+                        .execute(
+                            vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                            Vec::new(),
+                            0,
+                            None,
+                            Some(file!()),
+                            None,
+                            None,
+                        )
+                        .and_then(|execution| execution.block_until_ready());
+                    if left_size + right_size != 3 {
+                        assert!(matches!(execution, Err(error)
+                            if error.to_string().contains("expected 4 but got 3")));
+                        continue;
+                    }
+                    let execution = execution.unwrap().remove(0);
+                    let observed = execution.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                    let expected = left[..left_size as usize]
+                        .iter()
+                        .chain(&right[..right_size as usize])
+                        .copied()
+                        .collect::<Vec<_>>();
+                    assert_eq!(&values_from_bytes::<i64>(observed.as_slice())[..3], expected.as_slice());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_concatenate_tree() {
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = (0..33).map(|_| builder.add_input(test_vector_type(1))).collect::<Vec<_>>();
+        let joined =
+            builder.add_instruction(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.concatenate").count(), 3);
+        assert!(module.contains("-> tensor<33xf32>"), "{module}");
+    }
+
+    #[test]
+    fn test_lower_concatenate_explicit_sharding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, vec![4]).with_sharding(sharding.clone()).unwrap();
+        let domain = XlaDomain::new(&client);
+        let compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), ArrayType> = compile(
+            |(first, second)| first.concatenate_with([&second], 0).unwrap(),
+            (input_type.clone(), input_type.clone()),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let first = DeviceArray::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes(&[1_i64, 2, 3, 4]),
+        )
+        .unwrap();
+        let second =
+            DeviceArray::from_host_buffer(&client, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
+        let output = domain.interpret(&compiled.executable_function(), (first, second)).unwrap();
+        assert_eq!(output.r#type().sharding(), Some(&sharding));
+        for (index, device) in devices.iter().enumerate() {
+            let bytes = output
+                .device_shard(device.id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            let expected = if index == 0 { vec![1_i64, 2, 3, 4] } else { vec![5_i64, 6, 7, 8] };
+            assert_eq!(values_from_bytes::<i64>(bytes.as_slice()), expected);
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_strided_slice_and_pad() {
         let vector_type = test_vector_type(6);
         let pad_input_type = test_vector_type(3);
@@ -19265,9 +21634,9 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<8xf64>) -> (tensor<3xf64>, tensor<f64>) {
+                    %0 = stablehlo.slice %arg0 [1:6:2] : (tensor<8xf64>) -> tensor<3xf64>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                    %0 = stablehlo.pad %arg0, %cst, low = [-1], high = [-2], interior = [0] : (tensor<8xf64>, tensor<f64>) -> tensor<5xf64>
-                    %1 = stablehlo.slice %0 [0:5:2] : (tensor<5xf64>) -> tensor<3xf64>
+                    %1 = stablehlo.pad %0, %cst, low = [0], high = [0], interior = [0] : (tensor<3xf64>, tensor<f64>) -> tensor<3xf64>
                     %c = stablehlo.constant dense<false> : tensor<i1>
                     %2 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
                     %c_0 = stablehlo.constant dense<true> : tensor<i1>
@@ -19592,7 +21961,7 @@ mod tests {
             .unwrap()[0];
         let iota = builder
             .add_instruction(
-                ArrayIrOperation::<XlaArrayConstant>::Iota(IotaOperation::new(output_type, 0).unwrap()),
+                ArrayIrOperation::<XlaArrayConstant>::Iota(IotaOperation::new(output_type.clone(), 0).unwrap()),
                 Vec::new(),
                 vec![dimension],
                 None,
@@ -19608,15 +21977,47 @@ mod tests {
                 vec![Placeholder; 4],
             )
             .unwrap();
-        let static_type = ArrayType::new_static(DataType::F32, [3]);
-        assert_eq!(program.output_types(), vec![ArrayIrType::Array(static_type.clone()); 4]);
+        assert_eq!(program.output_types(), vec![ArrayIrType::Array(output_type.clone()); 4]);
         let input_types: [ArrayType; 0] = [];
         let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &vec![static_type; 4], "main", None, None).unwrap();
-        // The stored constructors retain their dimension input, but singleton results need no runtime refinement.
+            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type; 4], "main", None, None).unwrap();
+        // Even a singleton dimension retains its declared identity and logical extent in the lowered signature.
         assert_eq!(module.matches("stablehlo.broadcast_in_dim").count(), 3, "{module}");
         assert_eq!(module.matches("stablehlo.iota").count(), 1, "{module}");
-        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 0, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 4, "{module}");
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let outputs = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &[], ..Default::default() }],
+                vec![],
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap()
+            .remove(0)
+            .outputs;
+        for (output, expected) in
+            outputs
+                .iter()
+                .take(4)
+                .zip([[0_f32, 0.0, 0.0], [1_f32, 1.0, 1.0], [0_f32, 1.0, 2.0], [1_f32, 1.0, 1.0]])
+        {
+            assert_eq!(
+                output.copy_to_host(None).unwrap().r#await().unwrap(),
+                expected.into_iter().flat_map(f32::to_ne_bytes).collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[test]

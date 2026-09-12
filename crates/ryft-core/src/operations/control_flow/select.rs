@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::arrays::{Array, ArrayAddressing, ArrayType, Broadcastable, DataType};
+use crate::arrays::{Array, ArrayAddressing, ArrayType, Broadcastable, DataType, Sharding, ShardingDimension};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -132,12 +132,49 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
             )));
         }
 
-        // Broadcast the three operand shapes together and promote the two branch data types, retyping the Boolean
-        // condition to a branch data type first so it acts as a mask rather than a value that promotes into the result.
-        // The output shape and placement are then the standard elementwise broadcast of all three operands, and the
-        // output data type is the promotion of the two branch data types.
-        let condition = condition.clone().with_data_type(on_true.data_type());
-        Ok(vec![self.infer_elementwise_broadcast_type(&[condition, on_true.clone(), on_false.clone()])?])
+        let unreduced = on_true.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+        let reduced = on_true.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
+        if on_false.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default() != unreduced
+            || on_false.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default() != reduced
+        {
+            return Err(TypeError::invalid("`select` branches must carry identical reduction state"));
+        }
+        if let Some(sharding) = condition.sharding() {
+            if !sharding.unreduced_axes().is_empty() {
+                return Err(TypeError::invalid("`select` condition must not carry unreduced state"));
+            }
+            for axis in unreduced.union(&reduced) {
+                if sharding.varying_manual_axes().contains(axis)
+                    || sharding
+                        .dimensions()
+                        .iter()
+                        .any(|dimension| matches!(dimension, ShardingDimension::Sharded(axes) if axes.contains(axis)))
+                {
+                    return Err(TypeError::invalid(
+                        "`select` condition must be invariant over the branches' reduction axes",
+                    ));
+                }
+            }
+        }
+
+        // Selection is linear in its branches when its discrete condition is invariant over their reduction axes.
+        // Broadcast geometry and placement without pending reductions, then restore the shared branch state on the
+        // result. An already-reduced condition is a valid ordinary Boolean value; an unreduced condition is not.
+        // These temporary descriptors only drive inference; no runtime value is retagged.
+        let condition = condition.without_reduction_axes().with_data_type(on_true.data_type());
+        let mut output_type = self.infer_elementwise_broadcast_type(&[
+            condition,
+            on_true.without_reduction_axes(),
+            on_false.without_reduction_axes(),
+        ])?;
+        if let Some(sharding) = output_type.sharding().cloned() {
+            let sharding = sharding
+                .with_unreduced_axes(unreduced)
+                .and_then(|sharding| sharding.with_reduced_axes(reduced))
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            output_type = output_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+        }
+        Ok(vec![output_type])
     }
 }
 
@@ -355,17 +392,11 @@ where
 
 impl Select for Array {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
-        // the three operand shapes broadcast together, and the two branch data types promote together to the output
-        // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
-        // acts as a mask rather than promoting into the output.
-        assert_eq!(condition.r#type().data_type(), DataType::Boolean, "select condition must have a Boolean data type");
-        let output_type = ArrayType::broadcasted(&[
-            condition.r#type().into_owned().with_data_type(on_true.r#type().data_type()),
-            on_true.r#type().into_owned(),
-            on_false.r#type().into_owned(),
-        ])
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let output_type = ElementwiseOperation::infer_output_types(
+            &SelectOperation::<ArrayType>::new(),
+            &[condition.r#type().into_owned(), on_true.r#type().into_owned(), on_false.r#type().into_owned()],
+        )?
+        .remove(0);
 
         // Convert only when promotion requires it. Equal-typed branches retain their original physical storage and
         // arbitrary layouts; conversion remains responsible for the element semantics until its own typed-byte slice.
@@ -415,7 +446,7 @@ impl Select for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Dimension, Layout, Shape, StridedLayout};
+    use crate::arrays::{Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, StridedLayout};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::macros::{
@@ -486,6 +517,69 @@ mod tests {
                     output_types = [branch_type.clone()],
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_select_type_inference_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let branch = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding).unwrap();
+        let condition = ArrayType::new_static(DataType::Boolean, [2]);
+        let operation = SelectOperation::<ArrayType>::new();
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(&operation, &[condition.clone(), branch.clone(), branch.clone()]),
+            Ok(vec![branch.clone()])
+        );
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(
+                &operation,
+                &[condition.clone(), branch.clone(), branch.without_reduction_axes()]
+            ),
+            Err(TypeError::invalid("`select` branches must carry identical reduction state"))
+        );
+        let reduced_condition = condition
+            .clone()
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(&operation, &[reduced_condition, branch.clone(), branch.clone()]),
+            Ok(vec![branch.clone()])
+        );
+        let unreduced_condition = condition.clone().with_sharding(branch.sharding().cloned()).unwrap();
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(
+                &operation,
+                &[unreduced_condition, branch.clone(), branch.clone()]
+            ),
+            Err(TypeError::invalid("`select` condition must not carry unreduced state"))
+        );
+        let varying_condition = condition
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(&operation, &[varying_condition, branch.clone(), branch.clone()]),
+            Err(TypeError::invalid("`select` condition must be invariant over the branches' reduction axes"))
+        );
+        assert_eq!(
+            Array::select(
+                &Array::vector(vec![true, false]).unwrap(),
+                &Array::from_elements(branch.clone(), &[1f32, 2.0]).unwrap(),
+                &Array::from_elements(branch.clone(), &[3f32, 4.0]).unwrap(),
+            ),
+            Ok(Array::from_elements(branch, &[1f32, 4.0]).unwrap())
+        );
+        assert!(
+            matches!(Array::select(&Array::scalar(1f32).unwrap(), &Array::scalar(2f32).unwrap(), &Array::scalar(3f32).unwrap()), Err(ProgramError::Type(error)) if error == TypeError::invalid("`select` condition data type `f32` is not `bool`"))
         );
     }
 

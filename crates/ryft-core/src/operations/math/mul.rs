@@ -3,13 +3,14 @@ use std::ops::Mul as StandardMul;
 use std::sync::Arc;
 
 use crate::arrays::{Array, ArrayAddressing, ArrayElement, ArrayType, NumericArrayElement};
+use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     dispatch_on_array_element_type, impl_differentiable_elementwise_operation,
 };
 use crate::operations::ElementwiseOperation;
-use crate::programs::{Operation, ProgramError, TypeError, Typed};
+use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -118,10 +119,47 @@ impl_differentiable_elementwise_operation! {
         O: From<MulOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
-        [left = @linear, right = @known] =>
-            |output_cotangent| right.binary(output_cotangent, MulOperation::new());
-        [left = @known, right = @linear] =>
-            |output_cotangent| left.binary(output_cotangent, MulOperation::new());
+        |_operation, context, _driver, inputs, outputs, accumulators| {
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            let (linear, known) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
+                (true, false) => (0, 1),
+                (false, true) => (1, 0),
+                (left_linear, right_linear) => return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `mul` does not support transposition for input pattern [left = {}, right = {}]",
+                        if left_linear { "linear" } else { "known" },
+                        if right_linear { "linear" } else { "known" },
+                    ),
+                }.into()),
+            };
+            let target = inputs[linear].r#type().cotangent()?;
+            let contribution = match &outputs[0] {
+                MaybeZero::Zero(_) => MaybeZero::Zero(target),
+                MaybeZero::Value(cotangent) => {
+                    if target.is_zero_space() {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "linear input `{}` of operation `mul` has no cotangent space",
+                                if linear == 0 { "left" } else { "right" },
+                            ),
+                        }.into());
+                    }
+                    // The coefficient is a primal value: keep its reduction state when multiplying the dual
+                    // cotangent. Broadcasting and promotion happen in multiplication's own inference.
+                    let coefficient = inputs[known].as_known().unwrap();
+                    let mut contribution = context.stage_operation(
+                        MulOperation::new(),
+                        Vec::new(),
+                        &[coefficient.clone(), cotangent.clone()],
+                    )?;
+                    check_count!("output", contribution, 1, ProgramError);
+                    MaybeZero::Value(contribution.remove(0).unalign_cotangent(&target)?)
+                }
+            };
+            accumulators[linear].accumulate(context, contribution)
+        }
     },
 }
 
@@ -496,6 +534,32 @@ mod tests {
                             %3:f64[] = reduce_sum [axes=[0]] %2
                         in (%3)
                     "},
+                },
+            ],
+        );
+
+        // A reduced primal coefficient stays reduced when scaling an unreduced output cotangent.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let cotangent_type = reduced_type.cotangent().unwrap();
+        let coefficient = Array::from_elements(reduced_type.clone(), &[2.0_f64, 3.0]).unwrap();
+        let cotangent = Array::from_elements(cotangent_type.clone(), &[4.0_f64, 5.0]).unwrap();
+        let expected = Array::from_elements(cotangent_type, &[8.0_f64, 15.0]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = MulOperation::new(),
+            cases = [
+                {
+                    inputs = [(@known, coefficient.clone()), (@linear(type = reduced_type.clone()))],
+                    output_cotangents = [cotangent.clone()],
+                    input_cotangents = [expected.clone()],
+                },
+                {
+                    inputs = [(@linear(type = reduced_type)), (@known, coefficient)],
+                    output_cotangents = [cotangent],
+                    input_cotangents = [expected],
                 },
             ],
         );

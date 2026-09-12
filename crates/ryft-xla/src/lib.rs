@@ -40,8 +40,45 @@ pub use telemetry::{constructed_array_count, dropped_array_count, live_array_cou
 #[cfg(test)]
 pub(crate) mod tests {
     use std::mem::MaybeUninit;
+    use std::sync::Once;
 
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+
+    /// Creates a single-device execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
+    ///
+    /// The default is `cpu`; `cuda-13` explicitly requires the corresponding feature, plugin, and a CUDA device.
+    /// Selection errors fail the test instead of silently falling back to CPU or skipping GPU coverage.
+    pub(crate) fn execution_client() -> Client<'static> {
+        let platform = std::env::var("RYFT_TEST_EXECUTION_PLATFORM").unwrap_or_else(|_| "cpu".to_string());
+        let client = match platform.as_str() {
+            "cpu" => load_cpu_plugin()
+                .unwrap()
+                .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+                .unwrap(),
+            #[cfg(feature = "cuda-13")]
+            "cuda-13" => load_cuda_13_plugin()
+                .unwrap()
+                .client(ClientOptions::GPU(GpuClientOptions {
+                    platform: Some(GpuPlatform::CUDA),
+                    allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                    ..Default::default()
+                }))
+                .unwrap(),
+            _ => panic!("unsupported execution platform `{platform}`; CUDA testing requires `--features cuda-13`"),
+        };
+        let expected = if platform == "cpu" { "cpu" } else { "cuda" };
+        assert!(client.platform_name().unwrap().eq_ignore_ascii_case(expected));
+        let devices = client.addressable_devices().unwrap();
+        assert!(!devices.is_empty(), "execution platform `{platform}` has no addressable devices");
+        static REPORTED_PLATFORM: Once = Once::new();
+        REPORTED_PLATFORM.call_once(|| {
+            eprintln!("execution test platform: {platform}; addressable devices: {devices:?}");
+        });
+        client
+    }
 
     pub(crate) fn logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![

@@ -80,8 +80,6 @@ mod control_flow;
 mod cumulative;
 mod custom_call;
 mod dimensions;
-mod indexing;
-mod manipulation;
 mod math;
 mod quantization;
 mod random;

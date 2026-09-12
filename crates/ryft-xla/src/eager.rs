@@ -299,16 +299,18 @@ mod tests {
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
         ConvertElementType, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin, CumulativeProduct, CumulativeSum,
         DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor,
-        ForwardModeDifferentiate, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType,
-        Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
-        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
-        ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
-        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
+        ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, Log, Log1p,
+        LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow,
+        ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
+        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
+        Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch,
+        differentiate_at, f4e2m1fn, f8e4m3fn,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
-        ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, values_from_bytes, values_to_bytes,
+        ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, execution_client, values_from_bytes,
+        values_to_bytes,
     };
     use crate::{Array, FromPjrt};
 
@@ -645,10 +647,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_integer_rounding() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         // Integer precision above a BF16 rounding midpoint must survive the conversion.
         let midpoint = (1u64 << 60) + (1u64 << 52);
@@ -701,10 +700,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_finite_float_extremes() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let values = [0.0_f32, -0.0, 1.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0];
         let input = f32_vector(&client, &mesh, &values);
@@ -743,10 +739,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_f64_rounding() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         for (data_type, midpoint, expected) in [
             (DataType::BF16, 1.00390625_f64, [0x3f80_u16, 0x3f80, 0x3f81]),
@@ -796,10 +789,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_complex_boolean() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         // Purely imaginary values and NaNs in either component are nonzero; signed zeros are false.
         let components = [0.0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
@@ -816,10 +806,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_one_bit_integers() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         // The same physical bits represent -1 for I1 and +1 for U1 and Boolean.
         for (data_type, expected) in
@@ -859,10 +846,7 @@ mod tests {
 
     #[test]
     fn test_array_convert_element_type_subbyte_carrier_boundaries() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let values = [
             -129.0f32,
@@ -902,10 +886,7 @@ mod tests {
 
     #[test]
     fn test_array_bitcast_element_type() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let input = f32_vector(&client, &mesh, &[1.0, -0.0]);
         let integers = input.bitcast_element_type(DataType::I32).unwrap();
@@ -924,10 +905,7 @@ mod tests {
 
     #[test]
     fn test_array_bitcast_element_type_one_bit() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let input =
             Array::from_host_buffer(&client, replicated_type(&mesh, DataType::U8, &[]), mesh.clone(), &[0xab]).unwrap();
@@ -2089,10 +2067,7 @@ mod tests {
 
     #[test]
     fn test_eager_transpose_and_reshape_round_trip() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let matrix = f32_matrix(&client, &mesh, 2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
@@ -2131,10 +2106,7 @@ mod tests {
 
     #[test]
     fn test_eager_manipulation_capabilities() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = cpu_mesh(&client);
         let vector = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
 
@@ -2172,6 +2144,97 @@ mod tests {
         // Tag and stop-gradient behave as eager identities on the payload.
         assert_eq!(read_f32s(&vector.clone().tag("residual")), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(read_f32s(&vector.stop_gradient()), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_eager_scatter_differentiation() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[2.0, 5.0]);
+        let indices = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[2, 1]),
+            mesh.clone(),
+            &values_to_bytes(&[0_i32, 0]),
+        )
+        .unwrap();
+        let updates = f32_vector(&client, &mesh, &[2.0, 2.0]);
+
+        // Both extrema divide the derivative equally between the retained input and its two tied updates.
+        for kind in [ScatterReductionKind::Min, ScatterReductionKind::Max] {
+            let (value, (input_gradient, updates_gradient)) = differentiate_at((input.clone(), updates.clone()))
+                .with_captures(indices.clone())
+                .in_context(&input.execution_domain())
+                .value_and_gradient(|(input, updates), indices| {
+                    input
+                        .scatter(
+                            &indices,
+                            &updates,
+                            &ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
+                        )
+                        .unwrap()
+                        .reduce(&[0], ReductionKind::Sum)
+                })
+                .unwrap();
+            assert_eq!(read_f32s(&value), vec![7.0]);
+            assert_eq!(read_f32s(&input_gradient), vec![1.0 / 3.0, 1.0]);
+            assert_eq!(read_f32s(&updates_gradient), vec![1.0 / 3.0, 1.0 / 3.0]);
+        }
+
+        // Duplicate overwrite may select either update. Its primal and pullback must select the same winner,
+        // and untouched elements must retain their identity derivative regardless of device scheduling.
+        let updates = f32_vector(&client, &mesh, &[7.0, 8.0]);
+        let (value, (input_gradient, updates_gradient)) = differentiate_at((input.clone(), updates))
+            .with_captures(indices)
+            .in_context(&input.execution_domain())
+            .value_and_gradient(|(input, updates), indices| {
+                input
+                    .scatter(
+                        &indices,
+                        &updates,
+                        &ScatterOperation::new(
+                            ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            ScatterReductionKind::Overwrite,
+                        ),
+                    )
+                    .unwrap()
+                    .reduce(&[0], ReductionKind::Sum)
+            })
+            .unwrap();
+        assert_eq!(read_f32s(&input_gradient), vec![0.0, 1.0]);
+        let gradient = read_f32s(&updates_gradient);
+        assert!(gradient == vec![1.0, 0.0] || gradient == vec![0.0, 1.0]);
+        assert_eq!(read_f32s(&value), vec![5.0 + 7.0 * gradient[0] + 8.0 * gradient[1]]);
+    }
+
+    #[test]
+    fn test_eager_gather_differentiation() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0]);
+        let indices = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[4, 1]),
+            mesh.clone(),
+            &values_to_bytes(&[-1_i32, 1, 1, 3]),
+        )
+        .unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+            .with_mode(GatherScatterMode::FillOrDrop)
+            .with_fill_value(CpuArray::scalar(7_f32).unwrap())
+            .unwrap();
+
+        // Out-of-bounds fill contributes to the primal, but never to an input cotangent. Repeated valid indices
+        // accumulate their cotangents through the inverse scatter on the selected execution device.
+        let (value, gradient) = differentiate_at(input.clone())
+            .with_captures(indices)
+            .in_context(&input.execution_domain())
+            .value_and_gradient(|input, indices| {
+                input.gather(&indices, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
+            })
+            .unwrap();
+        assert_eq!(read_f32s(&value), vec![54.0]);
+        assert_eq!(read_f32s(&gradient), vec![0.0, 2.0, 0.0]);
     }
 
     #[test]

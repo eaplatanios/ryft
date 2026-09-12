@@ -5,12 +5,14 @@
 //! Eager evaluation and staging allow unbounded dimensions. Executable zero, one, iota, and like constructors need
 //! finite allocation bounds. Their dynamic extents must fit signed 32-bit size carriers; a bound reserves storage,
 //! while the explicit dimension inputs or exemplar sizes determine the runtime shape. Explicit constructor layouts
-//! support dense minor-to-major axis permutations; byte-strided layouts and physical tiles are rejected.
+//! support dense minor-to-major axis permutations; byte-strided layouts and physical tiles are rejected. Concatenation
+//! and padding result refinements resize bounded storage, so reconciling a different result extent or allocation bound
+//! requires finite input and output allocation bounds too.
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
-    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, EffectClass, Layout, Operation,
-    ProgramError, Shape,
+    Dimension, DimensionAddOperation, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
+    DimensionType, DimensionVariable, EffectClass, Layout, Operation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -21,13 +23,15 @@ use ryft_mlir::{
 use super::{
     CollectiveLoweringState, EffectTokens, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
     PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
-    lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
-    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
-    lower_dimension_requirement_to_assertion, lower_dynamic_shape_slice_assertion, lower_pad_to_mlir,
+    lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_concatenate_tree,
+    lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
+    lower_dimension_arithmetic_assertion, lower_dimension_extent, lower_dimension_requirement_to_assertion,
+    lower_dynamic_shape_slice_assertion, lower_pad_extent_assertion, lower_pad_to_mlir,
     lower_parallel_sum_scatter_to_mlir, lower_physical_bound_value, lower_ragged_all_to_all_to_mlir,
-    lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64, lower_sharding_constraint,
-    lower_static_index_constants, lower_tensor_type, physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    lower_reshape_element_count_assertion, lower_restore_dynamic_dimensions, lower_rng_bit_generator_to_mlir,
+    lower_runtime_dimension_size_i64, lower_sharding_constraint, lower_static_index_constants, lower_tensor_type,
+    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
+    static_dimensions,
 };
 
 /// Constrains a statically allocated constructor result before attaching its runtime dimensions.
@@ -124,14 +128,10 @@ fn plan_dynamic_shape_slice_axis(
             (variable.bounds().lower(), upper - 1)
         }
     };
-    if span > input_physical_size {
-        return Err(LoweringError::UnsupportedOp {
-            op: format!(
-                "{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} physical span {span} exceeds physical input axis {axis} size \
-                 {input_physical_size}",
-            ),
-        });
-    }
+    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| LoweringError::UnsupportedOp {
+        op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
+    })?;
+    reshape_dimension_i32(padded_size)?;
     let bounds_prove_runtime_in_bounds = start_type
         .bounds()
         .upper()
@@ -375,21 +375,6 @@ pub(super) fn lower_array_ir_operation<'b, 'c: 'b, 't: 'c, A>(
 where
     A: MlirLowerableValue,
 {
-    // Singleton-bound constructor inputs remain in the IR signature, but their axes are already static in
-    // the inferred result and no longer need runtime size refinement.
-    let constructor_inputs;
-    let input_values = if matches!(
-        operation,
-        ArrayIrOperation::Zero(_) | ArrayIrOperation::One(_) | ArrayIrOperation::Iota(_)
-    ) {
-        constructor_inputs = input_types.iter().zip(input_values).filter_map(|(r#type, value)| {
-            matches!(r#type, ArrayIrType::Dimension(dimension) if matches!(dimension.to_dimension(), Dimension::Dynamic(_)))
-                .then_some(*value)
-        }).collect::<Vec<_>>();
-        constructor_inputs.as_slice()
-    } else {
-        input_values
-    };
     match operation {
         ArrayIrOperation::Zero(operation) => {
             lower_dynamic_constructor(operation.name(), 0, input_values, output_types, block, context, location)
@@ -660,6 +645,62 @@ where
             };
             let output_type =
                 <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let Some((input_type, _)) = input_types.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let input_type =
+                <&ArrayType>::try_from(input_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            if output_extents.len() != output_type.rank() {
+                return Err(ProgramError::InvalidInputCount {
+                    expected: output_type.rank() + 1,
+                    actual: input_values.len(),
+                }
+                .into());
+            }
+
+            // Native reshape requires equal allocation capacities even when the runtime logical products agree.
+            // Reject unsupported bound combinations here rather than letting HLO import fail with a static-count error.
+            let physical_input = physical_bound_type(input_type).map_err(|_| LoweringError::UnsupportedOp {
+                op: "reshape requires finite physical bounds for every dynamic input dimension".to_string(),
+            })?;
+            let physical_output = physical_bound_type(output_type).map_err(|_| LoweringError::UnsupportedOp {
+                op: "reshape requires finite physical bounds for every dynamic output dimension".to_string(),
+            })?;
+            let input_capacity = physical_input.element_count().map_err(ProgramError::from)?.unwrap();
+            let output_capacity = physical_output.element_count().map_err(ProgramError::from)?.unwrap();
+            if input_capacity != output_capacity {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "reshape with unequal physical capacities (input {input_capacity}, output {output_capacity}); \
+                         dynamic bounds must preserve the physical element count",
+                    ),
+                });
+            }
+
+            if operation.effects().classes().contains(EffectClass::OrderedAssertion) {
+                // Keep products on the checked host assertion path. Multiplying extents in i64 on the device could
+                // overflow before the mismatch is diagnosed, or reject a valid empty shape with large other axes.
+                let mut input_extents = Vec::with_capacity(input_type.rank());
+                for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
+                    let extent = match dimension {
+                        Dimension::Static(extent) => {
+                            lower_static_index_constants(&[*extent], block, context, location)?[0]
+                        }
+                        Dimension::Dynamic(_) => {
+                            lower_runtime_dimension_size_i64(*input, axis, block, context, location)?
+                        }
+                    };
+                    input_extents.push(extent);
+                }
+                lower_reshape_element_count_assertion(
+                    &input_extents,
+                    output_extents,
+                    effect_tokens,
+                    block,
+                    context,
+                    location,
+                )?;
+            }
             let input = if let Some(dimensions) = operation.dimensions() {
                 let transpose = block.append_operation(stable_hlo::transpose(
                     *input,
@@ -861,10 +902,80 @@ where
                 )?;
             }
 
-            // StableHLO receives only the physical arrays. The trailing scalar is consumed by the optional assertion
-            // or is redundant with the type-level proof.
-            let result = block.append_operation(stable_hlo::concatenate(array_inputs, operation.axis(), location)?)?;
-            Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+            // The explicit extent may refine the sum's bound or even prove a static result. Native concatenate
+            // infers its own bound from its inputs, so reconcile that physical type with the declared result.
+            let mut result = lower_concatenate_tree(array_inputs, operation.axis(), block, location)?;
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            let output_type =
+                <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            let expected_type = lower_tensor_type(output_type, context, location)?;
+            if result.r#type()? != expected_type.as_ref() {
+                let inputs = array_input_types
+                    .iter()
+                    .map(<&ArrayType>::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| LoweringError::Tracing(error.into()))?;
+                let mut inferred_extent = DimensionSizeOperation::new(inputs[0], operation.axis())
+                    .map_err(ProgramError::from)?
+                    .result_type()
+                    .clone();
+                for input in &inputs[1..] {
+                    let extent = DimensionSizeOperation::new(input, operation.axis()).map_err(ProgramError::from)?;
+                    let sum = DimensionAddOperation::new(&inferred_extent, extent.result_type())
+                        .map_err(ProgramError::from)?;
+                    inferred_extent =
+                        DimensionType::new(DimensionVariable::new(sum.result_name(), sum.result_bounds()));
+                }
+                let mut inferred_dimensions = output_type.shape().dimensions().to_vec();
+                // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.
+                inferred_dimensions[operation.axis()] = Dimension::Dynamic(inferred_extent.variable().clone());
+                let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
+                let physical_input_type = physical_bound_type(&inferred_type)?;
+                let physical_output_type = physical_bound_type(output_type)?;
+                reshape_dimension_i32(physical_output_type.dimension(operation.axis()).value().unwrap())?;
+                let logical_result = result;
+                // Concatenate has already packed logical input extents contiguously. Expose its bounded storage,
+                // resize only its trailing padding, then restore the logical dimensions. Reshape cannot change an
+                // allocation bound in XLA, even when its runtime element count stays unchanged.
+                let padding_value = i64::from(output_type.data_type() == DataType::F8E8M0FNU);
+                result =
+                    lower_physical_bound_value(result, &inferred_type, padding_value as f64, block, context, location)?;
+                let mut high_padding = vec![0; output_type.rank()];
+                high_padding[operation.axis()] =
+                    reshape_dimension_i64(physical_output_type.dimension(operation.axis()).value().unwrap())?
+                        - reshape_dimension_i64(physical_input_type.dimension(operation.axis()).value().unwrap())?;
+                if high_padding[operation.axis()] != 0 {
+                    // Padding is outside the logical extent; choose a representable value even for the exponent-only
+                    // float format, which has no zero encoding.
+                    let padding = lower_constant_output(
+                        &[ArrayType::scalar(output_type.data_type())],
+                        padding_value,
+                        block,
+                        context,
+                        location,
+                    )?[0];
+                    let resized = block.append_operation(stable_hlo::pad(
+                        result,
+                        padding,
+                        &vec![0; output_type.rank()],
+                        &high_padding,
+                        &vec![0; output_type.rank()],
+                        location,
+                    )?)?;
+                    result = resized.result(0).unwrap().as_ref();
+                }
+                result = lower_restore_dynamic_dimensions(
+                    result,
+                    output_type,
+                    &(0..output_type.rank()).map(|axis| (logical_result, axis)).collect::<Vec<_>>(),
+                    block,
+                    context,
+                    location,
+                )?;
+            }
+            Ok(vec![result])
         }
         ArrayIrOperation::CustomCall(operation) => {
             let dynamic_output_dimension_count = operation
@@ -970,38 +1081,36 @@ where
                 }
                 .into());
             }
-            let mut results = lower_pad_to_mlir(
+            if operation.effects().classes().contains(EffectClass::OrderedAssertion) {
+                for axis in 0..output_type.rank() {
+                    let input_extent =
+                        lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
+                    lower_pad_extent_assertion(
+                        operation,
+                        axis,
+                        input_extent,
+                        input_values[axis + 2],
+                        effect_tokens,
+                        block,
+                        context,
+                        location,
+                    )?;
+                }
+            }
+            let results = lower_pad_to_mlir(
                 operation,
                 &input_values[..2],
+                &input_types[..2]
+                    .iter()
+                    .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ProgramError::from)?,
                 std::slice::from_ref(output_type),
+                Some(&input_values[2..]),
                 block,
                 context,
                 location,
             )?;
-            let i32_scalar_type = context
-                .tensor_type(context.signless_integer_type(32), &[], None, location)
-                .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
-            let mut refined_type = output_type.clone();
-            for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-                if !matches!(dimension, Dimension::Dynamic(_)) {
-                    continue;
-                }
-                let extent =
-                    block.append_operation(stable_hlo::convert(input_values[axis + 2], i32_scalar_type, location)?)?;
-                let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
-                let mut dimensions = refined_type.shape().dimensions().to_vec();
-                dimensions[axis] = dimension;
-                refined_type = refined_type.with_shape(Shape::new(dimensions));
-                let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
-                let result = block.append_operation(stable_hlo::set_dimension_size(
-                    results[0],
-                    extent,
-                    refined_tensor_type,
-                    axis,
-                    location,
-                )?)?;
-                results[0] = result.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
-            }
             Ok(results)
         }
         ArrayIrOperation::DynamicShapeSlice(operation) => {
@@ -1056,13 +1165,34 @@ where
                 physical_spans.push(plan.span);
             }
 
-            // `real_dynamic_slice` is not accepted by the pinned XLA translator. Extract each axis's maximum admitted
-            // physical span with the ordinary dynamic-slice operation, apply static strides, and then restore the
-            // logical runtime sizes. The checks above ensure the physical span fits the bound-shaped buffer and
-            // preserve eager semantics with a runtime assertion whenever the declared bounds alone do not prove the
-            // logical slice limit valid. Therefore, `dynamic_slice` clamps only executions that fail the assertion.
+            // Reserve enough trailing storage for the maximum window at every valid runtime start. Without this,
+            // native dynamic_slice clamps a small valid runtime slice near the end to fit the larger bound window.
+            // Only the requested logical size is exposed, so padded values never become observable elements.
+            let padding_value = if input_type.data_type() == DataType::F8E8M0FNU { 1 } else { 0 };
+            let physical_input =
+                lower_physical_bound_value(*input, input_type, padding_value as f64, block, context, location)?;
+            let padding = lower_constant_output(
+                &[ArrayType::scalar(input_type.data_type())],
+                padding_value,
+                block,
+                context,
+                location,
+            )?[0];
+            let high_padding = physical_spans.iter().map(|span| *span as i64).collect::<Vec<_>>();
+            let padded = block
+                .append_operation(stable_hlo::pad(
+                    physical_input,
+                    padding,
+                    &vec![0; rank],
+                    &high_padding,
+                    &vec![0; rank],
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
             let slice = block.append_operation(stable_hlo::dynamic_slice(
-                *input,
+                padded,
                 starts,
                 physical_spans.as_slice(),
                 location,
@@ -1315,10 +1445,8 @@ mod tests {
         );
 
         assert_eq!(
-            unsupported_operation(
-                plan_dynamic_shape_slice_axis(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap_err(),
-            ),
-            "dynamic_shape_slice physical span 4 exceeds physical input axis 0 size 3",
+            plan_dynamic_shape_slice_axis(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap(),
+            DynamicShapeSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
         );
 
         let bounded_input =

@@ -1879,7 +1879,7 @@ mod tests {
         XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
         compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{AdaptiveProfileGuidedOptions, Array, FromPjrt, XlaDomain, XlaOptions};
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -2109,10 +2109,7 @@ mod tests {
 
     #[test]
     fn test_compile_converted_broadcast() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
         let input_type = ArrayType::new_static(DataType::F32, [3])
@@ -4545,10 +4542,7 @@ mod tests {
 
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = execution_client();
         let devices = client.addressable_devices().unwrap();
         let device = &devices[0];
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();

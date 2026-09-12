@@ -1039,8 +1039,8 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output = context.dynamic_zero(&output_type, std::slice::from_ref(&dimension)).unwrap();
 
-        // Singleton bounds refine the inferred result without removing the declared dynamic input.
-        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        // The explicit dimension input binds the declared identity even when its bounds imply one extent.
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
         let program = context
             .builder()
             .borrow()

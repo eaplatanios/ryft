@@ -5,7 +5,7 @@
 //! with runtime shapes. [`Constant`] carries an existing value, while [`ZeroLike`] and [`OneLike`] obtain their
 //! geometry from an exemplar and therefore need no separate dynamic capability.
 
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
 use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
@@ -182,8 +182,8 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 /// contract, which derives *every* output axis from an input (including exact constants): a constructor's static axes
 /// have no input geometry to relate to, so passing them as inputs would only grow the interpreted representation. A
 /// stored type with no dynamic axes is valid with no inputs, although canonical operation-family lifts prefer the
-/// equivalent homogeneous nullary constructor inside the array member family. Singleton-bounded dynamic axes refine to
-/// their static extent in the inferred result, while the stored descriptor and required input count remain unchanged.
+/// equivalent homogeneous nullary constructor inside the array member family. Dynamic axes retain their declared
+/// identities, including singleton-bounded axes; the explicit dimension inputs bind those identities in the result.
 pub(crate) fn infer_array_ir_constant_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
@@ -214,18 +214,8 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
         }
     }
 
-    // Singleton bounds determine an exact size without changing the stored constructor input signature.
-    let dimensions = r#type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            Dimension::Static(_) => dimension.clone(),
-            Dimension::Dynamic(variable) => DimensionType::new(variable.clone()).to_dimension(),
-        })
-        .collect();
-
-    Ok(vec![ArrayIrType::Array(r#type.clone().with_shape(Shape::new(dimensions)))])
+    // Exact input-variable validation above establishes the declared identity, even when its bounds imply one size.
+    Ok(vec![ArrayIrType::Array(r#type.clone())])
 }
 
 /// Checks that the provided dimension inputs agree with the symbolic shape declared by `type` before a dynamic
@@ -284,7 +274,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
-        DimensionVariable,
+        DimensionVariable, Shape,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::MemberInterpretableOperation;
@@ -400,10 +390,10 @@ mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.variable().clone().into(), 2.into()]));
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &r#type, &[dimension.into()], &[]),
-            Ok(vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 2]))]),
+            Ok(vec![ArrayIrType::Array(r#type.clone())]),
         );
 
-        // Refining the result does not remove the dimension input required by the stored descriptor.
+        // The declared singleton identity still requires its explicit dimension input.
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &r#type, &[], &[]),
             Err(TypeError::invalid(

@@ -6106,8 +6106,8 @@ mod tests {
     -> Result<(), ProgramError> {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
 
-        // Projected member rules that have no ragged contract fail at the shared replay boundary if they discard the
-        // carrier metadata. A static slice of the bounded storage must not silently expose padding as live data.
+        // Slicing rejects unsupported ragged inputs before replay can discard their carrier metadata.
+        // A static slice of the bounded storage must not silently expose padding as live data.
         let slice: Result<ArrayIrValue<Array>, BatchingError> = batch(
             |(value, extent)| {
                 let extent = extent.to_dimension(variable.clone())?;
@@ -6125,14 +6125,13 @@ mod tests {
         );
         assert_eq!(
             slice,
-            Err(BatchingError::UnsupportedOperation {
-                message: "operation `slice` neither preserves nor consumes bounded ragged dimension `length`"
-                    .to_string(),
-            }),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation {
+                message: "`slice` does not support bounded ragged array inputs".to_string(),
+            })),
         );
 
-        // Mixed rules are subject to the same fail-closed carrier validation. Concatenating along the static axis
-        // cannot silently turn the unrelated ragged axis's padded bound into a logical extent.
+        // Concatenation preserves the unrelated ragged axis, which still cannot escape as an ordinary array
+        // at the transform output boundary. Its physical padding must never become logical data.
         let concatenation: Result<ArrayIrValue<Array>, BatchingError> = batch(
             |(value, extent)| {
                 let extent = extent.to_dimension(variable.clone())?;
@@ -6165,8 +6164,7 @@ mod tests {
         assert_eq!(
             concatenation,
             Err(BatchingError::UnsupportedOperation {
-                message: "operation `concatenate` neither preserves nor consumes bounded ragged dimension `length`"
-                    .to_string(),
+                message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
             }),
         );
 
@@ -6190,7 +6188,7 @@ mod tests {
         assert_eq!(
             reshape,
             Err(BatchingError::UnsupportedOperation {
-                message: "dynamic reshape does not support bounded ragged array operands".to_string(),
+                message: "dynamic reshape does not support bounded ragged array inputs".to_string(),
             }),
         );
         Ok(())

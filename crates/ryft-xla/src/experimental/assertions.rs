@@ -42,6 +42,12 @@ pub(crate) const ASSERT_BOUNDS_KIND: &str = "bounds";
 /// Formatting kind used for a dynamic concatenation result-extent check.
 pub(crate) const ASSERT_CONCATENATE_KIND: &str = "concatenate";
 
+/// Formatting kind used for a padding result-extent check.
+pub(crate) const ASSERT_PAD_KIND: &str = "pad";
+
+/// Formatting kind used for a reshape element-count check.
+pub(crate) const ASSERT_RESHAPE_KIND: &str = "reshape";
+
 /// Formatting kind used for a dynamic-shape-slice runtime bounds check.
 pub(crate) const ASSERT_DYNAMIC_SHAPE_SLICE_KIND: &str = "dynamic_shape_slice";
 
@@ -233,13 +239,51 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
             buffers.push(buffer);
         }
     }
-    if buffers.len() < 2 {
+    if buffers.is_empty() {
         return Err(FfiError::invalid_argument(format!(
             "expected the `{ASSERT_CUSTOM_CALL_TARGET}` custom call to receive a predicate and observed extents"
         )));
     }
     let actor = string_attribute(call_frame, ASSERT_ACTOR_ATTRIBUTE)?;
     let kind = string_attribute(call_frame, ASSERT_KIND_ATTRIBUTE)?;
+    if kind == ASSERT_RESHAPE_KIND {
+        let input_rank = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?
+            .parse::<usize>()
+            .map_err(|_| FfiError::invalid_argument("invalid reshape assertion input rank"))?;
+        let extents = buffers[1..].iter().map(|buffer| scalar_i64(buffer, memory)).collect::<Result<Vec<_>, _>>()?;
+        if input_rank > extents.len() {
+            return Err(FfiError::invalid_argument("reshape assertion input rank exceeds the number of extents"));
+        }
+        let (input, output) = extents.split_at(input_rank);
+        return validate_reshape(actor, input, output).map_err(FfiError::invalid_argument);
+    }
+    if buffers.len() < 2 {
+        return Err(FfiError::invalid_argument("assertion is missing observed extents"));
+    }
+    if kind == ASSERT_PAD_KIND {
+        if buffers.len() != 3 {
+            return Err(FfiError::invalid_argument("padding assertion requires input and output extents"));
+        }
+        let detail = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
+        let fields = detail.split(':').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            return Err(FfiError::invalid_argument("invalid padding assertion configuration"));
+        }
+        let axis = fields[0].parse::<usize>().map_err(|_| FfiError::invalid_argument("invalid padding axis"))?;
+        let low = fields[1].parse::<i64>().map_err(|_| FfiError::invalid_argument("invalid low padding"))?;
+        let high = fields[2].parse::<i64>().map_err(|_| FfiError::invalid_argument("invalid high padding"))?;
+        let interior =
+            fields[3].parse::<usize>().map_err(|_| FfiError::invalid_argument("invalid interior padding"))?;
+        return validate_pad(
+            axis,
+            scalar_i64(&buffers[1], memory)?,
+            scalar_i64(&buffers[2], memory)?,
+            low,
+            high,
+            interior,
+        )
+        .map_err(FfiError::invalid_argument);
+    }
     if kind == ASSERT_CONCATENATE_KIND {
         // Concatenation is variadic, so its callback recomputes the checked sum from every input extent instead of
         // relying on a fixed-arity predicate produced in StableHLO.
@@ -395,6 +439,50 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
         }
         _ => unreachable!(),
     })
+}
+
+/// Validates one padding result extent using wide signed arithmetic before narrowing to a native size carrier.
+fn validate_pad(axis: usize, input: i64, output: i64, low: i64, high: i64, interior: usize) -> Result<(), String> {
+    if input < 0 || output < 0 {
+        return Err(format!("`pad` dimensions must be nonnegative on axis {axis}"));
+    }
+    let expected = i128::from(input.saturating_sub(1).max(0))
+        .checked_mul(interior as i128)
+        .and_then(|value| value.checked_add(i128::from(input)))
+        .and_then(|value| value.checked_add(i128::from(low)))
+        .and_then(|value| value.checked_add(i128::from(high)))
+        .ok_or_else(|| format!("`pad` result extent arithmetic overflows on axis {axis}"))?;
+    if expected < 0 || expected > i128::from(i32::MAX) {
+        return Err(format!("`pad` result extent {expected} is outside the native dimension range on axis {axis}"));
+    }
+    if expected != i128::from(output) {
+        return Err(format!("`pad` result extent on axis {axis} must equal {expected} but got {output}"));
+    }
+    Ok(())
+}
+
+/// Validates equal logical element counts before a native reshape consumes its inputs.
+fn validate_reshape(actor: &str, input: &[i64], output: &[i64]) -> Result<(), String> {
+    let product = |extents: &[i64]| {
+        if extents.iter().any(|extent| *extent < 0) {
+            return Err(format!("`{actor}` dimensions must be nonnegative"));
+        }
+        // A zero-sized axis makes the product zero even if other factors would overflow independently.
+        if extents.contains(&0) {
+            return Ok(0_i64);
+        }
+        extents
+            .iter()
+            .try_fold(1_i64, |product, extent| product.checked_mul(*extent))
+            .ok_or_else(|| format!("`{actor}` element count overflows the portable dimension range"))
+    };
+    let input_count = product(input)?;
+    let output_count = product(output)?;
+    if input_count == output_count {
+        Ok(())
+    } else {
+        Err(format!("`{actor}` changes the number of elements from {input_count} to {output_count}"))
+    }
 }
 
 /// Validates that `actual` equals the checked sum of `input_extents` for one concatenation axis.
@@ -589,6 +677,53 @@ mod tests {
         assert_eq!(
             validate_arithmetic("unknown", "left", 1, "right", 1),
             Err("unsupported arithmetic assertion kind `unknown`".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_validate_pad() {
+        assert_eq!(validate_pad(0, 3, 6, -1, 2, 1), Ok(()));
+        assert_eq!(validate_pad(0, 0, 3, 1, 2, usize::MAX), Ok(()));
+        assert_eq!(validate_pad(0, 1, 4, 1, 2, usize::MAX), Ok(()));
+        assert_eq!(
+            validate_pad(0, 3, 5, -1, 2, 1),
+            Err("`pad` result extent on axis 0 must equal 6 but got 5".to_string())
+        );
+        assert_eq!(
+            validate_pad(1, 0, 0, -1, 0, 0),
+            Err("`pad` result extent -1 is outside the native dimension range on axis 1".to_string())
+        );
+        assert_eq!(
+            validate_pad(0, i64::from(i32::MAX), 0, 1, 0, 0),
+            Err("`pad` result extent 2147483648 is outside the native dimension range on axis 0".to_string()),
+        );
+        assert_eq!(validate_pad(0, -1, 0, 0, 0, 0), Err("`pad` dimensions must be nonnegative on axis 0".to_string()));
+        assert_eq!(
+            validate_pad(0, 2, 0, i64::MIN, i64::MAX, 0),
+            Err("`pad` result extent on axis 0 must equal 1 but got 0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_reshape() {
+        assert_eq!(validate_reshape("reshape", &[4], &[2, 2]), Ok(()));
+        assert_eq!(validate_reshape("reshape", &[], &[1]), Ok(()));
+        assert_eq!(validate_reshape("reshape", &[0, i64::MAX, 2], &[2, 0]), Ok(()));
+        assert_eq!(
+            validate_reshape("reshape", &[4], &[3]),
+            Err("`reshape` changes the number of elements from 4 to 3".to_string())
+        );
+        assert_eq!(
+            validate_reshape("reshape", &[4], &[0]),
+            Err("`reshape` changes the number of elements from 4 to 0".to_string())
+        );
+        assert_eq!(
+            validate_reshape("reshape", &[i64::MAX, 2], &[1]),
+            Err("`reshape` element count overflows the portable dimension range".to_string())
+        );
+        assert_eq!(
+            validate_reshape("reshape", &[0, -1], &[0]),
+            Err("`reshape` dimensions must be nonnegative".to_string())
         );
     }
 

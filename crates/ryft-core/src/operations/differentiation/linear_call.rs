@@ -755,14 +755,18 @@ impl<
         };
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
-        // Residual operands are known and contribute nothing. Preserve symbolic zeros reported by the stored
-        // backward program instead of adding materialized zero outputs to an accumulator.
+        // Residual operands are known and contribute nothing. Preserve symbolic zeros reported by the stored backward
+        // program when their types suffice to reconstruct them. A dynamic zero must retain the already materialized
+        // value as its extent inputs live in this call's residual graph and may otherwise disappear before the outer
+        // pullback constructs its disconnected-input zeros.
         linear_inputs
             .iter()
             .zip(input_cotangents)
             .zip(output_is_zero)
             .zip(&accumulators[self.residual_count..])
-            .filter(|(((input, _), is_zero), _)| input.is_unknown() && !is_zero)
+            .filter(|(((input, cotangent), is_zero), _)| {
+                input.is_unknown() && (!is_zero || !O::zero_residual_types(cotangent.r#type().as_ref()).is_empty())
+            })
             .try_for_each(|(((_, cotangent), _), accumulator)| {
                 accumulator.accumulate(context, MaybeZero::Value(cotangent))
             })?;
@@ -1882,5 +1886,70 @@ mod tests {
             rule_context.take_cotangents(&accumulators).unwrap()
         };
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+    }
+
+    #[test]
+    fn test_linear_call_operation_transposition_preserves_dynamic_zero_extents() {
+        let dimension = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
+        let dimension_type = DimensionType::new(dimension.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut forward_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        forward_builder.add_input(dimension_type.clone().into());
+        forward_builder.add_input(array_type.clone().into());
+        let output = forward_builder
+            .add_instruction(ZeroOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
+        let forward = forward_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The zero input cotangent is independent of the seed, but its runtime extent still belongs to the call's
+        // retained inputs. Converting this result to a symbolic zero would drop that required dependency.
+        let mut transpose_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = transpose_builder.add_input(dimension_type.clone().into());
+        transpose_builder.add_input(scalar_type.clone().into());
+        let zero = transpose_builder
+            .add_instruction(ZeroOperation::new(array_type.clone()), Vec::new(), vec![extent], None)
+            .unwrap()[0];
+        let transpose = transpose_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![zero],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent = builder.add_input(dimension_type.clone().into());
+        let input = builder.add_input(array_type.into());
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![extent, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        for extent in [0, 2] {
+            assert_eq!(
+                pullback.interpret(vec![
+                    ArrayIrValue::Array(Array::from_elements(scalar_type.clone(), &[7_f32]).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), extent).unwrap()),
+                ]),
+                Ok(vec![ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F32, [extent]), &vec![0_f32; extent],)
+                        .unwrap()
+                )])
+            );
+        }
     }
 }
