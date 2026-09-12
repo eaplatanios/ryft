@@ -249,7 +249,7 @@ macro_rules! check_builders {
 ///     DIMENSION_ADD_OPERATION_NAME,
 ///     Add,
 ///     add,
-///     result_name = |left: &DimensionType, right: &DimensionType| {
+///     output_name = |left: &DimensionType, right: &DimensionType| {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
 ///     infer_bounds = infer_add_bounds,
@@ -264,7 +264,7 @@ macro_rules! check_builders {
 ///   - `$capability`: Value-level capability required by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Add`).
 ///   - `$method`: Semantic capability method used for interpretation (e.g., `add`).
-///   - `$result_name`: Expression evaluating to a function or closure that accepts references to the left and right
+///   - `$output_name`: Expression evaluating to a function or closure that accepts references to the left and right
 ///     [`DimensionType`](crate::DimensionType)s and returns the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression evaluating to a function or closure that accepts references to the left and right
 ///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
@@ -275,7 +275,7 @@ macro_rules! define_arithmetic_dimension_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident,
-        result_name = $result_name:expr,
+        output_name = $output_name:expr,
         infer_bounds = $infer_bounds:expr $(,)?
     ) => {
         $(#[$documentation])*
@@ -291,14 +291,14 @@ macro_rules! define_arithmetic_dimension_operation {
                 left: &$crate::arrays::DimensionType,
                 right: &$crate::arrays::DimensionType,
             ) -> Result<Self, $crate::arrays::DimensionError> {
-                let result_name = ($result_name)(left, right);
-                let (result_bounds, requires_runtime_assertion) = ($infer_bounds)(left, right)?;
+                let output_name = ($output_name)(left, right);
+                let (output_bounds, requires_runtime_assertion) = ($infer_bounds)(left, right)?;
                 Ok(Self {
                     metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata::new(
                         left,
                         right,
-                        result_name,
-                        result_bounds,
+                        output_name,
+                        output_bounds,
                         requires_runtime_assertion,
                     ),
                 })
@@ -316,17 +316,17 @@ macro_rules! define_arithmetic_dimension_operation {
                 self.metadata.right_type()
             }
 
-            /// Returns the diagnostic name used for a freshly inferred result variable.
+            /// Returns the diagnostic name used for a freshly inferred output variable.
             #[inline]
-            pub fn result_name(&self) -> &str {
-                self.metadata.result_name()
+            pub fn output_name(&self) -> &str {
+                self.metadata.output_name()
             }
 
-            /// Returns the result bounds computed from the declared input types at construction.
+            /// Returns the output bounds computed from the declared input types at construction.
             /// Output inference recomputes these bounds when the actual inputs have narrower bounds.
             #[inline]
-            pub fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
-                self.metadata.result_bounds()
+            pub fn output_bounds(&self) -> $crate::arrays::DimensionBounds {
+                self.metadata.output_bounds()
             }
         }
 
@@ -410,13 +410,13 @@ macro_rules! define_arithmetic_dimension_operation {
             }
 
             #[inline]
-            fn result_name(&self) -> &str {
-                $operation::result_name(self)
+            fn output_name(&self) -> &str {
+                $operation::output_name(self)
             }
 
             #[inline]
-            fn result_bounds(&self) -> $crate::arrays::DimensionBounds {
-                $operation::result_bounds(self)
+            fn output_bounds(&self) -> $crate::arrays::DimensionBounds {
+                $operation::output_bounds(self)
             }
 
             #[inline]
@@ -4826,7 +4826,7 @@ mod tests {
         TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,
         TestArithmeticDimension,
         test_arithmetic_dimension,
-        result_name = |left: &DimensionType, right: &DimensionType| {
+        output_name = |left: &DimensionType, right: &DimensionType| {
             format!("{} + {}", left.variable(), right.variable())
         },
         infer_bounds = |left: &DimensionType, right: &DimensionType| {
@@ -5478,11 +5478,11 @@ mod tests {
         assert_eq!(operation.name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
         assert_eq!(operation.left_type(), &left_type);
         assert_eq!(operation.right_type(), &right_type);
-        assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(9)).unwrap());
+        assert_eq!(operation.output_bounds(), DimensionBounds::new(3, Some(9)).unwrap());
         let result = Operation::infer_output_types(&operation, &[left_type.clone(), right_type.clone()], &[]).unwrap();
         assert_ne!(result[0].variable(), left_type.variable());
         assert_ne!(result[0].variable(), right_type.variable());
-        assert_eq!(result[0].bounds(), operation.result_bounds());
+        assert_eq!(result[0].bounds(), operation.output_bounds());
         assert_eq!(
             Operation::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
@@ -5500,8 +5500,8 @@ mod tests {
         let renamed = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
-        assert_eq!(renamed.result_name(), operation.result_name());
-        assert_eq!(renamed.result_bounds(), operation.result_bounds());
+        assert_eq!(renamed.output_name(), operation.output_name());
+        assert_eq!(renamed.output_bounds(), operation.output_bounds());
 
         // The macro supplies the ordinary partial-evaluation marker implementation for any compatible context.
         fn assert_partially_evaluatable<

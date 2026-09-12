@@ -184,6 +184,9 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 /// stored type with no dynamic axes is valid with no inputs, although canonical operation-family lifts prefer the
 /// equivalent homogeneous nullary constructor inside the array member family. Dynamic axes retain their declared
 /// identities, including singleton-bounded axes; the explicit dimension inputs bind those identities in the result.
+/// Repeated exact axes may receive independently named inputs proving the same single extent, provided at least one
+/// input defines the stored output identity. This permits repeated reification during specialization without admitting
+/// an ungrounded identity or treating equal non-singleton bounds as nominal equality.
 pub(crate) fn infer_array_ir_constant_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
@@ -207,7 +210,18 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
             TypeError::invalid(format!("`{name}` operand {index} must be a dimension but has type {input_type}"))
         })?;
         if dimension_type.variable() != variable {
+            // Repeated reads may give one concrete extent separate nominal definitions after specialization.
+            // An exact matching extent is sufficient only when another input grounds the stored identity itself.
+            // Otherwise, the output would still reference an identity that this constructor never received.
             let required_type = DimensionType::new(variable.clone());
+            if required_type.extent().is_some()
+                && required_type.extent() == dimension_type.extent()
+                && input_types
+                    .iter()
+                    .any(|input| matches!(input, ArrayIrType::Dimension(input) if input.variable() == variable))
+            {
+                continue;
+            }
             return Err(TypeError::invalid(format!(
                 "`{name}` operand {index} has type {dimension_type} but the output shape requires {required_type}",
             )));
@@ -446,6 +460,46 @@ mod tests {
             validate_dynamic_constant_dimensions("fill", &repeated_type, &[row_extent.clone(), row_extent.clone()]),
             Ok(()),
         );
+
+        // Exact repeated reifications can share a grounded output identity; equal values alone cannot ground it.
+        let first = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        let second = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        let exact = <&DimensionType>::try_from(first.r#type().as_ref()).unwrap().variable().clone();
+        let exact_type = ArrayType::new(DataType::F32, Shape::new(vec![exact.clone().into(), exact.into()]));
+        assert_eq!(validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), second.clone()]), Ok(()));
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &exact_type, &[second.clone(), second]),
+            Err(TypeError::invalid(
+                "`fill` operand 0 has type dimension<2> but the output shape requires dimension<2>",
+            )
+            .into()),
+        );
+        let wider = ArrayIrValue::<Array>::Dimension(
+            DimensionValue::new(
+                DimensionType::new(DimensionVariable::new("wider", DimensionBounds::non_negative(Some(8)).unwrap())),
+                2,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), wider]),
+            Err(TypeError::invalid(
+                "`fill` operand 1 has type dimension<wider ∈ [0, 8)> but the output shape requires dimension<2>",
+            )
+            .into()),
+        );
+        assert_eq!(
+            validate_dynamic_constant_dimensions(
+                "fill",
+                &exact_type,
+                &[first, ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
+            ),
+            Err(TypeError::invalid(
+                "`fill` operand 1 has type dimension<3> but the output shape requires dimension<2>",
+            )
+            .into()),
+        );
+
         let static_type = ArrayType::new_static(DataType::F32, [3, 2]);
         assert_eq!(validate_dynamic_constant_dimensions::<ArrayIrValue<Array>>("fill", &static_type, &[]), Ok(()));
         assert_eq!(
