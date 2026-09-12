@@ -347,7 +347,9 @@ impl<C: Context<Type = ArrayIrType, Operation: From<IotaOperation<ArrayType>>>> 
     ) -> Result<C::Value, ProgramError> {
         let operation = IotaOperation::new(r#type.clone(), dimension)?;
         validate_dynamic_constant_dimensions(IOTA_OPERATION_NAME, r#type, dimensions)?;
-        Ok(self.bind(operation, Vec::new(), dimensions)?.remove(0))
+        let mut outputs = self.bind(operation, Vec::new(), dimensions)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 

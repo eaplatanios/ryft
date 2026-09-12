@@ -6,6 +6,7 @@ use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
+use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::validate_dynamic_constant_dimensions;
 use crate::operations::manipulation::broadcasting::{
@@ -174,18 +175,20 @@ where
             Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
         let scalar_operation =
             <C::Operation as OperationProjection<ArrayType>>::Projected::from(ConstantOperation::new(literal));
-        let scalar = self.bind(scalar_operation, Vec::new(), &[])?.remove(0);
+        let mut outputs = self.bind(scalar_operation, Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        let scalar = outputs.remove(0);
         if dimensions.is_empty() {
-            return Ok(self
-                .bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
-                        r#type.clone(),
-                        Vec::new(),
-                    )),
+            let mut outputs = self.bind(
+                <C::Operation as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
+                    r#type.clone(),
                     Vec::new(),
-                    &[scalar],
-                )?
-                .remove(0));
+                )),
+                Vec::new(),
+                &[scalar],
+            )?;
+            check_count!("output", outputs, 1, ProgramError);
+            return Ok(outputs.remove(0));
         }
 
         // Dynamic broadcast consumes every output axis. Static axes become dimension constants, while the
@@ -196,13 +199,18 @@ where
         for dimension in r#type.shape().dimensions() {
             inputs.push(match dimension {
                 Dimension::Static(extent) => {
-                    self.bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?.remove(0)
+                    let mut outputs =
+                        self.bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    outputs.remove(0)
                 }
                 Dimension::Dynamic(_) => dimensions.next().unwrap().clone(),
             });
         }
         let operation = DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(r#type.sharding().cloned());
-        Ok(self.bind(operation, Vec::new(), &inputs)?.remove(0))
+        let mut outputs = self.bind(operation, Vec::new(), &inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
