@@ -533,21 +533,24 @@ mod tests {
 
     #[test]
     fn test_array_elementwise_derivative_alignment() {
-        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap();
+        let scalar = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let exemplar = Array::from_f64s(target.clone(), vec![0.0; 6]).unwrap();
+        let exemplar = Array::from_elements::<f64>(target.clone(), &[0.0; 6]).unwrap();
         assert_eq!(
             scalar.align_tangent(&target, &exemplar),
-            Ok(Array::from_f64s(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0]).unwrap()),
+            Ok(Array::from_elements::<f64>(target, &[2.0, 2.0, 2.0, 2.0, 2.0, 2.0]).unwrap()),
         );
 
-        let cotangent = Array::from_f64s(
+        let cotangent = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         )
         .unwrap();
         let target = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        assert_eq!(cotangent.unalign_cotangent(&target), Ok(Array::from_f64s(target, vec![5.0, 7.0, 9.0]).unwrap()),);
+        assert_eq!(
+            cotangent.unalign_cotangent(&target),
+            Ok(Array::from_elements::<f32>(target, &[5.0, 7.0, 9.0]).unwrap()),
+        );
 
         let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
@@ -636,29 +639,29 @@ mod tests {
 
     #[test]
     fn test_broadcast_derivative_alignment() {
-        let cotangent = Array::from_f64s(
+        let cotangent = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         )
         .unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 0]),
-            Ok(Array::from_f64s(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap()),
+            Ok(Array::from_elements::<f64>(target, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]).unwrap()),
         );
 
-        let cotangent = Array::from_f64s(
+        let cotangent = Array::from_elements::<f64>(
             ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
             ),
-            (1..=24).map(|value| value as f64).collect(),
+            &(1..=24).map(|value| value as f64).collect::<Vec<_>>(),
         )
         .unwrap();
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 2]),
-            Ok(Array::from_f64s(target, vec![126.0, 174.0]).unwrap())
+            Ok(Array::from_elements::<f64>(target, &[126.0, 174.0]).unwrap())
         );
 
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
@@ -942,8 +945,8 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, pullback) = context
             .differentiate_at((
-                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]).unwrap(),
-                Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]).unwrap(),
+                Array::from_elements::<f64>(sharded_type.clone(), &[1.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type.clone(), &[3.0, 4.0]).unwrap(),
             ))
             .vjp(|(left, right)| Ok(left + right))
             .unwrap();
@@ -955,8 +958,9 @@ mod tests {
                 .to_string()
                 .contains("reshard")
         );
-        let (left, right) =
-            pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0]).unwrap()).unwrap();
+        let (left, right) = pullback
+            .apply(Array::from_elements::<f64>(output.r#type().into_owned(), &[1.0, 1.0]).unwrap())
+            .unwrap();
         assert_eq!(left.r#type().as_ref(), &sharded_type);
         assert_eq!(right.r#type().as_ref(), &replicated_type);
     }

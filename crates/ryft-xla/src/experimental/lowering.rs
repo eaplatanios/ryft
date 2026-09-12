@@ -13191,11 +13191,7 @@ mod tests {
         let rhs_values = [10.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let group_sizes_values = [1_i32, 0, 3];
         let lhs = CpuArray::matrix(5, 2, lhs_values.to_vec()).unwrap();
-        let rhs = CpuArray::from_f64s(
-            ArrayType::new_static(DataType::F32, [3, 2, 1]),
-            rhs_values.iter().map(|value| f64::from(*value)).collect(),
-        )
-        .unwrap();
+        let rhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 2, 1]), &rhs_values).unwrap();
         let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![12.0, 32.0, 50.0, 68.0, 0.0]);
@@ -13252,11 +13248,7 @@ mod tests {
         let rhs_values = [2.0_f32, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0, 0.0];
         let group_sizes_values = [u64::MAX, u64::MAX, 2, 1];
         let lhs = CpuArray::matrix(4, 2, lhs_values.to_vec()).unwrap();
-        let rhs = CpuArray::from_f64s(
-            ArrayType::new_static(DataType::F32, [4, 2, 1]),
-            rhs_values.iter().map(|value| f64::from(*value)).collect(),
-        )
-        .unwrap();
+        let rhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [4, 2, 1]), &rhs_values).unwrap();
         let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(group_sizes_values.to_vec()).unwrap()).unwrap();
         let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
         assert_eq!(expected, vec![2.0, 4.0, 6.0, 8.0]);
@@ -18202,7 +18194,7 @@ mod tests {
                 |x, ()| {
                     let start = x
                         .context()
-                        .lift(CpuArray::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap())
+                        .lift(CpuArray::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
                         .unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
@@ -18450,16 +18442,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
+        // Unsupported identities are rejected during inference before invalid IR can reach lowering.
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::Tracing(ProgramError::Type(TypeError::invalid(
-                "data type `zero` cannot represent one",
-            )))),
+            builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None),
+            Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
         );
     }
 
@@ -18468,16 +18454,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
+        // Unsupported identities are rejected during inference before invalid IR can reach lowering.
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::Tracing(ProgramError::Type(TypeError::invalid(
-                "data type `f8e8m0fnu` cannot represent zero",
-            )))),
+            builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None),
+            Err(ProgramError::Type(TypeError::invalid("data type `f8e8m0fnu` cannot represent zero"))),
         );
     }
 
@@ -18577,7 +18557,8 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+            let value =
+                CpuArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
             let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
@@ -18996,7 +18977,8 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+            let value =
+                CpuArray::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
             let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder.add_constant(value);
             let program =

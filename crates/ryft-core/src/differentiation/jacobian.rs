@@ -698,7 +698,7 @@ mod tests {
 
     use crate::arrays::DataType::{F32, F64};
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
@@ -810,7 +810,11 @@ mod tests {
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let jacobian = differentiate_at(input).jacobian_forward(|value| value.sin()).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
@@ -829,7 +833,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()).unwrap())
+        let jacobian = differentiate_at(Array::from_elements::<f64>(r#type.clone(), &[]).unwrap())
             .jacobian_forward(|input| Ok(input.clone() + input))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -892,10 +896,11 @@ mod tests {
         assert_abs_diff_eq!(block.value().to_f64s()[3], 3.0, epsilon = 1e-9);
 
         // Pullback replay unbroadcasts a selected scalar branch and preserves each input's differential data type.
-        let scalar = Array::from_f64s(ArrayType::scalar(F32), vec![5.0]).unwrap();
+        let scalar = Array::from_elements::<f32>(ArrayType::scalar(F32), &[5.0]).unwrap();
         let f32_vector_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]));
         let vector =
-            Array::from_f64s(ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)])), vec![2.0, -3.0]).unwrap();
+            Array::from_elements::<f64>(ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)])), &[2.0, -3.0])
+                .unwrap();
 
         let jacobian = differentiate_at((scalar.clone(), vector.clone()))
             .jacobian_reverse(|(scalar, vector)| {
@@ -930,8 +935,8 @@ mod tests {
         assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
 
         // Promoted elementwise cotangents are converted back to the differential type of each input leaf.
-        let f32 = Array::from_f64s(ArrayType::scalar(F32), vec![2.0]).unwrap();
-        let f64 = Array::from_f64s(ArrayType::scalar(F64), vec![3.0]).unwrap();
+        let f32 = Array::from_elements::<f32>(ArrayType::scalar(F32), &[2.0]).unwrap();
+        let f64 = Array::from_elements::<f64>(ArrayType::scalar(F64), &[3.0]).unwrap();
         let jacobian = differentiate_at((f32.clone(), f64.clone()))
             .jacobian_reverse(|(left, right)| Ok(left + right))
             .unwrap();
@@ -955,7 +960,11 @@ mod tests {
         assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let jacobian = differentiate_at(input).jacobian_reverse(|value| value.sin()).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
@@ -974,7 +983,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian = differentiate_at(Array::from_f64s(r#type.clone(), Vec::new()).unwrap())
+        let jacobian = differentiate_at(Array::from_elements::<f64>(r#type.clone(), &[]).unwrap())
             .jacobian_reverse(|input| Ok(input.clone() + input))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -1062,7 +1071,7 @@ mod tests {
             DifferentiationError::EmptyInput,
         );
 
-        let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]).unwrap();
+        let integer = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[2]).unwrap();
         assert_eq!(
             context.differentiate_at(integer).jacobian_forward(|x| Ok(x)).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {

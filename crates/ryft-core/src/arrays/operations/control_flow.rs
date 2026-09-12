@@ -474,13 +474,14 @@ mod tests {
         );
 
         // Eager interpretation selects one branch per predicate value and forwards the same dimension either way.
-        let boolean = |value: f64| array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![value]).unwrap());
+        let boolean =
+            |value: bool| array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[value]).unwrap());
         assert_eq!(
-            program.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            program.interpret(vec![boolean(true), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
             Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
         );
         assert_eq!(
-            program.interpret(vec![boolean(0.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            program.interpret(vec![boolean(false), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
             Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0).unwrap())]),
         );
 
@@ -498,7 +499,7 @@ mod tests {
             .unwrap();
         assert_eq!(relocated.to_string(), program.to_string());
         assert_eq!(
-            relocated.interpret(vec![boolean(1.0), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            relocated.interpret(vec![boolean(true), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
             Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
         );
     }
@@ -533,7 +534,7 @@ mod tests {
         assert_eq!(jvp.output_count(), 3);
         let outputs = jvp
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 4),
                 array(Array::scalar(5.0).unwrap()),
                 array(Array::scalar(7.0).unwrap()),
@@ -548,7 +549,7 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 4),
                 array(Array::scalar(5.0).unwrap()),
             ])
@@ -598,7 +599,7 @@ mod tests {
         assert_eq!(jvp.output_count(), 2);
         assert_eq!(
             jvp.interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 3),
             ]),
             Ok(vec![array(Array::vector(vec![0.0_f64; 3]).unwrap()), array(Array::vector(vec![0.0_f64; 3]).unwrap()),]),
@@ -614,7 +615,7 @@ mod tests {
                     context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())
                 },
                 vec![
-                    array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                    array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                     dimension(&extent_type, 3),
                 ],
                 vec![
@@ -634,7 +635,7 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 3),
             ])
             .unwrap();
@@ -759,7 +760,7 @@ mod tests {
         assert!(rendered.contains("zero_like"), "{rendered}");
         assert_eq!(
             jvp.interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 3),
                 array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
                 array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap()),
@@ -851,7 +852,7 @@ mod tests {
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
-                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap()),
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
                 dimension(&extent_type, 3),
                 array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             ])
@@ -1615,12 +1616,14 @@ mod tests {
         assert_eq!(Array::vector(vec![false, false]).unwrap().any_true(), Ok(false));
         assert!(Array::vector(vec![1.0]).unwrap().any_true().is_err());
         // Predicate item `i` masks the contiguous per-item block of operand elements it governs.
-        let on_true = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let on_true =
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[1.0, 2.0, 3.0, 4.0]).unwrap();
         let on_false =
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, -3.0, -4.0]).unwrap();
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, -3.0, -4.0])
+                .unwrap();
         assert_eq!(
             predicate.mask_select(&on_true, &on_false).unwrap(),
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, 3.0, 4.0]).unwrap(),
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, 3.0, 4.0]).unwrap(),
         );
 
         // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch

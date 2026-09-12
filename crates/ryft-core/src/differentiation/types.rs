@@ -855,6 +855,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f6e2m3fn,
+        f8e8m0fnu,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
@@ -1359,7 +1360,12 @@ mod tests {
         // extractors, whose expected per-item type is the widened `f32` differential representation.
         let narrow_type = ArrayType::scalar(F8E8M0FNU);
         let physical_type = ArrayType::new(F8E8M0FNU, Shape::new(vec![Dimension::Static(1)]));
-        let packed = ArrayBatch::new(Array::from_f64s(physical_type, vec![2.0]).unwrap(), BatchAxis::new(0)).unwrap();
+        let packed = ArrayBatch::new(
+            Array::from_elements::<f8e8m0fnu>(physical_type, &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()))
+                .unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
         assert_eq!(
             <ArrayType as DenseDifferentiableType<
                 EagerContext<Array, ArrayOperation<Array>>,

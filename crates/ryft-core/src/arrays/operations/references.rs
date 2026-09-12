@@ -1527,12 +1527,13 @@ mod tests {
     fn test_array_reference_view_operations_jvp() {
         let context = DifferentiationContext::fused(TestDestination::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference =
-            TestValue::Array(Array::from_f64s(allocation_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())
-                .reference_new()
-                .unwrap();
+        let reference = TestValue::Array(
+            Array::from_elements::<f32>(allocation_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        )
+        .reference_new()
+        .unwrap();
         let tangent_reference =
-            TestValue::Array(Array::from_f64s(allocation_type, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap())
+            TestValue::Array(Array::from_elements::<f32>(allocation_type, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap())
                 .reference_new()
                 .unwrap();
 
@@ -1563,28 +1564,34 @@ mod tests {
         let sliced_type = ArrayType::new_static(DataType::F32, [2, 2]);
         assert_eq!(
             sliced[0].primal().read(),
-            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![2.0, 3.0, 5.0, 6.0]).unwrap())),
+            Ok(TestValue::Array(Array::from_elements::<f32>(sliced_type.clone(), &[2.0, 3.0, 5.0, 6.0]).unwrap())),
         );
         assert_eq!(
             sliced[0].tangent().as_value().unwrap().read(),
-            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![8.0, 9.0, 11.0, 12.0]).unwrap())),
+            Ok(TestValue::Array(Array::from_elements::<f32>(sliced_type.clone(), &[8.0, 9.0, 11.0, 12.0]).unwrap())),
         );
 
         // A store through the tangent view lands in the tangent allocation and leaves the primal allocation untouched.
-        let zeros = TestValue::Array(Array::from_f64s(sliced_type, vec![0.0; 4]).unwrap());
+        let zeros = TestValue::Array(Array::from_elements::<f32>(sliced_type, &[0.0; 4]).unwrap());
         sliced[0].tangent().as_value().unwrap().write(&zeros).unwrap();
         assert_eq!(
             tangent_reference.read(),
             Ok(TestValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![7.0, 0.0, 0.0, 10.0, 0.0, 0.0],)
-                    .unwrap()
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    &[7.0, 0.0, 0.0, 10.0, 0.0, 0.0]
+                )
+                .unwrap()
             )),
         );
         assert_eq!(
             reference.read(),
             Ok(TestValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],)
-                    .unwrap()
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                )
+                .unwrap()
             )),
         );
 
@@ -1615,9 +1622,11 @@ mod tests {
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestDestination::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..24).map(f64::from).collect()).unwrap())
-            .reference_new()
-            .unwrap();
+        let reference = TestValue::Array(
+            Array::from_elements::<f32>(packed_type, &(0..24).map(|value| value as f32).collect::<Vec<_>>()).unwrap(),
+        )
+        .reference_new()
+        .unwrap();
 
         // A batch axis before the indexed axis shifts the packed indexed axis one position later and keeps the output
         // batch axis.
@@ -1633,8 +1642,11 @@ mod tests {
         assert_eq!(
             outputs[0].batch().value().read(),
             Ok(TestValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0],)
-                    .unwrap()
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    &[2.0, 6.0, 10.0, 14.0, 18.0, 22.0]
+                )
+                .unwrap()
             )),
         );
 
@@ -1651,8 +1663,11 @@ mod tests {
         assert_eq!(
             outputs[0].batch().value().read(),
             Ok(TestValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [3, 4]), (12..24).map(f64::from).collect(),)
-                    .unwrap()
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [3, 4]),
+                    &(12..24).map(|value| value as f32).collect::<Vec<_>>()
+                )
+                .unwrap()
             )),
         );
 
@@ -1666,8 +1681,11 @@ mod tests {
         assert_eq!(
             outputs[0].batch().value().read(),
             Ok(TestValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![3.0, 7.0, 11.0, 15.0, 19.0, 23.0],)
-                    .unwrap()
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    &[3.0, 7.0, 11.0, 15.0, 19.0, 23.0]
+                )
+                .unwrap()
             )),
         );
 
@@ -1682,9 +1700,9 @@ mod tests {
         assert_eq!(
             outputs[0].batch().value().read(),
             Ok(TestValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f32>(
                     ArrayType::new_static(DataType::F32, [1, 3, 2]),
-                    vec![13.0, 14.0, 17.0, 18.0, 21.0, 22.0],
+                    &[13.0, 14.0, 17.0, 18.0, 21.0, 22.0]
                 )
                 .unwrap()
             )),
@@ -1819,7 +1837,8 @@ mod tests {
     #[test]
     fn test_eager_reference_index_slice_and_composition() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let initial =
+            ArrayIrValue::Array(Array::from_elements::<f32>(matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let allocation = initial.reference_new().unwrap();
         let row = allocation.reference_index(0, 1).unwrap();
         assert_eq!(row.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())));
@@ -1828,9 +1847,9 @@ mod tests {
         assert_eq!(
             slice.read(),
             Ok(ArrayIrValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f32>(
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]),),
-                    vec![2.0, 3.0, 5.0, 6.0],
+                    &[2.0, 3.0, 5.0, 6.0]
                 )
                 .unwrap()
             )),
@@ -1842,8 +1861,9 @@ mod tests {
     #[test]
     fn test_eager_reference_indexed_mutation_reconstructs_removed_axis() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let initial =
-            ArrayIrValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let initial = ArrayIrValue::Array(
+            Array::from_elements::<f32>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
         let allocation = initial.reference_new().unwrap();
         let row = allocation.reference_index(0, 1).unwrap();
 
@@ -1854,7 +1874,9 @@ mod tests {
         row.add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())).unwrap();
         assert_eq!(
             allocation.read(),
-            Ok(ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0],).unwrap())),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements::<f32>(matrix_type, &[1.0, 2.0, 3.0, 11.0, 22.0, 33.0]).unwrap()
+            )),
         );
     }
 
@@ -2465,8 +2487,9 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         condition_builder.add_input(reference_type.clone());
-        let predicate = condition_builder
-            .add_constant(TestValue::Array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap()));
+        let predicate = condition_builder.add_constant(TestValue::Array(
+            Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap(),
+        ));
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();

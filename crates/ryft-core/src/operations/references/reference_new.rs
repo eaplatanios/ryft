@@ -454,7 +454,8 @@ mod tests {
 
         // A mapped initial value allocates a reference batched at the same axis.
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let initial = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let initial =
+            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let input =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(initial.clone(), BatchAxis::new(1)).unwrap());
         let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
@@ -479,7 +480,8 @@ mod tests {
         assert_eq!(
             outputs[0].batch().value().read(),
             Ok(TestIrValue::Array(
-                Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 1.0, 2.0],).unwrap()
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 1.0, 2.0])
+                    .unwrap()
             )),
         );
     }

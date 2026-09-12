@@ -62,7 +62,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
     use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -185,8 +185,12 @@ mod tests {
 
     #[test]
     fn test_sqrt_low_precision_differentiation_uses_widened_tangents() {
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.sqrt()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.

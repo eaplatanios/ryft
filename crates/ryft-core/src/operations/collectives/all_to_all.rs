@@ -926,12 +926,12 @@ mod tests {
         // the items and receives its own row index from every item, concatenated item-major along the columns. With
         // item 0 = `[[1, 2], [3, 4]]` and item 1 = `[[5, 6], [7, 8]]`, item 0 receives `[[1, 2, 5, 6]]` and item 1
         // receives `[[3, 4, 7, 8]]` (per-item shape `[1, 4]`).
-        let x = Array::from_f64s(
+        let x = Array::from_elements::<f64>(
             ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
             ),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         )
         .unwrap();
         let output: ArrayIrValue<Array> = batch(

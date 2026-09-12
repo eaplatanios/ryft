@@ -4205,7 +4205,7 @@ mod tests {
     #[test]
     fn test_array_batch_with_ragged_axes() {
         let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let packed = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let packed = Array::from_elements::<f64>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::vector(vec![1.0, 3.0]).unwrap();
 
@@ -4238,7 +4238,7 @@ mod tests {
     #[test]
     fn test_array_batch_unbatched_type() {
         let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let packed = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let packed = Array::from_elements::<f64>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 
         // A bounded ragged axis stores its finite physical bound in the packed type while each batch item extends only
         // to its own per-item extent, so the derivation restores the dynamic dimension at that axis.
@@ -4336,7 +4336,8 @@ mod tests {
             let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
                 .with_sharding(Sharding::replicated(mesh.clone(), 1))
                 .unwrap();
-            let replicated = ArrayBatch::replicated(Array::from_f64s(replicated_type, vec![1.0, 2.0, 3.0]).unwrap());
+            let replicated =
+                ArrayBatch::replicated(Array::from_elements::<f64>(replicated_type, &[1.0, 2.0, 3.0]).unwrap());
             let broadcasted = replicated.broadcast(0, 2, ShardingDimension::sharded(["x"])).unwrap();
             let expected_sharding =
                 Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
@@ -4932,7 +4933,8 @@ mod tests {
         let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        let replicated = ArrayBatch::replicated(Array::from_f64s(replicated_type, vec![1.0, 2.0, 3.0]).unwrap());
+        let replicated =
+            ArrayBatch::replicated(Array::from_elements::<f64>(replicated_type, &[1.0, 2.0, 3.0]).unwrap());
         let matched = StaticArrayExtentBatchingPolicy::match_axis(&context, &replicated, Axis::from(0)).unwrap();
         assert_eq!(
             matched.value().r#type().sharding(),
@@ -5922,8 +5924,8 @@ mod tests {
         let (context, inputs) = <ArrayBatchingPolicy as BatchingEntrypointPolicy<TestArrayContext>>::pack_inputs(
             &parent,
             vec![
-                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]).unwrap(),
-                Array::from_f64s(replicated_type, vec![3.0, 4.0]).unwrap(),
+                Array::from_elements::<f64>(sharded_type.clone(), &[1.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type, &[3.0, 4.0]).unwrap(),
             ],
             vec![BatchAxis::new(0), BatchAxis::new(0)],
             BatchAxisSpecification::default(),
@@ -5932,8 +5934,8 @@ mod tests {
         assert_eq!(
             inputs,
             vec![
-                ArrayBatch::new(Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]).unwrap(), Some(0))?,
-                ArrayBatch::new(Array::from_f64s(sharded_type, vec![3.0, 4.0]).unwrap(), Some(0))?,
+                ArrayBatch::new(Array::from_elements::<f64>(sharded_type.clone(), &[1.0, 2.0]).unwrap(), Some(0))?,
+                ArrayBatch::new(Array::from_elements::<f64>(sharded_type, &[3.0, 4.0]).unwrap(), Some(0))?,
             ],
         );
         Ok(())
@@ -6636,7 +6638,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 1))
                 .unwrap();
             let replicated = ArrayIrBatch::replicated(ArrayIrValue::Array(
-                Array::from_f64s(replicated_type, vec![1.0, 2.0, 3.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type, &[1.0, 2.0, 3.0]).unwrap(),
             ));
             let sharded_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
                 ArrayIrEagerContext::new(),
@@ -7463,12 +7465,12 @@ mod tests {
 
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = ArrayBatch::new(
-            Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            Array::from_elements::<f64>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
             Some(0),
         )
         .unwrap();
         let right = ArrayBatch::new(
-            Array::from_f64s(matrix_type.clone(), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
+            Array::from_elements::<f64>(matrix_type.clone(), &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
             Some(0),
         )
         .unwrap();
@@ -7483,7 +7485,8 @@ mod tests {
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated =
-            ArrayBatch::new(Array::from_f64s(vector_type.clone(), vec![10.0, 20.0, 30.0]).unwrap(), None).unwrap();
+            ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[10.0, 20.0, 30.0]).unwrap(), None)
+                .unwrap();
         let outputs = AddOperation::new()
             .batch(&context, &EmptyRegionDriver, &[left.clone(), replicated])
             .unwrap()
@@ -7496,7 +7499,7 @@ mod tests {
         let transposed_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let right_axis_one = ArrayBatch::new(
-            Array::from_f64s(transposed_type.clone(), vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0]).unwrap(),
+            Array::from_elements::<f64>(transposed_type.clone(), &[10.0, 40.0, 20.0, 50.0, 30.0, 60.0]).unwrap(),
             Some(1),
         )
         .unwrap();
@@ -7516,20 +7519,23 @@ mod tests {
             Shape::new(vec![Dimension::Static(3), Dimension::Static(4), Dimension::Static(2)]),
         );
         let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
-        let left =
-            ArrayBatch::new(Array::from_f64s(left_type.clone(), (1..=24).map(f64::from).collect()).unwrap(), Some(2))
-                .unwrap();
-        let right = ArrayBatch::new(Array::from_f64s(right_type.clone(), vec![10.0, 20.0]).unwrap(), Some(0)).unwrap();
+        let left = ArrayBatch::new(
+            Array::from_elements::<f64>(left_type.clone(), &(1..=24).map(f64::from).collect::<Vec<_>>()).unwrap(),
+            Some(2),
+        )
+        .unwrap();
+        let right =
+            ArrayBatch::new(Array::from_elements::<f64>(right_type.clone(), &[10.0, 20.0]).unwrap(), Some(0)).unwrap();
         let outputs = AddOperation::new().batch(&context, &EmptyRegionDriver, &[left, right]).unwrap().into_parts().0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(2));
         assert_eq!(
             outputs[0].value(),
-            &Array::from_f64s(
+            &Array::from_elements::<f64>(
                 left_type,
-                vec![
+                &[
                     11.0, 22.0, 13.0, 24.0, 15.0, 26.0, 17.0, 28.0, 19.0, 30.0, 21.0, 32.0, 23.0, 34.0, 25.0, 36.0,
                     27.0, 38.0, 29.0, 40.0, 31.0, 42.0, 33.0, 44.0,
-                ],
+                ]
             )
             .unwrap(),
         );
@@ -7550,9 +7556,10 @@ mod tests {
 
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated =
-            ArrayBatch::new(Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0]).unwrap(), None).unwrap();
+            ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[1.0, 2.0, 3.0]).unwrap(), None).unwrap();
         let right_replicated =
-            ArrayBatch::new(Array::from_f64s(vector_type.clone(), vec![10.0, 20.0, 30.0]).unwrap(), None).unwrap();
+            ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[10.0, 20.0, 30.0]).unwrap(), None)
+                .unwrap();
         let outputs = AddOperation::new()
             .batch(&context, &EmptyRegionDriver, &[left_replicated, right_replicated])
             .unwrap()
@@ -7564,7 +7571,8 @@ mod tests {
         // Unary elementwise operations use the same blanket rule and preserve the mapped input axis.
         let context = BatchingContext::new(TestArrayContext::new(), 3);
         let input =
-            ArrayBatch::new(Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0]).unwrap(), Some(0)).unwrap();
+            ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[1.0, 2.0, 3.0]).unwrap(), Some(0))
+                .unwrap();
         let outputs = NegOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
@@ -7595,12 +7603,12 @@ mod tests {
                     .with_sharding(Sharding::replicated(mesh.clone(), 2))
                     .unwrap();
             let sharded = ArrayBatch::new(
-                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+                Array::from_elements::<f64>(sharded_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
                 BatchAxis::new(0),
             )
             .unwrap();
             let replicated = ArrayBatch::new(
-                Array::from_f64s(replicated_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
+                Array::from_elements::<f64>(replicated_type, &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap(),
                 BatchAxis::new(0),
             )
             .unwrap();
@@ -7632,7 +7640,7 @@ mod tests {
                     .with_sharding(Sharding::new(mesh.clone(), sharding_dimensions).unwrap())
                     .unwrap();
             let batch = ArrayBatch::new(
-                Array::from_f64s(batched_type.clone(), (0..24).map(f64::from).collect()).unwrap(),
+                Array::from_elements::<f64>(batched_type.clone(), &(0..24).map(f64::from).collect::<Vec<_>>()).unwrap(),
                 BatchAxis::from_position(batch_axis),
             )
             .unwrap();

@@ -522,24 +522,24 @@ mod tests {
     fn test_scaled_dot() {
         // This fixture uses JAX's rank-2 default convention: the left trailing axis contracts with the right leading
         // axis. The two sides infer independent block ratios of two from different scale-axis positions.
-        let lhs = Array::from_f64s(
+        let lhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         )
         .unwrap();
-        let rhs = Array::from_f64s(
+        let rhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
-            (1..=12).map(|value| value as f64).collect(),
+            &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
         )
         .unwrap();
-        let lhs_scale = Array::from_f64s(
+        let lhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-            vec![1.0, 2.0, 0.5, 1.0],
+            &[1.0, 2.0, 0.5, 1.0],
         )
         .unwrap();
-        let rhs_scale = Array::from_f64s(
+        let rhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-            vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
         )
         .unwrap();
         let product = lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)).unwrap();
@@ -617,24 +617,24 @@ mod tests {
     fn test_scaled_dot_composition_supports_multiple_contracting_dimensions() {
         // Both contracting axes carry independent block ratios. Expanding all scale axes in one broadcast preserves
         // their original axis positions before the final reshape; every dequantized element is one in this fixture.
-        let lhs = Array::from_f64s(
+        let lhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into(), 6.into()])),
-            vec![1.0; 48],
+            &[1.0; 48],
         )
         .unwrap();
-        let rhs = Array::from_f64s(
+        let rhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 4.into(), 6.into(), 3.into()])),
-            vec![1.0; 72],
+            &[1.0; 72],
         )
         .unwrap();
-        let lhs_scale = Array::from_f64s(
+        let lhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 2.into()])),
-            vec![1.0; 8],
+            &[1.0; 8],
         )
         .unwrap();
-        let rhs_scale = Array::from_f64s(
+        let rhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 3.into()])),
-            vec![1.0; 12],
+            &[1.0; 12],
         )
         .unwrap();
         let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
@@ -645,24 +645,24 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![24.0; 6]);
 
         // The ergonomic wrapper follows JAX's `[B, M, K] x [B, N, K]` convention and defaults to an `f32` result.
-        let lhs = Array::from_f64s(
+        let lhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 4.into()])),
-            vec![1.0; 4],
+            &[1.0; 4],
         )
         .unwrap();
-        let rhs = Array::from_f64s(
+        let rhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into()])),
-            vec![1.0; 8],
+            &[1.0; 8],
         )
         .unwrap();
-        let lhs_scale = Array::from_f64s(
+        let lhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 2.into()])),
-            vec![1.0; 2],
+            &[1.0; 2],
         )
         .unwrap();
-        let rhs_scale = Array::from_f64s(
+        let rhs_scale = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into()])),
-            vec![1.0; 4],
+            &[1.0; 4],
         )
         .unwrap();
         let output = lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, None).unwrap();
@@ -672,9 +672,9 @@ mod tests {
 
         // Ryft honors the wrapper's documented independent block-ratio semantics even though pinned JAX's wrapper
         // currently rejects unequal scale contracting dimensions before reaching `lax.scaled_dot`.
-        let independently_scaled_rhs = Array::from_f64s(
+        let independently_scaled_rhs = Array::from_elements::<f32>(
             ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 1.into()])),
-            vec![1.0; 2],
+            &[1.0; 2],
         )
         .unwrap();
         let output = lhs.scaled_matmul(&rhs, &lhs_scale, &independently_scaled_rhs, None).unwrap();
@@ -687,12 +687,15 @@ mod tests {
         // operands follow the same rule, so each example retains its own block scales.
         let elements = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 4.into()]));
         let scales = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
-        let lhs =
-            ArrayBatch::new(Array::from_f64s(elements.clone(), vec![1.0; 8]).unwrap(), BatchAxis::new(0)).unwrap();
-        let rhs = ArrayBatch::new(Array::from_f64s(elements, vec![1.0; 8]).unwrap(), BatchAxis::new(0)).unwrap();
+        let lhs = ArrayBatch::new(Array::from_elements::<f32>(elements.clone(), &[1.0; 8]).unwrap(), BatchAxis::new(0))
+            .unwrap();
+        let rhs =
+            ArrayBatch::new(Array::from_elements::<f32>(elements, &[1.0; 8]).unwrap(), BatchAxis::new(0)).unwrap();
         let lhs_scale =
-            ArrayBatch::new(Array::from_f64s(scales.clone(), vec![1.0; 4]).unwrap(), BatchAxis::new(0)).unwrap();
-        let rhs_scale = ArrayBatch::new(Array::from_f64s(scales, vec![1.0; 4]).unwrap(), BatchAxis::new(0)).unwrap();
+            ArrayBatch::new(Array::from_elements::<f32>(scales.clone(), &[1.0; 4]).unwrap(), BatchAxis::new(0))
+                .unwrap();
+        let rhs_scale =
+            ArrayBatch::new(Array::from_elements::<f32>(scales, &[1.0; 4]).unwrap(), BatchAxis::new(0)).unwrap();
         let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, true);
 
         let outputs = operation

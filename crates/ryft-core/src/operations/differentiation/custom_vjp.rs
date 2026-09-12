@@ -1491,7 +1491,7 @@ mod tests {
         // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal
         // matrix `diag(3 * cos(x))`.
         let vector = test_type(&[2]);
-        let jacobian = differentiate_at(Array::from_f64s(vector, vec![0.5, 1.0]).unwrap())
+        let jacobian = differentiate_at(Array::from_elements::<f64>(vector, &[0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())

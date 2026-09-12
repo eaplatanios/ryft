@@ -373,7 +373,8 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let packed =
+            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
 
         // Freezing a batched reference yields the final packed referent at the reference's batch axis.
         let reference = packed.reference_new().unwrap();

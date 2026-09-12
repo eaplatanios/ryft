@@ -177,6 +177,10 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for
 /// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](crate::Zero), [`One`](super::One), and
 /// [`Fill`](super::Fill) in the same type-driven family.
+///
+/// For arrays, a zero-sized axis produces an empty result, including when products of other axis sizes would overflow.
+/// Non-empty arrays must have representable strides and storage sizes. Integer coordinates narrow to the element type,
+/// and complex coordinates have a zero imaginary component.
 pub trait Iota<V: Typed> {
     /// Returns a value of `type` whose elements increase from `0` along `dimension` and are constant along every other
     /// dimension.
@@ -224,7 +228,19 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
         // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
         // `stride` is the product of the sizes of the dimensions after `dimension`.
         let size = sizes[dimension];
-        let stride: usize = sizes[dimension + 1..].iter().product();
+
+        // Empty arrays never evaluate the element function, so their unused strides need not be representable.
+        let stride = if sizes.contains(&0) {
+            1
+        } else {
+            sizes[dimension + 1..]
+                .iter()
+                .try_fold(1usize, |stride, size| stride.checked_mul(*size))
+                .ok_or_else(|| {
+                    TypeError::invalid(format!("iota stride for array type `{type}` cannot be represented"))
+                })?
+        };
+
         let data_type = r#type.data_type();
         dispatch_on_array_element_type!(data_type, |Element| {
             Array::from_fn_elements(r#type.clone(), |flat| Element::from_unsigned(((flat / stride) % size) as u64))
@@ -244,7 +260,9 @@ where
         r#type: &ArrayType,
         dimension: usize,
     ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, ProgramError> {
-        Ok(self.bind(IotaOperation::new(r#type.clone(), dimension)?, Vec::new(), &[])?.remove(0))
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension)?, Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -361,7 +379,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, u4,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, i4, u4,
     };
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
@@ -484,7 +502,7 @@ mod tests {
         let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
         // Eager interpretation along axis one varies between columns and repeats across rows.
         let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
-        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap();
+        let expected = Array::from_elements::<f64>(r#type.clone(), &[0.0, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap();
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
                 &operation,
@@ -519,6 +537,45 @@ mod tests {
                 u4::new(1).unwrap(),
                 u4::new(2).unwrap(),
             ]),
+        );
+
+        // Integer coordinates narrow in two's-complement form rather than failing at the first unrepresentable index.
+        assert_eq!(
+            context.iota(&ArrayType::new_static(DataType::I4, [10]), 0).unwrap().elements::<i4>(),
+            Ok(vec![
+                i4::new(0).unwrap(),
+                i4::new(1).unwrap(),
+                i4::new(2).unwrap(),
+                i4::new(3).unwrap(),
+                i4::new(4).unwrap(),
+                i4::new(5).unwrap(),
+                i4::new(6).unwrap(),
+                i4::new(7).unwrap(),
+                i4::new(-8).unwrap(),
+                i4::new(-7).unwrap(),
+            ]),
+        );
+
+        // Empty arrays do not compute coordinates or unused strides, even if the nonzero sizes would overflow.
+        let empty_type = ArrayType::new_static(DataType::I32, [0, usize::MAX, usize::MAX]);
+        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]).map_err(Into::into));
+        let empty_type = ArrayType::new_static(DataType::I32, [usize::MAX, usize::MAX, 0]);
+        assert_eq!(context.iota(&empty_type, 0), Array::from_elements::<i32>(empty_type, &[]).map_err(Into::into));
+
+        // Nonempty oversized geometry is rejected before allocating storage, in both debug and release builds.
+        let oversized_type = ArrayType::new_static(DataType::I32, [1, usize::MAX, 2]);
+        assert_eq!(
+            context.iota(&oversized_type, 0),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "iota stride for array type `{oversized_type}` cannot be represented",
+            )))),
+        );
+        let oversized_type = ArrayType::new_static(DataType::I32, [usize::MAX]);
+        assert_eq!(
+            context.iota(&oversized_type, 0),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "array type {oversized_type} requires more bytes than can be represented",
+            )))),
         );
 
         // Non-numeric elements, out-of-range axes, and dynamic eager shapes are rejected.

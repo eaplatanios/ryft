@@ -172,6 +172,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::elements::{f8e4m3fn, f8e5m2};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
 
@@ -218,10 +219,17 @@ mod tests {
         let low_precision_type = ArrayType::new_static(DataType::BF16, [5]);
         let increment = f64::from(bf16::from_f64(0.005));
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![1.0, 0.005, 0.005, 0.005, 0.005])
-                .unwrap()
-                .cumulative_sum(0),
-            Ok(Array::from_f64s(low_precision_type, vec![1.0, 1.0078125, 1.015625, 1.0234375, 1.03125]).unwrap()),
+            Array::from_elements::<bf16>(
+                low_precision_type.clone(),
+                &[1.0, 0.005, 0.005, 0.005, 0.005].map(|value| bf16::from_f64(value))
+            )
+            .unwrap()
+            .cumulative_sum(0),
+            Ok(Array::from_elements::<bf16>(
+                low_precision_type,
+                &[1.0, 1.0078125, 1.015625, 1.0234375, 1.03125].map(|value| bf16::from_f64(value))
+            )
+            .unwrap()),
         );
         // Each of those partial sums is the re-encoding of the previous one plus the increment, and the exact sum of
         // all four increments rounds one step below the scan's last element.
@@ -256,8 +264,8 @@ mod tests {
         let laid_out =
             ArrayType::new_static(DataType::F32, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
         assert_eq!(
-            Array::from_f64s(laid_out.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap().cumulative_sum(1),
-            Ok(Array::from_f64s(laid_out, vec![1.0, 3.0, 3.0, 7.0]).unwrap()),
+            Array::from_elements::<f32>(laid_out.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap().cumulative_sum(1),
+            Ok(Array::from_elements::<f32>(laid_out, &[1.0, 3.0, 3.0, 7.0]).unwrap()),
         );
 
         // A zero-length scanned axis has nothing to accumulate.
@@ -297,14 +305,26 @@ mod tests {
         // an even mantissa, which drags the fourth prefix one step below the exactly accumulated product.
         let low_precision_type = ArrayType::new_static(DataType::F8E4M3FN, [4]);
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![2.0, 1.25, 1.25, 1.25])
-                .unwrap()
-                .cumulative_product(0),
-            Ok(Array::from_f64s(low_precision_type, vec![2.0, 2.5, 3.0, 3.75]).unwrap()),
+            Array::from_elements::<f8e4m3fn>(
+                low_precision_type.clone(),
+                &[2.0, 1.25, 1.25, 1.25].map(|value| f8e4m3fn::from_f64(value).unwrap())
+            )
+            .unwrap()
+            .cumulative_product(0),
+            Ok(Array::from_elements::<f8e4m3fn>(
+                low_precision_type,
+                &[2.0, 2.5, 3.0, 3.75].map(|value| f8e4m3fn::from_f64(value).unwrap())
+            )
+            .unwrap()),
         );
         assert_eq!(2.0 * 1.25 * 1.25 * 1.25, 3.90625);
         assert_eq!(
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![3.90625]).unwrap().to_f64s(),
+            Array::from_elements::<f8e4m3fn>(
+                ArrayType::new_static(DataType::F8E4M3FN, [1]),
+                &[3.90625].map(|value| f8e4m3fn::from_f64(value).unwrap())
+            )
+            .unwrap()
+            .to_f64s(),
             vec![4.0],
         );
 
@@ -346,8 +366,17 @@ mod tests {
         // rather than through a widened intermediate, and signed integers order below zero as expected.
         let low_precision_type = ArrayType::new_static(DataType::F8E5M2, [3]);
         assert_eq!(
-            Array::from_f64s(low_precision_type.clone(), vec![0.5, 6.0, 1.5]).unwrap().cumulative_max(0),
-            Ok(Array::from_f64s(low_precision_type, vec![0.5, 6.0, 6.0]).unwrap()),
+            Array::from_elements::<f8e5m2>(
+                low_precision_type.clone(),
+                &[0.5, 6.0, 1.5].map(|value| f8e5m2::from_f64(value).unwrap())
+            )
+            .unwrap()
+            .cumulative_max(0),
+            Ok(Array::from_elements::<f8e5m2>(
+                low_precision_type,
+                &[0.5, 6.0, 6.0].map(|value| f8e5m2::from_f64(value).unwrap())
+            )
+            .unwrap()),
         );
         assert_eq!(
             Array::vector(vec![7_i32, -2, 3]).unwrap().cumulative_min(0),
@@ -395,8 +424,10 @@ mod tests {
         // Accumulation happens in the operand's own encoding, so each partial result is rounded to it.
         let single_precision = ArrayType::new_static(DataType::F32, [2]);
         assert_eq!(
-            Array::from_f64s(single_precision.clone(), vec![0.0, 0.0]).unwrap().cumulative_log_sum_exp(0),
-            Ok(Array::from_f64s(single_precision, vec![0.0, f64::from(std::f32::consts::LN_2)]).unwrap()),
+            Array::from_elements::<f32>(single_precision.clone(), &[0.0, 0.0])
+                .unwrap()
+                .cumulative_log_sum_exp(0),
+            Ok(Array::from_elements::<f32>(single_precision, &[0.0, std::f32::consts::LN_2]).unwrap()),
         );
 
         // The exponential and the logarithm have no meaning for the integer element types.

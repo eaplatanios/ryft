@@ -51,6 +51,7 @@ impl<T: Type> Operation for ZeroLikeOperation<T> {
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
+        input_types[0].validate_zero()?;
         Ok(vec![input_types[0].clone()])
     }
 

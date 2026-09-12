@@ -1296,9 +1296,11 @@ mod tests {
         let context =
             BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()).unwrap())
-            .reference_new()
-            .unwrap();
+        let reference = TestValue::Array(
+            Array::from_elements::<f32>(packed_type, &(0..6).map(|value| value as f32).collect::<Vec<_>>()).unwrap(),
+        )
+        .reference_new()
+        .unwrap();
 
         // A mapped source moves its batch axis through the view and binds the batched view on the parent: the
         // leading batch axis shifts the indexed per-item axis to packed axis 1 and the output keeps batch axis 0.

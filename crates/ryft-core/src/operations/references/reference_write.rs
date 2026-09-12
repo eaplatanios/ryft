@@ -442,15 +442,16 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![0.0; 6]).unwrap())
+        let reference = TestIrValue::Array(Array::from_elements::<f32>(packed_type.clone(), &[0.0; 6]).unwrap())
             .reference_new()
             .unwrap();
         let batched =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
 
         // A replacement mapped at the reference's batch axis is stored packed.
-        let aligned =
-            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let aligned = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
         let replacement =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(aligned.clone(), BatchAxis::new(0)).unwrap());
         let outputs =
@@ -466,19 +467,23 @@ mod tests {
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[batched.clone(), replacement]).unwrap();
         assert_eq!(
             reference.read(),
-            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![7.0, 8.0, 9.0, 7.0, 8.0, 9.0]).unwrap())),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(packed_type.clone(), &[7.0, 8.0, 9.0, 7.0, 8.0, 9.0]).unwrap()
+            )),
         );
 
         // A replacement mapped at another axis is moved to the reference's batch axis.
         let transposed_type = ArrayType::new_static(DataType::F32, [3, 2]);
         let transposed =
-            TestIrValue::Array(Array::from_f64s(transposed_type, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap());
+            TestIrValue::Array(Array::from_elements::<f32>(transposed_type, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap());
         let replacement =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(transposed, BatchAxis::new(1)).unwrap());
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[batched, replacement]).unwrap();
         assert_eq!(
             reference.read(),
-            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+            )),
         );
 
         // A replicated replacement is stored plainly into a replicated reference, while a batched replacement has no
@@ -496,7 +501,7 @@ mod tests {
         let replacement = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestIrValue::Array(Array::from_f64s(packed_type, vec![0.0; 6]).unwrap()),
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[0.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),

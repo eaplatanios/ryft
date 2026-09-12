@@ -1479,7 +1479,7 @@ mod tests {
                 Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
             )
             .unwrap();
-        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let input = Array::from_elements::<f64>(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
@@ -1503,7 +1503,7 @@ mod tests {
         assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]).unwrap());
         assert_eq!(
             matrix.reduce(&[0, 1], ReductionKind::Sum),
-            Array::from_f64s(ArrayType::new_static(DataType::F64, []), vec![21.0]).unwrap()
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, []), &[21.0]).unwrap()
         );
         assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
         // Max and min use the data type's reduction identities and ordinary ordering.
@@ -1621,9 +1621,9 @@ mod tests {
             cases = [{
                 inputs = [(@mapped(
                     axis = 0
-                ), Array::from_f64s(
+                ), Array::from_elements::<f64>(
                     ArrayType::new_static(DataType::F64, [3, 2, 3]),
-                    (0..18).map(|index| index as f64).collect(),
+                    &(0..18).map(|index| index as f64).collect::<Vec<_>>(),
                 ).unwrap())],
                 outputs = [(@mapped(
                     axis = 0

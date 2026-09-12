@@ -4637,12 +4637,12 @@ macro_rules! check_gradient {
                 let perturbed = |index: usize, delta: f64| {
                     let mut values = input.to_f64s();
                     values[index] += delta;
-                    $crate::Array::from_f64s(input_type.clone(), values).unwrap()
+                    $crate::Array::from_elements::<f64>(input_type.clone(), &values).unwrap()
                 };
                 let estimates = (0..element_count)
                     .map(|index| central_difference(perturbed(index, step), perturbed(index, -step)))
                     .collect::<Vec<_>>();
-                let estimate = $crate::Array::from_f64s(input_type.clone(), estimates).unwrap();
+                let estimate = $crate::Array::from_elements::<f64>(input_type.clone(), &estimates).unwrap();
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             $crate::arrays::DataType::C128 => {
@@ -4657,8 +4657,8 @@ macro_rules! check_gradient {
                     real_values[index] += real_delta;
                     imaginary_values[index] += imaginary_delta;
                     $crate::operations::complex::Complex::complex(
-                        &$crate::Array::from_f64s(part_type.clone(), real_values).unwrap(),
-                        &$crate::Array::from_f64s(part_type.clone(), imaginary_values).unwrap(),
+                        &$crate::Array::from_elements::<f64>(part_type.clone(), &real_values).unwrap(),
+                        &$crate::Array::from_elements::<f64>(part_type.clone(), &imaginary_values).unwrap(),
                     )
                     .unwrap()
                 };
@@ -4675,8 +4675,8 @@ macro_rules! check_gradient {
                     ));
                 }
                 let estimate = $crate::operations::complex::Complex::complex(
-                    &$crate::Array::from_f64s(part_type.clone(), real_estimates).unwrap(),
-                    &$crate::Array::from_f64s(part_type, imaginary_estimates).unwrap(),
+                    &$crate::Array::from_elements::<f64>(part_type.clone(), &real_estimates).unwrap(),
+                    &$crate::Array::from_elements::<f64>(part_type, &imaginary_estimates).unwrap(),
                 )
                 .unwrap();
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);

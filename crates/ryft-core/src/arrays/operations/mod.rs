@@ -1027,6 +1027,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::elements::f8e8m0fnu;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::types::arrays::ArrayType;
@@ -2449,9 +2450,9 @@ mod tests {
                 .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
         );
 
-        let primal = Array::from_f64s(
+        let primal = Array::from_elements::<f8e8m0fnu>(
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
-            vec![1.0, 2.0, 4.0],
+            &[1.0, 2.0, 4.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
         )
         .unwrap();
         let tangent = Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap();
@@ -2729,12 +2730,12 @@ mod tests {
         assert_eq!(
             batched_output.batch().value(),
             &ArrayIrValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f64>(
                     ArrayType::new(
                         DataType::F64,
                         Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(3)]),
                     ),
-                    vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 5.0, 6.0]
                 )
                 .unwrap()
             ),
@@ -2893,16 +2894,16 @@ mod tests {
         );
         assert_eq!(
             batched_program.interpret(vec![ArrayIrValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f32>(
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
                 )
                 .unwrap()
             )]),
             Ok(vec![ArrayIrValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f32>(
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
-                    vec![12.0, 24.0, 36.0, 48.0, 60.0, 72.0],
+                    &[12.0, 24.0, 36.0, 48.0, 60.0, 72.0]
                 )
                 .unwrap()
             )]),

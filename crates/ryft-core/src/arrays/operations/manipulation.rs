@@ -2030,24 +2030,24 @@ in (%4)
         );
         assert_eq!(
             pullback.interpret(vec![ArrayIrValue::Array(
-                Array::from_f64s(
+                Array::from_elements::<f64>(
                     ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
                 )
                 .unwrap()
             )]),
             Ok(vec![
                 ArrayIrValue::Array(
-                    Array::from_f64s(
+                    Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-                        vec![1.0, 2.0, 3.0, 4.0],
+                        &[1.0, 2.0, 3.0, 4.0]
                     )
                     .unwrap()
                 ),
                 ArrayIrValue::Array(
-                    Array::from_f64s(
+                    Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
-                        vec![5.0, 6.0],
+                        &[5.0, 6.0]
                     )
                     .unwrap()
                 ),

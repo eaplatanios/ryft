@@ -197,10 +197,10 @@ mod tests {
             Shape::new(vec![Dimension::Static(1), Dimension::Static(1), Dimension::Static(1), Dimension::Static(1)]),
         );
         let inputs = AttentionInputs {
-            query: Array::from_f64s(r#type.clone(), vec![2.0]).unwrap(),
-            key: Array::from_f64s(r#type.clone(), vec![3.0]).unwrap(),
-            value: Array::from_f64s(r#type, vec![5.0]).unwrap(),
-            bias: Some(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![1.0]).unwrap()),
+            query: Array::from_elements::<f64>(r#type.clone(), &[2.0]).unwrap(),
+            key: Array::from_elements::<f64>(r#type.clone(), &[3.0]).unwrap(),
+            value: Array::from_elements::<f64>(r#type, &[5.0]).unwrap(),
+            bias: Some(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[1.0]).unwrap()),
             mask: Some(Array::from_elements(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
             query_sequence_lengths: Some(
                 Array::from_elements(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(1)])), &[1_i32])
@@ -238,9 +238,9 @@ mod tests {
         );
         let integer_bias = Array::from_elements(ArrayType::scalar(DataType::I32), &[0_i32]).unwrap();
         let inputs = AttentionInputs {
-            query: Array::from_f64s(r#type.clone(), vec![2.0]).unwrap(),
-            key: Array::from_f64s(r#type.clone(), vec![3.0]).unwrap(),
-            value: Array::from_f64s(r#type, vec![5.0]).unwrap(),
+            query: Array::from_elements::<f64>(r#type.clone(), &[2.0]).unwrap(),
+            key: Array::from_elements::<f64>(r#type.clone(), &[3.0]).unwrap(),
+            value: Array::from_elements::<f64>(r#type, &[5.0]).unwrap(),
             bias: Some(integer_bias),
             mask: None,
             query_sequence_lengths: None,
@@ -283,14 +283,14 @@ mod tests {
         let jvp = program.into_flat_program().jvp().unwrap();
         let outputs = jvp
             .interpret(vec![
-                ArrayIrValue::Array(Array::from_f64s(r#type.clone(), vec![2.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(r#type.clone(), vec![3.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(r#type.clone(), vec![5.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(scalar_type.clone(), vec![1.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(r#type.clone(), vec![7.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(r#type.clone(), vec![11.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(r#type, vec![13.0]).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(scalar_type, vec![17.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type.clone(), &[2.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type.clone(), &[3.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type.clone(), &[5.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(scalar_type.clone(), &[1.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type.clone(), &[7.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type.clone(), &[11.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(r#type, &[13.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<f64>(scalar_type, &[17.0]).unwrap()),
             ])
             .unwrap();
         let [

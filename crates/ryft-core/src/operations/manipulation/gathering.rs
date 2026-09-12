@@ -689,12 +689,15 @@ pub(crate) fn validate_unique_in_range(
 /// // Take rows 0 and 2 of a 3x2 matrix: each query is a scalar row index, so the indices have shape [2, 1]
 /// // (two queries, one index component each) and the gathered window is a full row (slice sizes [1, 2]).
 /// let operand = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-/// let indices = Array::from_f64s(
-///     ArrayType::new(DataType::I32, ryft_core::arrays::Shape::new(vec![
-///         ryft_core::arrays::Dimension::Static(2),
-///         ryft_core::arrays::Dimension::Static(1),
-///     ])),
-///     vec![0.0, 2.0],
+/// let indices = Array::from_elements::<i32>(
+///     ArrayType::new(
+///         DataType::I32,
+///         ryft_core::arrays::Shape::new(vec![
+///             ryft_core::arrays::Dimension::Static(2),
+///             ryft_core::arrays::Dimension::Static(1),
+///         ]),
+///     ),
+///     &[0, 2],
 /// ).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
 /// let operation = GatherOperation::new(dimensions, vec![1, 2]);
@@ -1051,13 +1054,13 @@ mod tests {
     }
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
-    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
+    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<i32>) -> V
     where
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
         let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
-        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values).unwrap()).unwrap()
+        exemplar.dispatch_domain().lift(Array::from_elements::<i32>(r#type, &values).unwrap()).unwrap()
     }
 
     #[test]
@@ -1124,7 +1127,7 @@ mod tests {
 
         // Interpretation handles each out-of-bounds mode explicitly.
         let scalar_dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let scalar_indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 5.0]).unwrap();
+        let scalar_indices = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[1, 5]).unwrap();
         let run = |mode| {
             Array::vector(vec![10.0, 20.0, 30.0, 40.0])
                 .unwrap()
@@ -1138,7 +1141,7 @@ mod tests {
 
         // Partial evaluation folds fully known gathers and residualizes an unknown data operand with known indices.
         let operand_value = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        let indices_value = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]).unwrap();
+        let indices_value = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap();
         let expected = Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
@@ -1167,15 +1170,15 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::from_f64s(
+                    (@mapped(axis = 0), Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 2.into()])),
-                        (0..12).map(|value| value as f64).collect(),
+                        &(0..12).map(|value| value as f64).collect::<Vec<_>>(),
                     ).unwrap()),
                     (@replicated, indices_value),
                 ],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(
                     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 2.into()])),
-                    vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 10.0, 11.0],
+                    &[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 10.0, 11.0],
                 ).unwrap())],
             }],
         );
@@ -1185,18 +1188,18 @@ mod tests {
             axis_size = 0,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::from_f64s(
+                    (@mapped(axis = 0), Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![0.into(), 3.into()])),
-                        Vec::new(),
+                        &[],
                     ).unwrap()),
-                    (@mapped(axis = 0), Array::from_f64s(
+                    (@mapped(axis = 0), Array::from_elements::<i32>(
                         ArrayType::new(DataType::I32, Shape::new(vec![0.into(), 1.into(), 1.into()])),
-                        Vec::new(),
+                        &[],
                     ).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(
                     ArrayType::new(DataType::F64, Shape::new(vec![0.into(), 1.into()])),
-                    Vec::new(),
+                    &[],
                 ).unwrap())],
             }],
         );
@@ -1313,7 +1316,7 @@ mod tests {
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
         let operation = GatherOperation::new(dimensions, vec![1, 2]);
         let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]).unwrap();
+        let indices = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap();
         let cotangent = Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]).unwrap();
         check_operation_transposition!(
             @exact,
@@ -1332,7 +1335,7 @@ mod tests {
         // Forward mode selects the operand coordinate feeding each gathered output.
         let jacobian = differentiate_at(Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap())
             .jacobian_forward(|operand| {
-                let indices = index_array(&operand, vec![2, 1], vec![0.0, 2.0]);
+                let indices = index_array(&operand, vec![2, 1], vec![0, 2]);
                 let operation =
                     GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
                 Ok(operand.gather(&indices, &operation).unwrap())
@@ -1363,7 +1366,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(dynamic_type);
-        let indices = builder.add_constant(Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]).unwrap());
+        let indices = builder.add_constant(Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap());
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let output = builder.add_instruction(operation, Vec::new(), vec![operand, indices], None).unwrap()[0];
         let program =

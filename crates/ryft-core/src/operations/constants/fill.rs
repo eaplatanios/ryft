@@ -109,7 +109,9 @@ where
 {
     fn fill_literal(&self, r#type: &ArrayType, value: L) -> Result<Self::Value, ProgramError> {
         let value = Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
-        self.bind(ConstantOperation::new(value), Vec::new(), &[])?.remove(0).broadcast(r#type.clone(), &[])
+        let mut outputs = self.bind(ConstantOperation::new(value), Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        outputs.remove(0).broadcast(r#type.clone(), &[])
     }
 }
 

@@ -14,7 +14,7 @@ use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdenti
 /// metadata and consume no operands. This is specialized to constant constructors because they have no data operands
 /// or regions and derive their complete result solely from stored type metadata plus dynamic extent operands.
 macro_rules! impl_member_operation_for_array_ir_constant_operation {
-    ($operation:ty) => {
+    ($operation:ty $(, $validate:ident)?) => {
         impl $crate::programs::MemberOperation<$crate::arrays::ArrayIrType> for $operation {
             #[inline]
             fn infer_parent_region_input_types(
@@ -31,6 +31,7 @@ macro_rules! impl_member_operation_for_array_ir_constant_operation {
                 input_types: &[$crate::arrays::ArrayIrType],
                 region_interfaces: &[$crate::programs::RegionInterface<$crate::arrays::ArrayIrType>],
             ) -> Result<Vec<$crate::arrays::ArrayIrType>, $crate::programs::TypeError> {
+                $(self.r#type().$validate()?;)?
                 $crate::operations::constants::infer_array_ir_constant_constructor_output_types(
                     self.name(),
                     self.r#type(),

@@ -5476,7 +5476,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let x = builder.add_input(state_type.clone());
             let k = builder.add_input(state_type.clone());
-            let one = builder.add_constant(Array::from_f64s(state_type.clone(), vec![1.0]).unwrap());
+            let one = builder.add_constant(Array::from_elements::<i32>(state_type.clone(), &[1]).unwrap());
             let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, k], None).unwrap()[0];
             let next_x = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, inverse], None).unwrap()[0];
             builder
@@ -5505,7 +5505,7 @@ mod tests {
         // to residualizing the loop whole.
         let knowledge = vec![
             PartialValue::Unknown(state_type.clone()),
-            PartialValue::Known(Array::from_f64s(state_type, vec![0.0]).unwrap()),
+            PartialValue::Known(Array::from_elements::<i32>(state_type, &[0]).unwrap()),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
         assert_eq!(evaluation.program.instructions().len(), 1);
@@ -5517,7 +5517,7 @@ mod tests {
             .iter()
             .map(|input| match input {
                 PartialEvaluationInput::Unknown(_) => {
-                    Array::from_f64s(ArrayType::scalar(DataType::I32), vec![-1.0]).unwrap()
+                    Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[-1]).unwrap()
                 }
                 PartialEvaluationInput::Known(value) => value.clone(),
             })

@@ -2876,7 +2876,7 @@ mod tests {
     #[test]
     fn test_rematerialization_matches_the_unrematerialized_gradient_under_every_policy() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (direct_value, direct_gradient) =
             domain.differentiate_at(input.clone()).value_and_gradient(|x| dot_sine(x)).unwrap();
@@ -2933,9 +2933,9 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder; 1])
                 .unwrap()
         };
-        let stacked = Array::from_f64s(
+        let stacked = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-            rows.iter().flatten().copied().collect(),
+            &rows.iter().flatten().copied().collect::<Vec<_>>(),
         )
         .unwrap();
         let scan_body = |carry: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
@@ -3169,9 +3169,8 @@ mod tests {
             let false_branch = branch(true);
             let body = move |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let context = input.dispatch_domain();
-                let predicate = context.lift(
-                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]).unwrap(),
-                )?;
+                let predicate = context
+                    .lift(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[predicate]).unwrap())?;
                 let mut outputs = context.bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![true_branch.clone(), false_branch.clone()],
@@ -3183,7 +3182,7 @@ mod tests {
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy);
             let forward_output_count = staged_operation(&function, vector_type(2)).forward().output_types().len();
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-                .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap())
+                .differentiate_at(Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap())
                 .value_and_gradient(|input| function.call(input).unwrap())
                 .unwrap();
             (forward_output_count, value.to_f64s()[0], gradient.to_f64s())
@@ -3270,7 +3269,7 @@ mod tests {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
             Ok(u.clone() * u.sin()?)
         }
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         // Forward output counts: 2 base outputs (output + input), plus the residuals each policy saves.
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, input: &Array, expected: &[f64]) {
@@ -3306,8 +3305,8 @@ mod tests {
         let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x, ()| function.call(x),
-                Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap(),
-                Array::from_f64s(vector_type(2), vec![1.0, 0.0]).unwrap(),
+                Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap(),
+                Array::from_elements::<f64>(vector_type(2), &[1.0, 0.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -3465,7 +3464,7 @@ mod tests {
             },
         );
         // f(x) = Σᵢ sin(xᵢ²) xᵢ, so ∂f/∂xⱼ = sin(xⱼ²) + 2 xⱼ² cos(xⱼ²).
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
         let (value, gradient) = domain.differentiate_at(input).value_and_gradient(|x| outer.call(x).unwrap()).unwrap();
@@ -3523,8 +3522,8 @@ mod tests {
         let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x, ()| outer.call(x),
-                Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap(),
-                Array::from_f64s(vector_type(2), vec![1.0, 0.0]).unwrap(),
+                Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap(),
+                Array::from_elements::<f64>(vector_type(2), &[1.0, 0.0]).unwrap(),
                 (),
             )
             .unwrap();
@@ -3659,7 +3658,7 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (value, gradient) = domain
-            .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]).unwrap())
+            .differentiate_at(Array::from_elements::<f64>(vector_type(2), &[0.5, 1.0]).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
@@ -3837,7 +3836,7 @@ mod tests {
                 "unexpected forward output count for policy {policy:?}",
             );
             // Custom policies only change the save/recompute split, never the gradient.
-            let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+            let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
             let (_, gradient) =
                 domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
@@ -3917,7 +3916,7 @@ mod tests {
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let jacobian = differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]).unwrap())
+        let jacobian = differentiate_at(Array::from_elements::<f64>(vector_type(2), &[0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| function.call(x))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -3955,7 +3954,7 @@ mod tests {
         // `u`). Offloaded residuals are emitted behind a staged transfer — the saved forward output carries the
         // destination memory, and the backward and tangent programs transfer it back before consuming it — while
         // residuals saved in place stay in their own memory with no transfers anywhere.
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let offload_u = SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST);
         let save_u = SaveAndOffloadOnlyTheseNames::new(["u"], [] as [&str; 0], PINNED_HOST);
@@ -4024,7 +4023,7 @@ mod tests {
         assert_eq!(forward_output_types.len(), 3);
         assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
 
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (value, gradient) =
             domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
@@ -4076,7 +4075,7 @@ mod tests {
         assert!(saved_memories.contains(&PINNED_HOST), "expected a host-parked saved residual");
 
         // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
-        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]).unwrap();
+        let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (_, gradient) = domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
@@ -4118,7 +4117,7 @@ mod tests {
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
         let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
         let (_, gradient) = domain
-            .differentiate_at(Array::from_f64s(matrix_type, rows.as_flattened().to_vec()).unwrap())
+            .differentiate_at(Array::from_elements::<f64>(matrix_type, &rows.as_flattened().to_vec()).unwrap())
             .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =

@@ -1923,8 +1923,8 @@ where
 /// # fn main() -> Result<(), ProgramError> {
 /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
-/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
+/// let i = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
+/// let j = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
 /// let y = x.dynamic_slice(&[i, j], &[1, 2])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
 /// assert_eq!(y.to_f64s(), vec![5.0, 6.0]);
@@ -2490,8 +2490,8 @@ where
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
-/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![0.0]).unwrap();
-/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]).unwrap();
+/// let i = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[0]).unwrap();
+/// let j = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
 /// let y = x.dynamic_update_slice(&update, &[i, j])?;
 /// assert_eq!(y.to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
@@ -2910,28 +2910,30 @@ mod tests {
     use super::*;
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
-    fn index(value: f64) -> Array {
-        Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]).unwrap()
+    fn index(value: i32) -> Array {
+        Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[value]).unwrap()
     }
 
     /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
-    fn index_constant<V>(exemplar: &V, value: f64) -> V
+    fn index_constant<V>(exemplar: &V, value: i32) -> V
     where
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
         exemplar
             .dispatch_domain()
-            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]).unwrap())
+            .lift(Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[value]).unwrap())
             .unwrap()
     }
 
     /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.
-    fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
+    fn batch_varying_indices(values: Vec<i32>) -> ArrayBatch<Array> {
         let length = values.len();
-        let value =
-            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])), values)
-                .unwrap();
+        let value = Array::from_elements::<i32>(
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])),
+            &values,
+        )
+        .unwrap();
         ArrayBatch::new(value, Some(0)).unwrap()
     }
 
@@ -3015,7 +3017,7 @@ mod tests {
             .interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[input.clone(), update.clone(), index(0.0), index(1.0)],
+                &[input.clone(), update.clone(), index(0), index(1)],
             )
             .unwrap();
         assert_eq!(*output[0].r#type(), input_type);
@@ -3027,7 +3029,7 @@ mod tests {
             .interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[input.clone(), update.clone(), index(5.0), index(-3.0)],
+                &[input.clone(), update.clone(), index(5), index(-3)],
             )
             .unwrap();
         assert_eq!(clamped[0].to_f64s(), vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
@@ -3165,7 +3167,7 @@ mod tests {
         // Partial evaluation folds known updates and residualizes an unknown operand with captured start indices.
         let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
         let update = Array::vector(vec![8.0, 9.0]).unwrap();
-        let start = index(1.0);
+        let start = index(1);
         let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
@@ -3226,7 +3228,7 @@ mod tests {
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
+                &[uniform_input, update, batch_varying_indices(vec![0, 2])],
             )
             .unwrap()
             .into_parts()
@@ -3247,7 +3249,7 @@ mod tests {
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
+                &[input, uniform_update, batch_varying_indices(vec![1, 0])],
             )
             .unwrap()
             .into_parts()
@@ -3271,8 +3273,8 @@ mod tests {
                 inputs = [
                     (@linear(type = input_type)),
                     (@linear(type = update_type)),
-                    (@known, index(0.0)),
-                    (@known, index(1.0)),
+                    (@known, index(0)),
+                    (@known, index(1)),
                 ],
                 output_cotangents = [cotangent],
                 input_cotangents = [
@@ -3288,9 +3290,11 @@ mod tests {
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
-        let start =
-            Array::from_f64s(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }), vec![1.0])
-                .unwrap();
+        let start = Array::from_elements::<i32>(
+            ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }),
+            &[1],
+        )
+        .unwrap();
         check_operation_transposition!(
             @exact,
             operation = DynamicUpdateSliceOperation,
@@ -3300,10 +3304,10 @@ mod tests {
                     (@linear(type = update_type.clone())),
                     (@known, start),
                 ],
-                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_f64s(update_type, vec![2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -3315,7 +3319,7 @@ mod tests {
             Array::vector(vec![7.0, 8.0]).unwrap(),
         ))
         .value_and_gradient(|(x, update)| {
-            let start = index_constant(&x, 1.0);
+            let start = index_constant(&x, 1);
             x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
         })
         .unwrap();
@@ -3367,7 +3371,7 @@ mod tests {
         // Interpretation extracts the block at the in-band start indices.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(1.0), index(1.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(1), index(1)])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![5.0, 6.0]);
@@ -3375,7 +3379,7 @@ mod tests {
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
         let clamped = operation
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(5.0), index(-2.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(5), index(-2)])
             .unwrap();
         assert_eq!(clamped[0].to_f64s(), vec![4.0, 5.0]);
 
@@ -3510,7 +3514,7 @@ mod tests {
 
         // Partial evaluation folds known starts and residualizes the read when the operand remains unknown.
         let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap();
-        let start = index(1.0);
+        let start = index(1);
         let expected = Array::vector(vec![1.0, 2.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
@@ -3560,7 +3564,7 @@ mod tests {
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[uniform, batch_varying_indices(vec![0.0, 2.0])],
+                &[uniform, batch_varying_indices(vec![0, 2])],
             )
             .unwrap()
             .into_parts()
@@ -3581,7 +3585,7 @@ mod tests {
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[input, batch_varying_indices(vec![1.0, 3.0])],
+                &[input, batch_varying_indices(vec![1, 3])],
             )
             .unwrap()
             .into_parts()
@@ -3600,7 +3604,7 @@ mod tests {
             .batch(
                 &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[trailing, batch_varying_indices(vec![1.0, 2.0])],
+                &[trailing, batch_varying_indices(vec![1, 2])],
             )
             .unwrap()
             .into_parts()
@@ -3621,9 +3625,9 @@ mod tests {
                 let context = x.context().clone();
                 let starts = context
                     .lift(
-                        Array::from_f64s(
+                        Array::from_elements::<i32>(
                             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])),
-                            vec![1.0, 2.0],
+                            &[1, 2],
                         )
                         .unwrap(),
                     )
@@ -3659,8 +3663,8 @@ mod tests {
             cases = [{
                 inputs = [
                     (@linear(type = operand_type)),
-                    (@known, index(1.0)),
-                    (@known, index(1.0)),
+                    (@known, index(1)),
+                    (@known, index(1)),
                 ],
                 output_cotangents = [cotangent],
                 input_cotangents = [Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0]).unwrap()],
@@ -3671,7 +3675,7 @@ mod tests {
         // batched basis tangents.
         let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
             .jacobian_forward(|x| {
-                let start = index_constant(&x, 1.0);
+                let start = index_constant(&x, 1);
                 Ok(x.dynamic_slice(&[start], &[2]).unwrap())
             })
             .unwrap();
@@ -4155,10 +4159,10 @@ mod tests {
             operation = UpdateSliceOperation::new(vec![1]),
             cases = [{
                 inputs = [(@linear(type = input_type.clone())), (@linear(type = update_type.clone()))],
-                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_f64s(update_type, vec![2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -4184,12 +4188,13 @@ mod tests {
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
-                    Array::from_f64s(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type.clone(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
                     BatchAxis::new(0),
                 )
                 .unwrap()
             };
-            let make_update = || ArrayBatch::replicated(Array::from_f64s(update_type.clone(), vec![9.0, 9.0]).unwrap());
+            let make_update =
+                || ArrayBatch::replicated(Array::from_elements::<f64>(update_type.clone(), &[9.0, 9.0]).unwrap());
 
             let static_outputs = UpdateSliceOperation::new(vec![1])
                 .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
@@ -4200,7 +4205,7 @@ mod tests {
                 .batch(
                     &context,
                     &crate::EmptyRegionDriver,
-                    &[make_input(), make_update(), ArrayBatch::replicated(index(1.0))],
+                    &[make_input(), make_update(), ArrayBatch::replicated(index(1))],
                 )
                 .unwrap()
                 .into_parts()
@@ -4432,16 +4437,16 @@ mod tests {
                     inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
                         .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
                         .with_memory(Memory::Host { pinned: true })))],
-                    output_cotangents = [Array::from_f64s(
+                    output_cotangents = [Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
                             .with_memory(Memory::Host { pinned: true }),
-                        vec![1.0, 2.0, 3.0],
+                        &[1.0, 2.0, 3.0],
                     ).unwrap()],
-                    input_cotangents = [Array::from_f64s(
+                    input_cotangents = [Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
                             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
                             .with_memory(Memory::Host { pinned: true }),
-                        vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
+                        &[0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
                     ).unwrap()],
                 },
             ],
@@ -4599,7 +4604,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type.clone(), values.clone())
+        let output = Array::from_elements::<f64>(input_type.clone(), &values.clone())
             .unwrap()
             .slice(&[0, 1, 2], &[2, 3, 4], &[1, 1, 1])
             .unwrap();
@@ -4613,15 +4618,16 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![6.0, 7.0, 10.0, 11.0, 18.0, 19.0, 22.0, 23.0]);
 
         // The matching update-slice writes the block back into place.
-        let update = Array::from_f64s(
+        let update = Array::from_elements::<f64>(
             ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
             ),
-            vec![-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
+            &[-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
         )
         .unwrap();
-        let updated = Array::from_f64s(input_type, values).unwrap().update_slice(&update, &[0, 1, 2]).unwrap();
+        let updated =
+            Array::from_elements::<f64>(input_type, &values).unwrap().update_slice(&update, &[0, 1, 2]).unwrap();
         assert_eq!(
             updated.to_f64s(),
             vec![
@@ -4632,12 +4638,12 @@ mod tests {
 
         // Strided slicing walks the row-major odometer with per-axis steps: rows with stride 2 and columns with
         // stride 3 keep elements at indices (0, 0), (0, 3), (1, 0), and (1, 3) of a 2x3x4 input's last two axes.
-        let strided = Array::from_f64s(
+        let strided = Array::from_elements::<f64>(
             ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
             ),
-            (0..24).map(|value| value as f64).collect(),
+            &(0..24).map(|value| value as f64).collect::<Vec<_>>(),
         )
         .unwrap()
         .slice(&[0, 0, 0], &[2, 3, 4], &[2, 2, 3])
@@ -4654,13 +4660,13 @@ mod tests {
         // The dynamic kernels validate their index operand shapes eagerly.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
-            input.dynamic_slice(&[index(0.0), Array::vector(vec![1.0, 2.0]).unwrap()], &[1, 2]),
+            input.dynamic_slice(&[index(0), Array::vector(vec![1.0, 2.0]).unwrap()], &[1, 2]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`dynamic_slice` start index 1 must be a scalar integer but has type f64[2]".to_string()
             ))),
         );
         assert_eq!(
-            input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]).unwrap(), &[index(0.0)]),
+            input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]).unwrap(), &[index(0)]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`dynamic_update_slice` expects one start index per input axis (2) but got 1".to_string()
             ))),

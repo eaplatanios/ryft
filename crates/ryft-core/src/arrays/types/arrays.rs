@@ -467,6 +467,22 @@ impl Type for ArrayType {
     type Identity = DimensionVariable;
     type Refinements = ArrayTypeRefinements;
 
+    #[inline]
+    fn validate_zero(&self) -> Result<(), TypeError> {
+        if matches!(self.data_type(), DataType::Token | DataType::F8E8M0FNU) {
+            return Err(TypeError::invalid(format!("data type `{}` cannot represent zero", self.data_type())));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_one(&self) -> Result<(), TypeError> {
+        if matches!(self.data_type(), DataType::Token | DataType::Zero) {
+            return Err(TypeError::invalid(format!("data type `{}` cannot represent one", self.data_type())));
+        }
+        Ok(())
+    }
+
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
         self.shape
             .dimensions()
@@ -1131,6 +1147,32 @@ mod tests {
             ArrayType::new(F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])).with_sharding(sharding),
             Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
         );
+    }
+
+    #[test]
+    fn test_array_type_validate_zero() {
+        for data_type in [DataType::F32, DataType::Zero] {
+            assert_eq!(ArrayType::scalar(data_type).validate_zero(), Ok(()));
+        }
+        for data_type in [DataType::Token, DataType::F8E8M0FNU] {
+            assert_eq!(
+                ArrayType::new_static(data_type, [0]).validate_zero(),
+                Err(TypeError::invalid(format!("data type `{data_type}` cannot represent zero"))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_type_validate_one() {
+        for data_type in [DataType::F32, DataType::F8E8M0FNU] {
+            assert_eq!(ArrayType::scalar(data_type).validate_one(), Ok(()));
+        }
+        for data_type in [DataType::Token, DataType::Zero] {
+            assert_eq!(
+                ArrayType::new_static(data_type, [0]).validate_one(),
+                Err(TypeError::invalid(format!("data type `{data_type}` cannot represent one"))),
+            );
+        }
     }
 
     #[test]

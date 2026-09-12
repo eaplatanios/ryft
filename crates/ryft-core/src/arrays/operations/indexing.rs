@@ -334,7 +334,7 @@ mod tests {
             ],
         );
         assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
-        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 1.0, 3.0]).unwrap());
+        let indices = ArrayIrValue::Array(Array::from_elements::<i32>(indices_type, &[1, 1, 3]).unwrap());
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()), indices])
@@ -385,7 +385,7 @@ mod tests {
         let linearization = program.linearize().unwrap();
 
         assert_eq!(linearization.residual_count(), 1);
-        let indices = ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]).unwrap());
+        let indices = ArrayIrValue::Array(Array::from_elements::<i32>(indices_type, &[1, 3]).unwrap());
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(
             jvp.interpret(vec![
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap()),
-                ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements::<i32>(indices_type, &[1, 3]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap()),
             ]),
@@ -524,7 +524,7 @@ mod tests {
     fn test_array_scatter() {
         // Scatter-add updates 10 and 20 into elements 3 and 0 of a vector.
         let operand = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let indices = Array::from_f64s(ArrayType::new_static(DataType::I64, [2, 1]), vec![3.0, 0.0]).unwrap();
+        let indices = Array::from_elements::<i64>(ArrayType::new_static(DataType::I64, [2, 1]), &[3, 0]).unwrap();
         let updates = Array::vector(vec![10.0, 20.0]).unwrap();
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);

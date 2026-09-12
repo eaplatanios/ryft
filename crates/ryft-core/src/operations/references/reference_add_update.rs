@@ -476,8 +476,9 @@ mod tests {
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let initial =
-            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let initial = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
         let reference = initial.reference_new().unwrap();
         let batched =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
@@ -486,7 +487,7 @@ mod tests {
         let update = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0; 6]).unwrap()),
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type.clone(), &[1.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),
@@ -495,7 +496,9 @@ mod tests {
         assert!(outputs.is_empty());
         assert_eq!(
             reference.read(),
-            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap())),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(packed_type.clone(), &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap()
+            )),
         );
 
         // A batched update cannot accumulate into an unbatched reference.
@@ -503,7 +506,7 @@ mod tests {
         let update = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0; 6]).unwrap()),
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),

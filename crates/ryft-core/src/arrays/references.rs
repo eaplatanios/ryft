@@ -2147,14 +2147,15 @@ mod tests {
             .unwrap();
         let inputs = vec![
             TestValue::Array(
-                Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
+                Array::from_elements::<f32>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+                    .unwrap(),
             ),
             TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0]).unwrap()),
         ];
         let expected = vec![
             TestValue::Array(Array::vector::<f32>(vec![7.0, 8.0]).unwrap()),
             TestValue::Array(
-                Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 9.0]).unwrap(),
+                Array::from_elements::<f32>(matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 9.0]).unwrap(),
             ),
         ];
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
@@ -2349,13 +2350,15 @@ mod tests {
             )
             .unwrap();
         let inputs = vec![
-            TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+            TestValue::Array(
+                Array::from_elements::<f32>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            ),
             TestValue::Array(Array::vector::<f32>(vec![10.0, 20.0, 30.0]).unwrap()),
             TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()),
         ];
         let expected = vec![
             TestValue::Array(Array::vector::<f32>(vec![4.0, 5.0, 6.0]).unwrap()),
-            TestValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 11.0, 22.0, 33.0]).unwrap()),
+            TestValue::Array(Array::from_elements::<f32>(matrix_type, &[1.0, 2.0, 3.0, 11.0, 22.0, 33.0]).unwrap()),
         ];
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
 
@@ -2414,11 +2417,11 @@ mod tests {
             (80, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
         ] {
             let selected = TestValue::Array(Array::vector::<f32>(selected).unwrap());
-            let written = TestValue::Array(Array::from_f64s(matrix_type.clone(), written).unwrap());
+            let written = TestValue::Array(Array::from_elements::<f32>(matrix_type.clone(), &written).unwrap());
             assert_eq!(
                 staged.clone().interpret(vec![
                     TestValue::Array(
-                        Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+                        Array::from_elements::<f32>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
                     ),
                     TestValue::Array(Array::scalar::<i32>(index).unwrap()),
                     TestValue::Array(Array::vector::<f32>(vec![20.0, 30.0]).unwrap()),
@@ -2428,7 +2431,7 @@ mod tests {
                     written.clone(),
                     selected,
                     written,
-                    TestValue::Array(Array::from_f64s(matrix_type.clone(), accumulated).unwrap()),
+                    TestValue::Array(Array::from_elements::<f32>(matrix_type.clone(), &accumulated).unwrap()),
                 ]),
             );
         }

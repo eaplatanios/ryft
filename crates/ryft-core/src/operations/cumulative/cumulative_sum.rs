@@ -314,7 +314,7 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, f8e4m3fn,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
@@ -414,11 +414,18 @@ mod tests {
 
         // Low-precision payloads accumulate in their own encoding, so each partial sum is rounded to it: `f8e4m3fn`
         // cannot represent 7 and rounds the third prefix to the nearest representable value.
-        let low_precision =
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 2.0, 4.0, 8.0]).unwrap();
+        let low_precision = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [4]),
+            &[1.0, 2.0, 4.0, 8.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(
             interpret(&CumulativeSumOperation::new(0), &low_precision),
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [4]), vec![1.0, 3.0, 7.0, 15.0]).unwrap(),
+            Array::from_elements::<f8e4m3fn>(
+                ArrayType::new_static(DataType::F8E4M3FN, [4]),
+                &[1.0, 3.0, 7.0, 15.0].map(|value| f8e4m3fn::from_f64(value).unwrap())
+            )
+            .unwrap(),
         );
 
         // Complex payloads accumulate both components.
@@ -486,8 +493,11 @@ mod tests {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
         let extents = Array::vector(vec![1_i32, 3]).unwrap();
         let input = ArrayBatch::new(
-            Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 3, 2]), (1..=12).map(f64::from).collect())
-                .unwrap(),
+            Array::from_elements::<f32>(
+                ArrayType::new_static(DataType::F32, [2, 3, 2]),
+                &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
+            )
+            .unwrap(),
             BatchAxis::new(0),
         )
         .unwrap()

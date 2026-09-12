@@ -797,14 +797,14 @@ mod tests {
     #[test]
     fn test_transpose_batching() {
         // Check that batching lifts the per-item permutation while leaving the mapped axis in place.
-        let batched_input = Array::from_f64s(
+        let batched_input = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
-            (0..24).map(|value| value as f64).collect(),
+            &(0..24).map(|value| value as f64).collect::<Vec<_>>(),
         )
         .unwrap();
-        let batched_output = Array::from_f64s(
+        let batched_output = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 4.into(), 3.into()])),
-            vec![
+            &[
                 0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 12.0, 16.0, 20.0, 13.0, 17.0, 21.0, 14.0,
                 18.0, 22.0, 15.0, 19.0, 23.0,
             ],
@@ -866,28 +866,28 @@ mod tests {
     fn test_transpose_batching_nonleading_axis() {
         // The batch axis may occupy any physical position. The lifted permutation leaves it in that position while
         // applying the logical rank-3 cycle around it.
-        let middle_axis_input = Array::from_f64s(
+        let middle_axis_input = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into(), 4.into()])),
-            (0..48).map(f64::from).collect(),
+            &(0..48).map(f64::from).collect::<Vec<_>>(),
         )
         .unwrap();
-        let middle_axis_output = Array::from_f64s(
+        let middle_axis_output = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![4.into(), 2.into(), 2.into(), 3.into()])),
-            vec![
+            &[
                 0.0, 4.0, 8.0, 24.0, 28.0, 32.0, 12.0, 16.0, 20.0, 36.0, 40.0, 44.0, 1.0, 5.0, 9.0, 25.0, 29.0, 33.0,
                 13.0, 17.0, 21.0, 37.0, 41.0, 45.0, 2.0, 6.0, 10.0, 26.0, 30.0, 34.0, 14.0, 18.0, 22.0, 38.0, 42.0,
                 46.0, 3.0, 7.0, 11.0, 27.0, 31.0, 35.0, 15.0, 19.0, 23.0, 39.0, 43.0, 47.0,
             ],
         )
         .unwrap();
-        let trailing_axis_input = Array::from_f64s(
+        let trailing_axis_input = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into(), 2.into()])),
-            (0..48).map(f64::from).collect(),
+            &(0..48).map(f64::from).collect::<Vec<_>>(),
         )
         .unwrap();
-        let trailing_axis_output = Array::from_f64s(
+        let trailing_axis_output = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![4.into(), 2.into(), 3.into(), 2.into()])),
-            vec![
+            &[
                 0.0, 1.0, 8.0, 9.0, 16.0, 17.0, 24.0, 25.0, 32.0, 33.0, 40.0, 41.0, 2.0, 3.0, 10.0, 11.0, 18.0, 19.0,
                 26.0, 27.0, 34.0, 35.0, 42.0, 43.0, 4.0, 5.0, 12.0, 13.0, 20.0, 21.0, 28.0, 29.0, 36.0, 37.0, 44.0,
                 45.0, 6.0, 7.0, 14.0, 15.0, 22.0, 23.0, 30.0, 31.0, 38.0, 39.0, 46.0, 47.0,
@@ -917,9 +917,11 @@ mod tests {
         // ragged dimension and every extent axis while preserving the mapped batch axis.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let extents = Array::matrix(2, 2, vec![1_i32, 4, 2, 3]).unwrap();
-        let packed =
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2, 3, 4]), (0..48).map(f64::from).collect())
-                .unwrap();
+        let packed = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [2, 2, 3, 4]),
+            &(0..48).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
         let expected_value = packed.transpose([3, 1, 0, 2]).unwrap();
         let input = ArrayBatch::new(packed, BatchAxis::new(1))
             .unwrap()
@@ -1006,22 +1008,22 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-9),
             operation = TransposeOperation::new(vec![2, 0, 1]),
             cases = [{
-                primals = [Array::from_f64s(cycle_input_type.clone(), (0..24).map(f64::from).collect()).unwrap()],
-                tangents = [Array::from_f64s(cycle_input_type.clone(), (24..48).map(f64::from).collect()).unwrap()],
-                primal_outputs = [Array::from_f64s(
-                    cycle_output_type.clone(),
-                    vec![
+                primals = [Array::from_elements::<f64>(
+                    cycle_input_type.clone(),
+                    &(0..24).map(f64::from).collect::<Vec<_>>(),
+                ).unwrap()],
+                tangents = [Array::from_elements::<f64>(
+                    cycle_input_type.clone(),
+                    &(24..48).map(f64::from).collect::<Vec<_>>(),
+                ).unwrap()],
+                primal_outputs = [Array::from_elements::<f64>(cycle_output_type.clone(), &[
                         0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 2.0, 6.0, 10.0,
                         14.0, 18.0, 22.0, 3.0, 7.0, 11.0, 15.0, 19.0, 23.0,
-                    ],
-                ).unwrap()],
-                tangent_outputs = [Array::from_f64s(
-                    cycle_output_type.clone(),
-                    vec![
+                    ]).unwrap()],
+                tangent_outputs = [Array::from_elements::<f64>(cycle_output_type.clone(), &[
                         24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 25.0, 29.0, 33.0, 37.0, 41.0, 45.0, 26.0, 30.0,
                         34.0, 38.0, 42.0, 46.0, 27.0, 31.0, 35.0, 39.0, 43.0, 47.0,
-                    ],
-                ).unwrap()],
+                    ]).unwrap()],
             }],
         );
     }
@@ -1067,17 +1069,14 @@ mod tests {
             operation = TransposeOperation::new(vec![2, 0, 1]),
             cases = [{
                 inputs = [(@linear(type = cycle_input_type.clone()))],
-                output_cotangents = [Array::from_f64s(
+                output_cotangents = [Array::from_elements::<f64>(
                     cycle_output_type.clone(),
-                    (0..24).map(f64::from).collect(),
+                    &(0..24).map(f64::from).collect::<Vec<_>>(),
                 ).unwrap()],
-                input_cotangents = [Array::from_f64s(
-                    cycle_input_type.clone(),
-                    vec![
+                input_cotangents = [Array::from_elements::<f64>(cycle_input_type.clone(), &[
                         0.0, 6.0, 12.0, 18.0, 1.0, 7.0, 13.0, 19.0, 2.0, 8.0, 14.0, 20.0, 3.0, 9.0, 15.0,
                         21.0, 4.0, 10.0, 16.0, 22.0, 5.0, 11.0, 17.0, 23.0,
-                    ],
-                ).unwrap()],
+                    ]).unwrap()],
             }],
         );
     }
@@ -1123,13 +1122,13 @@ mod tests {
             operation = TransposeOperation::new(vec![1, 0]),
             cases = [{
                 inputs = [(@linear(type = placed_input_type.clone()))],
-                output_cotangents = [Array::from_f64s(
+                output_cotangents = [Array::from_elements::<f64>(
                     placed_output_type,
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
-                input_cotangents = [Array::from_f64s(
+                input_cotangents = [Array::from_elements::<f64>(
                     placed_input_type,
-                    vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
+                    &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
                 ).unwrap()],
             }],
         );
@@ -1175,7 +1174,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).unwrap().move_axis(0, 2).unwrap();
+        let output = Array::from_elements::<f64>(input_type, &values).unwrap().move_axis(0, 2).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1274,7 +1273,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).unwrap().swap_axes(0, 1).unwrap();
+        let output = Array::from_elements::<f64>(input_type, &values).unwrap().swap_axes(0, 1).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1427,7 +1426,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = Array::from_f64s(input_type, values).unwrap().transpose(vec![2, 0, 1]).unwrap();
+        let output = Array::from_elements::<f64>(input_type, &values).unwrap().transpose(vec![2, 0, 1]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(
@@ -1451,7 +1450,7 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output.to_f64s(), vec![42.0]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
-        let output = Array::from_f64s(input_type, Vec::new()).unwrap().transpose(vec![1, 0]).unwrap();
+        let output = Array::from_elements::<f64>(input_type, &[]).unwrap().transpose(vec![1, 0]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(0)])),

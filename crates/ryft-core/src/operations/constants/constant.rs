@@ -24,7 +24,8 @@ pub const CONSTANT_OPERATION_NAME: &str = "constant";
 /// [`Operation`] that has no inputs and produces a single output equal to a stored typed literal. It carries a `V`
 /// [`Value`], so its output type is exactly the literal value's type and interpreting it materializes that value
 /// through the active context. Program capture references are normally represented as constant [`Atom`](crate::Atom)s
-/// instead (they name runtime values in a side table and are not literal operations).
+/// instead (they name runtime values in a side table and are not literal operations). Type inference and direct
+/// interpretation validate the stored payload with [`Value::validate_as_constant`] before using it as a literal.
 #[derive(Copy, Clone)]
 pub struct ConstantOperation<V: Value> {
     /// Literal value produced by this [`Operation`] when interpreted.
@@ -80,6 +81,7 @@ impl<V: Value> Operation for ConstantOperation<V> {
         _region_interfaces: &[RegionInterface<V::Type>],
     ) -> Result<Vec<V::Type>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
+        self.value.validate_as_constant()?;
         Ok(vec![self.value.r#type().into_owned()])
     }
 
@@ -109,6 +111,7 @@ impl<Stored: Value, C: Domain<Type = Stored::Type> + Constant<C::Value, Stored>>
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
+        self.value.validate_as_constant()?;
         Ok(vec![context.constant(self.value.clone())?])
     }
 }
@@ -234,7 +237,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionOperation,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        DimensionOperation,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{TransposableOperation, TranspositionContext};
@@ -273,6 +277,22 @@ mod tests {
     fn test_constant_type_inference() {
         let operation = ConstantOperation::<Array>::new(Array::scalar(3.5).unwrap());
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
+
+        // Dimension literals retain their complete identity-bearing type.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            ConstantOperation::new(dimension.clone()).infer_output_types(&[], &[]),
+            Ok(vec![dimension.r#type().into_owned()]),
+        );
+
+        // Mutable reference identity is absent from rendering and cannot be embedded in a literal operation.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        assert!(matches!(
+            ConstantOperation::new(reference).infer_output_types(&[], &[]),
+            Err(TypeError::Invalid { message, .. }) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
     }
 
     #[test]
@@ -288,6 +308,28 @@ mod tests {
             ),
             Ok(vec![Array::scalar(3.5).unwrap()]),
         );
+
+        // Direct interpretation enforces the same literal contract even without prior inference or sealing.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            ConstantOperation::new(dimension.clone()).interpret(
+                &EagerContext::<DimensionValue>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![dimension]),
+        );
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        assert!(matches!(
+            ConstantOperation::new(reference).interpret(
+                &EagerContext::<ArrayIrValue<Array>>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. })) if message ==
+                "reference values cannot be stored as program constants; pass external references through program \
+                 inputs or captures instead",
+        ));
 
         // Staged interpretation records the payload as a constant atom without emitting an instruction.
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();

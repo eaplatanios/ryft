@@ -1881,7 +1881,7 @@ mod tests {
             empty_type.pad(&padding_value_type, &[1], &[2], &[1]),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         );
-        let empty = Array::from_f64s(empty_type, vec![])
+        let empty = Array::from_elements::<f64>(empty_type, &[])
             .unwrap()
             .pad(&Array::scalar(7.0).unwrap(), &[1], &[2], &[1])
             .unwrap();
@@ -2178,10 +2178,10 @@ mod tests {
             cases = [{
                 inputs = [
                     (@linear(type = crop_input_type.clone())),
-                    (@known, Array::from_f64s(crop_padding_type, vec![9.0]).unwrap()),
+                    (@known, Array::from_elements::<f64>(crop_padding_type, &[9.0]).unwrap()),
                 ],
-                output_cotangents = [Array::from_f64s(crop_output_type, vec![2.0, 3.0]).unwrap()],
-                input_cotangents = [Array::from_f64s(crop_input_type, vec![0.0, 2.0, 3.0]).unwrap()],
+                output_cotangents = [Array::from_elements::<f64>(crop_output_type, &[2.0, 3.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f64>(crop_input_type, &[0.0, 2.0, 3.0]).unwrap()],
             }],
         );
 
@@ -2200,13 +2200,13 @@ mod tests {
             operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = input_type.clone())), (@linear(type = padding_type.clone()))],
-                output_cotangents = [Array::from_f64s(
+                output_cotangents = [Array::from_elements::<f64>(
                     output_type,
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                 ).unwrap()],
                 input_cotangents = [
-                    Array::from_f64s(input_type, vec![2.0, 4.0, 6.0]).unwrap(),
-                    Array::from_f64s(padding_type, vec![24.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type, &[2.0, 4.0, 6.0]).unwrap(),
+                    Array::from_elements::<f64>(padding_type, &[24.0]).unwrap(),
                 ],
             }],
         );
@@ -2259,7 +2259,7 @@ mod tests {
         // the complete type and avoid overflowing `interior + 1` for a value that can never be used as a stride.
         let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![7])));
-        let singleton = Array::from_f64s(singleton_type.clone(), vec![3.0]).unwrap();
+        let singleton = Array::from_elements::<f64>(singleton_type.clone(), &[3.0]).unwrap();
         let identity = singleton.pad(&Array::scalar(0.0).unwrap(), &[0], &[0], &[usize::MAX]).unwrap();
         assert_eq!(*identity.r#type(), singleton_type);
         assert_eq!(identity.to_f64s(), vec![3.0]);
@@ -2368,9 +2368,11 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
                     .with_sharding(physical_sharding)
                     .unwrap();
-            let input =
-                ArrayBatch::new(Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), BatchAxis::new(0))
-                    .unwrap();
+            let input = ArrayBatch::new(
+                Array::from_elements::<f64>(input_type, &[1.0, 2.0, 3.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+            )
+            .unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2380,7 +2382,8 @@ mod tests {
                 )
                 .unwrap();
             let padding =
-                ArrayBatch::new(Array::from_f64s(padding_type, vec![8.0, 9.0]).unwrap(), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(Array::from_elements::<f64>(padding_type, &[8.0, 9.0]).unwrap(), BatchAxis::new(0))
+                    .unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -2412,7 +2415,8 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]))
                     .with_sharding(physical_sharding.clone())
                     .unwrap();
-            let input = ArrayBatch::new(Array::from_f64s(input_type, Vec::new()).unwrap(), BatchAxis::new(0)).unwrap();
+            let input =
+                ArrayBatch::new(Array::from_elements::<f64>(input_type, &[]).unwrap(), BatchAxis::new(0)).unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2422,7 +2426,7 @@ mod tests {
                 )
                 .unwrap();
             let padding =
-                ArrayBatch::new(Array::from_f64s(padding_type, Vec::new()).unwrap(), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(Array::from_elements::<f64>(padding_type, &[]).unwrap(), BatchAxis::new(0)).unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 0)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 

@@ -1719,13 +1719,13 @@ mod tests {
                         (@linear(type = placed_left_type.clone())),
                         (@linear(type = placed_right_type.clone())),
                     ],
-                    output_cotangents = [Array::from_f64s(
+                    output_cotangents = [Array::from_elements::<f64>(
                         placed_output_type,
-                        vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                        &[1.0, 2.0, 3.0, 4.0, 5.0],
                     ).unwrap()],
                     input_cotangents = [
-                        Array::from_f64s(placed_left_type, vec![1.0, 2.0]).unwrap(),
-                        Array::from_f64s(placed_right_type, vec![3.0, 4.0, 5.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_left_type, &[1.0, 2.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_right_type, &[3.0, 4.0, 5.0]).unwrap(),
                     ],
                 },
                 {
@@ -1735,9 +1735,9 @@ mod tests {
                     ],
                     output_cotangents = [Array::vector(vec![1.0, 2.0]).unwrap()],
                     input_cotangents = [
-                        Array::from_f64s(
+                        Array::from_elements::<f64>(
                             ArrayType::new(DataType::F64, Shape::new(vec![0.into()])),
-                            Vec::new(),
+                            &[],
                         ).unwrap(),
                         Array::vector(vec![1.0, 2.0]).unwrap(),
                     ],
@@ -1967,15 +1967,12 @@ mod tests {
                 axis_sharding = ShardingDimension::sharded(["x"]),
                 cases = [{
                     inputs = [
-                        (@mapped(axis = 0), Array::from_f64s(
-                            physical_type,
-                            vec![1.0, 2.0, 3.0, 4.0],
-                        ).unwrap()),
-                        (@replicated, Array::from_f64s(replicated_type, vec![5.0]).unwrap()),
+                        (@mapped(axis = 0), Array::from_elements::<f64>(physical_type, &[1.0, 2.0, 3.0, 4.0]).unwrap()),
+                        (@replicated, Array::from_elements::<f64>(replicated_type, &[5.0]).unwrap()),
                     ],
-                    outputs = [(@mapped(axis = 0), Array::from_f64s(
+                    outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(
                         expected_type,
-                        vec![1.0, 2.0, 5.0, 3.0, 4.0, 5.0],
+                        &[1.0, 2.0, 5.0, 3.0, 4.0, 5.0],
                     ).unwrap())],
                 }],
             );
@@ -2230,11 +2227,11 @@ mod tests {
         assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap());
 
         // A rank-3 middle-axis concatenation exercises the row-major block odometer.
-        let first =
-            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let second = Array::from_f64s(
+        let first = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 1, 2]), &[1.0, 2.0, 3.0, 4.0])
+            .unwrap();
+        let second = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2, 2, 2]),
-            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
         )
         .unwrap();
         let concatenated = Array::concatenate([&first, &second], 1).unwrap();

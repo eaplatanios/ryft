@@ -195,9 +195,9 @@ mod tests {
         // below is a scaled copy of `f4e2m1fn` grid points whose scale is exactly representable in `f8e4m3fn`, so
         // quantization is exact; the all-zero block exercises the clamp to the smallest normal scale, `2^-6`.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)]));
-        let input = Array::from_f64s(
+        let input = Array::from_elements::<f32>(
             input_type.clone(),
-            vec![
+            &[
                 3.0, 1.5, 0.5, 6.0, 0.5, 1.0, 0.25, 1.5, // Blocks with scales 1.0 and 0.25.
                 -12.0, 6.0, 3.0, -1.0, 0.0, 0.0, 0.0, 0.0, // Blocks with scale 2.0 and the clamp floor.
             ],
@@ -240,13 +240,13 @@ mod tests {
             Err(error) if error.to_string().contains("`block_quantize` does not support scale data type `f16`"),
         ));
         let integer_input =
-            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(8)])), vec![1.0; 8])
+            Array::from_elements::<i32>(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(8)])), &[1; 8])
                 .unwrap();
         assert!(matches!(
             integer_input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
             Err(error) if error.to_string().contains("`block_quantize` expects an f32 or f64 input but got i32"),
         ));
-        let scalar_input = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![1.0]).unwrap();
+        let scalar_input = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[1.0]).unwrap();
         assert!(matches!(
             scalar_input.block_quantize(1, DataType::F4E2M1FN, DataType::F8E4M3FN),
             Err(error) if error.to_string().contains("must have rank between 1 and 3 but got rank 0"),
@@ -260,9 +260,9 @@ mod tests {
         // the boundary nudge in the `log2` composition) and every quotient is exactly representable in `f8e4m3fn`,
         // so quantization is exact; the all-zero block clamps its scale to `2^-127`.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)]));
-        let input = Array::from_f64s(
+        let input = Array::from_elements::<f32>(
             input_type.clone(),
-            vec![
+            &[
                 4.0, 2.0, 1.0, 0.5, 1.75, 0.5, -1.0, 0.25, // Blocks with scales 2^-6 and 2^-8.
                 -8.0, 4.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, // Blocks with scale 2^-5 and the clamp floor.
             ],
@@ -299,7 +299,8 @@ mod tests {
         // saturation of a block maximum landing past the finite range) and the contraction of eight such products
         // stays within a proportional tolerance of the full-precision dot.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(8)]));
-        let input = Array::from_f64s(input_type.clone(), vec![1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]).unwrap();
+        let input =
+            Array::from_elements::<f32>(input_type.clone(), &[1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]).unwrap();
         let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(elements.r#type().shape(), input_type.shape());
         assert_eq!(
@@ -317,7 +318,8 @@ mod tests {
 
         // Rank-1 inputs quantize per block along their only dimension.
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
-        let vector = Array::from_f64s(vector_type.clone(), vec![1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]).unwrap();
+        let vector =
+            Array::from_elements::<f32>(vector_type.clone(), &[1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]).unwrap();
         let (vector_elements, vector_scales) =
             vector.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(vector_elements.r#type().shape(), vector_type.shape());

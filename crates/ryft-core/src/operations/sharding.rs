@@ -529,7 +529,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension,
+        ShardingDimension, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
@@ -635,7 +635,8 @@ mod tests {
             .with_unreduced_axes(["m"])
             .unwrap();
         let input =
-            Array::from_f64s(vector_f64_type(8).with_sharding(input_sharding.clone()).unwrap(), vec![1.0; 8]).unwrap();
+            Array::from_elements::<f64>(vector_f64_type(8).with_sharding(input_sharding.clone()).unwrap(), &[1.0; 8])
+                .unwrap();
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let (_output, pullback) = differentiate_at(input)
@@ -679,7 +680,11 @@ mod tests {
         let mesh = mesh();
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(8)]));
-        let input = Array::from_f64s(input_type.clone(), vec![1.0; 8]).unwrap();
+        let input = Array::from_elements::<f8e8m0fnu>(
+            input_type.clone(),
+            &[1.0; 8].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let (output, pullback) = differentiate_at(input.clone())
             .vjp({
                 let target = target.clone();
@@ -687,7 +692,7 @@ mod tests {
             })
             .unwrap();
         let cotangent = pullback
-            .apply(Array::from_f64s(output.r#type().cotangent().unwrap(), vec![1.0; 8]).unwrap())
+            .apply(Array::from_elements::<f32>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
             .unwrap();
         assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent().unwrap());
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
@@ -719,9 +724,9 @@ mod tests {
         // Resharding records the requested distribution metadata on the type, carrying the input's varying manual
         // axes over to the target sharding exactly like the `ReshardOperation` type-inference rule.
         let input_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
-        let input = Array::from_f64s(
+        let input = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2]).with_sharding(input_sharding).unwrap(),
-            vec![1.0, 2.0],
+            &[1.0, 2.0],
         )
         .unwrap();
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();

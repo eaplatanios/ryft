@@ -117,7 +117,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, i4,
+        Array, ArrayType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, f8e4m3fn,
+        i4,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -313,7 +314,11 @@ mod tests {
     #[test]
     fn test_neg_for_array_low_precision() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(left.neg().unwrap().to_f64s(), vec![-1.0, -2.0]);
     }
 

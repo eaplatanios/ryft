@@ -815,9 +815,9 @@ mod tests {
     fn test_nested_batch_named_axes_route_collectives_to_matching_level() {
         // The inner `parallel_sum` targets the *outer* named axis, so each inner batch item must reduce over the
         // outer batch items: column sums of [[1, 2], [3, 4]].
-        let x = Array::from_f64s(
+        let x = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-            vec![1.0, 2.0, 3.0, 4.0],
+            &[1.0, 2.0, 3.0, 4.0],
         )
         .unwrap();
         let output: Array = batch(

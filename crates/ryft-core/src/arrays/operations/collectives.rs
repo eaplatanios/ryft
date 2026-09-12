@@ -723,7 +723,7 @@ mod tests {
         let zero_extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap());
         let zero_array = || {
             ArrayIrValue::Array(
-                Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])), Vec::new())
+                Array::from_elements::<f32>(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)])), &[])
                     .unwrap(),
             )
         };

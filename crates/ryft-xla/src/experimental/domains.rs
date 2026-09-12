@@ -6688,7 +6688,7 @@ mod tests {
         assert!(matches!(
             XlaDomain::token().bind(OneOperation::new(array_type.clone()), Vec::new(), &[]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "xla domain cannot synthesize one value for element type token"
+                if message == "data type `token` cannot represent one"
         ));
     }
 

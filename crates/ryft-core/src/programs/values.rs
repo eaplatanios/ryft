@@ -121,14 +121,18 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         rename_type_identities_by_rejection(self, renaming)
     }
 
-    /// Validates that this value can be used as a program constant (i.e., [`Atom::Constant`](crate::Atom::Constant)).
-    /// Such values must satisfy the following rendering contract: their [`Display`] output must be deterministic and
-    /// semantically complete, because program renderings double as structural fingerprints. Values that cannot satisfy
-    /// it (most notably mutable references, whose runtime identity is process-local and deliberately absent from
-    /// their deterministic rendering) must reject constant storage here and enter programs through inputs or captures
-    /// instead. [`Region`](crate::Region) sealing enforces this for every stored constant in every region, so all
-    /// construction paths (i.e., program builders, [`Program::new`](crate::Program::new), and region imports alike)
-    /// are covered. The default implementation accepts all values.
+    /// Validates that this value can be stored as an [`Atom::Constant`](crate::Atom::Constant) or a literal payload
+    /// of [`ConstantOperation`](crate::ConstantOperation). Such values must satisfy the following rendering contract:
+    /// their [`Display`] output must be deterministic and semantically complete, because program renderings double as
+    /// structural fingerprints. Values that cannot satisfy it (most notably mutable references, whose runtime identity
+    /// is process-local and deliberately absent from their deterministic rendering) must reject constant storage here
+    /// and enter programs through inputs or captures instead. [`Region`](crate::Region) sealing enforces this for every
+    /// stored constant in every region, so all construction paths (i.e., program builders,
+    /// [`Program::new`](crate::Program::new), and region imports alike) are covered.
+    /// [`ConstantOperation`](crate::ConstantOperation) also enforces this contract during type inference
+    /// and direct interpretation, preventing a literal instruction from bypassing constant-atom validation. This does
+    /// not prohibit captures: their runtime payloads remain outside the program, with capture references identifying
+    /// their positions in the capture table. The default implementation accepts all values.
     #[inline]
     fn validate_as_constant(&self) -> Result<(), TypeError> {
         Ok(())

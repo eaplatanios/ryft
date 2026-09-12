@@ -556,9 +556,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, f8e4m3fn, f8e5m2,
-        f8e8m0fnu, i4, u2, u4,
+        Array, ArrayElement, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, f8e4m3fn,
+        f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -567,7 +567,7 @@ mod tests {
     };
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_transposition, check_operation_type_inference,
+        check_operation_transposition, check_operation_type_inference, dispatch_on_array_element_type,
     };
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, Typed};
@@ -931,9 +931,9 @@ mod tests {
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::from_f64s(
+                    Array::from_elements::<f32>(
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
-                        vec![1.0, 2.0],
+                        &[1.0, 2.0],
                     ).unwrap()
                 )],
             }],
@@ -993,10 +993,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-6),
             operation = ConvertElementTypeOperation::new(DataType::F64, false),
             cases = [{
-                primals = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap()],
-                tangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap()],
-                primal_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap()],
-                tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap()],
+                primals = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap()],
+                tangents = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap()],
+                primal_outputs = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap()],
+                tangent_outputs = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap()],
             }],
         );
     }
@@ -1004,19 +1004,23 @@ mod tests {
     #[test]
     fn test_convert_element_type_differentiation_low_precision() {
         // Low-precision primals use their wider differential representations in both conversion directions.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (output, output_tangent) =
             differentiate_at(primal).jvp(tangent, |value| value.convert_element_type(DataType::F32)).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
+        assert_eq!(output_tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
 
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]).unwrap();
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
+        let primal = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap();
+        let tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::F8E8M0FNU))
             .unwrap();
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
+        assert_eq!(output_tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
     }
 
     #[test]
@@ -1029,37 +1033,62 @@ mod tests {
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
         let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f32.clone(), vec![2.0]).unwrap())
-            .jvp(Array::from_f64s(laid_out_f32.clone(), vec![3.0]).unwrap(), |value| {
+        let (_, tangent) = differentiate_at(Array::from_elements::<f32>(laid_out_f32.clone(), &[2.0]).unwrap())
+            .jvp(Array::from_elements::<f32>(laid_out_f32.clone(), &[3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F8E8M0FNU)
             })
             .unwrap();
-        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap());
+        assert_eq!(tangent, Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap());
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f8.clone(), vec![2.0]).unwrap())
-            .jvp(Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap(), |value| {
-                value.convert_element_type(DataType::F32)
-            })
-            .unwrap();
-        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap());
+        let (_, tangent) = differentiate_at(
+            Array::from_elements::<f8e8m0fnu>(
+                laid_out_f8.clone(),
+                &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+            )
+            .unwrap(),
+        )
+        .jvp(Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap(), |value| {
+            value.convert_element_type(DataType::F32)
+        })
+        .unwrap();
+        assert_eq!(tangent, Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_narrowing() {
         // Narrowing real and complex primals also narrows their concrete tangent values.
-        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]).unwrap())
-            .jvp(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap(), |value| {
-                value.convert_element_type(DataType::F32)
-            })
-            .unwrap();
-        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap());
+        let (_, tangent) =
+            differentiate_at(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap())
+                .jvp(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap(), |value| {
+                    value.convert_element_type(DataType::F32)
+                })
+                .unwrap();
+        assert_eq!(tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
 
-        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]).unwrap())
-            .jvp(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]).unwrap(), |value| {
-                value.convert_element_type(DataType::C64)
-            })
-            .unwrap();
-        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]).unwrap());
+        let (_, tangent) = differentiate_at(
+            Array::from_elements::<ComplexNumber<f64>>(
+                ArrayType::scalar(DataType::C128),
+                &[2.0].map(|value| ComplexNumber::new(value, 0.0)),
+            )
+            .unwrap(),
+        )
+        .jvp(
+            Array::from_elements::<ComplexNumber<f64>>(
+                ArrayType::scalar(DataType::C128),
+                &[3.0].map(|value| ComplexNumber::new(value, 0.0)),
+            )
+            .unwrap(),
+            |value| value.convert_element_type(DataType::C64),
+        )
+        .unwrap();
+        assert_eq!(
+            tangent,
+            Array::from_elements::<ComplexNumber<f32>>(
+                ArrayType::scalar(DataType::C64),
+                &[3.0].map(|value| ComplexNumber::new(value, 0.0))
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1101,13 +1130,13 @@ mod tests {
     #[test]
     fn test_convert_element_type_differentiation_discrete_intermediate() {
         // Passing through an element type with a zero-dimensional tangent space erases the incoming tangent.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]).unwrap();
-        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap();
+        let primal = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.75]).unwrap();
+        let tangent = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap();
         let (output, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64))
             .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]).unwrap());
+        assert_eq!(output_tangent, Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[0.0]).unwrap());
     }
 
     #[test]
@@ -1132,12 +1161,12 @@ mod tests {
             cases = [
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap()],
-                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]).unwrap()],
+                    output_cotangents = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap()],
+                    input_cotangents = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap()],
                 },
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap()],
+                    output_cotangents = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap()],
                     input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
                 },
             ],
@@ -1159,8 +1188,8 @@ mod tests {
             operation = ConvertElementTypeOperation::new(DataType::F8E8M0FNU, false),
             cases = [{
                 inputs = [(@linear(type = laid_out_f32.clone()))],
-                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap()],
-                input_cotangents = [Array::from_f64s(laid_out_f32.clone(), vec![3.0]).unwrap()],
+                output_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f32>(laid_out_f32.clone(), &[3.0]).unwrap()],
             }],
         );
 
@@ -1169,8 +1198,8 @@ mod tests {
             operation = ConvertElementTypeOperation::new(DataType::F32, false),
             cases = [{
                 inputs = [(@linear(type = laid_out_f8))],
-                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0]).unwrap()],
-                input_cotangents = [Array::from_f64s(plain_f32, vec![3.0]).unwrap()],
+                output_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f32>(plain_f32, &[3.0]).unwrap()],
             }],
         );
     }
@@ -1339,7 +1368,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
             .with_memory(Memory::Host { pinned: true });
-        let input = Array::from_f64s(input_type, vec![1.0, 2.0]).unwrap();
+        let input = Array::from_elements::<f32>(input_type, &[1.0, 2.0]).unwrap();
         assert_eq!(input.promote_element_type(DataType::F32), Ok(input));
     }
 
@@ -1396,7 +1425,13 @@ mod tests {
             DataType::C128,
         ];
         for source_data_type in data_types {
-            let source = Array::from_f64s(ArrayType::new_static(source_data_type, [1]), vec![1.0]).unwrap();
+            let source = dispatch_on_array_element_type!(source_data_type, |Element| {
+                Array::from_elements(
+                    ArrayType::new_static(source_data_type, [1]),
+                    &[<Element as ArrayElement>::one().unwrap()],
+                )
+            })
+            .unwrap();
             for target_data_type in data_types {
                 let converted = source.convert_element_type(target_data_type).unwrap();
                 assert_eq!(converted.r#type().into_owned(), ArrayType::new_static(target_data_type, [1]));
@@ -1469,7 +1504,11 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_encoding_fidelity() {
         // Exactly representable low-precision values survive a widening and narrowing round trip bit-for-bit.
-        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![2.0, 0.5]).unwrap();
+        let array = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::new_static(DataType::F8E8M0FNU, [2]),
+            &[2.0, 0.5].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let converted = array.convert_element_type(DataType::BF16).unwrap();
         assert_eq!(converted.to_f64s(), vec![2.0, 0.5]);
         let round_trip = converted.convert_element_type(DataType::F8E8M0FNU).unwrap();

@@ -74,6 +74,22 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// cross-value facts use `()`. Also, type refinements never inspect or retain runtime value payloads.
     type Refinements: TypeRefinements<Self>;
 
+    /// Validates that this type admits a zero value, independently of its shape or runtime allocation. Constructor
+    /// inference uses this before staging. The default accepts the type, but families with restrictions override it
+    /// so even empty values follow the same representability rules as non-empty values.
+    #[inline]
+    fn validate_zero(&self) -> Result<(), TypeError> {
+        Ok(())
+    }
+
+    /// Validates that this type admits a one value, independently of its shape or runtime allocation. Like
+    /// [`Type::validate_zero`], this validates representability without constructing a value. The default accepts
+    /// the type, but families whose values cannot represent one override it.
+    #[inline]
+    fn validate_one(&self) -> Result<(), TypeError> {
+        Ok(())
+    }
+
     /// Returns the [`TypeIdentity`]s carried by this [`Type`] in deterministic positional order. Each item contains
     /// the occurrence's [`TypeIdentityPosition`] and a borrowed identity. Types without identities return an empty
     /// iterator.

@@ -79,6 +79,7 @@ impl<T: Type> Operation for ZeroOperation<T> {
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
+        self.r#type.validate_zero()?;
         check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &self.r#type)?;
         Ok(vec![self.r#type.clone()])
     }
@@ -123,7 +124,7 @@ impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatchingPolicy> Ze
 impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 
-impl_member_operation_for_array_ir_constant_operation!(ZeroOperation<ArrayType>);
+impl_member_operation_for_array_ir_constant_operation!(ZeroOperation<ArrayType>, validate_zero);
 impl_member_interpretable_operation_for_array_ir_constant_operation!(
     ZeroOperation<ArrayType>,
     Zero,
@@ -199,6 +200,7 @@ pub trait Zero<V: Typed> {
 
 impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        r#type.validate_zero()?;
         match r#type.data_type() {
             DataType::Token => {
                 Err(TypeError::invalid(format!("data type `{}` cannot represent zero", DataType::Token)).into())
@@ -218,6 +220,7 @@ where
 {
     #[inline]
     fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<V>, ProgramError> {
+        r#type.validate_zero()?;
         let r#type = <&ArrayType>::try_from(r#type)?;
         Ok(ArrayIrValue::Array(EagerContext::<V, ArrayOperation<V>>::new().zero(r#type)?))
     }
@@ -231,7 +234,9 @@ where
 {
     #[inline]
     fn zero(&self, r#type: &T) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
-        Ok(self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?.remove(0))
+        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -333,6 +338,7 @@ pub trait DynamicZero<V: Typed> {
 impl<C: Context<Type = ArrayIrType, Operation: From<ZeroOperation<ArrayType>>>> DynamicZero<C::Value> for C {
     #[inline]
     fn dynamic_zero(&self, r#type: &ArrayType, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
+        r#type.validate_zero()?;
         validate_dynamic_constant_dimensions(ZERO_OPERATION_NAME, r#type, dimensions)?;
         let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), dimensions)?;
         check_count!("output", outputs, 1, ProgramError);
@@ -389,6 +395,20 @@ mod tests {
 
     #[test]
     fn test_zero_type_inference() {
+        // Representability is independent of the number of elements and is checked before staging.
+        for data_type in [DataType::Token, DataType::F8E8M0FNU] {
+            for shape in [vec![], vec![0], vec![2]] {
+                let r#type = ArrayType::new_static(data_type, shape);
+                let error = TypeError::invalid(format!("data type `{data_type}` cannot represent zero"));
+                assert_eq!(ZeroOperation::new(r#type.clone()).infer_output_types(&[], &[]), Err(error.clone()));
+                let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+                assert_eq!(context.zero(&r#type).unwrap_err(), ProgramError::Type(error.clone()));
+                assert!(context.builder().borrow().instructions().is_empty());
+                let context = EagerContext::<Array>::new();
+                assert_eq!(context.zero(&r#type), Err(ProgramError::Type(error)));
+            }
+        }
+
         let operation = ZeroOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
@@ -537,11 +557,14 @@ mod tests {
             ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
         assert_eq!(
             context.zero(&dimension_type),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+            Err(ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type"))),
         );
         assert_eq!(
             context.zero(&ArrayIrType::Reference(ReferenceType::new(output_type))),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got reference type"))),
+            Err(ProgramError::Type(TypeError::invalid(
+                "cannot materialize a zero for reference type `ref<f32[2, 3]>`; a reference denotes an allocation and has \
+                 no zero value, so tangent and cotangent references are allocated by the differentiation rules",
+            ))),
         );
     }
 
@@ -908,6 +931,18 @@ mod tests {
 
     #[test]
     fn test_dynamic_zero_invalid_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dimension = context.input(DimensionType::new(size.clone()).into());
+        for data_type in [DataType::Token, DataType::F8E8M0FNU] {
+            let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
+            assert_eq!(
+                context.dynamic_zero(&r#type, &[dimension.clone()]).unwrap_err(),
+                ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent zero"))),
+            );
+            assert!(context.builder().borrow().instructions().is_empty());
+        }
+
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));

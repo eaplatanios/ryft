@@ -122,8 +122,6 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Creates a new rank-0 [`Array`] containing `value`.
     #[inline]
     pub fn scalar<T: ArrayElement>(value: T) -> Result<Self, ProgramError> {
@@ -149,28 +147,6 @@ impl Array {
         )
     }
 
-    /// Creates a new [`Array`] from an array type and a row-major `f64` payload, converting each element into the
-    /// declared element data type (e.g., rounding into a low-precision floating-point encoding). Returns an error if
-    /// an element cannot be converted, the payload size does not match the type, or the type cannot describe
-    /// materialized storage. Token and residual-zero element types do not support conversion from `f64`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Array type, including the destination element data type and a fully static shape.
-    ///   - `values`: Row-major payload of the array, converted elementwise into `type`'s element data type.
-    pub fn from_f64s(r#type: ArrayType, values: Vec<f64>) -> Result<Self, ProgramError> {
-        let data_type = r#type.data_type();
-        if data_type.is_token() || data_type.is_zero() {
-            return Err(
-                TypeError::invalid(format!("cannot convert `f64` values to the `{data_type}` data type")).into()
-            );
-        }
-        dispatch_on_array_element_type!(data_type, |Element| {
-            let elements = values.into_iter().map(Element::from_real).collect::<Result<Vec<_>, _>>()?;
-            Self::from_elements(r#type, &elements)
-        })
-    }
-
     /// Creates a new [`Array`] with the provided [`ArrayType`] and backed by the provided shared physical storage
     /// without performing any validation for either. The caller guarantees what [`Array::new`] would otherwise check,
     /// namely that `bytes` has the exact layout-derived byte count for `type`, holds a valid encoding for every logical
@@ -182,6 +158,8 @@ impl Array {
     pub(crate) fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
         Self { r#type, bytes }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the complete immutable physical storage, including layout holes and tile padding.
     pub fn storage_bytes(&self) -> &[u8] {
@@ -912,6 +890,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::elements::f8e4m3fn;
     use crate::arrays::{DimensionBounds, DimensionVariable, Layout, StridedLayout};
     use crate::operations::complex::Complex;
     use crate::operations::{Compare, ComparisonDirection};
@@ -1225,40 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_from_f64s() {
-        // Conversion preserves the destination type's rounding and exact low-precision encodings.
-        let array = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.5, -1.5]).unwrap();
-        assert_eq!(array.elements::<f8e4m3fn>().unwrap()[0].to_bits(), 0x3c);
-        assert_eq!(array.elements::<f8e4m3fn>().unwrap()[1].to_bits(), 0xbc);
-        let array = Array::from_f64s(ArrayType::new_static(DataType::I32, [2]), vec![1.0, -2.0]).unwrap();
-        assert_eq!(array.elements::<i32>(), Ok(vec![1, -2]));
-
-        let array_type = ArrayType::new_static(DataType::F32, [2]);
-        assert!(matches!(
-            Array::from_f64s(array_type.clone(), vec![1.0]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == format!("array type {array_type} requires 2 logical elements but got 1"),
-        ));
-        for data_type in [DataType::Token, DataType::Zero] {
-            assert!(matches!(
-                Array::from_f64s(ArrayType::scalar(data_type), vec![0.0]),
-                Err(ProgramError::Type(TypeError::Invalid { message }))
-                    if message == format!("cannot convert `f64` values to the `{data_type}` data type"),
-            ));
-        }
-        assert!(matches!(
-            Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![0.0]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type `f8e8m0fnu` cannot represent zero",
-        ));
-        assert!(matches!(
-            Array::from_f64s(ArrayType::scalar(DataType::F4E2M1FN), vec![f64::NAN]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type `f4e2m1fn` cannot represent NaN",
-        ));
-    }
-
-    #[test]
     fn test_array_map_elements() {
         // `map_elements` applies a typed elementwise function, allowing input and output element types to differ.
         let integers = Array::vector(vec![1i32, -2, 3]).unwrap();
@@ -1382,7 +1327,12 @@ mod tests {
         );
         // Low-precision floating-point elements decode to the exact values they denote.
         assert_eq!(
-            Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![1.5]).unwrap().to_f64s(),
+            Array::from_elements::<f8e4m3fn>(
+                ArrayType::new_static(DataType::F8E4M3FN, [1]),
+                &[1.5].map(|value| f8e4m3fn::from_f64(value).unwrap())
+            )
+            .unwrap()
+            .to_f64s(),
             vec![1.5]
         );
     }
@@ -1484,8 +1434,16 @@ mod tests {
         assert_ne!(Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![1.0, 2.5]).unwrap());
         assert_ne!(Array::vector(vec![1.0f32]).unwrap(), Array::vector(vec![1.0f64]).unwrap());
         // Low-precision floating-point elements compare through their decoded values, so signed zeros compare equal.
-        let positive_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![0.0]).unwrap();
-        let negative_zero = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [1]), vec![-0.0]).unwrap();
+        let positive_zero = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [1]),
+            &[0.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let negative_zero = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [1]),
+            &[-0.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(positive_zero, negative_zero);
         // Equality decodes typed values directly, retaining IEEE NaN and signed-zero semantics rather than relying on
         // physical byte equality.

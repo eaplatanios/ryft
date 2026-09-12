@@ -1846,11 +1846,15 @@ mod tests {
             Shape::new(vec![Dimension::Static(batch_size), Dimension::Static(item_size)]),
         );
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
-        let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
-        let predicate =
-            ArrayBatch::new(Array::from_f64s(predicate_type, predicate_values).unwrap(), BatchAxis::new(0)).unwrap();
+        let predicate_values = (0..batch_size).map(|index| index == 0).collect::<Vec<_>>();
+        let predicate = ArrayBatch::new(
+            Array::from_elements::<bool>(predicate_type, &predicate_values).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
         let operand =
-            ArrayBatch::new(Array::from_f64s(batched_type, input_values).unwrap(), BatchAxis::new(0)).unwrap();
+            ArrayBatch::new(Array::from_elements::<f64>(batched_type, &input_values).unwrap(), BatchAxis::new(0))
+                .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
         let mut outputs = context
             .bind(
@@ -2004,12 +2008,12 @@ mod tests {
         // Eager binding interprets the predicate-selected branch through detached region access, and interpretation
         // without a predicate input is rejected.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let predicate = |value: f64| Array::from_f64s(predicate_type.clone(), vec![value]).unwrap();
+        let predicate = |value: bool| Array::from_elements::<bool>(predicate_type.clone(), &[value]).unwrap();
         let outputs = context
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(1.0), Array::scalar(4.0).unwrap()],
+                &[predicate(true), Array::scalar(4.0).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![8.0]);
@@ -2017,7 +2021,7 @@ mod tests {
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(0.0), Array::scalar(4.0).unwrap()],
+                &[predicate(false), Array::scalar(4.0).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![0.0]);
@@ -3622,7 +3626,7 @@ mod tests {
         let divide_branch = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
-            let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]).unwrap());
+            let one = builder.add_constant(Array::from_elements::<i32>(operand_type.clone(), &[1]).unwrap());
             let output = builder
                 .add_instruction(ArrayOperation::Div(DivOperation::new()), Vec::new(), vec![one, input], None)
                 .unwrap()[0];
@@ -3654,7 +3658,7 @@ mod tests {
         // back to residualizing the conditional whole.
         let knowledge = vec![
             PartialValue::Unknown(predicate_type),
-            PartialValue::Known(Array::from_f64s(operand_type.clone(), vec![0.0]).unwrap()),
+            PartialValue::Known(Array::from_elements::<i32>(operand_type.clone(), &[0]).unwrap()),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
         assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
@@ -3667,7 +3671,7 @@ mod tests {
             .iter()
             .map(|input| match input {
                 PartialEvaluationInput::Unknown(_) => {
-                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap()
+                    Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap()
                 }
                 PartialEvaluationInput::Known(value) => value.clone(),
             })
@@ -3690,7 +3694,7 @@ mod tests {
                     .with_sharding(batched_sharding)
                     .unwrap();
             let operand = ArrayBatch::new(
-                Array::from_f64s(batched_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+                Array::from_elements::<f64>(batched_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
                 BatchAxis::new(0),
             )
             .unwrap();
@@ -3700,8 +3704,9 @@ mod tests {
                     .unwrap();
             let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let predicate =
-                ArrayBatch::replicated(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap());
+            let predicate = ArrayBatch::replicated(
+                Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap(),
+            );
 
             let outputs = context
                 .bind(
@@ -3762,8 +3767,8 @@ mod tests {
             .filter(|instruction| instruction.operation().name() == "condition")
             .count();
         assert_eq!(condition_count, 1, "{program}");
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
+        let truthy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap();
+        let falsy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap();
         let operand = Array::vector(vec![1.0, 4.0, 9.0]).unwrap();
         assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
         assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![3.0, 12.0, 27.0]);
@@ -3772,9 +3777,9 @@ mod tests {
     #[test]
     fn test_condition_batching_reuses_naturally_aligned_branch_programs() {
         let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
-        let operand_values = Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let truthy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap();
+        let falsy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap();
+        let operand_values = Array::from_elements::<f64>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 
         // Both branches scale the batched operand per batch item, so both discover axis 0 and the joined layout equals
         // each branch's discovered layout: the rule batches each branch exactly once.
@@ -3915,8 +3920,8 @@ mod tests {
             .unwrap();
         let rendered = program.to_string();
         assert!(rendered.contains("broadcast"), "{rendered}");
-        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap();
-        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap();
+        let truthy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap();
+        let falsy = Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap();
         let operand = Array::vector(vec![1.0, 4.0, 9.0]).unwrap();
         assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
         assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![7.0, 7.0, 7.0]);
@@ -3965,7 +3970,8 @@ mod tests {
         let item_size = 3;
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
         let predicate =
-            ArrayBatch::new(Array::from_f64s(predicate_type, vec![1.0, 0.0]).unwrap(), BatchAxis::new(0)).unwrap();
+            ArrayBatch::new(Array::from_elements::<bool>(predicate_type, &[true, false]).unwrap(), BatchAxis::new(0))
+                .unwrap();
         let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let operand = ArrayBatch::new(operand, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
@@ -4300,8 +4306,7 @@ mod tests {
             let (value, pushforward) = differentiate_at(Array::scalar(0.7).unwrap())
                 .linearize(move |input| {
                     let predicate = input.context().lift(
-                        Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![if predicate { 1.0 } else { 0.0 }])
-                            .unwrap(),
+                        Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[predicate]).unwrap(),
                     )?;
                     let mut outputs = input.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
@@ -4643,8 +4648,9 @@ mod tests {
     fn test_condition_jvp_preserves_zero_space_output_tangents() {
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
             .jvp(Array::scalar(3.0).unwrap(), |input| {
-                let predicate =
-                    input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap())?;
+                let predicate = input
+                    .context()
+                    .lift(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap())?;
                 let mut outputs = input.context().bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![boolean_branch(), boolean_branch()],
@@ -4653,7 +4659,7 @@ mod tests {
                 Ok(outputs.remove(0))
             })
             .unwrap();
-        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap());
+        assert_eq!(primal, Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap());
         assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
     }
 
@@ -4701,7 +4707,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 (
-                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]).unwrap(),
+                    Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap(),
                     Array::scalar(4.0).unwrap(),
                 ),
                 (),
@@ -4723,7 +4729,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 (
-                    Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]).unwrap(),
+                    Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[false]).unwrap(),
                     Array::scalar(4.0).unwrap(),
                 ),
                 (),

@@ -303,7 +303,7 @@ mod tests {
         Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
         Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
         ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
-        UpdateSlice, ZeroLike, batch, differentiate_at,
+        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1633,8 +1633,16 @@ mod tests {
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let lhs_values = [0.5f64, 1.0, 1.5, 2.0];
         let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
-        let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec()).unwrap();
-        let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec()).unwrap();
+        let reference_lhs = CpuArray::from_elements::<f8e4m3fn>(
+            operand_type.clone(),
+            &lhs_values.to_vec().into_iter().map(|value| f8e4m3fn::from_f64(value).unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let reference_rhs = CpuArray::from_elements::<f8e4m3fn>(
+            operand_type.clone(),
+            &rhs_values.to_vec().into_iter().map(|value| f8e4m3fn::from_f64(value).unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap();
         let lhs_bytes = reference_lhs.logical_bytes();
         let rhs_bytes = reference_rhs.logical_bytes();
         let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
@@ -1671,10 +1679,26 @@ mod tests {
         const F4_CANDIDATES: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let element_values =
             |seed: usize| (0..32).map(|index| F4_CANDIDATES[(index * 5 + seed) % 8]).collect::<Vec<_>>();
-        let reference_lhs = CpuArray::from_f64s(element_type.clone(), element_values(0)).unwrap();
-        let reference_rhs = CpuArray::from_f64s(element_type.clone(), element_values(3)).unwrap();
-        let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]).unwrap();
-        let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]).unwrap();
+        let reference_lhs = CpuArray::from_elements::<f4e2m1fn>(
+            element_type.clone(),
+            &element_values(0).into_iter().map(|value| f4e2m1fn::from_f64(value).unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let reference_rhs = CpuArray::from_elements::<f4e2m1fn>(
+            element_type.clone(),
+            &element_values(3).into_iter().map(|value| f4e2m1fn::from_f64(value).unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let reference_lhs_scales = CpuArray::from_elements::<f8e4m3fn>(
+            scale_type.clone(),
+            &[0.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let reference_rhs_scales = CpuArray::from_elements::<f8e4m3fn>(
+            scale_type.clone(),
+            &[2.0, 0.5].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let bits = CpuArray::logical_bytes;
         let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
         let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
@@ -1736,9 +1760,7 @@ mod tests {
             Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
-        let reference = |values: &[f32]| {
-            CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect()).unwrap()
-        };
+        let reference = |values: &[f32]| CpuArray::from_elements::<f32>(host_type.clone(), &values).unwrap();
 
         for configuration in [
             AttentionConfiguration::new().with_scale(0.5),
@@ -1764,7 +1786,7 @@ mod tests {
 
         // The compiled composition also preserves the complete structural surface: a broadcast scalar bias, an
         // arbitrary mask, independent length vectors, the default scale, an asymmetric window, and the residual.
-        let reference_bias = CpuArray::from_f64s(ArrayType::scalar(DataType::F32), vec![0.25]).unwrap();
+        let reference_bias = CpuArray::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[0.25]).unwrap();
         let reference_mask = CpuArray::from_elements(
             ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)])),
             &[true, false, false, true, true, false, true, true, true],
@@ -1838,8 +1860,7 @@ mod tests {
         };
         let host_type =
             ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()));
-        let reference =
-            || CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect()).unwrap();
+        let reference = || CpuArray::from_elements::<f32>(host_type.clone(), &values).unwrap();
         let configuration = AttentionConfiguration::new().with_scale(0.5).with_causal(true);
 
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;

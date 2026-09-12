@@ -107,7 +107,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        i4,
+        f8e4m3fn, i4,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -283,10 +283,10 @@ mod tests {
                         (@linear(type = ArrayType::scalar(DataType::F64))),
                         (@linear(type = vector_type.clone())),
                     ],
-                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0]).unwrap()],
+                    output_cotangents = [Array::from_elements::<f64>(vector_type.clone(), &[2.0, 3.0, 4.0]).unwrap()],
                     input_cotangents = [
                         Array::scalar(9.0).unwrap(),
-                        Array::from_f64s(vector_type, vec![-2.0, -3.0, -4.0]).unwrap(),
+                        Array::from_elements::<f64>(vector_type, &[-2.0, -3.0, -4.0]).unwrap(),
                     ],
                     pullback = indoc! {"
                         lambda %0:f64[3] .
@@ -321,8 +321,16 @@ mod tests {
     #[test]
     fn test_sub_for_array_low_precision() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
-        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]).unwrap();
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
     }
 

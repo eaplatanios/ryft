@@ -598,7 +598,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::elements::{i2, i4};
+    use crate::arrays::elements::{f8e4m3fn, i2, i4};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;
@@ -608,8 +608,16 @@ mod tests {
     #[test]
     fn test_array_low_precision_float_arithmetic() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
-        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]).unwrap();
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let right = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(left.rem(&right).unwrap().to_f64s(), vec![0.0, 0.0]);
     }
 

@@ -221,7 +221,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, i4};
+    use crate::arrays::{Array, ArrayType, f8e4m3fn, f8e8m0fnu, i4};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -429,8 +429,12 @@ mod tests {
     #[test]
     fn test_abs_low_precision_differentiation_uses_widened_tangents() {
         // The coefficient and tangent are computed in the widened differential representation.
-        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
-        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]).unwrap();
+        let primal = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_eq!(tangent.to_f64s(), vec![3.0]);
@@ -468,8 +472,16 @@ mod tests {
 
     #[test]
     fn test_abs_for_array_low_precision() {
-        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]).unwrap();
-        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]).unwrap();
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let negative = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[-1.0, -2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
         assert_eq!(negative.abs().unwrap(), left);
     }
 

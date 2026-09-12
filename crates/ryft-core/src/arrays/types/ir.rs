@@ -138,6 +138,30 @@ impl Type for ArrayIrType {
     type Identity = DimensionVariable;
     type Refinements = ArrayIrTypeRefinements;
 
+    fn validate_zero(&self) -> Result<(), TypeError> {
+        match self {
+            Self::Array(r#type) => r#type.validate_zero(),
+            Self::Dimension(_) => Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
+            Self::Reference(r#type) => Err(TypeError::invalid(format!(
+                "cannot materialize a zero for reference type `{}`; a reference denotes an allocation and has \
+                 no zero value, so tangent and cotangent references are allocated by the differentiation rules",
+                r#type,
+            ))),
+        }
+    }
+
+    fn validate_one(&self) -> Result<(), TypeError> {
+        match self {
+            Self::Array(r#type) => r#type.validate_one(),
+            Self::Dimension(_) => Err(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
+            Self::Reference(r#type) => Err(TypeError::invalid(format!(
+                "cannot materialize a one for reference type `{}`; a reference denotes an allocation and has \
+                 no one value, so tangent and cotangent references are allocated by the differentiation rules",
+                r#type,
+            ))),
+        }
+    }
+
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
         let array = match self {
             Self::Array(r#type) => Some(r#type),
@@ -567,6 +591,44 @@ mod tests {
                 std::slice::from_ref(&unrelated),
             ),
             Ok(()),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_validate_zero() {
+        let array = ArrayType::scalar(F32);
+        assert_eq!(ArrayIrType::Array(array.clone()).validate_zero(), Ok(()));
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        assert_eq!(
+            ArrayIrType::Dimension(dimension).validate_zero(),
+            Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
+        );
+        let reference = ReferenceType::new(array);
+        assert_eq!(
+            ArrayIrType::Reference(reference.clone()).validate_zero(),
+            Err(TypeError::invalid(format!(
+                "cannot materialize a zero for reference type `{reference}`; a reference denotes an allocation and has \
+                 no zero value, so tangent and cotangent references are allocated by the differentiation rules",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_validate_one() {
+        let array = ArrayType::scalar(F32);
+        assert_eq!(ArrayIrType::Array(array.clone()).validate_one(), Ok(()));
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        assert_eq!(
+            ArrayIrType::Dimension(dimension).validate_one(),
+            Err(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
+        );
+        let reference = ReferenceType::new(array);
+        assert_eq!(
+            ArrayIrType::Reference(reference.clone()).validate_one(),
+            Err(TypeError::invalid(format!(
+                "cannot materialize a one for reference type `{reference}`; a reference denotes an allocation and has \
+                 no one value, so tangent and cotangent references are allocated by the differentiation rules",
+            ))),
         );
     }
 

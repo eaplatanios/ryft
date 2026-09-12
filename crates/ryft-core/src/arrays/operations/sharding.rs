@@ -43,9 +43,9 @@ mod tests {
         assert_eq!(transferred.storage_bytes(), array.storage_bytes());
 
         let input_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
-        let input = Array::from_f64s(
+        let input = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2]).with_sharding(input_sharding).unwrap(),
-            vec![1.0, 2.0],
+            &[1.0, 2.0],
         )
         .unwrap();
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();

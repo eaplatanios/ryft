@@ -1472,9 +1472,9 @@ mod tests {
 
         // Check batching, forward differentiation, and the inverse-reshape pullback.
         let batched_input = Array::matrix(2, 6, (0..12).map(|value| value as f64).collect()).unwrap();
-        let batched_output = Array::from_f64s(
+        let batched_output = Array::from_elements::<f64>(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
-            (0..12).map(|value| value as f64).collect(),
+            &(0..12).map(|value| value as f64).collect::<Vec<_>>(),
         )
         .unwrap();
         check_operation_batching!(
@@ -1496,9 +1496,9 @@ mod tests {
                     2,
                     vec![0.0, 6.0, 1.0, 7.0, 2.0, 8.0, 3.0, 9.0, 4.0, 10.0, 5.0, 11.0],
                 ).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(
                     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
-                    (0..12).map(|value| value as f64).collect(),
+                    &(0..12).map(|value| value as f64).collect::<Vec<_>>(),
                 ).unwrap())],
             }],
         );
@@ -1509,9 +1509,9 @@ mod tests {
             ),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::from_f64s(
+                inputs = [(@mapped(axis = 0), Array::from_elements::<f64>(
                     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
-                    (1..=12).map(|value| value as f64).collect(),
+                    &(1..=12).map(|value| value as f64).collect::<Vec<_>>(),
                 ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::matrix(
                     2,
@@ -1567,13 +1567,13 @@ mod tests {
             operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
             cases = [{
                 inputs = [(@linear(type = placed_input_type.clone()))],
-                output_cotangents = [Array::from_f64s(
+                output_cotangents = [Array::from_elements::<f64>(
                     placed_output_type,
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
-                input_cotangents = [Array::from_f64s(
+                input_cotangents = [Array::from_elements::<f64>(
                     placed_input_type,
-                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
             }],
         );

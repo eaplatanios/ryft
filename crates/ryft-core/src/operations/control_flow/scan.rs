@@ -4525,7 +4525,7 @@ mod tests {
             .bind(
                 ArrayOperation::Scan(empty),
                 vec![body.clone()],
-                &[Array::scalar(1.0).unwrap(), Array::from_f64s(empty_stacked_f64, vec![]).unwrap()],
+                &[Array::scalar(1.0).unwrap(), Array::from_elements::<f64>(empty_stacked_f64, &[]).unwrap()],
             )
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![1.0]);
@@ -6227,7 +6227,7 @@ mod tests {
             .unwrap();
         let discharged = program.clone().discharge_references(0).unwrap();
         assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
-        let value = TestIrValue::Array(Array::from_f64s(array_type, vec![1.0, 2.0, 3.0]).unwrap());
+        let value = TestIrValue::Array(Array::from_elements::<f32>(array_type, &[1.0, 2.0, 3.0]).unwrap());
         assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value.clone()]));
         assert_eq!(discharged.program().interpret(vec![value.clone()]), Ok(vec![value]));
     }
@@ -6418,7 +6418,7 @@ mod tests {
         let _index = builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = builder.add_input(r#type.clone());
         let _x = builder.add_input(r#type.clone());
-        let constant = builder.add_constant(Array::from_f64s(r#type, vec![7.0]).unwrap());
+        let constant = builder.add_constant(Array::from_elements::<f64>(r#type, &[7.0]).unwrap());
         builder
             .build(
                 vec![carry, carry, constant],
@@ -6792,9 +6792,10 @@ mod tests {
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
-                ArrayBatch::new(Array::from_f64s(carry_type, vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1.0, 2.0]).unwrap(), BatchAxis::new(0))
+                    .unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, Vec::new()).unwrap());
+            let stacked_inputs = ArrayBatch::replicated(Array::from_elements::<f64>(stack_type, &[]).unwrap());
             let context =
                 BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -6835,7 +6836,7 @@ mod tests {
             let _index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.clone());
             let x = builder.add_input(carry_type.clone());
-            let one = builder.add_constant(Array::from_f64s(carry_type.clone(), vec![1.0]).unwrap());
+            let one = builder.add_constant(Array::from_elements::<i32>(carry_type.clone(), &[1]).unwrap());
             let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, carry], None).unwrap()[0];
             let y = builder.add_instruction(MulOperation::new(), Vec::new(), vec![inverse, x], None).unwrap()[0];
             builder
@@ -6857,7 +6858,7 @@ mod tests {
         // The known zero carry would fold `1 / carry` during an invariance probe; with no iteration to run, the
         // partial evaluation must succeed and keep the scan whole.
         let knowledge = vec![
-            PartialValue::Known(Array::from_f64s(carry_type, vec![0.0]).unwrap()),
+            PartialValue::Known(Array::from_elements::<i32>(carry_type, &[0]).unwrap()),
             PartialValue::Unknown(stack_type),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
@@ -7007,7 +7008,7 @@ mod tests {
             evaluation.program.region_ref(scan.regions()[0]).unwrap().to_program().to_string(),
             body.to_string()
         );
-        let items = Array::from_f64s(stacked, vec![5.0, 7.0]).unwrap();
+        let items = Array::from_elements::<f64>(stacked, &[5.0, 7.0]).unwrap();
         assert_eq!(
             evaluation.interpret(&EagerContext::new(), &[items.clone()]),
             Ok(vec![Array::scalar(3.0).unwrap(), items]),
@@ -7650,9 +7651,11 @@ mod tests {
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
-                ArrayBatch::new(Array::from_f64s(carry_type, vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1.0, 2.0]).unwrap(), BatchAxis::new(0))
+                    .unwrap();
             let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, vec![2.0, 3.0, 4.0]).unwrap());
+            let stacked_inputs =
+                ArrayBatch::replicated(Array::from_elements::<f64>(stack_type, &[2.0, 3.0, 4.0]).unwrap());
             let context =
                 BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -7720,7 +7723,7 @@ mod tests {
 
         // Interpreting the staged program computes per-item cumulative products, with the replicated carry
         // broadcast across the batch.
-        let xs = Array::from_f64s(f64_type(&[2, 3]), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap();
+        let xs = Array::from_elements::<f64>(f64_type(&[2, 3]), &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap();
         let outputs = program.interpret((Array::scalar(1.0).unwrap(), xs)).unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![24.0, 210.0]);
         assert_eq!(outputs[1].to_f64s(), vec![2.0, 6.0, 24.0, 5.0, 30.0, 210.0]);
@@ -7772,8 +7775,8 @@ mod tests {
         );
         let outputs = program
             .interpret((
-                Array::from_f64s(f64_type(&[2]), vec![1.0, 1.0]).unwrap(),
-                Array::from_f64s(f64_type(&[3, 2]), vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]).unwrap(),
+                Array::from_elements::<f64>(f64_type(&[2]), &[1.0, 1.0]).unwrap(),
+                Array::from_elements::<f64>(f64_type(&[3, 2]), &[2.0, 5.0, 3.0, 6.0, 4.0, 7.0]).unwrap(),
             ))
             .unwrap();
         assert_eq!(outputs[0].to_f64s(), vec![24.0, 210.0]);
@@ -8636,22 +8639,25 @@ mod tests {
         // linear body contains another scan whose body also has scan-local residual references.
         let (scan, scan_body) = product_scan_with_lengths(&[2, 2, 2]);
         let xs_type = f64_type(&[2, 2, 2]);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = crate::EagerContext::<
-            crate::Array,
-            crate::ArrayOperation<crate::Array>,
-        >::new()
-        .differentiate_at((
-            Array::scalar(1.0).unwrap(),
-            Array::from_f64s(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
-        ))
-        .jvp((Array::scalar(1.0).unwrap(), Array::from_f64s(xs_type, vec![0.0; 8]).unwrap()), move |(init, xs)| {
-            let mut outputs =
-                init.context()
-                    .bind(TestOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])?;
-            let ys = outputs.remove(1);
-            Ok((outputs.remove(0), ys))
-        })
-        .unwrap();
+        let ((carry, ys), (carry_tangent, ys_tangent)) =
+            crate::EagerContext::<crate::Array, crate::ArrayOperation<crate::Array>>::new()
+                .differentiate_at((
+                    Array::scalar(1.0).unwrap(),
+                    Array::from_elements::<f64>(xs_type.clone(), &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(),
+                ))
+                .jvp(
+                    (Array::scalar(1.0).unwrap(), Array::from_elements::<f64>(xs_type, &[0.0; 8]).unwrap()),
+                    move |(init, xs)| {
+                        let mut outputs = init.context().bind(
+                            TestOperation::Scan(scan),
+                            vec![scan_body.clone()],
+                            &[init.clone(), xs.clone()],
+                        )?;
+                        let ys = outputs.remove(1);
+                        Ok((outputs.remove(0), ys))
+                    },
+                )
+                .unwrap();
         assert_eq!(carry.to_f64s(), vec![362880.0]);
         assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);
         assert_eq!(carry_tangent.to_f64s(), vec![362880.0]);

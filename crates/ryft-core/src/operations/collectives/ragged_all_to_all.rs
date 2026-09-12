@@ -1435,14 +1435,14 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("y".to_string());
         let operation = RaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation();
-        let operand = Array::from_f64s(
+        let operand = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2, 2, 3]),
-            vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
+            &[10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
         )
         .unwrap();
-        let output = Array::from_f64s(
+        let output = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2, 2, 4]),
-            vec![
+            &[
                 100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
                 212.0, 213.0,
             ],
@@ -2194,14 +2194,14 @@ mod tests {
     fn test_ragged_all_to_all_composes_named_batch_axes_in_both_orders() {
         let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
         let inputs = (
-            Array::from_f64s(
+            Array::from_elements::<f64>(
                 ArrayType::new_static(DataType::F64, [2, 2, 3]),
-                vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
+                &[10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
             )
             .unwrap(),
-            Array::from_f64s(
+            Array::from_elements::<f64>(
                 ArrayType::new_static(DataType::F64, [2, 2, 4]),
-                vec![
+                &[
                     100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
                     212.0, 213.0,
                 ],

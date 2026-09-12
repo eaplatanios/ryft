@@ -76,6 +76,7 @@ impl<T: Type> Operation for OneOperation<T> {
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
+        self.r#type.validate_one()?;
         check_constructor_type_has_no_identity_references(ONE_OPERATION_NAME, &self.r#type)?;
         Ok(vec![self.r#type.clone()])
     }
@@ -115,7 +116,7 @@ impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatchingPolicy> On
 impl_non_differentiable_operation!(<T> OneOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> OneOperation<T> where T: Type);
 
-impl_member_operation_for_array_ir_constant_operation!(OneOperation<ArrayType>);
+impl_member_operation_for_array_ir_constant_operation!(OneOperation<ArrayType>, validate_one);
 impl_member_interpretable_operation_for_array_ir_constant_operation!(
     OneOperation<ArrayType>,
     One,
@@ -187,6 +188,7 @@ pub trait One<V: Typed> {
 
 impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        r#type.validate_one()?;
         match r#type.data_type() {
             DataType::Token | DataType::Zero => {
                 Err(TypeError::invalid(format!("data type `{}` cannot represent one", r#type.data_type())).into())
@@ -205,6 +207,7 @@ where
 {
     #[inline]
     fn one(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<V>, ProgramError> {
+        r#type.validate_one()?;
         let r#type = <&ArrayType>::try_from(r#type)?;
         Ok(ArrayIrValue::Array(EagerContext::<V, ArrayOperation<V>>::new().one(r#type)?))
     }
@@ -218,7 +221,9 @@ where
 {
     #[inline]
     fn one(&self, r#type: &T) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
-        Ok(self.bind(OneOperation::new(r#type.clone()), Vec::new(), &[])?.remove(0))
+        let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -309,6 +314,7 @@ pub trait DynamicOne<V: Typed> {
 impl<C: Context<Type = ArrayIrType, Operation: From<OneOperation<ArrayType>>>> DynamicOne<C::Value> for C {
     #[inline]
     fn dynamic_one(&self, r#type: &ArrayType, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
+        r#type.validate_one()?;
         validate_dynamic_constant_dimensions(ONE_OPERATION_NAME, r#type, dimensions)?;
         let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), dimensions)?;
         check_count!("output", outputs, 1, ProgramError);
@@ -367,6 +373,20 @@ mod tests {
 
     #[test]
     fn test_one_type_inference() {
+        // Representability is independent of the number of elements and is checked before staging.
+        for data_type in [DataType::Token, DataType::Zero] {
+            for shape in [vec![], vec![0], vec![2]] {
+                let r#type = ArrayType::new_static(data_type, shape);
+                let error = TypeError::invalid(format!("data type `{data_type}` cannot represent one"));
+                assert_eq!(OneOperation::new(r#type.clone()).infer_output_types(&[], &[]), Err(error.clone()));
+                let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+                assert_eq!(context.one(&r#type).unwrap_err(), ProgramError::Type(error.clone()));
+                assert!(context.builder().borrow().instructions().is_empty());
+                let context = EagerContext::<Array>::new();
+                assert_eq!(context.one(&r#type), Err(ProgramError::Type(error)));
+            }
+        }
+
         let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
@@ -518,7 +538,7 @@ mod tests {
             ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
         assert_eq!(
             context.one(&dimension_type),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+            Err(ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type"))),
         );
     }
 
@@ -857,6 +877,18 @@ mod tests {
 
     #[test]
     fn test_dynamic_one_invalid_dimensions() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dimension = context.input(DimensionType::new(size.clone()).into());
+        for data_type in [DataType::Token, DataType::Zero] {
+            let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
+            assert_eq!(
+                context.dynamic_one(&r#type, &[dimension.clone()]).unwrap_err(),
+                ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent one"))),
+            );
+            assert!(context.builder().borrow().instructions().is_empty());
+        }
+
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));

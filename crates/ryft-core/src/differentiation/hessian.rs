@@ -357,7 +357,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType::{F32, F64};
-    use crate::arrays::{Array, ArrayType, DataType, Dimension, Shape};
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, Shape, f8e8m0fnu};
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::operations::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
@@ -412,7 +412,11 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 0.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Hessian blocks.
-        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]).unwrap();
+        let input = Array::from_elements::<f8e8m0fnu>(
+            ArrayType::scalar(DataType::F8E8M0FNU),
+            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
+        )
+        .unwrap();
         let widened_hessian = differentiate_at(input).hessian(|value| value.sin()).unwrap();
         let block = widened_hessian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
@@ -420,7 +424,7 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let zero_sized_hessian = differentiate_at(Array::from_f64s(r#type, Vec::new()).unwrap())
+        let zero_sized_hessian = differentiate_at(Array::from_elements::<f64>(r#type, &[]).unwrap())
             .hessian(|input| Ok(input.clone() * input))
             .unwrap();
         let block = zero_sized_hessian.iter_blocks().next().unwrap();

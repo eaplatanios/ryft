@@ -445,18 +445,25 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 
 /// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 4]), (1..=8).map(f64::from).collect())?;
-    let rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [4, 3]), (1..=12).map(f64::from).collect())?;
-    let lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 0.5, 1.0])?;
+    let lhs = CpuArray::from_elements::<f32>(
+        ArrayType::new_static(DataType::F32, [2, 4]),
+        &(1..=8).map(|value| value as f32).collect::<Vec<_>>(),
+    )?;
+    let rhs = CpuArray::from_elements::<f32>(
+        ArrayType::new_static(DataType::F32, [4, 3]),
+        &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
+    )?;
+    let lhs_scale =
+        CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 0.5, 1.0])?;
     let rhs_scale =
-        CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
+        CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
     let values = |value: CpuArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
 
-    let matmul_lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 4]), vec![1.0; 4])?;
-    let matmul_rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 4]), vec![1.0; 8])?;
-    let matmul_lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 2]), vec![1.0; 2])?;
-    let matmul_rhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2]), vec![1.0; 4])?;
+    let matmul_lhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0; 4])?;
+    let matmul_rhs = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8])?;
+    let matmul_lhs_scale = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0; 2])?;
+    let matmul_rhs_scale = CpuArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0; 4])?;
     let observations = BTreeMap::from([
         (
             "both_scales",
@@ -519,10 +526,10 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         .with_local_window((1, 0))
         .with_residual(true);
     let inputs = AttentionInputs {
-        query: CpuArray::from_f64s(query_type.clone(), vec![0.0; 4])?,
-        key: CpuArray::from_f64s(key_value_type.clone(), vec![0.0; 2])?,
-        value: CpuArray::from_f64s(key_value_type.clone(), vec![3.0, 9.0])?,
-        bias: Some(CpuArray::from_f64s(bias_type.clone(), vec![0.0])?),
+        query: CpuArray::from_elements::<f32>(query_type.clone(), &[0.0; 4])?,
+        key: CpuArray::from_elements::<f32>(key_value_type.clone(), &[0.0; 2])?,
+        value: CpuArray::from_elements::<f32>(key_value_type.clone(), &[3.0, 9.0])?,
+        bias: Some(CpuArray::from_elements::<f32>(bias_type.clone(), &[0.0])?),
         mask: Some(CpuArray::from_elements(mask_type.clone(), &[true, false, false, true])?),
         query_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
         key_value_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
@@ -533,9 +540,9 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
     let (gqa_output, _) = CpuArray::dot_product_attention(
         AttentionInputs {
-            query: CpuArray::from_f64s(gqa_query_type, vec![0.0; 8])?,
-            key: CpuArray::from_f64s(gqa_key_value_type.clone(), vec![0.0; 6])?,
-            value: CpuArray::from_f64s(gqa_key_value_type, vec![1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
+            query: CpuArray::from_elements::<f32>(gqa_query_type, &[0.0; 8])?,
+            key: CpuArray::from_elements::<f32>(gqa_key_value_type.clone(), &[0.0; 6])?,
+            value: CpuArray::from_elements::<f32>(gqa_key_value_type, &[1.0, 10.0, 2.0, 20.0, 4.0, 40.0])?,
             bias: None,
             mask: None,
             query_sequence_lengths: None,
