@@ -1,14 +1,15 @@
 use std::collections::BTreeSet;
 use std::ops::Mul as StandardMul;
+use std::sync::Arc;
 
-use crate::arrays::ArrayType;
+use crate::arrays::{Array, ArrayAddressing, ArrayElement, ArrayType, NumericArrayElement};
 use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    dispatch_on_array_element_type, impl_differentiable_elementwise_operation,
 };
 use crate::operations::ElementwiseOperation;
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{Operation, ProgramError, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -176,6 +177,51 @@ impl_capability_for_primitive!(@integer u128);
 impl_capability_for_primitive!(@integer usize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
+
+impl Mul for Array {
+    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        // Multiplication combines reduction states bilinearly rather than requiring congruent operand metadata.
+        // Use the operation's inference before evaluating elements so empty inputs obey the same contract.
+        let mut output_types = Operation::infer_output_types(
+            &MulOperation::<ArrayType>::new(),
+            &[self.r#type().into_owned(), rhs.r#type().into_owned()],
+            &[],
+        )?;
+        let output_type = output_types.remove(0);
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let data_type = output_type.data_type();
+        let lhs = self.promoted_to(data_type)?;
+        let rhs = rhs.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, NumericArrayElement::mul)
+        })
+    }
+}
+
+impl std::ops::Mul for Array {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Mul::mul(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Mul<f64> for Array {
+    type Output = Self;
+
+    /// Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
+    /// preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
+    fn mul(self, rhs: f64) -> Self::Output {
+        let data_type = self.r#type().data_type();
+        let factor = dispatch_on_array_element_type!(data_type, |Element| {
+            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
+        });
+        Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -457,5 +503,68 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`mul` result does not fit in i8".to_string() }),
         );
         assert_eq!(Mul::mul(&2.5_f64, &4.0), Ok(10.0));
+    }
+
+    #[test]
+    fn test_mul_for_array() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(Mul::mul(&vector, &vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]));
+        // Scaling by an `f64` preserves the array's element data type.
+        let scaled = Array::vector(vec![1.0f32, 2.0]) * 2.0;
+        assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]));
+    }
+
+    #[test]
+    fn test_mul_for_array_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
+        let partial_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let lhs = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
+        let rhs = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
+        let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
+
+        // A partial sum times an operand reduced over the same mesh axes remains a partial sum in either order.
+        assert_eq!(Mul::mul(&lhs, &rhs), Ok(expected.clone()));
+        assert_eq!(Mul::mul(&rhs, &lhs), Ok(expected));
+
+        // Multiplying two partial sums is invalid, including when no scalar evaluation would occur.
+        assert!(matches!(
+            Mul::mul(&lhs, &lhs),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two operands that are both unreduced",
+        ));
+        let empty_type = lhs.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
+        let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
+        assert!(matches!(
+            Mul::mul(&empty, &empty),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`mul` cannot multiply two operands that are both unreduced",
+        ));
+    }
+
+    #[test]
+    fn test_mul_for_array_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        assert_eq!(Mul::mul(&left, &right).unwrap().to_f64s(), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_mul_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
+        let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
+        assert_eq!(
+            Mul::mul(&left, &right).unwrap(),
+            Array::vector(vec![left_values[0] * right_values[0], left_values[1] * right_values[1]]),
+        );
     }
 }

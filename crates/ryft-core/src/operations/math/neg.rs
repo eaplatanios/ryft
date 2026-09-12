@@ -1,9 +1,11 @@
-use crate::arrays::DataType;
+use std::sync::Arc;
+
+use crate::arrays::{Array, ArrayAddressing, ArrayElement, DataType};
 use crate::macros::{
     check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    dispatch_on_array_element_type, impl_differentiable_elementwise_operation,
 };
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -81,6 +83,33 @@ impl_capability_for_primitive!(@signed isize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
 
+impl Neg for Array {
+    fn neg(&self) -> Result<Self, ProgramError> {
+        if Self::element_count(self.r#type().as_ref()) == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        if !data_type.is_numeric() {
+            return Err(TypeError::invalid(format!("cannot negate a scalar of data type `{data_type}`")).into());
+        }
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
+        })
+    }
+}
+
+impl std::ops::Neg for Array {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -88,7 +117,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, i4,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -271,5 +300,40 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`neg` result does not fit in i8".to_string() }),
         );
         assert_eq!(Neg::neg(&2.5_f64), Ok(-2.5));
+    }
+
+    #[test]
+    fn test_neg_for_array() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]));
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]));
+    }
+
+    #[test]
+    fn test_neg_for_array_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        assert_eq!(left.neg().unwrap().to_f64s(), vec![-1.0, -2.0]);
+    }
+
+    #[test]
+    fn test_neg_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
+        let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
+        assert_eq!(left.neg().unwrap(), Array::vector(vec![-left_values[0], -left_values[1]]));
+    }
+
+    #[test]
+    fn test_neg_for_array_integers() {
+        // Negation wraps deterministically for unsigned and two's-complement signed elements, matching the scalar
+        // reference backend (and StableHLO's integer semantics), rather than panicking or saturating.
+        let unsigned = Array::vector(vec![0u8, 1, 255]);
+        assert_eq!(unsigned.neg().unwrap().elements::<u8>(), Ok(vec![0, 255, 1]));
+        let minimum = Array::vector(vec![i8::MIN, -5]);
+        assert_eq!(minimum.neg().unwrap().elements::<i8>(), Ok(vec![i8::MIN, 5]));
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        assert_eq!(narrow.neg().unwrap().elements::<i4>(), Ok(vec![i4::new(-7).unwrap(), i4::MIN]));
     }
 }

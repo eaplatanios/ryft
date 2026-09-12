@@ -1,6 +1,7 @@
+use crate::arrays::{Array, NumericArrayElement};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
 
@@ -83,6 +84,23 @@ impl_capability_for_primitive!(@integer usize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
 
+impl_array_elementwise_operation!(
+    @binary
+    Add, add,
+    operation = "add",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |lhs, rhs| NumericArrayElement::add(lhs, rhs),
+);
+
+impl std::ops::Add for Array {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Add::add(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};
@@ -91,7 +109,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension, StridedLayout, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
@@ -100,7 +119,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Typed};
 
     use super::*;
 
@@ -300,5 +319,63 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`add` result does not fit in i8".to_string() }),
         );
         assert_eq!(Add::add(&2.5_f64, &0.5), Ok(3.0));
+    }
+
+    #[test]
+    fn test_add_for_array() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(vector.add(&Array::scalar(1.0)).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]));
+        // Mixed-precision operands promote to the common element data type.
+        let promoted = Array::vector(vec![1.0f32, 2.0]).add(&Array::vector(vec![0.5f64, 0.5])).unwrap();
+        assert_eq!(promoted, Array::vector(vec![1.5f64, 2.5]));
+        // General broadcasting traverses arbitrary input layouts while mixed element types normalize through the
+        // canonical conversion kernel.
+        let left_type =
+            ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
+        let left = Array::from_elements(left_type, &[1.0f32, 2.0]).unwrap();
+        let right_type =
+            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
+        let right = Array::from_elements(right_type, &[0.5f64, 1.0, 1.5]).unwrap();
+        let sum = left.add(&right).unwrap();
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_eq!(sum.elements::<f64>(), Ok(vec![1.5, 2.0, 2.5, 2.5, 3.0, 3.5]));
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(vector.clone() + Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
+        // Integer arithmetic wraps deterministically, matching the scalar reference backend.
+        let wrapped = Array::vector(vec![255u8]).add(&Array::vector(vec![1u8])).unwrap();
+        assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
+    }
+
+    #[test]
+    fn test_add_for_array_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        let sum = left.add(&right).unwrap();
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2]));
+        assert_eq!(sum.to_f64s(), vec![1.5, 2.25]);
+    }
+
+    #[test]
+    fn test_add_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
+        let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
+        assert_eq!(
+            left.add(&right).unwrap(),
+            Array::vector(vec![left_values[0] + right_values[0], left_values[1] + right_values[1]]),
+        );
+    }
+
+    #[test]
+    fn test_add_for_array_integers() {
+        // Sub-byte arithmetic wraps using the declared bit width.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        assert_eq!(
+            narrow.add(&Array::scalar(i4::new(1).unwrap())).unwrap().elements::<i4>(),
+            Ok(vec![i4::MIN, i4::new(-7).unwrap()]),
+        );
     }
 }

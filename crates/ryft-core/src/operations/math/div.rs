@@ -1,9 +1,10 @@
 use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
+use crate::arrays::{Array, NumericArrayElement};
 use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
 use crate::tracing::{Tracer, TracingContext};
@@ -108,6 +109,23 @@ impl_capability_for_primitive!(@integer usize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
 
+impl_array_elementwise_operation!(
+    @binary
+    Div, div,
+    operation = "div",
+    inputs = @numeric,
+    checks = [@no_unreduced, @same_reduced_axes],
+    |lhs, rhs| NumericArrayElement::div(lhs, rhs),
+);
+
+impl std::ops::Div for Array {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        Div::div(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -129,7 +147,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::manipulation::conversions::ConvertElementType;
-    use crate::programs::{EmptyRegionDriver, MaybeZero};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, TypeError};
 
     use super::*;
 
@@ -380,5 +398,54 @@ mod tests {
             }),
         );
         assert_eq!(Div::div(&1.0_f64, &0.0), Ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_div_for_array() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(Div::div(&vector, &Array::scalar(2.0)).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
+    }
+
+    #[test]
+    fn test_div_for_array_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        assert_eq!(Div::div(&left, &right).unwrap().to_f64s(), vec![2.0, 8.0]);
+    }
+
+    #[test]
+    fn test_div_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
+        let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
+        assert_abs_diff_eq!(
+            Div::div(&left, &right).unwrap(),
+            Array::vector(vec![left_values[0] / right_values[0], left_values[1] / right_values[1]]),
+            epsilon = 1e-12,
+        );
+        // Ratio-based division can still overflow when both denominator components are near the largest value.
+        let large = Array::scalar(Complex::new(1e308f64, 1e308));
+        let quotient = Div::div(&large, &large).unwrap().elements::<Complex<f64>>().unwrap()[0];
+        assert!(quotient.re.is_nan());
+        assert_eq!(quotient.im.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn test_div_for_array_integers() {
+        // Exceptional integer division inputs return the same structured errors as native-width array
+        // arithmetic rather than panicking.
+        assert!(matches!(
+            Div::div(&Array::vector(vec![1i32]), &Array::vector(vec![0i32])),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot divide an integer scalar of data type `i32` by zero",
+        ));
+        assert!(matches!(
+            Div::div(&Array::vector(vec![i8::MIN]), &Array::vector(vec![-1i8])),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
+        ));
     }
 }

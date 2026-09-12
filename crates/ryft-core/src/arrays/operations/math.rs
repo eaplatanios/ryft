@@ -25,10 +25,10 @@ use crate::macros::impl_array_elementwise_operation;
 use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_sum_exp_data_type};
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
-    Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Log1p, LogAddExp, LogSumExp, Logistic, Mul, MulOperation, Neg, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReductionKind, Rem, Reshape, Round, Rsqrt,
-    Sign, Sin, Slice, Sqrt, Sub, Tanh,
+    Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
+    Log1p, LogAddExp, LogSumExp, Logistic, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers,
+    RaggedDotMode, RaggedDotOperation, Reduce, ReductionKind, Rem, Reshape, Round, Rsqrt, Sign, Sin, Slice, Sqrt, Sub,
+    Tanh,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
@@ -666,42 +666,6 @@ impl Abs for Array {
     }
 }
 
-impl Neg for Array {
-    fn neg(&self) -> Result<Self, ProgramError> {
-        if Self::element_count(self.r#type().as_ref()) == 0 {
-            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-            return Ok(Self::new_unchecked(
-                self.r#type().into_owned(),
-                Arc::new(vec![0; addressing.storage_byte_len()]),
-            ));
-        }
-        let data_type = self.r#type().data_type();
-        if !data_type.is_numeric() {
-            return Err(TypeError::invalid(format!("cannot negate a scalar of data type `{data_type}`")).into());
-        }
-        dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
-        })
-    }
-}
-
-impl std::ops::Neg for Array {
-    type Output = Self;
-
-    fn neg(self) -> Self::Output {
-        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl_array_elementwise_operation!(
-    @binary
-    Add, add,
-    operation = "add",
-    inputs = @numeric,
-    checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::add(lhs, rhs),
-);
-
 impl_array_elementwise_operation!(
     @binary
     Sub, sub,
@@ -711,78 +675,11 @@ impl_array_elementwise_operation!(
     |lhs, rhs| NumericArrayElement::sub(lhs, rhs),
 );
 
-impl Mul for Array {
-    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        // Multiplication combines reduction states bilinearly rather than requiring congruent operand metadata.
-        // Use the operation's inference before evaluating elements so empty inputs obey the same contract.
-        let mut output_types = MulOperation::<ArrayType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
-        let output_type = output_types.remove(0);
-        if Self::element_count(&output_type) == 0 {
-            let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-        }
-        let data_type = output_type.data_type();
-        let lhs = self.promoted_to(data_type)?;
-        let rhs = rhs.promoted_to(data_type)?;
-        dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, NumericArrayElement::mul)
-        })
-    }
-}
-
-impl_array_elementwise_operation!(
-    @binary
-    Div, div,
-    operation = "div",
-    inputs = @numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::div(lhs, rhs),
-);
-
-impl std::ops::Add for Array {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Add::add(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
 impl std::ops::Sub for Array {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
         Sub::sub(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl std::ops::Mul for Array {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Mul::mul(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl std::ops::Mul<f64> for Array {
-    type Output = Self;
-
-    /// Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
-    /// preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
-    fn mul(self, rhs: f64) -> Self::Output {
-        let data_type = self.r#type().data_type();
-        let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
-        });
-        Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl std::ops::Div for Array {
-    type Output = Self;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        Div::div(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -1091,8 +988,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::elements::{f8e4m3fn, f8e8m0fnu, i2, i4};
-    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
-    use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::operations::complex::Complex;
@@ -1101,70 +996,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_array_arithmetic() {
-        // Elementwise arithmetic with scalar broadcasting.
+    fn test_array_sub() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(vector.add(&Array::scalar(1.0)).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]));
         assert_eq!(vector.sub(&Array::vector(vec![0.5, 1.0, 1.5])).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
-        assert_eq!(vector.mul(&vector).unwrap(), Array::vector(vec![1.0, 4.0, 9.0]));
-        assert_eq!(vector.div(&Array::scalar(2.0)).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
-        assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]));
-        // Mixed-precision operands promote to the common element data type.
-        let promoted = Array::vector(vec![1.0f32, 2.0]).add(&Array::vector(vec![0.5f64, 0.5])).unwrap();
-        assert_eq!(promoted, Array::vector(vec![1.5f64, 2.5]));
-        // General broadcasting traverses arbitrary input layouts while mixed element types normalize through the
-        // canonical conversion kernel.
-        let left_type =
-            ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
-        let left = Array::from_elements(left_type, &[1.0f32, 2.0]).unwrap();
-        let right_type =
-            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
-        let right = Array::from_elements(right_type, &[0.5f64, 1.0, 1.5]).unwrap();
-        let sum = left.add(&right).unwrap();
-        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
-        assert_eq!(sum.elements::<f64>(), Ok(vec![1.5, 2.0, 2.5, 2.5, 3.0, 3.5]));
-        // The `std::ops` sugar delegates to the fallible capabilities.
-        assert_eq!(vector.clone() + Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
-        assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]));
-        // Scaling by an `f64` preserves the array's element data type.
-        let scaled = Array::vector(vec![1.0f32, 2.0]) * 2.0;
-        assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]));
-        // Integer arithmetic wraps deterministically, matching the scalar reference backend.
-        let wrapped = Array::vector(vec![255u8]).add(&Array::vector(vec![1u8])).unwrap();
-        assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
-    }
-
-    #[test]
-    fn test_array_mul_reduction_state() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap();
-        let partial_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(sharding.clone().with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let reduced_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(sharding.with_reduced_axes(["x"]).unwrap())
-            .unwrap();
-        let lhs = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
-        let rhs = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
-        let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
-
-        // A partial sum times an operand reduced over the same mesh axes remains a partial sum in either order.
-        assert_eq!(lhs.mul(&rhs), Ok(expected.clone()));
-        assert_eq!(rhs.mul(&lhs), Ok(expected));
-
-        // Multiplying two partial sums is invalid, including when no scalar evaluation would occur.
-        assert!(matches!(
-            lhs.mul(&lhs),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two operands that are both unreduced",
-        ));
-        let empty_type = lhs.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
-        let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
-        assert!(matches!(
-            empty.mul(&empty),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two operands that are both unreduced",
-        ));
     }
 
     #[test]
@@ -1172,15 +1006,10 @@ mod tests {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
         let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
         let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
-        let sum = left.add(&right).unwrap();
-        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2]));
-        assert_eq!(sum.to_f64s(), vec![1.5, 2.25]);
         assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
-        assert_eq!(left.mul(&right).unwrap().to_f64s(), vec![0.5, 0.5]);
-        assert_eq!(left.div(&right).unwrap().to_f64s(), vec![2.0, 8.0]);
         assert_eq!(left.rem(&right).unwrap().to_f64s(), vec![0.0, 0.0]);
-        assert_eq!(left.neg().unwrap().to_f64s(), vec![-1.0, -2.0]);
-        assert_eq!(left.neg().unwrap().abs().unwrap(), left);
+        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]);
+        assert_eq!(negative.abs().unwrap(), left);
     }
 
     #[test]
@@ -1483,23 +1312,9 @@ mod tests {
         let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
         let expect = |values: [ComplexNumber<f64>; 2]| Array::vector(values.to_vec());
         assert_eq!(
-            left.add(&right).unwrap(),
-            expect([left_values[0] + right_values[0], left_values[1] + right_values[1]]),
-        );
-        assert_eq!(
             left.sub(&right).unwrap(),
             expect([left_values[0] - right_values[0], left_values[1] - right_values[1]]),
         );
-        assert_eq!(
-            left.mul(&right).unwrap(),
-            expect([left_values[0] * right_values[0], left_values[1] * right_values[1]]),
-        );
-        assert_abs_diff_eq!(
-            left.div(&right).unwrap(),
-            expect([left_values[0] / right_values[0], left_values[1] / right_values[1]]),
-            epsilon = 1e-12,
-        );
-        assert_eq!(left.neg().unwrap(), expect([-left_values[0], -left_values[1]]));
         assert_abs_diff_eq!(left.exp().unwrap(), expect([left_values[0].exp(), left_values[1].exp()]), epsilon = 1e-12);
         assert_abs_diff_eq!(left.log().unwrap(), expect([left_values[0].ln(), left_values[1].ln()]), epsilon = 1e-12);
         assert_abs_diff_eq!(
@@ -1517,45 +1332,18 @@ mod tests {
             Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),
             epsilon = 1e-12,
         );
-        // Ratio-based division can still overflow when both denominator components are near the largest value.
-        let large = Array::scalar(ComplexNumber::new(1e308f64, 1e308));
-        let quotient = large.div(&large).unwrap().elements::<ComplexNumber<f64>>().unwrap()[0];
-        assert!(quotient.re.is_nan());
-        assert_eq!(quotient.im.to_bits(), 0.0f64.to_bits());
     }
 
     #[test]
     fn test_array_integer_semantics() {
-        // Negation wraps deterministically for unsigned and two's-complement signed elements, matching the scalar
-        // reference backend (and StableHLO's integer semantics), rather than panicking or saturating.
-        let unsigned = Array::vector(vec![0u8, 1, 255]);
-        assert_eq!(unsigned.neg().unwrap().elements::<u8>(), Ok(vec![0, 255, 1]));
-        let minimum = Array::vector(vec![i8::MIN, -5]);
-        assert_eq!(minimum.neg().unwrap().elements::<i8>(), Ok(vec![i8::MIN, 5]));
         // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
         let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
-        assert_eq!(
-            narrow.add(&Array::scalar(i4::new(1).unwrap())).unwrap().elements::<i4>(),
-            Ok(vec![i4::MIN, i4::new(-7).unwrap()]),
-        );
         assert_eq!(
             narrow.sub(&Array::scalar(i4::new(1).unwrap())).unwrap().elements::<i4>(),
             Ok(vec![i4::new(6).unwrap(), i4::new(7).unwrap()]),
         );
-        assert_eq!(narrow.neg().unwrap().elements::<i4>(), Ok(vec![i4::new(-7).unwrap(), i4::MIN]));
         assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
-        // Exceptional integer division and remainder inputs return the same structured errors as native-width array
-        // arithmetic rather than panicking.
-        assert!(matches!(
-            Array::vector(vec![1i32]).div(&Array::vector(vec![0i32])),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide an integer scalar of data type `i32` by zero",
-        ));
-        assert!(matches!(
-            Array::vector(vec![i8::MIN]).div(&Array::vector(vec![-1i8])),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
-        ));
+        // Remainder by zero returns a structured error.
         assert!(matches!(
             Array::vector(vec![1u8]).rem(&Array::vector(vec![0u8])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
