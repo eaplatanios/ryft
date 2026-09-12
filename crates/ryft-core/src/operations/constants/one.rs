@@ -14,7 +14,9 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
-use crate::operations::constants::check_constructor_type_has_no_identity_references;
+use crate::operations::constants::{
+    check_constructor_type_has_no_identity_references, validate_dynamic_constant_dimensions,
+};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
@@ -133,7 +135,7 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperat
             .iter()
             .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
         {
-            Self::DynamicOne(operation)
+            Self::One(operation)
         } else {
             Self::Array(ArrayOperation::One(operation))
         }
@@ -267,6 +269,53 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
     }
 }
 
+/// Represents the ability to construct an [`Array`] of ones whose shape includes _dynamic_ (i.e., runtime) dimensions.
+/// Unlike [`One`], this capability supplies each dynamic axis with an explicit dimension value. Static axes retain
+/// their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension identities
+/// require a corresponding operand for every occurrence. Each operand must have the exact dimension identity declared
+/// by its axis. The caller must thus provide the same dimension value for repeated occurrences.
+///
+/// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
+/// mixed-IR values and with tracer values, where construction records the dimension inputs in the staged program.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+/// #     DimensionValue, DimensionVariable, DynamicOne, EagerContext, Shape,
+/// # };
+/// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+/// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+/// let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// assert_eq!(
+///     context.dynamic_one(&output_type, &[dimension]),
+///     Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]))),
+/// );
+/// ```
+pub trait DynamicOne<V: Typed> {
+    /// Constructs an array of ones with explicit values for its dynamic dimensions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_type`: Output [`ArrayType`] that may contain dynamic dimensions. Each dynamic axis names the
+    ///     dimension identity that its corresponding operand must carry.
+    ///   - `dimensions`: Contains one dimension value per dynamic axis, in axis order. Static axes do not consume input
+    ///     dimensions provided this way. Repeated identities still consume one operand for each axis that uses them.
+    fn dynamic_one(&self, output_type: &ArrayType, dimensions: &[V]) -> Result<V, ProgramError>;
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<OneOperation<ArrayType>>>> DynamicOne<C::Value> for C {
+    #[inline]
+    fn dynamic_one(&self, output_type: &ArrayType, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
+        validate_dynamic_constant_dimensions(ONE_OPERATION_NAME, output_type, dimensions)?;
+        let mut outputs = self.bind(OneOperation::new(output_type.clone()), Vec::new(), dimensions)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use half::{bf16, f16};
@@ -362,7 +411,7 @@ mod tests {
         let [instruction] = instantiated.instructions() else {
             panic!("expected one instantiated instruction");
         };
-        let ArrayIrOperation::DynamicOne(instantiated_one) = instruction.operation() else {
+        let ArrayIrOperation::One(instantiated_one) = instruction.operation() else {
             panic!("expected the instantiated operation to remain a dynamic one");
         };
         assert_eq!(
@@ -579,7 +628,7 @@ mod tests {
             ]),
         );
         assert_eq!(jvp.instructions().len(), 2);
-        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::DynamicOne(_)));
+        assert!(matches!(jvp.instructions()[0].operation(), ArrayIrOperation::One(_)));
         assert!(matches!(jvp.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(jvp.instructions()[0].inputs(), jvp.instructions()[1].inputs());
 
@@ -780,6 +829,97 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_one_interpretation() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size.clone()), 2).unwrap());
+        let output_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(3), Dimension::Dynamic(size)]),
+        );
+
+        // Static axes consume no operands; each occurrence of a dynamic identity consumes its own operand.
+        assert_eq!(
+            context.dynamic_one(&output_type, &[dimension.clone(), dimension]),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3, 2]), &[1.0f32; 12]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            context.dynamic_one(&ArrayType::scalar(DataType::F32), &[]),
+            Ok(ArrayIrValue::Array(Array::scalar(1.0f32))),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_one_invalid_dimensions() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        assert_eq!(
+            context.dynamic_one(&output_type, &[]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`one` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+            ))),
+        );
+        assert_eq!(
+            context.dynamic_one(&output_type, &[ArrayIrValue::Array(Array::scalar(2.0f32))]),
+            Err(ProgramError::Type(TypeError::invalid("`one` operand 0 must be a dimension but has type f32[]"))),
+        );
+        let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(other), 2).unwrap());
+        assert_eq!(
+            context.dynamic_one(&output_type, &[dimension]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`one` operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                 dimension<size ∈ [0, 8)>",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_one_staging() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dimension_type = DimensionType::new(size.clone());
+        let dimension = context.input(dimension_type.clone().into());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
+        let output = context.dynamic_one(&output_type, std::slice::from_ref(&dimension)).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let [instruction] = program.instructions() else {
+            panic!("expected one dynamic one instruction");
+        };
+        assert!(
+            matches!(instruction.operation(), ArrayIrOperation::One(operation) if operation.r#type() == &output_type)
+        );
+        assert_eq!(instruction.inputs(), &[dimension.atom_id().unwrap()]);
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        assert_eq!(
+            program.interpret(vec![extent.clone()]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]))]),
+        );
+
+        // The staged operation retains its existing derivative rule: shape inputs receive no live tangent.
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![extent]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32; 3])),
+                ArrayIrValue::Array(Array::vector(vec![0.0f32; 3])),
+            ]),
         );
     }
 }

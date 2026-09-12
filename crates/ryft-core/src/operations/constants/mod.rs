@@ -265,7 +265,7 @@ pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::{Array, ArrayIrValue, DataType, DimensionBounds, DimensionValue, DimensionVariable, Shape};
     use crate::programs::TypeError;
 
     use super::*;
@@ -331,6 +331,60 @@ mod tests {
             Err(TypeError::invalid(
                 "`zero` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
             )),
+        );
+    }
+
+    #[test]
+    fn test_validate_dynamic_constant_dimensions() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(8)).unwrap());
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), 2.into(), columns.clone().into()]));
+        let row_extent =
+            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::new(rows.clone()), 3).unwrap());
+        let column_extent =
+            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::new(columns), 4).unwrap());
+
+        // Operands correspond only to dynamic axes and must follow their order in the stored shape.
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &output_type, &[row_extent.clone(), column_extent.clone()]),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &output_type, std::slice::from_ref(&row_extent)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`fill` expects one dimension operand per dynamic output dimension (2) but got 1 operands",
+            ))),
+        );
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &output_type, &[column_extent.clone(), row_extent.clone()]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`fill` operand 0 has type dimension<columns ∈ [0, 8)> but the output shape requires \
+                 dimension<rows ∈ [0, 8)>",
+            ))),
+        );
+        assert_eq!(
+            validate_dynamic_constant_dimensions(
+                "fill",
+                &output_type,
+                &[ArrayIrValue::Array(Array::scalar(3i64)), column_extent],
+            ),
+            Err(ProgramError::Type(TypeError::invalid("`fill` operand 0 must be a dimension but has type i64[]"))),
+        );
+
+        // Repeated dynamic axes consume repeated operands; fully static shapes consume none.
+        let repeated_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into()]));
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &repeated_type, &[row_extent.clone(), row_extent.clone()]),
+            Ok(()),
+        );
+        let static_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        assert_eq!(validate_dynamic_constant_dimensions::<ArrayIrValue<Array>>("fill", &static_type, &[]), Ok(()));
+        assert_eq!(
+            validate_dynamic_constant_dimensions("fill", &static_type, &[row_extent]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`fill` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
+            ))),
         );
     }
 }

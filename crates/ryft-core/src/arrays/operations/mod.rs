@@ -404,13 +404,13 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// type consumes no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`]
     /// encoding.
     #[ryft(mixed(structural), skip_from)]
-    DynamicOne(OneOperation<ArrayType>),
+    One(OneOperation<ArrayType>),
 
     /// Mixed iota constructor whose stored [`ArrayType`] and iota axis define the complete output, and whose dynamic
     /// dimensions are consumed as explicit first-class dimension operands in axis order. A static stored type consumes
     /// no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`] encoding.
     #[ryft(mixed(structural), skip_from)]
-    DynamicIota(IotaOperation<ArrayType>),
+    Iota(IotaOperation<ArrayType>),
 
     /// Homogeneous array operation whose complete boundary is projected into the array member family. Every transform
     /// reaches the member rule through that projection, which carries no region access: an operation's attached
@@ -1308,11 +1308,11 @@ mod tests {
         // and ones whose types carry identities require the mixed encoding.
         let static_one = ArrayIrOperation::<Array>::from(OneOperation::new(static_zero_type.clone()));
         assert!(matches!(static_one, ArrayIrOperation::Array(ArrayOperation::One(_))));
-        let mixed_static_one = ArrayIrOperation::<Array>::DynamicOne(OneOperation::new(static_zero_type.clone()));
+        let mixed_static_one = ArrayIrOperation::<Array>::One(OneOperation::new(static_zero_type.clone()));
         assert_eq!(mixed_static_one.infer_output_types(&[], &[]), Ok(vec![static_zero_type.into()]));
         let dynamic_one_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let dynamic_one = ArrayIrOperation::<Array>::from(OneOperation::new(dynamic_one_type.clone()));
-        assert!(matches!(dynamic_one, ArrayIrOperation::DynamicOne(_)));
+        assert!(matches!(dynamic_one, ArrayIrOperation::One(_)));
         assert_eq!(
             dynamic_one.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
             Ok(vec![dynamic_one_type.into()]),
@@ -1344,12 +1344,12 @@ mod tests {
         let static_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
         assert!(matches!(static_iota, ArrayIrOperation::Array(ArrayOperation::Iota(_))));
         let mixed_static_iota =
-            ArrayIrOperation::<Array>::DynamicIota(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
+            ArrayIrOperation::<Array>::Iota(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
         assert_eq!(mixed_static_iota.infer_output_types(&[], &[]), Ok(vec![static_iota_type.into()]));
         let dynamic_iota_type =
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Static(2)]));
         let dynamic_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0).unwrap());
-        assert!(matches!(dynamic_iota, ArrayIrOperation::DynamicIota(_)));
+        assert!(matches!(dynamic_iota, ArrayIrOperation::Iota(_)));
         assert_eq!(
             dynamic_iota.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
             Ok(vec![dynamic_iota_type.clone().into()]),
@@ -1579,13 +1579,13 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32))]),
         );
         assert_eq!(
-            context.bind(ArrayIrOperation::DynamicOne(OneOperation::new(static_float_type)), Vec::new(), &[],),
+            context.bind(ArrayIrOperation::One(OneOperation::new(static_float_type)), Vec::new(), &[],),
             Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32))]),
         );
         let static_iota_type = ArrayType::new_static(DataType::I32, [3]);
         assert_eq!(
             context.bind(
-                ArrayIrOperation::DynamicIota(IotaOperation::new(static_iota_type.clone(), 0).unwrap()),
+                ArrayIrOperation::Iota(IotaOperation::new(static_iota_type.clone(), 0).unwrap()),
                 Vec::new(),
                 &[],
             ),
@@ -1593,7 +1593,7 @@ mod tests {
         );
         assert_eq!(
             context.bind(
-                ArrayIrOperation::DynamicIota(IotaOperation::new(static_iota_type, 0).unwrap()),
+                ArrayIrOperation::Iota(IotaOperation::new(static_iota_type, 0).unwrap()),
                 Vec::new(),
                 &[ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
             ),
@@ -1862,7 +1862,7 @@ mod tests {
             panic!("expected one dynamic-one instruction");
         };
         assert_eq!(one_instruction.inputs(), &[extent_atom]);
-        assert!(matches!(one_instruction.operation(), ArrayIrOperation::DynamicOne(_)));
+        assert!(matches!(one_instruction.operation(), ArrayIrOperation::One(_)));
         drop(one_builder);
         let one_program = one_context
             .builder()
@@ -1909,7 +1909,7 @@ mod tests {
             panic!("expected one dynamic-iota instruction");
         };
         assert_eq!(instruction.inputs(), &[extent_atom]);
-        assert!(matches!(instruction.operation(), ArrayIrOperation::DynamicIota(_)));
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Iota(_)));
         drop(iota_builder);
         let iota_program = iota_context
             .builder()
@@ -2941,8 +2941,8 @@ mod tests {
     fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
         match operation {
             ArrayIrOperation::Zero(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::DynamicOne(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::DynamicIota(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::One(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Iota(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::Array(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
@@ -2997,9 +2997,9 @@ mod tests {
         // stays inside one homogeneous member family, treats dimensions as geometry, or forwards regions.
         let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
             (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
-            (ArrayIrOperation::DynamicOne(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
+            (ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
             (
-                ArrayIrOperation::DynamicIota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
+                ArrayIrOperation::Iota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
                 MemberKindSignature::GeometryMixed,
             ),
             (ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())), MemberKindSignature::ArrayToArray),
