@@ -4005,10 +4005,9 @@ mod tests {
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         DimensionAddOperation, DimensionFromScalar, DimensionSize, DimensionToScalar, DimensionToScalarOperation,
-        DotDimensionNumbers, DotOperation, DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation,
-        NegOperation, OneLike, ParallelReduceOperation, ParallelReductionKind, Reduce, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReshardOperation, Slice, ZeroOperation,
+        DynamicBroadcast, DynamicReshapeOperation, LinearCallOperation, NegOperation, OneLike, ParallelReduceOperation,
+        ParallelReductionKind, Reduce, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReshardOperation, Slice, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -5350,31 +5349,6 @@ mod tests {
             .trim_end(),
         );
 
-        // End to end, each item broadcasts to its own checked length and contracts that ragged vector with itself.
-        // Zeroing the padded operand elements removes their products from the sums, so each item's result is the inner
-        // product over its live prefix.
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
-        let output: ArrayIrValue<Array> = batch(
-            |(value, extent)| {
-                let extent = extent.to_dimension(variable.clone())?;
-                let repeated = value.dynamic_broadcast_to(&[extent])?;
-                let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
-                let mut outputs = repeated.dispatch_domain().bind(
-                    DotOperation::new(DotDimensionNumbers::inner_product()),
-                    Vec::new(),
-                    &[repeated.clone(), repeated],
-                )?;
-                Ok(outputs.remove(0).into_value())
-            },
-            (
-                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])),
-                ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
-            ),
-            (BatchAxis::new(0), BatchAxis::new(0)),
-            BatchAxis::new(0),
-            None,
-        )?;
-        assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0])));
         Ok(())
     }
 

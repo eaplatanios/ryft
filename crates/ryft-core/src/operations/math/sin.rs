@@ -1,7 +1,9 @@
 use std::ops::Mul as StandardMul;
 
+use crate::arrays::FloatingPointArrayElement;
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
+    impl_differentiable_elementwise_operation,
 };
 use crate::operations::math::cos::Cos;
 use crate::programs::ProgramError;
@@ -54,6 +56,15 @@ macro_rules! impl_capability_for_primitive {
 
 impl_capability_for_primitive!(f32);
 impl_capability_for_primitive!(f64);
+
+impl_array_elementwise_operation!(
+    @unary
+    Sin, sin,
+    operation = "sin",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::sin(input),
+);
 
 #[cfg(test)]
 mod tests {
@@ -215,5 +226,23 @@ mod tests {
     #[test]
     fn test_sin_for_primitives() {
         assert_eq!(Sin::sin(&0.0_f64), Ok(0.0));
+    }
+
+    #[test]
+    fn test_sin_for_array() {
+        let vector = Array::vector(vec![0.0, 1.0]);
+        assert_abs_diff_eq!(vector.sin().unwrap(), Array::vector(vec![0.0, 1.0f64.sin()]), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_sin_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        assert_abs_diff_eq!(
+            left.sin().unwrap(),
+            Array::vector(vec![left_values[0].sin(), left_values[1].sin()]),
+            epsilon = 1e-12
+        );
     }
 }

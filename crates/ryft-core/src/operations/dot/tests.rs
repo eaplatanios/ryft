@@ -7,13 +7,15 @@ use crate::arrays::{
     DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
-use crate::contexts::EagerContext;
+use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{
     CotangentDestination, CotangentDestinationKind, CotangentSeed, TranspositionContext, differentiate_at,
 };
 use crate::macros::{check_operation_transposition, check_operation_type_inference};
+use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+use crate::operations::manipulation::broadcasting::DynamicBroadcast;
 use crate::parameters::Placeholder;
-use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, ValueProjection};
+use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, Value, ValueProjection};
 use crate::tracing::TracingContext;
 
 use super::*;
@@ -1662,4 +1664,31 @@ fn test_ragged_dot_transpose_rejects_contracting_and_batch_modes() {
             }),
         );
     }
+}
+
+#[test]
+fn test_dot_batching_ragged_dynamic_prefix() -> Result<(), ProgramError> {
+    // End to end, each item broadcasts to its own checked length and contracts that ragged vector with itself.
+    // Zeroing the padded operand elements removes their products from the sums, so each item's result is the inner
+    // product over its live prefix.
+    let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+    let output: ArrayIrValue<Array> = batch(
+        |(value, extent)| {
+            let extent = extent.to_dimension(variable.clone())?;
+            let repeated = value.dynamic_broadcast_to(&[extent])?;
+            let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
+            let mut outputs = repeated.dispatch_domain().bind(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                Vec::new(),
+                &[repeated.clone(), repeated],
+            )?;
+            Ok(outputs.remove(0).into_value())
+        },
+        (ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])), ArrayIrValue::Array(Array::vector(vec![1_i32, 3]))),
+        (BatchAxis::new(0), BatchAxis::new(0)),
+        BatchAxis::new(0),
+        None,
+    )?;
+    assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0])));
+    Ok(())
 }

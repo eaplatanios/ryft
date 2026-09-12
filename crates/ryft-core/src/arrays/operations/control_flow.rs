@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
-use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
@@ -29,8 +28,8 @@ use crate::operations::control_flow::scan::{
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
     DynamicUpdateSliceOperation, Fill, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind,
-    Reshape, Select, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice,
-    WhilePredicate, WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
+    Reshape, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
+    WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -320,64 +319,6 @@ where
     }
 }
 
-impl Select for Array {
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
-        // the three operand shapes broadcast together, and the two branch data types promote together to the output
-        // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
-        // acts as a mask rather than promoting into the output.
-        assert_eq!(condition.r#type().data_type(), DataType::Boolean, "select condition must have a Boolean data type");
-        let output_type = ArrayType::broadcasted(&[
-            condition.r#type().into_owned().with_data_type(on_true.r#type().data_type()),
-            on_true.r#type().into_owned(),
-            on_false.r#type().into_owned(),
-        ])
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-
-        // Convert only when promotion requires it. Equal-typed branches retain their original physical storage and
-        // arbitrary layouts; conversion remains responsible for the element semantics until its own typed-byte slice.
-        let output_data_type = output_type.data_type();
-        let on_true = on_true.promoted_to(output_data_type)?;
-        let on_false = on_false.promoted_to(output_data_type)?;
-
-        let output_shape = output_type.static_shape().unwrap();
-        let condition_shape = condition.r#type().static_shape().unwrap();
-        let true_shape = on_true.r#type().static_shape().unwrap();
-        let false_shape = on_false.r#type().static_shape().unwrap();
-        let output_strides = output_shape.row_major_strides();
-        let condition_strides = condition_shape.row_major_strides();
-        let true_strides = true_shape.row_major_strides();
-        let false_strides = false_shape.row_major_strides();
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let condition_addressing = ArrayAddressing::new(condition.r#type().into_owned())?;
-        let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
-        let false_addressing = ArrayAddressing::new(on_false.r#type().into_owned())?;
-        let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
-        for output_index in 0..output_addressing.element_count() {
-            let condition_index = Self::broadcast_index(
-                output_index,
-                &output_shape,
-                &output_strides,
-                &condition_shape,
-                &condition_strides,
-            );
-            let condition_range = condition_addressing.byte_range_for_flat_index(condition_index);
-            let (source, source_range) = if condition.storage_bytes()[condition_range.start] != 0 {
-                let source_index =
-                    Self::broadcast_index(output_index, &output_shape, &output_strides, &true_shape, &true_strides);
-                (on_true.storage_bytes(), true_addressing.byte_range_for_flat_index(source_index))
-            } else {
-                let source_index =
-                    Self::broadcast_index(output_index, &output_shape, &output_strides, &false_shape, &false_strides);
-                (on_false.storage_bytes(), false_addressing.byte_range_for_flat_index(source_index))
-            };
-            let output_range = output_addressing.byte_range_for_flat_index(output_index);
-            output_bytes[output_range].copy_from_slice(&source[source_range]);
-        }
-        Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
-    }
-}
-
 // Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
 // `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
 // masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
@@ -448,8 +389,8 @@ mod tests {
     use crate::operations::{
         Add, AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, Select, StopGradientOperation,
-        WhileOperation, WhilePredicate, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, StopGradientOperation, WhileOperation,
+        WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -1638,35 +1579,6 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::scalar(1.0))];
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![array(Array::scalar(2.0))]));
-    }
-
-    #[test]
-    fn test_array_select() {
-        let condition = Array::vector(vec![true, false, true]);
-        let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
-        let on_false = Array::vector(vec![-1.0, -2.0, -3.0]);
-        assert_eq!(Array::select(&condition, &on_true, &on_false).unwrap(), Array::vector(vec![1.0, -2.0, 3.0]));
-        // The condition broadcasts against the branches, and the branch data types promote together.
-        let broadcast =
-            Array::select(&Array::scalar(true), &Array::vector(vec![1.0f32, 2.0]), &Array::vector(vec![-1.0f64, -2.0]))
-                .unwrap();
-        assert_eq!(broadcast, Array::vector(vec![1.0f64, 2.0]));
-
-        // General broadcasting reads every input through its physical layout and writes one dense output without
-        // converting equal-typed branch elements through an intermediate representation.
-        let condition_type = ArrayType::new_static(DataType::Boolean, [2, 1])
-            .with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1])));
-        let condition = Array::from_elements(condition_type, &[true, false]).unwrap();
-        let true_type =
-            ArrayType::new_static(DataType::U16, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, -2])));
-        let on_true = Array::from_elements(true_type, &[0x1111u16, 0x2222, 0x3333]).unwrap();
-        let false_type =
-            ArrayType::new_static(DataType::U16, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 2])));
-        let on_false = Array::from_elements(false_type, &[0xaaaau16, 0xbbbb]).unwrap();
-        let selected = Array::select(&condition, &on_true, &on_false).unwrap();
-        assert_eq!(selected.r#type().as_ref(), &ArrayType::new_static(DataType::U16, [2, 3]));
-        assert_eq!(selected.elements::<u16>(), Ok(vec![0x1111, 0x2222, 0x3333, 0xbbbb, 0xbbbb, 0xbbbb]),);
-        assert_eq!(selected.storage_bytes(), [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb],);
     }
 
     #[test]

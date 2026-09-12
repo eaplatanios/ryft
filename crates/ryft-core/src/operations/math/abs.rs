@@ -1,7 +1,10 @@
-use crate::arrays::DataType;
+use std::sync::Arc;
+
+use crate::arrays::{Array, ArrayAddressing, DataType, NumericArrayElement};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::macros::{
-    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
+    check_count, define_elementwise_capability, define_elementwise_operation, dispatch_on_array_element_type,
+    impl_differentiable_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
@@ -179,6 +182,38 @@ impl_capability_for_primitive!(@unsigned usize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
 
+impl Abs for Array {
+    fn abs(&self) -> Result<Self, ProgramError> {
+        // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
+        // real part data type, mirroring the `AbsOperation` type-inference contract.
+        let data_type = match self.r#type().data_type() {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => other,
+        };
+        let output_type = self.r#type().into_owned().with_data_type(data_type);
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let input_type = self.r#type().data_type();
+        if !((input_type.is_signed() && input_type != DataType::I1)
+            || input_type.is_floating_point()
+            || input_type.is_complex())
+        {
+            return Err(TypeError::invalid(format!(
+                "cannot compute the absolute value of a scalar of data type `{input_type}`",
+            ))
+            .into());
+        }
+        dispatch_on_array_element_type!(@numeric input_type, |Element| {
+            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
+                <Element as NumericArrayElement>::abs(value)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -186,7 +221,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType};
+    use crate::arrays::{Array, ArrayType, i4};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -419,5 +454,43 @@ mod tests {
         );
         assert_eq!(Abs::abs(&5_usize), Ok(5));
         assert_eq!(Abs::abs(&-2.5_f64), Ok(2.5));
+    }
+
+    #[test]
+    fn test_abs_for_array() {
+        assert_eq!(Array::vector(vec![-1.5, 2.5]).abs().unwrap(), Array::vector(vec![1.5, 2.5]));
+        // The absolute value of a complex array is its elementwise magnitude with a real element data type.
+        let complex = Array::vector(vec![3.0]).complex(&Array::vector(vec![4.0])).unwrap();
+        let magnitude = complex.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
+        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_abs_for_array_low_precision() {
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]);
+        assert_eq!(negative.abs().unwrap(), left);
+    }
+
+    #[test]
+    fn test_abs_for_array_complex() {
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        // The absolute value is the elementwise magnitude with a real element data type.
+        let magnitude = left.abs().unwrap();
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
+        assert_abs_diff_eq!(
+            magnitude,
+            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_abs_for_array_integers() {
+        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
     }
 }

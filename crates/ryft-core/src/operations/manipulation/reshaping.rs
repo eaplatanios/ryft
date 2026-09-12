@@ -1,8 +1,10 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape,
+    Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -1322,6 +1324,29 @@ impl<
     }
 }
 
+impl Reshape for Array {
+    fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
+        // Delegate to the type-level reshape so all element-count and sharding validation remains shared with staged
+        // execution.
+        let parameters = parameters.into();
+        let output_type = self.r#type().reshape(parameters.clone())?;
+        let transposed = parameters.dimensions().map(|dimensions| self.transpose(dimensions)).transpose()?;
+        let input = transposed.as_ref().unwrap_or(self);
+        let input_addressing = ArrayAddressing::new(input.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
+            bytes.copy_from_slice(input.storage_bytes());
+        } else {
+            for index in 0..input_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(index)]
+                    .copy_from_slice(&input.storage_bytes()[input_addressing.byte_range_for_flat_index(index)]);
+            }
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2024,5 +2049,22 @@ mod tests {
             )
             .unwrap()),
         );
+    }
+
+    #[test]
+    fn test_array_reshape() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
+        assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
+        assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
+
+        // Reshaping preserves logical order independently of the input's physical placement.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
+        assert_eq!(reshaped.elements::<u16>(), Ok(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(reshaped.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
     }
 }

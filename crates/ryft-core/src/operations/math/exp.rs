@@ -1,7 +1,9 @@
 use std::ops::Mul as StandardMul;
 
+use crate::arrays::FloatingPointArrayElement;
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
+    impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
 
@@ -54,6 +56,15 @@ macro_rules! impl_capability_for_primitive {
 impl_capability_for_primitive!(f32);
 impl_capability_for_primitive!(f64);
 
+impl_array_elementwise_operation!(
+    @unary
+    Exp, exp,
+    operation = "exp",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::exp(input),
+);
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -62,7 +73,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Layout, StridedLayout, f8e4m3fn};
     use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -219,5 +230,48 @@ mod tests {
     #[test]
     fn test_exp_for_primitives() {
         assert_eq!(Exp::exp(&0.0_f64), Ok(1.0));
+    }
+
+    #[test]
+    fn test_exp_for_array() {
+        let vector = Array::vector(vec![0.0, 1.0]);
+        assert_abs_diff_eq!(vector.exp().unwrap(), Array::vector(vec![1.0, 1.0f64.exp()]), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_exp_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        assert_abs_diff_eq!(
+            left.exp().unwrap(),
+            Array::vector(vec![left_values[0].exp(), left_values[1].exp()]),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_exp_for_array_layout() {
+        // Unary kernels preserve arbitrary physical layouts while traversing elements in logical order.
+        let input_type =
+            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
+        let exponential = input.exp().unwrap();
+        assert_eq!(exponential.r#type().as_ref(), &input_type);
+        assert_eq!(exponential.elements::<f64>(), Ok(vec![1.0, 1.0f64.exp()]));
+    }
+
+    #[test]
+    fn test_exp_for_array_low_precision() {
+        // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
+        let low_precision = Array::from_elements(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            low_precision.exp().unwrap().to_f64s(),
+            vec![1.0, f8e4m3fn::from_f64(1.0f64.exp()).unwrap().to_f64()]
+        );
     }
 }

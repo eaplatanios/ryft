@@ -1,3 +1,4 @@
+use crate::arrays::Array;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
@@ -62,6 +63,20 @@ impl_capability_for_primitive!(u32);
 impl_capability_for_primitive!(u64);
 impl_capability_for_primitive!(u128);
 impl_capability_for_primitive!(usize);
+
+impl Or for Array {
+    fn or(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        self.binary_logical(rhs, "or", |left, right| left | right)
+    }
+}
+
+impl std::ops::BitOr for Array {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Or::or(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -177,5 +192,12 @@ mod tests {
     fn test_or_for_primitives() {
         assert_eq!(Or::or(&true, &false), Ok(true));
         assert_eq!(Or::or(&0b1100_u8, &0b1010), Ok(0b1110));
+    }
+
+    #[test]
+    fn test_or_for_array() {
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!(left.or(&right).unwrap(), Array::vector(vec![true, true, true, false]));
     }
 }

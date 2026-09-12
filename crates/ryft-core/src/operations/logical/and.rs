@@ -1,3 +1,4 @@
+use crate::arrays::Array;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
@@ -63,6 +64,20 @@ impl_capability_for_primitive!(u64);
 impl_capability_for_primitive!(u128);
 impl_capability_for_primitive!(usize);
 
+impl And for Array {
+    fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        self.binary_logical(rhs, "and", |left, right| left & right)
+    }
+}
+
+impl std::ops::BitAnd for Array {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        And::and(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -78,7 +93,7 @@ mod tests {
     use crate::operations::constants::zero_like::ZeroLike;
     use crate::operations::control_flow::select::Select;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramError};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramError, TypeError};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -193,5 +208,28 @@ mod tests {
     fn test_and_for_primitives() {
         assert_eq!(And::and(&true, &false), Ok(false));
         assert_eq!(And::and(&0b1100_u8, &0b1010), Ok(0b1000));
+    }
+
+    #[test]
+    fn test_and_for_array() {
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!(left.and(&right).unwrap(), Array::vector(vec![true, false, false, false]));
+        // General NumPy-style broadcasting maps each input coordinate into the common output shape.
+        assert_eq!(
+            Array::matrix(2, 1, vec![true, false]).and(&Array::matrix(1, 3, vec![true, false, true])).unwrap(),
+            Array::matrix(2, 3, vec![true, false, true, false, false, false]),
+        );
+        // Same-data-type integers combine bitwise directly over all bytes of each encoding.
+        let bits = Array::vector(vec![0b1100u8]).and(&Array::vector(vec![0b1010u8])).unwrap();
+        assert_eq!(bits.elements::<u8>(), Ok(vec![0b1000]));
+        // Real floating-point operands are rejected, matching the scalar reference backend.
+        assert!(matches!(
+            Array::vector(vec![1.0]).and(&Array::vector(vec![0.0])),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot apply `and` to arrays of element data types `f64` and `f64`",
+        ));
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]));
     }
 }

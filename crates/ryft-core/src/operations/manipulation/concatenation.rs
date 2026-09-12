@@ -2,11 +2,12 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
-    materialize_array_tangent,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue,
+    LinearResiduals, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1185,6 +1186,44 @@ fn merge_concatenation_axis_set(
     }
 }
 
+impl Concatenate for Array {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let Some(first) = inputs.first() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
+            ))
+            .into());
+        };
+        if inputs.len() == 1 {
+            return Ok((*first).clone());
+        }
+        let operation = ConcatenateOperation::new(axis, first.r#type().rank())?;
+        let axis = operation.axis();
+        let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
+        let output_type = ArrayType::concatenate(input_types.iter().map(|r#type| r#type.as_ref()), axis)?;
+        // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
+        // along `axis` and offset zero on every other axis.
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
+        // below, so this does not require the element data type itself to represent zero.
+        let mut output =
+            Self::new_unchecked(output_type.clone(), Arc::new(vec![0; output_addressing.storage_byte_len()]));
+        let mut offset = 0usize;
+        for input in inputs {
+            let input_axis_size = input.r#type().static_shape().unwrap()[axis];
+            let mut start_indices = vec![0usize; output_type.rank()];
+            start_indices[axis] = offset;
+            output = output.replace_block(input, start_indices.as_slice());
+            offset += input_axis_size;
+        }
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2174,5 +2213,50 @@ mod tests {
             .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
             .expect("expected one staged mixed dynamic zero");
         assert_eq!(zero.inputs(), size.outputs());
+    }
+
+    #[test]
+    fn test_array_concatenate() {
+        // Three operands joined along axis 0 preserve their order.
+        let concatenated = Array::concatenate(
+            [&Array::vector(vec![1.0]), &Array::vector(vec![2.0, 3.0]), &Array::vector(vec![4.0])],
+            0,
+        )
+        .unwrap();
+        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
+
+        // A rank-3 middle-axis concatenation exercises the row-major block odometer.
+        let first = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let second = Array::from_f64s(
+            ArrayType::new_static(DataType::F64, [2, 2, 2]),
+            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        );
+        let concatenated = Array::concatenate([&first, &second], 1).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3, 2]));
+        assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
+
+        // Concatenation traverses each input's physical layout and emits the canonical layout-free result.
+        let first_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let second_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let first = Array::from_elements(first_type, &[1u16, 2]).unwrap();
+        let second = Array::from_elements(second_type, &[3u16, 4]).unwrap();
+        let concatenated = Array::concatenate([&first, &second], 0).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::U16, [4]));
+        assert_eq!(concatenated.elements::<u16>(), Ok(vec![1, 2, 3, 4]));
+        assert_eq!(concatenated.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0]);
+
+        // Concatenation does not require an artificial additive zero, including when the output itself is empty.
+        let element_type = ArrayType::new_static(DataType::F8E8M0FNU, [1]);
+        let first = Array::new(element_type.clone(), vec![1]).unwrap();
+        let second = Array::new(element_type, vec![2]).unwrap();
+        assert_eq!(
+            Array::concatenate([&first, &second], 0),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![1, 2]),
+        );
+        let empty_type = ArrayType::new_static(DataType::F8E8M0FNU, [0]);
+        let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
+        assert_eq!(Array::concatenate([&empty, &empty], 0), Array::new(empty_type, Vec::new()));
     }
 }

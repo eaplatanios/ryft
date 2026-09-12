@@ -1,10 +1,11 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    LinearResiduals, Shape, Sharding, materialize_array_tangent,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1518,6 +1519,90 @@ where
     }
 }
 
+impl Pad for Array {
+    fn pad(
+        &self,
+        padding_value: &Self,
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
+        interior_padding: &[usize],
+    ) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().pad(
+            padding_value.r#type().as_ref(),
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+        )?;
+        let input_shape = self.r#type().static_shape().unwrap();
+        if edge_padding_low.iter().all(|padding| *padding == 0)
+            && edge_padding_high.iter().all(|padding| *padding == 0)
+            && input_shape
+                .dimensions()
+                .iter()
+                .zip(interior_padding)
+                .all(|(size, padding)| *padding == 0 || *size <= 1)
+        {
+            return Ok(self.clone());
+        }
+        let output_shape = output_type.static_shape().unwrap();
+        let rank = input_shape.rank();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let padding_addressing = ArrayAddressing::new(padding_value.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let padding_bytes = &padding_value.storage_bytes()[padding_addressing.byte_range_for_flat_index(0)];
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.is_dense_row_major() && output_addressing.element_byte_width() != 0 {
+            for output_bytes in bytes.chunks_exact_mut(output_addressing.element_byte_width()) {
+                output_bytes.copy_from_slice(padding_bytes);
+            }
+        } else {
+            for output_index in 0..output_addressing.element_count() {
+                bytes[output_addressing.byte_range_for_flat_index(output_index)].copy_from_slice(padding_bytes);
+            }
+        }
+        if input_addressing.element_count() == 0 {
+            return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
+        }
+        let mut input_index = vec![0usize; rank];
+        let mut output_index = vec![0usize; rank];
+        let mut written = 0usize;
+        'elements: while written < input_addressing.element_count() {
+            for axis in 0..rank {
+                let input_coordinate = i128::try_from(input_index[axis]).map_err(|_| {
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` input index is too large on axis {axis}"))
+                })?;
+                let stride =
+                    i128::try_from(interior_padding[axis]).ok().and_then(|padding| padding.checked_add(1)).ok_or_else(
+                        || TypeError::invalid(format!("`{PAD_OPERATION_NAME}` stride is too large on axis {axis}")),
+                    )?;
+                let output_coordinate = i128::from(edge_padding_low[axis])
+                    .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
+                        TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index overflows on axis {axis}"))
+                    })?)
+                    .ok_or_else(|| {
+                        TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index overflows on axis {axis}"))
+                    })?;
+                let output_extent = i128::try_from(output_shape[axis]).map_err(|_| {
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output extent is too large on axis {axis}"))
+                })?;
+                if output_coordinate < 0 || output_coordinate >= output_extent {
+                    written += 1;
+                    input_addressing.advance_index(&mut input_index);
+                    continue 'elements;
+                }
+                output_index[axis] = usize::try_from(output_coordinate).map_err(|_| {
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index is too large on axis {axis}"))
+                })?;
+            }
+            bytes[output_addressing.byte_range_unchecked(&output_index)]
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            written += 1;
+            input_addressing.advance_index(&mut input_index);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2416,5 +2501,21 @@ mod tests {
             .trim_end(),
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_array_pad_layouts() {
+        let vector = Array::vector(vec![1.0, 2.0]);
+        let padded = vector.pad(&Array::scalar(0.5), &[1], &[2], &[1]).unwrap();
+        assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]));
+
+        // Padding copies both the reversed input layout and the rank-zero padding element by their exact bytes.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type, &[1u16, 2]).unwrap();
+        let padded = vector.pad(&Array::scalar(9u16), &[1], &[1], &[1]).unwrap();
+        assert_eq!(padded.r#type().into_owned(), ArrayType::new_static(DataType::U16, [5]));
+        assert_eq!(padded.elements::<u16>(), Ok(vec![9, 1, 9, 2, 9]));
+        assert_eq!(padded.storage_bytes(), [9, 0, 1, 0, 9, 0, 2, 0, 9, 0]);
     }
 }

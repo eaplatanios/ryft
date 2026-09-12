@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArraySliceAxis, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType,
-    ReferenceSliceOperation, Shape, Sharding, ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
+    ArrayIrType, ArraySliceAxis, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Memory,
+    MeshAxisType, ReferenceSliceOperation, Shape, Sharding, ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -34,8 +34,8 @@ use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOp
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    RegionInterface, TypeError, Typed, Value, ValueProjection,
+    Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection,
+    ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -2817,6 +2817,70 @@ where
     Ok(vec![stacked])
 }
 
+impl Slice for Array {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().slice(start_indices, limit_indices, strides)?;
+        let axes = start_indices
+            .iter()
+            .zip(limit_indices.iter())
+            .zip(strides.iter())
+            .map(|((start, limit), stride)| ArraySliceAxis::new(*start, (limit - start).div_ceil(*stride), *stride))
+            .collect::<Vec<_>>();
+        self.copy_block(output_type, &axes)
+    }
+}
+
+impl UpdateSlice for Array {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
+        Ok(self.clone().replace_block(update, start_indices))
+    }
+}
+
+impl DynamicSlice for Array {
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type().into_owned()).collect();
+        let output_type = self.r#type().dynamic_slice(&index_types, sizes)?;
+        let input_shape = self.r#type().static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
+        let axes = starts
+            .iter()
+            .zip(sizes)
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        self.copy_block(output_type, &axes)
+    }
+}
+
+impl DynamicUpdateSlice for Array {
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type().into_owned()).collect();
+        self.r#type().dynamic_update_slice(update.r#type().as_ref(), &index_types)?;
+        let input_shape = self.r#type().static_shape().unwrap();
+        let update_shape = update.r#type().static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
+        Ok(self.clone().replace_block(update, starts.as_slice()))
+    }
+}
+
+impl Array {
+    /// Extracts the in-band scalar start indices of a dynamic slicing operation and clamps them per StableHLO
+    /// semantics: the effective start index along axis `d` is
+    /// `clamp(0, start_indices[d], input_dimension[d] - block_sizes[d])`.
+    fn clamped_start_indices(start_indices: &[Array], input_shape: &StaticShape, block_sizes: &[usize]) -> Vec<usize> {
+        start_indices
+            .iter()
+            .enumerate()
+            .map(|(axis, index)| {
+                // Input validation guarantees a scalar integer. Preserve unsigned extremes until after clamping.
+                let raw: i128 = index.concretize().unwrap();
+                let maximum = (input_shape[axis] - block_sizes[axis]) as i128;
+                raw.clamp(0, maximum) as usize
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -2826,7 +2890,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout, i4,
     };
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -4690,5 +4754,67 @@ mod tests {
             let output = operand.update_slice(&update, &[0, 0]).unwrap();
             assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
         }
+    }
+
+    #[test]
+    fn test_array_slice_layouts() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap(), Array::vector(vec![2.0, 4.0]));
+
+        // Static slicing traverses the logical coordinates of a reversed source layout.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5]).unwrap();
+        assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap().elements::<u16>(), Ok(vec![2, 4]));
+    }
+
+    #[test]
+    fn test_array_update_slice_layouts() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            vector.update_slice(&Array::vector(vec![10.0, 20.0]), &[1]).unwrap(),
+            Array::vector(vec![1.0, 10.0, 20.0, 4.0, 5.0]),
+        );
+
+        // Updating traverses arbitrary source and update layouts while preserving the destination layout.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let vector = Array::from_elements(input_type.clone(), &[1u16, 2, 3, 4, 5]).unwrap();
+        let update_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let update = Array::from_elements(update_type, &[10u16, 20]).unwrap();
+        let updated = vector.update_slice(&update, &[1]).unwrap();
+        assert_eq!(updated.r#type().as_ref(), &input_type);
+        assert_eq!(updated.elements::<u16>(), Ok(vec![1, 10, 20, 4, 5]));
+        assert_eq!(updated.storage_bytes(), [5, 0, 4, 0, 20, 0, 10, 0, 1, 0]);
+    }
+
+    #[test]
+    fn test_array_dynamic_slice_clamping() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Dynamic start indices clamp so the block stays in bounds.
+        let start = [Array::scalar(4i64)];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]));
+        // Index decoding is typed and supports sub-byte integers directly; a negative start still clamps to zero.
+        let start = [Array::scalar(i4::new(-1).unwrap())];
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]));
+    }
+
+    #[test]
+    fn test_array_dynamic_slice_unsigned_extreme() {
+        let input = Array::vector(vec![1_i32, 2, 3]);
+        assert_eq!(input.dynamic_slice(&[Array::scalar(u64::MAX)], &[1]), Ok(Array::vector(vec![3_i32])));
+        assert_eq!(input.dynamic_slice(&[Array::scalar(i64::MIN)], &[1]), Ok(Array::vector(vec![1_i32])));
+    }
+
+    #[test]
+    fn test_array_dynamic_update_slice_clamping() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Dynamic start indices clamp so the block stays in bounds.
+        let start = [Array::scalar(4i64)];
+        assert_eq!(
+            vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]), &start).unwrap(),
+            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]),
+        );
     }
 }

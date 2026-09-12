@@ -8,7 +8,7 @@ use num_complex::Complex;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::addressing::ArrayAddressing;
+use crate::arrays::addressing::{ArrayAddressing, ArraySliceAxis};
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::elements::{
     ArrayElement, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn,
@@ -522,16 +522,6 @@ impl Array {
         })
     }
 
-    /// Compares two arrays of the same type elementwise using their typed value semantics rather than their physical
-    /// byte patterns. In particular, signed floating-point zeros compare equal and NaNs compare unequal.
-    fn elements_equal<T: ArrayElement + PartialEq>(&self, other: &Self) -> bool {
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        (0..addressing.element_count()).all(|index| {
-            let range = addressing.byte_range_for_flat_index(index);
-            T::decode(&self.bytes[range.clone()]) == T::decode(&other.bytes[range])
-        })
-    }
-
     /// Maps one flat row-major output index to the corresponding flat input index under NumPy-style broadcasting.
     /// Input axes are right-aligned with output axes, and an input extent of one always selects coordinate zero.
     pub(crate) fn broadcast_index(
@@ -590,6 +580,77 @@ impl Array {
             DataType::C64 | DataType::C128 | DataType::Token | DataType::Zero => return None,
         })
     }
+
+    /// Copies the logical block selected by `axes` into a new array of `output_type`. The caller guarantees that the
+    /// selection lies in bounds and contains _exactly_ the output's logical element count.
+    pub(crate) fn copy_block(&self, output_type: ArrayType, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let ranges = input_addressing.ranges(axes)?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        debug_assert_eq!(ranges.element_count(), output_addressing.element_count());
+        let element_byte_width = input_addressing.element_byte_width();
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let output_is_dense = output_addressing.is_dense_row_major();
+        let mut output_index = 0usize;
+        for range in ranges {
+            let input_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if output_is_dense {
+                let output_start = output_index * element_byte_width;
+                bytes[output_start..output_start + input_bytes.len()]
+                    .copy_from_slice(&self.storage_bytes()[input_bytes]);
+                output_index += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let input_start = input_bytes.start + offset * element_byte_width;
+                bytes[output_addressing.byte_range_for_flat_index(output_index)]
+                    .copy_from_slice(&self.storage_bytes()[input_start..input_start + element_byte_width]);
+                output_index += 1;
+            }
+        }
+        debug_assert_eq!(output_index, output_addressing.element_count());
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+
+    /// Overwrites the logical block of `update`'s shape starting at `start_indices` in this array with `update`.
+    /// The caller guarantees that the block lies in bounds.
+    pub(crate) fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
+        let update_shape = update.r#type().static_shape().unwrap();
+        let addressing = ArrayAddressing::new(self.r#type().into_owned()).unwrap();
+        let update_addressing = ArrayAddressing::new(update.r#type().into_owned()).unwrap();
+        let axes = start_indices
+            .iter()
+            .zip(update_shape.dimensions())
+            .map(|(start, size)| ArraySliceAxis::new(*start, *size, 1))
+            .collect::<Vec<_>>();
+        let ranges = addressing.ranges(&axes).unwrap();
+        let element_byte_width = addressing.element_byte_width();
+        let mut output = self;
+        let bytes = output.storage_bytes_mut();
+        let update_is_dense = update_addressing.is_dense_row_major();
+        let mut written = 0usize;
+        for range in ranges {
+            let output_bytes = range.bytes();
+            let element_count = range.elements().len();
+            if update_is_dense {
+                let update_start = written * element_byte_width;
+                bytes[output_bytes].copy_from_slice(
+                    &update.storage_bytes()[update_start..update_start + element_count * element_byte_width],
+                );
+                written += element_count;
+                continue;
+            }
+            for offset in 0..element_count {
+                let output_start = output_bytes.start + offset * element_byte_width;
+                bytes[output_start..output_start + element_byte_width]
+                    .copy_from_slice(&update.storage_bytes()[update_addressing.byte_range_for_flat_index(written)]);
+                written += 1;
+            }
+        }
+        debug_assert_eq!(written, update_addressing.element_count());
+        output
+    }
 }
 
 #[cfg(test)]
@@ -620,11 +681,21 @@ impl PartialEq for Array {
         if self.r#type != other.r#type {
             return false;
         }
+
         let data_type = self.r#type.data_type();
         if matches!(data_type, DataType::Token | DataType::Zero) {
             return true;
         }
-        dispatch_on_array_element_type!(data_type, |Element| Self::elements_equal::<Element>(self, other))
+
+        // Compare typed values rather than physical byte patterns: signed floating-point zeros compare equal,
+        // while NaNs compare unequal.
+        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+        dispatch_on_array_element_type!(data_type, |Element| {
+            (0..addressing.element_count()).all(|index| {
+                let range = addressing.byte_range_for_flat_index(index);
+                Element::decode(&self.bytes[range.clone()]) == Element::decode(&other.bytes[range])
+            })
+        })
     }
 }
 
@@ -1261,6 +1332,36 @@ mod tests {
         let real = Array::vector(vec![1.0, 2.0]);
         let imaginary = Array::vector(vec![3.0, 4.0]);
         let _ = real.complex(&imaginary).unwrap().to_f64s();
+    }
+
+    #[test]
+    fn test_array_copy_block() {
+        // A reversed source and an output with holes exercise both sides of logical byte traversal.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[1u16, 2, 3, 4]).unwrap();
+        let output_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let output = input.copy_block(output_type.clone(), &[ArraySliceAxis::new(1, 2, 1)]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        assert_eq!(output.elements::<u16>(), Ok(vec![2, 3]));
+        assert_eq!(output.storage_bytes(), [2, 0, 0, 0, 3, 0]);
+    }
+
+    #[test]
+    fn test_array_replace_block() {
+        // Copying a block preserves the destination layout and leaves the shared original storage untouched.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type.clone(), &[1u16, 2, 3, 4]).unwrap();
+        let update_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let update = Array::from_elements(update_type, &[8u16, 9]).unwrap();
+        let output = input.clone().replace_block(&update, &[1]);
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.elements::<u16>(), Ok(vec![1, 8, 9, 4]));
+        assert_eq!(output.storage_bytes(), [4, 0, 9, 0, 8, 0, 1, 0]);
+        assert_eq!(input.elements::<u16>(), Ok(vec![1, 2, 3, 4]));
     }
 
     #[test]

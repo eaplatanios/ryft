@@ -81,7 +81,7 @@ mod control_flow;
 mod cumulative;
 mod custom_call;
 mod dimensions;
-mod logical;
+mod indexing;
 mod manipulation;
 mod math;
 mod memory;

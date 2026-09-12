@@ -1,3 +1,4 @@
+use crate::arrays::Array;
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
@@ -61,11 +62,25 @@ impl_capability_for_primitive!(u64);
 impl_capability_for_primitive!(u128);
 impl_capability_for_primitive!(usize);
 
+impl Xor for Array {
+    fn xor(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        self.binary_logical(rhs, "xor", |left, right| left ^ right)
+    }
+}
+
+impl std::ops::BitXor for Array {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Xor::xor(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, u4};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -176,5 +191,19 @@ mod tests {
         // The operator is logical for `bool` and bitwise for integer primitives.
         assert_eq!(Xor::xor(&true, &false), Ok(true));
         assert_eq!(Xor::xor(&0b1100_u8, &0b1010), Ok(0b0110));
+    }
+
+    #[test]
+    fn test_xor_for_array() {
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!(left.xor(&right).unwrap(), Array::vector(vec![false, true, true, false]));
+        assert_eq!(
+            Array::scalar(u4::new(0b1100).unwrap())
+                .xor(&Array::scalar(u4::new(0b1010).unwrap()))
+                .unwrap()
+                .elements::<u4>(),
+            Ok(vec![u4::new(0b0110).unwrap()]),
+        );
     }
 }

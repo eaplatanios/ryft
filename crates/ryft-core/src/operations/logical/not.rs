@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
+use crate::arrays::{Array, ArrayAddressing, DataType};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
-use crate::programs::ProgramError;
+use crate::programs::{ProgramError, TypeError, Typed};
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &str = "not";
@@ -63,11 +66,47 @@ impl_capability_for_primitive!(u64);
 impl_capability_for_primitive!(u128);
 impl_capability_for_primitive!(usize);
 
+impl Not for Array {
+    fn not(&self) -> Result<Self, ProgramError> {
+        let mask = match self.r#type().data_type() {
+            DataType::Boolean | DataType::I1 | DataType::U1 => 0b1,
+            DataType::I2 | DataType::U2 => 0b11,
+            DataType::I4 | DataType::U4 => 0b1111,
+            data_type if data_type.is_integer() => u8::MAX,
+            data_type => {
+                return Err(TypeError::invalid(format!(
+                    "cannot apply `{NOT_OPERATION_NAME}` to an array of element data type `{data_type}`"
+                ))
+                .into());
+            }
+        };
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let input_bytes = self.storage_bytes();
+        let mut bytes = vec![0; addressing.storage_byte_len()];
+        for element in 0..addressing.element_count() {
+            for byte in addressing.byte_range_for_flat_index(element) {
+                bytes[byte] = !input_bytes[byte] & mask;
+            }
+        }
+        // Masking retains valid Boolean and sub-byte encodings; full-width integers admit every bit pattern, and
+        // zero-initialization preserves all layout holes and padding.
+        Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(bytes)))
+    }
+}
+
+impl std::ops::Not for Array {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Layout, StridedLayout, i2};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
@@ -173,5 +212,27 @@ mod tests {
     fn test_not_for_primitives() {
         assert_eq!(Not::not(&true), Ok(false));
         assert_eq!(Not::not(&0b1100_u8), Ok(0b1111_0011));
+    }
+
+    #[test]
+    fn test_not_for_array() {
+        let left = Array::vector(vec![true, true, false, false]);
+        assert_eq!(left.not().unwrap(), Array::vector(vec![false, false, true, true]));
+        assert_eq!(Array::vector(vec![0x00ff_i16, -1]).not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
+        // Sub-byte negation complements only the declared low bits, retaining a valid sign-extended encoding.
+        let signed_sub_byte = Array::vector(vec![i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]);
+        assert_eq!(
+            signed_sub_byte.not().unwrap().elements::<i2>(),
+            Ok(vec![i2::MAX, i2::new(0).unwrap(), i2::new(-1).unwrap(), i2::MIN]),
+        );
+        // Physical layouts are traversed through addressing, so holes stay zero rather than being complemented.
+        let strided_type =
+            ArrayType::new_static(DataType::Boolean, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let strided = Array::new(strided_type.clone(), vec![1, 0, 0]).unwrap().not().unwrap();
+        assert_eq!(strided.r#type().as_ref(), &strided_type);
+        assert_eq!(strided.storage_bytes(), [0, 0, 1]);
+        assert_eq!(strided.elements::<bool>(), Ok(vec![false, true]));
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(!left.clone(), Array::vector(vec![false, false, true, true]));
     }
 }

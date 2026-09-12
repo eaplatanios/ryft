@@ -1,6 +1,7 @@
+use crate::arrays::{Array, NumericArrayElement};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation,
+    impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::programs::ProgramError;
 
@@ -81,6 +82,23 @@ impl_capability_for_primitive!(@integer usize);
 impl_capability_for_primitive!(@float f32);
 impl_capability_for_primitive!(@float f64);
 
+impl_array_elementwise_operation!(
+    @binary
+    Sub, sub,
+    operation = "sub",
+    inputs = @numeric,
+    checks = [@same_unreduced_axes, @same_reduced_axes],
+    |lhs, rhs| NumericArrayElement::sub(lhs, rhs),
+);
+
+impl std::ops::Sub for Array {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Sub::sub(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -89,6 +107,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        i4,
     };
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -285,5 +304,42 @@ mod tests {
             Err(ProgramError::InvalidArgument { message: "`sub` result does not fit in usize".to_string() }),
         );
         assert_eq!(Sub::sub(&2.5_f32, &0.5), Ok(2.0));
+    }
+
+    #[test]
+    fn test_sub_for_array() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(vector.sub(&Array::vector(vec![0.5, 1.0, 1.5])).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
+    }
+
+    #[test]
+    fn test_sub_for_array_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
+        assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
+    }
+
+    #[test]
+    fn test_sub_for_array_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)]);
+        let right = Array::vector(vec![Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)]);
+        let left_values = [Complex::new(1.0f64, 2.0), Complex::new(0.5f64, -1.0)];
+        let right_values = [Complex::new(0.5f64, -1.0), Complex::new(2.0f64, 0.5)];
+        assert_eq!(
+            left.sub(&right).unwrap(),
+            Array::vector(vec![left_values[0] - right_values[0], left_values[1] - right_values[1]]),
+        );
+    }
+
+    #[test]
+    fn test_sub_for_array_integers() {
+        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
+        assert_eq!(
+            narrow.sub(&Array::scalar(i4::new(1).unwrap())).unwrap().elements::<i4>(),
+            Ok(vec![i4::new(6).unwrap(), i4::new(7).unwrap()]),
+        );
     }
 }

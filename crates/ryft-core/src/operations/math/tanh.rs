@@ -1,7 +1,9 @@
 use std::ops::{Mul as StandardMul, Sub as StandardSub};
 
+use crate::arrays::FloatingPointArrayElement;
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
+    impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::one_like::OneLike;
 use crate::programs::ProgramError;
@@ -58,6 +60,15 @@ macro_rules! impl_capability_for_primitive {
 
 impl_capability_for_primitive!(f32);
 impl_capability_for_primitive!(f64);
+
+impl_array_elementwise_operation!(
+    @unary
+    Tanh, tanh,
+    operation = "tanh",
+    inputs = @float,
+    checks = [@no_unreduced],
+    |input| FloatingPointArrayElement::tanh(input),
+);
 
 #[cfg(test)]
 mod tests {

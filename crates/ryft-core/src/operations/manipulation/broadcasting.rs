@@ -1,9 +1,10 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, RaggedAxis, Shape, Sharding,
-    ShardingDimension,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals,
+    RaggedAxis, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -1262,6 +1263,42 @@ pub(crate) fn infer_explicit_broadcast_output_type(
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
+impl Broadcast for Array {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type().broadcast(output_type, output_axes)?;
+        let Some(target_shape) = r#type.static_shape() else {
+            return Err(
+                TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
+            );
+        };
+        if &r#type == self.r#type().as_ref() && output_axes.iter().copied().eq(0..r#type.rank()) {
+            return Ok(self.clone());
+        }
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_rank = input_shape.rank();
+        let target_rank = target_shape.rank();
+        let output_count = Self::materialized_element_count(&r#type)?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(r#type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_count == 0 {
+            return Ok(Self::new_unchecked(r#type, Arc::new(bytes)));
+        }
+        let mut target_index = vec![0usize; target_rank];
+        let mut input_index = vec![0usize; input_rank];
+        for output_flat in 0..output_count {
+            for input_axis in 0..input_rank {
+                let target_axis = output_axes[input_axis];
+                input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
+            }
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut target_index);
+        }
+        Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2316,5 +2353,45 @@ mod tests {
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
         );
         assert_eq!(input.dynamic_broadcast_leading_sizes(&[]), Ok(input));
+    }
+
+    #[test]
+    fn test_array_broadcast() {
+        let vector = Array::vector(vec![1.0, 2.0]);
+        let output_type = ArrayType::new_static(DataType::F64, [3, 2]);
+        let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().into_owned(), output_type);
+        assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
+        // zero in its holes.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
+        let output_type =
+            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
+        let broadcast = input.broadcast(output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().as_ref(), &output_type);
+        assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
+        assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
+
+        // Deliberately malformed concrete values with dynamic types fail through the structured materialization
+        // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
+        );
+        let dynamic = Array::with_unchecked_type(
+            dynamic_type.clone(),
+            [1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect(),
+        );
+        for output_axes in [vec![0, 1], vec![1, 0]] {
+            assert!(matches!(
+                dynamic.broadcast(dynamic_type.clone(), output_axes.as_slice()),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
+            ));
+        }
     }
 }

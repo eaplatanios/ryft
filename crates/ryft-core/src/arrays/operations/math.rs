@@ -2,19 +2,14 @@
 //!
 //! Kernels use the scalar arithmetic contracts in [`crate::arrays::elements`], decode operands through their
 //! physical addressing, and materialize owned results. Element data type promotion and broadcasting follow the
-//! corresponding operations' type-inference rules. Reduction-specific accumulation remains local to this module.
+//! corresponding operations' type-inference rules.
 
 use std::sync::Arc;
-
-use half::{bf16, f16};
-use num_complex::Complex;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::elements::{
     ArrayElement, FloatingPointArrayElement, NumericArrayElement, RealArrayElement, RealFloatingPointArrayElement,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    i1, i2, i4, u1, u2, u4,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::collectives::decode_nonnegative_integer_metadata;
@@ -23,250 +18,16 @@ use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::macros::impl_array_elementwise_operation;
 use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_sum_exp_data_type};
-use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
-    Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Log1p, LogAddExp, LogSumExp, Logistic, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers,
-    RaggedDotMode, RaggedDotOperation, Reduce, ReductionKind, Rem, Reshape, Round, Rsqrt, Sign, Sin, Slice, Sqrt, Sub,
-    Tanh,
+    Add, Atan2, Ceil, ConvertElementType, Dot, DotDimensionNumbers, DotOperation, Erf, Floor, Log, Log1p, LogAddExp,
+    LogSumExp, Logistic, Pow, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode,
+    RaggedDotOperation, Rem, Reshape, Round, Rsqrt, Sign, Slice, Sqrt,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
-/// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
-/// mean lowers to a sum followed by a division by the reduced element count.
-trait ElementDivideByCount: NumericArrayElement {
-    /// Divides this element by `count` after converting `count` to the element type.
-    fn divide_by_count(self, count: usize) -> Result<Self, ProgramError>;
-}
-
-// Implements typed arithmetic for signed primitive integers with deterministic two's-complement wrapping.
-macro_rules! impl_array_arithmetic_for_signed_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = count as Self;
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                if self == Self::MIN && divisor == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer array element of data type `{}` by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / divisor)
-            }
-        }
-    };
-}
-
-// Implements typed arithmetic for unsigned primitive integers with deterministic modular wrapping.
-macro_rules! impl_array_arithmetic_for_unsigned_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = count as Self;
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / divisor)
-            }
-        }
-    };
-}
-
-impl_array_arithmetic_for_signed_integer!(i8);
-impl_array_arithmetic_for_signed_integer!(i16);
-impl_array_arithmetic_for_signed_integer!(i32);
-impl_array_arithmetic_for_signed_integer!(i64);
-impl_array_arithmetic_for_unsigned_integer!(u8);
-impl_array_arithmetic_for_unsigned_integer!(u16);
-impl_array_arithmetic_for_unsigned_integer!(u32);
-impl_array_arithmetic_for_unsigned_integer!(u64);
-
-// Implements modular arithmetic for a signed sub-byte integer's checked low-bit encoding.
-macro_rules! impl_array_arithmetic_for_signed_sub_byte_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                let divisor = Self::from_bits(count as u8 & bit_mask).unwrap().value();
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                if self == Self::MIN && divisor == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer array element of data type `{}` by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() / divisor).unwrap())
-            }
-        }
-    };
-}
-
-// Implements modular arithmetic for an unsigned sub-byte integer's checked low-bit encoding.
-macro_rules! impl_array_arithmetic_for_unsigned_sub_byte_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = Self::from_bits(count as u8 & Self::MAX.to_bits()).unwrap().value();
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() / divisor).unwrap())
-            }
-        }
-    };
-}
-
-impl_array_arithmetic_for_signed_sub_byte_integer!(i1);
-impl_array_arithmetic_for_signed_sub_byte_integer!(i2);
-impl_array_arithmetic_for_signed_sub_byte_integer!(i4);
-impl_array_arithmetic_for_unsigned_sub_byte_integer!(u1);
-impl_array_arithmetic_for_unsigned_sub_byte_integer!(u2);
-impl_array_arithmetic_for_unsigned_sub_byte_integer!(u4);
-
-// Implements arithmetic for a low-precision floating-point format through its exact f64 conversion contract.
-macro_rules! impl_array_arithmetic_for_low_precision_float {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            #[inline]
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = Self::from_f64(count as f64)?;
-                Ok(Self::from_f64(self.to_f64() / divisor.to_f64())?)
-            }
-        }
-    };
-}
-
-impl_array_arithmetic_for_low_precision_float!(f4e2m1fn);
-impl_array_arithmetic_for_low_precision_float!(f6e2m3fn);
-impl_array_arithmetic_for_low_precision_float!(f6e3m2fn);
-impl_array_arithmetic_for_low_precision_float!(f8e3m4);
-impl_array_arithmetic_for_low_precision_float!(f8e4m3);
-impl_array_arithmetic_for_low_precision_float!(f8e4m3fn);
-impl_array_arithmetic_for_low_precision_float!(f8e4m3fnuz);
-impl_array_arithmetic_for_low_precision_float!(f8e4m3b11fnuz);
-impl_array_arithmetic_for_low_precision_float!(f8e5m2);
-impl_array_arithmetic_for_low_precision_float!(f8e5m2fnuz);
-impl_array_arithmetic_for_low_precision_float!(f8e8m0fnu);
-
-// Implements ordinary arithmetic for a native or half-precision real floating-point type.
-macro_rules! impl_array_arithmetic_for_float {
-    ($type:ty, $from_count:expr) => {
-        impl ElementDivideByCount for $type {
-            #[inline]
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                Ok(self / $from_count(count))
-            }
-        }
-    };
-}
-
-impl_array_arithmetic_for_float!(bf16, |count: usize| bf16::from_f64(count as f64));
-impl_array_arithmetic_for_float!(f16, |count: usize| f16::from_f64(count as f64));
-impl_array_arithmetic_for_float!(f32, |count: usize| count as f32);
-impl_array_arithmetic_for_float!(f64, |count: usize| count as f64);
-
-// Implements complex arithmetic; division by a real count acts componentwise to avoid an unnecessary complex norm.
-macro_rules! impl_array_arithmetic_for_complex {
-    ($component:ty) => {
-        impl ElementDivideByCount for Complex<$component> {
-            #[inline]
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                // Dividing by a real count is componentwise by definition, which also sidesteps the generic complex
-                // division's norm computation, whose intermediate values can overflow for large counts.
-                let divisor = count as $component;
-                Ok(Complex::new(self.re / divisor, self.im / divisor))
-            }
-        }
-    };
-}
-
-impl_array_arithmetic_for_complex!(f32);
-impl_array_arithmetic_for_complex!(f64);
-
 impl Array {
-    /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
-    /// and uniquely owned output buffers are mutated without another payload allocation.
-    fn map_elements_in_place<T: ArrayElement>(
-        &mut self,
-        function: impl Fn(T) -> Result<T, ProgramError>,
-    ) -> Result<(), ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let bytes = self.storage_bytes_mut();
-        for element in 0..addressing.element_count() {
-            let range = addressing.byte_range_for_flat_index(element);
-            let value = T::decode(&bytes[range.clone()]);
-            function(value)?.encode(&mut bytes[range]);
-        }
-        Ok(())
-    }
-
-    /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
-    /// initializes every output cell, including those whose reduced axes are empty.
-    fn reduce_elements<T: ArrayElement>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-        identity: T,
-        combine: impl Fn(T, T) -> Result<T, ProgramError>,
-    ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        debug_assert_eq!(output_type.data_type(), T::data_type());
-        let input_shape = self.r#type().static_shape().unwrap();
-        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut reduce_mask = vec![false; input_shape.rank()];
-        axes.iter().for_each(|axis| reduce_mask[*axis] = true);
-
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        for output in 0..output_addressing.element_count() {
-            identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
-        }
-
-        let mut input_index = vec![0usize; input_shape.rank()];
-        let mut output_index = vec![0usize; output_type.rank()];
-        for _ in 0..input_addressing.element_count() {
-            let mut output_axis = 0usize;
-            for axis in 0..input_shape.rank() {
-                if !reduce_mask[axis] {
-                    output_index[output_axis] = input_index[axis];
-                    output_axis += 1;
-                }
-            }
-            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
-            value.encode(&mut bytes[output_range]);
-            input_addressing.advance_index(&mut input_index);
-        }
-        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
-
     /// Computes one numerically stable `log(sum(exp(x)))` directly over typed elements, following the guarded
     /// construction that [`LogSumExpOperation`](crate::operations::math::LogSumExpOperation) documents: a maximum
     /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
@@ -324,23 +85,6 @@ impl Array {
             value.encode(&mut bytes[range]);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
-
-    /// Executes a typed sum or mean reduction, sharing the same wrapping addition and applying mean division in
-    /// place after accumulation.
-    fn reduce_sum_or_mean_elements<T: ElementDivideByCount>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-        mean: bool,
-    ) -> Result<Self, ProgramError> {
-        let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
-        if mean {
-            let shape = self.r#type().static_shape().unwrap();
-            let count = axes.iter().map(|axis| shape[*axis]).product::<usize>().max(1);
-            output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
-        }
-        Ok(output)
     }
 
     /// Allocates an array whose logical elements are initialized to the additive identity.
@@ -634,73 +378,6 @@ impl Array {
     }
 }
 
-impl Abs for Array {
-    fn abs(&self) -> Result<Self, ProgramError> {
-        // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
-        // real part data type, mirroring the `AbsOperation` type-inference contract.
-        let data_type = match self.r#type().data_type() {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other,
-        };
-        let output_type = self.r#type().into_owned().with_data_type(data_type);
-        if Self::element_count(&output_type) == 0 {
-            let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-        }
-        let input_type = self.r#type().data_type();
-        if !((input_type.is_signed() && input_type != DataType::I1)
-            || input_type.is_floating_point()
-            || input_type.is_complex())
-        {
-            return Err(TypeError::invalid(format!(
-                "cannot compute the absolute value of a scalar of data type `{input_type}`",
-            ))
-            .into());
-        }
-        dispatch_on_array_element_type!(@numeric input_type, |Element| {
-            self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
-                <Element as NumericArrayElement>::abs(value)
-            })
-        })
-    }
-}
-
-impl_array_elementwise_operation!(
-    @binary
-    Sub, sub,
-    operation = "sub",
-    inputs = @numeric,
-    checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::sub(lhs, rhs),
-);
-
-impl std::ops::Sub for Array {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Sub::sub(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl_array_elementwise_operation!(
-    @unary
-    Sin, sin,
-    operation = "sin",
-    inputs = @float,
-    checks = [@no_unreduced],
-    |input| FloatingPointArrayElement::sin(input),
-);
-
-impl_array_elementwise_operation!(
-    @unary
-    Cos, cos,
-    operation = "cos",
-    inputs = @float,
-    checks = [@no_unreduced],
-    |input| FloatingPointArrayElement::cos(input),
-);
-
 impl_array_elementwise_operation!(
     @binary
     Atan2, atan2,
@@ -708,15 +385,6 @@ impl_array_elementwise_operation!(
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
     |lhs, rhs| FloatingPointArrayElement::atan2(lhs, rhs),
-);
-
-impl_array_elementwise_operation!(
-    @unary
-    Exp, exp,
-    operation = "exp",
-    inputs = @float,
-    checks = [@no_unreduced],
-    |input| FloatingPointArrayElement::exp(input),
 );
 
 impl_array_elementwise_operation!(
@@ -762,15 +430,6 @@ impl_array_elementwise_operation!(
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::rsqrt(input),
-);
-
-impl_array_elementwise_operation!(
-    @unary
-    Tanh, tanh,
-    operation = "tanh",
-    inputs = @float,
-    checks = [@no_unreduced],
-    |input| FloatingPointArrayElement::tanh(input),
 );
 
 impl_array_elementwise_operation!(
@@ -914,54 +573,6 @@ impl RaggedDot for Array {
     }
 }
 
-impl Reduce for Array {
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
-        if axes.is_empty() {
-            return self.clone();
-        }
-        let data_type = self.r#type().data_type();
-        // Reuse the abstract rule for validation and for the complete result metadata. The concrete kernel below then
-        // decodes directly from the input's physical layout into the result's addressed storage.
-        let output_type =
-            reduce_abstract(self.r#type().as_ref(), axes, kind, "reduce").unwrap_or_else(|error| panic!("{error}"));
-        if data_type == DataType::Zero {
-            return Self::new(output_type, Vec::new()).unwrap();
-        }
-        let output = match kind {
-            ReductionKind::Sum | ReductionKind::Mean => {
-                dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.reduce_sum_or_mean_elements::<Element>(
-                        output_type,
-                        axes,
-                        kind == ReductionKind::Mean,
-                    )
-                })
-            }
-            ReductionKind::Max | ReductionKind::Min => {
-                dispatch_on_array_element_type!(data_type, |Element| {
-                    let identity = if kind == ReductionKind::Max {
-                        <Element as ArrayElement>::max_identity()
-                    } else {
-                        <Element as ArrayElement>::min_identity()
-                    };
-                    self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
-                        Ok(if kind == ReductionKind::Max {
-                            ArrayElement::max(&left, &right)
-                        } else {
-                            ArrayElement::min(&left, &right)
-                        })
-                    })
-                })
-            }
-            ReductionKind::Any => {
-                self.reduce_elements::<bool>(output_type, axes, false, |left, right| Ok(left | right))
-            }
-            ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
-        };
-        output.unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
 impl LogSumExp for Array {
     fn log_sum_exp(&self, axes: &[usize]) -> Result<Self, ProgramError> {
         // Reducing along no axes is the identity, but only for the operands this primitive accepts at all, so the
@@ -987,37 +598,23 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::elements::{f8e4m3fn, f8e8m0fnu, i2, i4};
+    use crate::arrays::elements::{i2, i4};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
-    use crate::operations::complex::Complex;
     use crate::programs::Typed;
 
     use super::*;
-
-    #[test]
-    fn test_array_sub() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(vector.sub(&Array::vector(vec![0.5, 1.0, 1.5])).unwrap(), Array::vector(vec![0.5, 1.0, 1.5]));
-    }
 
     #[test]
     fn test_array_low_precision_float_arithmetic() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
         let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
         let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
-        assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
         assert_eq!(left.rem(&right).unwrap().to_f64s(), vec![0.0, 0.0]);
-        let negative = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![-1.0, -2.0]);
-        assert_eq!(negative.abs().unwrap(), left);
     }
 
     #[test]
     fn test_array_math() {
-        let vector = Array::vector(vec![0.0, 1.0]);
-        assert_abs_diff_eq!(vector.sin().unwrap(), Array::vector(vec![0.0, 1.0f64.sin()]), epsilon = 1e-12);
-        assert_abs_diff_eq!(vector.cos().unwrap(), Array::vector(vec![1.0, 1.0f64.cos()]), epsilon = 1e-12);
-        assert_abs_diff_eq!(vector.exp().unwrap(), Array::vector(vec![1.0, 1.0f64.exp()]), epsilon = 1e-12);
         assert_abs_diff_eq!(
             Array::vector(vec![1.0, 4.0]).sqrt().unwrap(),
             Array::vector(vec![1.0, 2.0]),
@@ -1033,24 +630,10 @@ mod tests {
             Array::vector(vec![std::f64::consts::FRAC_PI_4]),
             epsilon = 1e-12,
         );
-        assert_eq!(Array::vector(vec![-1.5, 2.5]).abs().unwrap(), Array::vector(vec![1.5, 2.5]));
-        // The absolute value of a complex array is its elementwise magnitude with a real element data type.
-        let complex = Array::vector(vec![3.0]).complex(&Array::vector(vec![4.0])).unwrap();
-        let magnitude = complex.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
-        assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]), epsilon = 1e-12);
     }
 
     #[test]
     fn test_array_transcendental_math_uses_typed_storage() {
-        // Unary kernels preserve arbitrary physical layouts while traversing elements in logical order.
-        let input_type =
-            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
-        let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
-        let exponential = input.exp().unwrap();
-        assert_eq!(exponential.r#type().as_ref(), &input_type);
-        assert_eq!(exponential.elements::<f64>(), Ok(vec![1.0, 1.0f64.exp()]));
-
         // Binary kernels perform complete broadcasting after promoting both physical inputs to their common type.
         let left_type =
             ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
@@ -1089,21 +672,10 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`pow` does not support input data type `i32`",
         ));
-
-        // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
-        let low_precision = Array::from_elements(
-            ArrayType::new_static(DataType::F8E4M3FN, [2]),
-            &[f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            low_precision.exp().unwrap().to_f64s(),
-            vec![1.0, f8e4m3fn::from_f64(1.0f64.exp()).unwrap().to_f64()]
-        );
     }
 
     #[test]
-    fn test_array_real_float_math_and_sign_use_typed_storage() {
+    fn test_array_real_float_math_uses_typed_storage() {
         let input = Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]);
         assert_eq!(input.floor().unwrap(), Array::vector(vec![-2.0, -0.0, 2.0, 3.0]));
         assert_eq!(input.ceil().unwrap(), Array::vector(vec![-1.0, -0.0, 3.0, 4.0]));
@@ -1113,131 +685,6 @@ mod tests {
             Array::vector(vec![-1.0f64, 0.0, 1.0]).erf().unwrap(),
             Array::vector(vec![-0.8427007929497149, 0.0, 0.8427007929497149]),
             epsilon = 1e-12,
-        );
-
-        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
-        let signs = Array::from_elements(
-            ArrayType::new_static(DataType::F64, [4]),
-            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
-        )
-        .unwrap()
-        .sign()
-        .unwrap()
-        .elements::<f64>()
-        .unwrap();
-        assert_eq!(signs[0], -1.0);
-        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
-        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
-        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
-        let narrow =
-            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
-                .unwrap();
-        assert_eq!(
-            narrow.sign().unwrap().elements::<i2>(),
-            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
-        );
-        assert!(matches!(
-            Array::scalar(1u8).sign(),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute the sign of a scalar of data type `u8`",
-        ));
-    }
-
-    #[test]
-    fn test_array_reduce() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum), Array::vector(vec![6.0, 15.0]));
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]));
-        assert_eq!(
-            matrix.reduce(&[0, 1], ReductionKind::Sum),
-            Array::from_f64s(ArrayType::new_static(DataType::F64, []), vec![21.0])
-        );
-        assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
-        // Max and min use the data type's reduction identities and ordinary ordering.
-        let integers = Array::vector(vec![3i32, -1, 2]);
-        assert_eq!(integers.reduce(&[0], ReductionKind::Max).elements::<i32>(), Ok(vec![3]));
-        assert_eq!(integers.reduce(&[0], ReductionKind::Min).elements::<i32>(), Ok(vec![-1]));
-        // Boolean reductions.
-        let booleans = Array::vector(vec![true, false, true]);
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::All).elements::<bool>(), Ok(vec![false]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Max).elements::<bool>(), Ok(vec![true]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Min).elements::<bool>(), Ok(vec![false]));
-
-        // Numeric and Boolean reductions traverse arbitrary layouts and produce the abstract rule's dense result.
-        let r#type =
-            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 2])));
-        let matrix = Array::from_elements(r#type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum).elements::<u16>(), Ok(vec![6, 15]));
-        let r#type =
-            ArrayType::new_static(DataType::Boolean, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
-        let booleans = Array::from_elements(r#type, &[true, false, true]).unwrap();
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
-
-        // Sub-byte accumulation wraps in the declared width, and low-precision accumulation re-encodes each step.
-        let narrow = Array::matrix(
-            2,
-            2,
-            vec![i4::new(7).unwrap(), i4::new(2).unwrap(), i4::new(-8).unwrap(), i4::new(-3).unwrap()],
-        );
-        assert_eq!(
-            narrow.reduce(&[1], ReductionKind::Sum).elements::<i4>(),
-            Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
-        );
-        let low_precision = Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(0.5).unwrap()]);
-        assert_eq!(
-            low_precision.reduce(&[0], ReductionKind::Sum).elements::<f8e4m3fn>(),
-            Ok(vec![f8e4m3fn::from_f64(1.5).unwrap()]),
-        );
-
-        // Complex sums and means preserve both components, while empty sums materialize the numeric identity.
-        let complex = Array::vector(vec![ComplexNumber::new(2.0f32, 4.0), ComplexNumber::new(4.0, 8.0)]);
-        assert_eq!(
-            complex.reduce(&[0], ReductionKind::Sum).elements::<ComplexNumber<f32>>(),
-            Ok(vec![ComplexNumber::new(6.0, 12.0)]),
-        );
-        assert_eq!(
-            complex.reduce(&[0], ReductionKind::Mean).elements::<ComplexNumber<f32>>(),
-            Ok(vec![ComplexNumber::new(3.0, 6.0)]),
-        );
-        let empty = Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
-        assert_eq!(empty.reduce(&[1], ReductionKind::Sum).elements::<i32>(), Ok(vec![0, 0]));
-
-        // Floating-point extrema propagate NaNs and order negative zero below positive zero.
-        let nan = Array::vector(vec![1.0f32, f32::NAN]);
-        assert!(nan.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].is_nan());
-        let zeros = Array::vector(vec![-0.0f32, 0.0]);
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].to_bits(), 0.0f32.to_bits(),);
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).elements::<f32>().unwrap()[0].to_bits(), (-0.0f32).to_bits(),);
-
-        // Complex extrema compare `(real, imaginary)` lexicographically, including their JAX-compatible identities.
-        let complex = Array::vector(vec![
-            ComplexNumber::new(1.0f32, 5.0),
-            ComplexNumber::new(2.0, -3.0),
-            ComplexNumber::new(2.0, 4.0),
-        ]);
-        assert_eq!(
-            complex.reduce(&[0], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
-            Ok(vec![ComplexNumber::new(2.0, 4.0)]),
-        );
-        assert_eq!(
-            complex.reduce(&[0], ReductionKind::Min).elements::<ComplexNumber<f32>>(),
-            Ok(vec![ComplexNumber::new(1.0, 5.0)]),
-        );
-        let empty =
-            Array::from_elements::<ComplexNumber<f32>>(ArrayType::new_static(DataType::C64, [2, 0]), &[]).unwrap();
-        assert_eq!(
-            empty.reduce(&[1], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
-            Ok(vec![ComplexNumber::new(f32::NEG_INFINITY, 0.0), ComplexNumber::new(f32::NEG_INFINITY, 0.0),]),
-        );
-        let empty = Array::from_elements::<f8e8m0fnu>(ArrayType::new_static(DataType::F8E8M0FNU, [2, 0]), &[]).unwrap();
-        assert_eq!(
-            empty.reduce(&[1], ReductionKind::Max).elements::<f8e8m0fnu>(),
-            Ok(vec![f8e8m0fnu::MIN, f8e8m0fnu::MIN]),
-        );
-        assert_eq!(
-            empty.reduce(&[1], ReductionKind::Min).elements::<f8e8m0fnu>(),
-            Ok(vec![f8e8m0fnu::MAX, f8e8m0fnu::MAX]),
         );
     }
 
@@ -1307,48 +754,54 @@ mod tests {
     fn test_array_complex_math() {
         // Elementwise complex math decodes and encodes the complex element types directly.
         let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]);
-        let right = Array::vector(vec![ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)]);
         let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
-        let right_values = [ComplexNumber::new(0.5f64, -1.0), ComplexNumber::new(2.0f64, 0.5)];
         let expect = |values: [ComplexNumber<f64>; 2]| Array::vector(values.to_vec());
-        assert_eq!(
-            left.sub(&right).unwrap(),
-            expect([left_values[0] - right_values[0], left_values[1] - right_values[1]]),
-        );
-        assert_abs_diff_eq!(left.exp().unwrap(), expect([left_values[0].exp(), left_values[1].exp()]), epsilon = 1e-12);
         assert_abs_diff_eq!(left.log().unwrap(), expect([left_values[0].ln(), left_values[1].ln()]), epsilon = 1e-12);
         assert_abs_diff_eq!(
             left.sqrt().unwrap(),
             expect([left_values[0].sqrt(), left_values[1].sqrt()]),
             epsilon = 1e-12,
         );
-        assert_abs_diff_eq!(left.sin().unwrap(), expect([left_values[0].sin(), left_values[1].sin()]), epsilon = 1e-12);
-        assert_abs_diff_eq!(left.cos().unwrap(), expect([left_values[0].cos(), left_values[1].cos()]), epsilon = 1e-12);
-        // The absolute value is the elementwise magnitude with a real element data type.
-        let magnitude = left.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
-        assert_abs_diff_eq!(
-            magnitude,
-            Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),
-            epsilon = 1e-12,
-        );
     }
 
     #[test]
     fn test_array_integer_semantics() {
-        // Sub-byte arithmetic uses the declared bit width for every wrapping operation.
-        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]);
-        assert_eq!(
-            narrow.sub(&Array::scalar(i4::new(1).unwrap())).unwrap().elements::<i4>(),
-            Ok(vec![i4::new(6).unwrap(), i4::new(7).unwrap()]),
-        );
-        assert_eq!(narrow.abs().unwrap().elements::<i4>(), Ok(vec![i4::new(7).unwrap(), i4::MIN]));
         // Remainder by zero returns a structured error.
         assert!(matches!(
             Array::vector(vec![1u8]).rem(&Array::vector(vec![0u8])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message
                     == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
+        ));
+    }
+
+    #[test]
+    fn test_array_sign() {
+        // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
+        let signs = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [4]),
+            &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
+        )
+        .unwrap()
+        .sign()
+        .unwrap()
+        .elements::<f64>()
+        .unwrap();
+        assert_eq!(signs[0], -1.0);
+        assert_eq!(signs[1].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
+        assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
+        let narrow =
+            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
+                .unwrap();
+        assert_eq!(
+            narrow.sign().unwrap().elements::<i2>(),
+            Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
+        );
+        assert!(matches!(
+            Array::scalar(1u8).sign(),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot compute the sign of a scalar of data type `u8`",
         ));
     }
 }
