@@ -1,3 +1,10 @@
+//! Array concatenation along a selected axis, including static and first-class dynamic result extents.
+//!
+//! [`ConcatenateOperation`] joins inputs without changing their element values. Its homogeneous form implements
+//! [`Concatenate`], while its mixed form implements [`DynamicConcatenate`] and validates the supplied result extent.
+//! Batching preserves shared ragged geometry on unaffected axes; differentiation concatenates tangents and partitions
+//! output cotangents into slices with each input's original geometry and storage metadata.
+
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -6,8 +13,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue,
-    LinearResiduals, Shape, Sharding, materialize_array_tangent,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation,
+    DimensionType, DimensionValue, LinearResiduals, RaggedAxis, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -30,15 +37,17 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::conversions::ConvertElementType;
+use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
 
@@ -151,6 +160,44 @@ impl<T: Type> Display for ConcatenateOperation<T> {
     }
 }
 
+impl Operation for ConcatenateOperation<ArrayType> {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONCATENATE_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("region", region_interfaces, 0, TypeError);
+        // The operation stores a normalized axis, which remains subject to validation for the actual input rank.
+        if let Some(input_type) = input_types.first() {
+            Axis::from(self.axis).normalize(input_type.rank()).map_err(|_| {
+                TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` axis {} is out of bounds for inputs of rank {}",
+                    self.axis,
+                    input_type.rank(),
+                ))
+            })?;
+        }
+        match ArrayType::concatenate(input_types, self.axis) {
+            Ok(output_type) => Ok(vec![output_type]),
+            Err(ProgramError::Type(error)) => Err(error),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
+        }
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        self.render_operation(formatter, indentation)
+    }
+}
+
 impl Operation for ConcatenateOperation<ArrayIrType> {
     type Type = ArrayIrType;
 
@@ -192,33 +239,6 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
     }
 }
 
-impl Operation for ConcatenateOperation<ArrayType> {
-    type Type = ArrayType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONCATENATE_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        match ArrayType::concatenate(input_types, self.axis) {
-            Ok(output_type) => Ok(vec![output_type]),
-            Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError::invalid(error.to_string())),
-        }
-    }
-
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
-    }
-}
-
 impl_reference_dischargeable_operation!(@reference_free <T> ConcatenateOperation<T> where T: Type);
 
 impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation<ArrayType> {
@@ -233,11 +253,8 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-impl<C> InterpretableOperation<C> for ConcatenateOperation<ArrayIrType>
-where
-    C: Domain<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
+impl<C: Domain<Type = ArrayIrType, Value: DynamicConcatenate>> InterpretableOperation<C>
+    for ConcatenateOperation<ArrayIrType>
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -251,44 +268,7 @@ where
             ))
             .into());
         };
-        if inputs.is_empty() {
-            return match <C::Value as ValueProjection<DimensionType>>::into_projected(result_extent.clone()) {
-                Err(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
-                ))
-                .into()),
-                Ok(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
-                ))
-                .into()),
-            };
-        }
-        let result_extent =
-            <C::Value as ValueProjection<DimensionType>>::into_projected(result_extent.clone())?.extent();
-        let inputs = inputs
-            .iter()
-            .cloned()
-            .map(<C::Value as ValueProjection<ArrayType>>::into_projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        let actual_extent = inputs.iter().try_fold(0usize, |extent, input| {
-            extent.checked_add(input.dimension_size(self.axis())?).ok_or_else(|| {
-                ProgramError::from(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` result extent overflows usize",
-                )))
-            })
-        })?;
-        if result_extent != actual_extent {
-            return Err(ProgramError::InvalidArgument {
-                message: format!(
-                    "`{CONCATENATE_OPERATION_NAME}` result extent must equal the sum of input axis {} extents; \
-                     expected {actual_extent} but got {result_extent}",
-                    self.axis(),
-                ),
-            });
-        }
-        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(
-            <<C::Value as ValueProjection<ArrayType>>::Projected as Concatenate>::concatenate(&inputs, self.axis())?,
-        )])
+        Ok(vec![C::Value::dynamic_concatenate(inputs, result_extent, self.axis())?])
     }
 }
 
@@ -321,16 +301,25 @@ where
             .into());
         }
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+            let ragged_axes = validate_concatenation_ragged_axes(
+                &inputs.iter().map(ArrayBatch::ragged_axes).collect::<Vec<_>>(),
+                self.axis(),
+            )?;
+            let mut outputs = self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?;
+            return Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into());
         };
         let materialized = inputs
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        Ok(ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?
-            .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?
-            .into())
+        let ragged_axes = validate_concatenation_ragged_axes(
+            &materialized.iter().map(ArrayBatch::ragged_axes).collect::<Vec<_>>(),
+            lifted_axis,
+        )?;
+        let mut outputs = ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?
+            .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?;
+        Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into())
     }
 }
 
@@ -379,21 +368,21 @@ where
         result_extent.validate_replicated_dimension()?;
 
         let Some(batch_axis) = inputs.iter().find_map(ArrayIrBatch::batch_axis_position) else {
-            return Ok(context
-                .parent()
-                .bind(
-                    self.clone(),
-                    Vec::new(),
-                    &inputs
-                        .iter()
-                        .chain(std::iter::once(result_extent))
-                        .map(|input| input.value().clone())
-                        .collect::<Vec<_>>(),
-                )?
-                .into_iter()
-                .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
+            let ragged_axes = validate_concatenation_ragged_axes(
+                &inputs.iter().map(ArrayIrBatch::ragged_axes).collect::<Vec<_>>(),
+                self.axis(),
+            )?;
+            let mut outputs = context.parent().bind(
+                self.clone(),
+                Vec::new(),
+                &inputs
+                    .iter()
+                    .chain(std::iter::once(result_extent))
+                    .map(|input| input.value().clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            check_count!("output", outputs, 1, ProgramError);
+            return Ok(vec![ArrayIrBatch::replicated(outputs.remove(0)).with_ragged_axes(ragged_axes)?].into());
         };
 
         // Align every packed array on one mapped axis. Replicated operands gain that axis using the transform's
@@ -404,175 +393,21 @@ where
             .map(|input| driver.align_batch_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
+        let ragged_axes = validate_concatenation_ragged_axes(
+            &aligned_inputs.iter().map(ArrayIrBatch::ragged_axes).collect::<Vec<_>>(),
+            lifted_axis,
+        )?;
         let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
         lifted_inputs.push(result_extent.value().clone());
         let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
-        Ok(context
-            .parent()
-            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
-            .into_iter()
-            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
-    }
-}
-
-// Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
-// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
-// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
-impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
-where
-    C: Context<Type = ArrayIrType> + Zero<C::Value>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-        + From<ConcatenateOperation<ArrayIrType>>
-        + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let destinations = context;
-        let context = destinations.primal();
-        let Some((result_extent, array_inputs)) = inputs.split_last() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array followed by its result \
-                 extent",
-            ))
-            .into());
-        };
-        if array_inputs.is_empty() {
-            return match result_extent.primal().r#type().as_ref() {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
-                ))
-                .into()),
-                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array before its result \
-                     extent",
-                ))
-                .into()),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
-                ))
-                .into()),
-            };
-        }
-
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-        let output_primal = primal;
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
-        let inputs = tangent_inputs.as_slice();
-        let (result_extent, array_inputs) = inputs.split_last().unwrap();
-        let context = destinations.tangent();
-        let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            // Concatenation needs one concrete array tangent per array operand. Materialize only structural zeros;
-            // the trailing result extent remains the unchanged primal shape operand.
-            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
-            let mut tangent_inputs = array_inputs
-                .iter()
-                .map(|input| -> Result<C::Value, DifferentiationError> {
-                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
-                        &projected_context,
-                        input,
-                    )?))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let input_cotangent_types = array_inputs
-                .iter()
-                .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.cotangent()?))
-                .collect::<Result<Vec<_>, DifferentiationError>>()?;
-            if input_cotangent_types
-                .iter()
-                .flat_map(|r#type| r#type.shape().dimensions())
-                .all(|dimension| matches!(dimension, Dimension::Static(_)))
-            {
-                tangent_inputs.push(result_extent.primal().clone());
-                MaybeZero::Value(context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?.remove(0))
-            } else {
-                let mut residuals = LinearResiduals::new();
-                let result_extent_index = residuals.retain(result_extent.primal().clone());
-                let mut input_shapes = Vec::with_capacity(array_inputs.len());
-                for input in array_inputs {
-                    input_shapes.push(residuals.retain_shape(context, input.primal())?);
-                }
-                let forward_operation = self.clone();
-                let transpose_axis = self.axis();
-                let tangent = LinearCallOperation::stage(
-                    context,
-                    residuals.into_values(),
-                    tangent_inputs,
-                    move |residuals, linear_inputs| {
-                        let mut concatenate_inputs = linear_inputs.to_vec();
-                        concatenate_inputs.push(residuals[result_extent_index].clone());
-                        linear_inputs[0].dispatch_domain().bind(
-                            forward_operation,
-                            Vec::new(),
-                            concatenate_inputs.as_slice(),
-                        )
-                    },
-                    move |residuals, output_cotangents| {
-                        let transpose_context = output_cotangents[0].dispatch_domain();
-                        let zero = transpose_context
-                            .bind(
-                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
-                                Vec::new(),
-                                &[],
-                            )?
-                            .remove(0);
-                        let mut offset = zero.clone();
-                        let mut cotangents = Vec::with_capacity(input_shapes.len());
-                        for (input_index, input_shape) in input_shapes.iter().enumerate() {
-                            let sizes = input_shape.dimensions(&transpose_context, residuals)?;
-                            let mut starts = vec![zero.clone(); sizes.len()];
-                            starts[transpose_axis] = offset.clone();
-                            let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
-                            slice_inputs.push(output_cotangents[0].clone());
-                            slice_inputs.extend(starts);
-                            slice_inputs.extend(sizes.iter().cloned());
-                            cotangents.push(
-                                transpose_context
-                                    .bind(
-                                        DynamicShapeSliceOperation::new(sizes.len()),
-                                        Vec::new(),
-                                        slice_inputs.as_slice(),
-                                    )?
-                                    .remove(0),
-                            );
-                            if input_index + 1 < input_shapes.len() {
-                                let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
-                                let size_type =
-                                    <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
-                                offset = transpose_context
-                                    .bind(
-                                        DimensionOperation::Add(DimensionAddOperation::new(&offset_type, &size_type)?),
-                                        Vec::new(),
-                                        &[offset, sizes[transpose_axis].clone()],
-                                    )?
-                                    .remove(0);
-                            }
-                        }
-                        Ok(cotangents)
-                    },
-                )?
-                .remove(0);
-                MaybeZero::Value(tangent)
-            }
-        };
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+        let mut outputs = context.parent().bind(operation, Vec::new(), lifted_inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![
+            ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(batch_axis))?
+                .with_ragged_axes(ragged_axes)?,
+        ]
+        .into())
     }
 }
 
@@ -663,6 +498,171 @@ impl_differentiable_operation! {
     },
 }
 
+// Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
+// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
+// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
+impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
+where
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
+    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+        + From<ConcatenateOperation<ArrayIrType>>
+        + From<DimensionSizeOperation>
+        + From<DynamicShapeSliceOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
+        let Some((result_extent, array_inputs)) = inputs.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array followed by its result \
+                 extent",
+            ))
+            .into());
+        };
+        if array_inputs.is_empty() {
+            return match result_extent.primal().r#type().as_ref() {
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
+                ))
+                .into()),
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array before its result \
+                     extent",
+                ))
+                .into()),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
+                ))
+                .into()),
+            };
+        }
+
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut primal_outputs = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
+        check_count!("output", primal_outputs, 1, ProgramError);
+        let primal = primal_outputs.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let (result_extent, array_inputs) = inputs.split_last().unwrap();
+        let context = destinations.tangent();
+        let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
+            MaybeZero::Zero(primal.r#type().tangent()?)
+        } else {
+            // Concatenation needs one concrete array tangent per array operand. Materialize only structural zeros;
+            // the trailing result extent remains the unchanged primal shape operand.
+            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+            let mut tangent_inputs = array_inputs
+                .iter()
+                .map(|input| -> Result<C::Value, DifferentiationError> {
+                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                        &projected_context,
+                        input,
+                    )?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input_cotangent_types = array_inputs
+                .iter()
+                .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.cotangent()?))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?;
+            if input_cotangent_types
+                .iter()
+                .flat_map(|r#type| r#type.shape().dimensions())
+                .all(|dimension| matches!(dimension, Dimension::Static(_)))
+            {
+                tangent_inputs.push(result_extent.primal().clone());
+                let mut tangent_outputs = context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
+                check_count!("output", tangent_outputs, 1, ProgramError);
+                MaybeZero::Value(tangent_outputs.remove(0))
+            } else {
+                let mut residuals = LinearResiduals::new();
+                let result_extent_index = residuals.retain(result_extent.primal().clone());
+                let mut input_shapes = Vec::with_capacity(array_inputs.len());
+                for input in array_inputs {
+                    input_shapes.push(residuals.retain_shape(context, input.primal())?);
+                }
+                let forward_operation = self.clone();
+                let transpose_axis = self.axis();
+                let mut tangent_outputs = LinearCallOperation::stage(
+                    context,
+                    residuals.into_values(),
+                    tangent_inputs,
+                    move |residuals, linear_inputs| {
+                        let mut concatenate_inputs = linear_inputs.to_vec();
+                        concatenate_inputs.push(residuals[result_extent_index].clone());
+                        let outputs = linear_inputs[0].dispatch_domain().bind(
+                            forward_operation,
+                            Vec::new(),
+                            concatenate_inputs.as_slice(),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs)
+                    },
+                    move |residuals, output_cotangents| {
+                        let transpose_context = output_cotangents[0].dispatch_domain();
+                        let mut outputs = transpose_context.bind(
+                            DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
+                            Vec::new(),
+                            &[],
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        let zero = outputs.remove(0);
+                        let mut offset = zero.clone();
+                        let mut cotangents = Vec::with_capacity(input_shapes.len());
+                        for (input_index, input_shape) in input_shapes.iter().enumerate() {
+                            let sizes = input_shape.dimensions(&transpose_context, residuals)?;
+                            let mut starts = vec![zero.clone(); sizes.len()];
+                            starts[transpose_axis] = offset.clone();
+                            let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
+                            slice_inputs.push(output_cotangents[0].clone());
+                            slice_inputs.extend(starts);
+                            slice_inputs.extend(sizes.iter().cloned());
+                            let mut outputs = transpose_context.bind(
+                                DynamicShapeSliceOperation::new(sizes.len()),
+                                Vec::new(),
+                                slice_inputs.as_slice(),
+                            )?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            let cotangent = ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?
+                                .unalign_cotangent(&input_cotangent_types[input_index])?;
+                            cotangents.push(cotangent.into_value());
+                            if input_index + 1 < input_shapes.len() {
+                                let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
+                                let size_type =
+                                    <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
+                                let mut outputs = transpose_context.bind(
+                                    DimensionOperation::Add(DimensionAddOperation::new(&offset_type, &size_type)?),
+                                    Vec::new(),
+                                    &[offset, sizes[transpose_axis].clone()],
+                                )?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                offset = outputs.remove(0);
+                            }
+                        }
+                        Ok(cotangents)
+                    },
+                )?;
+                check_count!("output", tangent_outputs, 1, ProgramError);
+                MaybeZero::Value(tangent_outputs.remove(0))
+            }
+        };
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+    }
+}
+
 // Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
 // cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
 // concatenated axis. Fully static operands delegate that slicing to the homogeneous array pullback. Operands with a
@@ -679,7 +679,9 @@ where
         + OperationProjection<ArrayType>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>,
+        + From<DynamicShapeSliceOperation>
+        + From<DynamicBroadcastOperation>,
+    ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>: ElementwiseDerivativeAlignment<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -718,6 +720,14 @@ where
                 ))
                 .into()),
             };
+        }
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
+        if outputs[0].is_zero() {
+            for (input, accumulator) in inputs.iter().zip(accumulators) {
+                accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
+            }
+            return Ok(());
         }
         let axis = self.axis();
         let mut array_types = Vec::with_capacity(array_inputs.len());
@@ -774,31 +784,31 @@ where
                 // Stage the geometry shared by every operand slice once: a zero start, and one extent per
                 // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
                 // read of the live cotangent for a dynamic one. The concatenated axis is filled in per operand below.
-                let zero = context
-                    .stage_nullary_operation(ConstantOperation::new(
-                        DimensionValue::constant(0).map_err(ProgramError::from)?,
-                    ))?
-                    .remove(0);
+                let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                    DimensionValue::constant(0).map_err(ProgramError::from)?,
+                ))?;
+                check_count!("output", outputs, 1, ProgramError);
+                let zero = outputs.remove(0);
                 let mut extents = Vec::with_capacity(rank);
                 for (other_axis, dimension) in cotangent_type.shape().dimensions().iter().enumerate() {
                     extents.push(match dimension {
                         _ if other_axis == axis => None,
-                        Dimension::Static(extent) => Some(
-                            context
-                                .stage_nullary_operation(ConstantOperation::new(
-                                    DimensionValue::constant(*extent).map_err(ProgramError::from)?,
-                                ))?
-                                .remove(0),
-                        ),
-                        Dimension::Dynamic(_) => Some(
-                            context
-                                .stage_operation(
-                                    DimensionSizeOperation::new(&cotangent_type, other_axis)?,
-                                    Vec::new(),
-                                    std::slice::from_ref(cotangent),
-                                )?
-                                .remove(0),
-                        ),
+                        Dimension::Static(extent) => {
+                            let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                                DimensionValue::constant(*extent).map_err(ProgramError::from)?,
+                            ))?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            Some(outputs.remove(0))
+                        }
+                        Dimension::Dynamic(_) => {
+                            let mut outputs = context.stage_operation(
+                                DimensionSizeOperation::new(&cotangent_type, other_axis)?,
+                                Vec::new(),
+                                std::slice::from_ref(cotangent),
+                            )?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            Some(outputs.remove(0))
+                        }
                     });
                 }
 
@@ -813,17 +823,17 @@ where
                     let start = if offset == 0 {
                         zero.clone()
                     } else {
-                        context
-                            .stage_nullary_operation(ConstantOperation::new(
-                                DimensionValue::constant(offset).map_err(ProgramError::from)?,
-                            ))?
-                            .remove(0)
+                        let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                            DimensionValue::constant(offset).map_err(ProgramError::from)?,
+                        ))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        outputs.remove(0)
                     };
-                    let size = context
-                        .stage_nullary_operation(ConstantOperation::new(
-                            DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
-                        ))?
-                        .remove(0);
+                    let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                        DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
+                    ))?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    let size = outputs.remove(0);
                     let mut slice_inputs = Vec::with_capacity(1 + 2 * rank);
                     slice_inputs.push(cotangent.clone());
                     for other_axis in 0..rank {
@@ -838,7 +848,9 @@ where
                         slice_inputs.as_slice(),
                     )?;
                     check_count!("output", slice, 1, ProgramError);
-                    cotangents.push(MaybeZero::Value(slice.into_iter().next().unwrap()));
+                    let cotangent = ValueProjection::<ArrayType>::into_projected(slice.into_iter().next().unwrap())?
+                        .unalign_cotangent(&input_type.cotangent()?)?;
+                    cotangents.push(MaybeZero::Value(cotangent.into_value()));
                     offset += input_axis_size;
                 }
             }
@@ -851,32 +863,70 @@ where
     }
 }
 
-/// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
-/// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of
-/// StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation. `Self::concatenate(inputs,
-/// axis)` preserves the inputs' order and returns an array whose extent along `axis` is the sum of their extents.
-/// There must be at least one input. All inputs must have the same element data type, rank, memory space, and
-/// dimensions other than `axis`. A single input is returned unchanged without inspecting `axis`. For multiple inputs,
-/// the result preserves the common memory space, clears explicit physical layout metadata, and infers sharding,
-/// reduction state, and varying-manual axes independently. A dynamic concatenated dimension remains dynamic. Its type
-/// records the tight exclusive upper bound when every operand is bounded, while the operation's runtime extent is the
-/// exact sum of the operand extents. Equal dynamic descriptors on non-concatenated axes express the runtime requirement
-/// that those extents agree; the backend validates that requirement when executing the operation.
+/// Preserves shared ragged geometry whose values and extent arrays are unaffected by concatenating `axis`.
+fn validate_concatenation_ragged_axes<V: Value>(
+    inputs: &[&[RaggedAxis<V>]],
+    axis: usize,
+) -> Result<Vec<RaggedAxis<V>>, BatchingError> {
+    let first = inputs[0];
+    for ragged_axes in inputs {
+        if ragged_axes
+            .iter()
+            .any(|ragged_axis| ragged_axis.axis() == axis || ragged_axis.extent_axes().contains(&axis))
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an axis indexing its extents"),
+            }.into());
+        }
+        // Matching dimension identities denote the same per-item extents; comparing the runtime array values would
+        // require executing tracers. Their coordinate axes must also agree after batch-axis alignment.
+        // Metadata order is not semantic: match by physical axis and retain the first input's presentation order.
+        if ragged_axes.len() != first.len()
+            || ragged_axes.iter().any(|ragged_axis| {
+                first.iter().find(|candidate| candidate.axis() == ragged_axis.axis()).is_none_or(|candidate| {
+                    candidate.dimension() != ragged_axis.dimension()
+                        || candidate.extent_axes() != ragged_axis.extent_axes()
+                })
+            })
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{CONCATENATE_OPERATION_NAME}` batching requires matching ragged dimensions and extent axes"
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(first.to_vec())
+}
+
+/// Represents the ability to join arrays end to end along one axis. [`Self::concatenate`] preserves input order and
+/// requires the same element data type, rank, memory space, and dimensions other than the concatenated axis. Negative
+/// axes count from the final axis. There must be at least one input; a single input is returned unchanged without
+/// inspecting the axis.
+///
+/// For multiple inputs, the result preserves the common memory space, clears explicit physical layout metadata, and
+/// infers sharding, reduction state, and varying-manual axes independently. The concatenated axis must have static
+/// extents. Use [`DynamicConcatenate`] to supply a first-class result extent when that axis is dynamic. Dynamic
+/// dimensions on other axes must have equal identities; Ryft validates shared identities against concrete extents at
+/// execution boundaries.
+///
+/// These are the strict semantics of StableHLO's
+/// [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation. Use
+/// [`Self::concatenate_with_options`] to flatten inputs or convert their element data types before concatenation.
 ///
 /// # Example
 ///
-/// The following example shows how to use [`Concatenate`] in practice:
+/// The following example joins matrix columns while preserving the order of each row:
 ///
 /// ```rust
-/// # use ryft_core::arrays::Array;
-/// # use ryft_core::operations::manipulation::Concatenate;
-/// # use ryft_core::programs::ProgramError;
+/// # use ryft_core::{Array, ArrayType, Concatenate, DataType, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let left = Array::matrix(2, 1, vec![1.0, 2.0]).unwrap();
-/// let right = Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0]).unwrap();
+/// let left = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1i32, 2])?;
+/// let right = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[3i32, 4, 5, 6])?;
 /// let output = left.concatenate_with([&right], -1)?;
-/// assert_eq!(output.to_f64s(), vec![1.0, 3.0, 4.0, 2.0, 5.0, 6.0]);
+/// assert_eq!(output.elements::<i32>()?, vec![1, 3, 4, 2, 5, 6]);
 /// # Ok(())
 /// # }
 /// ```
@@ -915,6 +965,68 @@ pub trait Concatenate: Sized {
     {
         Self::concatenate(std::iter::once(self).chain(others), axis)
     }
+
+    /// Converts the inputs to a common element data type and optionally flattens them before joining them. Without an
+    /// explicit data type, [`DataType::promoted`] selects the common type. Conversion uses ordinary numeric conversion,
+    /// not bitcasting. The strict [`Self::concatenate`] function never performs this promotion implicitly.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Values to join in order. There must be at least one input.
+    ///   - `axis`: Axis to concatenate, or `None` to flatten each input in logical row-major order and join the resulting
+    ///     vectors. Flattening requires statically known element counts; use explicit dynamic reshaping otherwise.
+    ///   - `data_type`: Requested element data type, or `None` to promote the input types. Explicit conversion can lose
+    ///     precision and follows [`ConvertElementType::convert_element_type`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayType, Concatenate, DataType, ProgramError};
+    /// #
+    /// # fn main() -> Result<(), ProgramError> {
+    /// let matrix = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[1i32, 2])?;
+    /// let scalar = Array::from_elements(ArrayType::scalar(DataType::F32), &[3.5f32])?;
+    /// let output = Array::concatenate_with_options([&matrix, &scalar], None, Some(DataType::F64))?;
+    /// assert_eq!(output.elements::<f64>()?, vec![1.0, 2.0, 3.5]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn concatenate_with_options<'i, I: IntoIterator<Item = &'i Self>>(
+        inputs: I,
+        axis: Option<Axis>,
+        data_type: Option<DataType>,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: 'i + Typed<Type = ArrayType> + ConvertElementType + Reshape,
+    {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        if inputs.is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
+            ))
+            .into());
+        }
+        let data_type = match data_type {
+            Some(data_type) => data_type,
+            None => DataType::promoted(&inputs.iter().map(|input| input.r#type().data_type()).collect::<Vec<_>>())
+                .map_err(|error| TypeError::invalid(error.to_string()))?,
+        };
+        let inputs = inputs
+            .into_iter()
+            .map(|input| {
+                let converted = input.convert_element_type(data_type)?;
+                if axis.is_some() {
+                    Ok(converted)
+                } else {
+                    let element_count = converted.r#type().element_count()?.ok_or_else(|| {
+                        TypeError::invalid("`concatenate` flattening requires a statically known element count")
+                    })?;
+                    converted.reshape(Shape::new(vec![Dimension::Static(element_count)]))
+                }
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Self::concatenate(&inputs, axis.unwrap_or_else(|| Axis::from(0usize)))
+    }
 }
 
 impl Concatenate for ArrayType {
@@ -948,6 +1060,44 @@ impl Concatenate for ArrayType {
     }
 }
 
+impl Concatenate for Array {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
+        let Some(first) = inputs.first() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
+            ))
+            .into());
+        };
+        if inputs.len() == 1 {
+            return Ok((*first).clone());
+        }
+        let operation = ConcatenateOperation::new(axis, first.r#type().rank())?;
+        let axis = operation.axis();
+        let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
+        let output_type = ArrayType::concatenate(input_types.iter().map(|r#type| r#type.as_ref()), axis)?;
+        // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
+        // along `axis` and offset zero on every other axis.
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
+        // below, so this does not require the element data type itself to represent zero.
+        let mut output =
+            Self::new_unchecked(output_type.clone(), Arc::new(vec![0; output_addressing.storage_byte_len()]));
+        let mut offset = 0usize;
+        for input in inputs {
+            let input_axis_size = input.r#type().static_shape().unwrap()[axis];
+            let mut start_indices = vec![0usize; output_type.rank()];
+            start_indices[axis] = offset;
+            output = output.replace_block(input, start_indices.as_slice());
+            offset += input_axis_size;
+        }
+        Ok(output)
+    }
+}
+
 impl<V: Value<Type = ArrayType>> Concatenate for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
@@ -976,6 +1126,107 @@ where
         let operation = ConcatenateOperation::new(axis, rank)?;
         let first = &inputs[0];
         let mut outputs = first.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+/// Represents the ability to concatenate array inputs using an explicit first-class result extent. The array inputs
+/// obey [`Concatenate`]'s element type, rank, memory, and non-concatenated dimension requirements. Their concatenated
+/// extents can be static or dynamic; `result_extent` must equal their exact runtime sum.
+///
+/// The result extent's type describes the concatenated output axis. An exact dimension type yields a static axis;
+/// otherwise its variable and bounds are retained. A bound describes possible runtime sizes, not the size of this
+/// particular result. The operation checks the sum at runtime when its input types do not prove equality. Supplying
+/// an extent explicitly keeps its identity and computation available to staging and differentiation.
+///
+/// # Example
+///
+/// The following example uses concrete mixed values. The same function stages a mixed [`ConcatenateOperation`] when
+/// called with context-carrying mixed tracers:
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DimensionValue, DynamicConcatenate, ProgramError};
+/// #
+/// # fn main() -> Result<(), ProgramError> {
+/// let left = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 2])?);
+/// let right = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [1]), &[3i32])?);
+/// let extent = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+/// let output = ArrayIrValue::dynamic_concatenate(&[left, right], &extent, 0)?;
+/// let expected = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[1i32, 2, 3])?);
+/// assert_eq!(output, expected);
+/// # Ok(())
+/// # }
+/// ```
+pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
+    /// Joins array `inputs` along `axis`, checking that their extents sum to `result_extent`. Unlike the singleton
+    /// convenience in [`Concatenate`], this function validates the axis and result extent even for one input.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: One or more array values, in concatenation order. Dimension and reference values are rejected.
+    ///   - `result_extent`: Dimension value describing the concatenated output axis. Its runtime value must equal the
+    ///     sum of all input sizes on `axis`; its type determines the output dimension's identity and bounds.
+    ///   - `axis`: Axis along which to join the inputs. Negative axes count from the final axis.
+    fn dynamic_concatenate<A: Into<Axis>>(inputs: &[Self], result_extent: &Self, axis: A)
+    -> Result<Self, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicConcatenate for ArrayIrValue<A> {
+    fn dynamic_concatenate<AxisValue: Into<Axis>>(
+        inputs: &[Self],
+        result_extent: &Self,
+        axis: AxisValue,
+    ) -> Result<Self, ProgramError> {
+        if inputs.is_empty() {
+            return Err(TypeError::invalid(match result_extent.r#type().as_ref() {
+                ArrayIrType::Dimension(_) => {
+                    format!("`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",)
+                }
+                _ => format!("`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension"),
+            })
+            .into());
+        }
+        let result_extent = <Self as ValueProjection<DimensionType>>::projected(result_extent)?.extent();
+        let inputs =
+            inputs.iter().map(<Self as ValueProjection<ArrayType>>::projected).collect::<Result<Vec<_>, _>>()?;
+        let axis = ConcatenateOperation::new(axis, inputs[0].r#type().rank())?.axis();
+        // Validate array signatures before reading concrete sizes so malformed inputs report their type error.
+        let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
+        validate_concatenation_inputs(&input_types.iter().map(|r#type| r#type.as_ref()).collect::<Vec<_>>(), axis)?;
+        let actual_extent = inputs.iter().try_fold(0usize, |extent, input| {
+            extent.checked_add(input.dimension_size(axis)?).ok_or_else(|| {
+                ProgramError::from(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` result extent overflows usize"
+                )))
+            })
+        })?;
+        if result_extent != actual_extent {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "`{CONCATENATE_OPERATION_NAME}` result extent must equal the sum of input axis {axis} extents; \
+                     expected {actual_extent} but got {result_extent}",
+                ),
+            });
+        }
+        Ok(Self::Array(A::concatenate(inputs, axis)?))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> DynamicConcatenate for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
+{
+    fn dynamic_concatenate<A: Into<Axis>>(
+        inputs: &[Self],
+        result_extent: &Self,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let mut inputs = inputs.to_vec();
+        inputs.push(result_extent.clone());
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(axis, &input_types)?;
+        let mut outputs = inputs[0].dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1040,7 +1291,10 @@ fn infer_array_ir_concatenation(
             .with_sharding(infer_concatenation_sharding(&inputs)?)
             .map_err(|error| TypeError::invalid(error.to_string()))?
     };
-    Ok((axis, output_type, static_sum.is_none()))
+    // A singleton with the same dimension identity already proves the extent equality, even when it is dynamic.
+    let requires_runtime_assertion =
+        static_sum.is_none() && !(inputs.len() == 1 && first.dimension(axis) == result_extent.to_dimension());
+    Ok((axis, output_type, requires_runtime_assertion))
 }
 
 /// Validates concatenation array inputs and returns their axis sum when every input axis is static. Both call sites
@@ -1186,44 +1440,6 @@ fn merge_concatenation_axis_set(
     }
 }
 
-impl Concatenate for Array {
-    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
-        inputs: I,
-        axis: A,
-    ) -> Result<Self, ProgramError> {
-        let inputs = inputs.into_iter().collect::<Vec<_>>();
-        let Some(first) = inputs.first() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
-            ))
-            .into());
-        };
-        if inputs.len() == 1 {
-            return Ok((*first).clone());
-        }
-        let operation = ConcatenateOperation::new(axis, first.r#type().rank())?;
-        let axis = operation.axis();
-        let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
-        let output_type = ArrayType::concatenate(input_types.iter().map(|r#type| r#type.as_ref()), axis)?;
-        // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
-        // along `axis` and offset zero on every other axis.
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
-        // below, so this does not require the element data type itself to represent zero.
-        let mut output =
-            Self::new_unchecked(output_type.clone(), Arc::new(vec![0; output_addressing.storage_byte_len()]));
-        let mut offset = 0usize;
-        for input in inputs {
-            let input_axis_size = input.r#type().static_shape().unwrap()[axis];
-            let mut start_indices = vec![0usize; output_type.rank()];
-            start_indices[axis] = offset;
-            output = output.replace_block(input, start_indices.as_slice());
-            offset += input_axis_size;
-        }
-        Ok(output)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1232,7 +1448,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1240,13 +1456,85 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::constants::iota::IotaOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{
+        EffectClass, EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed,
+    };
 
     use super::*;
 
+    /// Builds a concatenation whose result size is the sum of two first-class input dimensions.
+    fn dynamic_concatenate_program()
+    -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
+        let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(6)).unwrap());
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(left_variable.clone())]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(right_variable.clone())]));
+        let left_size_operation = DimensionSizeOperation::new(&left_type, 0).unwrap();
+        let right_size_operation = DimensionSizeOperation::new(&right_type, 0).unwrap();
+        let left_size_type = left_size_operation.result_type().clone();
+        let right_size_type = right_size_operation.result_type().clone();
+        let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
+        let result_extent_type =
+            DimensionType::new(DimensionVariable::new(add_operation.result_name(), add_operation.result_bounds()));
+        let dynamic_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_extent_type.into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left_input = builder.add_input(left_type.into());
+        let right_input = builder.add_input(right_type.into());
+        let left_size = builder.add_instruction(left_size_operation, Vec::new(), vec![left_input], None).unwrap()[0];
+        let right_size = builder.add_instruction(right_size_operation, Vec::new(), vec![right_input], None).unwrap()[0];
+        let result_extent = builder
+            .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_size, right_size], None)
+            .unwrap()[0];
+        let concatenated = builder
+            .add_instruction(dynamic_operation, Vec::new(), vec![left_input, right_input, result_extent], None)
+            .unwrap()[0];
+        builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![concatenated],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap()
+    }
+
     #[test]
-    fn test_explicit_concatenate_operation() {
+    fn test_concatenate() {
+        let operation = ConcatenateOperation::new(0, 2).unwrap();
+        // Operation identity and accessors.
+        assert_eq!(operation.name(), CONCATENATE_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "concatenate [axis=0]");
+        assert_eq!(operation.axis(), 0);
+
+        let first_type = ArrayType::new_static(DataType::F64, [1, 2]);
+        let second_type = ArrayType::new_static(DataType::F64, [3, 2]);
+        // Program rendering uses the canonical operation name and includes the captured axis.
+        let mut builder = ProgramBuilder::<Array, ConcatenateOperation<ArrayType>>::new();
+        let program_first = builder.add_input(first_type);
+        let program_second = builder.add_input(second_type);
+        let program_output =
+            builder.add_instruction(operation, Vec::new(), vec![program_first, program_second], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[1, 2], %1:f64[3, 2] .
+                let %2:f64[4, 2] = concatenate [axis=0] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_concatenate_operation_from_input_types() {
         let operation = ConcatenateOperation::new(-2, 2).unwrap();
         let mixed_operation = ConcatenateOperation::<ArrayIrType>::from(operation.clone());
         assert_eq!(operation.axis(), 0);
@@ -1412,26 +1700,21 @@ mod tests {
     }
 
     #[test]
-    fn test_concatenate() {
-        #[derive(Debug, PartialEq)]
-        struct NonCloneArray(Vec<i32>);
-
-        impl Concatenate for NonCloneArray {
-            fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
-                inputs: I,
-                _axis: A,
-            ) -> Result<Self, ProgramError> {
-                Ok(Self(inputs.into_iter().flat_map(|input| input.0.iter().copied()).collect()))
-            }
-        }
-
+    fn test_concatenate_type_inference() {
+        assert_eq!(
+            ConcatenateOperation::new(1, 2)
+                .unwrap()
+                .infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[],),
+            Err(TypeError::invalid("`concatenate` axis 1 is out of bounds for inputs of rank 1")),
+        );
+        assert_eq!(
+            ConcatenateOperation::new(0, 1).unwrap().infer_output_types(
+                &[ArrayType::new_static(DataType::F32, [2])],
+                &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
         let operation = ConcatenateOperation::new(0, 2).unwrap();
-
-        // Operation identity and accessors.
-        assert_eq!(operation.name(), CONCATENATE_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "concatenate [axis=0]");
-        assert_eq!(operation.axis(), 0);
-
         // Type inference sums static concatenated axes, preserves matching non-concatenated axes, and reports exact
         // validation errors. Until the mixed signature lands, a dynamic result extent cannot be represented without
         // manufacturing an unstable identity, so it requires an explicit result-dimension operand.
@@ -1540,254 +1823,70 @@ mod tests {
             ConcatenateOperation::new(2, 2),
             Err(TypeError::invalid("`concatenate` axis 2 is out of bounds for operands of rank 2".to_string())),
         );
+    }
 
-        // Interpretation joins the row-major payloads along axis 0, while the sole-input fast path returns its input
-        // without inspecting the axis.
-        let first = Array::matrix(1, 2, vec![1.0, 2.0]).unwrap();
-        let second = Array::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
-        let output = operation
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first.clone(), second.clone()])
-            .unwrap();
-        assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(Array::concatenate([&first, &second], -2), Ok(output[0].clone()));
-        assert_eq!(first.concatenate_with([&second], -2), Ok(output[0].clone()));
-        assert_eq!(Array::concatenate([&first], 2), Ok(first.clone()));
-        assert_eq!(
-            NonCloneArray(vec![1]).concatenate_with([&NonCloneArray(vec![2, 3])], 0),
-            Ok(NonCloneArray(vec![1, 2, 3])),
-        );
-
-        // Program rendering uses the canonical operation name and includes the captured axis.
-        let mut builder = ProgramBuilder::<Array, ConcatenateOperation<ArrayType>>::new();
-        let program_first = builder.add_input(first_type);
-        let program_second = builder.add_input(second_type);
-        let program_output =
-            builder.add_instruction(operation, Vec::new(), vec![program_first, program_second], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[1, 2], %1:f64[3, 2] .
-                let %2:f64[4, 2] = concatenate [axis=0] %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-
-        // Check standard partial evaluation with known and residual operands.
-        let first = Array::vector(vec![1.0, 2.0]).unwrap();
-        let second = Array::vector(vec![3.0, 4.0, 5.0]).unwrap();
-        let expected = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        check_operation_partial_evaluation!(
-            backend = (Array, ArrayOperation<Array>),
-            operation = ConcatenateOperation::new(0, 1).unwrap(),
-            cases = [
-                {
-                    inputs = [(@known, first.clone()), (@known, second.clone())],
-                    outputs = [(@known, expected.clone())],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
-                        (@known, second.clone()),
-                    ],
-                    outputs = [(@residual, expected.clone())],
-                    residual_instructions = 1,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
-                        (@unknown(type = second.r#type().into_owned(), replay = second.clone())),
-                    ],
-                    outputs = [(@residual, expected)],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-
-        // Batching aligns mapped and replicated operands before lifting the concatenation axis.
-        check_operation_batching!(
-            @exact,
-            operation = ConcatenateOperation::new(0, 1).unwrap(),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]).unwrap()),
-                    ],
-                    outputs = [(@mapped(axis = 0), Array::matrix(
-                        2,
-                        4,
-                        vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0],
-                    ).unwrap())],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
-                        (@replicated, Array::vector(vec![8.0, 9.0]).unwrap()),
-                    ],
-                    outputs = [(@mapped(axis = 0), Array::matrix(
-                        2,
-                        4,
-                        vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0],
-                    ).unwrap())],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0]).unwrap()),
-                        (@replicated, Array::vector(vec![3.0]).unwrap()),
-                    ],
-                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
-                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 6.0]).unwrap()),
-                    ],
-                    outputs = [(@mapped(axis = 0), Array::matrix(
-                        2,
-                        3,
-                        vec![0.0, 1.0, 4.0, 2.0, 3.0, 6.0],
-                    ).unwrap())],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]).unwrap()),
-                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 5.0]).unwrap()),
-                    ],
-                    outputs = [(@mapped(axis = 1), Array::matrix(
-                        3,
-                        2,
-                        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-                    ).unwrap())],
-                },
-            ],
-        );
-
-        // Concatenate is linear in each operand: the JVP concatenates tangents and the pullback splits cotangents.
-        check_operation_differentiation!(
-            @approx(step = 0.125, epsilon = 1e-9),
-            operation = ConcatenateOperation::new(0, 1).unwrap(),
-            cases = [{
-                primals = [Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap()],
-                tangents = [Array::vector(vec![0.5, 1.0]).unwrap(), Array::vector(vec![1.5, 2.0, 2.5]).unwrap()],
-                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
-                tangent_outputs = [Array::vector(vec![0.5, 1.0, 1.5, 2.0, 2.5]).unwrap()],
-                jvp = indoc! {"
-                    lambda %0:f64[2], %1:f64[3], %2:f64[2], %3:f64[3] .
-                    let %4:f64[5] = concatenate [axis=0] %0 %1
-                        %5:f64[5] = concatenate [axis=0] %2 %3
-                    in (%4, %5)
-                "},
-            }],
-        );
-
-        let layout = Layout::Strided(StridedLayout::new(vec![8]));
-        let placed_left_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
-            .with_layout(layout.clone())
-            .with_memory(Memory::Host { pinned: true });
-        let placed_right_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
-            .with_layout(layout)
-            .with_memory(Memory::Host { pinned: true });
-        let placed_output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![5.into()])).with_memory(Memory::Host { pinned: true });
-        check_operation_transposition!(
-            @exact,
-            operation = ConcatenateOperation::new(0, 1).unwrap(),
-            cases = [
-                {
-                    inputs = [
-                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
-                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
-                    ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
-                    input_cotangents = [Array::vector(vec![1.0, 2.0]).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap()],
-                    pullback = indoc! {"
-                        lambda %0:f64[5] .
-                        let %1:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
-                            %2:f64[3] = slice [start_indices=[2], limit_indices=[5]] %0
-                        in (%1, %2)
-                    "},
-                },
-                {
-                    inputs = [
-                        (@linear(type = placed_left_type.clone())),
-                        (@linear(type = placed_right_type.clone())),
-                    ],
-                    output_cotangents = [Array::from_elements::<f64>(
-                        placed_output_type,
-                        &[1.0, 2.0, 3.0, 4.0, 5.0],
-                    ).unwrap()],
-                    input_cotangents = [
-                        Array::from_elements::<f64>(placed_left_type, &[1.0, 2.0]).unwrap(),
-                        Array::from_elements::<f64>(placed_right_type, &[3.0, 4.0, 5.0]).unwrap(),
-                    ],
-                },
-                {
-                    inputs = [
-                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
-                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
-                    ],
-                    output_cotangents = [Array::vector(vec![1.0, 2.0]).unwrap()],
-                    input_cotangents = [
-                        Array::from_elements::<f64>(
-                            ArrayType::new(DataType::F64, Shape::new(vec![0.into()])),
-                            &[],
-                        ).unwrap(),
-                        Array::vector(vec![1.0, 2.0]).unwrap(),
-                    ],
-                },
-            ],
-        );
-
-        check_operation_transposition!(
-            @exact,
-            operation = ConcatenateOperation::new(1, 2).unwrap(),
-            cases = [{
-                inputs = [
-                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into()])))),
-                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into()])))),
-                ],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
-                input_cotangents = [
-                    Array::matrix(2, 1, vec![1.0, 4.0]).unwrap(),
-                    Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
-                ],
-            }],
-        );
-
-        // A dynamic non-concatenated axis cannot be expressed by this homogeneous rule, whose `slice` bounds are
-        // static payload values, so transposition rejects the case instead of consulting hidden input-shape metadata.
-        // The composite rule does not inherit that rejection: it delegates here only for fully static operands and
-        // otherwise stages a `dynamic_shape_slice` whose extents it reads off the live output cotangent, which is
-        // pinned by `test_array_ir_concatenate_transpose_slices_a_dynamic_non_concatenated_extent` in
-        // `arrays::operations`.
-        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
-        let left_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
-        let right_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(columns)]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(left_type);
-        let right = builder.add_input(right_type);
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_array_ir_concatenate_identity_instantiation() {
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(12)).unwrap());
+        let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let fixed_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let result_extent_type = DimensionType::new(result.clone());
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[source_array_type.clone().into(), fixed_array_type.clone().into(), result_extent_type.clone().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source_array = builder.add_input(source_array_type.into());
+        let fixed_array = builder.add_input(fixed_array_type.clone().into());
+        let result_extent = builder.add_input(result_extent_type.into());
         let output = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
+            .add_instruction(operation, Vec::new(), vec![source_array, fixed_array, result_extent], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1], &[]),
-            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(
-                TypeError::Invalid { message },
-            ))) if message
-                == "`concatenate` transpose requires a static size on axis 1 but operand 0 has size columns",
-        ));
+
+        let target = DimensionVariable::new("target", bounds);
+        let target_result = DimensionVariable::new("target_result", DimensionBounds::new(2, Some(12)).unwrap());
+        let target_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
+        let target_result_type = DimensionType::new(target_result.clone());
+        let instantiated = program
+            .with_instantiated_type_identities(&[
+                target_array_type.clone().into(),
+                fixed_array_type.clone().into(),
+                target_result_type.clone().into(),
+            ])
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            instantiated.output_types(),
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_result.clone())])).into()],
+        );
+
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let imported_source = destination.add_input(target_array_type.into());
+        let imported_fixed = destination.add_input(fixed_array_type.into());
+        let imported_extent = destination.add_input(target_result_type.into());
+        let imported_outputs = destination
+            .splice_program(&instantiated, &[imported_source, imported_fixed, imported_extent])
+            .unwrap();
+        let [instruction] = destination.instructions() else {
+            panic!("expected the imported concatenate instruction");
+        };
+        assert_eq!(instruction.inputs(), &[imported_source, imported_fixed, imported_extent]);
+        assert_eq!(instruction.outputs(), imported_outputs.as_slice());
+        assert_eq!(
+            destination.atoms()[imported_outputs[0].index()].r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_result)]),)),
+        );
     }
 
     #[test]
@@ -1839,8 +1938,9 @@ mod tests {
             ] {
                 assert!(matches!(
                     operation.infer_output_types(&operands, &[]),
-                    Err(TypeError::Invalid { message }) if message.starts_with(
-                        "`concatenate` operands must be sharded identically, but got ",
+                    Err(TypeError::Invalid { message }) if message == format!(
+                        "`concatenate` operands must be sharded identically, but got {} and {}",
+                        operands[0].sharding().unwrap(), operands[1].sharding().unwrap(),
                     )
                 ));
             }
@@ -1933,9 +2033,8 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError::Invalid { message }) if message.starts_with(
-                "`concatenate` cannot make operand varying over axes",
-            )
+            Err(TypeError::Invalid { message }) if message ==
+                "`concatenate` cannot make operand varying over axes {\"m\"} while it is reduced or unreduced over any of those axes"
         ));
 
         // Batching preserves explicit and manual placement on the mapped physical axis while concatenating each
@@ -1980,7 +2079,316 @@ mod tests {
     }
 
     #[test]
+    fn test_concatenate_interpretation() {
+        #[derive(Debug, PartialEq)]
+        struct NonCloneArray(Vec<i32>);
+
+        impl Concatenate for NonCloneArray {
+            fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+                inputs: I,
+                _axis: A,
+            ) -> Result<Self, ProgramError> {
+                Ok(Self(inputs.into_iter().flat_map(|input| input.0.iter().copied()).collect()))
+            }
+        }
+
+        let operation = ConcatenateOperation::new(0, 2).unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [4, 2]);
+        // Interpretation joins the row-major payloads along axis 0, while the sole-input fast path returns its input
+        // without inspecting the axis.
+        let first = Array::from_elements(ArrayType::new_static(DataType::F64, [1, 2]), &[1_f64, 2.]).unwrap();
+        let second =
+            Array::from_elements(ArrayType::new_static(DataType::F64, [3, 2]), &[3_f64, 4., 5., 6., 7., 8.]).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(*output[0].r#type(), output_type);
+        assert_eq!(output[0].elements::<f64>(), Ok(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        assert_eq!(Array::concatenate([&first, &second], -2), Ok(output[0].clone()));
+        assert_eq!(first.concatenate_with([&second], -2), Ok(output[0].clone()));
+        assert_eq!(Array::concatenate([&first], 2), Ok(first.clone()));
+        assert_eq!(
+            NonCloneArray(vec![1]).concatenate_with([&NonCloneArray(vec![2, 3])], 0),
+            Ok(NonCloneArray(vec![1, 2, 3])),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_interpretation() {
+        let left = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap(),
+        );
+        let right = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap(),
+        );
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[1.0_f32, 2.0, 3.0]).unwrap(),
+        );
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
+        )
+        .unwrap();
+
+        // Eager execution consumes the explicit extent without copying either array during member projection.
+        assert_eq!(
+            context.bind(operation.clone(), Vec::new(), &[left.clone(), right.clone(), extent.clone()],),
+            Ok(vec![output.clone()]),
+        );
+        assert_eq!(
+            context.bind(
+                operation.clone(),
+                Vec::new(),
+                &[left.clone(), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),],
+            ),
+            Ok(vec![left.clone()]),
+        );
+
+        let observed_extent_type =
+            DimensionType::new(DimensionVariable::new("observed", DimensionBounds::new(1, Some(9)).unwrap()));
+        let checked_operation = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap());
+        assert_eq!(
+            ArrayIrOperation::<Array>::from(checked_operation).interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    left.clone(),
+                    right.clone(),
+                    ArrayIrValue::Dimension(DimensionValue::new(observed_extent_type, 4).unwrap()),
+                ],
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "`{}` result extent must equal the sum of input axis 0 extents; expected 3 but got 4",
+                    CONCATENATE_OPERATION_NAME,
+                ),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_dynamic_extent() {
+        let left = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap(),
+        );
+        let right = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap(),
+        );
+        let output = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[1.0_f32, 2.0, 3.0]).unwrap(),
+        );
+        let program = dynamic_concatenate_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[left], %1:f32[right] .
+                let %2:dimension<left ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<right ∈ [1, 6)> = dimension_size [axis=0] %1
+                    %4:dimension<left + right ∈ [2, 10)> = dimension_add %2 %3
+                    %5:f32[left + right] = concatenate [axis=0, requires_runtime_assertion=true] %0 %1 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.interpret(vec![left, right]), Ok(vec![output.clone()]));
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_partial_evaluation() {
+        let left = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap(),
+        );
+        let right = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap(),
+        );
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let output = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[1.0_f32, 2.0, 3.0]).unwrap(),
+        );
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
+        )
+        .unwrap();
+
+        // Partial evaluation folds a fully known concatenate and otherwise retains exactly one operation with the
+        // explicit extent edge, including when only that extent is unknown.
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = operation.clone(),
+            cases = [
+                {
+                    inputs = [(@known, left.clone()), (@known, right.clone()), (@known, extent.clone())],
+                    outputs = [(@known, output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = left.r#type().into_owned(), replay = left.clone())),
+                        (@known, right.clone()),
+                        (@known, extent.clone()),
+                    ],
+                    outputs = [(@residual, output.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, left.clone()),
+                        (@known, right.clone()),
+                        (@unknown(type = extent.r#type().into_owned(), replay = extent.clone())),
+                    ],
+                    outputs = [(@residual, output.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_concatenate_partial_evaluation() {
+        // Check standard partial evaluation with known and residual operands.
+        let first = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap();
+        let second = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[3.0, 4.0, 5.0]).unwrap();
+        let expected =
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [5]), &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ConcatenateOperation::new(0, 1).unwrap(),
+            cases = [
+                {
+                    inputs = [(@known, first.clone()), (@known, second.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
+                        (@known, second.clone()),
+                    ],
+                    outputs = [(@residual, expected.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
+                        (@unknown(type = second.r#type().into_owned(), replay = second.clone())),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_concatenate_batching() {
+        // Batching aligns mapped and replicated operands before lifting the concatenation axis.
+        check_operation_batching!(
+            @exact,
+            operation = ConcatenateOperation::new(0, 1).unwrap(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[4.0, 5.0, 6.0, 7.0]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 4]), &[0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@replicated, Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[8.0, 9.0]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 4]), &[0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap()),
+                        (@replicated, Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[3.0]).unwrap()),
+                    ],
+                    outputs = [(@replicated, Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[1.0, 2.0, 3.0]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 1), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1, 2]), &[4.0, 6.0]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 3]), &[0.0, 1.0, 4.0, 2.0, 3.0, 6.0]).unwrap())],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 1), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[0.0, 1.0, 2.0, 3.0]).unwrap()),
+                        (@mapped(axis = 1), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1, 2]), &[4.0, 5.0]).unwrap()),
+                    ],
+                    outputs = [(@mapped(axis = 1), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3, 2]), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap())],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_batching_dynamic_extent() {
+        let program = dynamic_concatenate_program();
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("items".to_string())
+        .with_axis_sharding(ShardingDimension::Unconstrained);
+        let batched_outputs = program
+            .interpret_in_context(
+                &batching_context,
+                vec![
+                    BatchingTracer::new(
+                        batching_context.clone(),
+                        ArrayIrBatch::new(
+                            ArrayIrValue::Array(
+                                Array::from_elements::<f32>(
+                                    ArrayType::new_static(DataType::F32, [2, 2]),
+                                    &[1.0_f32, 2.0, 4.0, 5.0],
+                                )
+                                .unwrap(),
+                            ),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                    ),
+                    BatchingTracer::new(
+                        batching_context.clone(),
+                        ArrayIrBatch::new(
+                            ArrayIrValue::Array(
+                                Array::from_elements::<f32>(
+                                    ArrayType::new_static(DataType::F32, [2, 1]),
+                                    &[3.0_f32, 6.0],
+                                )
+                                .unwrap(),
+                            ),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(batched_outputs.len(), 1);
+        assert_eq!(batched_outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            batched_outputs[0].batch().value(),
+            &ArrayIrValue::Array(
+                Array::from_elements::<f32>(
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                    &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                )
+                .unwrap()
+            ),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_batching() {
         // Concatenate aligns mapped array operands onto a common packed batch axis before shifting the per-item
         // concatenation axis around it, and a replicated operand is broadcast across the batch. The trailing result
         // extent remains a replicated shape value.
@@ -2007,12 +2415,24 @@ mod tests {
                     &RecursiveBatchingDriver::new(&EmptyRegionDriver),
                     &[
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]).unwrap()),
+                            ArrayIrValue::Array(
+                                Array::from_elements::<f32>(
+                                    ArrayType::new_static(DataType::F32, [2, 2]),
+                                    &[1.0_f32, 3.0, 2.0, 4.0]
+                                )
+                                .unwrap()
+                            ),
                             BatchAxis::new(1),
                         )
                         .unwrap(),
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 1, vec![5.0_f32, 6.0]).unwrap()),
+                            ArrayIrValue::Array(
+                                Array::from_elements::<f32>(
+                                    ArrayType::new_static(DataType::F32, [2, 1]),
+                                    &[5.0_f32, 6.0]
+                                )
+                                .unwrap()
+                            ),
                             BatchAxis::new(0)
                         )
                         .unwrap(),
@@ -2024,7 +2444,13 @@ mod tests {
                 .0,
             vec![
                 ArrayIrBatch::new(
-                    ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0]).unwrap()),
+                    ArrayIrValue::Array(
+                        Array::from_elements::<f32>(
+                            ArrayType::new_static(DataType::F32, [3, 2]),
+                            &[1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0]
+                        )
+                        .unwrap()
+                    ),
                     BatchAxis::new(1),
                 )
                 .unwrap()
@@ -2037,11 +2463,19 @@ mod tests {
                     &RecursiveBatchingDriver::new(&EmptyRegionDriver),
                     &[
                         ArrayIrBatch::new(
-                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()),
+                            ArrayIrValue::Array(
+                                Array::from_elements::<f32>(
+                                    ArrayType::new_static(DataType::F32, [2, 2]),
+                                    &[1.0_f32, 2.0, 3.0, 4.0]
+                                )
+                                .unwrap()
+                            ),
                             BatchAxis::new(0),
                         )
                         .unwrap(),
-                        ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![5.0_f32]).unwrap())),
+                        ArrayIrBatch::replicated(ArrayIrValue::Array(
+                            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[5.0_f32]).unwrap()
+                        )),
                         ArrayIrBatch::replicated(extent),
                     ],
                 )
@@ -2050,7 +2484,13 @@ mod tests {
                 .0,
             vec![
                 ArrayIrBatch::new(
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0]).unwrap()),
+                    ArrayIrValue::Array(
+                        Array::from_elements::<f32>(
+                            ArrayType::new_static(DataType::F32, [2, 3]),
+                            &[1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0]
+                        )
+                        .unwrap()
+                    ),
                     BatchAxis::new(0),
                 )
                 .unwrap()
@@ -2100,6 +2540,760 @@ mod tests {
             .trim_end(),
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_concatenate_batching_preserves_ragged_dimensions() {
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
+        let values =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1, 3]), &[1_f32, 0., 0., 2., 3., 4.])
+                .unwrap();
+        let ragged = RaggedAxis::new(2, extents.clone(), size.clone(), vec![0]);
+        let input = ArrayBatch::new(values.clone(), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![ragged.clone()])
+            .unwrap();
+        let output = ConcatenateOperation::new(0, 2)
+            .unwrap()
+            .batch(&context, &EmptyRegionDriver, &[input.clone(), input.clone()])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.ragged_axes(), &[ragged]);
+        assert_eq!(
+            output.value(),
+            &Array::from_elements(
+                ArrayType::new_static(DataType::F32, [2, 2, 3]),
+                &[1_f32, 0., 0., 1., 0., 0., 2., 3., 4., 2., 3., 4.],
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            ConcatenateOperation::new(1, 2).unwrap().batch(&context, &EmptyRegionDriver, &[input.clone(), input]),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`concatenate` batching cannot concatenate a ragged axis or an axis indexing its extents",
+        ));
+
+        // The mixed operation preserves the same metadata while treating its result extent as a shape input.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let ragged = RaggedAxis::new(2, ArrayIrValue::Array(extents), size, vec![0]);
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(values), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![ragged.clone()])
+            .unwrap();
+        let extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let operation = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 2).unwrap());
+        let output = operation
+            .batch(&context, &EmptyRegionDriver, &[input.clone(), input, extent])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.ragged_axes(), &[ragged]);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+    }
+
+    #[test]
+    fn test_concatenate_differentiation() {
+        // Concatenate is linear in each operand: the JVP concatenates tangents and the pullback splits cotangents.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = ConcatenateOperation::new(0, 1).unwrap(),
+            cases = [{
+                primals = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap(), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[3.0, 4.0, 5.0]).unwrap()],
+                tangents = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[0.5, 1.0]).unwrap(), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[1.5, 2.0, 2.5]).unwrap()],
+                primal_outputs = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [5]), &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                tangent_outputs = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [5]), &[0.5, 1.0, 1.5, 2.0, 2.5]).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[2], %1:f64[3], %2:f64[2], %3:f64[3] .
+                    let %4:f64[5] = concatenate [axis=0] %0 %1
+                        %5:f64[5] = concatenate [axis=0] %2 %3
+                    in (%4, %5)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_differentiation_dynamic_extent() {
+        let program = dynamic_concatenate_program();
+        let output = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[1.0_f32, 2.0, 3.0]).unwrap(),
+        );
+        // The same stored dynamic program composes dimension arithmetic with both forward differentiation and
+        // batching. Its tangent retains the result extent and both operand extents as ordinary residual SSA edges.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types().len(), 4);
+        let transformed_result_extent = jvp
+            .instructions()
+            .iter()
+            .find_map(|instruction| {
+                matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Add(_)),)
+                    .then_some(instruction.outputs()[0])
+            })
+            .unwrap();
+        assert_eq!(
+            jvp.instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.operation() {
+                    ArrayIrOperation::Concatenate(_) => instruction.inputs().last().copied(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![transformed_result_extent],
+        );
+        let tangent_call = jvp
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
+            .unwrap();
+        assert_eq!(tangent_call.inputs()[0], transformed_result_extent);
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[4.0_f32, 5.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[6.0_f32]).unwrap()
+                ),
+            ]),
+            Ok(vec![
+                output,
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[4.0_f32, 5.0, 6.0])
+                        .unwrap()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_linearization() {
+        let program = dynamic_concatenate_program();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 3);
+        assert_eq!(
+            linearization
+                .tangent()
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
+                .count(),
+            1
+        );
+        // The pullback retains the slicing inside its linear-call region, rather than inlining it at the entry.
+        assert_eq!(
+            linearization
+                .pullback()
+                .unwrap()
+                .entry_region_ref()
+                .instructions_in_closure()
+                .filter(|(_, instruction)| matches!(instruction.operation(), ArrayIrOperation::DynamicShapeSlice(_)))
+                .count(),
+            2
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[3.0_f32]).unwrap(),
+                ),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3]), &[7.0_f32, 8.0, 9.0]).unwrap(),
+        )];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[7.0_f32, 8.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1]), &[9.0_f32]).unwrap()
+                ),
+            ]),
+        );
+    }
+
+    /// Driver-side coverage for the widened differential representation at a dynamic shape. The `f32` tangent of an
+    /// `f8e8m0fnu[n]` operand has no live value of its own type anywhere, so the mixed JVP rule reads the extent `n`
+    /// from the operand's own primal and stages the mixed dynamic zero rather than an unconstructible nullary one.
+    #[test]
+    fn test_array_ir_concatenate_differentiation_materializes_a_widened_dynamic_zero_tangent() {
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.clone())]));
+        let widened_type = narrow_type.tangent().unwrap();
+        assert_eq!(widened_type.data_type(), DataType::F32);
+
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first_primal = context.input(narrow_type.clone().into());
+        let second_primal = context.input(narrow_type.clone().into());
+        let live_tangent = context.input(widened_type.clone().into());
+        let result_extent = context.input(DimensionType::new(n).into());
+
+        // The first operand carries a live tangent so the rule does not short-circuit, while the second carries a
+        // structural zero whose type names the runtime extent `n` but pins nothing.
+        let inputs = vec![
+            DifferentiationDual::new(first_primal, MaybeZero::Value(live_tangent)).unwrap(),
+            DifferentiationDual::new(second_primal, MaybeZero::Zero(widened_type.clone().into())).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(result_extent).unwrap(),
+        ];
+        let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, inputs.as_slice())
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayIrType::Array(widened_type));
+
+        // The staged extent read and the mixed dynamic zero both target the second operand's own primal.
+        let builder = context.builder().borrow();
+        let size = builder
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)))
+            .expect("expected one staged extent read");
+        let zero = builder
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
+            .expect("expected one staged mixed dynamic zero");
+        assert_eq!(zero.inputs(), size.outputs());
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_differentiation_disconnected_input_tangent_uses_a_primal_exemplar() {
+        let left = DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(5)).unwrap());
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(left.clone())]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let left_extent_type = DimensionType::new(left);
+        let result_type = DimensionType::new(result);
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_type.clone().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left_extent = builder.add_input(left_extent_type.clone().into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_input(result_type.clone().into());
+        let left = builder
+            .add_instruction(
+                ArrayIrOperation::<Array>::from(IotaOperation::new(left_type, 0).unwrap()),
+                Vec::new(),
+                vec![left_extent],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(left_extent_type, 2).unwrap()),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[30.0_f64]).unwrap()
+                ),
+                ArrayIrValue::Dimension(DimensionValue::new(result_type, 3).unwrap()),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[1.0_f64]).unwrap()
+                ),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[0.0_f64, 1.0, 30.0])
+                        .unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[0.0_f64, 0.0, 1.0])
+                        .unwrap()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_differentiation() {
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().into_owned().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_constant(ArrayIrValue::Dimension(extent_value));
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert_eq!(
+            program.jvp().unwrap().interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0_f64, 2.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[3.0_f64]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[4.0_f64, 5.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[6.0_f64]).unwrap()
+                ),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[1.0_f64, 2.0, 3.0])
+                        .unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[4.0_f64, 5.0, 6.0])
+                        .unwrap()
+                ),
+            ]),
+        );
+        assert_eq!(
+            program.transpose_with_respect_to(&[0, 1], &[]).unwrap().interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[7.0_f64, 8.0, 9.0]).unwrap()
+            )]),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[7.0_f64, 8.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[9.0_f64]).unwrap()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_differentiation_restores_dynamic_input_layouts() {
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()])).with_layout(layout.clone());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first = builder.add_input(input_type.clone().into());
+        let second = builder.add_input(input_type.clone().into());
+        let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()));
+        let output = builder
+            .add_instruction(
+                ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 2).unwrap()),
+                Vec::new(),
+                vec![first, second, extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(input_type.clone()); 2]);
+        assert_eq!(
+            program.linearize().unwrap().pullback().unwrap().output_types(),
+            vec![ArrayIrType::Array(input_type); 2]
+        );
+        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout);
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [4, 2]),
+                    &[1_f32, 2., 3., 4., 5., 6., 7., 8.],
+                )
+                .unwrap()
+            )]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::from_elements(concrete_type.clone(), &[1_f32, 2., 3., 4.]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements(concrete_type, &[5_f32, 6., 7., 8.]).unwrap()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_differentiation_restores_dynamic_input_shardings() {
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2);
+        let sharded_type = input_type.clone().with_sharding(sharding.clone()).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first = builder.add_input(input_type.clone().into());
+        let second = builder.add_input(sharded_type.clone().into());
+        let extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()));
+        let output = builder
+            .add_instruction(
+                ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 2).unwrap()),
+                Vec::new(),
+                vec![first, second, extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let expected_types = vec![ArrayIrType::Array(input_type), ArrayIrType::Array(sharded_type)];
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(pullback.output_types(), expected_types);
+        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let first = ArrayIrValue::Array(Array::from_elements(concrete_type.clone(), &[1_f32, 2., 3., 4.]).unwrap());
+        let second = ArrayIrValue::Array(
+            Array::from_elements(concrete_type.with_sharding(sharding.clone()).unwrap(), &[5_f32, 6., 7., 8.]).unwrap(),
+        );
+        let cotangent = ArrayIrValue::Array(
+            Array::from_elements(
+                ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap(),
+                &[1_f32, 2., 3., 4., 5., 6., 7., 8.],
+            )
+            .unwrap(),
+        );
+        // The output carries the second input's placement, but the first cotangent must recover absent sharding.
+        assert_eq!(pullback.interpret(vec![cotangent.clone()]), Ok(vec![first.clone(), second.clone()]));
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.output_types(), expected_types);
+        let mut outputs = linearization.primal().interpret(vec![first.clone(), second.clone()]).unwrap();
+        let residuals = outputs.split_off(1);
+        let mut inputs = vec![cotangent];
+        inputs.extend(residuals);
+        assert_eq!(pullback.interpret(inputs), Ok(vec![first, second]));
+    }
+
+    #[test]
+    fn test_concatenate_transposition() {
+        let layout = Layout::Strided(StridedLayout::new(vec![8]));
+        let placed_left_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
+            .with_layout(layout.clone())
+            .with_memory(Memory::Host { pinned: true });
+        let placed_right_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
+            .with_layout(layout)
+            .with_memory(Memory::Host { pinned: true });
+        let placed_output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![5.into()])).with_memory(Memory::Host { pinned: true });
+        check_operation_transposition!(
+            @exact,
+            operation = ConcatenateOperation::new(0, 1).unwrap(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [5]), &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                    input_cotangents = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap(), Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[3.0, 4.0, 5.0]).unwrap()],
+                    pullback = indoc! {"
+                        lambda %0:f64[5] .
+                        let %1:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
+                            %2:f64[3] = slice [start_indices=[2], limit_indices=[5]] %0
+                        in (%1, %2)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = placed_left_type.clone())),
+                        (@linear(type = placed_right_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(
+                        placed_output_type,
+                        &[1.0, 2.0, 3.0, 4.0, 5.0],
+                    ).unwrap()],
+                    input_cotangents = [
+                        Array::from_elements::<f64>(placed_left_type, &[1.0, 2.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_right_type, &[3.0, 4.0, 5.0]).unwrap(),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                    ],
+                    output_cotangents = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap()],
+                    input_cotangents = [
+                        Array::from_elements::<f64>(
+                            ArrayType::new(DataType::F64, Shape::new(vec![0.into()])),
+                            &[],
+                        ).unwrap(),
+                        Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[1.0, 2.0]).unwrap(),
+                    ],
+                },
+            ],
+        );
+
+        check_operation_transposition!(
+            @exact,
+            operation = ConcatenateOperation::new(1, 2).unwrap(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into()])))),
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into()])))),
+                ],
+                output_cotangents = [Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 1]), &[1.0, 4.0]).unwrap(),
+                    Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[2.0, 3.0, 5.0, 6.0]).unwrap(),
+                ],
+            }],
+        );
+
+        // A dynamic non-concatenated axis cannot be expressed by this homogeneous rule, whose `slice` bounds are
+        // static payload values, so transposition rejects the case instead of consulting hidden input-shape metadata.
+        // The composite rule does not inherit that rejection: it delegates here only for fully static operands and
+        // otherwise stages a `dynamic_shape_slice` whose extents it reads off the live output cotangent, which is
+        // pinned by `test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent` in
+        // this module.
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let left_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
+        let right_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(columns)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(left_type);
+        let right = builder.add_input(right_type);
+        let output = builder
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1], &[]),
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(
+                TypeError::Invalid { message },
+            ))) if message
+                == "`concatenate` transpose requires a static size on axis 1 but operand 0 has size columns",
+        ));
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent() {
+        // Concatenation along a static axis of operands whose other axis is dynamic. Transposition slices the
+        // cotangent back into per-operand pieces, which needs the runtime extent of the non-concatenated axis. That
+        // extent is already live at the transpose boundary: concatenation preserves every non-concatenated axis, so
+        // the output cotangent repeats the operands' `columns` identity, and one `dimension_size` read of the
+        // cotangent recovers it. The composite rule therefore stages the slicing itself rather than delegating to the
+        // homogeneous array-only rule, whose static `slice` bounds cannot express a runtime extent, and no residual
+        // is retained.
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());
+        let left_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
+        let right_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(columns)]));
+        let extent_value = DimensionValue::constant(3).unwrap();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().into_owned().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_constant(ArrayIrValue::Dimension(extent_value));
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Forward mode is unaffected: only the cotangent slicing needs the non-concatenated extent.
+        assert!(program.jvp().is_ok());
+
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3, columns] .
+                let %1:dimension<3> = const 3
+                    %2:dimension<0> = constant [value=0]
+                    %3:dimension<columns ∈ [1, 9)> = dimension_size [axis=1] %0
+                    %4:dimension<2> = constant [value=2]
+                    %5:f64[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+                    %6:dimension<2> = constant [value=2]
+                    %7:dimension<1> = constant [value=1]
+                    %8:f64[1, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %6 %2 %7 %3
+                in (%5, %8)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::from_elements::<f64>(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                )
+                .unwrap()
+            )]),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                        &[1.0, 2.0, 3.0, 4.0]
+                    )
+                    .unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements::<f64>(
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
+                        &[5.0, 6.0]
+                    )
+                    .unwrap()
+                ),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_transposition_symbolic_zero() {
+        let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(9)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
+        let input_types = vec![input_type.clone().into(), input_type.into(), DimensionType::new(result).into()];
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(0, &input_types).unwrap();
+        let output_type = operation.infer_output_types(&input_types, &[]).unwrap().remove(0);
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let mut transpose = TranspositionContext::new(context.clone());
+        let inputs = input_types.iter().cloned().map(PartialValue::Unknown).collect::<Vec<_>>();
+        let accumulators = transpose.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(
+                &mut transpose,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(output_type.cotangent().unwrap())],
+                &accumulators,
+            )
+            .unwrap();
+        let cotangents = transpose.take_cotangents(&accumulators).unwrap();
+        assert_eq!(cotangents.len(), 3);
+        for (cotangent, input_type) in cotangents.iter().zip(&input_types) {
+            assert!(cotangent.is_zero());
+            assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent().unwrap());
+        }
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_array_ir_concatenate_transposition_rejects_a_dynamic_concatenated_extent() {
+        // A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold: the
+        // per-operand slice offsets are runtime sums that the output cotangent alone cannot recover. Direct
+        // transposition therefore rejects the case by name instead of guessing, and linearization is the supported
+        // route, because it retains those input extents as explicit residuals.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let total = DimensionVariable::new("total", DimensionBounds::new(2, Some(10)).unwrap());
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let result_extent_type = DimensionType::new(total);
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_extent_type.clone().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_input(result_extent_type.into());
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct transposition of a dynamic `concatenate` requires linearization so its input \
+                               extents can be retained as residuals",
+        ));
+        assert!(program.linearize().unwrap().pullback().is_ok());
+    }
+
+    #[test]
+    fn test_validate_concatenation_ragged_axes() {
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I64, [2]), &[1_i64, 3]).unwrap();
+        let rows = RaggedAxis::new(
+            1,
+            extents.clone(),
+            DimensionVariable::new("rows", DimensionBounds::new(0, Some(4)).unwrap()),
+            vec![0],
+        );
+        let columns = RaggedAxis::new(
+            2,
+            extents,
+            DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap()),
+            vec![0],
+        );
+        let first = [rows.clone(), columns.clone()];
+        let second = [columns, rows];
+        assert_eq!(validate_concatenation_ragged_axes(&[&first, &second], 3), Ok(first.to_vec()));
+    }
+
+    #[test]
+    fn test_array_concatenate_with_options() {
+        let integers = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[1_i32, 2]).unwrap();
+        let floats = Array::from_elements(ArrayType::new_static(DataType::F32, [1, 2]), &[3.5_f32, 4.5]).unwrap();
+        let output = Array::concatenate_with_options([&integers, &floats], Some(Axis::from(0)), None).unwrap();
+        assert_eq!(output.r#type().data_type(), DataType::F32);
+        assert_eq!(output.elements::<f32>(), Ok(vec![1., 2., 3.5, 4.5]));
+        let scalar = Array::from_elements(ArrayType::scalar(DataType::F32), &[5.5_f32]).unwrap();
+        assert_eq!(
+            Array::concatenate_with_options([&integers, &scalar], None, Some(DataType::F64)),
+            Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[1_f64, 2., 5.5])
+        );
+        assert_eq!(
+            Array::concatenate_with_options([&floats], Some(Axis::from(0)), Some(DataType::I32)),
+            Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[3_i32, 4])
+        );
+        assert_eq!(
+            Array::concatenate_with_options([], None, None),
+            Err(ProgramError::Type(TypeError::invalid("`concatenate` expects at least one operand but got none")))
+        );
     }
 
     #[test]
@@ -2164,67 +3358,22 @@ mod tests {
         );
     }
 
-    /// Driver-side coverage for the widened differential representation at a dynamic shape. The `f32` tangent of an
-    /// `f8e8m0fnu[n]` operand has no live value of its own type anywhere, so the mixed JVP rule reads the extent `n`
-    /// from the operand's own primal and stages the mixed dynamic zero rather than an unconstructible nullary one.
-    #[test]
-    fn test_concatenate_jvp_materializes_a_widened_dynamic_zero_tangent() {
-        type CompositeValue = ArrayIrValue<Array>;
-        type CompositeOperation = ArrayIrOperation<Array>;
-        type TestContext = TracingContext<CompositeValue, CompositeOperation>;
-
-        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.clone())]));
-        let widened_type = narrow_type.tangent().unwrap();
-        assert_eq!(widened_type.data_type(), DataType::F32);
-
-        let context = TestContext::new();
-        let first_primal = context.input(narrow_type.clone().into());
-        let second_primal = context.input(narrow_type.clone().into());
-        let live_tangent = context.input(widened_type.clone().into());
-        let result_extent = context.input(DimensionType::new(n).into());
-
-        // The first operand carries a live tangent so the rule does not short-circuit, while the second carries a
-        // structural zero whose type names the runtime extent `n` but pins nothing.
-        let inputs = vec![
-            DifferentiationDual::new(first_primal, MaybeZero::Value(live_tangent)).unwrap(),
-            DifferentiationDual::new(second_primal, MaybeZero::Zero(widened_type.clone().into())).unwrap(),
-            DifferentiationDual::new_with_zero_tangent(result_extent).unwrap(),
-        ];
-        let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
-            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, inputs.as_slice())
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayIrType::Array(widened_type));
-
-        // The staged extent read and the mixed dynamic zero both target the second operand's own primal.
-        let builder = context.builder().borrow();
-        let size = builder
-            .instructions()
-            .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)))
-            .expect("expected one staged extent read");
-        let zero = builder
-            .instructions()
-            .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
-            .expect("expected one staged mixed dynamic zero");
-        assert_eq!(zero.inputs(), size.outputs());
-    }
-
     #[test]
     fn test_array_concatenate() {
         // Three operands joined along axis 0 preserve their order.
         let concatenated = Array::concatenate(
             [
-                &Array::vector(vec![1.0]).unwrap(),
-                &Array::vector(vec![2.0, 3.0]).unwrap(),
-                &Array::vector(vec![4.0]).unwrap(),
+                &Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[1.0]).unwrap(),
+                &Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2]), &[2.0, 3.0]).unwrap(),
+                &Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [1]), &[4.0]).unwrap(),
             ],
             0,
         )
         .unwrap();
-        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap());
+        assert_eq!(
+            concatenated,
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [4]), &[1.0, 2.0, 3.0, 4.0]).unwrap()
+        );
 
         // A rank-3 middle-axis concatenation exercises the row-major block odometer.
         let first = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 1, 2]), &[1.0, 2.0, 3.0, 4.0])
@@ -2236,7 +3385,10 @@ mod tests {
         .unwrap();
         let concatenated = Array::concatenate([&first, &second], 1).unwrap();
         assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3, 2]));
-        assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
+        assert_eq!(
+            concatenated.elements::<f64>(),
+            Ok(vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0])
+        );
 
         // Concatenation traverses each input's physical layout and emits the canonical layout-free result.
         let first_type =
@@ -2261,5 +3413,48 @@ mod tests {
         let empty_type = ArrayType::new_static(DataType::F8E8M0FNU, [0]);
         let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
         assert_eq!(Array::concatenate([&empty, &empty], 0), Array::new(empty_type, Vec::new()));
+    }
+    #[test]
+    fn test_array_ir_value_dynamic_concatenate() {
+        let first =
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap());
+        let second =
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [1]), &[3_i32]).unwrap());
+        assert_eq!(
+            ArrayIrValue::dynamic_concatenate(
+                &[first.clone(), second.clone()],
+                &ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+                -1,
+            ),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[1_i32, 2, 3]).unwrap()
+            ))
+        );
+        assert_eq!(
+            ArrayIrValue::dynamic_concatenate(
+                &[first, second],
+                &ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
+                0,
+            ),
+            Err(ProgramError::InvalidArgument {
+                message: "`concatenate` result extent must equal the sum of input axis 0 extents; expected 3 but got 4"
+                    .into(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_dynamic_concatenate() {
+        let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(input_type.clone().into());
+        let extent = context.input(DimensionType::new(size).into());
+        let output = Tracer::dynamic_concatenate(&[input.clone()], &extent, 0).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(input_type));
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else { panic!("expected one concatenation instruction") };
+        assert_eq!(instruction.inputs(), &[input.atom_id().unwrap(), extent.atom_id().unwrap()]);
+        assert_eq!(instruction.operation().effects().classes(), EffectClasses::NONE);
     }
 }

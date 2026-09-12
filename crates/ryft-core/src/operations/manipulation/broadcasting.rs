@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayType, ArrayTypeRefinements, Dimension, DimensionType, DimensionValue,
-    Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, TiledLayout,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
+    DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -139,8 +139,27 @@ impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> fo
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // In a validated homogeneous broadcast, every dynamic output axis maps the identical input dimension.
+        // Replay may refine that input to a concrete extent (including one), so recover that extent without
+        // inventing a replication count for an unmapped axis or changing a still-symbolic input.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].broadcast(self.output_type.clone(), self.output_axes())?])
+        let input_type = inputs[0].r#type();
+        let mut dimensions = self.output_type.shape().dimensions().to_vec();
+        for (input_axis, &output_axis) in self.output_axes().iter().enumerate() {
+            if let (Some(Dimension::Static(extent)), Some(dimension @ Dimension::Dynamic(_))) =
+                (input_type.shape().dimensions().get(input_axis), dimensions.get_mut(output_axis))
+            {
+                *dimension = Dimension::Static(*extent);
+            }
+        }
+        let output_type = self.output_type.clone().with_shape(Shape::new(dimensions));
+        let mut refinements = ArrayTypeRefinements::default();
+        ArrayTypeRefinements::visit_dynamic_to_static_refinements(
+            &self.output_type,
+            &output_type,
+            |variable, extent| refinements.bind(variable, extent),
+        )?;
+        Ok(vec![inputs[0].broadcast(output_type, self.output_axes())?])
     }
 }
 
@@ -535,6 +554,9 @@ impl Broadcast for ArrayType {
             match (input_dimension, output_dimension.clone()) {
                 // Identical sizes always map through, including identical dynamic sizes.
                 (input_dimension, output_dimension) if input_dimension == output_dimension => {}
+                // A singleton dynamic bound proves the same extent even when a residual has refined it to static.
+                (Dimension::Static(size), Dimension::Dynamic(variable))
+                    if variable.bounds() == Dimension::Static(size).bounds() => {}
                 // A static size-1 input dimension is replicated to match any static output extent. Expanding it
                 // into a dynamic output dimension is unsupported because the replication count is unknown.
                 (Dimension::Static(1), Dimension::Static(_)) => {}
@@ -1535,6 +1557,32 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     }
 }
 
+impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
+    fn dynamic_broadcast_with_output_sharding(
+        &self,
+        output_dimensions: &[Self],
+        output_axes: &[usize],
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let mut refinements = ArrayTypeRefinements::default();
+        let output_shape = Shape::new(
+            output_dimensions
+                .iter()
+                .map(<Self as ValueProjection<DimensionType>>::projected)
+                .map(|result| {
+                    let dimension = result?;
+                    refinements.bind(dimension.r#type().variable(), dimension.extent())?;
+                    Ok(Dimension::Static(dimension.extent()))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?,
+        );
+        let operation = DynamicBroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
+        let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
+        Ok(Self::Array(input.broadcast(output_type, output_axes)?))
+    }
+}
+
 impl<V: Value<Type = ArrayIrType>> DynamicBroadcast for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
@@ -1566,7 +1614,7 @@ where
 }
 
 /// Infers the result of the canonical mixed broadcast from its explicit output extent types.
-pub(crate) fn infer_explicit_broadcast_output_type(
+fn infer_explicit_broadcast_output_type(
     input: &ArrayType,
     output_shape: Shape,
     operation: &DynamicBroadcastOperation,
@@ -1764,6 +1812,15 @@ mod tests {
 
     #[test]
     fn test_broadcast_type_inference() {
+        // Singleton symbolic extents retain their identity when restoring a refined cotangent signature.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
+        let output = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        assert_eq!(
+            BroadcastOperation::new(output.clone(), vec![0])
+                .infer_output_types(&[ArrayType::new_static(DataType::F64, [4])], &[]),
+            Ok(vec![output]),
+        );
+
         // Broadcasting is regionless even when its input and output metadata are otherwise valid.
         assert_eq!(
             BroadcastOperation::new(ArrayType::scalar(DataType::F32), vec![]).infer_output_types(
@@ -1932,6 +1989,51 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_interpretation_refines_mapped_dynamic_dimensions() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(3)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let operation = BroadcastOperation::new(output_type.clone(), vec![0]);
+        let context = EagerContext::<Array>::new();
+        for elements in [&[1f32][..], &[1f32, 2.][..]] {
+            let input = Array::from_elements(ArrayType::new_static(DataType::F32, [elements.len()]), elements).unwrap();
+            assert_eq!(
+                operation.interpret(&context, &EmptyRegionDriver, &[input]),
+                Ok(vec![
+                    Array::from_elements(
+                        output_type.clone().with_shape(Shape::new(vec![elements.len().into()])),
+                        elements,
+                    )
+                    .unwrap()
+                ]),
+            );
+        }
+
+        // The refined dimensions must respect their declared bounds and repeated-identity equality.
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [3]), &[1f32, 2., 3.]).unwrap();
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input]),
+            Err(ProgramError::Type(
+                DimensionError::BindingOutOfBounds {
+                    variable: "extent".to_string(),
+                    value: 3,
+                    bounds: extent.bounds(),
+                }
+                .into()
+            )),
+        );
+        let repeated_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()]));
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [1, 2]), &[1f32, 2.]).unwrap();
+        assert_eq!(
+            BroadcastOperation::new(repeated_type, vec![0, 1]).interpret(&context, &EmptyRegionDriver, &[input]),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "extent".to_string(), expected: 1, actual: 2 }
+                    .into()
+            )),
         );
     }
 
@@ -2821,6 +2923,59 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_broadcast_type_inference_identity_instantiation() {
+        let bounds = DimensionBounds::new(1, Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = builder.add_input(DimensionType::new(source.clone()).into());
+        let one = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
+        let output = builder
+            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![input, extent, one], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let target = DimensionVariable::new("target", bounds);
+        let instantiated = program
+            .with_instantiated_type_identities(&[
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into(),
+                DimensionType::new(target.clone()).into(),
+            ])
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            instantiated.output_types(),
+            vec![
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(target.clone()), Dimension::Static(1)]),
+                )
+                .into()
+            ],
+        );
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = destination.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let extent = destination.add_input(DimensionType::new(target.clone()).into());
+        let outputs = destination.splice_program(&instantiated, &[input, extent]).unwrap();
+        let [instruction] = destination.instructions() else {
+            panic!("expected the imported broadcast instruction");
+        };
+        assert_eq!(instruction.inputs()[..2], [input, extent]);
+        assert_eq!(
+            destination.atoms()[outputs[0].index()].r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(1)]),
+            )),
+        );
+    }
+
+    #[test]
     fn test_dynamic_broadcast_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = [
@@ -2835,6 +2990,33 @@ mod tests {
         assert_eq!(
             DynamicBroadcastOperation::new(vec![1]).interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::Type(TypeError::invalid("`broadcast` expects an array followed by its output extents"))),
+        );
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
+        let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap());
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(
+            context.bind(
+                DynamicBroadcastOperation::new(vec![1]),
+                Vec::new(),
+                &[input.clone(), first_extent.clone(), second_extent.clone()],
+            ),
+            Ok(vec![expected_output.clone()]),
+        );
+        let eager_dynamic_type =
+            DimensionType::new(DimensionVariable::new("eager_extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        assert_eq!(
+            context.bind(
+                DynamicBroadcastOperation::new(vec![1]),
+                Vec::new(),
+                &[
+                    ArrayIrValue::Array(Array::vector(vec![7.0_f64]).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(eager_dynamic_type, 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 1, vec![7.0_f64, 7.0, 7.0]).unwrap())]),
         );
     }
 
@@ -2899,6 +3081,22 @@ mod tests {
                 Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0f32; 6]).unwrap()
             )]),
         );
+        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let input = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
+        let three = ArrayIrValue::Dimension(DimensionValue::new(dimension, 3).unwrap());
+        assert_eq!(
+            input.dynamic_broadcast_with_output_sharding(&[two.clone(), two.clone()], &[], None),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0f32; 4]).unwrap()
+            )),
+        );
+        assert_eq!(
+            input.dynamic_broadcast_with_output_sharding(&[two, three], &[], None),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "size".to_owned(), expected: 2, actual: 3 }.into()
+            )),
+        );
     }
 
     #[test]
@@ -2926,6 +3124,49 @@ mod tests {
                     residual_instructions = 1,
                 },
             ],
+        );
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
+        let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap());
+        let input_type = input.r#type().into_owned();
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = DynamicBroadcastOperation::new(vec![1]),
+            cases = [
+                {
+                    inputs = [
+                        (@known, input.clone()),
+                        (@known, first_extent.clone()),
+                        (@known, second_extent.clone()),
+                    ],
+                    outputs = [(@known, expected_output.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input_type, replay = input.clone())),
+                        (@known, first_extent.clone()),
+                        (@known, second_extent.clone()),
+                    ],
+                    outputs = [(@residual, expected_output.clone())],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        let identity_input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = DynamicBroadcastOperation::new(vec![0]),
+            cases = [{
+                inputs = [
+                    (@unknown(type = identity_input.r#type().into_owned(), replay = identity_input.clone())),
+                    (@known, second_extent.clone()),
+                ],
+                outputs = [(@residual, identity_input)],
+                residual_instructions = 0,
+            }],
         );
     }
 
@@ -3251,6 +3492,82 @@ mod tests {
             output_tangent,
             ArrayIrValue::Array(Array::matrix(2, 3, vec![4.0, 5.0, 6.0, 4.0, 5.0, 6.0]).unwrap())
         );
+        let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let first_extent = builder.add_constant(first_extent);
+        let second_extent = builder.add_constant(second_extent);
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![1]),
+                Vec::new(),
+                vec![input, first_extent, second_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(program.instructions()[0].operation(), ArrayIrOperation::Broadcast(_)));
+        assert_eq!(program.instructions()[0].inputs(), &[input, first_extent, second_extent]);
+        assert!(program.to_string().contains("broadcast [output_axes=[1]]"));
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]).unwrap()),
+            ]),
+            Ok(vec![
+                expected_output,
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f64, 4.0, 3.0, 4.0, 3.0, 4.0]).unwrap()),
+            ]),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::matrix(3, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 12.0]).unwrap())]),
+        );
+
+        let dynamic_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_extent = DimensionType::new(dynamic_variable.clone());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_variable)])).into());
+        let extent = builder.add_input(dynamic_extent.clone().into());
+        let output = builder
+            .add_instruction(DynamicBroadcastOperation::new(vec![0]), Vec::new(), vec![input, extent], None)
+            .unwrap()[0];
+        let dynamic_program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(dynamic_program.jvp().is_ok());
+        let linearization = dynamic_program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dynamic_extent, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let tangent = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0]).unwrap());
+        let mut tangent_inputs = vec![tangent.clone()];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![tangent.clone()]));
+        let mut pullback_inputs = vec![tangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![tangent]));
     }
 
     #[test]
@@ -3383,6 +3700,146 @@ mod tests {
             input.dynamic_broadcast_to(&dimensions),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_to_first_class_dimensions() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let eager = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
+        assert_eq!(
+            eager.dynamic_broadcast_leading_sizes(&[2]),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],).unwrap())),
+        );
+
+        let context = TestContext::new();
+        let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
+        let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        assert_eq!(value.dynamic_broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
+        // tracing retains the operation even though its input and output types are equal.
+        let square_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]).unwrap());
+        assert_eq!(square.dynamic_broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
+
+        let context = TestContext::new();
+        let value = context.input(square_type.into());
+        let extent = context.constant(two);
+        let output = value.dynamic_broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected one shape-preserving broadcast instruction");
+            };
+            let ArrayIrOperation::Broadcast(operation) = instruction.operation() else {
+                panic!("expected a broadcast instruction");
+            };
+            assert_eq!(operation.output_axes(), &[1, 0]);
+        }
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(vec![square]), Ok(vec![expected]));
+
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let context = TestContext::new();
+        let scalar = context.input(ArrayType::scalar(DataType::F64).into());
+        let extent = context.input(extent_type.clone().into());
+        let output = scalar.dynamic_broadcast_to(std::slice::from_ref(&extent)).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:dimension<extent \u{2208} [1, 5)> .
+                let %2:f64[extent] = broadcast [output_axes=[]] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(2.5_f64).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5]).unwrap())]),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())]),
+        );
+
+        let context = TestContext::new();
+        let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
+        let rows = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let columns = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = value.dynamic_broadcast_to(&[rows, columns]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64]).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0_f64; 6]).unwrap())]),
+        );
+
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let context = TestContext::new();
+        let value = context.input(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let output = value.dynamic_broadcast_leading_sizes(&[2]).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch), Dimension::Static(3)]),
+            )),
+        );
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let rendered = program.to_string();
+        assert_eq!(rendered.matches("dimension_size").count(), 1);
+        assert!(rendered.contains("broadcast [output_axes=[1, 2]]"));
     }
 
     #[test]
