@@ -1,5 +1,12 @@
+//! Constant values and type-driven array constructors.
+//!
+//! [`Zero`], [`One`], [`Iota`], and [`Fill`] construct values from types with statically known extents. Their
+//! dynamic counterparts accept explicit first-class dimension operands, allowing the same constructors to be used
+//! with runtime shapes. [`Constant`] carries an existing value, while [`ZeroLike`] and [`OneLike`] obtain their
+//! geometry from an exemplar and therefore need no separate dynamic capability.
+
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
-use crate::programs::{RegionInterface, Type, TypeError, TypeIdentityPosition};
+use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};
 
 /// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
 /// constructor. The generated implementation treats the operation's stored [`ArrayType`] as the complete output type
@@ -164,7 +171,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 }
 
 /// Infers the output type of one mixed [`ArrayIrType`] constant constructor whose stored [`ArrayType`] is the complete
-/// output type. The constructor consumes one first-class dimension operand per *dynamic* dimension of its stored shape,
+/// output type. The constructor consumes one first-class dimension operand per _dynamic_ dimension of its stored shape,
 /// in axis order, and each operand's [`DimensionType`] must define exactly the
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
 /// stored type metadata and consume no operands. This is deliberately narrower than the mixed reshape/broadcast
@@ -204,6 +211,40 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
     Ok(vec![ArrayIrType::Array(r#type.clone())])
 }
 
+/// Checks that the provided dimension inputs agree with the symbolic shape declared by `output_type` before a dynamic
+/// constructor binds any operations. An [`ArrayType`] can describe a shape without knowing all its extents as it stores
+/// static sizes directly and represents each dynamic axis by a [`DimensionVariable`](crate::DimensionVariable),
+/// including its identity and bounds. The inputs supply values for those dynamic axes at runtime.
+///
+/// This function checks that there is exactly one input per dynamic axis, that every input has a [`DimensionType`],
+/// and that its dimension variable matches the corresponding output axis. Static axes consume no inputs. It inspects
+/// input types only. It neither reads runtime extents nor constructs an array. Concrete values and their extent bounds
+/// are checked when created or interpreted. This also gives eager capability calls the same shape checks as staged
+/// constructors, without relying on a staging context to run type inference.
+///
+/// # Example
+///
+/// For an `F32` output with shape `[N, 2, M]`, `dimensions` must contain two values with dimension types `N` and `M`,
+/// in that order. If their runtime extents are `3` and `4`, the constructor produces an array of shape `[3, 2, 4]`.
+/// An array input, a missing input, or inputs ordered as `[M, N]` fail validation. A shape `[N, N]` requires two inputs
+/// of type `N` and thus callers must supply the same extent for both occurrences. A fully static shape `[3, 2]`
+/// requires an empty input slice.
+///
+/// # Parameters
+///
+///   - `name`: Operation name included in validation errors.
+///   - `type`: Declared output type, including static extents and dynamic dimension variables.
+///   - `dimensions`: One dimension input per dynamic output axis, in shape order.
+pub(crate) fn validate_dynamic_constant_dimensions<V: Typed<Type = ArrayIrType>>(
+    name: &str,
+    r#type: &ArrayType,
+    dimensions: &[V],
+) -> Result<(), ProgramError> {
+    let input_types = dimensions.iter().map(|dimension| dimension.r#type().into_owned()).collect::<Vec<_>>();
+    infer_array_ir_constant_constructor_output_types(name, r#type, &input_types, &[])?;
+    Ok(())
+}
+
 pub mod constant;
 pub mod fill;
 pub mod iota;
@@ -213,11 +254,11 @@ pub mod zero;
 pub mod zero_like;
 
 pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant};
-pub use fill::Fill;
-pub use iota::{IOTA_OPERATION_NAME, Iota, IotaOperation};
-pub use one::{ONE_OPERATION_NAME, One, OneOperation};
+pub use fill::{DynamicFill, Fill};
+pub use iota::{DynamicIota, IOTA_OPERATION_NAME, Iota, IotaOperation};
+pub use one::{DynamicOne, ONE_OPERATION_NAME, One, OneOperation};
 pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
-pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation};
+pub use zero::{DynamicZero, ZERO_OPERATION_NAME, Zero, ZeroOperation};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 #[cfg(test)]

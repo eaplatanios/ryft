@@ -86,46 +86,22 @@ impl Array {
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Creates an array from its staged array type and shared physical storage without revalidating either. The
-    /// caller guarantees what [`Array::new`] would otherwise check: `bytes` has the exact layout-derived byte count
-    /// for `type`, holds a valid encoding for every logical element, and is zero in every layout hole and
-    /// tile-padding byte. This exists because the reference kernels in [`crate::arrays::operations`] build their
-    /// results by writing into an addressed buffer they sized from the output type, so they already uphold the
-    /// storage invariants by construction and would otherwise pay for a second full traversal per operation. Taking
-    /// the payload as an [`Arc`] also lets kernels that only retype a value (such as a memory transfer or a reshard)
-    /// share the original payload instead of copying it.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Staged array type of the array.
-    ///   - `bytes`: Complete physical storage, including any layout holes or tile padding.
-    pub(crate) fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
-        Self { r#type, bytes }
-    }
-
-    /// Creates an array from typed elements provided in logical row-major order.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Staged array type of the array.
-    ///   - `elements`: Logical row-major elements. Their Rust type and count must match `type`.
+    /// Creates a new [`Array`] from `elements` assuming they are provided densely packed in logical row-major order.
+    #[inline]
     pub fn from_elements<T: ArrayElement>(r#type: ArrayType, elements: &[T]) -> Result<Self, ProgramError> {
         let bytes = encode_elements(&r#type, elements)?;
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
 
-    /// Creates an array from concatenated logical element encodings in row-major order.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Staged array type of the array.
-    ///   - `bytes`: Concatenated logical element bytes, without layout holes or tile padding.
+    /// Creates a new [`Array`] from `bytes` assuming it represents the concatenated densely packed logical element
+    /// encodings in row-major order.
+    #[inline]
     pub fn from_logical_bytes(r#type: ArrayType, bytes: &[u8]) -> Result<Self, ProgramError> {
         let bytes = encode_logical_bytes(&r#type, bytes)?;
         Ok(Self { r#type, bytes: Arc::new(bytes) })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates a rank-0 array containing `value`.
     pub fn scalar<T: ArrayElement>(value: T) -> Self {
@@ -169,6 +145,18 @@ impl Array {
                 .unwrap_or_else(|error| panic!("{error}"));
             Self::from_elements(r#type, &elements).unwrap_or_else(|error| panic!("{error}"))
         })
+    }
+
+    /// Creates a new [`Array`] with the provided [`ArrayType`] and backed by the provided shared physical storage
+    /// without performing any validation for either. The caller guarantees what [`Array::new`] would otherwise check,
+    /// namely that `bytes` has the exact layout-derived byte count for `type`, holds a valid encoding for every logical
+    /// element, and is zero in every layout "hole" and padding byte. This exists because the reference Ryft kernels for
+    /// [`Array`]s build their results by writing into an addressed buffer they sized from the output type, and so they
+    /// already uphold the storage invariants by construction and would otherwise pay for a second full traversal per
+    /// operation. Taking the payload as an [`Arc`] also lets kernels that only retype a value (such as a memory
+    /// transfer or a reshard kernel) share the original payload instead of copying it.
+    pub(crate) fn new_unchecked(r#type: ArrayType, bytes: Arc<Vec<u8>>) -> Self {
+        Self { r#type, bytes }
     }
 
     /// Returns the complete immutable physical storage, including layout holes and tile padding.
