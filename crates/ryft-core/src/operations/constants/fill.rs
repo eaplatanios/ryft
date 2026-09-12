@@ -224,7 +224,13 @@ where
                     Dimension::Dynamic(_) => dimensions.next().unwrap().r#type().into_owned(),
                 });
             }
-            operation.infer_output_types(&input_types, &[])?;
+            let output_types = operation.infer_output_types(&input_types, &[])?;
+            let output_type = <&ArrayType>::try_from(&output_types[0])?;
+
+            // Singleton bounds can make all storage geometry known even with explicit dimension inputs.
+            if output_type.static_shape().is_some() {
+                ArrayAddressing::new(output_type.clone())?;
+            }
         }
 
         let scalar_operation =
@@ -547,6 +553,17 @@ mod tests {
         assert!(context.builder().borrow().instructions().is_empty());
         let invalid_type = ArrayType::new(DataType::Token, Shape::new(vec![size.into()]));
         assert!(context.dynamic_fill(&invalid_type, 1f32, &[dimension]).is_err());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // Singleton inputs also expose statically decidable storage overflow before staging.
+        let singleton = DimensionVariable::new("singleton", DimensionBounds::new(2, Some(3)).unwrap());
+        let extent = context.input(DimensionType::new(singleton.clone()).into());
+        let large_extent = (i64::MAX as usize).min(usize::MAX / 2);
+        let invalid_type = ArrayType::new(DataType::F32, Shape::new(vec![singleton.into(), large_extent.into()]));
+        let static_type = ArrayType::new_static(DataType::F32, [2, large_extent]);
+        assert!(matches!(context.dynamic_fill(&invalid_type, 1f32, &[extent]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == format!("array type {static_type} requires more bytes than can be represented")));
         assert!(context.builder().borrow().instructions().is_empty());
 
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
