@@ -272,7 +272,7 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 /// Represents the ability to construct an [`Array`] of ones whose shape includes _dynamic_ (i.e., runtime) dimensions.
 /// Unlike [`One`], this capability supplies each dynamic axis with an explicit dimension value. Static axes retain
 /// their declared sizes. Dynamic axes take their sizes from the inputs in axis order. Repeated dimension identities
-/// require a corresponding operand for every occurrence. Each operand must have the exact dimension identity declared
+/// require a corresponding input for every occurrence. Each input must have the exact dimension identity declared
 /// by its axis. The caller must thus provide the same dimension value for repeated occurrences.
 ///
 /// Note that a fully static output type is also accepted with no dimension inputs. The same capability works with eager
@@ -299,18 +299,18 @@ pub trait DynamicOne<V: Typed> {
     ///
     /// # Parameters
     ///
-    ///   - `output_type`: Output [`ArrayType`] that may contain dynamic dimensions. Each dynamic axis names the
-    ///     dimension identity that its corresponding operand must carry.
+    ///   - `type`: Output [`ArrayType`] that may contain dynamic dimensions. Each dynamic axis names the dimension
+    ///     identity that its corresponding input must carry.
     ///   - `dimensions`: Contains one dimension value per dynamic axis, in axis order. Static axes do not consume input
-    ///     dimensions provided this way. Repeated identities still consume one operand for each axis that uses them.
-    fn dynamic_one(&self, output_type: &ArrayType, dimensions: &[V]) -> Result<V, ProgramError>;
+    ///     dimensions provided this way. Repeated identities still consume one input for each axis that uses them.
+    fn dynamic_one(&self, r#type: &ArrayType, dimensions: &[V]) -> Result<V, ProgramError>;
 }
 
 impl<C: Context<Type = ArrayIrType, Operation: From<OneOperation<ArrayType>>>> DynamicOne<C::Value> for C {
     #[inline]
-    fn dynamic_one(&self, output_type: &ArrayType, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
-        validate_dynamic_constant_dimensions(ONE_OPERATION_NAME, output_type, dimensions)?;
-        let mut outputs = self.bind(OneOperation::new(output_type.clone()), Vec::new(), dimensions)?;
+    fn dynamic_one(&self, r#type: &ArrayType, dimensions: &[C::Value]) -> Result<C::Value, ProgramError> {
+        validate_dynamic_constant_dimensions(ONE_OPERATION_NAME, r#type, dimensions)?;
+        let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), dimensions)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

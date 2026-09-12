@@ -367,7 +367,7 @@ mod tests {
             validate_dynamic_constant_dimensions(
                 "fill",
                 &output_type,
-                &[ArrayIrValue::Array(Array::scalar(3i64)), column_extent],
+                &[ArrayIrValue::Array(Array::scalar(3i64).unwrap()), column_extent],
             ),
             Err(ProgramError::Type(TypeError::invalid("`fill` operand 0 must be a dimension but has type i64[]"))),
         );
