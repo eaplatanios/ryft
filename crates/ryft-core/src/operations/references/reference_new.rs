@@ -3,6 +3,8 @@
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType};
@@ -37,11 +39,25 @@ static REFERENCE_NEW_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
 });
 
-define_reference_operation!(
-    /// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
-    ReferenceNewOperation,
-    REFERENCE_NEW_OPERATION_NAME
-);
+/// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
+#[derive(Clone, Debug)]
+pub struct ReferenceNewOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+
+impl<T: Type, U: Type> ReferenceNewOperation<T, U> {
+    /// Creates a new [`ReferenceNewOperation`].
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Copy for ReferenceNewOperation<T, U> {}
+
+impl<T: Type, U: Type> Display for ReferenceNewOperation<T, U> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REFERENCE_NEW_OPERATION_NAME)
+    }
+}
 
 impl<T, U> Operation for ReferenceNewOperation<T, U>
 where
@@ -333,52 +349,66 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-    use crate::operations::references::reference_read::ReferenceRead;
+    use crate::macros::check_operation_type_inference;
+    use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_write::ReferenceWrite;
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
     use crate::programs::{
         EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, TypeIdentityPosition,
     };
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
 
     use super::*;
 
     type TestIrValue = ArrayIrValue<Array>;
+    type TestIrOperation = ArrayIrOperation<Array>;
+    type TestIrNew = ReferenceNewOperation<ArrayType, ArrayIrType>;
 
     #[test]
-    fn test_reference_new_operation() {
+    fn test_reference_new() {
+        let operation = New::new();
+        assert_eq!(operation.name(), REFERENCE_NEW_OPERATION_NAME);
+        assert_eq!(operation.to_string(), REFERENCE_NEW_OPERATION_NAME);
+        assert_eq!(
+            format!("{operation:?}"),
+            format!("ReferenceNewOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
+        );
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
+        assert_eq!(operation.effects().reference_aliases(), &[]);
+    }
+
+    #[test]
+    fn test_reference_new_type_inference() {
         let referent = TestReferent::new(7, 16);
-        let promoted_refinement = TestReferent::new(7, 32);
         let value = TestType::Value(referent);
         let reference = TestType::Reference(ReferenceType::new(referent));
-
-        assert_parameter_roundtrip(New::new());
-        assert_eq!(New::new(), New::default());
-        assert_eq!(format!("{:?}", New::new()), "ReferenceNewOperation");
-        assert_eq!(New::new().to_string(), REFERENCE_NEW_OPERATION_NAME);
-        assert_eq!(New::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
-        assert_eq!(New::new().effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
-        assert_eq!(New::new().effects().reference_aliases(), &[]);
-
-        assert_eq!(
-            ReferenceNewOperation::<TestReferent, NewUniverse>::new()
-                .infer_output_types(&[NewUniverse::Value(referent)], &[]),
-            Ok(vec![NewUniverse::Reference(ReferenceType::new(referent))]),
-        );
-        assert_eq!(New::new().infer_output_types(std::slice::from_ref(&value), &[]), Ok(vec![reference.clone()]));
-        assert_eq!(New::new().infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
-        assert_eq!(
-            New::new().infer_output_types(std::slice::from_ref(&reference), &[]),
-            Err(TypeError::invalid("expected value type but got reference type")),
+        check_operation_type_inference!(
+            operation = New::new(),
+            cases = [
+                {
+                    input_types = [value.clone()],
+                    output_types = [reference.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [reference.clone()],
+                    error = "expected value type but got reference type",
+                },
+            ],
         );
         let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
@@ -386,25 +416,319 @@ mod tests {
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
 
+        // The inferred reference type carries the referent's identity and refinement, which is what later refinement
+        // checks against the allocated reference compare.
         assert_eq!(
             referent.identities().collect::<Vec<_>>(),
             vec![(TypeIdentityPosition::Definition, &referent.identity)],
         );
-        assert!(referent.is_refined_by(&promoted_refinement));
+        assert!(referent.is_refined_by(&TestReferent::new(7, 32)));
 
+        // Allocation only requires a universe that embeds reference types and projects referents.
+        check_operation_type_inference!(
+            operation = ReferenceNewOperation::<TestReferent, NewUniverse>::new(),
+            cases = [{
+                input_types = [NewUniverse::Value(referent)],
+                output_types = [NewUniverse::Reference(ReferenceType::new(referent))],
+            }],
+        );
+
+        // A referent that is itself a reference is rejected even when the universe can represent the nesting.
         let nested_referent = ReferenceType::new(referent);
-        assert_eq!(
-            ReferenceNewOperation::<ReferenceType<TestReferent>, NestedTestType>::new()
-                .infer_output_types(&[NestedTestType::Reference(nested_referent.clone())], &[]),
-            Err(TypeError::invalid(format!(
-                "`reference_new` cannot allocate a reference whose referent type `{nested_referent}` is itself a \
-                 reference",
-            ))),
+        check_operation_type_inference!(
+            operation = ReferenceNewOperation::<ReferenceType<TestReferent>, NestedTestType>::new(),
+            cases = [{
+                input_types = [NestedTestType::Reference(nested_referent.clone())],
+                error = format!(
+                    "`reference_new` cannot allocate a reference whose referent type `{nested_referent}` is itself a \
+                     reference",
+                ),
+            }],
+        );
+
+        // The array universe allocates array referents and rejects its other members.
+        let array_type = ArrayType::scalar(DataType::F32);
+        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::unbounded()));
+        check_operation_type_inference!(
+            operation = TestIrNew::new(),
+            cases = [
+                {
+                    input_types = [ArrayIrType::Array(array_type.clone())],
+                    output_types = [ArrayIrType::Reference(ReferenceType::new(array_type.clone()))],
+                },
+                {
+                    input_types = [ArrayIrType::Reference(ReferenceType::new(array_type))],
+                    error = "expected array type but got reference type",
+                },
+                {
+                    input_types = [ArrayIrType::Dimension(dimension_type)],
+                    error = "expected array type but got dimension type",
+                },
+            ],
         );
     }
 
     #[test]
-    fn test_reference_new_operation_reference_discharge() {
+    fn test_reference_new_interpretation() {
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+
+        // Allocation yields a live reference whose type and initial state come from the initializer.
+        let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+            &TestIrNew::new(),
+            &context,
+            &EmptyRegionDriver,
+            std::slice::from_ref(&initial),
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], TestIrValue::Reference(_)));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(outputs[0].read(), Ok(initial.clone()));
+
+        // Every allocation is independent of the others allocated from the same initializer.
+        let other = initial.reference_new().unwrap();
+        assert!(matches!(other, TestIrValue::Reference(_)));
+        other.write(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())).unwrap();
+        assert_eq!(outputs[0].read(), Ok(initial.clone()));
+        assert_eq!(other.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
+
+        // Only array members can be allocated, so a reference initializer is rejected before any allocation happens.
+        assert_eq!(
+            InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+                &TestIrNew::new(),
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&other),
+            ),
+            Err(TypeError::invalid("expected array type but got reference type").into()),
+        );
+        assert_eq!(
+            other.reference_new(),
+            Err(TypeError::invalid("expected array type but got reference type").into()),
+        );
+
+        // A dynamically shaped initializer allocates a reference of exactly its declared dynamic type. `Array`'s
+        // checked constructors reject dynamically shaped types, so the referent comes from the test-only unchecked
+        // hatch.
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        let dynamic = TestIrValue::Array(Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec()));
+        let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+            &TestIrNew::new(),
+            &context,
+            &EmptyRegionDriver,
+            std::slice::from_ref(&dynamic),
+        )
+        .unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::Reference(ReferenceType::new(dynamic_type)));
+    }
+
+    #[test]
+    fn test_reference_new_partial_evaluation() {
+        // The allocated reference compares by identity rather than by value, so the known/unknown placement check is
+        // written out instead of going through the partial-evaluation check macro, which compares replayed outputs.
+        let initial = TestIrValue::Array(Array::scalar(1.0_f32).unwrap());
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+
+        // A known initial value folds the allocation eagerly, so the known output is a live reference holding it.
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(initial.clone())]).unwrap();
+        assert!(evaluation.program().instructions().is_empty());
+        assert_eq!(evaluation.outputs().len(), 1);
+        assert!(evaluation.outputs()[0].is_known());
+        let outputs = evaluation.interpret(&context, &[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], TestIrValue::Reference(_)));
+        assert_eq!(outputs[0].read(), Ok(initial.clone()));
+
+        // An unknown initial value residualizes the allocation, whose reference output is then unknown.
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:ref<f32[]> = reference_new %0
+                in (%1)"},
+        );
+        assert_eq!(evaluation.outputs().len(), 1);
+        assert!(evaluation.outputs()[0].is_unknown());
+        let outputs = evaluation.interpret(&context, std::slice::from_ref(&initial)).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], TestIrValue::Reference(_)));
+        assert_eq!(outputs[0].read(), Ok(initial));
+    }
+
+    #[test]
+    fn test_reference_new_batching() {
+        let extent = TestIrValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            extent,
+        );
+
+        // A mapped initial value allocates a reference batched at the same axis.
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let initial =
+            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(initial.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3]))),
+        );
+        assert_eq!(outputs[0].batch().value().read(), Ok(initial));
+
+        // A replicated initial value is broadcast along a new leading batch axis, so the allocation is always batched
+        // and can later receive batched values.
+        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(initial));
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 1.0, 2.0])
+                    .unwrap()
+            )),
+        );
+    }
+
+    #[test]
+    fn test_reference_new_differentiation() {
+        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, TestIrOperation>::new());
+        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+
+        // A live initial tangent seeds an independent tangent reference beside the primal allocation.
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(initial.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
+                .unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
+        let tangent_reference = outputs[0].tangent().as_value().unwrap();
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
+        tangent_reference.write(&TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())).unwrap();
+        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
+
+        // A symbolic zero initial tangent is instantiated as a zero-filled tangent reference, because a reference type
+        // is never zero-space and later stores need a concrete allocation to land in.
+        let input =
+            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(initial).unwrap(), context.clone());
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(
+            outputs[0].tangent().as_value().unwrap().read(),
+            Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_reference_new_transposition() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+
+        // `r = new(v); y = read(r)`: the read accumulates `ȳ` into the lazily allocated cotangent reference of `r`, and
+        // the allocation's transpose then freezes that accumulator into `v̄`, so the transposed program allocates the
+        // accumulator exactly once.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let output = builder
+            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = zero [type=f32[]]
+                    %2:ref<f32[]> = reference_new %1
+                    reference_add_update %2 %0
+                    %3:f32[] = reference_freeze %2
+                in (%3)"},
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestIrValue::Array(Array::scalar(3.0_f32).unwrap())]),
+            Ok(vec![TestIrValue::Array(Array::scalar(3.0_f32).unwrap())]),
+        );
+
+        // An allocation that nothing accumulates into was never allocated a cotangent reference, so its initial value's
+        // cotangent is a symbolic zero and neither `reference_new` nor `reference_freeze` is staged.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let value = builder.add_input(scalar_type.clone());
+        builder.add_instruction(TestIrNew::new(), Vec::new(), vec![initial], None).unwrap();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = zero [type=f32[]]
+                in (%1, %0)"},
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestIrValue::Array(Array::scalar(4.0_f32).unwrap())]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(0.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+            ]),
+        );
+
+        // The rule takes the allocation's accumulator from the transposition scope, which only a context scoped to the
+        // allocating instruction can resolve, so a detached context rejects it.
+        let inputs = [PartialValue::Unknown(scalar_type)];
+        let mut context = TranspositionContext::new(TracingContext::<TestIrValue, TestIrOperation>::new());
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert!(matches!(
+            TestIrNew::new().transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(reference_type)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "output 0 has no reference allocation in a transposition context that is not scoped to \
+                    a reference-carrying instruction",
+        ));
+    }
+
+    #[test]
+    fn test_reference_new_reference_discharge() {
         // Allocation binds a fresh discharged reference whose entering state is the initializer and whose reference
         // type is the one this operation's own inference derives, exposed through the storage alias of a complete
         // value.
@@ -439,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_primitive_discharge_preserves_an_unselected_allocation() {
+    fn test_reference_new_discharge_preserves_unselected_allocation() {
         // The allocation rule consults its own replay position against the targets, so an unselected allocation
         // target is replayed rather than turned into threaded state, and its allocated reference survives in the
         // destination.
@@ -489,81 +813,75 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_new_operation_jvp() {
-        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
-        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+    fn test_reference_new_operation_provider() {
+        // Composite array families construct the canonical reference allocation operation.
+        assert!(matches!(
+            TestIrOperation::provide(
+                ReferenceNewOperation::<ArrayIrType, ArrayIrType>::new(),
+                &[&ArrayIrType::Array(ArrayType::scalar(DataType::F32))],
+            ),
+            Ok(ArrayIrOperation::ReferenceNew(_)),
+        ));
 
-        // A live initial tangent seeds an independent tangent reference beside the primal allocation.
-        let input = DifferentiationTracer::new(
-            DifferentiationDual::new(initial.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()))
-                .unwrap(),
-            context.clone(),
-        );
-        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(
-            outputs[0].r#type().as_ref(),
-            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
-        );
-        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
-        let tangent_reference = outputs[0].tangent().as_value().unwrap();
-        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
-        tangent_reference.write(&TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())).unwrap();
-        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
+        // Homogeneous array and scalar families satisfy the provider contract without supporting references.
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(ReferenceNewOperation::<ArrayType, ArrayType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference allocation",
+        ));
+        assert!(matches!(
+            AddOperation::<DataType>::provide(ReferenceNewOperation::<DataType, DataType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference allocation",
+        ));
+    }
 
-        // A symbolic zero initial tangent is instantiated as a zero-filled tangent reference, because a reference type
-        // is never zero-space and later stores need a concrete allocation to land in.
-        let input =
-            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(initial).unwrap(), context.clone());
-        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+    #[test]
+    fn test_reference_new_projected() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // Allocating through a projected array member binds the operation through the parent tracer's context and
+        // hands back the projected reference member.
+        let (output_type, program) = TestContext::trace(
+            |input: TestTracer| {
+                let initial = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
+                let reference: ProjectedValue<ReferenceType<ArrayType>, TestTracer> = initial.reference_new()?;
+                reference.into_value().read()
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])));
         assert_eq!(
-            outputs[0].tangent().as_value().unwrap().read(),
-            Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap())),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:ref<f32[2]> = reference_new %0
+                    %2:f32[2] = reference_read %1
+                in (%2)"},
         );
     }
 
     #[test]
-    fn test_reference_new_operation_batching() {
-        let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
-        );
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
-            extent,
-        );
+    fn test_reference_new_staging() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
 
-        // A mapped initial value allocates a reference batched at the same axis.
-        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let initial =
-            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
-        let input =
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(initial.clone(), BatchAxis::new(1)).unwrap());
-        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        // A staged allocation is the native `reference_new` variant of the array operation family.
+        let (output_type, program) = TestContext::trace(
+            |input| input.reference_new()?.read(),
+            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         assert_eq!(
-            outputs[0].r#type().as_ref(),
-            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3]))),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:ref<f32[]> = reference_new %0
+                    %2:f32[] = reference_read %1
+                in (%2)"},
         );
-        assert_eq!(outputs[0].batch().value().read(), Ok(initial));
-
-        // A replicated initial value is broadcast along a new leading batch axis, so the allocation is always batched
-        // and can later receive batched values.
-        let initial = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
-        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(initial));
-        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            outputs[0].r#type().as_ref(),
-            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
-        );
-        assert_eq!(
-            outputs[0].batch().value().read(),
-            Ok(TestIrValue::Array(
-                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 1.0, 2.0])
-                    .unwrap()
-            )),
-        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 }

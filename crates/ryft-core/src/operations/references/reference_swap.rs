@@ -3,6 +3,8 @@
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
@@ -45,11 +47,25 @@ static REFERENCE_SWAP_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     .unwrap()
 });
 
-define_reference_operation!(
-    /// Replaces a reference's stored value with an exactly matching referent and returns the old value.
-    ReferenceSwapOperation,
-    REFERENCE_SWAP_OPERATION_NAME
-);
+/// Replaces a reference's stored value with an exactly matching referent and returns the old value.
+#[derive(Clone, Debug)]
+pub struct ReferenceSwapOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+
+impl<T: Type, U: Type> ReferenceSwapOperation<T, U> {
+    /// Creates a new [`ReferenceSwapOperation`].
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Copy for ReferenceSwapOperation<T, U> {}
+
+impl<T: Type, U: Type> Display for ReferenceSwapOperation<T, U> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REFERENCE_SWAP_OPERATION_NAME)
+    }
+}
 
 impl<T, U> Operation for ReferenceSwapOperation<T, U>
 where
@@ -340,7 +356,6 @@ mod tests {
         let value = TestType::Value(referent);
         let reference = TestType::Reference(ReferenceType::new(referent));
 
-        assert_parameter_roundtrip(Swap::new());
         assert_eq!(Swap::new().to_string(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(Swap::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(

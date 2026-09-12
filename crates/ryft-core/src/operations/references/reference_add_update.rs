@@ -3,6 +3,8 @@
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
@@ -44,11 +46,25 @@ static REFERENCE_ADD_UPDATE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new
     .unwrap()
 });
 
-define_reference_operation!(
-    /// Applies an ordered additive update whose result must retain the reference's exact referent type.
-    ReferenceAddUpdateOperation,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME
-);
+/// Applies an ordered additive update whose result must retain the reference's exact referent type.
+#[derive(Clone, Debug)]
+pub struct ReferenceAddUpdateOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+
+impl<T: Type, U: Type> ReferenceAddUpdateOperation<T, U> {
+    /// Creates a new [`ReferenceAddUpdateOperation`].
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Copy for ReferenceAddUpdateOperation<T, U> {}
+
+impl<T: Type, U: Type> Display for ReferenceAddUpdateOperation<T, U> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REFERENCE_ADD_UPDATE_OPERATION_NAME)
+    }
+}
 
 impl<T, U> Operation for ReferenceAddUpdateOperation<T, U>
 where
@@ -362,7 +378,6 @@ mod tests {
         let value = TestType::Value(referent);
         let reference = TestType::Reference(ReferenceType::new(referent));
 
-        assert_parameter_roundtrip(AddUpdate::new());
         assert_eq!(AddUpdate::new().to_string(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(AddUpdate::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(

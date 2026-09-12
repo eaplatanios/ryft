@@ -3,6 +3,8 @@
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
@@ -42,11 +44,25 @@ static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| 
     .unwrap()
 });
 
-define_reference_operation!(
-    /// Consumes an allocation reference, returning its final referent and invalidating its complete alias family.
-    ReferenceFreezeOperation,
-    REFERENCE_FREEZE_OPERATION_NAME
-);
+/// Consumes an allocation reference, returning its final referent and invalidating its complete alias family.
+#[derive(Clone, Debug)]
+pub struct ReferenceFreezeOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+
+impl<T: Type, U: Type> ReferenceFreezeOperation<T, U> {
+    /// Creates a new [`ReferenceFreezeOperation`].
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Copy for ReferenceFreezeOperation<T, U> {}
+
+impl<T: Type, U: Type> Display for ReferenceFreezeOperation<T, U> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REFERENCE_FREEZE_OPERATION_NAME)
+    }
+}
 
 impl<T, U> Operation for ReferenceFreezeOperation<T, U>
 where
@@ -334,80 +350,244 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::operations::math::add::AddOperation;
     use crate::operations::references::reference_new::ReferenceNew;
     use crate::operations::references::reference_read::ReferenceRead;
+    use crate::operations::references::reference_swap::ReferenceSwap;
     use crate::operations::references::tests::*;
-    use crate::programs::{EffectClass, EmptyRegionDriver, Typed};
-    use pretty_assertions::assert_eq;
+    use crate::parameters::Placeholder;
+    use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceError};
 
     use super::*;
 
     type TestIrValue = ArrayIrValue<Array>;
+    type TestIrOperation = ArrayIrOperation<Array>;
+    type TestIrFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
 
     #[test]
-    fn test_reference_freeze_operation() {
+    fn test_reference_freeze() {
+        let operation = Freeze::new();
+        assert_eq!(operation.name(), REFERENCE_FREEZE_OPERATION_NAME);
+        assert_eq!(operation.to_string(), REFERENCE_FREEZE_OPERATION_NAME);
+        assert_eq!(
+            format!("{operation:?}"),
+            format!("ReferenceFreezeOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
+        );
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert_eq!(
+            operation.effects().reference_effects(),
+            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }],
+        );
+        assert_eq!(operation.effects().reference_aliases(), &[]);
+    }
+
+    #[test]
+    fn test_reference_freeze_type_inference() {
         let referent = TestReferent::new(7, 16);
         let value = TestType::Value(referent);
         let reference = TestType::Reference(ReferenceType::new(referent));
-
-        assert_parameter_roundtrip(Freeze::new());
-        assert_eq!(Freeze::new().to_string(), REFERENCE_FREEZE_OPERATION_NAME);
-        assert_eq!(Freeze::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
-        assert_eq!(
-            Freeze::new().effects().reference_effects(),
-            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
-        );
-        assert_eq!(Freeze::new().effects().reference_aliases(), &[]);
-
-        let minimal_reference = ReadFreezeUniverse::Reference(ReferenceType::new(referent));
-        assert_eq!(
-            ReferenceFreezeOperation::<TestReferent, ReadFreezeUniverse>::new()
-                .infer_output_types(std::slice::from_ref(&minimal_reference), &[]),
-            Ok(vec![ReadFreezeUniverse::Value(referent)]),
-        );
-        assert_eq!(Freeze::new().infer_output_types(std::slice::from_ref(&reference), &[]), Ok(vec![value.clone()]),);
-        assert_eq!(Freeze::new().infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
-        assert_eq!(
-            Freeze::new().infer_output_types(std::slice::from_ref(&value), &[]),
-            Err(TypeError::invalid("expected reference type but got value type")),
+        check_operation_type_inference!(
+            operation = Freeze::new(),
+            cases = [
+                {
+                    input_types = [reference.clone()],
+                    output_types = [value.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [value],
+                    error = "expected reference type but got value type",
+                },
+            ],
         );
         let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
             Freeze::new().infer_output_types(std::slice::from_ref(&reference), std::slice::from_ref(&region)),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
+
+        // Freezing only requires a universe that embeds referents and projects reference types.
+        check_operation_type_inference!(
+            operation = ReferenceFreezeOperation::<TestReferent, ReadFreezeUniverse>::new(),
+            cases = [{
+                input_types = [ReadFreezeUniverse::Reference(ReferenceType::new(referent))],
+                output_types = [ReadFreezeUniverse::Value(referent)],
+            }],
+        );
+
+        // The array universe freezes array referents and rejects its other members.
+        let array_type = ArrayType::scalar(DataType::F32);
+        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::unbounded()));
+        check_operation_type_inference!(
+            operation = TestIrFreeze::new(),
+            cases = [
+                {
+                    input_types = [ArrayIrType::Reference(ReferenceType::new(array_type.clone()))],
+                    output_types = [ArrayIrType::Array(array_type.clone())],
+                },
+                {
+                    input_types = [ArrayIrType::Array(array_type)],
+                    error = "expected reference type but got array type",
+                },
+                {
+                    input_types = [ArrayIrType::Dimension(dimension_type)],
+                    error = "expected reference type but got dimension type",
+                },
+            ],
+        );
     }
 
     #[test]
-    fn test_reference_freeze_operation_reference_discharge() {
-        // A freeze yields the allocation's final state and unbinds the allocation, so every later access is a
-        // use-after-consume.
-        let (context, reference) = allocated_reference(4);
-        let handle = ReferenceDischargeValue::Reference(reference.clone());
+    fn test_reference_freeze_interpretation() {
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let value = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        let reference = TestIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
+        let alias = reference.clone();
+
+        // A freeze returns the final referent and invalidates the complete alias family, so every clone of the handle
+        // fails its next access against the shared allocation state.
         assert_eq!(
-            Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
-            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
+            InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+                &TestIrFreeze::new(),
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&reference),
+            ),
+            Ok(vec![value.clone()]),
         );
-        assert_eq!(context.live_allocation_ids(), Vec::new());
+        let error = alias.read().unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        let error = alias.freeze().unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        let error = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+            &TestIrFreeze::new(),
+            &context,
+            &EmptyRegionDriver,
+            std::slice::from_ref(&reference),
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+
+        // The value-level capability consumes its handle and agrees with the operation.
+        let reference = value.reference_new().unwrap();
+        assert_eq!(reference.freeze(), Ok(value.clone()));
+
+        // Only reference members can be frozen.
         assert_eq!(
-            Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge accessed consumed {}",
-                reference.allocation_id(),
-            ))),
+            InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+                &TestIrFreeze::new(),
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&value),
+            ),
+            Err(TypeError::invalid("expected reference type but got array type").into()),
+        );
+        assert_eq!(value.freeze(), Err(TypeError::invalid("expected reference type but got array type").into()));
+
+        // Freezing a dynamically typed referent returns exactly the installed dynamic payload rather than the original
+        // one, and the consumed handle fails afterwards. Equality over a dynamically typed `Array` cannot address its
+        // elements, so the frozen referent is unwrapped and compared by its declared type and storage. `Array`'s
+        // checked constructors reject dynamically shaped types, so both referents come from the test-only unchecked
+        // hatch.
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        let replacement_bytes = 2.0_f32.to_le_bytes().to_vec();
+        let initial = Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec());
+        let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
+        let reference = TestIrValue::Reference(ArrayReference::new(initial));
+        reference.swap(&TestIrValue::Array(replacement)).unwrap();
+        let frozen = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
+            &TestIrFreeze::new(),
+            &context,
+            &EmptyRegionDriver,
+            std::slice::from_ref(&reference),
+        )
+        .unwrap()
+        .remove(0);
+        let frozen = <TestIrValue as ValueProjection<ArrayType>>::into_projected(frozen).unwrap();
+        assert_eq!(frozen.r#type().into_owned(), dynamic_type);
+        assert_eq!(frozen.storage_bytes(), replacement_bytes.as_slice());
+        let error = reference.read().unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_reference_freeze_partial_evaluation() {
+        let value = TestIrValue::Array(Array::scalar(1.0_f32).unwrap());
+        let known = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let replay = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = TestIrFreeze::new(),
+            cases = [
+                {
+                    inputs = [(@known, known)],
+                    outputs = [(@known, value.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = reference_type, replay = replay))],
+                    outputs = [(@residual, value)],
+                    residual_instructions = 1,
+                },
+            ],
         );
     }
 
     #[test]
-    fn test_reference_freeze_operation_jvp() {
-        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
+    fn test_reference_freeze_batching() {
+        let extent = TestIrValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let packed =
+            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+
+        // Freezing a batched reference yields the final packed referent at the reference's batch axis.
+        let reference = packed.reference_new().unwrap();
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(outputs[0].batch().value(), &packed);
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        assert!(reference.read().is_err());
+
+        // Freezing a replicated reference stays replicated.
+        let reference = packed.reference_new().unwrap();
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference));
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].batch().value(), &packed);
+    }
+
+    #[test]
+    fn test_reference_freeze_differentiation() {
+        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, TestIrOperation>::new());
         let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
         let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
 
@@ -442,35 +622,161 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_freeze_operation_batching() {
-        let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
-        );
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
-            extent,
-        );
-        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let packed =
-            TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+    fn test_reference_freeze_transposition() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // Freezing a batched reference yields the final packed referent at the reference's batch axis.
-        let reference = packed.reference_new().unwrap();
-        let input =
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
-        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[0].batch().value(), &packed);
-        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
-        assert!(reference.read().is_err());
+        // `r = new(v); y = freeze(r)` reads the final state and consumes the allocation, so the freeze's transpose
+        // accumulates `ȳ` into the root's cotangent reference exactly like a read, and the allocation's transpose then
+        // freezes that accumulator into `v̄`.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let reference = builder
+            .add_instruction(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(TestIrFreeze::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = zero [type=f32[]]
+                    %2:ref<f32[]> = reference_new %1
+                    reference_add_update %2 %0
+                    %3:f32[] = reference_freeze %2
+                in (%3)"},
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestIrValue::Array(Array::scalar(2.0_f32).unwrap())]),
+            Ok(vec![TestIrValue::Array(Array::scalar(2.0_f32).unwrap())]),
+        );
 
-        // Freezing a replicated reference stays replicated.
-        let reference = packed.reference_new().unwrap();
-        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference));
-        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].batch().value(), &packed);
+        // The rule accumulates through the cotangent reference of its operand's root, which only a transposition
+        // context scoped to the freeze instruction can resolve, so a detached context rejects a live result cotangent.
+        let inputs = [PartialValue::Unknown(reference_type)];
+        let tracing = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let cotangent = tracing.input(scalar_type);
+        let mut context = TranspositionContext::new(tracing);
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert!(matches!(
+            TestIrFreeze::new().transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "input 0 has no reference root in a transposition context that is not scoped to a \
+                    reference-carrying instruction",
+        ));
+
+        // A symbolic zero result cotangent contributes nothing, so the rule never touches the cotangent reference.
+        assert_eq!(
+            TestIrFreeze::new().transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))],
+                &accumulators,
+            ),
+            Ok(()),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_reference_freeze_reference_discharge() {
+        // A freeze yields the allocation's final state and unbinds the allocation, so every later access is a
+        // use-after-consume.
+        let (context, reference) = allocated_reference(4);
+        let handle = ReferenceDischargeValue::Reference(reference.clone());
+        assert_eq!(
+            Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
+            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
+        );
+        assert_eq!(context.live_allocation_ids(), Vec::new());
+        assert_eq!(
+            Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed consumed {}",
+                reference.allocation_id(),
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_freeze_operation_provider() {
+        // Extraction uses the canonical consuming operation, keeping alias invalidation in the reference machinery.
+        assert!(matches!(
+            TestIrOperation::provide(
+                ReferenceFreezeOperation::<ArrayIrType, ArrayIrType>::new(),
+                &[&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))],
+            ),
+            Ok(ArrayIrOperation::ReferenceFreeze(_)),
+        ));
+
+        // Value-only families report unsupported construction instead of requiring reference conversions.
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(ReferenceFreezeOperation::<ArrayType, ArrayType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference freezing",
+        ));
+        assert!(matches!(
+            AddOperation::<DataType>::provide(ReferenceFreezeOperation::<DataType, DataType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference freezing",
+        ));
+    }
+
+    #[test]
+    fn test_reference_freeze_projected() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // Freezing through a projected reference member binds the operation through the parent tracer's context and
+        // hands back the projected array member.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        let (output_type, program) = TestContext::trace(
+            |input: TestTracer| {
+                let reference = <TestTracer as ValueProjection<ReferenceType<ArrayType>>>::into_projected(input)?;
+                let frozen: ProjectedValue<ArrayType, TestTracer> = reference.freeze()?;
+                Ok(frozen.into_value())
+            },
+            reference_type,
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[2]> .
+                let %1:f32[2] = reference_freeze %0
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_reference_freeze_staging() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+
+        // A staged freeze is the native `reference_freeze` variant of the array operation family.
+        let (output_type, program) = TestContext::trace(
+            |input| input.freeze(),
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]> .
+                let %1:f32[] = reference_freeze %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 }

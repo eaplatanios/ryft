@@ -17,75 +17,6 @@ use crate::programs::{
     Value,
 };
 
-macro_rules! define_reference_operation {
-    // Accepts `$(#[doc])* OperationType, OPERATION_NAME` and defines the zero-sized `OperationType<T, U>` payload
-    // indexed by its referent type `T` and enclosing type universe `U`, its constructor, its structural trait
-    // implementations, and its `Display` rendering through the canonical operation name, all without deriving
-    // unnecessary bounds on the phantom type parameters.
-    ($(#[$documentation:meta])* $operation:ident, $name:ident) => {
-        $(#[$documentation])*
-        pub struct $operation<T: $crate::programs::Type, U: $crate::programs::Type>(
-            std::marker::PhantomData<fn() -> (T, U)>,
-        );
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> $operation<T, U> {
-            #[doc = concat!("Creates a new [`", stringify!($operation), "`].")]
-            pub const fn new() -> Self {
-                Self(std::marker::PhantomData)
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> Copy for $operation<T, U> {}
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> Clone for $operation<T, U> {
-            #[inline]
-            fn clone(&self) -> Self {
-                *self
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> std::fmt::Debug for $operation<T, U> {
-            #[inline]
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!($operation))
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> std::fmt::Display for $operation<T, U> {
-            #[inline]
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str($name)
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> Default for $operation<T, U> {
-            #[inline]
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> PartialEq for $operation<T, U> {
-            #[inline]
-            fn eq(&self, _other: &Self) -> bool {
-                true
-            }
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> Eq for $operation<T, U> {}
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> std::hash::Hash for $operation<T, U> {
-            #[inline]
-            fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
-        }
-
-        impl<T: $crate::programs::Type, U: $crate::programs::Type> $crate::parameters::Parameter
-            for $operation<T, U>
-        {
-        }
-    };
-}
-
 /// Re-derives one reference primitive's own type inference over the carriers it received, so that a rewrite acts only
 /// on operands the operation itself accepts.
 ///
@@ -238,7 +169,7 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::math::add::{Add, AddOperation};
-    use crate::parameters::{Parameter, Parameterized, Placeholder};
+    use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{
         Effects, EmptyRegionDriver, ProgramBuilder, ReferenceAccumulationPolicy, ReferenceDischargeContext,
         ReferenceDischargeDriver, ReferenceDischargeReference, ReferenceDischargeableOperation,
@@ -1046,15 +977,6 @@ pub(crate) mod tests {
         let allocated = New::new().discharge_references(&context, &EmptyRegionDriver, &[initial]).unwrap();
         let reference = allocated[0].try_as_reference("the allocated reference").unwrap().clone();
         (context, reference)
-    }
-
-    /// Asserts that `parameter` round-trips through its parameter structure.
-    pub(crate) fn assert_parameter_roundtrip<P>(parameter: P)
-    where
-        P: Copy + Debug + PartialEq + Parameter,
-    {
-        let structure = <P as Parameterized<P>>::parameter_structure(&parameter);
-        assert_eq!(<P as Parameterized<P>>::from_parameters(structure, [parameter]), Ok(parameter));
     }
 
     #[test]
