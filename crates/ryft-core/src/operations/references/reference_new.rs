@@ -35,10 +35,6 @@ use crate::tracing::{Tracer, TracingContext};
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
 
-static REFERENCE_NEW_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-    Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
-});
-
 /// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
 #[derive(Clone, Debug)]
 pub struct ReferenceNewOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
@@ -91,7 +87,10 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Borrowed(&REFERENCE_NEW_OPERATION_EFFECTS)
+        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
+        });
+        Cow::Borrowed(&EFFECTS)
     }
 }
 
@@ -364,6 +363,7 @@ mod tests {
     use crate::operations::references::reference_write::ReferenceWrite;
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
         EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, TypeIdentityPosition,
     };
@@ -497,6 +497,7 @@ mod tests {
         assert_eq!(other.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())));
 
         // Only array members can be allocated, so a reference initializer is rejected before any allocation happens.
+        let mismatch: ProgramError = TypeError::invalid("expected array type but got reference type").into();
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
                 &TestIrNew::new(),
@@ -504,12 +505,9 @@ mod tests {
                 &EmptyRegionDriver,
                 std::slice::from_ref(&other),
             ),
-            Err(TypeError::invalid("expected array type but got reference type").into()),
+            Err(mismatch.clone()),
         );
-        assert_eq!(
-            other.reference_new(),
-            Err(TypeError::invalid("expected array type but got reference type").into()),
-        );
+        assert_eq!(other.reference_new(), Err(mismatch));
 
         // A dynamically shaped initializer allocates a reference of exactly its declared dynamic type. `Array`'s
         // checked constructors reject dynamically shaped types, so the referent comes from the test-only unchecked
@@ -518,7 +516,8 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
-        let dynamic = TestIrValue::Array(Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec()));
+        let dynamic =
+            TestIrValue::Array(Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec()));
         let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
             &TestIrNew::new(),
             &context,
@@ -531,31 +530,30 @@ mod tests {
 
     #[test]
     fn test_reference_new_partial_evaluation() {
-        // The allocated reference compares by identity rather than by value, so the known/unknown placement check is
-        // written out instead of going through the partial-evaluation check macro, which compares replayed outputs.
+        type TestContext = EagerContext<TestIrValue, TestIrOperation>;
+
         let initial = TestIrValue::Array(Array::scalar(1.0_f32).unwrap());
-        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
-        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
 
-        // A known initial value folds the allocation eagerly, so the known output is a live reference holding it.
-        let evaluation = program.partially_evaluate(&[PartialValue::Known(initial.clone())]).unwrap();
-        assert!(evaluation.program().instructions().is_empty());
-        assert_eq!(evaluation.outputs().len(), 1);
-        assert!(evaluation.outputs()[0].is_known());
-        let outputs = evaluation.interpret(&context, &[]).unwrap();
+        // Under the default `Execute` placement a known initial value folds the allocation eagerly, so the known output
+        // is a live reference holding the initial value.
+        let executing = PartialEvaluationContext::new(TestContext::new());
+        let outputs = executing
+            .fold_or_residualize(TestIrNew::new(), Vec::new(), &[PartialEvaluationValue::known(initial.clone())])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0], TestIrValue::Reference(_)));
-        assert_eq!(outputs[0].read(), Ok(initial.clone()));
+        let reference = outputs[0].as_known().unwrap();
+        assert!(matches!(reference, TestIrValue::Reference(_)));
+        assert_eq!(reference.read(), Ok(initial.clone()));
 
-        // An unknown initial value residualizes the allocation, whose reference output is then unknown.
-        let evaluation = program
-            .partially_evaluate(&[PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))])
-            .unwrap();
+        // An unknown initial value residualizes the allocation, whose reference output is then unknown and is allocated
+        // only when the residual program replays against the runtime initial value.
+        let executing = PartialEvaluationContext::new(TestContext::new());
+        let unknown = executing.unknown_input(scalar_type.clone(), 0);
+        let outputs = executing.fold_or_residualize(TestIrNew::new(), Vec::new(), &[unknown]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        let evaluation = executing.into_evaluation(outputs).unwrap();
         assert_eq!(
             evaluation.program().to_string(),
             indoc! {"
@@ -563,12 +561,35 @@ mod tests {
                 let %1:ref<f32[]> = reference_new %0
                 in (%1)"},
         );
+        let replayed = evaluation.interpret(&TestContext::new(), std::slice::from_ref(&initial)).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert!(matches!(replayed[0], TestIrValue::Reference(_)));
+        assert_eq!(replayed[0].read(), Ok(initial.clone()));
+
+        // Under the `Stage` placement even a known initial value stages the allocation, so eager specialization never
+        // creates live reference state. Program-level partial evaluation uses that placement, so a known initial value
+        // becomes a residual input of the retained allocation.
+        let staging =
+            PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
+        let outputs = staging
+            .fold_or_residualize(TestIrNew::new(), Vec::new(), &[PartialEvaluationValue::known(initial.clone())])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(scalar_type);
+        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(initial.clone())]).unwrap();
+        assert_eq!(evaluation.program().instructions().len(), 1);
         assert_eq!(evaluation.outputs().len(), 1);
         assert!(evaluation.outputs()[0].is_unknown());
-        let outputs = evaluation.interpret(&context, std::slice::from_ref(&initial)).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0], TestIrValue::Reference(_)));
-        assert_eq!(outputs[0].read(), Ok(initial));
+        let replayed = evaluation.interpret(&TestContext::new(), &[]).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert!(matches!(replayed[0], TestIrValue::Reference(_)));
+        assert_eq!(replayed[0].read(), Ok(initial));
     }
 
     #[test]

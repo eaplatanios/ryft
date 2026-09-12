@@ -26,6 +26,8 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::Broadcast;
+use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::gathering::{Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
@@ -1237,14 +1239,9 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 {
 }
 
-// Batch-varying (batched) start indices cannot ride along structurally — every batch item needs its own slice origin
-// while the lifted operation reads one origin for all batch items — so the rule falls back to per-item expansion via
-// `batch_by_item_expansion`: each batch item's input (when batched; a replicated input is used whole) and start
-// indices are extracted, sliced dynamically per item, and restacked along a fresh leading batch axis (the result's
-// batch axis is `0` even when the input carried its batch axis elsewhere). The expansion stages `O(batch_size)`
-// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
-// because it only goes through the value capability traits.
-// Batching rule for [`DynamicSliceOperation`].
+// Batched starts over a shared source are packed into one gather index vector per item. Mapped sources and
+// explicit-layout inputs retain per-item expansion, which extracts each input/start tuple and stacks its slice
+// along a leading batch axis. Both paths use existing capabilities in eager and tracing contexts.
 //
 // Replicated start indices keep the structural fast path: a batched input keeps its batch axis by slicing it
 // fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
@@ -1255,7 +1252,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard + Concatenate + Gather,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -1276,6 +1273,42 @@ where
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1..].iter().any(Option::is_some) {
+            // A shared source and rectangular windows are one gather, independent of the number of mapped
+            // starts. Keep each integer index in its original type so clipping preserves unsigned extremes.
+            // Explicit layouts retain the existing expansion path, which owns their layout transformations.
+            if batch_axes[0].is_none()
+                && inputs[0].r#type().layout().is_none()
+                && let Some(axis_size) = axis_size
+            {
+                let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
+                let output_type = self.infer_output_types(&input_types, &[])?[0].batched(
+                    0,
+                    Dimension::Static(axis_size),
+                    context.axis_sharding().clone(),
+                )?;
+                let indices = inputs[1..]
+                    .iter()
+                    .map(|input| {
+                        P::match_axis(context, input, Axis::from(0))?
+                            .value()
+                            .reshape(Shape::new(vec![Dimension::Static(axis_size), Dimension::Static(1)]))
+                            .map_err(BatchingError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let indices = C::Value::concatenate(&indices, 1)?;
+                let operation = GatherOperation::new(
+                    GatherDimensionNumbers::new(
+                        (1..=self.sizes.len()).collect(),
+                        Vec::new(),
+                        (0..self.sizes.len()).collect(),
+                    ),
+                    self.sizes.clone(),
+                )
+                .with_mode(GatherScatterMode::Clip)
+                .with_output_sharding(output_type.sharding().cloned());
+                let output = inputs[0].value().gather(&indices, &operation)?;
+                return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?].into());
+            }
             return Ok(batch_by_item_expansion(
                 context,
                 crate::operations::manipulation::DYNAMIC_SLICE_OPERATION_NAME,
@@ -4344,9 +4377,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_slice_batching_expands_batch_varying_indices() {
-        // Batch-varying start indices over a replicated input expand per item: item 0 reads `x[0..2]` and item 1
-        // reads `x[2..4]` of the shared input, restacked along a fresh leading batch axis.
+    fn test_dynamic_slice_batching_with_mapped_indices() {
+        // Mapped start indices over a replicated input share one gather: item 0 reads `x[0..2]` and item 1
+        // reads `x[2..4]`, with a leading output batch axis.
         let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
@@ -4361,6 +4394,76 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(2)]);
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
+
+        // Signed and unsigned extremes clamp before narrowing; neither negative wrapping nor signed
+        // reinterpretation of `u64::MAX` is part of this raw-index contract.
+        for (starts, expected) in [
+            (Array::vector(vec![i64::MIN, i64::MAX]).unwrap(), vec![0.0, 1.0, 2.0, 3.0]),
+            (Array::vector(vec![0_u64, u64::MAX]).unwrap(), vec![0.0, 1.0, 2.0, 3.0]),
+            (Array::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
+        ] {
+            let size = starts.r#type().static_shape().unwrap()[0];
+            let output = batch(
+                |(input, start)| input.dynamic_slice(&[start], &[2]),
+                (Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap(), starts),
+                (BatchAxis::replicated(), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.r#type().static_shape().unwrap().as_slice(), &[size, 2]);
+            assert_eq!(output.to_f64s(), expected);
+        }
+
+        // Mixed replicated/mapped coordinates form one vector per window; the full-width second coordinate
+        // clamps to zero. This also covers concatenating multiple columns and an empty result window.
+        for sizes in [vec![1, 3], vec![0, 3]] {
+            let output = batch(
+                |(input, row, column)| input.dynamic_slice(&[row, column], &sizes),
+                (
+                    Array::matrix(3, 3, (0..9).map(f64::from).collect()).unwrap(),
+                    Array::vector(vec![-1_i32, 2]).unwrap(),
+                    Array::scalar(99_i32).unwrap(),
+                ),
+                (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.r#type().static_shape().unwrap().as_slice(), &[2, sizes[0], 3]);
+            assert_eq!(output.to_f64s(), if sizes[0] == 0 { vec![] } else { vec![0., 1., 2., 6., 7., 8.] });
+        }
+
+        // The gather keeps mapped placement and host memory metadata rather than replicating the result.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [4])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let index_type = ArrayType::new_static(DataType::I32, [2])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let output = DynamicSliceOperation::new(vec![2])
+            .batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2)
+                    .with_axis_sharding(ShardingDimension::sharded(["x"])),
+                &EmptyRegionDriver,
+                &[
+                    ArrayBatch::replicated(Array::from_elements(input_type, &[0_f64, 1., 2., 3.]).unwrap()),
+                    ArrayBatch::new(Array::from_elements(index_type, &[0_i32, 2]).unwrap(), BatchAxis::new(0)).unwrap(),
+                ],
+            )
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
+        assert_eq!(
+            output.r#type().sharding().unwrap(),
+            &Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap()
+        );
+        assert_eq!(output.value().to_f64s(), vec![0., 1., 2., 3.]);
 
         // A batched input pairs item `i` of the input with item `i` of the indices; item 1's start index 3 is
         // clamped to 2 so the extracted block stays in bounds.
@@ -4431,9 +4534,29 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_batching_under_tracing() {
+        // The staged graph stays constant-sized as the mapped length grows.
+        for size in [2, 256] {
+            let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+                |(input, starts)| {
+                    batch(
+                        |(input, start)| input.dynamic_slice(&[start], &[2]),
+                        (input, starts),
+                        (BatchAxis::replicated(), BatchAxis::new(0)),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .map_err(ProgramError::from)
+                },
+                (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::I32, [size])),
+            )
+            .unwrap();
+            let names =
+                program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>();
+            assert_eq!(names, vec!["reshape", "gather"]);
+        }
+
         // vmap-under-tracing composition: each batch item extracts a window of the differentiated vector at its own
-        // start index, so the batching rule must stage the per-item expansion (instead of rejecting the batch-varying
-        // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
+        // start index, so the batching rule must stage the shared gather and its transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
         let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())

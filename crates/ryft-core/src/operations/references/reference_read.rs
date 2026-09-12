@@ -37,15 +37,6 @@ use super::forwarded_tangent;
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
 
-static REFERENCE_READ_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-    Effects::new(
-        EffectClasses::NONE,
-        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-        Vec::new(),
-    )
-    .unwrap()
-});
-
 /// Reads the current referent snapshot from a reference in the enclosing type universe `U`.
 #[derive(Clone, Debug)]
 pub struct ReferenceReadOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
@@ -92,7 +83,15 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Borrowed(&REFERENCE_READ_OPERATION_EFFECTS)
+        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+            Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                Vec::new(),
+            )
+            .unwrap()
+        });
+        Cow::Borrowed(&EFFECTS)
     }
 }
 
@@ -285,6 +284,7 @@ mod tests {
     use crate::operations::references::reference_new::ReferenceNew;
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceError};
 
     use super::*;
@@ -408,8 +408,10 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
         let initial_bytes = 1.0_f32.to_le_bytes().to_vec();
-        let reference =
-            TestIrValue::Reference(ArrayReference::new(Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone())));
+        let reference = TestIrValue::Reference(ArrayReference::new(Array::with_unchecked_type(
+            dynamic_type.clone(),
+            initial_bytes.clone(),
+        )));
         let read = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
             &TestIrRead::new(),
             &context,
@@ -436,7 +438,32 @@ mod tests {
 
     #[test]
     fn test_reference_read_partial_evaluation() {
+        type TestContext = EagerContext<TestIrValue, TestIrOperation>;
+
         let value = TestIrValue::Array(Array::scalar(1.0_f32).unwrap());
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
+
+        // Under the default `Execute` placement a known reference folds the read against the live state, which the read
+        // leaves untouched.
+        let executing = PartialEvaluationContext::new(TestContext::new());
+        let outputs = executing
+            .fold_or_residualize(TestIrRead::new(), Vec::new(), std::slice::from_ref(&reference))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&value));
+        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
+
+        // Under the `Stage` placement the read stays residual regardless of operand knowledge, so eager specialization
+        // never observes live reference state.
+        let staging =
+            PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
+        let outputs = staging.fold_or_residualize(TestIrRead::new(), Vec::new(), &[reference]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+
+        // Program-level partial evaluation uses the `Stage` placement, so both a known and an unknown reference retain
+        // the read in the residual program and replay it against the runtime reference.
         let known = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         let replay = TestIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32).unwrap()));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
@@ -446,8 +473,8 @@ mod tests {
             cases = [
                 {
                     inputs = [(@known, known)],
-                    outputs = [(@known, value.clone())],
-                    residual_instructions = 0,
+                    outputs = [(@residual, value.clone())],
+                    residual_instructions = 1,
                 },
                 {
                     inputs = [(@unknown(type = reference_type, replay = replay))],

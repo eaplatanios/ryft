@@ -38,15 +38,6 @@ use super::{align_stored_batch, stored_tangents, validate_operand_types};
 /// Canonical operation name for [`ReferenceWriteOperation`].
 pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
 
-static REFERENCE_WRITE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-    Effects::new(
-        EffectClasses::NONE,
-        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }],
-        Vec::new(),
-    )
-    .unwrap()
-});
-
 /// Replaces a reference's stored value with an exactly matching referent without observing the old value.
 #[derive(Clone, Debug)]
 pub struct ReferenceWriteOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
@@ -102,7 +93,15 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Borrowed(&REFERENCE_WRITE_OPERATION_EFFECTS)
+        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+            Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }],
+                Vec::new(),
+            )
+            .unwrap()
+        });
+        Cow::Borrowed(&EFFECTS)
     }
 }
 

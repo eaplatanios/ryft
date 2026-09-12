@@ -510,13 +510,20 @@ pub trait Reshape: Sized {
         }
     }
 
-    /// Returns the input as a one-dimensional array in logical row-major order. The element count must be known;
-    /// an empty input produces shape `[0]`. Storage sharing or copying is determined by the backend.
+    /// Returns the input as a one-dimensional array in logical row-major order. An input that is already a vector
+    /// retains its shape, including a dynamic extent. Other ranks require a known element count; an empty input
+    /// produces shape `[0]`. Storage sharing or copying is determined by the backend.
     fn ravel(&self) -> Result<Self, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
     {
-        self.reshape_to_sizes(&[-1])
+        let input_type = self.r#type();
+        if input_type.rank() == 1 {
+            // An existing vector needs no inferred element count or newly introduced dimension identity.
+            self.reshape(input_type.shape().clone())
+        } else {
+            self.reshape_to_sizes(&[-1])
+        }
     }
 
     /// Returns a one-dimensional array in logical row-major order, with the same contract as [`Self::ravel`].
@@ -2053,6 +2060,15 @@ mod tests {
 
     #[test]
     fn test_array_type_reshape() {
+        // Flattening an existing dynamic vector preserves its nominal identity and placement.
+        let vector = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        )
+        .with_memory(Memory::Host { pinned: true });
+        assert_eq!(vector.ravel(), Ok(vector.clone()));
+        assert_eq!(vector.flatten(), Ok(vector));
+
         // Dynamic dimensions can only be reshaped without explicit dimension inputs when equality follows directly
         // from identical shapes carrying the same symbolic identities. Other runtime relationships require the mixed
         // reshape operation and its explicit result-dimension inputs.

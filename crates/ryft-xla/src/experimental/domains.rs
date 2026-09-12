@@ -5979,7 +5979,7 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayOperation, ArraySliceAxis, Atan2Operation, CalleeRegionDriver,
+        AddOperation, AndOperation, ArrayOperation, ArraySliceAxis, Atan2Operation, BatchAxis, CalleeRegionDriver,
         CaptureReference, CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
         CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation,
@@ -5987,15 +5987,15 @@ mod tests {
         DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMulOperation,
         DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill,
-        Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, IotaOperation, LogSumExpOperation,
-        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
-        ScatterOperation, SelectOperation, Sharding, ShardingDimension, SliceOperation, StaticShape, SubOperation,
-        WhileOperation, ZeroOperation, try_jit_with_options,
+        DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, Fill, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode,
+        IotaOperation, LogSumExpOperation, MulOperation, NegOperation, OneOperation, PrintOperation,
+        RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
+        ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, SliceOperation,
+        StaticShape, SubOperation, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7270,9 +7270,11 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         // These fixtures use the pinned JAX oracle values. Build the first five mixed graphs at each concrete
-        // signature and replay dynamic-axis capability graphs for the last two. Keep dimension residuals internal
-        // to a fused primal/pullback; no case asserts reuse of one bounded executable across physical shapes.
-        for name in ["reshape", "broadcast", "concatenate", "gather", "slice", "gather_axis", "scatter_axis"] {
+        // signature and replay dynamic-axis capability graphs for the remaining cases. Keep dimension residuals
+        // internal to a fused primal/pullback; no case asserts reuse of one bounded executable across physical shapes.
+        for name in
+            ["reshape", "broadcast", "concatenate", "gather", "slice", "gather_axis", "scatter_axis", "batched_slice"]
+        {
             for size in [4, 5] {
                 let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
                 let mut builder = XlaProgramBuilder::new();
@@ -7347,19 +7349,28 @@ mod tests {
                             None,
                         )
                         .unwrap()[0],
-                    "gather_axis" | "scatter_axis" => input,
+                    "gather_axis" | "scatter_axis" | "batched_slice" => input,
                     _ => unreachable!(),
                 };
                 let program = builder
                     .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 5], vec![Placeholder])
                     .unwrap();
-                let program = if name == "gather_axis" || name == "scatter_axis" {
+                let program = if matches!(name, "gather_axis" | "scatter_axis" | "batched_slice") {
                     // Trace the convenience with a dynamic selected axis. Unlike the derived arithmetic shapes
                     // above, this geometry can be specialized through the existing replay path.
                     let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                         |inputs| {
                             let indices = inputs[1].reshape(Shape::new(vec![Dimension::Static(3)])).unwrap();
-                            vec![if name == "gather_axis" {
+                            vec![if name == "batched_slice" {
+                                batch(
+                                    |(input, start, zero)| input.dynamic_slice(&[start, zero], &[2, 4]),
+                                    (inputs[0].clone(), indices, inputs[3].clone()),
+                                    (BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()),
+                                    BatchAxis::new(0),
+                                    None,
+                                )
+                                .unwrap()
+                            } else if name == "gather_axis" {
                                 inputs[0].gather_axis(&indices, 0, GatherScatterMode::Clip).unwrap()
                             } else {
                                 inputs[0]
@@ -7405,6 +7416,10 @@ mod tests {
                     "concatenate" => (vec![2 * size, 4], [values.clone(), values.clone()].concat()),
                     "gather" | "gather_axis" => (vec![3, 4], [&values[4..8], &values[4..8], &values[12..16]].concat()),
                     "slice" => (vec![2, 4], values[4..12].to_vec()),
+                    "batched_slice" => {
+                        let start = 3.min(size - 2) * 4;
+                        (vec![3, 2, 4], [&values[4..12], &values[4..12], &values[start..start + 8]].concat())
+                    }
                     "scatter_axis" => {
                         let mut expected = values.clone();
                         expected[4..8].iter_mut().for_each(|value| *value += 2.);
@@ -7475,6 +7490,11 @@ mod tests {
                 if name == "slice" {
                     gradient.fill(0.);
                     gradient[4..12].fill(1.);
+                }
+                if name == "batched_slice" {
+                    // Overlapping windows accumulate rather than overwrite their input cotangents.
+                    let rows = if size == 4 { vec![0., 2., 3., 1.] } else { vec![0., 2., 2., 1., 1.] };
+                    gradient = rows.into_iter().flat_map(|value| [value; 4]).collect();
                 }
                 assert_eq!(outputs[1].shape().as_slice(), &[size, 4]);
                 assert_eq!(read_f64s(&client, &outputs[1]), gradient, "{name} pullback, n={size}");

@@ -38,15 +38,6 @@ use super::{align_stored_batch, stored_tangents, validate_operand_types};
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
 
-static REFERENCE_SWAP_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-    Effects::new(
-        EffectClasses::NONE,
-        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
-        Vec::new(),
-    )
-    .unwrap()
-});
-
 /// Replaces a reference's stored value with an exactly matching referent and returns the old value.
 #[derive(Clone, Debug)]
 pub struct ReferenceSwapOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
@@ -102,7 +93,15 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Borrowed(&REFERENCE_SWAP_OPERATION_EFFECTS)
+        static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+            Effects::new(
+                EffectClasses::NONE,
+                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
+                Vec::new(),
+            )
+            .unwrap()
+        });
+        Cow::Borrowed(&EFFECTS)
     }
 }
 
@@ -332,102 +331,321 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayType, DataType,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayReference, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-    use crate::operations::references::reference_new::ReferenceNew;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::operations::references::reference_freeze::{ReferenceFreeze, ReferenceFreezeOperation};
+    use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;
     use crate::operations::references::tests::*;
-    use crate::programs::{EffectClass, EmptyRegionDriver};
-    use pretty_assertions::assert_eq;
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
+    use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
 
     type TestIrValue = ArrayIrValue<Array>;
+    type TestIrOperation = ArrayIrOperation<Array>;
+    type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
+    type TestIrSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
 
     #[test]
-    fn test_reference_swap_operation() {
-        let referent = TestReferent::new(7, 16);
-        let promoted_refinement = TestReferent::new(7, 32);
-        let value = TestType::Value(referent);
-        let reference = TestType::Reference(ReferenceType::new(referent));
-
-        assert_eq!(Swap::new().to_string(), REFERENCE_SWAP_OPERATION_NAME);
-        assert_eq!(Swap::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+    fn test_reference_swap() {
+        let operation = Swap::new();
+        assert_eq!(operation.name(), REFERENCE_SWAP_OPERATION_NAME);
+        assert_eq!(operation.to_string(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(
-            Swap::new().effects().reference_effects(),
+            format!("{operation:?}"),
+            "ReferenceSwapOperation(PhantomData<fn() -> (ryft_core::operations::references::tests::TestReferent, \
+             ryft_core::operations::references::tests::TestType)>)",
+        );
+
+        // A swap orders against other state effects, reads and writes its reference operand, and aliases nothing.
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert_eq!(
+            operation.effects().reference_effects(),
             &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }]
         );
-        assert_eq!(Swap::new().effects().reference_aliases(), &[]);
+        assert_eq!(operation.effects().reference_aliases(), &[]);
+    }
 
-        assert_eq!(
-            ReferenceSwapOperation::<TestReferent, SwapUniverse>::new().infer_output_types(
-                &[SwapUniverse::Reference(ReferenceType::new(referent)), SwapUniverse::Value(referent)],
-                &[],
-            ),
-            Ok(vec![SwapUniverse::Value(referent)]),
-        );
-        assert_eq!(Swap::new().infer_output_types(&[reference.clone(), value.clone()], &[]), Ok(vec![value.clone()]),);
-        assert_eq!(
-            Swap::new().infer_output_types(&[reference.clone(), TestType::Value(promoted_refinement)], &[]),
-            Err(TypeError::invalid(
-                "`reference_swap` replacement type `value<i7,p32>` must exactly match reference referent type \
-                 `value<i7,p16>`",
-            )),
-        );
-        assert_eq!(
-            Swap::new().infer_output_types(std::slice::from_ref(&reference), &[]),
-            Err(TypeError::invalid("expected 2 inputs but got 1")),
-        );
-        assert_eq!(
-            Swap::new().infer_output_types(&[value.clone(), value.clone()], &[]),
-            Err(TypeError::invalid("expected reference type but got value type")),
-        );
-        assert_eq!(
-            Swap::new().infer_output_types(&[reference.clone(), reference.clone()], &[]),
-            Err(TypeError::invalid("expected value type but got reference type")),
+    #[test]
+    fn test_reference_swap_type_inference() {
+        let referent = TestReferent::new(7, 16);
+        let value = TestType::Value(referent);
+        let reference = TestType::Reference(ReferenceType::new(referent));
+        check_operation_type_inference!(
+            operation = Swap::new(),
+            cases = [
+                {
+                    input_types = [reference.clone(), value.clone()],
+                    output_types = [value.clone()],
+                },
+                {
+                    input_types = [reference.clone(), TestType::Value(TestReferent::new(7, 32))],
+                    error = "`reference_swap` replacement type `value<i7,p32>` must exactly match reference referent \
+                             type `value<i7,p16>`",
+                },
+                {
+                    input_types = [reference.clone()],
+                    error = "expected 2 inputs but got 1",
+                },
+                {
+                    input_types = [value.clone(), value.clone()],
+                    error = "expected reference type but got value type",
+                },
+                {
+                    input_types = [reference.clone(), reference.clone()],
+                    error = "expected value type but got reference type",
+                },
+            ],
         );
         let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
             Swap::new().infer_output_types(&[reference, value], std::slice::from_ref(&region)),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
+
+        // A universe must project references and values out of itself and embed the previous value back into itself.
+        check_operation_type_inference!(
+            operation = ReferenceSwapOperation::<TestReferent, SwapUniverse>::new(),
+            cases = [{
+                input_types = [SwapUniverse::Reference(ReferenceType::new(referent)), SwapUniverse::Value(referent)],
+                output_types = [SwapUniverse::Value(referent)],
+            }],
+        );
+
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        check_operation_type_inference!(
+            operation = TestIrSwap::new(),
+            cases = [
+                {
+                    input_types = [
+                        ArrayIrType::Reference(ReferenceType::new(vector_type.clone())),
+                        ArrayIrType::Array(vector_type.clone()),
+                    ],
+                    output_types = [ArrayIrType::Array(vector_type.clone())],
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Reference(ReferenceType::new(vector_type.clone())),
+                        ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
+                    ],
+                    error = "`reference_swap` replacement type `f32[3]` must exactly match reference referent type \
+                             `f32[2]`",
+                },
+                {
+                    input_types = [ArrayIrType::Array(vector_type.clone()), ArrayIrType::Array(vector_type.clone())],
+                    error = "expected reference type but got array type",
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Reference(ReferenceType::new(vector_type.clone())),
+                        ArrayIrType::Reference(ReferenceType::new(vector_type)),
+                    ],
+                    error = "expected array type but got reference type",
+                },
+            ],
+        );
     }
 
     #[test]
-    fn test_reference_swap_operation_reference_discharge() {
-        // A replacement returns the previous state and commits the successor, which marks the allocation mutated.
-        let (context, reference) = allocated_reference(4);
-        let inputs = vec![
-            ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
-        ];
-        assert_eq!(
-            Swap::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()),
-            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
-        );
-        assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
-        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
+    fn test_reference_swap_interpretation() {
+        let live = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        let reference = TestIrValue::Reference(live.clone());
 
-        // The replacement itself must be a value rather than a second reference handle.
-        let handles =
-            vec![ReferenceDischargeValue::Reference(reference.clone()), ReferenceDischargeValue::Reference(reference)];
+        // A replacement carrying exactly the referent type replaces the stored value and returns the previous value.
         assert_eq!(
-            Swap::new().discharge_references(&context, &EmptyRegionDriver, handles.as_slice()),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a replacement value but received {}",
-                handles[1],
-            ))),
+            InterpretableOperation::<TestIrContext>::interpret(
+                &TestIrSwap::new(),
+                &TestIrContext::new(),
+                &EmptyRegionDriver,
+                &[reference.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())],
+            ),
+            Ok(vec![TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap())]),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
+
+        // Exact operand inference runs before the swap, so a rejected replacement leaves the stored value unchanged.
+        assert_eq!(
+            InterpretableOperation::<TestIrContext>::interpret(
+                &TestIrSwap::new(),
+                &TestIrContext::new(),
+                &EmptyRegionDriver,
+                &[reference.clone(), TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0, 7.0]).unwrap())],
+            ),
+            Err(TypeError::invalid(
+                "`reference_swap` replacement type `f32[3]` must exactly match reference referent type `f32[2]`",
+            )
+            .into()),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
+
+        // Each operand must be the member kind the operation expects.
+        let array = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap());
+        assert_eq!(
+            InterpretableOperation::<TestIrContext>::interpret(
+                &TestIrSwap::new(),
+                &TestIrContext::new(),
+                &EmptyRegionDriver,
+                &[array.clone(), array],
+            ),
+            Err(TypeError::invalid("expected reference type but got array type").into()),
+        );
+        assert_eq!(
+            InterpretableOperation::<TestIrContext>::interpret(
+                &TestIrSwap::new(),
+                &TestIrContext::new(),
+                &EmptyRegionDriver,
+                &[reference.clone(), reference],
+            ),
+            Err(TypeError::invalid("expected array type but got reference type").into()),
+        );
+        assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
+
+        // Equality over a dynamically typed `Array` cannot address its elements, so a dynamically typed referent is
+        // compared by its declared type and its exact physical storage. Both referents come from the test-only
+        // unchecked hatch because the checked constructors reject dynamically shaped types, and they declare exactly
+        // the same dynamic type, so the swap is observable only through the payloads it returns and installs.
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        let initial_bytes = 1.0_f32.to_le_bytes().to_vec();
+        let replacement_bytes = 2.0_f32.to_le_bytes().to_vec();
+        let live = ArrayReference::new(Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone()));
+        let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
+        let mut outputs = InterpretableOperation::<TestIrContext>::interpret(
+            &TestIrSwap::new(),
+            &TestIrContext::new(),
+            &EmptyRegionDriver,
+            &[TestIrValue::Reference(live.clone()), TestIrValue::Array(replacement)],
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        let previous = <TestIrValue as ValueProjection<ArrayType>>::into_projected(outputs.remove(0)).unwrap();
+        assert_eq!(previous.r#type().into_owned(), dynamic_type);
+        assert_eq!(previous.storage_bytes(), initial_bytes.as_slice());
+        let installed = live.read().unwrap();
+        assert_eq!(installed.r#type().into_owned(), dynamic_type);
+        assert_eq!(installed.storage_bytes(), replacement_bytes.as_slice());
+    }
+
+    #[test]
+    fn test_reference_swap_partial_evaluation() {
+        // Program replay uses the `Stage` placement: a swap stages regardless of operand knowledge, its previous value
+        // is an unknown of the residual program, the live handle is passed to that program as a known reference input,
+        // and the swap runs only when that program runs.
+        let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (TestIrValue, TestIrOperation),
+            operation = TestIrSwap::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(live.clone())),
+                        (@known, TestIrValue::Array(Array::scalar(2.0_f32).unwrap())),
+                    ],
+                    outputs = [(@residual, TestIrValue::Array(Array::scalar(1.0_f32).unwrap()))],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(live.clone())),
+                        (@unknown(
+                            type = ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                            replay = TestIrValue::Array(Array::scalar(3.0_f32).unwrap())
+                        )),
+                    ],
+                    outputs = [(@residual, TestIrValue::Array(Array::scalar(2.0_f32).unwrap()))],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
+
+        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every operand
+        // is known.
+        let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
+        let replacement = PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(4.0_f32).unwrap()));
+        let staging =
+            PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
+        let swapped = staging
+            .fold_or_residualize(TestIrSwap::new(), Vec::new(), &[reference.clone(), replacement.clone()])
+            .unwrap();
+        assert_eq!(swapped.len(), 1);
+        assert!(swapped[0].is_unknown());
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
+
+        // Under the default `Execute` placement an all-known swap folds: it runs against the live state in program
+        // order at partial evaluation time and its previous value is known.
+        let executing = PartialEvaluationContext::new(TestIrContext::new());
+        let swapped = executing.fold_or_residualize(TestIrSwap::new(), Vec::new(), &[reference, replacement]).unwrap();
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(swapped[0].as_known(), Some(&TestIrValue::Array(Array::scalar(3.0_f32).unwrap())));
+        assert_eq!(live.read(), Ok(Array::scalar(4.0_f32).unwrap()));
+    }
+
+    #[test]
+    fn test_reference_swap_batching() {
+        let extent = TestIrValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestIrContext::new(), extent);
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let initial = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
+        let reference = initial.reference_new().unwrap();
+        let batched =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+
+        // A replacement mapped at the reference's batch axis is swapped packed, and the previous packed value is
+        // batched at the reference's axis.
+        let aligned = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap(),
+        );
+        let replacement =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(aligned.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[batched, replacement]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(outputs[0].batch().value(), &initial);
+        assert_eq!(reference.read(), Ok(aligned));
+
+        // A batched replacement cannot be swapped into an unbatched reference.
+        let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference.clone()));
+        let replacement = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::new(
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[0.0; 6]).unwrap()),
+                BatchAxis::new(1),
+            )
+            .unwrap(),
+        );
+        let error = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[replicated, replacement]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::UnsupportedOperation {
+                message: "`reference_swap` cannot store a batched value into an unbatched reference; pass the \
+                          reference as a batched input instead"
+                    .to_string(),
+            }),
         );
     }
 
     #[test]
-    fn test_reference_swap_operation_jvp() {
-        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
+    fn test_reference_swap_differentiation() {
+        let context = DifferentiationContext::fused(TestIrContext::new());
         let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
         let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
         let active = DifferentiationTracer::new(
@@ -497,54 +715,235 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_swap_operation_batching() {
-        let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
-        );
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
-            extent,
-        );
-        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let initial = TestIrValue::Array(
-            Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
-        );
-        let reference = initial.reference_new().unwrap();
-        let batched =
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+    fn test_reference_swap_transposition() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // A replacement mapped at the reference's batch axis is swapped packed, and the previous packed value is
-        // batched at the reference's axis.
-        let aligned = TestIrValue::Array(
-            Array::from_elements::<f32>(packed_type.clone(), &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap(),
-        );
-        let replacement =
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(aligned.clone(), BatchAxis::new(1)).unwrap());
-        let outputs = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[batched, replacement]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[0].batch().value(), &initial);
-        assert_eq!(reference.read(), Ok(aligned));
+        // The swap transposes through the cotangent accumulator of its reference operand, which only a transposition
+        // context scoped to the instruction being transposed can resolve, so a detached context rejects it.
+        let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(scalar_type.clone())];
+        let tracing = TracingContext::<TestIrValue, TestIrOperation>::new();
+        let cotangent = tracing.input(scalar_type.clone());
+        let mut context = TranspositionContext::new(tracing);
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert!(matches!(
+            TestIrSwap::new().transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent)],
+                &accumulators,
+            ),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "input 0 has no reference root in a transposition context that is not scoped to a \
+                    reference-carrying instruction",
+        ));
 
-        // A batched replacement cannot be swapped into an unbatched reference.
-        let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference.clone()));
-        let replacement = BatchingTracer::new(
-            context.clone(),
-            ArrayIrBatch::new(
-                TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[0.0; 6]).unwrap()),
-                BatchAxis::new(1),
+        // `r = new(v); y = swap(r, x); z = freeze(r)`: the freeze lands `z̄` in the allocation's accumulator, the swap
+        // swaps `ȳ` into it and hands its previous contents to `x̄ = z̄`, and the allocation freezes the accumulator
+        // into `v̄ = ȳ`.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let replacement = builder.add_input(scalar_type.clone());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![previous, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
             )
-            .unwrap(),
-        );
-        let error = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[replicated, replacement]).unwrap_err();
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
-            error.downcast_custom::<BatchingError>(),
-            Some(&BatchingError::UnsupportedOperation {
-                message: "`reference_swap` cannot store a batched value into an unbatched reference; pass the \
-                          reference as a batched input instead"
-                    .to_string(),
-            }),
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = zero [type=f32[]]
+                    %3:ref<f32[]> = reference_new %2
+                    reference_add_update %3 %1
+                    %4:f32[] = reference_swap %3 %0
+                    %5:f32[] = reference_freeze %3
+                in (%5, %4)
+            "}
+            .trim_end(),
         );
+        assert_eq!(
+            transposed.interpret(vec![
+                TestIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+            ]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+            ]),
+        );
+
+        // A dead swap result whose accumulator a later freeze allocated instantiates its zero cotangent, because the
+        // accumulator must observe the swap: `x̄ = z̄` and `v̄ = 0`.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let replacement = builder.add_input(scalar_type.clone());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = zero [type=f32[]]
+                    %2:ref<f32[]> = reference_new %1
+                    reference_add_update %2 %0
+                    %3:f32[] = zero [type=f32[]]
+                    %4:f32[] = reference_swap %2 %3
+                    %5:f32[] = reference_freeze %2
+                in (%5, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestIrValue::Array(Array::scalar(5.0_f32).unwrap())]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(0.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+            ]),
+        );
+
+        // A dead swap result with an accumulator that nothing reached stages nothing and leaves both cotangents
+        // symbolic zeros.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let replacement = builder.add_input(scalar_type);
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::<Placeholder>::new())
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[] = zero [type=f32[]]
+                    %1:f32[] = zero [type=f32[]]
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            transposed.interpret(Vec::new()),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(0.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(0.0_f32).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_reference_swap_reference_discharge() {
+        // A replacement returns the previous state and commits the successor, which marks the allocation mutated.
+        let (context, reference) = allocated_reference(4);
+        let inputs = vec![
+            ReferenceDischargeValue::Reference(reference.clone()),
+            ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
+        ];
+        assert_eq!(
+            Swap::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()),
+            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
+        );
+        assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
+
+        // The replacement itself must be a value rather than a second reference handle.
+        let handles =
+            vec![ReferenceDischargeValue::Reference(reference.clone()), ReferenceDischargeValue::Reference(reference)];
+        assert_eq!(
+            Swap::new().discharge_references(&context, &EmptyRegionDriver, handles.as_slice()),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge expected a replacement value but received {}",
+                handles[1],
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_swap_projected() {
+        type TestTracingContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestTracingContext>;
+
+        // A projected reference binds the swap through its parent tracer's context and projects the previous value,
+        // so the projected surface stages exactly the native operation.
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = TestTracingContext::trace(
+            |inputs| {
+                let [initial, replacement]: [TestTracer; 2] = inputs.try_into().unwrap();
+                let initial = <TestTracer as ValueProjection<ArrayType>>::into_projected(initial)?;
+                let replacement = <TestTracer as ValueProjection<ArrayType>>::into_projected(replacement)?;
+                let reference = initial.reference_new()?;
+                let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &reference;
+                let previous = reference.swap(&replacement)?;
+                let _: &ProjectedValue<ArrayType, TestTracer> = &previous;
+                let frozen = reference.freeze()?;
+                Ok(vec![previous.into_value(), frozen.into_value()])
+            },
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:ref<f32[2]> = reference_new %0
+                    %3:f32[2] = reference_swap %2 %1
+                    %4:f32[2] = reference_freeze %2
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_reference_swap_staging() {
+        // A traced reference stages the swap as the native variant of its operation family, with the previous value
+        // as its result and the ordered-state effect of the program.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let (output_types, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
+            |inputs| {
+                let [reference, replacement]: [Tracer<_>; 2] = inputs.try_into().unwrap();
+                Ok(vec![reference.swap(&replacement)?])
+            },
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
+                ArrayIrType::Array(array_type.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(output_types, vec![ArrayIrType::Array(array_type)]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[2]>, %1:f32[2] .
+                let %2:f32[2] = reference_swap %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 }

@@ -974,7 +974,8 @@ pub trait Concatenate: Sized {
     ///
     ///   - `inputs`: Values to join in order. There must be at least one input.
     ///   - `axis`: Axis to concatenate, or `None` to flatten each input in logical row-major order and join the resulting
-    ///     vectors. Flattening requires statically known element counts; use explicit dynamic reshaping otherwise.
+    ///     vectors. Existing vectors retain dynamic extents; flattening other ranks requires statically known element
+    ///     counts. Joining multiple dynamic extents still requires explicit dynamic concatenation.
     ///   - `data_type`: Requested element data type, or `None` to promote the input types. Explicit conversion can lose
     ///     precision and follows [`ConvertElementType::convert_element_type`].
     ///
@@ -1015,14 +1016,7 @@ pub trait Concatenate: Sized {
             .into_iter()
             .map(|input| {
                 let converted = input.convert_element_type(data_type)?;
-                if axis.is_some() {
-                    Ok(converted)
-                } else {
-                    let element_count = converted.r#type().element_count()?.ok_or_else(|| {
-                        TypeError::invalid("`concatenate` flattening requires a statically known element count")
-                    })?;
-                    converted.reshape(Shape::new(vec![Dimension::Static(element_count)]))
-                }
+                if axis.is_some() { Ok(converted) } else { converted.ravel() }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         Self::concatenate(&inputs, axis.unwrap_or_else(|| Axis::from(0usize)))
@@ -3276,6 +3270,16 @@ mod tests {
 
     #[test]
     fn test_array_concatenate_with_options() {
+        // Flattening a sole vector reuses its dynamic shape instead of requiring an element-count constant.
+        let vector_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let vector = context.input(vector_type.clone());
+        let output = Tracer::concatenate_with_options([&vector], None, None).unwrap();
+        assert_eq!(output.r#type().as_ref(), &vector_type);
+
         let integers = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[1_i32, 2]).unwrap();
         let floats = Array::from_elements(ArrayType::new_static(DataType::F32, [1, 2]), &[3.5_f32, 4.5]).unwrap();
         let output = Array::concatenate_with_options([&integers, &floats], Some(Axis::from(0)), None).unwrap();
