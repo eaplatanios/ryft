@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use ryft_macros::Parameter;
 
+use crate::arrays::elements::{validate_element_bytes, validate_logical_bytes};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::Dimension;
@@ -344,6 +345,41 @@ impl ArrayAddressing {
                 layout.tiles().is_empty() && layout.minor_to_major().iter().rev().copied().eq(0..self.r#type.rank())
             }
         }
+    }
+
+    /// Validates that `bytes` is a complete physical storage buffer for this [`ArrayAddressing`] instance's
+    /// [`ArrayType`]. Validation covers the [`Layout`]-derived storage length, every logical element's
+    /// [`DataType`]-specific byte encoding, and the requirement that layout "holes" and tile padding contain
+    /// only zero bytes.
+    pub fn validate_storage_bytes(&self, bytes: &[u8]) -> Result<(), ProgramError> {
+        if bytes.len() != self.storage_byte_len() {
+            return Err(TypeError::invalid(format!(
+                "array type {} requires {} physical storage bytes but got {}",
+                self.r#type,
+                self.storage_byte_len(),
+                bytes.len(),
+            ))
+            .into());
+        }
+
+        if self.is_dense_row_major() {
+            return validate_logical_bytes(self.r#type.data_type(), self.element_byte_width(), bytes);
+        }
+
+        let mut logical_nonzero_byte_count = 0usize;
+        for element in 0..self.element_count() {
+            let element_bytes = &bytes[self.byte_range_for_flat_index(element)];
+            validate_element_bytes(self.r#type.data_type(), element, element_bytes)?;
+            logical_nonzero_byte_count += element_bytes.iter().filter(|byte| **byte != 0).count();
+        }
+
+        // Validated layouts have disjoint element ranges. Any nonzero byte not counted inside those ranges must
+        // therefore belong to a layout hole or tile padding.
+        if bytes.iter().filter(|byte| **byte != 0).count() != logical_nonzero_byte_count {
+            return Err(TypeError::invalid("array layout holes and tile padding must contain zero bytes").into());
+        }
+
+        Ok(())
     }
 
     /// Returns the checked logical payload byte length, rejecting static element counts or byte lengths
@@ -787,6 +823,23 @@ mod tests {
         let range = addressing.range(1..4).unwrap();
         assert_eq!(range.elements(), 1..4);
         assert_eq!(range.bytes(), 4..16);
+        assert!(addressing.is_dense_row_major());
+
+        // Dense storage validates by length and per-element encoding alone.
+        assert_eq!(addressing.validate_storage_bytes(&[0; 24]), Ok(()));
+        assert!(matches!(
+            addressing.validate_storage_bytes(&[0; 23]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array type f32[2, 3] requires 24 physical storage bytes but got 23",
+        ));
+        let booleans =
+            ArrayAddressing::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]))).unwrap();
+        assert_eq!(booleans.validate_storage_bytes(&[1, 0]), Ok(()));
+        assert!(matches!(
+            booleans.validate_storage_bytes(&[0, 2]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 1 has invalid bool byte encoding [2]",
+        ));
 
         let mut index = vec![0, 0];
         assert!(addressing.advance_index(&mut index));
@@ -808,6 +861,7 @@ mod tests {
         assert_eq!(scalar.element_count(), 1);
         assert_eq!(scalar.logical_byte_len(), 16);
         assert_eq!(scalar.storage_byte_len(), 16);
+        assert_eq!(scalar.validate_storage_bytes(&[0; 16]), Ok(()));
         assert!(!scalar.advance_index(&mut []));
         assert_eq!(scalar.index(&[]), Ok(0));
         let empty = ArrayAddressing::new(ArrayType::new(
@@ -818,6 +872,7 @@ mod tests {
         assert_eq!(empty.element_count(), 0);
         assert_eq!(empty.logical_byte_len(), 0);
         assert_eq!(empty.storage_byte_len(), 0);
+        assert_eq!(empty.validate_storage_bytes(&[]), Ok(()));
 
         // Malformed external indices and unmaterializable types fail before payload access.
         assert!(matches!(
@@ -915,6 +970,27 @@ mod tests {
         assert!(!negative.is_dense_row_major());
         assert!(!permuted.is_dense_row_major());
 
+        // Storage validation covers the physical span, so the hole between rows must be present and zero,
+        // while element bytes may hold any valid encoding.
+        let mut bytes = vec![0; 28];
+        bytes[0..12].fill(0xFF);
+        bytes[16..28].fill(0xFF);
+        assert_eq!(positive.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(negative.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(dense.validate_storage_bytes(&[0xFF; 24]), Ok(()));
+        assert!(matches!(
+            positive.validate_storage_bytes(&[0; 24]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array type f32[2, 3][layout=strided{16,4}] requires 28 physical storage bytes but \
+                               got 24",
+        ));
+        bytes[12] = 1;
+        assert!(matches!(
+            positive.validate_storage_bytes(&bytes),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array layout holes and tile padding must contain zero bytes",
+        ));
+
         // Invalid ranks, potentially aliasing strides, and unrepresentable storage spans fail at construction.
         assert!(matches!(
             ArrayAddressing::new(
@@ -976,6 +1052,19 @@ mod tests {
         assert_eq!(tiled.byte_range(&[0, 2]), Ok(16..20));
         assert_eq!(tiled.byte_range(&[2, 3]), Ok(68..72));
         assert_eq!(tiled.byte_range(&[2, 4]), Ok(80..84));
+
+        // Tile padding is part of the physical span and must be zero, while the padded logical elements may hold any
+        // valid encoding.
+        let mut bytes = vec![0; 96];
+        bytes[80..84].fill(0xFF);
+        assert_eq!(tiled.validate_storage_bytes(&bytes), Ok(()));
+        assert_eq!(row_major.validate_storage_bytes(&[0xFF; 60]), Ok(()));
+        bytes[84] = 1;
+        assert!(matches!(
+            tiled.validate_storage_bytes(&bytes),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array layout holes and tile padding must contain zero bytes",
+        ));
 
         // Repeated tiling may rearrange the within-tile dimensions produced by an earlier tile.
         let nested = ArrayAddressing::new(
@@ -1121,6 +1210,7 @@ mod tests {
             assert_eq!(addressing.element_byte_width(), byte_width);
             assert_eq!(addressing.logical_byte_len(), 2 * byte_width);
             assert_eq!(addressing.storage_byte_len(), 2 * byte_width);
+            assert_eq!(addressing.validate_storage_bytes(&vec![0; 2 * byte_width]), Ok(()));
         }
     }
 
