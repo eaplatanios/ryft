@@ -277,12 +277,12 @@ impl Type for ArrayIrType {
 }
 
 /// [`TypeRefinements`] established while refining one complete [`ArrayIrType`] signature. A declared dynamic array
-/// axis met by a static extent contributes a dynamic-to-static binding following the [`ArrayTypeRefinements`] rules
-/// unchanged. A dimension member contributes no concrete fact, because a [`DimensionType`] is strictly identity
-/// plus bounds. Its variable belongs to the boundary's closed identity set (i.e., for more information refer to
+/// axis met by a static extent contributes a dynamic-to-static binding following the [`ArrayTypeRefinements`] rules.
+/// A dimension member with singleton bounds contributes its exact extent to the same binding environment, so array
+/// shapes and first-class dimension inputs must agree. Wider dimension bounds establish no concrete fact; their
+/// variable belongs to the boundary's closed identity set (refer to
 /// [`TypeIdentitySignature`](crate::TypeIdentitySignature)), which lets output validation establish the concrete
-/// extent on first observation (e.g., relating an eagerly materialized static array output back to the dimension
-/// input that supplied its shape) while still rejecting inconsistent repeated observations.
+/// extent on first observation while rejecting inconsistent repeated observations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayIrTypeRefinements {
     /// [`ArrayTypeRefinements`] shared by array members and reference referents across the complete signature.
@@ -301,11 +301,8 @@ impl ArrayIrTypeRefinements {
     ///
     ///   - An array pair delegates to [`ArrayTypeRefinements::visit_dynamic_to_static_refinements`], so declared
     ///     dynamic axes met by in-bounds static extents reach `visit` under the ordinary array refinement rules.
-    ///   - A dimension pair only checks that `actual` refines `declared` (same [`DimensionVariable`], equal or
-    ///     narrowed bounds) and never calls `visit`: a [`DimensionType`] is strictly identity plus bounds, so the
-    ///     pair carries no concrete extent to record. Concrete facts about such an identity can only be established
-    ///     later, when output validation first observes it on an array member (refer to the [`ArrayIrTypeRefinements`]
-    ///     documentation for how the closed identity set makes that sound).
+    ///   - A dimension pair checks that the actual bounds refine the declared bounds. Singleton actual bounds
+    ///     contribute their exact extent under the declared variable while wider bounds establish no concrete fact.
     ///   - A reference pair applies the array rules to its referents using the same refinement accumulator.
     ///   - Mismatched member kinds fail, since values never refine across composite member kinds.
     ///
@@ -313,19 +310,22 @@ impl ArrayIrTypeRefinements {
     ///
     ///   - `declared`: [`ArrayIrType`] declared by the boundary signature.
     ///   - `actual`: Observed [`ArrayIrType`] that must refine `declared`, including having the same member kind.
-    ///   - `visit`: Callback invoked once per in-bounds dynamic-to-static array axis, in axis order, with the
-    ///     declared [`DimensionVariable`] and the observed static extent. Any error it returns aborts the walk and
-    ///     propagates to the caller.
+    ///   - `visit`: Callback invoked for each in-bounds dynamic-to-static array axis or exact dimension member,
+    ///     with the declared [`DimensionVariable`] and the observed static extent. Any error it returns aborts
+    ///     the walk and propagates to the caller.
     fn visit_dynamic_to_static_refinements(
         declared: &ArrayIrType,
         actual: &ArrayIrType,
-        visit: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
+        mut visit: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
     ) -> Result<(), TypeError> {
         match (declared, actual) {
             (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
                 ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared, actual, visit)
             }
             (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) if declared.is_refined_by(actual) => {
+                if let Some(extent) = actual.extent() {
+                    visit(declared.variable(), extent)?;
+                }
                 Ok(())
             }
             (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
@@ -534,10 +534,9 @@ mod tests {
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
         );
 
-        // A dimension member contributes no concrete fact (its type is strictly identity plus bounds). Its variable
-        // instead belongs to the boundary's closed identity signature, so output validation may establish the concrete
-        // extent for it on first observation and must reject an inconsistent repeated observation within the same
-        // validated signature.
+        // A dimension member with wider bounds contributes no concrete fact. Its variable instead belongs to the
+        // boundary's closed identity signature, so output validation may establish the concrete extent for it on first
+        // observation and must reject an inconsistent repeated observation within the same validated signature.
         let declared_dimension = ArrayIrType::Dimension(DimensionType::new(batch.clone()));
         let refinements = ArrayIrTypeRefinements::establish(
             std::slice::from_ref(&declared_dimension),
@@ -570,6 +569,45 @@ mod tests {
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
         );
+
+        // Singleton dimension bounds and static array axes constrain the same boundary variable. Record their
+        // agreement in either signature order and reject contradictory extents before executing any instruction.
+        for extent in [2, 3] {
+            let exact_dimension = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+                "exact",
+                DimensionBounds::new(extent, Some(extent + 1)).unwrap(),
+            )));
+            for (declared, actual) in [
+                ([declared_array.clone(), declared_dimension.clone()], [actual_two.clone(), exact_dimension.clone()]),
+                ([declared_dimension.clone(), declared_array.clone()], [exact_dimension.clone(), actual_two.clone()]),
+            ] {
+                let result = ArrayIrTypeRefinements::establish(declared, actual);
+                if extent == 2 {
+                    assert_eq!(result.unwrap().validate([declared_array.clone()], [actual_two.clone()], &[]), Ok(()));
+                } else {
+                    assert!(matches!(
+                        result.unwrap_err().downcast_custom::<DimensionError>(),
+                        Some(DimensionError::InputDimensionMismatch { dimension, expected, actual })
+                            if dimension == "batch" && ((*expected, *actual) == (2, 3) || (*expected, *actual) == (3, 2)),
+                    ));
+                }
+            }
+            let exact_refinements =
+                ArrayIrTypeRefinements::establish([declared_dimension.clone()], [exact_dimension]).unwrap();
+            let result = exact_refinements.validate([declared_array.clone()], [actual_two.clone()], &[]);
+            if extent == 2 {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().downcast_custom::<DimensionError>(),
+                    Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "batch".to_string(),
+                        expected: 3,
+                        actual: 2,
+                    }),
+                );
+            }
+        }
 
         // An identity outside the boundary's closed signature stays rejected, and an internally defined identity may
         // establish its first fact exactly like an input-signature identity.

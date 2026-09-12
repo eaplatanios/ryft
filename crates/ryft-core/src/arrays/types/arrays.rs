@@ -386,8 +386,9 @@ impl ArrayType {
     ///
     /// Every other combination (e.g., mismatched static extents, a static declared dimension instantiated by a dynamic
     /// one, or actual bounds the declared variable's bounds do not contain) fails with a [`TypeError`]. A conflict
-    /// *between* the two accumulators, where one signature position renames a variable that another position binds to
-    /// a static extent, is deliberately left to the signature-folding callers, which call
+    /// _between_ the two accumulators, where one signature position renames a variable that another position binds to
+    /// a static extent, is deliberately left to the signature-folding callers. A singleton target bound equal to the
+    /// static extent is consistent while wider or unequal target bounds conflict. The callers invoke
     /// [`ArrayTypeRefinements::require_disjoint_from`] once after folding over the complete signature,
     /// so that detection does not depend on the order in which the two conflicting observations arrive.
     ///
@@ -704,12 +705,17 @@ impl ArrayTypeRefinements {
     }
 
     /// Rejects a [`DimensionVariable`] that one signature member binds to a static extent while another member renames
-    /// it to a live [`DimensionVariable`], since no instantiation can satisfy both observations. Complete signature
-    /// renaming derivations call this after folding over every member, so the check is independent of the order in
-    /// which the two conflicting observations were recorded.
+    /// it to a variable whose bounds do not specify that exact extent. A singleton target bound equal to the static
+    /// extent is consistent as first-class dimensions retain a nominal variable even when their extent is statically
+    /// known. Wider bounds do not prove that the two observations agree. Complete signature renaming derivations call
+    /// this after folding over every member, so the check is independent of the order of the observations.
     pub fn require_disjoint_from(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<(), TypeError> {
         for (variable, extent) in &self.bindings {
             if let Some((_, target)) = renaming.replacements().iter().find(|(source, _)| source == variable) {
+                let bounds = target.bounds();
+                if bounds.lower() == *extent && bounds.lower().checked_add(1) == bounds.upper() {
+                    continue;
+                }
                 return Err(TypeError::invalid(format!(
                     "dimension variable {variable} is renamed to {target} by one signature member and bound to \
                      static extent {extent} by another",
@@ -1233,6 +1239,36 @@ mod tests {
             ),
             Err(error),
         );
+
+        // A first-class dimension with exact bounds carries the same fact as the array's static extent. Both
+        // signature orders admit that agreement, but an unequal exact extent or an unknown extent still conflicts.
+        for (lower, upper, accepted) in [(3, 4, true), (4, 5, false), (2, 5, false)] {
+            let target = DimensionVariable::new("target", DimensionBounds::new(lower, Some(upper)).unwrap());
+            let declared_dimension = ArrayIrType::Dimension(DimensionType::new(declared_variable.clone()));
+            let actual_dimension = ArrayIrType::Dimension(DimensionType::new(target.clone()));
+            let static_array = ArrayIrType::Array(ArrayType::new_static(F32, [3]));
+            let declared_array = ArrayIrType::Array(declared.clone());
+            for (declared_types, actual_types) in [
+                (
+                    [declared_array.clone(), declared_dimension.clone()],
+                    [static_array.clone(), actual_dimension.clone()],
+                ),
+                ([declared_dimension, declared_array], [actual_dimension, static_array]),
+            ] {
+                let result = ArrayIrType::derive_identity_renaming(&declared_types, &actual_types);
+                if accepted {
+                    assert_eq!(result.unwrap().rename(&declared_variable), target);
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(TypeError::invalid(
+                            "dimension variable n is renamed to target by one signature member and bound to \
+                             static extent 3 by another",
+                        )),
+                    );
+                }
+            }
+        }
 
         // Consistent repeated renamings of the same variable still succeed.
         let renaming = ArrayType::derive_identity_renaming(
