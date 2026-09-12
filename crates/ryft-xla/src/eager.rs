@@ -644,6 +644,157 @@ mod tests {
     }
 
     #[test]
+    fn test_array_convert_element_type_integer_rounding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        // Integer precision above a BF16 rounding midpoint must survive the conversion.
+        let midpoint = (1u64 << 60) + (1u64 << 52);
+        let values = [midpoint - 1, midpoint, midpoint + 1, u64::MAX];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[values.len()]),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let output = input.convert_element_type(DataType::BF16).unwrap();
+        let expected = values_to_bytes(&[0x5d80u16, 0x5d80, 0x5d81, 0x5f80]);
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), expected);
+        let reference = CpuArray::from_elements(
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(values.len())])),
+            &values,
+        )
+        .unwrap();
+        assert_eq!(reference.convert_element_type(DataType::BF16).unwrap().logical_bytes(), expected);
+
+        // Rounding direction is measured by magnitude for negative integers, including the signed extrema.
+        let midpoint = midpoint as i64;
+        let values = [-midpoint - 1, -midpoint, -midpoint + 1, i64::MIN, i64::MAX];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I64, &[values.len()]),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let output = input.convert_element_type(DataType::BF16).unwrap();
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]),
+        );
+
+        let midpoint = 3_u64 << 60;
+        let values = [midpoint - 1, midpoint, midpoint + 1];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[3]),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0xbc, 0xbd, 0xbd]);
+    }
+
+    #[test]
+    fn test_array_convert_element_type_finite_float_extremes() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let values = [0.0_f32, -0.0, 1.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0];
+        let input = f32_vector(&client, &mesh, &values);
+        let reference = CpuArray::from_elements(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(values.len())])),
+            &values,
+        )
+        .unwrap();
+        // Finite-only formats saturate infinities and finite overflow; NaNs select the positive maximum.
+        for data_type in [DataType::F4E2M1FN, DataType::F6E2M3FN, DataType::F6E3M2FN, DataType::F8E8M0FNU] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(
+                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                reference.convert_element_type(data_type).unwrap().logical_bytes(),
+                "{data_type}",
+            );
+        }
+        // Exponent-only conversion has an upward normal tie and a distinct lowest-bin boundary.
+        let minimum = 2.0_f64.powi(-127);
+        let midpoint = 3.0_f64;
+        let values =
+            [minimum.next_down(), minimum, minimum.next_up(), midpoint.next_down(), midpoint, midpoint.next_up()];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F64, &[values.len()]),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
+        assert_eq!(
+            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            vec![0, 0, 1, 128, 129, 129]
+        );
+    }
+
+    #[test]
+    fn test_array_convert_element_type_f64_rounding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        for (data_type, midpoint, expected) in [
+            (DataType::BF16, 1.00390625_f64, [0x3f80_u16, 0x3f80, 0x3f81]),
+            (DataType::F16, 1.00048828125_f64, [0x3c00_u16, 0x3c00, 0x3c01]),
+            (DataType::BF16, 2.0_f64.powi(-134), [0, 0, 1]),
+            (DataType::F16, 2.0_f64.powi(-25), [0, 0, 1]),
+        ] {
+            let values = [
+                midpoint.next_down(),
+                midpoint,
+                midpoint.next_up(),
+                -midpoint.next_down(),
+                -midpoint,
+                -midpoint.next_up(),
+                0.0,
+                -0.0,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+            ];
+            let expected = [
+                expected[0],
+                expected[1],
+                expected[2],
+                expected[0] | 0x8000,
+                expected[1] | 0x8000,
+                expected[2] | 0x8000,
+                0,
+                0x8000,
+                0,
+                0x8000,
+            ];
+            let input = Array::from_host_buffer(
+                &client,
+                replicated_type(&mesh, DataType::F64, &[values.len()]),
+                mesh.clone(),
+                values_to_bytes(&values).as_slice(),
+            )
+            .unwrap();
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(
+                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                values_to_bytes(&expected),
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
     fn test_array_convert_element_type_complex_boolean() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -679,11 +830,11 @@ mod tests {
                     .unwrap();
             assert_eq!(read_f32s(&input.convert_element_type(DataType::F32).unwrap()), expected);
         }
-        // Narrowing keeps parity, unlike Boolean truthiness. Fractional values truncate before narrowing.
+        // Real inputs truncate and saturate to the logical range, unlike Boolean truthiness.
         let input = f32_vector(&client, &mesh, &[0.0, 1.9, 2.0, 3.0, -1.9, -2.0, 128.0, -129.0]);
         for (data_type, expected) in [
-            (DataType::I1, vec![0, 1, 0, 1, 1, 0, 1, 0]),
-            (DataType::U1, vec![0, 1, 0, 1, 0, 0, 0, 0]),
+            (DataType::I1, vec![0, 0, 0, 0, 1, 1, 0, 1]),
+            (DataType::U1, vec![0, 1, 1, 1, 0, 0, 1, 0]),
             (DataType::Boolean, vec![0, 1, 1, 1, 1, 1, 1, 1]),
         ] {
             let output = input.convert_element_type(data_type).unwrap();
@@ -714,12 +865,31 @@ mod tests {
             .unwrap();
         let mesh = cpu_mesh(&client);
         let values = [
-            -129.0f32, -9.0, -8.0, -3.0, -2.0, -1.9, 0.0, 1.0, 2.0, 3.0, 7.0, 8.0, 15.0, 16.0, 127.0, 128.0, 255.0,
+            -129.0f32,
+            -9.0,
+            -8.0,
+            -3.0,
+            -2.0,
+            -1.9,
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            7.0,
+            8.0,
+            15.0,
+            16.0,
+            127.0,
+            128.0,
+            255.0,
             256.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
         ];
         let input = f32_vector(&client, &mesh, &values);
         let reference = CpuArray::vector(values.to_vec()).unwrap();
-        // Sub-byte conversion saturates at the byte carrier limits and then narrows modularly to the logical width.
+        // Real conversion saturates at the logical limits, including infinities; NaNs convert to zero.
         for data_type in [DataType::I2, DataType::I4, DataType::U2, DataType::U4] {
             let output = input.convert_element_type(data_type).unwrap();
             assert_eq!(
@@ -777,6 +947,41 @@ mod tests {
         assert_eq!(shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(), vec![1, 1]);
         let restored = bits.bitcast_element_type(DataType::U2).unwrap();
         assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type_fp6() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        // Exhaust all six-bit encodings, including both signed zeros, and assert the logical group count.
+        let encodings = (0_u8..64).collect::<Vec<_>>();
+        for data_type in [DataType::F6E2M3FN, DataType::F6E3M2FN] {
+            let input =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[64]), mesh.clone(), &encodings)
+                    .unwrap();
+            let reference =
+                CpuArray::new(ArrayType::new(data_type, Shape::new(vec![Dimension::Static(64)])), encodings.clone())
+                    .unwrap();
+            let other_type = if data_type == DataType::F6E2M3FN { DataType::F6E3M2FN } else { DataType::F6E2M3FN };
+            let reinterpreted = input.bitcast_element_type(other_type).unwrap();
+            assert_eq!(shard_host_bytes(reinterpreted.addressable_shards().next().unwrap()).unwrap(), encodings);
+            for group_type in [DataType::I1, DataType::U1, DataType::I2, DataType::U2] {
+                let groups = input.bitcast_element_type(group_type).unwrap();
+                let expected = reference.bitcast_element_type(group_type).unwrap();
+                assert_eq!(groups.shape(), expected.r#type().static_shape().unwrap());
+                assert_eq!(
+                    shard_host_bytes(groups.addressable_shards().next().unwrap()).unwrap(),
+                    expected.logical_bytes(),
+                    "{data_type} to {group_type}",
+                );
+                let restored = groups.bitcast_element_type(data_type).unwrap();
+                assert_eq!(restored.shape().dimensions(), &[64]);
+                assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), encodings);
+            }
+        }
     }
 
     #[test]

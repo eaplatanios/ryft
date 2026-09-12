@@ -130,8 +130,7 @@ impl ZeroLike for Array {
             DataType::Token => Err(TypeError::invalid(format!("data type `{data_type}` cannot represent zero")).into()),
             DataType::Zero => Ok(self.clone()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(0)?;
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element))
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(Element::zero()?))
             }),
         }
     }

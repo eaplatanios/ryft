@@ -1,6 +1,6 @@
 use ryft_core::{
-    ArrayType, BroadcastingError, DataTypeError, Error as CoreError, LayoutError, ParameterError, Shape, ShardingError,
-    TypeError,
+    ArrayType, BroadcastingError, DataTypeError, Error as CoreError, LayoutError, Memory, ParameterError, Shape,
+    ShardingError, TypeError,
 };
 use ryft_pjrt::{DeviceId, Error as PjrtError};
 use thiserror::Error;
@@ -46,6 +46,12 @@ pub enum Error {
 
     #[error("buffer has type {actual}, but expected {expected}")]
     BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
+
+    #[error("device {device_id} has no addressable memory for `{memory}`")]
+    UnsupportedMemory { device_id: DeviceId, memory: Memory },
+
+    #[error("buffer on device {device_id} uses memory kind `{actual}`, but expected `{expected}`")]
+    BufferMemoryMismatch { device_id: DeviceId, expected: Memory, actual: String },
 
     #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
     NonCanonicalZeroBuffer { device_id: DeviceId },

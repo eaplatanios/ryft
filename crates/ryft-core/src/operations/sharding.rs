@@ -523,6 +523,10 @@ where
     }
 }
 
+// The sharding-constraint hint is untracked: the output type (sharding included) is identical to the input, so the
+// identity default is exactly the `ShardingConstraintOperation` interpretation contract for a concrete value.
+impl ConstrainSharding for Array {}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -534,6 +538,7 @@ mod tests {
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
+    use crate::programs::EmptyRegionDriver;
     use crate::tracing::Trace;
 
     use super::*;
@@ -761,6 +766,29 @@ mod tests {
                           reshard for explicit or manual axes"
                     .to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn test_sharding_constraint_interpretation() {
+        let mesh = explicit_manual_mesh();
+        let input_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let input = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [2]).with_sharding(input_sharding).unwrap(),
+            &[1.0, 2.0],
+        )
+        .unwrap();
+        let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])]).unwrap();
+
+        // An untracked hint preserves the payload and all existing type metadata, including manual-axis variation.
+        assert_eq!(input.constrain_sharding(&target), input);
+        assert_eq!(
+            ShardingConstraintOperation::new(target).interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Ok(vec![input]),
         );
     }
 

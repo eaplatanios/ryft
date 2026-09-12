@@ -83,11 +83,9 @@ mod dimensions;
 mod indexing;
 mod manipulation;
 mod math;
-mod memory;
 mod quantization;
 mod random;
 mod references;
-mod sharding;
 mod sort;
 mod tag;
 

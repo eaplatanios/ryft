@@ -67,8 +67,9 @@ use crate::programs::{ProgramError, TypeError};
 /// with strictly more exponent and mantissa bits is exact, and both complex element types are exactly representable in
 /// [`Complex<f64>`]. The destination therefore always receives the exact source value and performs the single rounding,
 /// truncation, or saturation step itself, so a routed conversion is bit-identical to a handwritten direct conversion
-/// between the same pair of element types. In particular, no double rounding is possible (the carrier step is exact by
-/// construction and so there is only ever one inexact step).
+/// between the same pair of element types. Narrow floating-point destinations preserve sticky rounding information when
+/// an implementation needs a smaller intermediate significand, so intermediate rounding cannot turn a value near a
+/// destination midpoint into an incorrect tie.
 ///
 /// ## Cost
 ///
@@ -110,10 +111,14 @@ pub trait ArrayElement: private::Codec {
     /// performs the conversion's only inexact step.
     fn from_unsigned(value: u64) -> Result<Self, ProgramError>;
 
-    /// Converts one value carried by the real floating-point interchange category into this [`ArrayElement`] type. The
-    /// carrier holds the source value exactly, so this performs the conversion's only inexact step: floating-point
-    /// destinations round to nearest and saturate or fail according to their own format contract, and integer
-    /// destinations truncate toward zero.
+    /// Converts one value carried by the real floating-point interchange category into this [`ArrayElement`] type.
+    /// The carrier holds the source value exactly, so this performs the conversion's only inexact step: floating-point
+    /// destinations round to nearest and saturate or fail according to their own format contract. Conversion to
+    /// [`f8e8m0fnu`] maps zero to NaN even though its checked literal constructor rejects zero. Conversion to the
+    /// microscaling formats [`f4e2m1fn`], [`f6e2m3fn`], and [`f6e3m2fn`] maps NaN to the positive maximum finite
+    /// value, and saturates infinite inputs to the finite bound with the same sign. Their checked literal constructors
+    /// still reject NaN. Integer destinations truncate toward zero and saturate to their logical bounds, with NaN
+    /// converted to zero.
     fn from_real(value: f64) -> Result<Self, ProgramError>;
 
     /// Converts one value carried by the complex interchange category into this [`ArrayElement`] type. The default
@@ -746,14 +751,25 @@ impl LowPrecisionFloatingPointFormat {
 
     /// Encoding of the value nearest to one finite nonzero `magnitude`, with `negative` applied to the result.
     /// Rounding scans every finite magnitude encoding of this format plus the virtual overflow candidate one step
-    /// past its largest finite magnitude, which reproduces round-to-nearest-even exactly, including at the overflow
-    /// boundary. A result beyond the finite range follows the overflow policy of this format's
-    /// [`LowPrecisionFloatingPointFormatClass`].
+    /// past its largest finite magnitude. Ties choose the even encoding except for exponent-only values, whose
+    /// one-bit significand rounds a tie up to the next power of two. Results beyond the finite range follow this
+    /// format's [`LowPrecisionFloatingPointFormatClass`]. Exponent-only values use their special minimum-boundary rule.
     fn nearest_bits(self, magnitude: f64, negative: bool) -> u8 {
-        let max_finite_magnitude = u16::from(self.max_finite_magnitude());
+        if matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
+            // The minimum exponent is the boundary inherited from an `F32` subnormal. Positive inputs through the
+            // minimum map to it and every input above it but below the next power of two maps to that next power.
+            if magnitude <= self.decode_magnitude(0) {
+                return 0;
+            }
+            if magnitude < self.decode_magnitude(1) {
+                return 1;
+            }
+        }
+
         // An input above the virtual overflow candidate is unambiguously an overflow. Resolving it before the scan
         // also keeps the distance comparisons below meaningful, because the distances from every candidate round to
         // the same value once the input is astronomically larger than this format's whole range.
+        let max_finite_magnitude = u16::from(self.max_finite_magnitude());
         if magnitude > self.decode_magnitude(max_finite_magnitude + 1) {
             return self.overflow_bits(negative);
         }
@@ -763,9 +779,11 @@ impl LowPrecisionFloatingPointFormat {
         for candidate in 0..=max_finite_magnitude + 1 {
             let distance = (self.decode_magnitude(candidate) - magnitude).abs();
 
-            // Candidate values increase strictly with their encoding, so at most two candidates can be equidistant
-            // from the input and exactly one of those two has an even encoding, which is the one to round to.
-            if distance < nearest_distance || (distance == nearest_distance && candidate % 2 == 0) {
+            // Candidate values increase strictly with their encoding, so at most two can be equidistant. Most
+            // formats choose the even encoding. Exponent-only rounding instead carries the implicit one-bit
+            // significand into the next exponent, independently of exponent-encoding parity.
+            let ties_up = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
+            if distance < nearest_distance || (distance == nearest_distance && (ties_up || candidate % 2 == 0)) {
                 nearest = candidate;
                 nearest_distance = distance;
             }
@@ -788,16 +806,16 @@ impl LowPrecisionFloatingPointFormat {
         let mantissa = f64::from(u32::from(magnitude) & ((1u32 << self.mantissa_bits) - 1));
         let exponent = i32::from(magnitude >> self.mantissa_bits);
         if exponent == 0 && !matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly) {
-            // A zero exponent field denotes a subnormal value, whose implicit leading mantissa bit is zero.
+            // A zero-exponent field denotes a subnormal value, whose implicit leading mantissa bit is zero.
             return 2f64.powi(1 - self.bias) * mantissa / mantissa_scale;
         }
         2f64.powi(exponent - self.bias) * (1.0 + mantissa / mantissa_scale)
     }
 
     /// Encodes the value nearest to `value` in this [`LowPrecisionFloatingPointFormat`], rounding to nearest with
-    /// exact ties broken toward the even encoding. NaN, infinite, and zero inputs, along with finite inputs whose
-    /// rounded result falls beyond the format's finite range, follow the policies of this format's
-    /// [`LowPrecisionFloatingPointFormatClass`].
+    /// exact ties broken toward the even encoding, or upward for exponent-only values. Special inputs and values whose
+    /// rounded result falls beyond the finite range follow the policies of this format's
+    /// [`LowPrecisionFloatingPointFormatClass`], including its special minimum-boundary rule for exponent-only values.
     fn encode(self, value: f64) -> Result<u8, TypeError> {
         let negative = value.is_sign_negative();
         let exponent_only = matches!(self.class, LowPrecisionFloatingPointFormatClass::ExponentOnly);
@@ -970,8 +988,11 @@ pub struct f8e5m2fnuz(u8);
 /// `2^-127` through `2^127`, and `0xff` is the single NaN. The format has no zero, no negative value, and no infinity,
 /// so [`f8e8m0fnu::MIN`] is the smallest positive value `2^-127` rather than a negative one, zero inputs are rejected
 /// with a [`TypeError`], and negative, infinite, and overflowing inputs convert to NaN. Conversions round to nearest
-/// with ties to even, so `1.5` and `3` both round to `2` while `6` rounds to `8`, following
-/// [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes#float8_e8m0fnu).
+/// with exact ties rounded upward: `1.5` rounds to `2`, `3` to `4`, and `6` to `8`. The implicit one-bit significand
+/// carries into the next exponent at a tie; the parity of the encoded exponent does not select the rounding direction.
+/// At the minimum boundary, every positive input at most `2^-127` becomes `2^-127`, and every input strictly between
+/// `2^-127` and `2^-126` becomes `2^-126`. This boundary follows the underlying exponent extraction, rather than the
+/// arithmetic midpoint between these two smallest values.
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]
 pub struct f8e8m0fnu(u8);
@@ -1002,7 +1023,8 @@ macro_rules! impl_low_precision_floating_point_type {
                 self.0
             }
 
-            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding.
+            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
+            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
             /// Returns an error only when this format has no encoding for the input at all, namely a NaN input
             /// to a microscaling format or a zero input to [`f8e8m0fnu`].
             #[inline]
@@ -1011,7 +1033,8 @@ macro_rules! impl_low_precision_floating_point_type {
                 Self::from_f64(f64::from(value))
             }
 
-            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding.
+            /// Rounds `value` to the nearest representable value, breaking exact ties toward the even encoding except
+            /// for [`f8e8m0fnu`], which rounds ties upward and uses the minimum-boundary rule described on its type.
             /// Returns an error only when this format has no encoding for the input at all, namely a NaN input to a
             /// microscaling format or a zero input to [`f8e8m0fnu`].
             #[inline]
@@ -1312,9 +1335,9 @@ impl ArrayElement for bool {
     }
 }
 
-// Implements the interchange contract for the checked signed sub-byte integer element types. Conversions into them
-// narrow modularly into the declared bit width, and conversions out of them widen their sign-extended native value
-// exactly into `i64`.
+// Implements the interchange contract for the checked signed sub-byte integer element types. Integer inputs narrow
+// modularly into the declared bit width, real inputs saturate to the logical range, and conversions out widen the
+// sign-extended native value exactly into `i64`.
 macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
@@ -1333,7 +1356,8 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             #[inline]
             fn from_real(value: f64) -> Result<Self, ProgramError> {
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
-                Ok(Self::from_bits(value as i8 as u8 & bit_mask).unwrap())
+                let value = (value as i8).clamp(Self::MIN.value(), Self::MAX.value());
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
             }
 
             #[inline]
@@ -1442,9 +1466,9 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
 
 impl_array_element_for_signed_sub_byte_integer_types!(i1, i2, i4);
 
-// Implements the interchange contract for the checked unsigned sub-byte integer element types. Conversions into them
-// narrow modularly into the declared bit width, and conversions out of them widen their native value exactly into
-// `u64`.
+// Implements the interchange contract for the checked unsigned sub-byte integer element types. Integer inputs narrow
+// modularly into the declared bit width, real inputs saturate to the logical range, and conversions out widen the
+// native value exactly into `u64`.
 macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
     ($($type:ty),+ $(,)?) => {$(
         impl ArrayElement for $type {
@@ -1460,7 +1484,7 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
 
             #[inline]
             fn from_real(value: f64) -> Result<Self, ProgramError> {
-                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+                Ok(Self::from_bits((value as u8).min(Self::MAX.to_bits())).unwrap())
             }
 
             #[inline]
@@ -2067,24 +2091,40 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
 }
 
 // Implements the interchange contract for the low-precision floating-point element types. Conversions into them go
-// through each format's own checked rounding contract, which is also where an unrepresentable value (such as zero in
-// `f8e8m0fnu`) is rejected, and conversions out of them widen exactly into `f64`.
+// through each format's rounding contract, with zero converted to NaN for the exponent-only format. Literal zero
+// construction retains its checked contract, and conversions out of these types widen exactly into `f64`.
 macro_rules! impl_array_element_for_low_precision_floating_point_types {
     ($($type:ty => ($min_identity:expr, $max_identity:expr)),+ $(,)?) => {$(
         impl ArrayElement for $type {
             #[inline]
             fn from_signed(value: i64) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(value as f64)?)
+                Self::from_real(integer_to_f64_round_to_odd(value.unsigned_abs()).copysign(value as f64))
             }
 
             #[inline]
             fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
-                Ok(Self::from_f64(value as f64)?)
+                Self::from_real(integer_to_f64_round_to_odd(value))
             }
 
             #[inline]
             fn from_real(value: f64) -> Result<Self, ProgramError> {
+                // Numerical conversion maps an unrepresentable zero to this format's NaN. Constructing an additive
+                // identity remains checked because returning NaN would violate the zero capability's contract.
+                let value = if Self::data_type() == DataType::F8E8M0FNU && value == 0.0 { f64::NAN } else { value };
+
+                // Microscaling formats have no NaN encoding. Select a deterministic finite result rather than
+                // inheriting target-dependent native conversion behavior for an unrepresentable special value.
+                if matches!(Self::data_type(), DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN)
+                    && value.is_nan()
+                {
+                    return Ok(Self::MAX);
+                }
                 Ok(Self::from_f64(value)?)
+            }
+
+            #[inline]
+            fn zero() -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(0.0)?)
             }
 
             #[inline]
@@ -2319,9 +2359,11 @@ macro_rules! impl_array_element_for_floating_point_type {
 impl_array_element_for_floating_point_type!(
     half,
     bf16,
-    |value: i64| bf16::from_f64(value as f64),
-    |value: u64| bf16::from_f64(value as f64),
-    bf16::from_f64,
+    |value: i64| bf16::from_f64(half_conversion_input(
+        integer_to_f64_round_to_odd(value.unsigned_abs()).copysign(value as f64),
+    )),
+    |value: u64| bf16::from_f64(half_conversion_input(integer_to_f64_round_to_odd(value))),
+    |value: f64| bf16::from_f64(half_conversion_input(value)),
     bf16::to_f64,
     |value: bf16| bf16::from_f32(value.to_f32().abs()),
 );
@@ -2331,7 +2373,7 @@ impl_array_element_for_floating_point_type!(
     f16,
     |value: i64| f16::from_f64(value as f64),
     |value: u64| f16::from_f64(value as f64),
-    f16::from_f64,
+    |value: f64| f16::from_f64(half_conversion_input(value)),
     f16::to_f64,
     |value: f16| f16::from_f32(value.to_f32().abs()),
 );
@@ -2355,6 +2397,25 @@ impl_array_element_for_floating_point_type!(
     |value| value,
     f64::abs,
 );
+
+/// Converts an unsigned integer into an intermediate `f64` using round-to-odd. When low bits must be discarded,
+/// truncates the significand and records any nonzero discarded bits in its least significant bit. Subsequent rounding
+/// to a floating-point format with fewer than 52 significand bits therefore preserves the original integer's position
+/// relative to every destination midpoint, avoiding double rounding through an ordinary nearest-rounded `f64`.
+fn integer_to_f64_round_to_odd(value: u64) -> f64 {
+    let shift = 11u32.saturating_sub(value.leading_zeros());
+    let discarded = value & ((1u64 << shift) - 1);
+    let significand = (value >> shift) | u64::from(discarded != 0);
+    (significand as f64) * ((1u64 << shift) as f64)
+}
+
+/// Preserves sticky rounding information across the `half` crate's truncation of the low 32 `f64` mantissa bits.
+/// The retained 21-bit significand is wider than both `f16` and `bf16`, so round-to-odd preserves their nearest-even
+/// results, including sub-normals. NaN payloads may be canonicalized by the destination conversion.
+fn half_conversion_input(value: f64) -> f64 {
+    let bits = value.to_bits();
+    f64::from_bits((bits & !u64::from(u32::MAX)) | (u64::from(bits as u32 != 0) << 32))
+}
 
 // Implements the interchange contract for the complex element types, which place a real source in the real component
 // and preserve both components of a complex source.
@@ -2683,14 +2744,25 @@ mod tests {
     #[test]
     fn test_array_element_conversions() {
         // Signed sub-byte destinations narrow modularly into their declared bit width, and real inputs truncate
-        // toward zero before narrowing.
+        // toward zero and saturate at the logical bounds.
         assert_eq!(i4::from_signed(-3), Ok(i4::new(-3).unwrap()));
         assert_eq!(i4::from_signed(23), Ok(i4::new(7).unwrap()));
         assert_eq!(i4::from_unsigned(9), Ok(i4::new(-7).unwrap()));
         assert_eq!(i4::from_real(-2.9), Ok(i4::new(-2).unwrap()));
+        assert_eq!(i4::from_real(20.0), Ok(i4::MAX));
+        assert_eq!(i4::from_real(-20.0), Ok(i4::MIN));
+        assert_eq!(i1::from_real(1.0), Ok(i1::MAX));
+        assert_eq!(i2::from_real(f64::INFINITY), Ok(i2::MAX));
+        assert_eq!(i2::from_real(f64::NEG_INFINITY), Ok(i2::MIN));
+        assert_eq!(i4::from_real(f64::NAN), Ok(i4::new(0).unwrap()));
         assert_eq!(u2::from_signed(-1), Ok(u2::new(3).unwrap()));
         assert_eq!(u2::from_unsigned(5), Ok(u2::new(1).unwrap()));
         assert_eq!(u2::from_real(3.7), Ok(u2::new(3).unwrap()));
+        assert_eq!(u2::from_real(4.0), Ok(u2::MAX));
+        assert_eq!(u1::from_real(2.0), Ok(u1::MAX));
+        assert_eq!(u4::from_real(f64::INFINITY), Ok(u4::MAX));
+        assert_eq!(u4::from_real(f64::NEG_INFINITY), Ok(u4::MIN));
+        assert_eq!(u4::from_real(f64::NAN), Ok(u4::MIN));
 
         // Native integer destinations follow Rust's `as` contract: integer inputs narrow with two's-complement
         // truncation, and real inputs truncate toward zero.
@@ -2744,6 +2816,37 @@ mod tests {
         assert_ne!((value as f64) as f32, value as f32);
         assert_eq!(u64::convert_to::<f32>(value), Ok(value as f32));
 
+        // The low bits beyond the half crate's retained significand still distinguish a midpoint from its neighbors.
+        let midpoint = 1.0f64 + 1.0 / 256.0;
+        assert_eq!(bf16::from_real(midpoint.next_down()).unwrap().to_bits(), 0x3f80);
+        assert_eq!(bf16::from_real(midpoint).unwrap().to_bits(), 0x3f80);
+        assert_eq!(bf16::from_real(midpoint.next_up()).unwrap().to_bits(), 0x3f81);
+        let midpoint = 1.0f64 + 1.0 / 2048.0;
+        assert_eq!(f16::from_real(midpoint.next_down()).unwrap().to_bits(), 0x3c00);
+        assert_eq!(f16::from_real(midpoint).unwrap().to_bits(), 0x3c00);
+        assert_eq!(f16::from_real(midpoint.next_up()).unwrap().to_bits(), 0x3c01);
+        let midpoint = 2.0f64.powi(-134);
+        assert_eq!(bf16::from_real(midpoint).unwrap().to_bits(), 0);
+        assert_eq!(bf16::from_real(midpoint.next_up()).unwrap().to_bits(), 1);
+        let midpoint = 2.0f64.powi(-25);
+        assert_eq!(f16::from_real(midpoint).unwrap().to_bits(), 0);
+        assert_eq!(f16::from_real(midpoint.next_up()).unwrap().to_bits(), 1);
+
+        // Large integer values immediately around a BF16 midpoint must retain their discarded low bits.
+        let midpoint = (1_u64 << 60) + (1_u64 << 52);
+        assert_eq!(bf16::from_unsigned(midpoint - 1).unwrap().to_bits(), 0x5d80);
+        assert_eq!(bf16::from_unsigned(midpoint).unwrap().to_bits(), 0x5d80);
+        assert_eq!(bf16::from_unsigned(midpoint + 1).unwrap().to_bits(), 0x5d81);
+        assert_eq!(bf16::from_signed(-(midpoint as i64) - 1).unwrap().to_bits(), 0xdd81);
+        assert_eq!(bf16::from_signed(i64::MIN).unwrap().to_bits(), 0xdf00);
+        assert_eq!(bf16::from_unsigned(u64::MAX).unwrap().to_bits(), 0x5f80);
+
+        // The exponent-only format has the same hazard at the arithmetic midpoint of neighboring powers of two.
+        let midpoint = 3_u64 << 60;
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint - 1).unwrap().to_bits(), 0xbc);
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint).unwrap().to_bits(), 0xbd);
+        assert_eq!(f8e8m0fnu::from_unsigned(midpoint + 1).unwrap().to_bits(), 0xbd);
+
         // Widening a low-precision float into `f64` is exact, so casting out and back is the identity.
         let element = f8e4m3fn::from_real(0.3125).unwrap();
         assert_eq!(f8e4m3fn::convert_to::<f64>(element), Ok(0.3125));
@@ -2761,17 +2864,24 @@ mod tests {
         assert_eq!(f4e2m1fn::from_real(1e6).map(f4e2m1fn::to_f64), Ok(6.0));
         assert_eq!(f4e2m1fn::from_real(-1e6).map(f4e2m1fn::to_f64), Ok(-6.0));
 
-        // Formats with no encoding for the input at all reject the conversion instead of guessing.
-        assert!(matches!(
-            f4e2m1fn::from_real(f64::NAN),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type `f4e2m1fn` cannot represent NaN",
-        ));
-        assert!(matches!(
-            f8e8m0fnu::from_real(0.0),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type `f8e8m0fnu` cannot represent zero",
-        ));
+        // Microscaling conversion canonicalizes NaN to positive maximum and saturates signed infinities.
+        assert_eq!(f4e2m1fn::from_real(f64::NAN), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(-f64::NAN), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(f64::INFINITY), Ok(f4e2m1fn::MAX));
+        assert_eq!(f4e2m1fn::from_real(f64::NEG_INFINITY), Ok(f4e2m1fn::MIN));
+        assert_eq!(f6e2m3fn::from_real(f64::NAN), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(-f64::NAN), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(f64::INFINITY), Ok(f6e2m3fn::MAX));
+        assert_eq!(f6e2m3fn::from_real(f64::NEG_INFINITY), Ok(f6e2m3fn::MIN));
+        assert_eq!(f6e3m2fn::from_real(f64::NAN), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(-f64::NAN), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(f64::INFINITY), Ok(f6e3m2fn::MAX));
+        assert_eq!(f6e3m2fn::from_real(f64::NEG_INFINITY), Ok(f6e3m2fn::MIN));
+        // Numerical conversion can return a NaN encoding even though constructing an additive identity cannot.
+        assert_eq!(f8e8m0fnu::from_real(0.0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_real(-0.0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_signed(0).unwrap().to_bits(), 0xff);
+        assert_eq!(f8e8m0fnu::from_unsigned(0).unwrap().to_bits(), 0xff);
 
         // Real inputs into native integer destinations saturate at the destination's bounds, and NaN collapses to
         // zero, matching Rust's `as` contract.
@@ -3880,13 +3990,27 @@ mod tests {
 
         assert_eq!(f8e8m0fnu::from_f64(1.0).map(f8e8m0fnu::to_bits), Ok(0x7f));
         assert_eq!(f8e8m0fnu::from_f64(2.0).map(f8e8m0fnu::to_bits), Ok(0x80));
-        // Consecutive powers of two are the only representable values, so ties round to the even exponent encoding.
+
+        // Consecutive powers of two have one-bit significands, so every exact tie rounds upward.
         assert_eq!(f8e8m0fnu::from_f64(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
-        assert_eq!(f8e8m0fnu::from_f64(3.0).map(f8e8m0fnu::to_f64), Ok(2.0));
+        assert_eq!(f8e8m0fnu::from_f64(3.0f64.next_down()).map(f8e8m0fnu::to_f64), Ok(2.0));
+        assert_eq!(f8e8m0fnu::from_f64(3.0).map(f8e8m0fnu::to_f64), Ok(4.0));
+        assert_eq!(f8e8m0fnu::from_f64(3.0f64.next_up()).map(f8e8m0fnu::to_f64), Ok(4.0));
         assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_bits), Ok(0x82));
         assert_eq!(f8e8m0fnu::from_f64(6.0).map(f8e8m0fnu::to_f64), Ok(8.0));
-        assert_eq!(f8e8m0fnu::from_f64(2f64.powi(-127)).map(f8e8m0fnu::to_bits), Ok(0x00));
+
+        // The minimum exponent follows a distinct boundary instead of using the arithmetic midpoint.
+        let minimum = 2f64.powi(-127);
+        assert_eq!(f8e8m0fnu::from_f64(minimum / 2.0).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum.next_down()).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum).map(f8e8m0fnu::to_bits), Ok(0x00));
+        assert_eq!(f8e8m0fnu::from_f64(minimum.next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64((minimum * 2.0).next_down()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(minimum * 2.0).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f32((minimum as f32).next_up()).map(f8e8m0fnu::to_bits), Ok(0x01));
+        assert_eq!(f8e8m0fnu::from_f64(1.5 * 2f64.powi(127)).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f32(1.5).map(f8e8m0fnu::to_bits), Ok(0x80));
+
         // Negative, infinite, and overflowing inputs have no encoding other than the single NaN.
         assert_eq!(f8e8m0fnu::from_f64(-1.0).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert_eq!(f8e8m0fnu::from_f64(f64::MAX).map(f8e8m0fnu::to_bits), Ok(0xff));

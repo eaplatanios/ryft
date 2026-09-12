@@ -1060,7 +1060,7 @@ where
         let value = if value.r#type().memory() == output_type.memory() {
             value.clone()
         } else {
-            value.transfer_to_memory(output_type.memory())
+            value.transfer_to_memory(output_type.memory())?
         };
         if value.r#type().data_type() == DataType::U64 {
             Ok(value)

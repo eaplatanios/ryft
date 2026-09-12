@@ -31,7 +31,7 @@ use super::{
 };
 
 /// Constrains a statically allocated constructor result before attaching its runtime dimensions.
-fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
@@ -156,7 +156,7 @@ pub(super) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
 
 /// Packs scalar first-class dimension operands into the rank-one `i64` shape tensor consumed by dynamic StableHLO
 /// shape operations.
-fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -661,8 +661,11 @@ where
             let output_type =
                 <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
             let input = if let Some(dimensions) = operation.dimensions() {
-                let transpose =
-                    block.append_operation(stable_hlo::transpose(*input, dimensions.as_slice(), location)?)?;
+                let transpose = block.append_operation(stable_hlo::transpose(
+                    *input,
+                    dimensions.normalize(dimensions.len()).map_err(ProgramError::from)?.as_slice(),
+                    location,
+                )?)?;
                 transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
             } else {
                 *input

@@ -16,7 +16,7 @@ use crate::operations::{
     ReferenceReadOperation, Zero, ZeroOperation,
 };
 use crate::programs::{
-    AtomId, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, Typed, Value,
+    AtomId, Operation, OperationProjection, OperationProvider, ProgramBuilder, ProgramError, TypeError, Typed, Value,
     ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -254,10 +254,11 @@ impl ExactShape {
     /// Returns this exact shape transposed by `permutation`, so that output axis `i` is copied from source axis
     /// `permutation[i]`. Rules whose transpose sees a permuted view of a retained shape (e.g., a reshape with a
     /// `dimensions` permutation) use this to derive that view without retaining any additional residuals. Residual
-    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`.
+    /// slot indices are preserved, so the result addresses the same [`LinearResiduals`] list as `self`. Invalid axes
+    /// or a permutation whose length differs from this shape return a [`TypeError`].
     #[inline]
-    pub fn transposed(&self, permutation: &Permutation) -> Self {
-        Self(permutation.iter().map(|axis| self.0[*axis]).collect())
+    pub fn transposed(&self, permutation: &Permutation) -> Result<Self, TypeError> {
+        Ok(Self(permutation.normalize(self.0.len())?.into_iter().map(|axis| self.0[axis]).collect()))
     }
 }
 
@@ -964,7 +965,7 @@ mod tests {
 
         // Transposing copies output axis `i` from source axis `permutation[i]`, preserving residual slot indices.
         assert_eq!(
-            plan.transposed(&Permutation::from(vec![4, 0, 1, 2, 3])),
+            plan.transposed(&Permutation::from(vec![-1, 0, 1, 2, 3])).unwrap(),
             ExactShape(vec![
                 ExactShapeDimension::Residual(1),
                 ExactShapeDimension::Static(2),

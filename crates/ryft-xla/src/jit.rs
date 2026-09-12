@@ -1859,13 +1859,13 @@ mod tests {
         CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
         DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
-        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
+        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
         ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
         ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
         ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
-        StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
-        differentiate_at,
+        StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -4545,60 +4545,82 @@ mod tests {
 
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
-        use ryft_core::{Memory, TransferToMemory};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
             .unwrap();
-
-        // Host offloading requires a pinned-host memory space on the target device: without one the lowered
-        // `annotate_device_placement` annotations have nothing to legalize into, so skip on plugins that do not
-        // expose it instead of failing.
         let devices = client.addressable_devices().unwrap();
-        let has_pinned_host = devices[0]
-            .addressable_memories()
-            .unwrap()
-            .iter()
-            .any(|memory| memory.kind().map(|kind| kind == "pinned_host").unwrap_or(false));
-        if !has_pinned_host {
-            eprintln!("skipping transfer_to_memory smoke test: the plugin exposes no pinned_host memory space");
-            return;
-        }
-
+        let device = &devices[0];
+        let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
+        let device_id = device.id().unwrap();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
-
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let input_type = ArrayType::new_static(DataType::I64, [4])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
-            |x| x.transfer_to_memory(Memory::Host { pinned: true }).transfer_to_memory(Memory::Device),
-            input_type.clone(),
-            &engine,
-            mesh.clone(),
-        )
-        .unwrap();
+        for (memory, memory_kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            assert!(device.addressable_memories().unwrap().iter().any(|memory| memory.kind().unwrap() == memory_kind));
+            let host_type = input_type.clone().with_memory(memory);
+            let values = [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993];
+            let source =
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+                    .unwrap();
 
-        let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
-        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
+            // A compiled host result must occupy the requested host memory, not just carry host metadata on a device buffer.
+            let to_host: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+                compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
+                    .unwrap();
+            let host = engine.interpret(&to_host.executable_function(), source.clone()).unwrap();
+            assert_eq!(host.r#type().as_ref(), &host_type);
+            let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
+            assert_eq!(
+                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
+                values,
+            );
 
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let shard_bytes = output
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
+            // Host placement survives an identity executable boundary, even without a transfer instruction.
+            let identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+                compile(|input| input, host_type.clone(), &engine, mesh.clone()).unwrap();
+            let host = engine.interpret(&identity.executable_function(), host).unwrap();
+            assert_eq!(host.r#type().as_ref(), &host_type);
+            let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
+            assert_eq!(
+                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
+                values,
+            );
+
+            // The host input signature must permit a real host input to return to device memory.
+            let to_device: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+                compile(|input| input.transfer_to_memory(Memory::Device).unwrap(), host_type, &engine, mesh.clone())
+                    .unwrap();
+            let output = engine.interpret(&to_device.executable_function(), host).unwrap();
+            assert_eq!(output.r#type().as_ref(), &input_type);
+            let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
+            assert_eq!(
+                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
+                values,
+            );
+
+            let round_trip: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+                |input| input.transfer_to_memory(memory).unwrap().transfer_to_memory(Memory::Device).unwrap(),
+                input_type.clone(),
+                &engine,
+                mesh.clone(),
+            )
             .unwrap();
-        let observed = values_from_bytes::<f32>(shard_bytes.as_slice());
-        for (got, &input) in observed.iter().zip(values.iter()) {
-            assert!((got - input).abs() < 1e-6, "got {got}, expected {input}");
+            let output = engine.interpret(&round_trip.executable_function(), source).unwrap();
+            assert_eq!(output.r#type().as_ref(), &input_type);
+            let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
+            assert_eq!(
+                values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
+                values,
+            );
         }
     }
 

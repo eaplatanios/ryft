@@ -19,8 +19,9 @@ use std::fmt::Display;
 ///
 /// Note that *placement* information is metadata about *where* values live, not about their contents. It never affects
 /// shapes, data types, or the numerical semantics of operations. Values residing in different memory spaces never
-/// combine directly (i.e., moving a value between memories requires staging an explicit transfer), and eager domains,
-/// which have no memory hierarchy, treat all placements alike.
+/// combine directly (i.e., moving a value between memories requires an explicit transfer). Reference arrays model
+/// placement as type metadata and retain their host storage. Native backends, on the other hand, must honor their
+/// physical memory hierarchy and may reject unsupported placements.
 ///
 /// The [`Display`] implementation renders `Device`, `Host[Pinned]`, or `Host[Unpinned]`. This rendering is only
 /// meant for diagnostics and rendered types/programs; backends that need their own placement vocabulary (e.g., the
@@ -36,8 +37,9 @@ pub enum Memory {
     Host {
         /// Boolean value indicating whether the memory is pinned (i.e., page-locked). Pinned host memory supports
         /// the asynchronous device-to-host and host-to-device transfers that XLA's host-offloading pipeline relies
-        /// on (which may also be true for similar functionality in other backends). On the other hand, unpinned host
-        /// memory avoids consuming page-locked pages at the cost of slower, synchronous, staging.
+        /// on (which may also be true for similar functionality in other backends). Unpinned host memory avoids
+        /// consuming page-locked pages but may require additional staging. Availability and transfer scheduling
+        /// depend on the backend; the pinned flag does not specify whether the calling thread blocks.
         pinned: bool,
     },
 }

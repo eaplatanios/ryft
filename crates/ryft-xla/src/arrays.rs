@@ -5,8 +5,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, ProjectedContext, Sharding,
-    ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Memory, Parameter, Parameterized, ProjectedContext,
+    Sharding, ShardingDimension, ShardingError, StaticShape, Typed, Value, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -123,8 +123,10 @@ impl<'o> Array<'o> {
     /// device. It will also return an [`Error::DeviceNotInMesh`] if there are buffer whose device is not present in
     /// `mesh`, an [`Error::NonAddressableDevice`] for buffers whose device belongs to a different process than the
     /// corresponding mesh device, and an [`Error::BufferTypeMismatch`] for buffers whose data type or static shape
-    /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. Shards that do not
-    /// have a local/addressable buffer are retained as non-addressable [`ArrayShard`]s. For a logical
+    /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. A buffer whose physical
+    /// memory differs from `r#type.memory()` produces [`Error::BufferMemoryMismatch`]. [`Memory::Device`] denotes the
+    /// owning device's default memory; host placements require the corresponding pinned or unpinned memory kind.
+    /// Shards without a local/addressable buffer are retained as non-addressable [`ArrayShard`]s. For a logical
     /// [`DataType::Zero`] array, every private predicate carrier must contain only false bits; a noncanonical buffer is
     /// rejected so that its physical payload cannot become observable through the logical zero-space value. Valid
     /// carriers are discarded after validation and the local shards become addressable bufferless zero-space shards.
@@ -204,6 +206,23 @@ impl<'o> Array<'o> {
                     device_id,
                     expected_process_index: descriptor.device().process_index(),
                     actual_process_index: process_index,
+                });
+            }
+
+            // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
+            // means the plugin's default memory, whose kind is platform-dependent (e.g., CPU uses host memory).
+            let buffer_memory = buffer.memory()?;
+            let buffer_device = buffer.device()?;
+            let memory_matches = match r#type.memory() {
+                Memory::Device => buffer_memory == buffer_device.default_memory()?,
+                Memory::Host { pinned: true } => buffer_memory.kind()? == "pinned_host",
+                Memory::Host { pinned: false } => buffer_memory.kind()? == "unpinned_host",
+            };
+            if !memory_matches {
+                return Err(Error::BufferMemoryMismatch {
+                    device_id,
+                    expected: r#type.memory(),
+                    actual: buffer_memory.kind()?.to_string(),
                 });
             }
 
@@ -338,6 +357,10 @@ impl<'o> Array<'o> {
     /// This function derives the per-device shard slices from the provided type/mesh pair, transfers only the shards
     /// addressable by `client`, and returns an [`Array`] whose global shard metadata covers the full mesh.
     ///
+    /// Each addressable shard is uploaded to the memory requested by `r#type`. [`Memory::Device`] uses the device's
+    /// default memory; host placements select its `pinned_host` or `unpinned_host` memory. A device without the requested
+    /// host space produces [`Error::UnsupportedMemory`]. Bufferless structural-zero arrays require no allocation.
+    ///
     /// # Parameters
     ///
     ///   - `client`: PJRT [`Client`] used to transfer the local addressable shard buffers.
@@ -394,6 +417,23 @@ impl<'o> Array<'o> {
                 process_index: client_process_index,
             })?;
 
+            // Resolve the requested space explicitly; passing the device itself would always upload to its default
+            // memory and could silently mislabel a host-resident array as pinned or unpinned memory.
+            let memory = match r#type.memory() {
+                Memory::Device => device.default_memory()?,
+                requested @ Memory::Host { pinned } => {
+                    let kind = if pinned { "pinned_host" } else { "unpinned_host" };
+                    let mut selected = None;
+                    for candidate in device.addressable_memories()? {
+                        if candidate.kind()? == kind {
+                            selected = Some(candidate);
+                            break;
+                        }
+                    }
+                    selected.ok_or(Error::UnsupportedMemory { device_id: shard_device_id, memory: requested })?
+                }
+            };
+
             // Upload the local shard bytes to the PJRT device using the shard-local static shape. For non-scalar
             // shards, the host pointer is moved to the shard's first element in the dense source buffer, and PJRT's
             // host byte-stride support describes how to read the shard without materializing a packed temporary vector.
@@ -407,7 +447,7 @@ impl<'o> Array<'o> {
                     buffer_type,
                     shard_dimensions.as_slice(),
                     None,
-                    device.clone(),
+                    memory,
                     None,
                 )?);
             } else {
@@ -482,7 +522,7 @@ impl<'o> Array<'o> {
                     buffer_type,
                     shard_dimensions.as_slice(),
                     byte_strides.as_deref(),
-                    device.clone(),
+                    memory,
                     None,
                 )?);
             }
@@ -1228,8 +1268,8 @@ mod tests {
 
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Error as CoreError,
-        Layout, LogicalMesh, MeshAxis, MeshAxisType, Reference, Shape, Sharding, ShardingDimension, ShardingError,
-        StaticShape, TiledLayout, Typed, Value,
+        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Reference, Shape, Sharding, ShardingDimension,
+        ShardingError, StaticShape, TiledLayout, Typed, Value,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
@@ -1340,6 +1380,69 @@ mod tests {
             .r#await()
             .unwrap();
         assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![0.0, 1.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_array_from_addressable_buffers_memory() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![Device::from_pjrt(&device).unwrap()]).unwrap();
+        let r#type = ArrayType::scalar(DataType::I32);
+        let values = values_to_bytes::<i32>(&[7]);
+
+        // Reject a valid device buffer whose logical type falsely claims pinned-host placement.
+        let buffer = client.buffer(values.as_slice(), BufferType::I32, [], None, device.clone(), None).unwrap();
+        let actual = buffer.memory().unwrap().kind().unwrap().to_string();
+        assert_ne!(actual, "pinned_host");
+        assert_eq!(
+            Array::from_addressable_buffers(
+                &client,
+                r#type.with_memory(Memory::Host { pinned: true }),
+                mesh,
+                vec![buffer],
+            )
+            .unwrap_err(),
+            Error::BufferMemoryMismatch {
+                device_id: device.id().unwrap(),
+                expected: Memory::Host { pinned: true },
+                actual,
+            },
+        );
+    }
+
+    #[test]
+    fn test_array_from_host_buffer_memory() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![Device::from_pjrt(&device).unwrap()]).unwrap();
+        let values = values_to_bytes::<i64>(&[i64::MIN, i64::MAX]);
+
+        // Verify physical placement and exact contents for every public memory variant. Exercise both scalar and
+        // nonscalar uploads because their host-buffer paths use different stride handling.
+        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
+            for shape in [Shape::new(vec![]), Shape::new(vec![Dimension::Static(2)])] {
+                let count = if shape.rank() == 0 { 1 } else { 2 };
+                let r#type = ArrayType::new(DataType::I64, shape).with_memory(memory);
+                let array = Array::from_host_buffer(&client, r#type, mesh.clone(), &values[..count * 8]).unwrap();
+                assert_eq!(array.r#type().memory(), memory);
+                let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
+                let actual = buffer.memory().unwrap();
+                match memory {
+                    Memory::Device => assert_eq!(actual, device.default_memory().unwrap()),
+                    Memory::Host { pinned: true } => assert_eq!(actual.kind().unwrap(), "pinned_host"),
+                    Memory::Host { pinned: false } => assert_eq!(actual.kind().unwrap(), "unpinned_host"),
+                }
+                assert_eq!(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice(), &values[..count * 8]);
+            }
+        }
     }
 
     #[test]

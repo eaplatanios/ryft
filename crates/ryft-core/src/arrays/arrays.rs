@@ -328,10 +328,9 @@ impl Array {
     /// kernel that promotes mixed-type operands through [`Array::promoted_to`].
     ///
     /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
-    /// (which category carries each source, which destination performs the single rounding, truncation, or
-    /// saturation step, and which formats reject a value outright) are the ones documented on that trait. Converting
-    /// an array to its own element data type shares the existing payload instead of copying it. Token conversions are
-    /// always rejected, and structural-zero conversion is accepted only as a same-type no-op.
+    /// (including rounding, truncation, saturation, and exceptional-value handling) are documented on that trait.
+    /// Converting an array to its own element data type shares the existing payload instead of copying it. Token
+    /// conversions are always rejected, and structural-zero conversion is accepted only as a same-type no-op.
     ///
     /// # Parameters
     ///
@@ -339,9 +338,10 @@ impl Array {
     ///
     /// # Errors
     ///
-    /// Returns an error if either data type is [`DataType::Token`], if exactly one of them is [`DataType::Zero`], or
-    /// if any element has no representation in `data_type` (for example, converting a zero into `f8e8m0fnu`, which
-    /// cannot represent it).
+    /// Returns an error if either data type is [`DataType::Token`] or exactly one is [`DataType::Zero`]. Numerical
+    /// conversion maps zero to NaN for `f8e8m0fnu`; finite-only microscaling formats map NaN to their positive maximum
+    /// and saturate infinities to their signed finite limits. Explicit checked element constructors retain their own
+    /// representability checks.
     pub fn converted_to(&self, data_type: DataType) -> Result<Self, ProgramError> {
         let source_data_type = self.r#type.data_type();
         if source_data_type.is_token() || data_type.is_token() {

@@ -65,7 +65,7 @@ impl<L: ArrayElement, O: Operation<Type = ArrayType>> Fill<L, Array> for EagerCo
         }
         Array::scalar(value)?
             .convert_element_type(r#type.data_type())?
-            .transfer_to_memory(r#type.memory())
+            .transfer_to_memory(r#type.memory())?
             .broadcast(r#type.clone(), &[])
     }
 }
@@ -134,7 +134,9 @@ where
     C::Operation: From<ConstantOperation<Array>>,
 {
     fn fill_literal(&self, r#type: &ArrayType, value: L) -> Result<Self::Value, ProgramError> {
-        let value = Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+        let value = Array::scalar(value)?
+            .convert_element_type(r#type.data_type())?
+            .transfer_to_memory(r#type.memory())?;
         r#type
             .clone()
             .with_sharding(r#type.sharding().cloned())
@@ -218,8 +220,9 @@ where
             .clone()
             .with_sharding(r#type.sharding().cloned())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let literal =
-            Array::scalar(value)?.convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+        let literal = Array::scalar(value)?
+            .convert_element_type(r#type.data_type())?
+            .transfer_to_memory(r#type.memory())?;
 
         // Check every locally decidable failure before binding the literal. Static output axes of a dynamic
         // broadcast need dimension constants too, and their extents must fit the dimension representation.

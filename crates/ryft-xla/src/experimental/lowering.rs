@@ -750,7 +750,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
         check_count!("output", output_types, 1, ProgramError);
         check_count!("input", lowerer.input_types, 1, ProgramError);
         let input_type = &lowerer.input_types[0];
-        let input_data_type = input_type.data_type();
+        let mut input_data_type = input_type.data_type();
         let output_data_type = output_types[0].data_type();
         let output_type = lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?;
         let mut input = input_values[0];
@@ -788,6 +788,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
             return Ok(vec![result.result(0).unwrap().as_ref()]);
         }
 
+        // Floating destinations use the real component, retaining its precision for the rounding adjustment below.
+        if input_data_type.is_complex() && output_data_type.is_floating_point() {
+            let real = lowerer.block.append_operation(stable_hlo::real(input, lowerer.location)?)?;
+            input = real.result(0).unwrap().as_ref();
+            input_data_type = if input_data_type == DataType::C128 { DataType::F64 } else { DataType::F32 };
+        }
+
         // The shared i1 carrier has predicate semantics in StableHLO. Recover the signed numeric value before
         // widening an I1, while preserving its bit directly when converting between one-bit carriers.
         if matches!(input_data_type, DataType::Boolean | DataType::I1 | DataType::U1)
@@ -808,8 +815,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
             output_data_type,
             DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4
         ) {
-            // Integer narrowing retains the low bits. Real inputs first truncate/saturate to the same byte carrier
-            // used by the reference sub-byte codecs, then narrow modularly; conversion directly to i1 tests nonzero.
+            // Integer narrowing retains low bits. Real inputs instead saturate to the logical integer range;
+            // using a byte carrier first also gives NaNs the integer conversion's zero value. The final mask
+            // preserves one-bit signed encodings rather than invoking predicate truthiness.
             let carrier_data_type = if matches!(output_data_type, DataType::I1 | DataType::I2 | DataType::I4) {
                 DataType::I8
             } else {
@@ -819,6 +827,38 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
             let carrier_tensor_type = lower_tensor_type(&carrier_type, lowerer.context, lowerer.location)?;
             let converted =
                 lowerer.block.append_operation(stable_hlo::convert(input, carrier_tensor_type, lowerer.location)?)?;
+            let mut converted = converted.result(0).unwrap().as_ref();
+            if input_data_type.is_floating_point() || input_data_type.is_complex() {
+                let (minimum, maximum) = match output_data_type {
+                    DataType::I1 => (-1, 0),
+                    DataType::I2 => (-2, 1),
+                    DataType::I4 => (-8, 7),
+                    DataType::U1 => (0, 1),
+                    DataType::U2 => (0, 3),
+                    _ => (0, 15),
+                };
+                let minimum = lower_unplaced_constant_output(
+                    &[carrier_type.clone()],
+                    minimum,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?[0];
+                let maximum = lower_unplaced_constant_output(
+                    &[carrier_type.clone()],
+                    maximum,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?[0];
+                let clamped = lowerer.block.append_operation(stable_hlo::clamp(
+                    minimum,
+                    converted,
+                    maximum,
+                    lowerer.location,
+                )?)?;
+                converted = clamped.result(0).unwrap().as_ref();
+            }
             let mask = lower_unplaced_constant_output(
                 &[carrier_type],
                 match output_data_type {
@@ -830,16 +870,253 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
                 lowerer.context,
                 lowerer.location,
             )?[0];
-            let masked = lowerer.block.append_operation(stable_hlo::and(
-                converted.result(0).unwrap().as_ref(),
-                mask,
+            let masked = lowerer.block.append_operation(stable_hlo::and(converted, mask, lowerer.location)?)?;
+            input = masked.result(0).unwrap().as_ref();
+        }
+        if (matches!(input_data_type, DataType::I32 | DataType::U32 | DataType::I64 | DataType::U64)
+            && matches!(output_data_type, DataType::BF16 | DataType::F8E8M0FNU))
+            || (input_data_type == DataType::F64
+                && output_data_type.is_floating_point()
+                && !matches!(output_data_type, DataType::F32 | DataType::F64))
+        {
+            input = lower_conversion_round_to_odd(
+                input,
+                &input_type.clone().with_data_type(input_data_type),
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+        }
+        if matches!(output_data_type, DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN) {
+            // These formats have no NaN or infinity encodings. Normalize exceptional values and clamp finite
+            // overflow before native conversion, whose handling otherwise differs across CPU and GPU backends.
+            let float_type = input_type.clone().with_data_type(DataType::F32);
+            let float_tensor_type = lower_tensor_type(&float_type, lowerer.context, lowerer.location)?;
+            let converted =
+                lowerer.block.append_operation(stable_hlo::convert(input, float_tensor_type, lowerer.location)?)?;
+            input = converted.result(0).unwrap().as_ref();
+            let maximum = match output_data_type {
+                DataType::F4E2M1FN => 6.0,
+                DataType::F6E2M3FN => 7.5,
+                _ => 28.0,
+            };
+            let minimum = lower_f64_constant_splat(
+                -maximum,
+                &float_type,
+                float_tensor_type,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            let maximum = lower_f64_constant_splat(
+                maximum,
+                &float_type,
+                float_tensor_type,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            let is_nan = lowerer.block.append_operation(stable_hlo::compare(
+                input,
+                input,
+                stable_hlo::ComparisonDirection::NotEqual,
+                stable_hlo::ComparisonType::Float,
                 lowerer.location,
             )?)?;
-            input = masked.result(0).unwrap().as_ref();
+            let clamped =
+                lowerer.block.append_operation(stable_hlo::clamp(minimum, input, maximum, lowerer.location)?)?;
+            let normalized = lowerer.block.append_operation(stable_hlo::select(
+                is_nan.result(0).unwrap().as_ref(),
+                maximum,
+                clamped.result(0).unwrap().as_ref(),
+                lowerer.location,
+            )?)?;
+            input = normalized.result(0).unwrap().as_ref();
         }
         let result = lowerer.block.append_operation(stable_hlo::convert(input, output_type, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.convert should return one result").as_ref()])
     }
+}
+
+/// Preserves rounding information in an intermediate `f32` before conversion to a lower-precision float.
+/// An inexact intermediate is truncated toward zero and its low significand bit is set, preventing a second
+/// nearest-even rounding from mistaking a value adjacent to a destination midpoint for the midpoint itself.
+fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let float_type = lower_tensor_type(&input_type.clone().with_data_type(DataType::F32), context, location)?;
+    let float = block.append_operation(stable_hlo::convert(input, float_type, location)?)?;
+    let float = float.result(0).unwrap().as_ref();
+    // The intermediate rounding is observable here. Prevent excess-precision optimizations from cancelling
+    // the narrowing/widening pair and incorrectly proving that the original conversion was exact.
+    let float = block.append_operation(stable_hlo::optimization_barrier(&[float], location)?)?;
+    let float = float.result(0).unwrap().as_ref();
+    let recovered = block.append_operation(stable_hlo::convert(
+        float,
+        lower_tensor_type(input_type, context, location)?,
+        location,
+    )?)?;
+    let recovered = recovered.result(0).unwrap().as_ref();
+    let comparison_type = if input_type.data_type().is_floating_point() {
+        stable_hlo::ComparisonType::Float
+    } else if input_type.data_type().is_signed() {
+        stable_hlo::ComparisonType::Signed
+    } else {
+        stable_hlo::ComparisonType::Unsigned
+    };
+    let inexact = block.append_operation(stable_hlo::compare(
+        input,
+        recovered,
+        stable_hlo::ComparisonDirection::NotEqual,
+        comparison_type,
+        location,
+    )?)?;
+    let inexact = inexact.result(0).unwrap().as_ref();
+    let increased = block.append_operation(stable_hlo::compare(
+        recovered,
+        input,
+        stable_hlo::ComparisonDirection::GreaterThan,
+        comparison_type,
+        location,
+    )?)?;
+    let mut increased = increased.result(0).unwrap().as_ref();
+    if input_type.data_type().is_signed() || input_type.data_type().is_floating_point() {
+        let zero = lower_unplaced_constant_output(&[input_type.clone()], 0, block, context, location)?[0];
+        let negative = block.append_operation(stable_hlo::compare(
+            input,
+            zero,
+            stable_hlo::ComparisonDirection::LessThan,
+            comparison_type,
+            location,
+        )?)?;
+        let decreased = block.append_operation(stable_hlo::compare(
+            recovered,
+            input,
+            stable_hlo::ComparisonDirection::LessThan,
+            comparison_type,
+            location,
+        )?)?;
+        let direction = block.append_operation(stable_hlo::select(
+            negative.result(0).unwrap().as_ref(),
+            decreased.result(0).unwrap().as_ref(),
+            increased,
+            location,
+        )?)?;
+        increased = direction.result(0).unwrap().as_ref();
+    }
+    let bits_type = input_type.clone().with_data_type(DataType::U32);
+    let bits = block.append_operation(stable_hlo::bitcast_convert(
+        float,
+        lower_tensor_type(&bits_type, context, location)?,
+        location,
+    )?)?;
+    let bits = bits.result(0).unwrap().as_ref();
+    let one = lower_unplaced_constant_output(&[bits_type], 1, block, context, location)?[0];
+    let previous = block.append_operation(stable_hlo::subtract(bits, one, location)?)?;
+    let truncated =
+        block.append_operation(stable_hlo::select(increased, previous.result(0).unwrap().as_ref(), bits, location)?)?;
+    let odd = block.append_operation(stable_hlo::or(truncated.result(0).unwrap().as_ref(), one, location)?)?;
+    let rounded =
+        block.append_operation(stable_hlo::select(inexact, odd.result(0).unwrap().as_ref(), bits, location)?)?;
+    let mut rounded = rounded.result(0).unwrap().as_ref();
+    if input_type.data_type() == DataType::F64 {
+        // CPU floating-point modes may flush subnormal f32 results during the initial narrowing. Construct these
+        // encodings directly from f64 bits instead. Shift the exact significand to f32 subnormal precision and
+        // jam every discarded nonzero bit into its low bit, without any floating-point arithmetic.
+        let wide_type = input_type.clone().with_data_type(DataType::U64);
+        let wide_tensor_type = lower_tensor_type(&wide_type, context, location)?;
+        let source_bits = block.append_operation(stable_hlo::bitcast_convert(input, wide_tensor_type, location)?)?;
+        let source_bits = source_bits.result(0).unwrap().as_ref();
+        let magnitude_mask =
+            lower_unplaced_constant_output(&[wide_type.clone()], i64::MAX, block, context, location)?[0];
+        let exponent_shift = lower_unplaced_constant_output(&[wide_type.clone()], 52, block, context, location)?[0];
+        // The smallest normal f32 has f64 biased exponent 1023 - 126 = 897. Its subnormal unit is 2^-149,
+        // so an f64 significand at biased exponent `e` needs a right shift of 1023 + 52 - 149 - e = 926 - e.
+        let smallest_normal_exponent =
+            lower_unplaced_constant_output(&[wide_type.clone()], 897, block, context, location)?[0];
+        let shift_offset = lower_unplaced_constant_output(&[wide_type.clone()], 926, block, context, location)?[0];
+        let mantissa_mask =
+            lower_unplaced_constant_output(&[wide_type.clone()], (1_i64 << 52) - 1, block, context, location)?[0];
+        let implicit_bit =
+            lower_unplaced_constant_output(&[wide_type.clone()], 1_i64 << 52, block, context, location)?[0];
+        let wide_one = lower_unplaced_constant_output(&[wide_type.clone()], 1, block, context, location)?[0];
+        let wide_zero = lower_unplaced_constant_output(&[wide_type.clone()], 0, block, context, location)?[0];
+        let sign_shift = lower_unplaced_constant_output(&[wide_type.clone()], 32, block, context, location)?[0];
+        let sign_mask = lower_unplaced_constant_output(&[wide_type.clone()], 1_i64 << 31, block, context, location)?[0];
+        let magnitude = block.append_operation(stable_hlo::and(source_bits, magnitude_mask, location)?)?;
+        let magnitude = magnitude.result(0).unwrap().as_ref();
+        let exponent = block.append_operation(stable_hlo::shift_right_logical(magnitude, exponent_shift, location)?)?;
+        let exponent = exponent.result(0).unwrap().as_ref();
+        let mantissa = block.append_operation(stable_hlo::and(magnitude, mantissa_mask, location)?)?;
+        let mantissa = mantissa.result(0).unwrap().as_ref();
+        let significand = block.append_operation(stable_hlo::or(mantissa, implicit_bit, location)?)?;
+        let significand = significand.result(0).unwrap().as_ref();
+        let shift = block.append_operation(stable_hlo::subtract(shift_offset, exponent, location)?)?;
+        let shift = shift.result(0).unwrap().as_ref();
+        let truncated = block.append_operation(stable_hlo::shift_right_logical(significand, shift, location)?)?;
+        let truncated = truncated.result(0).unwrap().as_ref();
+        let discarded_mask = block.append_operation(stable_hlo::shift_left(wide_one, shift, location)?)?;
+        let discarded_mask = discarded_mask.result(0).unwrap().as_ref();
+        let discarded_mask = block.append_operation(stable_hlo::subtract(discarded_mask, wide_one, location)?)?;
+        let discarded_mask = discarded_mask.result(0).unwrap().as_ref();
+        let discarded = block.append_operation(stable_hlo::and(significand, discarded_mask, location)?)?;
+        let discarded = discarded.result(0).unwrap().as_ref();
+        let sticky = block.append_operation(stable_hlo::compare(
+            discarded,
+            wide_zero,
+            stable_hlo::ComparisonDirection::NotEqual,
+            stable_hlo::ComparisonType::Unsigned,
+            location,
+        )?)?;
+        let sticky = sticky.result(0).unwrap().as_ref();
+        let sticky = block.append_operation(stable_hlo::convert(sticky, wide_tensor_type, location)?)?;
+        let sticky = sticky.result(0).unwrap().as_ref();
+        let subnormal = block.append_operation(stable_hlo::or(truncated, sticky, location)?)?;
+        let subnormal = subnormal.result(0).unwrap().as_ref();
+        // A shift beyond 63 bits gives zero and an all-ones discarded mask, so every nonzero tiny f64 jams to
+        // the smallest f32 subnormal. Clear that sticky bit only for an exact signed zero.
+        let is_zero = block.append_operation(stable_hlo::compare(
+            magnitude,
+            wide_zero,
+            stable_hlo::ComparisonDirection::Equal,
+            stable_hlo::ComparisonType::Unsigned,
+            location,
+        )?)?;
+        let is_zero = is_zero.result(0).unwrap().as_ref();
+        let subnormal = block.append_operation(stable_hlo::select(is_zero, wide_zero, subnormal, location)?)?;
+        let subnormal = subnormal.result(0).unwrap().as_ref();
+        let sign = block.append_operation(stable_hlo::shift_right_logical(source_bits, sign_shift, location)?)?;
+        let sign = sign.result(0).unwrap().as_ref();
+        let sign = block.append_operation(stable_hlo::and(sign, sign_mask, location)?)?;
+        let sign = sign.result(0).unwrap().as_ref();
+        let subnormal = block.append_operation(stable_hlo::or(subnormal, sign, location)?)?;
+        let subnormal = subnormal.result(0).unwrap().as_ref();
+        let subnormal = block.append_operation(stable_hlo::convert(
+            subnormal,
+            lower_tensor_type(&input_type.clone().with_data_type(DataType::U32), context, location)?,
+            location,
+        )?)?;
+        let subnormal = subnormal.result(0).unwrap().as_ref();
+        let is_subnormal = block.append_operation(stable_hlo::compare(
+            exponent,
+            smallest_normal_exponent,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Unsigned,
+            location,
+        )?)?;
+        let is_subnormal = is_subnormal.result(0).unwrap().as_ref();
+        let corrected = block.append_operation(stable_hlo::select(is_subnormal, subnormal, rounded, location)?)?;
+        let corrected = corrected.result(0).unwrap().as_ref();
+        rounded = corrected;
+    }
+    // Saturating cast-back cannot detect the inexact representation of the largest positive integer. Its rounded
+    // power of two is nevertheless already the correct result for both destination formats, far from a midpoint.
+    let result = block.append_operation(stable_hlo::bitcast_convert(rounded, float_type, location)?)?;
+    Ok(result.result(0).unwrap().as_ref())
 }
 
 /// Reinterprets physical encoding bits, including logical one-bit integers whose XLA predicate carrier occupies a
@@ -858,14 +1135,87 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     if input_type.data_type() == output_type.data_type() || input_one_bit && output_one_bit {
         return Ok(input);
     }
+    // Equal-width bitcasts preserve every dimension and can operate directly on unbounded dynamic tensors.
+    // Type inference adds or removes one trailing axis for every width-changing bitcast.
+    if input_type.rank() == output_type.rank() {
+        let result = block.append_operation(stable_hlo::bitcast_convert(
+            input,
+            lower_tensor_type(output_type, context, location)?,
+            location,
+        )?)?;
+        return Ok(result.result(0).unwrap().as_ref());
+    }
+    // Width-changing bitcasts need physical bounds for XLA's dynamic padding pass.
+    let physical_input_type = physical_bound_type(input_type).map_err(|_| LoweringError::UnsupportedOp {
+        op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
+    })?;
     let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
     let carrier_input_type =
         if input_one_bit { input_type.clone().with_data_type(DataType::Boolean) } else { input_type.clone() };
     let physical_input = lower_physical_bound_value(input, &carrier_input_type, padding, block, context, location)?;
-    let physical_input_type = physical_bound_type(input_type)?;
     let physical_output_type = physical_bound_type(output_type)?;
     let output_tensor_type = lower_tensor_type(&physical_output_type, context, location)?;
-    let result = if output_one_bit {
+    let result = if matches!(input_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
+        // XLA stores FP6 in a byte and native rank-changing bitcasts expose eight bits. Recover the six logical
+        // encoding bits explicitly before splitting them into one- or two-bit groups.
+        let bits = lower_fp6_to_bits(physical_input, &physical_input_type, block, context, location)?;
+        let group_width = if output_one_bit { 1 } else { 2 };
+        let expanded_type = physical_output_type.clone().with_data_type(DataType::U8);
+        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded = block.append_operation(stable_hlo::broadcast(
+            bits,
+            expanded_tensor_type,
+            &(0..input_type.rank()).collect::<Vec<_>>(),
+            location,
+        )?)?;
+        let offsets =
+            block.append_operation(stable_hlo::iota(expanded_tensor_type, output_type.rank() - 1, location)?)?;
+        let width = lower_unplaced_constant_output(&[expanded_type.clone()], group_width, block, context, location)?[0];
+        let offsets =
+            block.append_operation(stable_hlo::multiply(offsets.result(0).unwrap().as_ref(), width, location)?)?;
+        let shifted = block.append_operation(stable_hlo::shift_right_logical(
+            expanded.result(0).unwrap().as_ref(),
+            offsets.result(0).unwrap().as_ref(),
+            location,
+        )?)?;
+        let mask =
+            lower_unplaced_constant_output(&[expanded_type], (1 << group_width) - 1, block, context, location)?[0];
+        let groups = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), mask, location)?)?;
+        let result = block.append_operation(stable_hlo::convert(
+            groups.result(0).unwrap().as_ref(),
+            output_tensor_type,
+            location,
+        )?)?;
+        result.result(0).unwrap().as_ref()
+    } else if matches!(output_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
+        let group_width = if input_one_bit { 1 } else { 2 };
+        let groups_type = physical_input_type.clone().with_data_type(DataType::U8);
+        let groups_tensor_type = lower_tensor_type(&groups_type, context, location)?;
+        let groups = block.append_operation(stable_hlo::convert(physical_input, groups_tensor_type, location)?)?;
+        let mask =
+            lower_unplaced_constant_output(&[groups_type.clone()], (1 << group_width) - 1, block, context, location)?
+                [0];
+        let groups = block.append_operation(stable_hlo::and(groups.result(0).unwrap().as_ref(), mask, location)?)?;
+        let offsets = block.append_operation(stable_hlo::iota(groups_tensor_type, input_type.rank() - 1, location)?)?;
+        let width = lower_unplaced_constant_output(&[groups_type], group_width, block, context, location)?[0];
+        let offsets =
+            block.append_operation(stable_hlo::multiply(offsets.result(0).unwrap().as_ref(), width, location)?)?;
+        let shifted = block.append_operation(stable_hlo::shift_left(
+            groups.result(0).unwrap().as_ref(),
+            offsets.result(0).unwrap().as_ref(),
+            location,
+        )?)?;
+        let bits = lower_reduce_to_mlir(
+            ReductionKind::Sum,
+            &[input_type.rank() - 1],
+            shifted.result(0).unwrap().as_ref(),
+            &physical_output_type.clone().with_data_type(DataType::U8),
+            block,
+            context,
+            location,
+        )?;
+        lower_bits_to_fp6(bits, &physical_output_type, block, context, location)?
+    } else if output_one_bit {
         // Split into two-bit groups first: every supported non-one-bit numeric encoding has an even width, including
         // six-bit floats. Expanding each group to two predicates avoids treating each predicate as eight bits.
         let mut shape = static_dimensions(&physical_output_type)?;
@@ -968,6 +1318,174 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     };
     let sources = (0..output_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
     lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
+}
+
+/// Extracts a finite FP6 encoding through its exact `f32` representation, preserving the sign of zero.
+fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
+    let integer_type = r#type.clone().with_data_type(DataType::U32);
+    let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
+    let float_type = r#type.clone().with_data_type(DataType::F32);
+    let float_tensor_type = lower_tensor_type(&float_type, context, location)?;
+    let float = block.append_operation(stable_hlo::convert(input, float_tensor_type, location)?)?;
+    let float = float.result(0).unwrap().as_ref();
+    let bits = block.append_operation(stable_hlo::bitcast_convert(float, integer_tensor_type, location)?)?;
+    let bits = bits.result(0).unwrap().as_ref();
+    let sign_shift = lower_unplaced_constant_output(&[integer_type.clone()], 26, block, context, location)?[0];
+    let sign_mask = lower_unplaced_constant_output(&[integer_type.clone()], 32, block, context, location)?[0];
+    let exponent_shift = lower_unplaced_constant_output(&[integer_type.clone()], 23, block, context, location)?[0];
+    let exponent_mask = lower_unplaced_constant_output(&[integer_type.clone()], 255, block, context, location)?[0];
+    let mantissa_shift =
+        lower_unplaced_constant_output(&[integer_type.clone()], 23 - mantissa_bits, block, context, location)?[0];
+    let mantissa_mask =
+        lower_unplaced_constant_output(&[integer_type.clone()], (1 << mantissa_bits) - 1, block, context, location)?[0];
+    let bias_offset = lower_unplaced_constant_output(&[integer_type.clone()], 127 - bias, block, context, location)?[0];
+    let smallest_normal_exponent =
+        lower_unplaced_constant_output(&[integer_type.clone()], 128 - bias, block, context, location)?[0];
+    let encoding_shift =
+        lower_unplaced_constant_output(&[integer_type.clone()], mantissa_bits, block, context, location)?[0];
+    let sign = block.append_operation(stable_hlo::shift_right_logical(bits, sign_shift, location)?)?;
+    let sign = sign.result(0).unwrap().as_ref();
+    let sign = block.append_operation(stable_hlo::and(sign, sign_mask, location)?)?;
+    let sign = sign.result(0).unwrap().as_ref();
+    let exponent = block.append_operation(stable_hlo::shift_right_logical(bits, exponent_shift, location)?)?;
+    let exponent = exponent.result(0).unwrap().as_ref();
+    let exponent = block.append_operation(stable_hlo::and(exponent, exponent_mask, location)?)?;
+    let exponent = exponent.result(0).unwrap().as_ref();
+    let mantissa = block.append_operation(stable_hlo::shift_right_logical(bits, mantissa_shift, location)?)?;
+    let mantissa = mantissa.result(0).unwrap().as_ref();
+    let mantissa = block.append_operation(stable_hlo::and(mantissa, mantissa_mask, location)?)?;
+    let mantissa = mantissa.result(0).unwrap().as_ref();
+    let biased = block.append_operation(stable_hlo::subtract(exponent, bias_offset, location)?)?;
+    let biased = biased.result(0).unwrap().as_ref();
+    let biased = block.append_operation(stable_hlo::shift_left(biased, encoding_shift, location)?)?;
+    let biased = biased.result(0).unwrap().as_ref();
+    let normal = block.append_operation(stable_hlo::or(biased, mantissa, location)?)?;
+    let normal = normal.result(0).unwrap().as_ref();
+    let scale = lower_f64_constant_splat(
+        2.0_f64.powi((bias + mantissa_bits - 1) as i32),
+        &float_type,
+        float_tensor_type,
+        block,
+        context,
+        location,
+    )?;
+    let magnitude = block.append_operation(stable_hlo::abs(float, location)?)?;
+    let magnitude = magnitude.result(0).unwrap().as_ref();
+    let scaled = block.append_operation(stable_hlo::multiply(magnitude, scale, location)?)?;
+    let scaled = scaled.result(0).unwrap().as_ref();
+    let subnormal = block.append_operation(stable_hlo::convert(scaled, integer_tensor_type, location)?)?;
+    let subnormal = subnormal.result(0).unwrap().as_ref();
+    let is_subnormal = block.append_operation(stable_hlo::compare(
+        exponent,
+        smallest_normal_exponent,
+        stable_hlo::ComparisonDirection::LessThan,
+        stable_hlo::ComparisonType::Unsigned,
+        location,
+    )?)?;
+    let is_subnormal = is_subnormal.result(0).unwrap().as_ref();
+    let encoding = block.append_operation(stable_hlo::select(is_subnormal, subnormal, normal, location)?)?;
+    let encoding = encoding.result(0).unwrap().as_ref();
+    let encoding = block.append_operation(stable_hlo::or(encoding, sign, location)?)?;
+    let encoding = encoding.result(0).unwrap().as_ref();
+    let result = block.append_operation(stable_hlo::convert(
+        encoding,
+        lower_tensor_type(&r#type.clone().with_data_type(DataType::U8), context, location)?,
+        location,
+    )?)?;
+    let result = result.result(0).unwrap().as_ref();
+    Ok(result)
+}
+
+/// Decodes six packed logical bits into an exactly representable `f32` value before constructing the FP6 result.
+fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
+    let integer_type = r#type.clone().with_data_type(DataType::U32);
+    let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
+    let float_type = r#type.clone().with_data_type(DataType::F32);
+    let float_tensor_type = lower_tensor_type(&float_type, context, location)?;
+    let bits = block.append_operation(stable_hlo::convert(input, integer_tensor_type, location)?)?;
+    let bits = bits.result(0).unwrap().as_ref();
+    let sign_mask = lower_unplaced_constant_output(&[integer_type.clone()], 32, block, context, location)?[0];
+    let sign_shift = lower_unplaced_constant_output(&[integer_type.clone()], 26, block, context, location)?[0];
+    let encoding_shift =
+        lower_unplaced_constant_output(&[integer_type.clone()], mantissa_bits, block, context, location)?[0];
+    let exponent_mask = lower_unplaced_constant_output(
+        &[integer_type.clone()],
+        (1 << (5 - mantissa_bits)) - 1,
+        block,
+        context,
+        location,
+    )?[0];
+    let mantissa_mask =
+        lower_unplaced_constant_output(&[integer_type.clone()], (1 << mantissa_bits) - 1, block, context, location)?[0];
+    let bias_offset = lower_unplaced_constant_output(&[integer_type.clone()], 127 - bias, block, context, location)?[0];
+    let exponent_shift = lower_unplaced_constant_output(&[integer_type.clone()], 23, block, context, location)?[0];
+    let mantissa_shift =
+        lower_unplaced_constant_output(&[integer_type.clone()], 23 - mantissa_bits, block, context, location)?[0];
+    let zero = lower_unplaced_constant_output(&[integer_type.clone()], 0, block, context, location)?[0];
+    let sign = block.append_operation(stable_hlo::and(bits, sign_mask, location)?)?;
+    let sign = sign.result(0).unwrap().as_ref();
+    let sign = block.append_operation(stable_hlo::shift_left(sign, sign_shift, location)?)?;
+    let sign = sign.result(0).unwrap().as_ref();
+    let exponent = block.append_operation(stable_hlo::shift_right_logical(bits, encoding_shift, location)?)?;
+    let exponent = exponent.result(0).unwrap().as_ref();
+    let exponent = block.append_operation(stable_hlo::and(exponent, exponent_mask, location)?)?;
+    let exponent = exponent.result(0).unwrap().as_ref();
+    let mantissa = block.append_operation(stable_hlo::and(bits, mantissa_mask, location)?)?;
+    let mantissa = mantissa.result(0).unwrap().as_ref();
+    let biased = block.append_operation(stable_hlo::add(exponent, bias_offset, location)?)?;
+    let biased = biased.result(0).unwrap().as_ref();
+    let biased = block.append_operation(stable_hlo::shift_left(biased, exponent_shift, location)?)?;
+    let biased = biased.result(0).unwrap().as_ref();
+    let normal_mantissa = block.append_operation(stable_hlo::shift_left(mantissa, mantissa_shift, location)?)?;
+    let normal_mantissa = normal_mantissa.result(0).unwrap().as_ref();
+    let normal = block.append_operation(stable_hlo::or(biased, normal_mantissa, location)?)?;
+    let normal = normal.result(0).unwrap().as_ref();
+    let scale = lower_f64_constant_splat(
+        2.0_f64.powi((1 - bias - mantissa_bits) as i32),
+        &float_type,
+        float_tensor_type,
+        block,
+        context,
+        location,
+    )?;
+    let subnormal = block.append_operation(stable_hlo::convert(mantissa, float_tensor_type, location)?)?;
+    let subnormal = subnormal.result(0).unwrap().as_ref();
+    let subnormal = block.append_operation(stable_hlo::multiply(subnormal, scale, location)?)?;
+    let subnormal = subnormal.result(0).unwrap().as_ref();
+    let subnormal = block.append_operation(stable_hlo::bitcast_convert(subnormal, integer_tensor_type, location)?)?;
+    let subnormal = subnormal.result(0).unwrap().as_ref();
+    let is_subnormal = block.append_operation(stable_hlo::compare(
+        exponent,
+        zero,
+        stable_hlo::ComparisonDirection::Equal,
+        stable_hlo::ComparisonType::Unsigned,
+        location,
+    )?)?;
+    let is_subnormal = is_subnormal.result(0).unwrap().as_ref();
+    let encoding = block.append_operation(stable_hlo::select(is_subnormal, subnormal, normal, location)?)?;
+    let encoding = encoding.result(0).unwrap().as_ref();
+    let encoding = block.append_operation(stable_hlo::or(encoding, sign, location)?)?;
+    let encoding = encoding.result(0).unwrap().as_ref();
+    let float = block.append_operation(stable_hlo::bitcast_convert(encoding, float_tensor_type, location)?)?;
+    let float = float.result(0).unwrap().as_ref();
+    let result =
+        block.append_operation(stable_hlo::convert(float, lower_tensor_type(r#type, context, location)?, location)?)?;
+    let result = result.result(0).unwrap().as_ref();
+    Ok(result)
 }
 
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
@@ -1748,7 +2266,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TransposeOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::transpose(
             input_values[0],
-            self.permutation().as_slice(),
+            self.permutation().normalize(self.permutation().len()).map_err(ProgramError::from)?.as_slice(),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
@@ -2245,8 +2763,11 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let input = if let Some(dimensions) = operation.parameters().dimensions() {
-        let transpose =
-            block.append_operation(stable_hlo::transpose(input_values[0], dimensions.as_slice(), location)?)?;
+        let transpose = block.append_operation(stable_hlo::transpose(
+            input_values[0],
+            dimensions.normalize(dimensions.len()).map_err(ProgramError::from)?.as_slice(),
+            location,
+        )?)?;
         transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
     } else {
         input_values[0]
@@ -2383,8 +2904,20 @@ fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
         });
     }
     let physical_tensor_type = lower_tensor_type(&physical_type, context, location)?;
-    let padding =
-        lower_f64_constant_splat(padding_value, &physical_type, physical_tensor_type, block, context, location)?;
+    let padding = if physical_type.data_type().is_complex() {
+        // Padding belongs to the complex element type too; construct its real and imaginary components separately.
+        let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
+            DataType::F32
+        } else {
+            DataType::F64
+        });
+        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let real = lower_f64_constant_splat(padding_value, &part_type, part_tensor_type, block, context, location)?;
+        let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+        block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref()
+    } else {
+        lower_f64_constant_splat(padding_value, &physical_type, physical_tensor_type, block, context, location)?
+    };
     let masked = block.append_operation(stable_hlo::select(in_bounds.unwrap(), data, padding, location)?)?;
     Ok(masked.result(0).expect("stablehlo.select should return one result").as_ref())
 }
@@ -2563,14 +3096,77 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 1, ProgramError);
     check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    let output_tensor_type = lower_tensor_type(&output_types[0], context, location)?;
-    let broadcast = block.append_operation(stable_hlo::broadcast(
-        input_values[0],
-        output_tensor_type,
-        operation.output_axes(),
-        location,
-    )?)?;
-    let result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+    let output_type = &output_types[0];
+    let input = input_values[0];
+    let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
+        if output_type.layout().is_some() {
+            return Err(LoweringError::UnsupportedOp {
+                op: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
+            });
+        }
+        // Every dynamic result axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
+        let extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(axis, dimension)| {
+                if let Dimension::Static(extent) = dimension {
+                    reshape_dimension_i64(*extent)?;
+                    Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
+                } else {
+                    let input_axis =
+                        operation.output_axes().iter().position(|output_axis| *output_axis == axis).unwrap();
+                    lower_runtime_dimension_size_i64(input, input_axis, block, context, location)
+                }
+            })
+            .collect::<Result<Vec<_>, LoweringError>>()?;
+        let shape = composite::lower_explicit_shape(&extents, block, context, location)?;
+        let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
+            input,
+            shape,
+            operation.output_axes(),
+            None,
+            None,
+            location,
+        )?)?;
+        let result = broadcast.result(0).unwrap().as_ref();
+        let expected_type = lower_tensor_type(output_type, context, location)?;
+        if result.r#type()? == expected_type.as_ref() {
+            result
+        } else {
+            block.append_operation(tensor::cast(result, expected_type, location)?)?.result(0).unwrap().as_ref()
+        }
+    } else if output_type.layout().is_some() && output_type.static_shape().is_none() {
+        // Layout constraints describe the physical allocation; restore logical sizes after constraining it.
+        let physical_type = physical_bound_type(output_type)?;
+        let physical_input = lower_physical_bound_value(input, &input_types[0], 0.0, block, context, location)?;
+        let broadcast = block.append_operation(stable_hlo::broadcast(
+            physical_input,
+            lower_tensor_type(&physical_type, context, location)?,
+            operation.output_axes(),
+            location,
+        )?)?;
+        let result = composite::lower_constructor_layout(
+            broadcast.result(0).unwrap().as_ref(),
+            &physical_type,
+            block,
+            location,
+        )?;
+        let mut sources = vec![(input, 0); output_type.rank()];
+        for (input_axis, output_axis) in operation.output_axes().iter().enumerate() {
+            sources[*output_axis] = (input, input_axis);
+        }
+        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?
+    } else {
+        let broadcast = block.append_operation(stable_hlo::broadcast(
+            input,
+            lower_tensor_type(output_type, context, location)?,
+            operation.output_axes(),
+            location,
+        )?)?;
+        composite::lower_constructor_layout(broadcast.result(0).unwrap().as_ref(), output_type, block, location)?
+    };
     if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
         lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), bound_manual_axes, block, location)
     } else {
@@ -2748,8 +3344,8 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Returns the XLA buffer-placement kind string for `memory`, as consumed by the `_xla_buffer_placement` frontend
-/// attribute on `annotate_device_placement` custom calls. This mapping is owned by the lowering on purpose: core's
+/// Returns the XLA memory-kind string for `memory`, used by `mhlo.memory_kind` signature attributes and the
+/// `_xla_buffer_placement` frontend attribute on `annotate_device_placement` custom calls. This mapping is owned by the lowering on purpose: core's
 /// [`Memory`] exposes no backend vocabulary (its `Display` rendering is diagnostics-only), mirroring how
 /// [`Sharding`] converts to MLIR through backend-owned conversions.
 fn memory_placement_kind(memory: Memory) -> &'static str {
@@ -2777,11 +3373,13 @@ fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Lo
 /// Lowers one staged memory transfer to the `stablehlo.custom_call @annotate_device_placement` annotation that
 /// XLA's `ConvertMemoryPlacementToInternalAnnotations` and
 /// [`HostOffloader`](https://openxla.org/xla/tools_and_passes/host_offloading) passes legalize into memory-space
-/// annotated asynchronous copies — exactly the form JAX emits for memory-kind `device_put`s: API version 1,
-/// `has_side_effect = true`, an empty `backend_config` string, and the destination kind string carried as
-/// `_xla_buffer_placement` inside the `mhlo.frontend_attributes` dictionary. The empty `backend_config` carries no
-/// information, but emitting it keeps the rendered custom call byte-identical to JAX's so module diffs against JAX
-/// stay clean.
+/// annotated copies. The annotation uses API version 1, `has_side_effect = true`, an empty `backend_config`, and
+/// the destination kind in `_xla_buffer_placement` inside `mhlo.frontend_attributes`.
+///
+/// These constraints are retained on CPU as well: reference arrays only retag their types, but native arrays must
+/// honor the requested physical placement on every platform. The current XLA offloading pass treats pinned and
+/// unpinned host annotations alike internally; function boundary attributes and PJRT memory validation retain the
+/// distinction at runtime boundaries. A plugin must expose the requested memory kind for native allocation.
 ///
 /// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
 /// transfers (destination equal to the operand's current space) still lower to the annotation: placement round
@@ -5244,23 +5842,33 @@ pub(crate) fn to_mlir_module<
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
-        .map(|(tensor_type, sharding)| {
+        .zip(&global_input_types)
+        .map(|((tensor_type, sharding), r#type)| {
             let sharding = sharding.to_mlir(location)?;
-            Ok(TypeAndAttributes {
-                r#type: tensor_type.as_ref(),
-                attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
-            })
+            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            if r#type.memory() != Memory::Device {
+                attributes.insert(
+                    "mhlo.memory_kind".into(),
+                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                );
+            }
+            Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
     let function_results = global_output_tensor_types
         .iter()
         .zip(shard_map.out_shardings().iter())
-        .map(|(tensor_type, sharding)| {
+        .zip(&global_output_types)
+        .map(|((tensor_type, sharding), r#type)| {
             let sharding = sharding.to_mlir(location)?;
-            Ok(TypeAndAttributes {
-                r#type: tensor_type.as_ref(),
-                attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
-            })
+            let mut attributes = HashMap::from([("sdy.sharding".into(), sharding.as_ref())]);
+            if r#type.memory() != Memory::Device {
+                attributes.insert(
+                    "mhlo.memory_kind".into(),
+                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                );
+            }
+            Ok(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: Some(attributes) })
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
 
@@ -5692,6 +6300,8 @@ where
             shardings.push(token_sharding);
         }
     }
+    // Placement belongs to physical array slots, including captures, but never to the appended effect token.
+    // Default device placement needs no attribute; host identities still need attributes even without transfers.
     let function_arguments = physical_argument_tensor_types
         .iter()
         .enumerate()
@@ -5699,6 +6309,13 @@ where
             let mut attributes = HashMap::new();
             if let Some(sharding) = arg_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
+            }
+            if let Some(r#type) = physical_argument_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
+            {
+                attributes.insert(
+                    "mhlo.memory_kind".into(),
+                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                );
             }
             if let Some(output_index) = aliases.get(&index) {
                 attributes.insert(
@@ -5714,10 +6331,17 @@ where
         .iter()
         .enumerate()
         .map(|(index, tensor_type)| {
-            let attributes = result_sharding_attributes
-                .as_ref()
-                .and_then(|shardings| shardings.get(index))
-                .map(|sharding| HashMap::from([("sdy.sharding".into(), sharding.as_ref())]));
+            let mut attributes = HashMap::new();
+            if let Some(sharding) = result_sharding_attributes.as_ref().and_then(|shardings| shardings.get(index)) {
+                attributes.insert("sdy.sharding".into(), sharding.as_ref());
+            }
+            if let Some(r#type) = physical_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device) {
+                attributes.insert(
+                    "mhlo.memory_kind".into(),
+                    context.string_attribute(memory_placement_kind(r#type.memory())).as_ref(),
+                );
+            }
+            let attributes = (!attributes.is_empty()).then_some(attributes);
             TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
         })
         .collect::<Vec<_>>();
@@ -6068,11 +6692,31 @@ fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
             func::FuncAttributes {
                 arguments: input_tensor_types
                     .iter()
-                    .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                    .zip(program.input_ids())
+                    .map(|(tensor_type, atom_id)| {
+                        let memory = program.atoms()[atom_id.index()].r#type().memory();
+                        let attributes = (memory != Memory::Device).then(|| {
+                            HashMap::from([(
+                                "mhlo.memory_kind".into(),
+                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                            )])
+                        });
+                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+                    })
                     .collect(),
                 results: output_tensor_types
                     .iter()
-                    .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                    .zip(program.output_ids())
+                    .map(|(tensor_type, atom_id)| {
+                        let memory = program.atoms()[atom_id.index()].r#type().memory();
+                        let attributes = (memory != Memory::Device).then(|| {
+                            HashMap::from([(
+                                "mhlo.memory_kind".into(),
+                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                            )])
+                        });
+                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+                    })
                     .collect(),
                 ..Default::default()
             },
@@ -10397,6 +11041,54 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, true),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<?xf32>) -> tensor<?xi32> {
+                %0 = stablehlo.bitcast_convert %arg0 : (tensor<?xf32>) -> tensor<?xi32>
+                return %0 : tensor<?xi32>
+              }
+            }
+        "#}
+        );
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::UnsupportedOp {
+                op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn test_broadcast_sharding_transition_detection() {
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let replicated = test_vector_type(4).with_sharding(Sharding::replicated(explicit_mesh.clone(), 1)).unwrap();
@@ -10512,8 +11204,7 @@ mod tests {
             "#},
         );
 
-        // An unbounded dynamic result has no bounded form to lower into, so the module fails StableHLO verification
-        // rather than producing an unverified graph.
+        // Unbounded passthrough dimensions are supplied at runtime to the dynamic StableHLO operation.
         let unbounded = dynamic_dimension("n", None);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![unbounded.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), unbounded]));
@@ -10525,7 +11216,363 @@ mod tests {
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(to_mlir_module_for_plain_program(&program, "main"), Err(LoweringError::MlirVerificationFailure));
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1, "{module}");
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 1, "{module}");
+    }
+
+    #[test]
+    fn test_plain_broadcast_output_layout() {
+        // Both static and bounded dynamic outputs constrain the physical result allocation.
+        for dimension in [Dimension::Static(4), dynamic_dimension("size", Some(5))] {
+            let input_type = ArrayType::new(DataType::C128, Shape::new(vec![dimension.clone()]));
+            let output_type = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2), dimension]))
+                .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
+            let mut builder = ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+            let input = builder.add_input(input_type);
+            let output = builder
+                .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 1, "{module}");
+            assert_eq!(module.matches("result_layouts = [dense<[0, 1]> : tensor<2xindex>]").count(), 1, "{module}");
+        }
+    }
+
+    #[test]
+    fn test_plain_broadcast_output_layout_unsupported() {
+        for (layout, kind) in [
+            (Layout::Strided(StridedLayout::new(vec![4])), "strided"),
+            (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
+        ] {
+            let output_type = ArrayType::new_static(DataType::F32, [4]).with_layout(layout.clone());
+            let mut builder = ProgramBuilder::<CpuArray, BroadcastOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32));
+            let output = builder
+                .add_instruction(BroadcastOperation::new(output_type, Vec::new()), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                to_mlir_module_for_plain_program(&program, "main"),
+                Err(LoweringError::UnsupportedOp {
+                    op: format!("dynamic constructor with {kind} output layout `{layout}`"),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_dynamic_broadcast_executes_dynamic_geometry() {
+        let shape = Shape::new(vec![dynamic_dimension("size", Some(5))]);
+        let integer_type = ArrayType::new(DataType::I64, shape.clone());
+        let complex_type = ArrayType::new(DataType::C64, shape.clone());
+        let output_shape = Shape::new(vec![Dimension::Static(2), shape.dimensions()[0].clone()]);
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let integer_input = builder.add_input(integer_type.clone().into());
+        let complex_input = builder.add_input(complex_type.clone().into());
+        let size = builder
+            .add_instruction(
+                DimensionSizeOperation::new(&integer_type, 0).unwrap(),
+                Vec::new(),
+                vec![integer_input],
+                None,
+            )
+            .unwrap()[0];
+        let leading = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(2).unwrap()));
+        let integer_output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![1]),
+                Vec::new(),
+                vec![integer_input, leading, size],
+                None,
+            )
+            .unwrap()[0];
+        let complex_output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![1]),
+                Vec::new(),
+                vec![complex_input, leading, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![integer_output, complex_output],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![integer_type, complex_type],
+            &vec![ArrayType::new(DataType::I64, output_shape.clone()), ArrayType::new(DataType::C64, output_shape)],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        // The executable ABI exposes physical buffers followed by each input's runtime size, and returns
+        // each dynamic output size separately. One executable must handle both populated and empty shapes.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        // Integers beyond exact f64 precision detect accidental numeric conversion. Negative imaginary parts and
+        // signed zeros detect unintended conjugation or loss of exact complex storage.
+        let integers = [i64::MAX, -9_007_199_254_740_993, 5, 6];
+        let complex_components = [1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0];
+        for extent in [2_i32, 0] {
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&integers).as_slice(),
+                                BufferType::I64,
+                                &[4],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&complex_components).as_slice(),
+                                BufferType::C64,
+                                &[4],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&[extent]).as_slice(),
+                                BufferType::I32,
+                                &[],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&[extent]).as_slice(),
+                                BufferType::I32,
+                                &[],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let execution = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0);
+            let outputs = execution
+                .outputs
+                .iter()
+                .map(|output| output.copy_to_host(None).unwrap().r#await().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(values_from_bytes::<i64>(outputs[2].as_slice()), vec![i64::from(extent)]);
+            assert_eq!(values_from_bytes::<i64>(outputs[3].as_slice()), vec![i64::from(extent)]);
+            assert_eq!(execution.outputs[0].unpadded_dimensions().unwrap(), &[2, extent as u64]);
+            assert_eq!(execution.outputs[1].unpadded_dimensions().unwrap(), &[2, extent as u64]);
+            // Verify active payloads; an empty logical result need not have an empty backing allocation.
+            if extent == 2 {
+                assert_eq!(
+                    values_from_bytes::<i64>(outputs[0].as_slice()),
+                    vec![integers[0], integers[1], integers[0], integers[1]],
+                );
+                assert_eq!(
+                    values_from_bytes::<u32>(outputs[1].as_slice()),
+                    vec![1_f32, -2.0, -0.0, 0.0, 1.0, -2.0, -0.0, 0.0]
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_transpose_executes_dynamic_geometry() {
+        let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), Dimension::Static(2)]);
+        let mut builder = XlaProgramBuilder::new();
+        let integer_input = builder.add_input(ArrayType::new(DataType::I64, shape.clone()));
+        let complex_input = builder.add_input(ArrayType::new(DataType::C64, shape));
+        let integer_output = builder
+            .add_instruction(TransposeOperation::new([-1, -2]), Vec::new(), vec![integer_input], None)
+            .unwrap()[0];
+        let complex_output = builder
+            .add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![complex_input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![integer_output, complex_output],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "transpose_dynamic").unwrap();
+        // Keep CPU PJRT's physical boundary static while transposing bounded dynamic intermediates. The output
+        // extent must follow the permuted axis, and one executable must also handle an empty runtime shape.
+        let module = format!(
+            "{}{}",
+            module
+                .strip_suffix("}\n")
+                .unwrap()
+                .replace("func.func @transpose_dynamic", "func.func private @transpose_dynamic"),
+            indoc! {r#"
+              func.func @main(%arg0: tensor<4x2xi64>, %arg1: tensor<4x2xcomplex<f32>>, %arg2: tensor<i32>) -> (tensor<2x4xi64>, tensor<2x4xcomplex<f32>>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) {
+                %integers = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x2xi64>, tensor<i32>) -> tensor<?x2xi64, #stablehlo.bounds<4, ?>>
+                %complex = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x2xcomplex<f32>>, tensor<i32>) -> tensor<?x2xcomplex<f32>, #stablehlo.bounds<4, ?>>
+                %integer_result, %complex_result = func.call @transpose_dynamic(%integers, %complex) : (tensor<?x2xi64, #stablehlo.bounds<4, ?>>, tensor<?x2xcomplex<f32>, #stablehlo.bounds<4, ?>>) -> (tensor<2x?xi64, #stablehlo.bounds<?, 4>>, tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>)
+                %integer_rows = stablehlo.get_dimension_size %integer_result, dim = 0 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                %integer_columns = stablehlo.get_dimension_size %integer_result, dim = 1 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                %complex_rows = stablehlo.get_dimension_size %complex_result, dim = 0 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                %complex_columns = stablehlo.get_dimension_size %complex_result, dim = 1 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                %bound = stablehlo.constant dense<4> : tensor<i32>
+                %integer_storage = stablehlo.set_dimension_size %integer_result, %bound, dim = 1 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<2x4xi64>
+                %complex_storage = stablehlo.set_dimension_size %complex_result, %bound, dim = 1 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<2x4xcomplex<f32>>
+                return %integer_storage, %complex_storage, %integer_rows, %integer_columns, %complex_rows, %complex_columns : tensor<2x4xi64>, tensor<2x4xcomplex<f32>>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>
+              }
+            }
+            "#},
+        );
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        // Integers beyond exact f64 precision detect accidental numeric conversion. Negative imaginary parts and
+        // signed zeros detect unintended conjugation or loss of exact complex storage.
+        let integers = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993, 5, 6, 7, 8];
+        let complex_components =
+            [1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
+        for extent in [2_i32, 0] {
+            let inputs = vec![
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&integers).as_slice(),
+                                BufferType::I64,
+                                &[4, 2],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&complex_components).as_slice(),
+                                BufferType::C64,
+                                &[4, 2],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+                ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(
+                                values_to_bytes(&[extent]).as_slice(),
+                                BufferType::I32,
+                                &[],
+                                None,
+                                device.clone(),
+                                None,
+                            )
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                },
+            ];
+            let execution = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0);
+            let outputs = execution
+                .outputs
+                .iter()
+                .map(|output| output.copy_to_host(None).unwrap().r#await().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![2]);
+            assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
+            assert_eq!(values_from_bytes::<i32>(outputs[4].as_slice()), vec![2]);
+            assert_eq!(values_from_bytes::<i32>(outputs[5].as_slice()), vec![extent]);
+            if extent == 2 {
+                // Ignore padding beyond the runtime extent in each physical row.
+                let integer_values = values_from_bytes::<i64>(outputs[0].as_slice());
+                assert_eq!(&integer_values[..2], &[integers[0], integers[2]]);
+                assert_eq!(&integer_values[4..6], &[integers[1], integers[3]]);
+                let complex_bits = values_from_bytes::<u32>(outputs[1].as_slice());
+                assert_eq!(&complex_bits[..4], &[1_f32, -2.0, 3.0, -4.0].map(f32::to_bits));
+                assert_eq!(&complex_bits[8..12], &[-0_f32, 0.0, 5.0, -6.0].map(f32::to_bits));
+            }
+        }
     }
 
     #[test]
@@ -10536,7 +11583,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 ReshapeOperation::new(
-                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
+                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([-1, -2]),
                 ),
                 Vec::new(),
                 vec![input],
@@ -18413,8 +19460,8 @@ mod tests {
         let (_, program) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::trace(
             |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
                 let y = x.clone() * x;
-                let on_host = y.transfer_to_memory(Memory::Host { pinned: true });
-                let back = on_host.transfer_to_memory(Memory::Device);
+                let on_host = y.transfer_to_memory(Memory::Host { pinned: true })?;
+                let back = on_host.transfer_to_memory(Memory::Device)?;
                 Ok(back.clone() * back)
             },
             test_vector_type(4),
@@ -18439,6 +19486,40 @@ mod tests {
             ),
             "{stablehlo}",
         );
+    }
+
+    #[test]
+    fn test_transfer_to_memory_signature_placement() {
+        // A host identity has no transfer instruction: only its signature can communicate physical placement.
+        // Exercise both the diagnostic homogeneous path and the compiled composite entry path.
+        for (memory, kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            let r#type = ArrayType::new_static(DataType::I64, [2]).with_memory(memory);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(r#type.clone());
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![input],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let expected = indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xi64> {mhlo.memory_kind = "KIND"}) -> (tensor<2xi64> {mhlo.memory_kind = "KIND"}) {
+                    return %arg0 : tensor<2xi64>
+                  }
+                }
+            "#}.replace("KIND", kind);
+            assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            let types = vec![r#type];
+            assert_eq!(
+                to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap(),
+                expected,
+            );
+        }
     }
 
     #[test]
@@ -19401,7 +20482,7 @@ mod tests {
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0).unwrap(), ())
+            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), CpuArray::scalar(2.0).unwrap(), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
