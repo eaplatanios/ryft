@@ -1880,7 +1880,7 @@ mod tests {
         compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{AdaptiveProfileGuidedOptions, Array, FromPjrt, XlaDomain, XlaOptions};
+    use crate::{AdaptiveProfileGuidedOptions, Array, ArrayError, Error, FromPjrt, XlaDomain, XlaOptions};
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
     #[derive(Clone)]
@@ -4555,9 +4555,24 @@ mod tests {
         for (memory, memory_kind) in
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {
-            assert!(device.addressable_memories().unwrap().iter().any(|memory| memory.kind().unwrap() == memory_kind));
+            let available =
+                device.addressable_memories().unwrap().iter().any(|memory| memory.kind().unwrap() == memory_kind);
             let host_type = input_type.clone().with_memory(memory);
             let values = [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993];
+            // CUDA exposes pinned host buffers, but not an unpinned host allocation tier. Reject an unavailable
+            // placement explicitly rather than silently allocating the buffer in device memory.
+            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
+                && memory == (Memory::Host { pinned: false })
+            {
+                assert!(!available);
+                assert!(matches!(
+                    Array::from_host_buffer(&client, host_type, mesh.clone(), values_to_bytes(&values).as_slice()),
+                    Err(ArrayError::Error(Error::UnsupportedMemory { device_id: actual_device, memory: actual_memory }))
+                        if actual_device == device_id && actual_memory == memory,
+                ));
+                continue;
+            }
+            assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
             let source =
                 Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
                     .unwrap();

@@ -47,7 +47,7 @@ pub(crate) mod tests {
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
-    /// Creates a single-device execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
+    /// Creates an execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
     ///
     /// The default is `cpu`; `cuda-13` explicitly requires the corresponding feature, plugin, and a CUDA device.
     /// Selection errors fail the test instead of silently falling back to CPU or skipping GPU coverage.
