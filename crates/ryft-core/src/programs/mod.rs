@@ -147,9 +147,9 @@ pub use references::{
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionRole, RegionSlot,
+    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
+    RegionSlot, ReplayRegionDriver,
 };
-pub(crate) use regions::{RegionReplayMappings, ReplayRegionDriver};
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed};

@@ -1383,7 +1383,38 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Calle
 /// imports them, `mappings` preserves their source identities across every instruction in the surrounding replay.
 /// Construction validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain
 /// non-fallible without trusting callers to preserve that relationship.
-pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
+///
+/// Custom transforms can create one driver per instruction and pass it to their region-aware operation rules. Share
+/// one [`RegionReplayMappings`] across those drivers so instructions referencing the same source region reuse its
+/// destination import. Create fresh mappings for each source-arena replay, including recursive replays. The driver
+/// exposes and imports attached regions; it does not transform their bodies. Context staging owns specialization.
+///
+/// For example, the following imports attached regions incrementally into one builder while preserving sharing across
+/// instructions. A transform can supply its established [`TypeIdentityRenaming`] when replay has replaced identities
+/// referenced inside those regions, such as a symbolic dimension `m` becoming `m_replayed`.
+///
+/// ```
+/// # use std::cell::RefCell;
+/// # use std::rc::Rc;
+/// # use ryft_core::{
+/// #     BindingRegionDriver, Operation, ProgramBuilder, ProgramError, RegionId, RegionRef,
+/// #     RegionReplayMappings, ReplayRegionDriver, Type, TypeIdentityRenaming, Value,
+/// # };
+/// fn import_attached_regions<V: Value, O: Operation<Type = V::Type>>(
+///     source: RegionRef<'_, V, O>,
+///     builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+///     renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+/// ) -> Result<Vec<Vec<RegionId>>, ProgramError> {
+///     let mappings = RegionReplayMappings::new();
+///     source.instructions().iter().map(|instruction| {
+///         let roots = instruction.regions();
+///         let driver = ReplayRegionDriver::new(source, roots, &mappings)?.with_type_identity_renaming(renaming)?;
+///         // Retain each region's declared input types after applying the replay's type-identity renaming.
+///         driver.import_into(builder, &vec![None; roots.len()])
+///     }).collect()
+/// }
+/// ```
+pub struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Borrowed [`Region`] view used to access every root's shared source arena.
     source: RegionRef<'r, V, O>,
 
@@ -1438,9 +1469,18 @@ pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>>
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
-    /// Creates a new [`ReplayRegionDriver`].
+    /// Creates a driver for the attached roots of one instruction. Returns an error if any root is absent from
+    /// `source`'s arena. Region identifiers are arena-local; callers must obtain `roots` from that same arena.
+    ///
+    /// # Parameters
+    ///
+    ///   - `source`: Borrowed [`Region`] providing the source [`RegionArena`]. Attached roots need not be descendants
+    ///     of this region.
+    ///   - `roots`: Attached [`RegionId`]s in [`Instruction`] order.
+    ///   - `mappings`: Shared import state for this source-arena replay. Reuse it across instruction drivers, but
+    ///     never across different source arenas or independent replays.
     #[inline]
-    pub(crate) fn new(
+    pub fn new(
         source: RegionRef<'r, V, O>,
         roots: &'r [RegionId],
         mappings: &'r RegionReplayMappings<V, O>,
@@ -1454,7 +1494,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
     /// Applies the provided already-established replay identities to attached region metadata before either eager
     /// recursion or staging imports inspect it. The unchanged path keeps the source arena borrowed and preserves
     /// its sharing.
-    pub(crate) fn with_type_identity_renaming(
+    ///
+    /// For example, if replay replaces a dimension `m` with `m_replayed`, this makes an attached region's stored
+    /// `Array[2, m]` types refer to `m_replayed` too. The same renamed source is used for both inspection and import,
+    /// without modifying the original arena. Formal-input instantiation during import remains a separate step.
+    /// Renaming errors from the source region types or operations are propagated to the caller.
+    ///
+    /// # Parameters
+    ///
+    ///   - `renaming`: Complete [`TypeIdentityRenaming`] already established by the enclosing replay, expressed
+    ///     relative to the original source [`RegionArena`]. Apply it when constructing the instruction's driver, before
+    ///     passing it to a transform rule. Drivers using the same renaming share the cached renamed source arena.
+    pub fn with_type_identity_renaming(
         mut self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
     ) -> Result<Self, ProgramError> {
@@ -1598,12 +1649,17 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
 
 /// Replay-scoped collection of source-to-destination [`RegionId`] mappings. One instance of this type is shared
 /// by all [`ReplayRegionDriver`]s created while replaying one source [`Region`] arena. It maintains a separate
-/// [`DestinationRegionMapping`] for every live destination [`ProgramBuilder`] so repeated roots and shared
-/// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
-/// spaces of different builders. It also caches renamed source [`RegionArena`]s independently of those destinations
-/// (source entries avoid repeating the renaming work, while destination maps preserve sharing during import). Both
-/// caches belong to exactly one source-arena replay and are discarded when that replay finishes.
-pub(crate) struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
+/// mapping for every live destination [`ProgramBuilder`] so repeated roots and shared descendants retain their identity
+/// across [`Instruction`] applications without mixing the unrelated identifier spaces of different builders. It also
+/// caches renamed source [`RegionArena`]s independently of those destinations (source entries avoid repeating the
+/// renaming work, while destination maps preserve sharing during import). Both caches belong to exactly one
+/// source-arena replay and are discarded when that replay finishes.
+///
+/// Create this state outside the instruction loop and lend it to each driver, as shown in [`ReplayRegionDriver`].
+/// Never reuse it with another source arena. Source [`RegionId`]s and renamed-source entries are interpreted relative
+/// to the original arena, whose identity is not part of the cache key. Multiple destination builders are supported
+/// within the same replay; their import mappings are kept separate automatically.
+pub struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
 
@@ -1617,9 +1673,10 @@ pub(crate) struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionReplayMappings<V, O> {
-    /// Creates a new [`RegionReplayMappings`].
+    /// Creates an empty import state for one source-arena replay. Share it across that replay's instruction drivers
+    /// and create a separate instance for each independent or recursive replay.
     #[inline]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 }

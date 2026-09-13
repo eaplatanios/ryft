@@ -169,12 +169,12 @@ pub use programs::{
     ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
     ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionRole, RegionSlot, RegionStatistics,
-    TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
-    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, discharge_local_reference_operation,
-    discharge_positional_region_operation, discharge_reference_free_operation, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types, validate_reference_boundary,
+    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
+    RegionSlot, RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact,
+    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
+    TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection,
+    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types, validate_reference_boundary,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
