@@ -19,16 +19,21 @@
 //!     instruction-dispatch closures directly; it is responsible only for atom availability, instruction order,
 //!     last-use value transfer, output counts, and flat output gathering.
 //!
-//! [`RegionRef`] provides corresponding context-driven and low-level methods that replay a borrowed sealed region
-//! directly from its source arena.
+//! [`RegionRef`] provides corresponding context-driven and low-level functions that replay a borrowed sealed region
+//! directly from its source arena. Context-driven [`Program`] and [`RegionRef`] calls share one flat replay
+//! implementation. [`Program`] adds parameter-structure validation and reconstruction while retaining program-specific
+//! diagnostics.
 //!
 //! # Replay Environment and Boundaries
 //!
 //! [`Program::interpret_in_context`] first checks the input [`Parameterized`] structure and the complete input type
 //! signature. Refinements are established across the whole signature so repeated dynamic type identities cannot receive
-//! contradictory concrete bindings. Structured inputs are then flattened into an atom-indexed environment.
-//! Only live constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its
-//! results in that environment.
+//! contradictory concrete bindings. Structured inputs are then flattened into an atom-indexed environment. Only live
+//! constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its results in
+//! that environment. After validating the original boundary, staged replay carries permitted input definition
+//! [`TypeIdentityRenaming`]s into operation payloads and nested regions. Fresh instruction definitions extend that
+//! [`TypeIdentityRenaming`]. Staging also freshens local constant definitions so separate retained replays can share
+//! one destination safely.
 //!
 //! Values are moved from the environment on their final use and cloned only when another consumer remains. Once all
 //! instructions have run, output types are validated against the input refinement environment and the program's closed
@@ -74,6 +79,7 @@
 //! [`InterpretationDriver`]. A new replay meaning normally requires no second interpreter: define a [`Context`]
 //! whose [`Context::bind`] implements that meaning and call [`Program::interpret_in_context`].
 
+use std::cell::RefCell;
 use std::fmt::Debug;
 
 use crate::contexts::{Context, Domain, EagerContext};
@@ -81,7 +87,8 @@ use crate::macros::check_count;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
     Atom, AtomId, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value, ValueProjection,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value, ValueProjection,
 };
 
 /// Provides instruction-scoped access to the attached [`Region`](crate::Region)s of one interpreted [`Operation`]
@@ -312,98 +319,8 @@ impl<
             .into());
         }
 
-        // Flatten the structured input and validate the complete input type signature. Program construction normally
-        // guarantees these identifiers, but every check below indexes the atom table directly. Validate the boundary
-        // first so malformed internal state remains a structured error rather than a panic during diagnostic or
-        // refinement handling.
-        let inputs = input.into_parameters().collect::<Vec<_>>();
-        let input_ids = self.input_ids();
-        for input_id in input_ids {
-            if input_id.index() >= self.atoms().len() {
-                return Err(ProgramError::UnboundAtomId { id: *input_id });
-            }
-        }
-
-        // Refinement errors that already carry structured cross-leaf or dimension details pass through unchanged.
-        // For an ordinary pairwise incompatibility, retain the established program-boundary diagnostic naming the
-        // first mismatched leaf and whether it occurred at the input or output boundary.
-        let contextualize_refinement_error =
-            |error: TypeError, ids: &[AtomId], actual: &[C::Value], position: &str| -> ProgramError {
-                if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
-                    for (id, actual) in ids.iter().zip(actual) {
-                        let declared = self.atoms()[id.index()].r#type();
-                        let actual = actual.r#type();
-                        if !declared.is_refined_by(actual.as_ref()) {
-                            return TypeError::invalid(format!(
-                                "encountered {position} type {actual} which is incompatible with the program's \
-                                 declared type {declared}",
-                            ))
-                            .into();
-                        }
-                    }
-                }
-                error.into()
-            };
-
-        // Equal boundary types carry no additional refinement facts, so avoid constructing a refinement environment
-        // in the common staging/replay case. More precise actual types (for example, a static extent supplied for a
-        // dynamic dimension) must be checked as one complete signature so repeated identities agree across inputs.
-        let refinements = if input_ids.len() == inputs.len()
-            && input_ids
-                .iter()
-                .zip(&inputs)
-                .all(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
-        {
-            T::Refinements::default()
-        } else {
-            T::Refinements::establish(
-                input_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
-                inputs.iter().map(Typed::r#type),
-            )
-            .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
-        };
-
-        // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
-        // structured output form of this program, reparameterized at the context's value type. All instructions
-        // share one mapping scope so that a staging destination imports each unchanged source region at most once.
-        let source = self.entry_region_ref();
-        let region_mappings = RegionReplayMappings::new();
-        let outputs = self.interpret_with(
-            inputs,
-            |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| {
-                let driver = ReplayRegionDriver::new(source, instruction.regions(), &region_mappings)?;
-
-                // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
-                // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
-                // This also holds for unknown source provenance: preserving it exactly means the replay must not absorb
-                // ambient transform scopes.
-                context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                    context.bind(instruction.operation().clone(), driver, inputs)
-                })
-            },
-        )?;
-
-        // Replayed values commonly retain the program's exact declared output types. Only a count difference or a
-        // more precise output type requires validation. That validation reuses facts established from the inputs and
-        // permits a previously unbound output identity only when it belongs to this program's closed identity signature
-        // (established by the formal inputs or defined by an instruction inside it).
-        let output_ids = self.output_ids();
-        if output_ids.len() != outputs.len()
-            || output_ids
-                .iter()
-                .zip(&outputs)
-                .any(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
-        {
-            refinements
-                .validate(
-                    output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
-                    outputs.iter().map(Typed::r#type),
-                    self.type_identity_signature().identities(),
-                )
-                .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
-        }
-
+        // Program validates the structured parameters while its entry region owns type validation, and replay.
+        let outputs = self.entry_region_ref().interpret_in_context(context, input.into_parameters().collect())?;
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
@@ -468,7 +385,12 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         context: &C,
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Both direct region calls and structured Program calls arrive here with flat values.
+        // Check their count before validating types or binding instructions.
         check_count!("input", inputs, self.input_ids().len(), ProgramError);
+
+        // Validate boundary identifiers before refinement handling indexes the atom table. Sealed regions normally
+        // guarantee these identifiers, but malformed internal state must still produce an error rather than a panic.
         let input_ids = self.input_ids();
         for input_id in input_ids {
             if input_id.index() >= self.atoms().len() {
@@ -476,9 +398,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             }
         }
 
-        // Preserve structured refinement errors while keeping the established pairwise region-boundary diagnostic for
-        // ordinary incompatibilities. This closure is local because the owner wording and atom lookup are properties
-        // of this specific borrowed region, not a separate boundary-refinement abstraction.
+        // Refinement errors that already carry structured cross-leaf or dimension details pass through unchanged.
+        // For an ordinary pairwise incompatibility, retain the established boundary diagnostic naming the
+        // first mismatched leaf and whether it occurred at the input or output boundary.
         let contextualize_refinement_error =
             |error: TypeError, ids: &[AtomId], actual: &[C::Value], position: &str| -> ProgramError {
                 if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
@@ -487,8 +409,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                         let actual = actual.r#type();
                         if !declared.is_refined_by(actual.as_ref()) {
                             return TypeError::invalid(format!(
-                                "encountered {position} type {actual} which is incompatible with the region's declared \
-                                 type {declared}",
+                                "encountered {position} type {actual} which is incompatible with the region's \
+                                 declared type {declared}",
                             ))
                             .into();
                         }
@@ -497,8 +419,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                 error.into()
             };
 
-        // Exact input types introduce no new boundary facts. Otherwise, establish one environment across the entire
-        // region signature so repeated dynamic identities cannot acquire conflicting concrete refinements.
+        // Equal boundary types carry no additional refinement facts, so avoid constructing a refinement environment
+        // in the common staging/replay case. More precise actual types (e.g., a static extent supplied for a dynamic
+        // dimension) must be checked as one complete signature so repeated identities agree across inputs.
         let refinements = if input_ids.len() == inputs.len()
             && input_ids
                 .iter()
@@ -514,26 +437,110 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
         };
 
-        // Share one source-to-destination mapping across every instruction in this replay. If several instructions
-        // attach the same nested source region, a staging context imports it only once and preserves that sharing.
+        // Replay through the context's lift/bind protocol. All instructions share one region mapping scope so that
+        // a staging destination imports each unchanged source region at most once. Both public entry points use this
+        // loop: structured programs and borrowed nested regions must observe identical replay and refinement rules.
+        //
+        // Dimension definitions also need type-identity renaming between the source and replayed graphs. For example:
+        //
+        //   - Source: `m1 = n * 2; reshape(x, [2, m1])`
+        //   - Replay: `m2 = n * 2; reshape(x, [2, m2])`
+        //
+        // Replaying multiplication defines a fresh identity `m2`. Record `m1 -> m2` after binding that instruction,
+        // then rename subsequent operation payloads and attached region metadata before binding them. Otherwise, the
+        // reshape still refers to `m1`, even though both dimensions may print as `n * 2`. The same type-identity
+        // renaming applies to declared output types during validation; it does not equate unrelated dimensions
+        // with equal names.
         let region_mappings = RegionReplayMappings::new();
+        let identity_renaming = RefCell::new(self.replay_identity_renaming(&inputs, !context.is_eager())?);
+
+        // A staged pullback can receive a dimension residual under a new identity. After validating the original
+        // input signature, express its refinement facts under that type-identity renaming too: an exact extent of 8
+        // must still constrain every output shape referring to the residual's replayed identity.
+        let input_refinements = refinements.clone();
+        let refinements = if identity_renaming.borrow().is_identity() {
+            refinements
+        } else {
+            let declared = input_ids
+                .iter()
+                .map(|id| self.atoms()[id.index()].r#type().rename_identities(&identity_renaming.borrow()))
+                .collect::<Result<Vec<_>, _>>()?;
+            <V::Type as Type>::Refinements::establish(declared.iter(), inputs.iter().map(Typed::r#type))?
+        };
         let outputs = self.interpret_with(
             inputs,
-            |_, constant| context.lift(constant.clone()),
+            |_, constant| context.lift(constant.rename_type_identities(&identity_renaming.borrow())?),
             |instruction, inputs| {
-                let driver = ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?;
+                // Both closures share the type-identity renaming through a `RefCell`. The operation and driver own
+                // their renamed metadata, so release this read borrow before binding and recording fresh output
+                // identities. Leaving its guard alive would make the later mutable borrow fail even after its final
+                // read.
+                let (operation, driver) = {
+                    let mut renaming = identity_renaming.borrow().clone();
+                    let reified_inputs = instruction
+                        .inputs()
+                        .iter()
+                        .zip(inputs)
+                        .filter_map(|(id, actual)| {
+                            let declared = self.atoms()[id.index()].r#type().into_owned();
+                            let reified = declared.identities().any(|(position, identity)| {
+                                position == TypeIdentityPosition::Definition
+                                    && !self.type_identity_signature().internal_identities().contains(&identity)
+                            });
+                            reified.then(|| (declared, actual.r#type().into_owned()))
+                        })
+                        .collect::<Vec<_>>();
+                    if !reified_inputs.is_empty() {
+                        // An input array can establish q without carrying its first-class dimension value.
+                        // Replaying `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh
+                        // exact dimension. Use that explicit operand's identity for this constructor and its regions.
+                        // Keep this local as a second `dimension_size` may reify the same `q` under another fresh
+                        // identity, and so globally renaming `q` would incorrectly make those two instructions define
+                        // one identity. Original boundary facts still require every reification of `q` to have the
+                        // same extent.
+                        input_refinements.validate(
+                            reified_inputs.iter().map(|(declared, _)| declared),
+                            reified_inputs.iter().map(|(_, actual)| actual),
+                            self.type_identity_signature().identities(),
+                        )?;
+                        let local = V::Type::derive_identity_renaming(
+                            &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
+                            &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
+                        )?;
+                        let mut combined = TypeIdentityRenaming::new();
+                        for (source, target) in renaming.replacements() {
+                            if !local.replacements().iter().any(|(local_source, _)| local_source == source) {
+                                combined.insert(source.clone(), target.clone())?;
+                            }
+                        }
+                        for (source, target) in local.replacements() {
+                            combined.insert(source.clone(), target.clone())?;
+                        }
+                        renaming = combined;
+                    }
+                    let operation = instruction.operation().rename_type_identities(&renaming)?;
+                    let driver = ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?
+                        .with_type_identity_renaming(&renaming)?;
+                    (operation, driver)
+                };
 
-                // Refer to the matching comment in `Program::interpret_in_context`. Binding inside the source
-                // instruction's recorded origin makes one-to-one and one-to-many propagation automatic.
-                context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                    context.bind(instruction.operation().clone(), driver, inputs)
-                })
+                // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
+                // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
+                // This also holds for unknown source provenance as preserving it exactly means that the replay must not
+                // absorb ambient transform scopes.
+                let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    context.bind(operation, driver, inputs)
+                })?;
+                self.extend_replay_identity_renaming(instruction, &outputs, &mut identity_renaming.borrow_mut())?;
+                Ok(outputs)
             },
         )?;
 
-        // Skip output validation when replay preserved every declared type exactly. Refined outputs are checked
-        // against the input environment. Only identities in this region's closed identity signature (established by
-        // its formal inputs or defined by its instructions) may establish new facts at the output boundary.
+        // Replayed values commonly retain the program's exact declared output types. Only a count difference or a more
+        // precise output type requires validation. That validation reuses facts established from the inputs and permits
+        // a previously unbound output identity only when it belongs to this program's closed identity signature
+        // (established by the formal inputs or defined by an instruction inside it).
+        let identity_renaming = identity_renaming.into_inner();
         let output_ids = self.output_ids();
         if output_ids.len() != outputs.len()
             || output_ids
@@ -541,13 +548,29 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                 .zip(&outputs)
                 .any(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
         {
-            refinements
-                .validate(
-                    output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
-                    outputs.iter().map(Typed::r#type),
-                    self.type_identity_signature().identities(),
-                )
-                .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+            if identity_renaming.is_identity() {
+                refinements
+                    .validate(
+                        output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                        outputs.iter().map(Typed::r#type),
+                        self.type_identity_signature().identities(),
+                    )
+                    .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+            } else {
+                let output_types = output_ids
+                    .iter()
+                    .map(|id| self.atoms()[id.index()].r#type().rename_identities(&identity_renaming))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let closed_identities = self
+                    .type_identity_signature()
+                    .identities()
+                    .iter()
+                    .map(|identity| identity_renaming.rename(identity))
+                    .collect::<Vec<_>>();
+                refinements
+                    .validate(output_types.iter(), outputs.iter().map(Typed::r#type), &closed_identities)
+                    .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+            }
         }
 
         Ok(outputs)
@@ -657,6 +680,115 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
 
         Ok(outputs)
     }
+
+    /// Extends the [`TypeIdentityRenaming`] with replayed internal definitions. Output references cannot introduce
+    /// replacements; renaming formal input identities is handled separately when initializing replay after boundary
+    /// validation.
+    fn extend_replay_identity_renaming<R: Typed<Type = V::Type>>(
+        self,
+        instruction: &Instruction<O>,
+        outputs: &[R],
+        renaming: &mut TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<(), ProgramError> {
+        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+        let internal_identities = self.type_identity_signature().internal_identities();
+        if internal_identities.is_empty() {
+            return Ok(());
+        }
+        let declared = instruction
+            .outputs()
+            .iter()
+            .map(|id| self.atoms()[id.index()].r#type().into_owned())
+            .collect::<Vec<_>>();
+        let definitions = declared
+            .iter()
+            .flat_map(Type::identities)
+            .filter(|(position, identity)| {
+                *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
+            })
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        if definitions.is_empty() {
+            return Ok(());
+        }
+        let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+        let output_renaming = V::Type::derive_identity_renaming(&declared, &actual)?;
+        for (source, target) in output_renaming.replacements() {
+            if source != target && definitions.contains(source) {
+                // An unchanged definition adds no type-identity replacement. A later read of that same source
+                // dimension may refine its bounds and establish the first nontrivial replacement.
+                renaming.insert(source.clone(), target.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds a [`TypeIdentityRenaming`] from validated input definitions and fresh staging-local constant definitions.
+    fn replay_identity_renaming<RuntimeValue: Typed<Type = V::Type>>(
+        &self,
+        inputs: &[RuntimeValue],
+        staging: bool,
+    ) -> Result<TypeIdentityRenaming<<V::Type as Type>::Identity>, ProgramError> {
+        let signature = self.type_identity_signature();
+        let mut renaming = TypeIdentityRenaming::new();
+        if !staging {
+            // Eager kernels materialize concrete shapes and retain the original boundary refinement facts.
+            return Ok(renaming);
+        }
+        let mut input_definitions = Vec::new();
+        for input in self.input_ids() {
+            input_definitions.extend(
+                self.atoms()[input.index()]
+                    .r#type()
+                    .identities()
+                    .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
+                    .map(|(_, identity)| identity.clone()),
+            );
+        }
+        if !input_definitions.is_empty() {
+            // Complete boundary refinement has already succeeded. Dimension-valued inputs can carry a more precise
+            // nominal definition, which subsequent staged array payloads must reference consistently with those inputs.
+            // For example, a pullback declared to return Array[n, 4] may receive its dimension residual as `n2`.
+            // Mapping the validated dimension input `n -> n2` makes the output payload refer to that residual.
+            // Array shape references alone cannot establish such a mapping; only definition positions participate.
+            let declared = self.input_types();
+            let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            for (source, target) in V::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
+                if source != target && input_definitions.contains(source) {
+                    renaming.insert(source.clone(), target.clone())?;
+                }
+            }
+        }
+        if signature.internal_identities().is_empty() {
+            return Ok(renaming);
+        }
+        // Two retained programs can lift the same literal into one destination. Its local definition must be fresh
+        // for each replay, while identities belonging to input bindings retain their established type-identity renaming.
+        // For example, replaying a primal and its pullback must not define the same source dimension constant `2`
+        // twice in the destination. Each replay gets its own definition, shared consistently by all its local uses.
+        let mut unavailable = None;
+        for atom in self.atoms() {
+            if let Some(constant) = atom.as_constant() {
+                for (position, identity) in constant.r#type().identities() {
+                    if position == TypeIdentityPosition::Definition
+                        && signature.internal_identities().contains(identity)
+                        && !renaming.replacements().iter().any(|(source, _)| source == identity)
+                    {
+                        let unavailable = unavailable.get_or_insert_with(|| {
+                            let mut identities = signature.identities().to_vec();
+                            for input in inputs {
+                                identities.extend(input.r#type().identities().map(|(_, identity)| identity.clone()));
+                            }
+                            identities
+                        });
+                        let target = renaming.insert_fresh(identity.clone(), unavailable)?;
+                        unavailable.push(target);
+                    }
+                }
+            }
+        }
+        Ok(renaming)
+    }
 }
 
 /// Interprets a [`Region`](crate::Region)-free member [`Operation`] through a composite [`Domain`]. Inputs are
@@ -722,11 +854,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionError, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, BroadcastOperation, NegOperation};
+    use crate::operations::{
+        AddOperation, BroadcastOperation, DimensionAddOperation, DimensionSizeOperation, NegOperation, ZeroOperation,
+    };
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::{
         AtomId, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, RegionId, RegionInterface, RegionSlot,
@@ -935,7 +1069,7 @@ mod tests {
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
+                == "encountered input type f64[3] which is incompatible with the region's declared type f64[2]",
         ));
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
@@ -955,7 +1089,7 @@ mod tests {
         assert!(matches!(
             program.interpret(Array::scalar(1.0).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[] which is incompatible with the program's declared type f64[dynamic]",
+                == "encountered input type f64[] which is incompatible with the region's declared type f64[dynamic]",
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
@@ -1076,6 +1210,211 @@ mod tests {
                         actual: 3,
                     }),
         ));
+
+        // Both public entry points use the same output validation and region diagnostics. Use a
+        // static declaration here so this is the ordinary type-mismatch diagnostic rather than a refinement conflict.
+        let mut builder = ProgramBuilder::<Array, WrongShapeOperation>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+        let output = builder.add_instruction(WrongShapeOperation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let input = Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[1_f64, 2.]).unwrap();
+        assert_eq!(
+            program.interpret(input.clone()),
+            Err(TypeError::invalid(
+                "encountered output type f64[3] which is incompatible with the region's declared type f64[2]",
+            )
+            .into()),
+        );
+        assert_eq!(
+            program
+                .entry_region_ref()
+                .interpret_in_context(&EagerContext::<Array, WrongShapeOperation>::new(), vec![input]),
+            Err(TypeError::invalid(
+                "encountered output type f64[3] which is incompatible with the region's declared type f64[2]",
+            )
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_program_interpret_replayed_internal_identities() {
+        // The two internal dimensions have equal printed names and bounds, but different definition sites. Replay
+        // must retain that distinction while consistently renaming each subsequent constructor's shape payload.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let one = DimensionValue::constant(1).unwrap();
+        let one_type = one.r#type().into_owned();
+        let one = builder.add_constant(ArrayIrValue::Dimension(one));
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+            let size = DimensionSizeOperation::new(&input_type, 0).unwrap();
+            let addition = DimensionAddOperation::new(size.result_type(), &one_type).unwrap();
+            let input = builder.add_input(input_type.into());
+            let size = builder.add_instruction(size, Vec::new(), vec![input], None).unwrap()[0];
+            let result = builder
+                .add_instruction(DimensionOperation::Add(addition), Vec::new(), vec![size, one], None)
+                .unwrap()[0];
+            let ArrayIrType::Dimension(result_type) = builder.atoms()[result.index()].r#type().into_owned() else {
+                panic!("expected a dimension result");
+            };
+            let output_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(result_type.variable().clone())]));
+            outputs.push(
+                builder
+                    .add_instruction(
+                        ArrayIrOperation::Zero(ZeroOperation::new(output_type.into())),
+                        Vec::new(),
+                        vec![result],
+                        None,
+                    )
+                    .unwrap()[0],
+            );
+        }
+        outputs.push(outputs[0]);
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let original = program.to_string();
+        let specialized = program
+            .clone()
+            .specialize(&[
+                ArrayType::new_static(DataType::F64, [2]).into(),
+                ArrayType::new_static(DataType::F64, [3]).into(),
+            ])
+            .unwrap();
+        let output_types = specialized.output_types();
+        let variables = output_types
+            .iter()
+            .map(|r#type| {
+                let ArrayIrType::Array(r#type) = r#type else { panic!("expected array type") };
+                let [Dimension::Dynamic(variable)] = r#type.shape().dimensions() else {
+                    panic!("expected one retained dimension input");
+                };
+                assert_eq!(r#type.data_type(), DataType::F64);
+                variable.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(variables[0].bounds(), DimensionBounds::new(3, Some(4)).unwrap());
+        assert_eq!(variables[1].bounds(), DimensionBounds::new(4, Some(5)).unwrap());
+        assert_ne!(variables[0], variables[1]);
+        assert_eq!(variables[0], variables[2]);
+        assert_eq!(
+            specialized.interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[1_f64, 2.]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[3_f64, 4., 5.]).unwrap()
+                ),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[0_f64; 3]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F64, [4]), &[0_f64; 4]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[0_f64; 3]).unwrap()
+                ),
+            ])
+        );
+        assert_eq!(program.to_string(), original);
+
+        // Replaying two retained graphs into the same destination must also give their literal dimension
+        // definitions separate identities. Each replay still shares its own literal across all uses.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = vec![
+            context.input(ArrayType::new_static(DataType::F64, [2]).into()),
+            context.input(ArrayType::new_static(DataType::F64, [3]).into()),
+        ];
+        let first = program.interpret_in_context(&context, inputs.clone()).unwrap();
+        let second = program.interpret_in_context(&context, inputs).unwrap();
+        let destination = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                first.iter().chain(&second).map(|value| value.atom_id().unwrap()).collect(),
+                vec![Placeholder; 2],
+                vec![Placeholder; 6],
+            )
+            .unwrap();
+        let constants = destination.atoms().iter().filter_map(Atom::as_constant).collect::<Vec<_>>();
+        assert_eq!(constants.len(), 2);
+        assert_ne!(constants[0].r#type(), constants[1].r#type());
+
+        // A more precise dimension input carries its own nominal definition. Array outputs referring to that
+        // dimension must respect its validated refinement, including during eager replay.
+        let variable = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(DimensionType::new(variable.clone()).into());
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let output = builder
+            .add_instruction(ArrayIrOperation::Zero(ZeroOperation::new(output_type.into())), vec![], vec![input], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            source.interpret(vec![ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F64, [3]), &[0_f64; 3]).unwrap()
+            ),])
+        );
+
+        // Reifying an input-owned identity also determines its type-identity renaming. The input reference
+        // establishes `q`, dimension_size defines its first-class value, and zero must use the replayed definition.
+        let variable = DimensionVariable::new("queries", DimensionBounds::new(2, Some(4)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![variable.clone().into(), variable.into()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let sizes = (0..2)
+                .map(|axis| {
+                    builder
+                        .add_instruction(
+                            DimensionSizeOperation::new(&input_type, axis).unwrap(),
+                            vec![],
+                            vec![input],
+                            None,
+                        )
+                        .unwrap()[0]
+                })
+                .collect();
+            outputs.push(
+                builder
+                    .add_instruction(
+                        ArrayIrOperation::Zero(ZeroOperation::new(input_type.clone())),
+                        vec![],
+                        sizes,
+                        None,
+                    )
+                    .unwrap()[0],
+            );
+        }
+        let source = builder
+            .build::<ArrayIrValue<Array>, Vec<ArrayIrValue<Array>>>(outputs, Placeholder, vec![Placeholder; 2])
+            .unwrap();
+        for extent in [2, 3] {
+            let input_type = ArrayType::new_static(DataType::F64, [extent, extent]);
+            let specialized = source.clone().specialize(&[input_type.clone().into()]).unwrap();
+            let input =
+                ArrayIrValue::Array(Array::from_elements(input_type.clone(), &vec![1_f64; extent * extent]).unwrap());
+            let expected =
+                ArrayIrValue::Array(Array::from_elements(input_type, &vec![0_f64; extent * extent]).unwrap());
+            assert_eq!(specialized.interpret(input), Ok(vec![expected.clone(), expected]));
+        }
     }
 
     #[test]
@@ -1167,6 +1506,36 @@ mod tests {
             ),
             Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
+    }
+
+    #[test]
+    fn test_region_ref_interpret_in_context() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let r#type = ArrayType::new_static(DataType::F64, [2]);
+        let input = builder.add_input(r#type.clone());
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        let region = program.entry_region_ref();
+        let context = TestArrayContext::new();
+
+        // Borrowed regions use the same execution path as structured programs, with a flat input/output boundary.
+        assert_eq!(
+            region.interpret_in_context(&context, vec![Array::from_elements(r#type.clone(), &[1_f64, 2.]).unwrap()]),
+            Ok(vec![Array::from_elements(r#type, &[-1_f64, -2.]).unwrap()]),
+        );
+
+        // Flat arity is checked before replay, and pairwise type errors retain the region diagnostic wording.
+        assert_eq!(
+            region.interpret_in_context(&context, vec![]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            region.interpret_in_context(&context, vec![Array::scalar(1_f64).unwrap()]),
+            Err(TypeError::invalid(
+                "encountered input type f64[] which is incompatible with the region's declared type f64[2]",
+            )
+            .into()),
+        );
     }
 
     #[test]
