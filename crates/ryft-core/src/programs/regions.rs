@@ -1288,7 +1288,10 @@ pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order and returns their
     /// [`RegionId`]s in the same order. Each type in `input_types` corresponds to the corresponding attached [`Region`]
     /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
-    /// [`Some`] instantiates them from the supplied input types.
+    /// [`Some`] instantiates their nominal identities from the supplied input types. Importing is _structural_. It
+    /// renames stored type metadata without re-inferring instruction outputs or replaying bodies. The staging context
+    /// specializes bodies when input bounds or geometry become more precise, and reconciles signatures that depend
+    /// on other attached regions before recording the operation.
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -1420,6 +1423,34 @@ pub struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// One [`RegionReplayMappings`] value must be scoped to exactly one source-arena replay. Its per-destination state
     /// is shared across that replay's instruction drivers, but must not be reused for a different source arena.
     mappings: &'r RegionReplayMappings<V, O>,
+
+    /// Source-to-replay [`TypeIdentityRenaming`] established before the replayed [`Instruction`] is bound.
+    ///
+    /// For example, replaying a dimension definition `m = n * 2` creates a fresh identity `m_replayed`. An attached
+    /// region whose stored types reference `m` must now reference `m_replayed`, even when those references are inside
+    /// its body rather than in its formal input signature. This map records that correspondence and it is separate from
+    /// the formal-input identity instantiation performed by [`import_into`](Self::import_into) for each attached
+    /// region.
+    ///
+    /// Imports also use this map as part of their cache key. The same source region and requested input types can
+    /// require different imported bodies when their internal identities have different replay correspondences.
+    /// Reusing an import based only on its input signature could retain identities from an earlier definition.
+    identity_renaming: TypeIdentityRenaming<<V::Type as Type>::Identity>,
+
+    /// Owned backing [`RegionArena`] for attached region views with `identity_renaming` already applied.
+    ///
+    /// Continuing the example above, a stored `Array[2, m]` type becomes `Array[2, m_replayed]` here. Both
+    /// [`regions`](Self::regions) and [`import_into`](Self::import_into) read this arena so inspecting a region and
+    /// importing it see the same identities. Keeping only the map would leave [`regions`](Self::regions) exposing the
+    /// original metadata; these borrowed views need an arena that owns the renamed regions for the lifetime of the
+    /// [`ReplayRegionDriver`].
+    ///
+    /// The entire source arena is renamed together, retaining its region identifiers and shared descendants without
+    /// modifying the source. [`RegionReplayMappings`] caches this arena, and the [`Rc`] lets instruction drivers with
+    /// the same correspondence share it. This is [`None`] when no identities change or the instruction has no attached
+    /// regions. In that case the driver borrows the source directly. Renaming does not specialize region bodies or
+    /// recompute output types; staging owns that separate step.
+    renamed_arena: Option<Rc<RegionArena<V, O>>>,
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
@@ -1433,7 +1464,36 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
         for root in roots {
             source.with_id(*root)?;
         }
-        Ok(Self { source, roots, mappings })
+        Ok(Self { source, roots, mappings, identity_renaming: TypeIdentityRenaming::new(), renamed_arena: None })
+    }
+
+    /// Applies the provided already-established replay identities to attached region metadata before either eager
+    /// recursion or staging imports inspect it. The unchanged path keeps the source arena borrowed and preserves
+    /// its sharing.
+    pub(crate) fn with_type_identity_renaming(
+        mut self,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<Self, ProgramError> {
+        if !renaming.is_identity() && !self.roots.is_empty() {
+            let mut sources = self.mappings.renamed_sources.borrow_mut();
+            let arena = if let Some((_, arena)) = sources.iter().find(|(existing, _)| existing == renaming) {
+                arena.clone()
+            } else {
+                let arena = Rc::new(RegionArena::from_regions(
+                    self.source
+                        .arena()
+                        .regions
+                        .iter()
+                        .map(|region| region.region.rename_type_identities(renaming))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?);
+                sources.push((renaming.clone(), arena.clone()));
+                arena
+            };
+            self.renamed_arena = Some(arena);
+            self.identity_renaming = renaming.clone();
+        }
+        Ok(self)
     }
 }
 
@@ -1444,7 +1504,10 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for ReplayRegion
         V: 'r,
         O: 'r,
     {
-        self.roots.iter().map(|root| self.source.with_id(*root).unwrap())
+        self.roots.iter().map(|root| match &self.renamed_arena {
+            Some(arena) => RegionRef::new(arena, *root).unwrap(),
+            None => self.source.with_id(*root).unwrap(),
+        })
     }
 }
 
@@ -1472,6 +1535,7 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
                     builder: builder_identity,
                     remapping: HashMap::new(),
                     instantiated_region_mappings: Vec::new(),
+                    renamed_remappings: Vec::new(),
                 });
                 destinations.len() - 1
             });
@@ -1481,26 +1545,45 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
             .iter()
             .zip(input_types)
             .map(|(root, input_types)| {
-                let region = self.source.with_id(*root)?;
-                let Some(input_types) = input_types else {
-                    return Ok(builder.import_region_with_remapping(region, &mut destination.remapping));
+                let region = match &self.renamed_arena {
+                    Some(arena) => RegionRef::new(arena, *root)?,
+                    None => self.source.with_id(*root)?,
                 };
-                if let Some(mapping) = destination
-                    .instantiated_region_mappings
-                    .iter()
-                    .find(|mapping| &mapping.source_region == root && mapping.input_types == *input_types)
-                {
+                if input_types.is_none() && self.identity_renaming.is_identity() {
+                    return Ok(builder.import_region_with_remapping(region, &mut destination.remapping));
+                }
+                let declared_input_types = region.input_types();
+                let input_types = input_types.as_ref().unwrap_or(&declared_input_types);
+                if let Some(mapping) = destination.instantiated_region_mappings.iter().find(|mapping| {
+                    &mapping.source_region == root
+                        && mapping.input_types == *input_types
+                        && mapping.identity_renaming == self.identity_renaming
+                }) {
                     return Ok(mapping.destination_region);
                 }
                 let renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
                 let imported = if renaming.is_identity() {
-                    builder.import_region_with_remapping(region, &mut destination.remapping)
+                    let remapping = if self.identity_renaming.is_identity() {
+                        &mut destination.remapping
+                    } else {
+                        let index = destination
+                            .renamed_remappings
+                            .iter()
+                            .position(|(existing, _)| existing == &self.identity_renaming)
+                            .unwrap_or_else(|| {
+                                destination.renamed_remappings.push((self.identity_renaming.clone(), HashMap::new()));
+                                destination.renamed_remappings.len() - 1
+                            });
+                        &mut destination.renamed_remappings[index].1
+                    };
+                    builder.import_region_with_remapping(region, remapping)
                 } else {
                     builder.import_program(region.to_program().rename_type_identities(&renaming)?)
                 };
                 destination.instantiated_region_mappings.push(InstantiatedRegionMapping {
                     source_region: *root,
                     input_types: input_types.clone(),
+                    identity_renaming: self.identity_renaming.clone(),
                     destination_region: imported,
                 });
                 Ok(imported)
@@ -1517,6 +1600,9 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
 pub struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
+
+    /// Whole-arena renamings shared across instruction drivers in this replay.
+    renamed_sources: RefCell<Vec<(TypeIdentityRenaming<<V::Type as Type>::Identity>, Rc<RegionArena<V, O>>)>>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionReplayMappings<V, O> {
@@ -1530,7 +1616,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionReplayMappings<V, O> {
 impl<V: Value, O: Operation<Type = V::Type>> Default for RegionReplayMappings<V, O> {
     #[inline]
     fn default() -> Self {
-        Self { destinations: RefCell::new(Vec::new()) }
+        Self { destinations: RefCell::new(Vec::new()), renamed_sources: RefCell::new(Vec::new()) }
     }
 }
 
@@ -1548,6 +1634,9 @@ pub struct DestinationRegionMapping<V: Value, O: Operation<Type = V::Type>> {
     /// Instantiated source-[`Region`] imports that cannot use `remapping` because one source [`RegionId`] may map
     /// to multiple destination regions under different [`TypeIdentity`](crate::TypeIdentity) instantiations.
     pub instantiated_region_mappings: Vec<InstantiatedRegionMapping<V::Type>>,
+
+    /// Shared descendant imports for each replayed internal identity correspondence.
+    pub renamed_remappings: Vec<(TypeIdentityRenaming<<V::Type as Type>::Identity>, HashMap<RegionId, RegionId>)>,
 }
 
 /// Cached import of one source [`Region`] instantiated for a particular input type signature. A source region can
@@ -1563,6 +1652,10 @@ pub struct InstantiatedRegionMapping<T: Type> {
     /// cache reuse because the imported region retains these live [`TypeIdentity`](crate::TypeIdentity)s and attached
     /// [`Instruction`]s do not store a separate per-invocation renaming.
     pub input_types: Vec<T>,
+
+    /// Internal definition correspondence applied before formal input instantiation. Equal input types alone do
+    /// not identify an import whose operation payloads reference different replayed internal dimensions.
+    pub identity_renaming: TypeIdentityRenaming<T::Identity>,
 
     /// Root of the instantiated [`Region`] in the destination [`ProgramBuilder`]'s [`RegionArena`].
     pub destination_region: RegionId,
@@ -2671,7 +2764,7 @@ mod tests {
             |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let formal = DimensionVariable::new("formal", bounds);
         let mut source_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let input = source_builder.add_input(array_type(formal));
+        let input = source_builder.add_input(array_type(formal.clone()));
         let source = source_builder
             .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2694,6 +2787,22 @@ mod tests {
         let destination = destination.borrow();
         assert_eq!(destination.region_ref(first).unwrap().input_types(), first_input_types);
         assert_eq!(destination.region_ref(second).unwrap().input_types(), second_input_types);
+        drop(destination);
+
+        let mut renaming = TypeIdentityRenaming::new();
+        let replayed = DimensionVariable::new("replayed", bounds);
+        renaming.insert(formal, replayed.clone()).unwrap();
+        let renamed_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings)
+            .unwrap()
+            .with_type_identity_renaming(&renaming)
+            .unwrap();
+        assert_eq!(driver.region(0).unwrap().input_types(), vec![array_type(replayed.clone())]);
+        let imported = driver.import_into(&renamed_destination, &[None]).unwrap()[0];
+        assert_eq!(
+            renamed_destination.borrow().region_ref(imported).unwrap().input_types(),
+            vec![array_type(replayed)]
+        );
     }
 
     #[test]
@@ -2708,6 +2817,41 @@ mod tests {
         assert_eq!(destination.regions.len(), 3);
         assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
         assert_eq!(destination.region_ref(RegionId::new(2)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
+
+        // A replay correspondence must preserve the same arena sharing even when the identities being renamed
+        // belong to an earlier instruction and do not occur in these particular nested regions.
+        let mut renaming = TypeIdentityRenaming::new();
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        renaming
+            .insert(DimensionVariable::new("source", bounds), DimensionVariable::new("replayed", bounds))
+            .unwrap();
+        let renamed_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings)
+            .unwrap()
+            .with_type_identity_renaming(&renaming)
+            .unwrap();
+        assert_eq!(
+            driver.import_into(&renamed_destination, &[None, None]),
+            Ok(vec![RegionId::new(1), RegionId::new(2)])
+        );
+        let repeated = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings)
+            .unwrap()
+            .with_type_identity_renaming(&renaming)
+            .unwrap();
+        assert_eq!(
+            repeated.import_into(&renamed_destination, &[None, None]),
+            Ok(vec![RegionId::new(1), RegionId::new(2)])
+        );
+        let renamed_destination = renamed_destination.borrow();
+        assert_eq!(renamed_destination.regions.len(), 3);
+        assert_eq!(
+            renamed_destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(),
+            &[RegionId::new(0)]
+        );
+        assert_eq!(
+            renamed_destination.region_ref(RegionId::new(2)).unwrap().instructions()[0].regions(),
+            &[RegionId::new(0)]
+        );
     }
 
     #[test]
@@ -2783,7 +2927,7 @@ mod tests {
                 )],
             )
         };
-        let regions = vec![
+        let regions = [
             Region::<Array, TestRegionOperation>::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             attaching(vec![RegionId::new(0)]),
             attaching(vec![RegionId::new(0)]),
