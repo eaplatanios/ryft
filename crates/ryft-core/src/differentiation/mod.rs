@@ -99,7 +99,9 @@
 //! Scalar gradient functions return ordinary values at every active input position. An input of type `T` returns
 //! `cotangent(T)`; an input of type `ref<T>` returns `cotangent(T)`, the derivative with respect to its initial
 //! contents. The original parameter structure is preserved, so the value family must represent both references and
-//! their referents. [`OperationProvider`] selects the allocation and freeze operations for families supporting references.
+//! their referents. [`ReferenceNewOperationProvider`] and [`ReferenceFreezeOperationProvider`] select the allocation
+//! and freeze operations over the universe's referent family, and [`ReferenceAddUpdateOperationProvider`] selects the
+//! accumulation operation.
 //!
 //! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
 //! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
@@ -157,12 +159,14 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
-    ZeroLikeOperation,
+    AddOperation, OneOperation, ReferenceAddUpdateOperationProvider, ReferenceFreezeOperationProvider,
+    ReferenceNewOperationProvider, Zero, ZeroLikeOperation,
 };
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{OperationProvider, ProgramError, ReferenceBoundary, ReferenceBoundaryError, TypeError, Value};
+use crate::programs::{
+    OperationProvider, ProgramError, ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, TypeError, Value,
+};
 use crate::tracing::TracingContext;
 
 pub mod batching;
@@ -867,7 +871,7 @@ impl<Input, ContextState>
     ) -> Result<(Output::To<V>, Pullback<C, Input, Output::To<V>>), DifferentiationError>
     where
         C: Context<Type = V::Type, Value = V> + ReverseModeDifferentiate,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
@@ -910,17 +914,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
@@ -951,17 +949,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
         ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
@@ -1062,11 +1054,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C>,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::Family: ParameterizedFamily<V::Type>,
         Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
@@ -1128,11 +1120,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::To<V::Type>: Clone,
         Input::To<LinearizationTracer<C>>: Parameterized<
@@ -1186,18 +1178,12 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
         AuxiliaryOutput: Parameterized<
@@ -1237,18 +1223,12 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
         AuxiliaryOutput: Parameterized<
@@ -1338,11 +1318,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C>,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::Family: ParameterizedFamily<V::Type>,
         Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
@@ -1393,11 +1373,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::To<V::Type>: Clone,
         Input::To<LinearizationTracer<C>>: Parameterized<
@@ -1536,7 +1516,7 @@ impl<Input, Capture, ContextState>
     ) -> Result<(Output::To<V>, Pullback<C, Input, Output::To<V>>), DifferentiationError>
     where
         C: Context<Type = V::Type, Value = V> + ReverseModeDifferentiate,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<V>>,
@@ -1569,17 +1549,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
@@ -1609,17 +1583,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
@@ -1708,11 +1676,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C>,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::Family: ParameterizedFamily<V::Type>,
         Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
@@ -1767,11 +1735,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::To<V::Type>: Clone,
         Input::To<LinearizationTracer<C>>: Parameterized<
@@ -1838,18 +1806,12 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         AuxiliaryOutput: Parameterized<
@@ -1890,18 +1852,12 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: OperationProvider<
-                    V::Type,
-                    ReferenceNewOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<
-                    V::Type,
-                    ReferenceFreezeOperation<V::Type, V::Type>,
-                    Operation = C::Operation,
-                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: ReferenceNewOperationProvider<V::Type>
+                               + ReferenceFreezeOperationProvider<V::Type>
+                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
-        V: Value<Type: DifferentiableType>,
+        V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         Capture: Parameterized<V, To<V> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
         AuxiliaryOutput: Parameterized<
@@ -1997,11 +1953,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C>,
+        V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::Family: ParameterizedFamily<V::Type>,
         Input::Family: ParameterizedFamily<LinearizationTracer<C>>,
@@ -2057,11 +2013,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
-            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<V::Type>
+            + ReferenceAddUpdateOperationProvider<V::Type>
             + From<AddOperation<V::Type>>,
         V: Value,
-        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
+        V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
         Input::To<V::Type>: Clone,
         Input::To<LinearizationTracer<C>>: Parameterized<

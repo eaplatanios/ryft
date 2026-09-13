@@ -31,7 +31,8 @@
 //! ([`ReferenceNewOperation`] and its siblings) are wrapped by the family and interpret eagerly through the value-level
 //! capabilities implemented on [`RegisterValue`], and their generic differentiation, transposition, and batching rules
 //! apply at the eager context and at the staged contexts that transforms instantiate. The family selects allocation,
-//! accumulation, and freezing operations through [`OperationProvider`], using the requested operation as a marker.
+//! accumulation, and freezing operations through [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and
+//! [`ReferenceFreezeOperationProvider`] over its register referent family.
 //! Generic transposition can therefore allocate cotangent references and use [`ReferenceAddUpdate`] on core-owned
 //! tracers without a downstream tracer implementation. `register.add_update` retains family-owned addition semantics;
 //! the other reference primitives reuse their generic transform rules. The gradient convenience boundary also uses
@@ -48,27 +49,28 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayIrType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableReferenceView,
-    BatchableType, BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
-    BatchingPolicy, BoundaryPreservingBatchedProgram, Context, CotangentAccumulator, CotangentDestination,
-    CotangentDestinationKind, CotangentSeed, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, EagerContext,
-    EffectClass, EffectClasses, Effects, ExternalReferenceBinding, InstructionId, InterpretableOperation,
-    InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance,
-    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference,
-    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
-    ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew,
-    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
-    RegionId, RegionInterface, RegionRef, RegionSlot, ResidualZeroProvider, Trace, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero,
-    ZeroOperation, batch, check_count, differentiate_at, discharge_reference_free_operation,
-    validate_reference_boundary,
+    AddOperation, ArrayIrType, ArrayType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation,
+    BatchableReferenceView, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy,
+    BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram, Context, CotangentAccumulator,
+    CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses, Effects, ExternalReferenceBinding,
+    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation,
+    OperationProvider, OutputRegionProvenance, Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder,
+    Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
+    RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
+    ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary,
+    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
+    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider, ReferenceId,
+    ReferenceMemberType, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead,
+    ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
+    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
+    ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ResidualZeroProvider,
+    Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    Typed, Value, ValueId, Zero, ZeroOperation, batch, check_count, differentiate_at,
+    discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -193,11 +195,22 @@ impl Type for RegisterIrType {
     fn is_reference(&self) -> bool {
         matches!(self, Self::Reference(_))
     }
+}
 
-    fn referent(&self) -> Option<Self> {
+impl ReferenceMemberType for RegisterIrType {
+    type Referent = RegisterType;
+
+    fn referent(&self) -> Option<&RegisterType> {
         match self {
             Self::Register(_) => None,
-            Self::Reference(r#type) => Some(Self::Register(r#type.referent().clone())),
+            Self::Reference(r#type) => Some(r#type.referent()),
+        }
+    }
+
+    fn as_referent(&self) -> Option<&RegisterType> {
+        match self {
+            Self::Register(r#type) => Some(r#type),
+            Self::Reference(_) => None,
         }
     }
 }
@@ -568,40 +581,20 @@ impl From<ReferenceFreezeOperation<RegisterType, RegisterIrType>> for RegisterOp
     }
 }
 
-impl OperationProvider<RegisterIrType, ReferenceNewOperation<RegisterIrType, RegisterIrType>> for RegisterOperation {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<RegisterIrType, RegisterIrType>,
-        input_types: &[&RegisterIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
+impl ReferenceNewOperationProvider<RegisterIrType> for RegisterOperation {
+    fn reference_new(_referent: &RegisterType) -> Result<Self, ProgramError> {
         Ok(Self::ReferenceNew(ReferenceNewOperation::new()))
     }
 }
 
-impl OperationProvider<RegisterIrType, ReferenceFreezeOperation<RegisterIrType, RegisterIrType>> for RegisterOperation {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<RegisterIrType, RegisterIrType>,
-        input_types: &[&RegisterIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
+impl ReferenceFreezeOperationProvider<RegisterIrType> for RegisterOperation {
+    fn reference_freeze(_referent: &RegisterType) -> Result<Self, ProgramError> {
         Ok(Self::Freeze(ReferenceFreezeOperation::new()))
     }
 }
 
-impl OperationProvider<RegisterIrType, ReferenceAddUpdateOperation<RegisterIrType, RegisterIrType>>
-    for RegisterOperation
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<RegisterIrType, RegisterIrType>,
-        input_types: &[&RegisterIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
+impl ReferenceAddUpdateOperationProvider<RegisterIrType> for RegisterOperation {
+    fn reference_add_update(_referent: &RegisterType) -> Result<Self, ProgramError> {
         Ok(Self::AddUpdate)
     }
 }
@@ -1437,6 +1430,42 @@ impl<C: Context<Type = RegisterIrType>> BatchingEntrypointPolicy<C> for Register
         }
         Ok(output)
     }
+}
+
+#[test]
+fn test_register_ir_type_reference_member_type() {
+    let register_member = RegisterIrType::from(RegisterType);
+    let reference_member = RegisterIrType::from(ReferenceType::new(RegisterType));
+
+    // L1: `is_reference` agrees with `referent` on both member kinds.
+    assert!(reference_member.is_reference());
+    assert!(reference_member.referent().is_some());
+    assert!(!register_member.is_reference());
+    assert!(register_member.referent().is_none());
+
+    // L2: embedding a reference type and projecting it back yields exactly the referent it wraps.
+    assert_eq!(reference_member.referent(), Some(&RegisterType));
+
+    // L3: embedding a referent and viewing it in the referent family yields it back, while the reference member is
+    // not a referent.
+    assert_eq!(register_member.as_referent(), Some(&RegisterType));
+    assert_eq!(reference_member.as_referent(), None);
+
+    // L4: the borrowed conversions succeed exactly where the projections do and agree with them.
+    assert_eq!(<&RegisterType>::try_from(&register_member), Ok(&RegisterType));
+    assert_eq!(
+        <&RegisterType>::try_from(&reference_member),
+        Err(TypeError::invalid("expected register type but got reference type")),
+    );
+    assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member), Ok(&ReferenceType::new(RegisterType)),);
+    assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member).unwrap().referent(), &RegisterType);
+    assert_eq!(
+        <&ReferenceType<RegisterType>>::try_from(&register_member),
+        Err(TypeError::invalid("expected reference type but got register type")),
+    );
+
+    // L5 concerns universes whose referent family is `NoReferent`; this universe's referent family is `RegisterType`,
+    // which is inhabited, so the law does not constrain it.
 }
 
 #[test]
@@ -2480,26 +2509,18 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         }
     }
 
-    impl OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for ValueOnlyOperation {
-        type Operation = Self;
-
-        fn provide(
-            _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
-            _input_types: &[&ArrayIrType],
-        ) -> Result<Self, ProgramError> {
+    // The family converts from no reference payload, so the array-IR blankets do not apply and it states its own
+    // answer for the array referent family.
+    impl ReferenceNewOperationProvider<ArrayIrType> for ValueOnlyOperation {
+        fn reference_new(_referent: &ArrayType) -> Result<Self, ProgramError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "this operation family does not support reference allocation".to_string(),
             })
         }
     }
 
-    impl OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for ValueOnlyOperation {
-        type Operation = Self;
-
-        fn provide(
-            _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
-            _input_types: &[&ArrayIrType],
-        ) -> Result<Self, ProgramError> {
+    impl ReferenceFreezeOperationProvider<ArrayIrType> for ValueOnlyOperation {
+        fn reference_freeze(_referent: &ArrayType) -> Result<Self, ProgramError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "this operation family does not support reference freezing".to_string(),
             })
@@ -2508,12 +2529,12 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
 
     // Unsupported constructors are fallible; ordinary gradients do not call them for value-only inputs.
     assert!(matches!(
-        ValueOnlyOperation::provide(ReferenceNewOperation::new(), &[]),
+        ValueOnlyOperation::reference_new(&ArrayType::scalar(DataType::F32)),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference allocation",
     ));
     assert!(matches!(
-        ValueOnlyOperation::provide(ReferenceFreezeOperation::new(), &[]),
+        ValueOnlyOperation::reference_freeze(&ArrayType::scalar(DataType::F32)),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference freezing",
     ));

@@ -1,11 +1,33 @@
 //! Generic reference primitive operations and their value-level capabilities.
 //!
 //! Each child module owns one complete primitive, laid out as the type-indexed operation payload with its inference,
-//! effects, reference-discharge rewrite, and transform rules, then the [`OperationProvider`](crate::OperationProvider)
-//! implementations selecting it for the array type universes, then the value-level capability trait with its
-//! implementations for eager array values, projected values, and staged values of every transform, and finally its
-//! unit tests. This facade retains only machinery genuinely shared by multiple primitives and re-exports the
-//! established public operation surface.
+//! effects, reference-discharge rewrite, and transform rules, then the provider implementations selecting it for the
+//! array type universes, then the value-level capability trait with its implementations for eager array values,
+//! projected values, and staged values of every transform, and finally its unit tests. This facade retains only
+//! machinery genuinely shared by multiple primitives and re-exports the established public operation surface.
+//!
+//! # Reference Operation Providers
+//!
+//! [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`] are the family-level
+//! selection surface through which reverse-mode differentiation allocates, accumulates into, and freezes cotangent
+//! references over a universe's referent family (i.e., [`ReferenceMemberType::Referent`]), and through which the
+//! [`ReferenceAddUpdate`] capability stages accumulation on tracers of arbitrary universes. Each constructor receives
+//! the borrowed referent that the reference in question is over and returns the family's operation for it, so a
+//! family selects on the referent instead of on a request marker and operand types. Selection is fallible because a
+//! family over a composite universe may legitimately provide no reference operations (e.g., a downstream value-only
+//! family over [`ArrayIrType`](crate::arrays::ArrayIrType)), and such a family reports
+//! [`ProgramError::UnsupportedOperation`]. A universe whose referent family is [`NoReferent`](crate::NoReferent)
+//! implements the providers with `match *referent {}` bodies: no referent value exists, so the compiler proves the
+//! constructors unreachable and reference-free universes need no runtime rejection. Each family implements only the
+//! providers a bound actually demands; for example, the [`ReferenceAddUpdate`] capability requires only
+//! [`ReferenceAddUpdateOperationProvider`], while reverse mode requires all three.
+//!
+//! The provider super-trait is a plain [`Operation`] rather than `Operation<Type = T>` because the current trait
+//! solver cannot discharge that projection equality at bound sites whose tracing context is built from the same
+//! operation family (E0284): the bound `C::Operation: ReferenceNewOperationProvider<C::Type>` would elaborate a second source
+//! for `<C::Operation as Operation>::Type` beside the one that [`Domain`] already states. Every bound site names the
+//! provider on a context's operation family, whose type the context already pins, and every implementation constrains
+//! its target to `Operation<Type = T>`, so the agreement holds wherever the traits are used.
 
 // TODO(eaplatanios): Review this module.
 
@@ -153,9 +175,16 @@ mod reference_read;
 mod reference_swap;
 mod reference_write;
 
-pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation};
-pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
-pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
+pub use reference_add_update::{
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAddUpdateOperationProvider,
+};
+pub use reference_freeze::{
+    REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider,
+};
+pub use reference_new::{
+    REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
+};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};

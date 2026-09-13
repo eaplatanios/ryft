@@ -4,7 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::identities::{NoIdentity, TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
 
 /// [`Type`] that represents a reference to a [`Value`](crate::Value) whose [`Type`] is `T`. A reference type contains
@@ -144,6 +144,105 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
     }
 }
 
+/// Referent family of [`Type`] universes that contain no references. It has no values, so a function
+/// taking a borrowed [`NoReferent`] can never be called, and a [`ReferenceMemberType`] implementation whose
+/// [`Referent`](ReferenceMemberType::Referent) is [`NoReferent`] satisfies reference-aware bounds without any runtime
+/// rejection because the compiler proves every referent-consuming path unreachable. It follows [`NoIdentity`], which
+/// plays the same role for identity-free type families.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum NoReferent {}
+
+impl Display for NoReferent {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `NoReferent` has no variants, so this function can never be called. `Display` is implemented only because
+        // `Type` requires it. Exhaustively matching the uninhabited `self` is the complete body (Rust accepts a match
+        // with no arms as producing any type, including the `std::fmt::Result` return type), and nothing is ever
+        // written. The formatter is unused as a consequence and it is referenced only to keep the conventional
+        // `formatter` parameter name without an unused-variable warning.
+        let _ = formatter;
+        match *self {}
+    }
+}
+
+impl Type for NoReferent {
+    type Identity = NoIdentity;
+    type Refinements = ();
+
+    // `NoReferent` has no variants, so no value can ever reach these functions. Exhaustively matching that impossible
+    // value lets Rust produce the required return types without fabricating semantics for a referent-free family.
+
+    #[inline]
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        let _ = other;
+        match *self {}
+    }
+
+    #[inline]
+    fn is_refined_by(&self, other: &Self) -> bool {
+        let _ = other;
+        match *self {}
+    }
+
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        match *self {}
+    }
+
+    #[inline]
+    fn is_complex(&self) -> bool {
+        match *self {}
+    }
+}
+
+/// [`Type`] extension describing how a type universe represents references (i.e., the referent family that its
+/// reference members wrap, the two projections between the universe and that family, and the conversions that embed
+/// the family and its [`ReferenceType`] into the universe). It is implemented once per universe. A universe without
+/// references implements it with the uninhabited [`NoReferent`], so that every function taking a borrowed referent
+/// is unreachable for it and no runtime rejection is needed to express that the universe has no references.
+///
+/// # Canonical Referent
+///
+/// The associated [`Referent`](Self::Referent) makes "exactly one referent family per universe" a rule. The
+/// per-operation conversion bounds of the reference operations never required this, so a universe could in principle
+/// embed several [`ReferenceType`] families, but reverse-mode differentiation and reference discharge already treat a
+/// universe as having one referent, and a second family would need a second set of cotangent constructors with no
+/// consumer. A universe that embeds several [`ReferenceType`] families therefore cannot implement this trait.
+///
+/// # Laws
+///
+/// For every implementing universe with referent family `R`, the projections, [`Type::is_reference`], and the
+/// conversions agree as follows, and each universe's tests check every law:
+///
+///   1. `is_reference()` holds exactly when `referent()` returns [`Some`].
+///   2. `Self::from(ReferenceType::new(r)).referent() == Some(&r)` for every `r: R`.
+///   3. `Self::from(r).as_referent() == Some(&r)` for every `r: R`, while `as_referent()` returns [`None`] for
+///      reference members and for members that belong to neither the referent family nor its references (e.g.,
+///      first-class dimensions in the array IR).
+///   4. Wherever a universe also implements the borrowed `TryFrom<&Self>` conversions onto `&R` and
+///      `&ReferenceType<R>`, those conversions succeed exactly where `as_referent()` and `referent()` return [`Some`],
+///      respectively, and agree with them.
+///   5. With `Referent = NoReferent`, `is_reference()` is `false` for every value and both projections return [`None`]
+///      for every value.
+///
+/// # Projections As Functions
+///
+/// Both projections are functions rather than trait-level `where` clauses over the borrowed `TryFrom` conversions
+/// because `where` clauses stated on a trait are not implied at its use sites, so every bound naming this trait would
+/// have to restate them. The conversions remain per-operation bounds where operations need them, and the fourth law
+/// ties them to the projections.
+pub trait ReferenceMemberType: Type + From<Self::Referent> + From<ReferenceType<Self::Referent>> {
+    /// Referent family of this universe's references, or [`NoReferent`] when the universe has none.
+    type Referent: Type;
+
+    /// Returns the referent of this type when it is a reference member of the universe, and [`None`] otherwise.
+    fn referent(&self) -> Option<&Self::Referent>;
+
+    /// Returns this type as a value of the referent family when it is the ordinary member of the universe that
+    /// `From<Self::Referent>` produces, and [`None`] for reference members and for members of any other kind.
+    fn as_referent(&self) -> Option<&Self::Referent>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Borrow;
@@ -151,6 +250,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::DataType;
     use crate::parameters::Parameter;
     use crate::programs::identities::TypeIdentity;
 
@@ -340,7 +440,6 @@ mod tests {
         assert!(!declared_type.is_compatible_with(&static_two));
         assert!(!static_two.is_compatible_with(&static_three));
         assert!(static_two.is_reference());
-        assert_eq!(Type::referent(&static_two), None);
         assert!(!static_two.is_scalar());
         assert!(!static_two.is_complex());
         assert_eq!(static_two.to_string(), "ref<static<2>>");
@@ -357,5 +456,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, TypeError::invalid("identity `identity<0>` was refined to both 2 and 3"));
+    }
+
+    #[test]
+    fn test_no_referent() {
+        // `NoReferent` is uninhabited, so it, a reference type over it, and `Option`s of either are zero-sized: no
+        // value of these types can exist, which is what lets referent-consuming code be proven unreachable.
+        assert_eq!(size_of::<NoReferent>(), 0);
+        assert_eq!(size_of::<Option<NoReferent>>(), 0);
+        assert_eq!(size_of::<ReferenceType<NoReferent>>(), 0);
+        assert_eq!(size_of::<Option<ReferenceType<NoReferent>>>(), 0);
+
+        // `NoReferent` is a complete identity-free `Type`, so it can serve as the `Referent` of a universe and appear
+        // wherever a `ReferenceMemberType` bound is used, both of which are checked here at compile time.
+        fn assert_type<T: Type<Identity = NoIdentity, Refinements = ()>>() {}
+        fn has_no_referent<T: ReferenceMemberType<Referent = NoReferent>>(r#type: &T) -> bool {
+            r#type.referent().is_none() && r#type.as_referent().is_none() && !r#type.is_reference()
+        }
+        assert_type::<NoReferent>();
+        assert!(has_no_referent(&DataType::F32));
     }
 }

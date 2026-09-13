@@ -20,17 +20,16 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
-use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::forwarded_tangent;
+use super::{ReferenceNewOperationProvider, forwarded_tangent};
 
 /// Canonical operation name for [`ReferenceFreezeOperation`].
 pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
@@ -204,12 +203,10 @@ where
 impl<T, U, V, O> TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
 where
     T: Type,
-    U: DifferentiableType,
+    U: DifferentiableType + ReferenceMemberType,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U>
-        + ResidualZeroProvider<U, Operation = O>
-        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>,
+    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U, Operation = O> + ReferenceNewOperationProvider<U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
     // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
@@ -234,46 +231,25 @@ where
     }
 }
 
-// Composite families select canonical operations; homogeneous families reject requests for reference state.
+// Composite array families select the canonical payload; the reference-free array and scalar universes have no
+// referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for O
+    ReferenceFreezeOperationProvider<ArrayIrType> for O
 {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
+    fn reference_freeze(_referent: &ArrayType) -> Result<Self, ProgramError> {
         Ok(ReferenceFreezeOperation::new().into())
     }
 }
 
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreezeOperation<ArrayType, ArrayType>>
-    for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference freezing".to_string(),
-        })
+impl<O: Operation<Type = ArrayType>> ReferenceFreezeOperationProvider<ArrayType> for O {
+    fn reference_freeze(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
     }
 }
 
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<DataType, DataType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceFreezeOperation<DataType, DataType>,
-        _input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference freezing".to_string(),
-        })
+impl<O: Operation<Type = DataType>> ReferenceFreezeOperationProvider<DataType> for O {
+    fn reference_freeze(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
     }
 }
 
@@ -351,6 +327,23 @@ where
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
+//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
+//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
+//  implementation constrains its target to `Operation<Type = T>` instead.
+/// Selects the operation of an [`Operation`] family over the universe `T` that consumes a reference over a referent
+/// and returns its final value, or reports that the family provides none. Reverse-mode differentiation freezes
+/// completed cotangent references through it. Refer to the [module documentation](super) for the shared provider
+/// contract, including how reference-free universes implement it.
+pub trait ReferenceFreezeOperationProvider<T: ReferenceMemberType>: Operation + Sized {
+    /// Returns this family's operation that freezes a reference over `referent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference freezing.
+    fn reference_freeze(referent: &T::Referent) -> Result<Self, ProgramError>;
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -367,7 +360,7 @@ mod tests {
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::math::add::AddOperation;
     use crate::operations::references::reference_add_update::ReferenceAddUpdate;
-    use crate::operations::references::reference_new::ReferenceNew;
+    use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;
     use crate::operations::references::reference_swap::ReferenceSwap;
     use crate::operations::references::tests::*;
@@ -744,27 +737,19 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_freeze_operation_provider() {
-        // Extraction uses the canonical consuming operation, keeping alias invalidation in the reference machinery.
+    fn test_reference_freeze_provider() {
+        // Composite array families select the canonical consuming operation for an array referent, keeping alias
+        // invalidation in the reference machinery.
         assert!(matches!(
-            TestIrOperation::provide(
-                ReferenceFreezeOperation::<ArrayIrType, ArrayIrType>::new(),
-                &[&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))],
-            ),
+            TestIrOperation::reference_freeze(&ArrayType::scalar(DataType::F32)),
             Ok(ArrayIrOperation::ReferenceFreeze(_)),
         ));
 
-        // Value-only families report unsupported construction instead of requiring reference conversions.
-        assert!(matches!(
-            ArrayOperation::<Array>::provide(ReferenceFreezeOperation::<ArrayType, ArrayType>::new(), &[]),
-            Err(ProgramError::UnsupportedOperation { message, .. })
-                if message == "this operation family does not support reference freezing",
-        ));
-        assert!(matches!(
-            AddOperation::<DataType>::provide(ReferenceFreezeOperation::<DataType, DataType>::new(), &[]),
-            Err(ProgramError::UnsupportedOperation { message, .. })
-                if message == "this operation family does not support reference freezing",
-        ));
+        // Reference-free array and scalar families satisfy the provider contract without any runtime rejection, so
+        // the contract is checked at compile time only.
+        fn assert_provider<T: ReferenceMemberType, O: ReferenceFreezeOperationProvider<T>>() {}
+        assert_provider::<ArrayType, ArrayOperation<Array>>();
+        assert_provider::<DataType, AddOperation<DataType>>();
     }
 
     #[test]

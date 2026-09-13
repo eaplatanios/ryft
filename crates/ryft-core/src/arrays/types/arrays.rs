@@ -18,7 +18,10 @@ use crate::axes::Axis;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
-use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements, Typed, Value};
+use crate::programs::{
+    NoReferent, ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeRefinements, Typed, Value,
+};
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
 // that carry no `Sharding`, so that both accessors can hand back a borrow without allocating.
@@ -544,6 +547,22 @@ impl Type for ArrayType {
     }
 }
 
+// Array types never describe references, so the universe has no referent family: `NoReferent` is uninhabited and both
+// projections are `None` for every array type, which is the referent-free contract of `ReferenceMemberType`.
+impl ReferenceMemberType for ArrayType {
+    type Referent = NoReferent;
+
+    #[inline]
+    fn referent(&self) -> Option<&NoReferent> {
+        None
+    }
+
+    #[inline]
+    fn as_referent(&self) -> Option<&NoReferent> {
+        None
+    }
+}
+
 // `ArrayType` describes itself. This fixed point (rather than a dummy unit-like type) is deliberate and load-bearing
 // for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the
 // same type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<Type = ArrayType>` type
@@ -587,6 +606,20 @@ impl Value for ArrayType {
         renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         self.rename_identities(renaming)
+    }
+}
+
+impl From<NoReferent> for ArrayType {
+    #[inline]
+    fn from(referent: NoReferent) -> Self {
+        match referent {}
+    }
+}
+
+impl From<ReferenceType<NoReferent>> for ArrayType {
+    #[inline]
+    fn from(r#type: ReferenceType<NoReferent>) -> Self {
+        match *r#type.referent() {}
     }
 }
 
@@ -1306,6 +1339,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(renaming.rename(&declared_variable), actual_variable);
+    }
+
+    #[test]
+    fn test_array_type_reference_member_type() {
+        // Array types have no referent family. `NoReferent` is uninhabited, so no array type is a reference and
+        // both projections are `None` for every value; `is_reference` and `referent` therefore agree trivially, and
+        // the embedding round trips have no referent value to quantify over.
+        let scalar = ArrayType::scalar(F32);
+        let vector = ArrayType::new(F64, Shape::new(vec![Dimension::Static(3)]));
+        assert!(!scalar.is_reference());
+        assert_eq!(scalar.referent(), None);
+        assert_eq!(scalar.as_referent(), None);
+        assert!(!vector.is_reference());
+        assert_eq!(vector.referent(), None);
+        assert_eq!(vector.as_referent(), None);
+
+        // The embedding conversions required by `ReferenceMemberType` exist so that reverse-mode bounds are satisfied,
+        // and can never be called because their arguments have no values. There is no borrowed conversion onto
+        // `NoReferent` for the projections to agree with.
+        fn assert_embeddings<T: ReferenceMemberType<Referent = NoReferent>>() {}
+        assert_embeddings::<ArrayType>();
     }
 
     #[test]

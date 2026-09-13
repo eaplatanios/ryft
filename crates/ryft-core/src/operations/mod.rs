@@ -63,7 +63,8 @@ pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, Scal
 pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceFreezeOperationProvider, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };

@@ -7,7 +7,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -25,10 +25,10 @@ use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -256,47 +256,36 @@ where
     }
 }
 
+// Composite array families select the canonical payload; the reference-free array and scalar universes have no
+// referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>> for O
+    ReferenceAddUpdateOperationProvider<ArrayIrType> for O
 {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
+    fn reference_add_update(_referent: &ArrayType) -> Result<Self, ProgramError> {
         Ok(ReferenceAddUpdateOperation::new().into())
     }
 }
 
-// Homogeneous array families can return or ignore cotangents, but their type universe contains no references.
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<ArrayType, ArrayType>>
-    for O
-{
-    type Operation = Self;
+impl<O: Operation<Type = ArrayType>> ReferenceAddUpdateOperationProvider<ArrayType> for O {
+    fn reference_add_update(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
+    }
+}
 
-    fn provide(
-        _request: ReferenceAddUpdateOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "the homogeneous array operation family cannot accumulate into a reference destination"
-                .to_string(),
-        })
+impl<O: Operation<Type = DataType>> ReferenceAddUpdateOperationProvider<DataType> for O {
+    fn reference_add_update(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
     }
 }
 
 /// Adds an update into the value stored by a reference in program order.
 ///
-/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a
-/// [`Context`] use its operation family to select and bind the update operation through
-/// [`OperationProvider<Type, ReferenceAddUpdateOperation<Type, Type>>`](OperationProvider). Here both request
-/// parameters name the enclosing value type family; the selected operation may use a different referent type or
-/// a downstream payload. The provider returns its enclosing operation family, receives the reference and update
-/// types in that order, and may report unsupported construction for families without references. This capability
-/// alone is generic over type universes because reverse-mode differentiation accumulates cotangents through it on
-/// tracers of arbitrary universes; the other five reference capabilities are specific to
+/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a [`Context`]
+/// project the referent of their reference type through [`ReferenceMemberType::referent`] and use the context's
+/// operation family to select and bind the update operation through [`ReferenceAddUpdateOperationProvider`]; the selected
+/// operation may use a downstream payload, and a family without references may report unsupported construction. This
+/// capability alone is generic over type universes because reverse-mode differentiation accumulates cotangents
+/// through it on tracers of arbitrary universes; the other five reference capabilities are specific to
 /// [`ArrayIrType`](crate::arrays::ArrayIrType), because no core machinery needs them on arbitrary type universes.
 pub trait ReferenceAddUpdate<Update = Self>: Sized {
     /// Adds `update` to the stored value in program order.
@@ -329,28 +318,39 @@ where
     }
 }
 
-// Staged values delegate selection to their operation family. The request uses the enclosing type in both slots:
-// it identifies the capability, while the selected operation can use the family's actual referent type or payload.
-impl<V: Value> ReferenceAddUpdate for V
+// Staged values delegate selection to their operation family over the referent of the reference being updated; a
+// value that is not a reference member of its universe has no referent and is rejected before any selection.
+impl<V: Value<Type: ReferenceMemberType>> ReferenceAddUpdate for V
 where
-    V::DispatchDomain: Context<
-        Operation: OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<V::Type, V::Type>,
-            Operation = <V::DispatchDomain as Domain>::Operation,
-        >,
-    >,
+    V::DispatchDomain: Context<Operation: ReferenceAddUpdateOperationProvider<V::Type>>,
 {
     fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
         let reference_type = self.r#type();
-        let update_type = update.r#type();
-        let operation = <V::DispatchDomain as Domain>::Operation::provide(
-            ReferenceAddUpdateOperation::<V::Type, V::Type>::new(),
-            &[reference_type.as_ref(), update_type.as_ref()],
-        )?;
+        let referent = reference_type
+            .referent()
+            .ok_or_else(|| TypeError::invalid(format!("expected reference type but got `{reference_type}`")))?;
+        let operation = <V::DispatchDomain as Domain>::Operation::reference_add_update(referent)?;
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
         Ok(())
     }
+}
+
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
+//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
+//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
+//  implementation constrains its target to `Operation<Type = T>` instead.
+/// Selects the operation of an [`Operation`] family over the universe `T` that adds an update of the referent's type
+/// into a reference over that referent in program order, or reports that the family provides none. Reverse-mode
+/// differentiation accumulates cotangents through it, and the [`ReferenceAddUpdate`] capability stages accumulation
+/// on tracers through it. Refer to the [module documentation](super) for the shared provider contract, including how
+/// reference-free universes implement it.
+pub trait ReferenceAddUpdateOperationProvider<T: ReferenceMemberType>: Operation + Sized {
+    /// Returns this family's operation that adds an update into a reference over `referent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference accumulation.
+    fn reference_add_update(referent: &T::Referent) -> Result<Self, ProgramError>;
 }
 
 #[cfg(test)]
@@ -902,32 +902,17 @@ mod tests {
 
     #[test]
     fn test_reference_add_update_provider() {
-        // The composite array family selects its own accumulation for a reference and an update operand.
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let update_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        // The composite array family selects its own accumulation operation for an array referent.
         assert!(matches!(
-            TestIrOperation::provide(
-                ReferenceAddUpdateOperation::<ArrayIrType, ArrayIrType>::new(),
-                &[&reference_type, &update_type],
-            ),
+            TestIrOperation::reference_add_update(&ArrayType::scalar(DataType::F32)),
             Ok(ArrayIrOperation::ReferenceAddUpdate(_)),
         ));
-        assert_eq!(
-            TestIrOperation::provide(
-                ReferenceAddUpdateOperation::<ArrayIrType, ArrayIrType>::new(),
-                std::slice::from_ref(&&reference_type),
-            )
-            .map(|operation| operation.name()),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        );
 
-        // The homogeneous array family satisfies the provider contract that reverse mode requires without supporting
-        // a reference destination.
-        assert!(matches!(
-            ArrayOperation::<Array>::provide(ReferenceAddUpdateOperation::<ArrayType, ArrayType>::new(), &[]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "the homogeneous array operation family cannot accumulate into a reference destination",
-        ));
+        // Reference-free array and scalar families satisfy the provider contract that reverse mode requires without
+        // any runtime rejection, so the contract is checked at compile time only.
+        fn assert_provider<T: ReferenceMemberType, O: ReferenceAddUpdateOperationProvider<T>>() {}
+        assert_provider::<ArrayType, ArrayOperation<Array>>();
+        assert_provider::<DataType, AddOperation<DataType>>();
     }
 
     #[test]

@@ -18,7 +18,8 @@ use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationErr
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
+    AddOperation, OneOperation, ReferenceAddUpdateOperationProvider, ReferenceFreezeOperationProvider,
+    ReferenceNewOperationProvider, Zero,
 };
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -26,9 +27,9 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
     Operation, OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceAnalysis, ReferenceBoundary, ReferenceRoot,
-    ReferenceViewOperation, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    ReferenceAccessMode, ReferenceAliasKind, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
+    ReferenceType, ReferenceViewOperation, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -279,16 +280,14 @@ impl<V: Typed> CotangentReferenceAccumulator<V> {
 }
 
 impl<
-    V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
+    V: Value<Type: DifferentiableType + ReferenceMemberType>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O> + ReferenceNewOperationProvider<V::Type>,
 > CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>
 {
     /// Returns this [`CotangentReferenceAccumulator`]'s cotangent reference, allocating it with a zero initial value
     /// first if it has not been allocated yet. The zero referent is materialized through the operation family's
-    /// [`ResidualZeroProvider`] implementation and then allocated through its [`OperationProvider`] implementation,
-    /// both in `context`.
+    /// [`ResidualZeroProvider`] implementation and then allocated through its [`ReferenceNewOperationProvider`]
+    /// implementation, both in `context`.
     ///
     /// # Parameters
     ///
@@ -301,8 +300,9 @@ impl<
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when the accumulator's type does not project onto a referent
-    /// through [`Type::referent`], and propagates zero materialization and allocation errors otherwise.
+    /// Returns [`ProgramError::UnsupportedOperation`] when the accumulator's type is not a reference member of its
+    /// universe (i.e., [`ReferenceMemberType::referent`] returns [`None`]), and propagates zero materialization and
+    /// allocation errors otherwise.
     fn allocate_in(
         &mut self,
         context: &TracingContext<V, O>,
@@ -312,17 +312,16 @@ impl<
             Self::Unallocated { cotangent_type } => {
                 let referent = cotangent_type.referent().ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
-                        "cannot allocate a cotangent reference of type {cotangent_type} because its universe does not \
-                         project the type onto a referent"
+                        "cannot allocate a cotangent reference of type {cotangent_type} \
+                         because it is not a reference type",
                     ),
                 })?;
-                let zero =
-                    O::materialize_zero_from_residual_sources(context, MaybeZero::Zero(referent), sources.iter())?;
-                let mut references = context.bind(
-                    O::provide(ReferenceNewOperation::new(), &[zero.r#type().as_ref()])?,
-                    Vec::new(),
-                    &[zero],
+                let zero = O::materialize_zero_from_residual_sources(
+                    context,
+                    MaybeZero::Zero(V::Type::from(referent.clone())),
+                    sources.iter(),
                 )?;
+                let mut references = context.bind(O::reference_new(referent)?, Vec::new(), &[zero])?;
                 check_count!("output", references, 1, ProgramError);
                 *self = Self::Allocated { reference: references.remove(0) };
                 Ok(self.reference().unwrap())
@@ -489,8 +488,9 @@ enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
         /// Reference receiving the accumulated contributions.
         reference: Tracer<TracingContext<V, O>>,
 
-        /// Selected [`ReferenceAddUpdateOperation`] instance. Retaining it preserves operation-family dispatch without
-        /// adding reference-operation provider bounds to every transpose rule for non-reference values.
+        /// Accumulation operation selected through [`ReferenceAddUpdateOperationProvider`]. Retaining it preserves
+        /// operation-family dispatch without adding reference-operation provider bounds to every transpose rule for
+        /// non-reference values.
         operation: O,
     },
 }
@@ -767,10 +767,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         input_index: usize,
     ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
     where
-        V::Type: DifferentiableType,
+        V::Type: DifferentiableType + ReferenceMemberType,
         O: ReferenceViewOperation
             + ResidualZeroProvider<V::Type, Operation = O>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
+            + ReferenceNewOperationProvider<V::Type>,
     {
         let (_, value, root) = self.reference_input(driver, input_index)?;
         let root_reference = {
@@ -971,10 +971,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         accumulators: &[CotangentAccumulator],
     ) -> Result<CotangentDestinations<Tracer<TracingContext<V, O>>>, DifferentiationError>
     where
-        V::Type: DifferentiableType,
+        V::Type: DifferentiableType + ReferenceMemberType,
         O: ReferenceViewOperation
             + ResidualZeroProvider<V::Type, Operation = O>
-            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
+            + ReferenceNewOperationProvider<V::Type>,
     {
         if !accumulators.is_empty() {
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -1260,7 +1260,7 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
 }
 
 impl<
-    C: Context<Type: DifferentiableType>,
+    C: Context<Type: DifferentiableType + ReferenceMemberType>,
     Input: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
     Output: Parameterized<C::Value>,
 > Pullback<C, Input, Output>
@@ -1326,8 +1326,8 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
     {
         self.linear_program
@@ -1375,8 +1375,8 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
     {
         self.validate_reference_boundary()?;
@@ -1399,8 +1399,8 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
     {
         self.validate_reference_boundary()?;
@@ -1466,8 +1466,8 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
         Input::Family: ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<C::Value>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
@@ -1488,11 +1488,11 @@ impl<
         destinations: Vec<CotangentDestination<C::Value>>,
     ) -> Result<Input::To<C::Value>, ProgramError>
     where
-        C::Operation: OperationProvider<C::Type, ReferenceFreezeOperation<C::Type, C::Type>, Operation = C::Operation>
+        C::Operation: ReferenceFreezeOperationProvider<C::Type>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
     {
         let cotangents = self.apply_impl(seeds, &destinations)?;
@@ -1501,11 +1501,14 @@ impl<
             .zip(cotangents)
             .map(|(destination, cotangent)| match destination {
                 CotangentDestination::Reference(reference) => {
-                    let mut outputs = self.context.bind(
-                        C::Operation::provide(ReferenceFreezeOperation::new(), &[reference.r#type().as_ref()])?,
-                        Vec::new(),
-                        &[reference],
-                    )?;
+                    let reference_type = reference.r#type();
+                    let referent = reference_type.referent().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "gradient destination of type `{reference_type}` is not a reference type",
+                        ))
+                    })?;
+                    let freeze = C::Operation::reference_freeze(referent)?;
+                    let mut outputs = self.context.bind(freeze, Vec::new(), &[reference])?;
                     check_count!("output", outputs, 1, ProgramError);
                     Ok(outputs.remove(0))
                 }
@@ -1537,8 +1540,8 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-            + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+            + ReferenceNewOperationProvider<C::Type>
+            + ReferenceAddUpdateOperationProvider<C::Type>
             + From<AddOperation<C::Type>>,
     {
         // Validate the seeds against the complete primal output boundary, including the leaves whose differential
@@ -1619,7 +1622,9 @@ impl<
                     let valid_type = if is_reference {
                         reference.r#type().as_ref() == &cotangent_type
                     } else {
-                        reference.r#type().referent().as_ref() == Some(&cotangent_type)
+                        cotangent_type
+                            .as_referent()
+                            .is_some_and(|referent| reference.r#type().referent() == Some(referent))
                     };
                     if !valid_type {
                         let requirement = if is_reference {
@@ -1830,11 +1835,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveTra
 }
 
 impl<
-    V: Value<Type: DifferentiableType>,
+    V: Value<Type: DifferentiableType + ReferenceMemberType>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>
-        + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = O>
+        + ReferenceNewOperationProvider<V::Type>
+        + ReferenceAddUpdateOperationProvider<V::Type>
         + From<AddOperation<V::Type>>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 {
@@ -2056,12 +2061,12 @@ pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
 }
 
 impl<
-    T: DifferentiableType,
+    T: DifferentiableType + ReferenceMemberType,
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
-        + OperationProvider<T, ReferenceNewOperation<T, T>, Operation = O>
-        + OperationProvider<T, ReferenceAddUpdateOperation<T, T>, Operation = O>
+        + ReferenceNewOperationProvider<T>
+        + ReferenceAddUpdateOperationProvider<T>
         + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
 {
@@ -2450,17 +2455,19 @@ impl<
                     self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?.r#type();
                 if !input_type.is_reference() {
                     if kind_by_input[index] == Some(CotangentDestinationKind::Reference) {
+                        // Project the cotangent onto the universe's referent family to name the caller-owned reference
+                        // type without allocating a runtime reference.
                         let cotangent_type = input_type.cotangent()?;
-                        // Ask the operation family for its reference type without allocating a runtime reference.
-                        let allocation = O::provide(ReferenceNewOperation::<T, T>::new(), &[&cotangent_type])?;
-                        let reference_types =
-                            allocation.infer_output_types(std::slice::from_ref(&cotangent_type), &[])?;
-                        check_count!("output", reference_types, 1, ProgramError);
-                        let reference_type = reference_types.into_iter().next().unwrap();
-                        let update = O::provide(
-                            ReferenceAddUpdateOperation::<T, T>::new(),
-                            &[&reference_type, &cotangent_type],
-                        )?;
+                        let referent =
+                            cotangent_type.as_referent().ok_or_else(|| ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "cannot store the cotangent of type {cotangent_type} of input {index} in a \
+                                     caller-owned reference because it is not a member of its universe's \
+                                     referent family",
+                                ),
+                            })?;
+                        let reference_type = T::from(ReferenceType::new(referent.clone()));
+                        let update = O::reference_add_update(referent)?;
                         let reference = context.input(reference_type);
                         let handle = &atom_accumulators[input.index()];
                         let slot = &mut context.cotangent_storage[handle.storage_index];
@@ -2869,12 +2876,12 @@ impl<
 
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
-    T: DifferentiableType,
+    T: DifferentiableType + ReferenceMemberType,
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
-        + OperationProvider<T, ReferenceNewOperation<T, T>, Operation = O>
-        + OperationProvider<T, ReferenceAddUpdateOperation<T, T>, Operation = O>
+        + ReferenceNewOperationProvider<T>
+        + ReferenceAddUpdateOperationProvider<T>
         + From<AddOperation<T>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -3104,20 +3111,15 @@ where
 pub trait ReverseModeDifferentiate:
     ForwardModeDifferentiate
     + Context<
+        Type: ReferenceMemberType,
         Operation: PartiallyEvaluatableOperation<Self>
                        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
-                       + OperationProvider<
-            Self::Type,
-            ReferenceNewOperation<Self::Type, Self::Type>,
-            Operation = Self::Operation,
-        > + OperationProvider<
-            Self::Type,
-            ReferenceAddUpdateOperation<Self::Type, Self::Type>,
-            Operation = Self::Operation,
-        > + From<AddOperation<Self::Type>>,
+                       + ReferenceNewOperationProvider<Self::Type>
+                       + ReferenceAddUpdateOperationProvider<Self::Type>
+                       + From<AddOperation<Self::Type>>,
     >
 {
     /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
@@ -3192,14 +3194,14 @@ pub trait ReverseModeDifferentiate:
     }
 }
 
-impl<C: ForwardModeDifferentiate + Context> ReverseModeDifferentiate for C where
+impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseModeDifferentiate for C where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+        + ReferenceNewOperationProvider<C::Type>
+        + ReferenceAddUpdateOperationProvider<C::Type>
         + From<AddOperation<C::Type>>
 {
 }
@@ -3220,8 +3222,8 @@ pub(crate) fn value_and_gradient_in_context<
     holomorphic: bool,
 ) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError>
 where
-    C::Operation: OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceFreezeOperation<C::Type, C::Type>, Operation = C::Operation>
+    C::Operation: ReferenceNewOperationProvider<C::Type>
+        + ReferenceFreezeOperationProvider<C::Type>
         + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
 {
     let destinations = gradient_destinations(context, &primals)?;
@@ -3253,8 +3255,8 @@ pub(crate) fn value_and_gradient_auxiliary_in_context<
     holomorphic: bool,
 ) -> Result<((C::Value, AuxiliaryOutput), Input::To<C::Value>), DifferentiationError>
 where
-    C::Operation: OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceFreezeOperation<C::Type, C::Type>, Operation = C::Operation>
+    C::Operation: ReferenceNewOperationProvider<C::Type>
+        + ReferenceFreezeOperationProvider<C::Type>
         + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
     (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>): Parameterized<
             LinearizationTracer<C>,
@@ -3641,9 +3643,8 @@ fn gradient_destinations<C: Context + Zero<C::Value>, Input: Parameterized<C::Va
     primals: &Input,
 ) -> Result<Vec<CotangentDestination<C::Value>>, ProgramError>
 where
-    C::Type: DifferentiableType,
-    C::Operation: OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    C::Type: DifferentiableType + ReferenceMemberType,
+    C::Operation: ReferenceNewOperationProvider<C::Type> + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     primals
         .parameters()
@@ -3653,20 +3654,14 @@ where
             }
             let cotangent_type = primal.r#type().cotangent()?;
             let referent = cotangent_type.referent().ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: format!(
-                    "gradient cotangent type `{cotangent_type}` cannot represent its referent in this value family",
-                ),
+                message: format!("gradient cotangent type `{cotangent_type}` is not a reference type"),
             })?;
             let zero = C::Operation::materialize_zero_from_residual_sources(
                 context,
-                MaybeZero::Zero(referent),
+                MaybeZero::Zero(C::Type::from(referent.clone())),
                 std::iter::once(primal),
             )?;
-            let mut outputs = context.bind(
-                C::Operation::provide(ReferenceNewOperation::new(), &[zero.r#type().as_ref()])?,
-                Vec::new(),
-                &[zero],
-            )?;
+            let mut outputs = context.bind(C::Operation::reference_new(referent)?, Vec::new(), &[zero])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(CotangentDestination::Reference(outputs.remove(0)))
         })
@@ -4195,7 +4190,7 @@ pub(crate) mod tests {
         assert_eq!(again.atom_id(), reference.atom_id());
         assert_eq!(context.builder().borrow().instructions().len(), 2);
 
-        // A type that does not project onto a referent cannot be allocated.
+        // A non-reference type has no referent and cannot be allocated.
         let mut accumulator =
             CotangentReferenceAccumulator::<Tracer<TracingContext<ReferenceTestValue, _>>>::Unallocated {
                 cotangent_type: ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
@@ -4203,8 +4198,7 @@ pub(crate) mod tests {
         assert!(matches!(
             accumulator.allocate_in(&context, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot allocate a cotangent reference of type f32[] because its universe does not \
-                    project the type onto a referent",
+                if message == "cannot allocate a cotangent reference of type f32[] because it is not a reference type",
         ));
     }
 

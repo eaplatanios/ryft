@@ -7,7 +7,9 @@ use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements};
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable};
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
-use crate::programs::{ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
+use crate::programs::{
+    ReferenceMemberType, ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements,
+};
 
 /// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays,
 /// first-class runtime dimensions, or [`Reference`](crate::Reference)s to arrays. It is the type-level counterpart of
@@ -266,12 +268,24 @@ impl Type for ArrayIrType {
     fn is_reference(&self) -> bool {
         matches!(self, Self::Reference(_))
     }
+}
+
+impl ReferenceMemberType for ArrayIrType {
+    type Referent = ArrayType;
 
     #[inline]
-    fn referent(&self) -> Option<Self> {
+    fn referent(&self) -> Option<&ArrayType> {
         match self {
-            Self::Reference(r#type) => Some(Self::Array(r#type.referent().clone())),
+            Self::Reference(r#type) => Some(r#type.referent()),
             Self::Array(_) | Self::Dimension(_) => None,
+        }
+    }
+
+    #[inline]
+    fn as_referent(&self) -> Option<&ArrayType> {
+        match self {
+            Self::Array(r#type) => Some(r#type),
+            Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
 }
@@ -710,7 +724,7 @@ mod tests {
         assert!(!stored.is_scalar());
         assert!(!stored.is_complex());
         assert!(stored.is_reference());
-        assert_eq!(stored.referent(), Some(ArrayIrType::Array(array.clone())));
+        assert_eq!(stored.referent(), Some(&array));
         assert!(!stored.is_compatible_with(&ArrayIrType::Array(array.clone())));
         assert!(!ArrayIrType::Array(array.clone()).is_compatible_with(&stored));
         assert!(!stored.is_refined_by(&ArrayIrType::Array(array.clone())));
@@ -722,6 +736,55 @@ mod tests {
         assert_eq!(
             <&DimensionType>::try_from(&stored),
             Err(TypeError::invalid("expected dimension type but got reference type")),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_reference_member_type() {
+        let array = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
+        let reference = ReferenceType::new(array.clone());
+        let dimension = DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded()));
+        let array_member = ArrayIrType::from(array.clone());
+        let reference_member = ArrayIrType::from(reference.clone());
+        let dimension_member = ArrayIrType::from(dimension);
+
+        // `is_reference` and `referent` agree on every member kind: exactly the reference member has a referent.
+        assert!(reference_member.is_reference());
+        assert!(reference_member.referent().is_some());
+        assert!(!array_member.is_reference());
+        assert!(array_member.referent().is_none());
+        assert!(!dimension_member.is_reference());
+        assert!(dimension_member.referent().is_none());
+
+        // Embedding a reference type and projecting it back yields exactly the referent it wraps.
+        assert_eq!(reference_member.referent(), Some(&array));
+        assert_eq!(ArrayIrType::from(ReferenceType::new(array.clone())).referent(), Some(&array));
+
+        // Embedding a referent and viewing it in the referent family yields it back, while reference members and
+        // first-class dimension members are not referents.
+        assert_eq!(array_member.as_referent(), Some(&array));
+        assert_eq!(reference_member.as_referent(), None);
+        assert_eq!(dimension_member.as_referent(), None);
+
+        // The borrowed conversions succeed exactly where the projections do and agree with them.
+        assert_eq!(<&ArrayType>::try_from(&array_member), Ok(&array));
+        assert_eq!(
+            <&ArrayType>::try_from(&reference_member),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            <&ArrayType>::try_from(&dimension_member),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(<&ReferenceType<ArrayType>>::try_from(&reference_member), Ok(&reference));
+        assert_eq!(<&ReferenceType<ArrayType>>::try_from(&reference_member).unwrap().referent(), &array);
+        assert_eq!(
+            <&ReferenceType<ArrayType>>::try_from(&array_member),
+            Err(TypeError::invalid("expected reference type but got array type")),
+        );
+        assert_eq!(
+            <&ReferenceType<ArrayType>>::try_from(&dimension_member),
+            Err(TypeError::invalid("expected reference type but got dimension type")),
         );
     }
 }

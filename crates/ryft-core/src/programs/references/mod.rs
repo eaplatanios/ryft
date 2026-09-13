@@ -229,7 +229,7 @@ pub use discharge::{
     ReferenceDischargeableType, ReferenceSource, discharge_local_reference_operation,
     discharge_positional_region_operation, discharge_reference_free_operation,
 };
-pub use types::{ReferenceType, ReferenceTypeRefinements};
+pub use types::{NoReferent, ReferenceMemberType, ReferenceType, ReferenceTypeRefinements};
 pub use values::{
     PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundary,
     ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend,

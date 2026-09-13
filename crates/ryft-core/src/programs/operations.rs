@@ -908,14 +908,12 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///
 /// The default `Request = ()` needs no construction arguments beyond operand types, as used by elementwise
 /// capabilities. A caller can instead pass an operation payload as a request to its context's operation family.
-/// For example, `ZeroOperation::new(output_type)` requests a zero with no operands, while a reference allocation
-/// request takes the initial value's type in `input_types`. The selected operation may differ from the request:
-/// composite families select their member operations, and unsupported families return an error.
+/// For example, `ZeroOperation::new(output_type)` requests a zero with no operands. The selected operation may
+/// differ from the request (e.g., composite families select their member operations, and unsupported families
+/// return an error).
 ///
-/// Explicit requests use the same payload types as ordinary operation construction. Reference requests repeat the
-/// enclosing type family in both payload parameters to identify the capability; the selected operation uses the
-/// actual referent family. The default unit request keeps self-provision separate from family selection, including
-/// when a family is a single operation.
+/// Explicit requests use the same payload types as ordinary operation construction. The default unit request keeps
+/// self-provision separate from family selection, including when a family is a single operation.
 ///
 /// The default request supports two implementation levels:
 ///

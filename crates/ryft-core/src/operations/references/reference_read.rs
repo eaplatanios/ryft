@@ -22,17 +22,16 @@ use crate::macros::check_count;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::references::reference_add_update::ReferenceAddUpdate;
-use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::forwarded_tangent;
+use super::{ReferenceNewOperationProvider, forwarded_tangent};
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
@@ -197,12 +196,10 @@ where
 impl<T, U, V, O> TransposableOperation<V, O> for ReferenceReadOperation<T, U>
 where
     T: Type,
-    U: DifferentiableType,
+    U: DifferentiableType + ReferenceMemberType,
     ReferenceReadOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U>
-        + ResidualZeroProvider<U, Operation = O>
-        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>,
+    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U, Operation = O> + ReferenceNewOperationProvider<U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
     // A read is the identity map from the referenced state to its result, so its transpose accumulates the result's
@@ -285,7 +282,7 @@ mod tests {
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::references::reference_freeze::ReferenceFreeze;
-    use crate::operations::references::reference_new::ReferenceNew;
+    use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};

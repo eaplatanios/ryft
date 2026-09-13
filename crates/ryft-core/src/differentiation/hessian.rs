@@ -9,10 +9,10 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperationProvider, ReferenceNewOperationProvider};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{OperationProvider, ProgramError, Type, Typed, Value};
+use crate::programs::{ProgramError, ReferenceMemberType, Type, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
@@ -249,7 +249,7 @@ pub(crate) fn hessian_in_context<C, Input, Capture, Output, AuxiliaryOutput, F>(
 >
 where
     C: Context<
-            Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
+            Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
             Operation: PartiallyEvaluatableOperation<C>
                            + PartiallyEvaluatableOperation<LinearizationContext<C>>
                            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
@@ -259,12 +259,9 @@ where
                            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
                            + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-                           + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<C::Type, C::Type>,
-                Operation = C::Operation,
-            > + From<AddOperation<C::Type>>,
+                           + ReferenceNewOperationProvider<C::Type>
+                           + ReferenceAddUpdateOperationProvider<C::Type>
+                           + From<AddOperation<C::Type>>,
         >,
     Input: Parameterized<
             C::Value,

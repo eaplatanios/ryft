@@ -9,10 +9,10 @@ use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType}
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperationProvider, ReferenceNewOperationProvider};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{OperationProvider, ProgramError, Type, Typed};
+use crate::programs::{ProgramError, ReferenceMemberType, Type, Typed};
 use crate::tracing::TracingContext;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
@@ -414,14 +414,14 @@ pub(crate) fn jacobian_reverse_in_context<
     DifferentiationError,
 >
 where
-    C::Type: DenseDifferentiableType<C>,
+    C::Type: DenseDifferentiableType<C> + ReferenceMemberType,
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+        + ReferenceNewOperationProvider<C::Type>
+        + ReferenceAddUpdateOperationProvider<C::Type>
         + From<AddOperation<C::Type>>,
 {
     // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex

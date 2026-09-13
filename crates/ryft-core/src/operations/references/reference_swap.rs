@@ -23,17 +23,16 @@ use crate::operations::constants::zero::Zero;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::math::add::AddOperation;
-use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::{align_stored_batch, stored_tangents, validate_operand_types};
+use super::{ReferenceNewOperationProvider, align_stored_batch, stored_tangents, validate_operand_types};
 
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
@@ -240,13 +239,13 @@ where
 impl<T, U, V, O> TransposableOperation<V, O> for ReferenceSwapOperation<T, U>
 where
     T: Type,
-    U: DifferentiableType,
+    U: DifferentiableType + ReferenceMemberType,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + From<AddOperation<U>>
         + ResidualZeroProvider<U, Operation = O>
-        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>
+        + ReferenceNewOperationProvider<U>
         + From<ReferenceSwapOperation<T, U>>,
 {
     // A swap maps `(state, x) ↦ (x, state)`, so its transpose swaps the output cotangent into the cotangent reference

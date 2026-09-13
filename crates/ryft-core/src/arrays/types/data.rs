@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::parameters::Parameter;
-use crate::programs::{NoIdentity, Type};
+use crate::programs::{NoIdentity, NoReferent, ReferenceMemberType, ReferenceType, Type};
 
 /// Represents [`DataType`]-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1313,6 +1313,36 @@ impl Type for DataType {
     }
 }
 
+// Data types never describe references, so the universe has no referent family. `NoReferent` is uninhabited and both
+// projections are `None` for every data type, which is the referent-free contract of `ReferenceMemberType`.
+impl ReferenceMemberType for DataType {
+    type Referent = NoReferent;
+
+    #[inline]
+    fn referent(&self) -> Option<&NoReferent> {
+        None
+    }
+
+    #[inline]
+    fn as_referent(&self) -> Option<&NoReferent> {
+        None
+    }
+}
+
+impl From<NoReferent> for DataType {
+    #[inline]
+    fn from(referent: NoReferent) -> Self {
+        match referent {}
+    }
+}
+
+impl From<ReferenceType<NoReferent>> for DataType {
+    #[inline]
+    fn from(r#type: ReferenceType<NoReferent>) -> Self {
+        match *r#type.referent() {}
+    }
+}
+
 /// Node in the [`DataType`] promotion lattice. Refer to the documentation of [`DataType`] for more information
 /// on `ryft`'s type promotion semantics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1548,7 +1578,7 @@ static DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS: [[Option<DataType>; DataType::COU
 
 #[cfg(test)]
 mod tests {
-    use super::{DataType, DataTypeError, Type};
+    use super::*;
 
     #[test]
     fn test_data_type_classification() {
@@ -1815,6 +1845,24 @@ mod tests {
         assert!(DataType::F32.is_refined_by(&DataType::F32));
         assert!(!DataType::F16.is_refined_by(&DataType::F32));
         assert!(!DataType::F32.is_refined_by(&DataType::F16));
+    }
+
+    #[test]
+    fn test_data_type_reference_member_type() {
+        // Data types have no referent family. `NoReferent` is uninhabited, so no data type is a reference and both
+        // projections are `None` for every value; `is_reference` and `referent` therefore agree trivially, and the
+        // embedding round trips have no referent value to quantify over.
+        for data_type in [DataType::Token, DataType::Boolean, DataType::I32, DataType::F32, DataType::C128] {
+            assert!(!data_type.is_reference());
+            assert_eq!(data_type.referent(), None);
+            assert_eq!(data_type.as_referent(), None);
+        }
+
+        // The embedding conversions required by `ReferenceMemberType` exist so that reverse-mode bounds are satisfied,
+        // and can never be called because their arguments have no values. There is no borrowed conversion onto
+        // `NoReferent` for the projections to agree with.
+        fn assert_embeddings<T: ReferenceMemberType<Referent = NoReferent>>() {}
+        assert_embeddings::<DataType>();
     }
 
     #[test]

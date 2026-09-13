@@ -196,26 +196,12 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 
     /// Returns `true` if this [`Type`] describes a [`ReferenceType`](crate::ReferenceType). Transform boundaries use
     /// this predicate to reject unresolved references even when no stateful operation is present, such as a pure
-    /// reference passthrough.
+    /// reference passthrough. The predicate is all that the core [`Type`] contract says about references. Type
+    /// universes that also need the referent itself implement the [`ReferenceMemberType`](crate::ReferenceMemberType)
+    /// extension, whose projections are required to agree with this predicate.
     #[inline]
     fn is_reference(&self) -> bool {
         false
-    }
-
-    /// Returns the referent as another value of `Self` when this [`Type`] represents a reference and its
-    /// type universe also represents referent types directly, and returns [`None`] otherwise. For example, an
-    /// [`ArrayIrType::Reference`](crate::ArrayIrType::Reference) containing a [`ReferenceType`](crate::ReferenceType)
-    /// whose referent is an [`ArrayType`](crate::ArrayType) returns the corresponding
-    /// [`ArrayIrType::Array`](crate::ArrayIrType::Array). It does not return the contained `ArrayType` directly because
-    /// this function's return type is `Option<Self>`. This is a projection within a type universe, not the concrete
-    /// [`ReferenceType::referent`](crate::ReferenceType::referent) accessor of the same name. A concrete
-    /// `ReferenceType<T>` uses that inherent accessor to return `&T`. Its implementation of this function returns
-    /// [`None`] because `T` cannot generally be represented as another `ReferenceType<T>`. Consequently, [`None`]
-    /// means that no same-universe projection is available, not necessarily that this is not a reference type.
-    /// Use [`Self::is_reference`] instead to check if this is a reference type.
-    #[inline]
-    fn referent(&self) -> Option<Self> {
-        None
     }
 }
 

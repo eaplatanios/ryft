@@ -25,9 +25,9 @@ use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceEffect, ReferenceMemberType, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
     ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -265,44 +265,25 @@ where
     }
 }
 
-// Composite families select canonical operations; homogeneous families reject requests for reference state.
+// Composite array families select the canonical payload; the reference-free array and scalar universes have no
+// referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for O
+    ReferenceNewOperationProvider<ArrayIrType> for O
 {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
+    fn reference_new(_referent: &ArrayType) -> Result<Self, ProgramError> {
         Ok(ReferenceNewOperation::new().into())
     }
 }
 
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<ArrayType, ArrayType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<ArrayType, ArrayType>,
-        _input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference allocation".to_string(),
-        })
+impl<O: Operation<Type = ArrayType>> ReferenceNewOperationProvider<ArrayType> for O {
+    fn reference_new(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
     }
 }
 
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<DataType, DataType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<DataType, DataType>,
-        _input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference allocation".to_string(),
-        })
+impl<O: Operation<Type = DataType>> ReferenceNewOperationProvider<DataType> for O {
+    fn reference_new(referent: &NoReferent) -> Result<Self, ProgramError> {
+        match *referent {}
     }
 }
 
@@ -350,6 +331,23 @@ where
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
+//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
+//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
+//  implementation constrains its target to `Operation<Type = T>` instead.
+/// Selects the operation of an [`Operation`] family over the universe `T` that allocates a reference over a referent
+/// from an initial value of the referent's type, or reports that the family provides none. Reverse-mode
+/// differentiation allocates cotangent references through it. Refer to the [module documentation](super) for the
+/// shared provider contract, including how reference-free universes implement it.
+pub trait ReferenceNewOperationProvider<T: ReferenceMemberType>: Operation + Sized {
+    /// Returns this family's operation that allocates a reference over `referent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference allocation.
+    fn reference_new(referent: &T::Referent) -> Result<Self, ProgramError>;
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -369,7 +367,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, TypeIdentityPosition,
+        EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, ReferenceMemberType,
+        TypeIdentityPosition,
     };
 
     use super::*;
@@ -838,27 +837,18 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_new_operation_provider() {
-        // Composite array families construct the canonical reference allocation operation.
+    fn test_reference_new_provider() {
+        // Composite array families select the canonical reference allocation operation for an array referent.
         assert!(matches!(
-            TestIrOperation::provide(
-                ReferenceNewOperation::<ArrayIrType, ArrayIrType>::new(),
-                &[&ArrayIrType::Array(ArrayType::scalar(DataType::F32))],
-            ),
+            TestIrOperation::reference_new(&ArrayType::scalar(DataType::F32)),
             Ok(ArrayIrOperation::ReferenceNew(_)),
         ));
 
-        // Homogeneous array and scalar families satisfy the provider contract without supporting references.
-        assert!(matches!(
-            ArrayOperation::<Array>::provide(ReferenceNewOperation::<ArrayType, ArrayType>::new(), &[]),
-            Err(ProgramError::UnsupportedOperation { message, .. })
-                if message == "this operation family does not support reference allocation",
-        ));
-        assert!(matches!(
-            AddOperation::<DataType>::provide(ReferenceNewOperation::<DataType, DataType>::new(), &[]),
-            Err(ProgramError::UnsupportedOperation { message, .. })
-                if message == "this operation family does not support reference allocation",
-        ));
+        // Reference-free array and scalar families satisfy the provider contract without any runtime rejection, so
+        // the contract is checked at compile time only.
+        fn assert_provider<T: ReferenceMemberType, O: ReferenceNewOperationProvider<T>>() {}
+        assert_provider::<ArrayType, ArrayOperation<Array>>();
+        assert_provider::<DataType, AddOperation<DataType>>();
     }
 
     #[test]

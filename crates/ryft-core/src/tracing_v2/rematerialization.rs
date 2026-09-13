@@ -72,15 +72,15 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::{
-    AddOperation, DotOperation, LinearCallOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, TagOperation,
-    TransferToMemoryOperation, Zero,
+    AddOperation, DotOperation, LinearCallOperation, ReferenceAddUpdateOperationProvider,
+    ReferenceNewOperationProvider, TagOperation, TransferToMemoryOperation, Zero,
 };
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, EffectClass, EffectClasses, InstructionId, Operation, OperationFormatter, OperationProvider,
-    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
-    ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    Atom, AtomId, EffectClass, EffectClasses, InstructionId, Operation, OperationFormatter, OutputRegionProvenance,
+    Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot,
+    Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -2362,7 +2362,7 @@ where
 
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: Context<Type: DifferentiableType>,
+    D: Context<Type: DifferentiableType + ReferenceMemberType>,
     B: Fn(IT) -> Result<OT, ProgramError>,
     P: RematerializationPolicy<D::Type, <D as Domain>::Operation>,
     IT: Parameterized<DomainTracer<D>>,
@@ -2385,8 +2385,8 @@ where
         >,
     <D as Domain>::Operation: From<RematerializeOperation<<D as Domain>::Type>>
         + ResidualZeroProvider<D::Type, Operation = D::Operation>
-        + OperationProvider<D::Type, ReferenceNewOperation<D::Type, D::Type>, Operation = <D as Domain>::Operation>
-        + OperationProvider<D::Type, ReferenceAddUpdateOperation<D::Type, D::Type>, Operation = <D as Domain>::Operation>
+        + ReferenceNewOperationProvider<D::Type>
+        + ReferenceAddUpdateOperationProvider<D::Type>
         + From<AddOperation<D::Type>>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
         + DifferentiableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>
