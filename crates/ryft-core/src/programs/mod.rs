@@ -146,10 +146,10 @@ pub use references::{
     discharge_reference_free_operation, validate_reference_boundary,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,
-    Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
+    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena,
+    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionRole, RegionSlot,
 };
+pub(crate) use regions::{RegionReplayMappings, ReplayRegionDriver};
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed};

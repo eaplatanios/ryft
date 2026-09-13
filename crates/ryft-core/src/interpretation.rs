@@ -452,7 +452,72 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         // renaming applies to declared output types during validation; it does not equate unrelated dimensions
         // with equal names.
         let region_mappings = RegionReplayMappings::new();
-        let identity_renaming = RefCell::new(self.replay_identity_renaming(&inputs, !context.is_eager())?);
+        let identity_renaming = RefCell::new({
+            // Eager kernels materialize concrete shapes and keep the original boundary refinement facts. Only staging
+            // substitutes validated formal definitions and freshens constant-owned identities.
+            let mut renaming = TypeIdentityRenaming::new();
+            if !context.is_eager() {
+                let signature = self.type_identity_signature();
+                let mut input_definitions = Vec::new();
+                for input in self.input_ids() {
+                    input_definitions.extend(
+                        self.atoms()[input.index()]
+                            .r#type()
+                            .identities()
+                            .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
+                            .map(|(_, identity)| identity.clone()),
+                    );
+                }
+
+                if !input_definitions.is_empty() {
+                    // Complete boundary refinement has already succeeded. Dimension-valued inputs can carry a more
+                    // precise nominal definition, which subsequent staged array payloads must reference consistently
+                    // with those inputs. For example, a pullback declared to return `Array[n, 4]` may receive its
+                    // dimension residual as `n2`. Mapping the validated dimension input `n -> n2` makes the output
+                    // payload refer to that residual. Array shape references alone cannot establish such a mapping;
+                    // only definition positions participate.
+                    let declared = self.input_types();
+                    let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                    for (source, target) in V::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
+                        if source != target && input_definitions.contains(source) {
+                            renaming.insert(source.clone(), target.clone())?;
+                        }
+                    }
+                }
+
+                if !signature.internal_identities().is_empty() {
+                    // Two retained programs can lift the same literal into one destination. Its local definition must
+                    // be fresh for each replay, while identities belonging to input bindings retain their established
+                    // type-identity renaming. For example, replaying a primal and its pullback must not define the same
+                    // source dimension constant `2` twice in the destination. Each replay gets its own definition,
+                    // shared consistently by all its local uses.
+                    let mut unavailable = None;
+                    for atom in self.atoms() {
+                        if let Some(constant) = atom.as_constant() {
+                            for (position, identity) in constant.r#type().identities() {
+                                if position == TypeIdentityPosition::Definition
+                                    && signature.internal_identities().contains(identity)
+                                    && !renaming.replacements().iter().any(|(source, _)| source == identity)
+                                {
+                                    let unavailable = unavailable.get_or_insert_with(|| {
+                                        let mut identities = signature.identities().to_vec();
+                                        for input in &inputs {
+                                            identities.extend(
+                                                input.r#type().identities().map(|(_, identity)| identity.clone()),
+                                            );
+                                        }
+                                        identities
+                                    });
+                                    let target = renaming.insert_fresh(identity.clone(), unavailable)?;
+                                    unavailable.push(target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            renaming
+        });
 
         // A staged pullback can receive a dimension residual under a new identity. After validating the original
         // input signature, express its refinement facts under that type-identity renaming too: an exact extent of 8
@@ -531,7 +596,42 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                 let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
                     context.bind(operation, driver, inputs)
                 })?;
-                self.extend_replay_identity_renaming(instruction, &outputs, &mut identity_renaming.borrow_mut())?;
+
+                // Record fresh internal definitions before the next instruction uses their identities. Only definition
+                // positions owned by this region may extend the shared type-identity renaming; output references cannot
+                // introduce replacements. Formal input renaming was handled at entry, and reified input-owned
+                // dimensions use the instruction-local renaming above.
+                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                let internal_identities = self.type_identity_signature().internal_identities();
+                if internal_identities.is_empty() {
+                    return Ok(outputs);
+                }
+                let declared = instruction
+                    .outputs()
+                    .iter()
+                    .map(|id| self.atoms()[id.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let definitions = declared
+                    .iter()
+                    .flat_map(Type::identities)
+                    .filter(|(position, identity)| {
+                        *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
+                    })
+                    .map(|(_, identity)| identity.clone())
+                    .collect::<Vec<_>>();
+                if definitions.is_empty() {
+                    return Ok(outputs);
+                }
+                let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+                let output_renaming = V::Type::derive_identity_renaming(&declared, &actual)?;
+                let mut renaming = identity_renaming.borrow_mut();
+                for (source, target) in output_renaming.replacements() {
+                    if source != target && definitions.contains(source) {
+                        // An unchanged definition adds no type-identity replacement. A later read of that same source
+                        // dimension may refine its bounds and establish the first nontrivial replacement.
+                        renaming.insert(source.clone(), target.clone())?;
+                    }
+                }
                 Ok(outputs)
             },
         )?;
@@ -679,115 +779,6 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         }
 
         Ok(outputs)
-    }
-
-    /// Extends the [`TypeIdentityRenaming`] with replayed internal definitions. Output references cannot introduce
-    /// replacements; renaming formal input identities is handled separately when initializing replay after boundary
-    /// validation.
-    fn extend_replay_identity_renaming<R: Typed<Type = V::Type>>(
-        self,
-        instruction: &Instruction<O>,
-        outputs: &[R],
-        renaming: &mut TypeIdentityRenaming<<V::Type as Type>::Identity>,
-    ) -> Result<(), ProgramError> {
-        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-        let internal_identities = self.type_identity_signature().internal_identities();
-        if internal_identities.is_empty() {
-            return Ok(());
-        }
-        let declared = instruction
-            .outputs()
-            .iter()
-            .map(|id| self.atoms()[id.index()].r#type().into_owned())
-            .collect::<Vec<_>>();
-        let definitions = declared
-            .iter()
-            .flat_map(Type::identities)
-            .filter(|(position, identity)| {
-                *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
-            })
-            .map(|(_, identity)| identity.clone())
-            .collect::<Vec<_>>();
-        if definitions.is_empty() {
-            return Ok(());
-        }
-        let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-        let output_renaming = V::Type::derive_identity_renaming(&declared, &actual)?;
-        for (source, target) in output_renaming.replacements() {
-            if source != target && definitions.contains(source) {
-                // An unchanged definition adds no type-identity replacement. A later read of that same source
-                // dimension may refine its bounds and establish the first nontrivial replacement.
-                renaming.insert(source.clone(), target.clone())?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Builds a [`TypeIdentityRenaming`] from validated input definitions and fresh staging-local constant definitions.
-    fn replay_identity_renaming<RuntimeValue: Typed<Type = V::Type>>(
-        &self,
-        inputs: &[RuntimeValue],
-        staging: bool,
-    ) -> Result<TypeIdentityRenaming<<V::Type as Type>::Identity>, ProgramError> {
-        let signature = self.type_identity_signature();
-        let mut renaming = TypeIdentityRenaming::new();
-        if !staging {
-            // Eager kernels materialize concrete shapes and retain the original boundary refinement facts.
-            return Ok(renaming);
-        }
-        let mut input_definitions = Vec::new();
-        for input in self.input_ids() {
-            input_definitions.extend(
-                self.atoms()[input.index()]
-                    .r#type()
-                    .identities()
-                    .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
-                    .map(|(_, identity)| identity.clone()),
-            );
-        }
-        if !input_definitions.is_empty() {
-            // Complete boundary refinement has already succeeded. Dimension-valued inputs can carry a more precise
-            // nominal definition, which subsequent staged array payloads must reference consistently with those inputs.
-            // For example, a pullback declared to return Array[n, 4] may receive its dimension residual as `n2`.
-            // Mapping the validated dimension input `n -> n2` makes the output payload refer to that residual.
-            // Array shape references alone cannot establish such a mapping; only definition positions participate.
-            let declared = self.input_types();
-            let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            for (source, target) in V::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
-                if source != target && input_definitions.contains(source) {
-                    renaming.insert(source.clone(), target.clone())?;
-                }
-            }
-        }
-        if signature.internal_identities().is_empty() {
-            return Ok(renaming);
-        }
-        // Two retained programs can lift the same literal into one destination. Its local definition must be fresh
-        // for each replay, while identities belonging to input bindings retain their established type-identity renaming.
-        // For example, replaying a primal and its pullback must not define the same source dimension constant `2`
-        // twice in the destination. Each replay gets its own definition, shared consistently by all its local uses.
-        let mut unavailable = None;
-        for atom in self.atoms() {
-            if let Some(constant) = atom.as_constant() {
-                for (position, identity) in constant.r#type().identities() {
-                    if position == TypeIdentityPosition::Definition
-                        && signature.internal_identities().contains(identity)
-                        && !renaming.replacements().iter().any(|(source, _)| source == identity)
-                    {
-                        let unavailable = unavailable.get_or_insert_with(|| {
-                            let mut identities = signature.identities().to_vec();
-                            for input in inputs {
-                                identities.extend(input.r#type().identities().map(|(_, identity)| identity.clone()));
-                            }
-                            identities
-                        });
-                        let target = renaming.insert_fresh(identity.clone(), unavailable)?;
-                        unavailable.push(target);
-                    }
-                }
-            }
-        }
-        Ok(renaming)
     }
 }
 
