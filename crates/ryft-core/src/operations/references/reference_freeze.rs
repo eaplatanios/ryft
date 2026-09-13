@@ -231,6 +231,23 @@ where
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
+//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
+//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
+//  implementation constrains its target to `Operation<Type = T>` instead.
+/// Selects the operation of an [`Operation`] family over the universe `T` that consumes a reference over a referent
+/// and returns its final value, or reports that the family provides none. Reverse-mode differentiation freezes
+/// completed cotangent references through it. Refer to the [module documentation](super) for the shared provider
+/// contract, including how reference-free universes implement it.
+pub trait ReferenceFreezeOperationProvider<T: ReferenceMemberType>: Operation + Sized {
+    /// Returns this family's operation that freezes a reference over `referent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference freezing.
+    fn reference_freeze(referent: &T::Referent) -> Result<Self, ProgramError>;
+}
+
 // Composite array families select the canonical payload; the reference-free array and scalar universes have no
 // referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
@@ -325,23 +342,6 @@ where
         let domain = self.dispatch_domain();
         Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
-}
-
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
-//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
-//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
-//  implementation constrains its target to `Operation<Type = T>` instead.
-/// Selects the operation of an [`Operation`] family over the universe `T` that consumes a reference over a referent
-/// and returns its final value, or reports that the family provides none. Reverse-mode differentiation freezes
-/// completed cotangent references through it. Refer to the [module documentation](super) for the shared provider
-/// contract, including how reference-free universes implement it.
-pub trait ReferenceFreezeOperationProvider<T: ReferenceMemberType>: Operation + Sized {
-    /// Returns this family's operation that freezes a reference over `referent`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference freezing.
-    fn reference_freeze(referent: &T::Referent) -> Result<Self, ProgramError>;
 }
 
 #[cfg(test)]

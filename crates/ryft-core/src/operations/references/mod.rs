@@ -1,33 +1,34 @@
 //! Generic reference primitive operations and their value-level capabilities.
 //!
 //! Each child module owns one complete primitive, laid out as the type-indexed operation payload with its inference,
-//! effects, reference-discharge rewrite, and transform rules, then the provider implementations selecting it for the
-//! array type universes, then the value-level capability trait with its implementations for eager array values,
+//! effects, reference-discharge rewrite, and transform rules, then the provider trait and implementations selecting
+//! it for array type universes, then the value-level capability trait with its implementations for eager array values,
 //! projected values, and staged values of every transform, and finally its unit tests. This facade retains only
 //! machinery genuinely shared by multiple primitives and re-exports the established public operation surface.
 //!
 //! # Reference Operation Providers
 //!
-//! [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`] are the family-level
-//! selection surface through which reverse-mode differentiation allocates, accumulates into, and freezes cotangent
-//! references over a universe's referent family (i.e., [`ReferenceMemberType::Referent`]), and through which the
-//! [`ReferenceAddUpdate`] capability stages accumulation on tracers of arbitrary universes. Each constructor receives
-//! the borrowed referent that the reference in question is over and returns the family's operation for it, so a
-//! family selects on the referent instead of on a request marker and operand types. Selection is fallible because a
-//! family over a composite universe may legitimately provide no reference operations (e.g., a downstream value-only
-//! family over [`ArrayIrType`](crate::arrays::ArrayIrType)), and such a family reports
+//! [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`]
+//! select allocation, accumulation, and freezing operations over a universe's referent family
+//! ([`ReferenceMemberType::Referent`](crate::programs::ReferenceMemberType::Referent)). Each constructor receives
+//! the borrowed referent and returns the family's operation for it, so a family selects on the referent instead of
+//! on a request marker and input types. Selection
+//! is fallible because a family over a composite universe may provide no reference operations (e.g., a downstream
+//! value-only family over [`ArrayIrType`](crate::arrays::ArrayIrType)); such a family reports
 //! [`ProgramError::UnsupportedOperation`]. A universe whose referent family is [`NoReferent`](crate::NoReferent)
-//! implements the providers with `match *referent {}` bodies: no referent value exists, so the compiler proves the
-//! constructors unreachable and reference-free universes need no runtime rejection. Each family implements only the
-//! providers a bound actually demands; for example, the [`ReferenceAddUpdate`] capability requires only
-//! [`ReferenceAddUpdateOperationProvider`], while reverse mode requires all three.
+//! implements the providers with `match *referent {}` bodies: no referent value exists, so the constructors are
+//! unreachable and reference-free universes need no runtime rejection.
 //!
-//! The provider super-trait is a plain [`Operation`] rather than `Operation<Type = T>` because the current trait
-//! solver cannot discharge that projection equality at bound sites whose tracing context is built from the same
-//! operation family (E0284): the bound `C::Operation: ReferenceNewOperationProvider<C::Type>` would elaborate a second source
-//! for `<C::Operation as Operation>::Type` beside the one that [`Domain`] already states. Every bound site names the
-//! provider on a context's operation family, whose type the context already pins, and every implementation constrains
-//! its target to `Operation<Type = T>`, so the agreement holds wherever the traits are used.
+//! Each capability requires only the providers it uses. [`ReferenceAddUpdate`] needs only
+//! [`ReferenceAddUpdateOperationProvider`]. Reverse-mode transposition requires allocation and accumulation, while
+//! scalar gradient extraction additionally requires freezing to return the contents of its cotangent references.
+//!
+//! Implementors must ensure that the operation family's [`Operation::Type`] is `T`. The provider supertrait is a plain
+//! [`Operation`] rather than `Operation<Type = T>` because the current trait solver cannot discharge that projection
+//! equality at bound sites whose tracing context is built from the same operation family (E0284). For example,
+//! `C::Operation: ReferenceNewOperationProvider<C::Type>` would introduce a second source for the type equality that
+//! [`Domain`] already establishes. Context-based callers obtain the agreement from their context; other generic
+//! callers must require `Operation<Type = T>` explicitly.
 
 // TODO(eaplatanios): Review this module.
 

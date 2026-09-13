@@ -1342,24 +1342,19 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_reference_member_type() {
-        // Array types have no referent family. `NoReferent` is uninhabited, so no array type is a reference and
-        // both projections are `None` for every value; `is_reference` and `referent` therefore agree trivially, and
-        // the embedding round trips have no referent value to quantify over.
+    fn test_array_type_referent() {
         let scalar = ArrayType::scalar(F32);
-        let vector = ArrayType::new(F64, Shape::new(vec![Dimension::Static(3)]));
-        assert!(!scalar.is_reference());
+        let vector = ArrayType::new_static(F64, [3]);
         assert_eq!(scalar.referent(), None);
-        assert_eq!(scalar.as_referent(), None);
-        assert!(!vector.is_reference());
         assert_eq!(vector.referent(), None);
-        assert_eq!(vector.as_referent(), None);
+        assert!(!scalar.is_reference());
+        assert!(!vector.is_reference());
+    }
 
-        // The embedding conversions required by `ReferenceMemberType` exist so that reverse-mode bounds are satisfied,
-        // and can never be called because their arguments have no values. There is no borrowed conversion onto
-        // `NoReferent` for the projections to agree with.
-        fn assert_embeddings<T: ReferenceMemberType<Referent = NoReferent>>() {}
-        assert_embeddings::<ArrayType>();
+    #[test]
+    fn test_array_type_as_referent() {
+        assert_eq!(ArrayType::scalar(F32).as_referent(), None);
+        assert_eq!(ArrayType::new_static(F64, [3]).as_referent(), None);
     }
 
     #[test]

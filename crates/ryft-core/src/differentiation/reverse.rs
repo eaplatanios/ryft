@@ -279,10 +279,10 @@ impl<V: Typed> CotangentReferenceAccumulator<V> {
     }
 }
 
-impl<
-    V: Value<Type: DifferentiableType + ReferenceMemberType>,
-    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O> + ReferenceNewOperationProvider<V::Type>,
-> CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>
+impl<V: Value<Type: DifferentiableType + ReferenceMemberType>, O: Operation<Type = V::Type>>
+    CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>
+where
+    O: ResidualZeroProvider<V::Type, Operation = O> + ReferenceNewOperationProvider<V::Type>,
 {
     /// Returns this [`CotangentReferenceAccumulator`]'s cotangent reference, allocating it with a zero initial value
     /// first if it has not been allocated yet. The zero referent is materialized through the operation family's
@@ -312,7 +312,7 @@ impl<
             Self::Unallocated { cotangent_type } => {
                 let referent = cotangent_type.referent().ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
-                        "cannot allocate a cotangent reference of type {cotangent_type} \
+                        "cannot allocate a cotangent reference of type `{cotangent_type}` \
                          because it is not a reference type",
                     ),
                 })?;
@@ -2461,7 +2461,7 @@ impl<
                         let referent =
                             cotangent_type.as_referent().ok_or_else(|| ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "cannot store the cotangent of type {cotangent_type} of input {index} in a \
+                                    "cannot store the cotangent of type `{cotangent_type}` of input {index} in a \
                                      caller-owned reference because it is not a member of its universe's \
                                      referent family",
                                 ),
@@ -4198,7 +4198,8 @@ pub(crate) mod tests {
         assert!(matches!(
             accumulator.allocate_in(&context, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "cannot allocate a cotangent reference of type f32[] because it is not a reference type",
+                if message == "cannot allocate a cotangent reference of type `f32[]` \
+                               because it is not a reference type",
         ));
     }
 

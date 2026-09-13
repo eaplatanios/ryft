@@ -31,8 +31,8 @@
 //! ([`ReferenceNewOperation`] and its siblings) are wrapped by the family and interpret eagerly through the value-level
 //! capabilities implemented on [`RegisterValue`], and their generic differentiation, transposition, and batching rules
 //! apply at the eager context and at the staged contexts that transforms instantiate. The family selects allocation,
-//! accumulation, and freezing operations through [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and
-//! [`ReferenceFreezeOperationProvider`] over its register referent family.
+//! accumulation, and freezing operations through [`ReferenceNewOperationProvider`],
+//! [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`] over its register referent family.
 //! Generic transposition can therefore allocate cotangent references and use [`ReferenceAddUpdate`] on core-owned
 //! tracers without a downstream tracer implementation. `register.add_update` retains family-owned addition semantics;
 //! the other reference primitives reuse their generic transform rules. The gradient convenience boundary also uses
@@ -49,28 +49,32 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayIrType, ArrayType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation,
-    BatchableReferenceView, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy,
-    BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram, Context, CotangentAccumulator,
+    AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
+    BatchableOperation, BatchableReferenceView, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
+    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram, BroadcastOperation,
+    CompareOperation, ConstantOperation, Context, ConvertElementTypeOperation, CotangentAccumulator,
     CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses, Effects, ExternalReferenceBinding,
-    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation,
-    OperationProvider, OutputRegionProvenance, Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder,
-    Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
-    RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
-    ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary,
-    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider, ReferenceId,
-    ReferenceMemberType, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead,
-    ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
-    ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ResidualZeroProvider,
-    Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    Typed, Value, ValueId, Zero, ZeroOperation, batch, check_count, differentiate_at,
-    discharge_reference_free_operation, validate_reference_boundary,
+    DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses, Effects,
+    ExternalReferenceBinding, InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero,
+    MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
+    OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
+    ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
+    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge,
+    ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceFreezeOperationProvider, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
+    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
+    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
+    RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, Trace,
+    Tracer, TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, Typed, Value, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count,
+    differentiate_at, discharge_reference_free_operation, jvp_projected_operation, transpose_projected_operation,
+    validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -1433,7 +1437,7 @@ impl<C: Context<Type = RegisterIrType>> BatchingEntrypointPolicy<C> for Register
 }
 
 #[test]
-fn test_register_ir_type_reference_member_type() {
+fn test_register_ir_type_referent() {
     let register_member = RegisterIrType::from(RegisterType);
     let reference_member = RegisterIrType::from(ReferenceType::new(RegisterType));
 
@@ -1446,17 +1450,7 @@ fn test_register_ir_type_reference_member_type() {
     // L2: embedding a reference type and projecting it back yields exactly the referent it wraps.
     assert_eq!(reference_member.referent(), Some(&RegisterType));
 
-    // L3: embedding a referent and viewing it in the referent family yields it back, while the reference member is
-    // not a referent.
-    assert_eq!(register_member.as_referent(), Some(&RegisterType));
-    assert_eq!(reference_member.as_referent(), None);
-
-    // L4: the borrowed conversions succeed exactly where the projections do and agree with them.
-    assert_eq!(<&RegisterType>::try_from(&register_member), Ok(&RegisterType));
-    assert_eq!(
-        <&RegisterType>::try_from(&reference_member),
-        Err(TypeError::invalid("expected register type but got reference type")),
-    );
+    // L4: the borrowed reference conversion succeeds exactly where the projection does and agrees with it.
     assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member), Ok(&ReferenceType::new(RegisterType)),);
     assert_eq!(<&ReferenceType<RegisterType>>::try_from(&reference_member).unwrap().referent(), &RegisterType);
     assert_eq!(
@@ -1466,6 +1460,24 @@ fn test_register_ir_type_reference_member_type() {
 
     // L5 concerns universes whose referent family is `NoReferent`; this universe's referent family is `RegisterType`,
     // which is inhabited, so the law does not constrain it.
+}
+
+#[test]
+fn test_register_ir_type_as_referent() {
+    let register_member = RegisterIrType::from(RegisterType);
+    let reference_member = RegisterIrType::from(ReferenceType::new(RegisterType));
+
+    // L3: embedding a referent and viewing it in the referent family yields it back, while the reference member is
+    // not a referent.
+    assert_eq!(register_member.as_referent(), Some(&RegisterType));
+    assert_eq!(reference_member.as_referent(), None);
+
+    // L4: the borrowed referent conversion succeeds exactly where the projection does and agrees with it.
+    assert_eq!(<&RegisterType>::try_from(&register_member), Ok(&RegisterType));
+    assert_eq!(
+        <&RegisterType>::try_from(&reference_member),
+        Err(TypeError::invalid("expected register type but got reference type")),
+    );
 }
 
 #[test]
@@ -2487,25 +2499,85 @@ fn test_downstream_reference_universe_vjp_with_a_local_allocation() {
 fn test_downstream_reference_operation_providers_support_value_only_composite_families() {
     // A downstream family can use the core composite type without supporting reference operations. Owning the
     // providers on the operation family lets it opt into ordinary gradients without an orphan-rule conflict.
-    /// A downstream operation family whose only operation has no operands or results.
-    #[derive(Clone)]
-    struct ValueOnlyOperation;
+    /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(crate = "ryft_core", type = ArrayType, constant = Array, dispatch(differentiation, transposition))]
+    enum ValueOnlyArrayOperation {
+        Constant(ConstantOperation<Array>),
+        Zero(ZeroOperation<ArrayType>),
+        One(OneOperation<ArrayType>),
+        ZeroLike(ZeroLikeOperation<ArrayType>),
+        OneLike(OneLikeOperation<ArrayType>),
+        Neg(NegOperation<ArrayType>),
+        Add(AddOperation<ArrayType>),
+        Mul(MulOperation<ArrayType>),
+        ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+        Broadcast(BroadcastOperation),
+        Transpose(TransposeOperation),
+        Reshape(ReshapeOperation),
+        Reduce(ReduceOperation),
+        Reshard(ReshardOperation),
+        Compare(CompareOperation<ArrayType>),
+        Div(DivOperation<ArrayType>),
+    }
 
-    impl Operation for ValueOnlyOperation {
-        type Type = ArrayIrType;
+    /// A downstream composite family containing only constants and ordinary array operations.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(
+        crate = "ryft_core",
+        type = ArrayIrType,
+        constant = ArrayIrValue<Array>,
+        members(ArrayType),
+        dispatch(differentiation, transposition),
+    )]
+    enum ValueOnlyOperation {
+        Constant(ConstantOperation<ArrayIrValue<Array>>),
+        Zero(ZeroOperation<ArrayIrType>),
+        One(OneOperation<ArrayIrType>),
+        #[ryft(projected(ArrayType))]
+        Array(ValueOnlyArrayOperation),
+    }
 
-        fn name(&self) -> &'static str {
-            "value_only"
-        }
-
-        fn infer_output_types(
+    // The member rules stay entirely within ordinary arrays, so the standard projection adapters suffice.
+    impl<C> MemberDifferentiableOperation<C> for ValueOnlyArrayOperation
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Operation = ValueOnlyOperation,
+            >,
+        Self: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+    {
+        fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
-            input_types: &[ArrayIrType],
-            region_interfaces: &[RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<ArrayIrType>, TypeError> {
-            check_count!("input", input_types, 0, TypeError);
-            check_count!("region", region_interfaces, 0, TypeError);
-            Ok(Vec::new())
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            jvp_projected_operation(context, self, inputs)
+        }
+    }
+
+    impl MemberTransposableOperation<ArrayIrValue<Array>, ValueOnlyOperation> for ValueOnlyArrayOperation {
+        fn transpose_in_parent<D: TranspositionDriver<ArrayIrValue<Array>, ValueOnlyOperation>>(
+            &self,
+            context: &mut TranspositionContext<ArrayIrValue<Array>, ValueOnlyOperation>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
+            transpose_projected_operation(context, self, inputs, outputs, accumulators)
+        }
+    }
+
+    // This fixture uses static shapes, whose residual zeros need no runtime dimensions.
+    impl ResidualZeroProvider<ArrayIrType> for ValueOnlyOperation {}
+
+    impl From<AddOperation<ArrayIrType>> for ValueOnlyOperation {
+        fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+            Self::Array(ValueOnlyArrayOperation::Add(AddOperation::new()))
         }
     }
 
@@ -2519,6 +2591,14 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         }
     }
 
+    impl ReferenceAddUpdateOperationProvider<ArrayIrType> for ValueOnlyOperation {
+        fn reference_add_update(_referent: &ArrayType) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "this operation family does not support reference accumulation".to_string(),
+            })
+        }
+    }
+
     impl ReferenceFreezeOperationProvider<ArrayIrType> for ValueOnlyOperation {
         fn reference_freeze(_referent: &ArrayType) -> Result<Self, ProgramError> {
             Err(ProgramError::UnsupportedOperation {
@@ -2527,11 +2607,31 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         }
     }
 
+    let scalar_type = ArrayType::scalar(DataType::F32);
+    let primal = ArrayIrValue::Array(Array::from_elements(scalar_type.clone(), &[3.0_f32]).unwrap());
+    let context = EagerContext::<ArrayIrValue<Array>, ValueOnlyOperation>::new();
+    assert_eq!(
+        differentiate_at(primal).in_context(&context).value_and_gradient(|value| {
+            let operation = ValueOnlyOperation::Array(ValueOnlyArrayOperation::Add(AddOperation::new()));
+            let outputs = value.context().bind(operation, Vec::new(), &[value.clone(), value.clone()])?;
+            Ok::<_, ProgramError>(outputs.into_iter().next().unwrap())
+        }),
+        Ok((
+            ArrayIrValue::Array(Array::from_elements(scalar_type.clone(), &[6.0_f32]).unwrap()),
+            ArrayIrValue::Array(Array::from_elements(scalar_type, &[2.0_f32]).unwrap()),
+        )),
+    );
+
     // Unsupported constructors are fallible; ordinary gradients do not call them for value-only inputs.
     assert!(matches!(
         ValueOnlyOperation::reference_new(&ArrayType::scalar(DataType::F32)),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference allocation",
+    ));
+    assert!(matches!(
+        ValueOnlyOperation::reference_add_update(&ArrayType::scalar(DataType::F32)),
+        Err(ProgramError::UnsupportedOperation { message, .. })
+            if message == "this operation family does not support reference accumulation",
     ));
     assert!(matches!(
         ValueOnlyOperation::reference_freeze(&ArrayType::scalar(DataType::F32)),

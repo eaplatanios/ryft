@@ -256,6 +256,24 @@ where
     }
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
+//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
+//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
+//  implementation constrains its target to `Operation<Type = T>` instead.
+/// Selects the operation of an [`Operation`] family over the universe `T` that adds an update of the referent's type
+/// into a reference over that referent in program order, or reports that the family provides none. Reverse-mode
+/// differentiation accumulates cotangents through it, and the [`ReferenceAddUpdate`] capability stages accumulation
+/// on tracers through it. Refer to the [module documentation](super) for the shared provider contract, including how
+/// reference-free universes implement it.
+pub trait ReferenceAddUpdateOperationProvider<T: ReferenceMemberType>: Operation + Sized {
+    /// Returns this family's operation that adds an update into a reference over `referent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference accumulation.
+    fn reference_add_update(referent: &T::Referent) -> Result<Self, ProgramError>;
+}
+
 // Composite array families select the canonical payload; the reference-free array and scalar universes have no
 // referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
@@ -282,11 +300,11 @@ impl<O: Operation<Type = DataType>> ReferenceAddUpdateOperationProvider<DataType
 ///
 /// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a [`Context`]
 /// project the referent of their reference type through [`ReferenceMemberType::referent`] and use the context's
-/// operation family to select and bind the update operation through [`ReferenceAddUpdateOperationProvider`]; the selected
-/// operation may use a downstream payload, and a family without references may report unsupported construction. This
-/// capability alone is generic over type universes because reverse-mode differentiation accumulates cotangents
+/// operation family to select and bind the update operation through [`ReferenceAddUpdateOperationProvider`]. The
+/// selected operation may use a downstream payload, and a family without reference operations may reject construction.
+/// This capability alone is generic over type universes because reverse-mode differentiation accumulates cotangents
 /// through it on tracers of arbitrary universes; the other five reference capabilities are specific to
-/// [`ArrayIrType`](crate::arrays::ArrayIrType), because no core machinery needs them on arbitrary type universes.
+/// [`ArrayIrType`], because no core machinery needs them on arbitrary type universes.
 pub trait ReferenceAddUpdate<Update = Self>: Sized {
     /// Adds `update` to the stored value in program order.
     fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
@@ -333,24 +351,6 @@ where
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
         Ok(())
     }
-}
-
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
-//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
-//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
-//  implementation constrains its target to `Operation<Type = T>` instead.
-/// Selects the operation of an [`Operation`] family over the universe `T` that adds an update of the referent's type
-/// into a reference over that referent in program order, or reports that the family provides none. Reverse-mode
-/// differentiation accumulates cotangents through it, and the [`ReferenceAddUpdate`] capability stages accumulation
-/// on tracers through it. Refer to the [module documentation](super) for the shared provider contract, including how
-/// reference-free universes implement it.
-pub trait ReferenceAddUpdateOperationProvider<T: ReferenceMemberType>: Operation + Sized {
-    /// Returns this family's operation that adds an update into a reference over `referent`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference accumulation.
-    fn reference_add_update(referent: &T::Referent) -> Result<Self, ProgramError>;
 }
 
 #[cfg(test)]

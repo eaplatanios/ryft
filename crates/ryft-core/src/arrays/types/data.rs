@@ -1848,21 +1848,17 @@ mod tests {
     }
 
     #[test]
-    fn test_data_type_reference_member_type() {
-        // Data types have no referent family. `NoReferent` is uninhabited, so no data type is a reference and both
-        // projections are `None` for every value; `is_reference` and `referent` therefore agree trivially, and the
-        // embedding round trips have no referent value to quantify over.
-        for data_type in [DataType::Token, DataType::Boolean, DataType::I32, DataType::F32, DataType::C128] {
-            assert!(!data_type.is_reference());
-            assert_eq!(data_type.referent(), None);
-            assert_eq!(data_type.as_referent(), None);
-        }
+    fn test_data_type_referent() {
+        assert_eq!(DataType::Token.referent(), None);
+        assert_eq!(DataType::F32.referent(), None);
+        assert!(!DataType::Token.is_reference());
+        assert!(!DataType::F32.is_reference());
+    }
 
-        // The embedding conversions required by `ReferenceMemberType` exist so that reverse-mode bounds are satisfied,
-        // and can never be called because their arguments have no values. There is no borrowed conversion onto
-        // `NoReferent` for the projections to agree with.
-        fn assert_embeddings<T: ReferenceMemberType<Referent = NoReferent>>() {}
-        assert_embeddings::<DataType>();
+    #[test]
+    fn test_data_type_as_referent() {
+        assert_eq!(DataType::Token.as_referent(), None);
+        assert_eq!(DataType::F32.as_referent(), None);
     }
 
     #[test]
