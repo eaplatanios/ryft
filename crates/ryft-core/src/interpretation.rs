@@ -380,44 +380,265 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     ///
     ///   - `context`: [`Context`] that assigns meaning to constant lifting and instruction binding.
     ///   - `inputs`: Flat input values aligned with this region's input atoms.
+    #[inline]
     pub fn interpret_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         self,
         context: &C,
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Both direct region calls and structured Program calls arrive here with flat values.
-        // Check their count before validating types or binding instructions.
-        check_count!("input", inputs, self.input_ids().len(), ProgramError);
+        let mut interpretation = RegionInterpreter::new(self, context.clone(), inputs)?;
+        while !interpretation.is_complete() {
+            interpretation = interpretation.step()?;
+        }
+        interpretation.finish()
+    }
 
-        // Validate boundary identifiers before refinement handling indexes the atom table. Sealed regions normally
-        // guarantee these identifiers, but malformed internal state must still produce an error rather than a panic.
-        let input_ids = self.input_ids();
-        for input_id in input_ids {
-            if input_id.index() >= self.atoms().len() {
-                return Err(ProgramError::UnboundAtomId { id: *input_id });
+    /// Interprets/executes this borrowed [`RegionRef`]'s [`Instruction`]s using the caller-supplied value and error
+    /// semantics. This is the borrowed-[`Region`](crate::Region) counterpart of [`Program::interpret_with`]. It replays
+    /// the region directly from its source arena without first materializing a standalone [`Program`], while preserving
+    /// the same flat input, constant-lifting, instruction-dispatch, and output-gathering behavior.
+    #[inline]
+    pub fn interpret_with<
+        RuntimeValue: Clone,
+        Error: From<ProgramError>,
+        LiftFn: FnMut(AtomId, &V) -> Result<RuntimeValue, Error>,
+        InterpretFn: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,
+    >(
+        self,
+        inputs: Vec<RuntimeValue>,
+        lift_fn: LiftFn,
+        mut interpret_fn: InterpretFn,
+    ) -> Result<Vec<RuntimeValue>, Error> {
+        let mut interpretation = RegionInterpretationState::new(self, inputs, lift_fn)?;
+        while !interpretation.is_complete() {
+            interpretation = interpretation.step(&mut interpret_fn)?;
+        }
+        interpretation.finish().map_err(Into::into)
+    }
+}
+
+/// Resumable interpretation state for a borrowed [`Region`](crate::Region). This is the same atom environment and
+/// last-use transfer used by [`RegionRef::interpret_with`] and context-driven kernel scheduling. Constants are lifted
+/// once, and each successful step dispatches exactly one instruction. Consuming steps prevent reuse after a dispatcher
+/// failure has consumed operands or performed an effect.
+///
+/// [`RegionRef::interpret_with`] supplies constant lifting and instruction dispatch through functions that can use
+/// arbitrary runtime values and errors without a [`Context`]. [`RegionInterpreter`] wraps this state to add context
+/// binding and validation while sharing the same traversal and liveness rules.
+struct RegionInterpretationState<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue> {
+    /// Borrowed canonical source region and its attached region arena.
+    region: RegionRef<'r, V, O>,
+
+    /// Runtime atom values retained only while a future instruction or output needs them.
+    values: Vec<Option<RuntimeValue>>,
+
+    /// Number of unconsumed operand and region-output occurrences for each atom, indexed like [`Self::values`].
+    /// Each operand gathered by [`Self::step`] and each output gathered by [`Self::finish`] decrements its atom's
+    /// count. Repeated occurrences count separately. A value is cloned while later consumers remain and moved out
+    /// of `values` on its last use; instruction results with no consumers are not stored. Counting region outputs
+    /// keeps their values available after [`Self::next_instruction`] reaches the end of the instruction list.
+    remaining_uses: Vec<usize>,
+
+    /// Position of the next instruction in [`Self::region`]'s instruction list. It starts at zero and advances
+    /// after [`Self::step`] successfully dispatches one instruction, checks its output count, and stores its live
+    /// results in [`Self::values`]. Together with those values and [`Self::remaining_uses`], this position allows
+    /// execution to resume without replaying earlier instructions or their effects. Reaching the instruction count
+    /// makes [`Self::is_complete`] true; [`Self::finish`] must still gather the region's outputs.
+    next_instruction: usize,
+
+    /// Reusable buffer holding operands in the order required by the instruction selected by
+    /// [`Self::next_instruction`]. Each [`Self::step`] clears the previous contents, then fills this buffer from
+    /// [`Self::values`], cloning or moving each operand according to [`Self::remaining_uses`]. The dispatcher borrows
+    /// the resulting slice; its live results are stored back in `values`. Capacity is reserved for the largest
+    /// instruction's operand count so successive steps reuse the allocation. Operands remain here until the next
+    /// step clears them or this interpretation state is finished or dropped.
+    instruction_inputs: Vec<RuntimeValue>,
+}
+
+impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone>
+    RegionInterpretationState<'r, V, O, RuntimeValue>
+{
+    /// Creates a new [`RegionInterpretationState`] by checking flat input arity, recording atom uses, and lifting live
+    /// constants exactly once. Instruction dispatch has not started when this function returns. The caller supplies the
+    /// same value semantics as ordinary flat replay.
+    fn new<Error: From<ProgramError>, LiftFn: FnMut(AtomId, &V) -> Result<RuntimeValue, Error>>(
+        region: RegionRef<'r, V, O>,
+        inputs: Vec<RuntimeValue>,
+        mut lift_fn: LiftFn,
+    ) -> Result<Self, Error> {
+        let atoms = region.atoms();
+        let input_ids = region.input_ids();
+        let instructions = region.instructions();
+        let output_ids = region.output_ids();
+        check_count!("input", inputs, input_ids.len(), ProgramError);
+
+        // Count every future consumer of each atom, including final region outputs. These counts let us move each
+        // value out on its last use and clone it only when a later consumer still needs it.
+        let mut remaining_uses = vec![0usize; atoms.len()];
+        for instruction in instructions {
+            for input_id in instruction.inputs().iter().copied() {
+                let Some(remaining_uses) = remaining_uses.get_mut(input_id.index()) else {
+                    return Err(ProgramError::UnboundAtomId { id: input_id }.into());
+                };
+                *remaining_uses += 1;
+            }
+        }
+        for output_id in output_ids.iter().copied() {
+            let Some(remaining_uses) = remaining_uses.get_mut(output_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
+            };
+            *remaining_uses += 1;
+        }
+
+        // Store concrete input values in a sparse value table indexed by `AtomId`.
+        let mut values = vec![None; atoms.len()];
+        for (input_id, input) in input_ids.iter().copied().zip(inputs) {
+            let Some(slot) = values.get_mut(input_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
+            };
+            *slot = Some(input);
+        }
+
+        // Materialize literal constants that are live. Dead constants can remain unset because no instruction
+        // or region output will read them.
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            if remaining_uses[atom_index] == 0 {
+                continue;
+            }
+            if let Atom::Constant(value) = atom {
+                values[atom_index] = Some(lift_fn(AtomId::new(atom_index), value)?);
             }
         }
 
-        // Refinement errors that already carry structured cross-leaf or dimension details pass through unchanged.
-        // For an ordinary pairwise incompatibility, retain the established boundary diagnostic naming the
-        // first mismatched leaf and whether it occurred at the input or output boundary.
-        let contextualize_refinement_error =
-            |error: TypeError, ids: &[AtomId], actual: &[C::Value], position: &str| -> ProgramError {
-                if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
-                    for (id, actual) in ids.iter().zip(actual) {
-                        let declared = self.atoms()[id.index()].r#type();
-                        let actual = actual.r#type();
-                        if !declared.is_refined_by(actual.as_ref()) {
-                            return TypeError::invalid(format!(
-                                "encountered {position} type {actual} which is incompatible with the region's \
-                                 declared type {declared}",
-                            ))
-                            .into();
-                        }
-                    }
-                }
-                error.into()
+        let maximum_input_count = instructions.iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
+        Ok(Self {
+            region,
+            values,
+            remaining_uses,
+            next_instruction: 0,
+            instruction_inputs: Vec::with_capacity(maximum_input_count),
+        })
+    }
+
+    /// Returns whether every instruction has been dispatched successfully. Outputs still belong to this state until
+    /// [`Self::finish`] consumes it, including for a region with no instructions.
+    fn is_complete(&self) -> bool {
+        self.next_instruction == self.region.instructions().len()
+    }
+
+    /// Dispatches exactly one instruction with the supplied semantics and validates its output arity. This consumes
+    /// the state so an error cannot resume with operands already transferred or an effect already executed.
+    fn step<
+        Error: From<ProgramError>,
+        InterpretFn: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,
+    >(
+        mut self,
+        mut interpret_fn: InterpretFn,
+    ) -> Result<Self, Error> {
+        let instruction = self.region.instructions().get(self.next_instruction).ok_or_else(|| {
+            ProgramError::MalformedProgram("cannot step a completed region interpretation".to_owned())
+        })?;
+        self.instruction_inputs.clear();
+        for input_id in instruction.inputs().iter().copied() {
+            // Consume the appropriate input value for the current instruction. If this is the last consumer,
+            // move the value out of the table. Otherwise, clone it so later consumers can still read it.
+            let remaining_uses = self.remaining_uses.get_mut(input_id.index()).unwrap();
+            debug_assert!(*remaining_uses > 0);
+            *remaining_uses -= 1;
+            let value = self.values.get_mut(input_id.index()).unwrap();
+            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
+            self.instruction_inputs.push(value);
+        }
+
+        // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
+        let outputs = interpret_fn(instruction, self.instruction_inputs.as_slice())?;
+        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+
+        for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
+            let Some(value) = self.values.get_mut(output_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
             };
+
+            // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
+            if self.remaining_uses[output_id.index()] != 0 {
+                *value = Some(output);
+            }
+        }
+        self.next_instruction += 1;
+        Ok(self)
+    }
+
+    /// Gathers flat outputs using the ordinary last-use transfer rules. An incomplete state is rejected instead
+    /// of exposing intermediate results as completed program outputs.
+    fn finish(mut self) -> Result<Vec<RuntimeValue>, ProgramError> {
+        if !self.is_complete() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "cannot finish region interpretation with {} instructions remaining",
+                self.region.instructions().len() - self.next_instruction,
+            )));
+        }
+
+        // Gather the region outputs using the same last-use transfer logic that we used for instruction inputs.
+        let mut outputs = Vec::with_capacity(self.region.output_ids().len());
+        for output_id in self.region.output_ids().iter().copied() {
+            let remaining_uses = self.remaining_uses.get_mut(output_id.index()).unwrap();
+            debug_assert!(*remaining_uses > 0);
+            *remaining_uses -= 1;
+            let value = self.values.get_mut(output_id.index()).unwrap();
+            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
+            outputs.push(value);
+        }
+
+        Ok(outputs)
+    }
+}
+
+/// Resumable context-driven interpreter with the same boundary refinements, provenance, identity renaming, and
+/// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps [`RegionInterpretationState`] to retain
+/// context-specific validation and binding between steps. Each step completes one outer instruction; an attached
+/// region executes through the context's ordinary operation rule within that step.
+pub(crate) struct RegionInterpreter<'r, C: Context> {
+    /// Canonical source region, retained for type and identity validation.
+    region: RegionRef<'r, C::Constant, C::Operation>,
+
+    /// Context assigning meaning to each constant and operation.
+    context: C,
+
+    /// Shared low-level atom environment and liveness state.
+    state: RegionInterpretationState<'r, C::Constant, C::Operation, C::Value>,
+
+    /// Refinements expressed under the replay's current input identities.
+    refinements: <C::Type as Type>::Refinements,
+
+    /// Original input facts used to check reified boundary dimensions.
+    input_refinements: <C::Type as Type>::Refinements,
+
+    /// Renaming extended by each replayed internal dimension definition.
+    identity_renaming: RefCell<TypeIdentityRenaming<<C::Type as Type>::Identity>>,
+
+    /// One shared source-arena mapping for all attached regions in this replay.
+    region_mappings: RegionReplayMappings<C::Constant, C::Operation>,
+}
+
+impl<'r, C: Context> RegionInterpreter<'r, C> {
+    /// Validates flat inputs and establishes the ordinary context replay state before dispatching instructions.
+    pub(crate) fn new(
+        region: RegionRef<'r, C::Constant, C::Operation>,
+        context: C,
+        inputs: Vec<C::Value>,
+    ) -> Result<Self, ProgramError> {
+        // Both direct region calls and structured Program calls arrive here with flat values.
+        // Check their count before validating types or binding instructions.
+        check_count!("input", inputs, region.input_ids().len(), ProgramError);
+
+        // Validate boundary identifiers before refinement handling indexes the atom table. Sealed regions normally
+        // guarantee these identifiers, but malformed internal state must still produce an error rather than a panic.
+        let input_ids = region.input_ids();
+        for input_id in input_ids {
+            if input_id.index() >= region.atoms().len() {
+                return Err(ProgramError::UnboundAtomId { id: *input_id });
+            }
+        }
 
         // Equal boundary types carry no additional refinement facts, so avoid constructing a refinement environment
         // in the common staging/replay case. More precise actual types (e.g., a static extent supplied for a dynamic
@@ -426,15 +647,15 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             && input_ids
                 .iter()
                 .zip(&inputs)
-                .all(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
+                .all(|(id, actual)| region.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
         {
-            <V::Type as Type>::Refinements::default()
+            <C::Type as Type>::Refinements::default()
         } else {
-            <V::Type as Type>::Refinements::establish(
-                input_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+            <C::Type as Type>::Refinements::establish(
+                input_ids.iter().map(|id| region.atoms()[id.index()].r#type()),
                 inputs.iter().map(Typed::r#type),
             )
-            .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
+            .map_err(|error| Self::contextualize_refinement_error(region, error, input_ids, &inputs, "input"))?
         };
 
         // Replay through the context's lift/bind protocol. All instructions share one region mapping scope so that
@@ -457,11 +678,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             // substitutes validated formal definitions and freshens constant-owned identities.
             let mut renaming = TypeIdentityRenaming::new();
             if !context.is_eager() {
-                let signature = self.type_identity_signature();
+                let signature = region.type_identity_signature();
                 let mut input_definitions = Vec::new();
-                for input in self.input_ids() {
+                for input in region.input_ids() {
                     input_definitions.extend(
-                        self.atoms()[input.index()]
+                        region.atoms()[input.index()]
                             .r#type()
                             .identities()
                             .filter(|(position, _)| *position == TypeIdentityPosition::Definition)
@@ -476,9 +697,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                     // dimension residual as `n2`. Mapping the validated dimension input `n -> n2` makes the output
                     // payload refer to that residual. Array shape references alone cannot establish such a mapping;
                     // only definition positions participate.
-                    let declared = self.input_types();
+                    let declared = region.input_types();
                     let actual = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    for (source, target) in V::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
+                    for (source, target) in C::Type::derive_identity_renaming(&declared, &actual)?.replacements() {
                         if source != target && input_definitions.contains(source) {
                             renaming.insert(source.clone(), target.clone())?;
                         }
@@ -492,7 +713,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                     // source dimension constant `2` twice in the destination. Each replay gets its own definition,
                     // shared consistently by all its local uses.
                     let mut unavailable = None;
-                    for atom in self.atoms() {
+                    for atom in region.atoms() {
                         if let Some(constant) = atom.as_constant() {
                             for (position, identity) in constant.r#type().identities() {
                                 if position == TypeIdentityPosition::Definition
@@ -528,140 +749,163 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         } else {
             let declared = input_ids
                 .iter()
-                .map(|id| self.atoms()[id.index()].r#type().rename_identities(&identity_renaming.borrow()))
+                .map(|id| region.atoms()[id.index()].r#type().rename_identities(&identity_renaming.borrow()))
                 .collect::<Result<Vec<_>, _>>()?;
-            <V::Type as Type>::Refinements::establish(declared.iter(), inputs.iter().map(Typed::r#type))?
+            <C::Type as Type>::Refinements::establish(declared.iter(), inputs.iter().map(Typed::r#type))?
         };
-        let outputs = self.interpret_with(
-            inputs,
-            |_, constant| context.lift(constant.rename_type_identities(&identity_renaming.borrow())?),
-            |instruction, inputs| {
-                // Both closures share the type-identity renaming through a `RefCell`. The operation and driver own
-                // their renamed metadata, so release this read borrow before binding and recording fresh output
-                // identities. Leaving its guard alive would make the later mutable borrow fail even after its final
-                // read.
-                let (operation, driver) = {
-                    let mut renaming = identity_renaming.borrow().clone();
-                    let reified_inputs = instruction
-                        .inputs()
-                        .iter()
-                        .zip(inputs)
-                        .filter_map(|(id, actual)| {
-                            let declared = self.atoms()[id.index()].r#type().into_owned();
-                            let reified = declared.identities().any(|(position, identity)| {
-                                position == TypeIdentityPosition::Definition
-                                    && !self.type_identity_signature().internal_identities().contains(&identity)
-                            });
-                            reified.then(|| (declared, actual.r#type().into_owned()))
-                        })
-                        .collect::<Vec<_>>();
-                    if !reified_inputs.is_empty() {
-                        // An input array can establish q without carrying its first-class dimension value.
-                        // Replaying `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh
-                        // exact dimension. Use that explicit operand's identity for this constructor and its regions.
-                        // Keep this local as a second `dimension_size` may reify the same `q` under another fresh
-                        // identity, and so globally renaming `q` would incorrectly make those two instructions define
-                        // one identity. Original boundary facts still require every reification of `q` to have the
-                        // same extent.
-                        input_refinements.validate(
-                            reified_inputs.iter().map(|(declared, _)| declared),
-                            reified_inputs.iter().map(|(_, actual)| actual),
-                            self.type_identity_signature().identities(),
-                        )?;
-                        let local = V::Type::derive_identity_renaming(
-                            &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
-                            &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
-                        )?;
-                        let mut combined = TypeIdentityRenaming::new();
-                        for (source, target) in renaming.replacements() {
-                            if !local.replacements().iter().any(|(local_source, _)| local_source == source) {
-                                combined.insert(source.clone(), target.clone())?;
-                            }
-                        }
-                        for (source, target) in local.replacements() {
+        let state = RegionInterpretationState::new(region, inputs, |_, constant| {
+            context.lift(constant.rename_type_identities(&identity_renaming.borrow())?)
+        })?;
+        Ok(Self { region, context, state, refinements, input_refinements, identity_renaming, region_mappings })
+    }
+
+    /// Returns the context retained by this replay, for diagnostics and context-owned invocation state.
+    pub(crate) fn context(&self) -> &C {
+        &self.context
+    }
+
+    /// Returns whether every outer instruction has completed successfully.
+    fn is_complete(&self) -> bool {
+        self.state.is_complete()
+    }
+
+    /// Executes one outer instruction through ordinary context binding, retaining refinement and driver state.
+    /// Failure consumes this invocation so partially executed effects cannot be retried through the same state.
+    pub(crate) fn step(self) -> Result<Self, ProgramError> {
+        let Self { region, context, state, refinements, input_refinements, identity_renaming, region_mappings } = self;
+        let state = state.step::<ProgramError, _>(|instruction, inputs| {
+            // Constant lifting and instruction replay share this type-identity renaming. The operation and driver
+            // own their renamed metadata, so release the read borrow before binding and recording fresh output
+            // identities. Retaining its guard would make the later mutable borrow fail.
+            let (operation, driver) = {
+                let mut renaming = identity_renaming.borrow().clone();
+                let reified_inputs = instruction
+                    .inputs()
+                    .iter()
+                    .zip(inputs)
+                    .filter_map(|(id, actual)| {
+                        let declared = region.atoms()[id.index()].r#type().into_owned();
+                        let reified = declared.identities().any(|(position, identity)| {
+                            position == TypeIdentityPosition::Definition
+                                && !region.type_identity_signature().internal_identities().contains(&identity)
+                        });
+                        reified.then(|| (declared, actual.r#type().into_owned()))
+                    })
+                    .collect::<Vec<_>>();
+                if !reified_inputs.is_empty() {
+                    // An input array can establish q without carrying its first-class dimension value.
+                    // Replaying `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh
+                    // exact dimension. Use that explicit operand's identity for this constructor and its regions.
+                    // Keep this local as a second `dimension_size` may reify the same `q` under another fresh
+                    // identity, and so globally renaming `q` would incorrectly make those two instructions define
+                    // one identity. Original boundary facts still require every reification of `q` to have the
+                    // same extent.
+                    input_refinements.validate(
+                        reified_inputs.iter().map(|(declared, _)| declared),
+                        reified_inputs.iter().map(|(_, actual)| actual),
+                        region.type_identity_signature().identities(),
+                    )?;
+                    let local = C::Type::derive_identity_renaming(
+                        &reified_inputs.iter().map(|(declared, _)| declared.clone()).collect::<Vec<_>>(),
+                        &reified_inputs.iter().map(|(_, actual)| actual.clone()).collect::<Vec<_>>(),
+                    )?;
+                    let mut combined = TypeIdentityRenaming::new();
+                    for (source, target) in renaming.replacements() {
+                        if !local.replacements().iter().any(|(local_source, _)| local_source == source) {
                             combined.insert(source.clone(), target.clone())?;
                         }
-                        renaming = combined;
                     }
-                    let operation = instruction.operation().rename_type_identities(&renaming)?;
-                    let driver = ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?
-                        .with_type_identity_renaming(&renaming)?;
-                    (operation, driver)
-                };
-
-                // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
-                // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
-                // This also holds for unknown source provenance as preserving it exactly means that the replay must not
-                // absorb ambient transform scopes.
-                let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                    context.bind(operation, driver, inputs)
-                })?;
-
-                // Record fresh internal definitions before the next instruction uses their identities. Only definition
-                // positions owned by this region may extend the shared type-identity renaming; output references cannot
-                // introduce replacements. Formal input renaming was handled at entry, and reified input-owned
-                // dimensions use the instruction-local renaming above.
-                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-                let internal_identities = self.type_identity_signature().internal_identities();
-                if internal_identities.is_empty() {
-                    return Ok(outputs);
-                }
-                let declared = instruction
-                    .outputs()
-                    .iter()
-                    .map(|id| self.atoms()[id.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let definitions = declared
-                    .iter()
-                    .flat_map(Type::identities)
-                    .filter(|(position, identity)| {
-                        *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
-                    })
-                    .map(|(_, identity)| identity.clone())
-                    .collect::<Vec<_>>();
-                if definitions.is_empty() {
-                    return Ok(outputs);
-                }
-                let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-                let output_renaming = V::Type::derive_identity_renaming(&declared, &actual)?;
-                let mut renaming = identity_renaming.borrow_mut();
-                for (source, target) in output_renaming.replacements() {
-                    if source != target && definitions.contains(source) {
-                        // An unchanged definition adds no type-identity replacement. A later read of that same source
-                        // dimension may refine its bounds and establish the first nontrivial replacement.
-                        renaming.insert(source.clone(), target.clone())?;
+                    for (source, target) in local.replacements() {
+                        combined.insert(source.clone(), target.clone())?;
                     }
+                    renaming = combined;
                 }
-                Ok(outputs)
-            },
-        )?;
+                let operation = instruction.operation().rename_type_identities(&renaming)?;
+                let driver = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?
+                    .with_type_identity_renaming(&renaming)?;
+                (operation, driver)
+            };
 
+            // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
+            // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
+            // This also holds for unknown source provenance as preserving it exactly means that the replay must not
+            // absorb ambient transform scopes.
+            let outputs = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                context.bind(operation, driver, inputs)
+            })?;
+
+            // Record fresh internal definitions before the next instruction uses their identities. Only definition
+            // positions owned by this region may extend the shared type-identity renaming; output references cannot
+            // introduce replacements. Formal input renaming was handled at entry, and reified input-owned
+            // dimensions use the instruction-local renaming above.
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+            let internal_identities = region.type_identity_signature().internal_identities();
+            if internal_identities.is_empty() {
+                return Ok(outputs);
+            }
+            let declared = instruction
+                .outputs()
+                .iter()
+                .map(|id| region.atoms()[id.index()].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let definitions = declared
+                .iter()
+                .flat_map(Type::identities)
+                .filter(|(position, identity)| {
+                    *position == TypeIdentityPosition::Definition && internal_identities.contains(identity)
+                })
+                .map(|(_, identity)| identity.clone())
+                .collect::<Vec<_>>();
+            if definitions.is_empty() {
+                return Ok(outputs);
+            }
+            let actual = outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+            let output_renaming = C::Type::derive_identity_renaming(&declared, &actual)?;
+            let mut renaming = identity_renaming.borrow_mut();
+            for (source, target) in output_renaming.replacements() {
+                if source != target && definitions.contains(source) {
+                    // An unchanged definition adds no type-identity replacement. A later read of that same source
+                    // dimension may refine its bounds and establish the first nontrivial replacement.
+                    renaming.insert(source.clone(), target.clone())?;
+                }
+            }
+            Ok(outputs)
+        })?;
+        Ok(Self { region, context, state, refinements, input_refinements, identity_renaming, region_mappings })
+    }
+
+    /// Collects completed outputs and performs the ordinary output refinement and closed-identity checks.
+    pub(crate) fn finish(self) -> Result<Vec<C::Value>, ProgramError> {
         // Replayed values commonly retain the program's exact declared output types. Only a count difference or a more
         // precise output type requires validation. That validation reuses facts established from the inputs and permits
         // a previously unbound output identity only when it belongs to this program's closed identity signature
         // (established by the formal inputs or defined by an instruction inside it).
+        let Self { region, context: _context, state, refinements, identity_renaming, .. } = self;
+        let outputs = state.finish()?;
         let identity_renaming = identity_renaming.into_inner();
-        let output_ids = self.output_ids();
+        let output_ids = region.output_ids();
         if output_ids.len() != outputs.len()
             || output_ids
                 .iter()
                 .zip(&outputs)
-                .any(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
+                .any(|(id, actual)| region.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
         {
             if identity_renaming.is_identity() {
                 refinements
                     .validate(
-                        output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                        output_ids.iter().map(|id| region.atoms()[id.index()].r#type()),
                         outputs.iter().map(Typed::r#type),
-                        self.type_identity_signature().identities(),
+                        region.type_identity_signature().identities(),
                     )
-                    .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+                    .map_err(|error| {
+                        Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output")
+                    })?;
             } else {
                 let output_types = output_ids
                     .iter()
-                    .map(|id| self.atoms()[id.index()].r#type().rename_identities(&identity_renaming))
+                    .map(|id| region.atoms()[id.index()].r#type().rename_identities(&identity_renaming))
                     .collect::<Result<Vec<_>, _>>()?;
-                let closed_identities = self
+                let closed_identities = region
                     .type_identity_signature()
                     .identities()
                     .iter()
@@ -669,116 +913,37 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                     .collect::<Vec<_>>();
                 refinements
                     .validate(output_types.iter(), outputs.iter().map(Typed::r#type), &closed_identities)
-                    .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+                    .map_err(|error| {
+                        Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output")
+                    })?;
             }
         }
-
         Ok(outputs)
     }
 
-    /// Interprets/executes this borrowed [`RegionRef`]'s [`Instruction`]s using the caller-supplied value and error
-    /// semantics. This is the borrowed-[`Region`](crate::Region) counterpart of [`Program::interpret_with`]. It replays
-    /// the region directly from its source arena without first materializing a standalone [`Program`], while preserving
-    /// the same flat input, constant-lifting, instruction-dispatch, and output-gathering behavior.
-    pub fn interpret_with<
-        RuntimeValue: Clone,
-        Error: From<ProgramError>,
-        LiftFn: FnMut(AtomId, &V) -> Result<RuntimeValue, Error>,
-        InterpretFn: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,
-    >(
-        self,
-        inputs: Vec<RuntimeValue>,
-        mut lift_fn: LiftFn,
-        mut interpret_fn: InterpretFn,
-    ) -> Result<Vec<RuntimeValue>, Error> {
-        let atoms = self.atoms();
-        let input_ids = self.input_ids();
-        let instructions = self.instructions();
-        let output_ids = self.output_ids();
-        check_count!("input", inputs, input_ids.len(), ProgramError);
-
-        // Count every future consumer of each atom, including final region outputs. These counts let us move each
-        // value out on its last use and clone it only when a later consumer still needs it.
-        let mut remaining_uses = vec![0usize; atoms.len()];
-        for instruction in instructions {
-            for input_id in instruction.inputs().iter().copied() {
-                let Some(remaining_uses) = remaining_uses.get_mut(input_id.index()) else {
-                    return Err(ProgramError::UnboundAtomId { id: input_id }.into());
-                };
-                *remaining_uses += 1;
-            }
-        }
-        for output_id in output_ids.iter().copied() {
-            let Some(remaining_uses) = remaining_uses.get_mut(output_id.index()) else {
-                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
-            };
-            *remaining_uses += 1;
-        }
-
-        // Store concrete input values in a sparse value table indexed by `AtomId`.
-        let mut values = vec![None; atoms.len()];
-        for (input_id, input) in input_ids.iter().copied().zip(inputs) {
-            let Some(slot) = values.get_mut(input_id.index()) else {
-                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
-            };
-            *slot = Some(input);
-        }
-
-        // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
-        // region output will read them.
-        for (atom_index, atom) in atoms.iter().enumerate() {
-            if remaining_uses[atom_index] == 0 {
-                continue;
-            }
-            if let Atom::Constant(value) = atom {
-                values[atom_index] = Some(lift_fn(AtomId::new(atom_index), value)?);
-            }
-        }
-
-        // Replay instructions in region order, reusing one scratch input buffer to avoid per-instruction allocation.
-        let max_input_count = instructions.iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
-        let mut instruction_inputs = Vec::with_capacity(max_input_count);
-        for instruction in instructions {
-            instruction_inputs.clear();
-            for input_id in instruction.inputs().iter().copied() {
-                // Consume the appropriate input value for the current instruction. If this is the last consumer,
-                // move the value out of the table. Otherwise, clone it so later consumers can still read it.
-                let remaining_uses = remaining_uses.get_mut(input_id.index()).unwrap();
-                debug_assert!(*remaining_uses > 0);
-                *remaining_uses -= 1;
-                let value = values.get_mut(input_id.index()).unwrap();
-                let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-                instruction_inputs.push(value);
-            }
-
-            // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
-            let outputs = interpret_fn(instruction, instruction_inputs.as_slice())?;
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-
-            for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
-                let Some(value) = values.get_mut(output_id.index()) else {
-                    return Err(ProgramError::UnboundAtomId { id: output_id }.into());
-                };
-
-                // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
-                if remaining_uses[output_id.index()] != 0 {
-                    *value = Some(output);
+    /// Returns a [`ProgramError`] that retains structured refinement errors while adding the established input/output
+    /// boundary diagnostic to a pairwise type mismatch.
+    fn contextualize_refinement_error(
+        region: RegionRef<'r, C::Constant, C::Operation>,
+        error: TypeError,
+        ids: &[AtomId],
+        actual: &[C::Value],
+        position: &str,
+    ) -> ProgramError {
+        if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
+            for (id, actual) in ids.iter().zip(actual) {
+                let declared = region.atoms()[id.index()].r#type();
+                let actual = actual.r#type();
+                if !declared.is_refined_by(actual.as_ref()) {
+                    return TypeError::invalid(format!(
+                        "encountered {position} type {actual} which is incompatible with the region's \
+                         declared type {declared}",
+                    ))
+                    .into();
                 }
             }
         }
-
-        // Gather the region outputs using the same last-use transfer logic that we used for instruction inputs.
-        let mut outputs = Vec::with_capacity(output_ids.len());
-        for output_id in output_ids.iter().copied() {
-            let remaining_uses = remaining_uses.get_mut(output_id.index()).unwrap();
-            debug_assert!(*remaining_uses > 0);
-            *remaining_uses -= 1;
-            let value = values.get_mut(output_id.index()).unwrap();
-            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-            outputs.push(value);
-        }
-
-        Ok(outputs)
+        error.into()
     }
 }
 
@@ -861,6 +1026,17 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Two dependent operations with a shared final result for resumable last-use tests.
+    fn stepping_program() -> Program<Array, TestArrayOperation, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let constant = builder.add_constant(Array::scalar(3f32).unwrap());
+        builder.add_constant(Array::scalar(99f32).unwrap());
+        let sum = builder.add_instruction(AddOperation::new(), vec![], vec![input, constant], None).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), vec![], vec![sum], None).unwrap()[0];
+        builder.build(vec![output, output], vec![Placeholder], vec![Placeholder; 2]).unwrap()
+    }
 
     #[test]
     fn test_empty_region_driver_interpret_region() {
@@ -1526,6 +1702,190 @@ mod tests {
                 "encountered input type f64[] which is incompatible with the region's declared type f64[2]",
             )
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_region_interpretation_state_new() {
+        let program = stepping_program();
+        let mut lifted = 0;
+        let state = RegionInterpretationState::new(
+            program.entry_region_ref(),
+            vec![Array::scalar(2f32).unwrap()],
+            |_, value| {
+                lifted += 1;
+                Ok::<_, ProgramError>(value.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(lifted, 1);
+        assert_eq!(state.next_instruction, 0);
+        assert_eq!(state.remaining_uses[program.output_ids()[0].index()], 2);
+        assert!(matches!(
+            RegionInterpretationState::new(program.entry_region_ref(), Vec::<Array>::new(), |_, value| {
+                Ok::<_, ProgramError>(value.clone())
+            }),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_region_interpretation_state_is_complete() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let value = builder.add_constant(Array::scalar(3f32).unwrap());
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![], vec![Placeholder]).unwrap();
+        let state = RegionInterpretationState::new(program.entry_region_ref(), vec![], |_, value| {
+            Ok::<_, ProgramError>(value.clone())
+        })
+        .unwrap();
+        assert!(state.is_complete());
+        assert_eq!(state.finish(), Ok(vec![Array::scalar(3f32).unwrap()]));
+    }
+
+    #[test]
+    fn test_region_interpretation_state_step() {
+        let program = stepping_program();
+        let state = RegionInterpretationState::new(
+            program.entry_region_ref(),
+            vec![Array::scalar(2f32).unwrap()],
+            |_, value| Ok::<_, ProgramError>(value.clone()),
+        )
+        .unwrap();
+        let mut dispatched = Vec::new();
+        let mut dispatch = |instruction: &Instruction<TestArrayOperation>, inputs: &[Array]| {
+            dispatched.push(instruction.operation().name());
+            instruction.operation().interpret(&TestArrayContext::new(), &EmptyRegionDriver, inputs)
+        };
+        let state = state.step(&mut dispatch).unwrap();
+        assert!(!state.is_complete());
+        let state = state.step(&mut dispatch).unwrap();
+        assert!(state.is_complete());
+        assert_eq!(dispatched, vec!["add", "neg"]);
+        assert_eq!(state.finish(), Ok(vec![Array::scalar(-5f32).unwrap(), Array::scalar(-5f32).unwrap()]));
+    }
+
+    #[test]
+    fn test_region_interpretation_state_step_rejects_wrong_output_count() {
+        let program = stepping_program();
+        let state = RegionInterpretationState::new(
+            program.entry_region_ref(),
+            vec![Array::scalar(2f32).unwrap()],
+            |_, value| Ok::<_, ProgramError>(value.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.step(|_, _| Ok::<Vec<Array>, ProgramError>(vec![])),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        ));
+    }
+
+    #[test]
+    fn test_region_interpretation_state_finish() {
+        let program = stepping_program();
+        let state = RegionInterpretationState::new(
+            program.entry_region_ref(),
+            vec![Array::scalar(2f32).unwrap()],
+            |_, value| Ok::<_, ProgramError>(value.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            state.finish(),
+            Err(ProgramError::MalformedProgram(
+                "cannot finish region interpretation with 2 instructions remaining".to_owned(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_region_interpreter_new() {
+        let program = stepping_program();
+        let state = RegionInterpreter::new(
+            program.entry_region_ref(),
+            TestArrayContext::new(),
+            vec![Array::scalar(2f32).unwrap()],
+        )
+        .unwrap();
+        assert!(!state.is_complete());
+        assert!(matches!(
+            RegionInterpreter::new(program.entry_region_ref(), TestArrayContext::new(), vec![]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        let error = RegionInterpreter::new(
+            program.entry_region_ref(),
+            TestArrayContext::new(),
+            vec![Array::scalar(2i32).unwrap()],
+        );
+        assert!(matches!(error, Err(error) if error == ProgramError::from(TypeError::invalid(
+            "encountered input type i32[] which is incompatible with the region's declared type f32[]",
+        ))));
+    }
+
+    #[test]
+    fn test_region_interpreter_context() {
+        let program = stepping_program();
+        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F32));
+        let state = RegionInterpreter::new(program.entry_region_ref(), context.clone(), vec![input]).unwrap();
+        assert!(std::rc::Rc::ptr_eq(state.context().builder(), context.builder()));
+    }
+
+    #[test]
+    fn test_region_interpreter_is_complete() {
+        let program = stepping_program();
+        let mut state = RegionInterpreter::new(
+            program.entry_region_ref(),
+            TestArrayContext::new(),
+            vec![Array::scalar(2f32).unwrap()],
+        )
+        .unwrap();
+        assert!(!state.is_complete());
+        state = state.step().unwrap();
+        assert!(!state.is_complete());
+        state = state.step().unwrap();
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn test_region_interpreter_step() {
+        let program = stepping_program();
+        let context = TracingContext::<Array, TestArrayOperation>::new();
+        let input = context.input(ArrayType::scalar(DataType::F32));
+        let state = RegionInterpreter::new(program.entry_region_ref(), context.clone(), vec![input]).unwrap();
+        let state = state.step().unwrap();
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
+        let state = state.step().unwrap();
+        assert_eq!(context.builder().borrow().instructions().len(), 2);
+        let outputs = state.finish().unwrap();
+        assert_eq!(outputs[0].atom_id().unwrap(), outputs[1].atom_id().unwrap());
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+    }
+
+    #[test]
+    fn test_region_interpreter_finish() {
+        let program = stepping_program();
+        let state = RegionInterpreter::new(
+            program.entry_region_ref(),
+            TestArrayContext::new(),
+            vec![Array::scalar(2f32).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            state.finish(),
+            Err(ProgramError::MalformedProgram(
+                "cannot finish region interpretation with 2 instructions remaining".to_owned(),
+            )),
+        );
+        let state = RegionInterpreter::new(
+            program.entry_region_ref(),
+            TestArrayContext::new(),
+            vec![Array::scalar(2f32).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            state.step().unwrap().step().unwrap().finish(),
+            program
+                .entry_region_ref()
+                .interpret_in_context(&TestArrayContext::new(), vec![Array::scalar(2f32).unwrap()]),
         );
     }
 

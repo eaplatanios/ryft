@@ -46,7 +46,7 @@ use crate::arrays::{
 };
 use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
 use crate::interpretation::{
-    ContextRegionInterpretation, EagerInterpretationDriver, InterpretableOperation, InterpretationDriver,
+    EagerInterpretationDriver, InterpretableOperation, InterpretationDriver, RegionInterpreter,
 };
 use crate::kernels::calls::{KernelCallOperation, KernelDefinition};
 use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
@@ -503,7 +503,7 @@ impl KernelCallOperation {
                 pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
             };
             if order.is_some() {
-                scheduled.push(Some(ContextRegionInterpretation::new(body, qualified, windows)?));
+                scheduled.push(Some(RegionInterpreter::new(body, qualified, windows)?));
                 continue;
             }
             qualified.check_step(self.name())?;
