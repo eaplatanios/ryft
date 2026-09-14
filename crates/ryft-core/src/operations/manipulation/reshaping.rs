@@ -1,11 +1,15 @@
+//! Array reshaping with static shapes or explicit runtime dimensions. [`Reshape`] preserves logical row-major
+//! element order, with optional input permutation and output sharding, while [`DynamicReshape`] carries runtime
+//! extents as ordinary dimension inputs. Both capabilities share element-count and placement validation.
+
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionType, DimensionValue,
-    LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
+    DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -33,14 +37,11 @@ use crate::partial::{
 };
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
-
-/// Canonical operation name for [`ReshapeOperation`] and [`DynamicReshapeOperation`].
-pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 
 /// Logical element visitation order for [`Reshape::reshape_with_order`], independent of physical storage layout.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -155,21 +156,21 @@ impl ReshapeParameters {
         self.output_sharding.as_ref()
     }
 
-    /// Returns this operation with `dimensions` used to permute the input before reshaping.
+    /// Returns these parameters with `dimensions` used to permute the input before reshaping.
     #[inline]
     pub fn with_dimensions<P: Into<Permutation>>(mut self, dimensions: P) -> Self {
         self.dimensions = Some(dimensions.into());
         self
     }
 
-    /// Returns this operation with the requested output `sharding`.
+    /// Returns these parameters with the requested output `sharding`.
     #[inline]
     pub fn with_output_sharding(mut self, sharding: impl Into<Option<Sharding>>) -> Self {
         self.output_sharding = sharding.into();
         self
     }
 
-    /// Returns whether this operation leaves the input dimension order unchanged for an input of rank `rank`.
+    /// Returns whether these parameters leave the input dimension order unchanged for an input of rank `rank`.
     #[inline]
     fn has_identity_dimensions(&self, rank: usize) -> bool {
         self.dimensions
@@ -184,6 +185,9 @@ impl From<Shape> for ReshapeParameters {
         Self::new(shape)
     }
 }
+
+/// Canonical operation name for [`ReshapeOperation`] and [`DynamicReshapeOperation`].
+pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 
 /// [`Operation`] that reshapes its input array according to semantic [`ReshapeParameters`].
 ///
@@ -247,7 +251,7 @@ impl Operation for ReshapeOperation {
 
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self::new(ReshapeParameters {
             output_shape: self.parameters.output_shape().rename_type_identities(renaming),
@@ -409,11 +413,9 @@ impl_differentiable_operation! {
                     if let Some(dimensions) = operation.parameters().dimensions() {
                         cotangent = cotangent.transpose(dimensions.inverse()?)?;
                     }
-                    {
-                        let contribution = MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?);
-                        accumulators[0].accumulate(context, contribution)?;
-                        Ok(())
-                    }
+                    let contribution = MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?);
+                    accumulators[0].accumulate(context, contribution)?;
+                    Ok(())
                 }
                 MaybeZero::Zero(_) => Ok(()),
             }
@@ -421,39 +423,47 @@ impl_differentiable_operation! {
     },
 }
 
-/// Represents the ability to reshape an array without changing its element count or row-major element order.
+/// Reshapes an array without changing its element count, reading and writing elements in logical row-major order.
 ///
-/// `t.reshape(target_shape)` reinterprets `t`'s payload under the specified target [`Shape`]. The input and target
-/// shapes must have equal element counts, which the type system must be able to establish from the two shapes alone.
-/// Shape-polymorphic programs whose output extents are not recoverable from anonymous dynamic [`Dimension`] values
-/// stage [`DynamicReshapeOperation`] instead, which takes one explicit first-class dimension input per output axis
-/// and so expresses runtime shape arithmetic as ordinary graph values. When the input carries a [`Sharding`], singleton
-/// dimensions are ignored and contiguous split/merge groups redistribute compatible mesh axes over their output
-/// factors. Ambiguous dynamic, zero-sized, unconstrained, or non-contiguous placement changes require an explicit
-/// output sharding. A non-identity reshape preserves the input memory space and clears explicit physical layout
-/// metadata because the logical shape change does not determine a unique output storage layout.
+/// A [`Shape`] specifies the result dimensions; [`ReshapeParameters`] can additionally request a permutation of the
+/// input axes before reshaping and an explicit output [`Sharding`]. The final axis varies fastest, independently of
+/// physical storage layout. For example, reshaping a `[2, 3]` matrix to `[3, 2]` groups the same six elements into
+/// three consecutive pairs. An empty shape requests a scalar and therefore requires exactly one input element.
+/// Zero-sized arrays can be reshaped to any fully static shape whose element count is also zero.
+///
+/// The input and output element counts must be equal. An unchanged shape or a pure axis permutation can preserve
+/// existing dynamic identities through this capability. Other dynamic result shapes, and shape changes whose input
+/// element count is unknown, require [`DynamicReshape`], which takes one explicit dimension input per output axis.
+/// A statically zero axis proves a zero element count even when another input axis is dynamic. When the input carries
+/// sharding, singleton dimensions are ignored and contiguous split/merge groups redistribute compatible mesh axes over
+/// their output factors. Ambiguous dynamic, zero-sized, unconstrained, or non-contiguous placement changes require an
+/// explicit output sharding. A non-identity reshape preserves the input memory space and clears explicit physical
+/// layout metadata because the logical shape change does not determine a unique output storage layout.
+///
+/// [`Reshape`] fills the same role for [`ReshapeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
+/// their corresponding arithmetic [`Operation`]s.
 ///
 /// # Examples
 ///
-/// The following example shows how to use [`Reshape`] in practice:
-///
 /// ```rust
-/// # use ryft_core::operations::manipulation::Reshape;
-/// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::arrays::Array;
-/// # use ryft_core::arrays::{Shape, Dimension};
+/// # use ryft_core::{Array, ProgramError, Reshape, Shape};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Reshape a length-6 vector to a `[2, 3]` matrix while keeping the row-major payload unchanged.
-/// let x = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-/// let y = x.reshape(Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))?;
-/// assert_eq!(y.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+/// let output = input.reshape(Shape::new(vec![2.into(), 3.into()]))?;
+/// assert_eq!(output, Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Reshape: Sized {
     /// Reshapes `self` according to semantic `parameters`. A [`Shape`] converts directly into
     /// [`ReshapeParameters`], so ordinary calls remain `value.reshape(shape)`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `parameters`: Output shape and optional input permutation and output sharding. The permutation contains
+    ///     every input axis exactly once and is applied before reading elements in row-major order. The output shape
+    ///     must preserve the element count. When no sharding is requested, compatible input placement is inferred.
     fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError>;
 
     /// Reshapes with signed sizes, accepting one inferred `-1` dimension. Values are visited in row-major order;
@@ -853,8 +863,7 @@ impl_reference_dischargeable_operation!(@reference_free DynamicReshapeOperation)
 impl<C> InterpretableOperation<C> for DynamicReshapeOperation
 where
     C: Domain<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reshape>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Value: DynamicReshape,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -868,23 +877,11 @@ where
             ))
             .into());
         };
-        let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
-        let output_shape = Shape::new(
-            output_extents
-                .iter()
-                .cloned()
-                .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
-                .map(|result| result.map(|extent| Dimension::Static(extent.extent())))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let mut parameters = ReshapeParameters::new(output_shape);
-        if let Some(dimensions) = self.dimensions() {
-            parameters = parameters.with_dimensions(dimensions.clone());
-        }
-        if let Some(output_sharding) = self.output_sharding() {
-            parameters = parameters.with_output_sharding(output_sharding.clone());
-        }
-        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(input.reshape(parameters)?)])
+        Ok(vec![input.dynamic_reshape_with_parameters(
+            output_extents,
+            self.dimensions().cloned(),
+            self.output_sharding().cloned(),
+        )?])
     }
 }
 
@@ -935,7 +932,7 @@ where
         <&ArrayType>::try_from(&input.unbatched_type())?;
         if !input.ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
-                message: format!("dynamic {RESHAPE_OPERATION_NAME} does not support bounded ragged array inputs"),
+                message: format!("dynamic `{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
             });
         }
         for extent in output_extents {
@@ -1012,17 +1009,16 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let destinations = context;
         let context = destinations.primal();
-        let Some(_) = inputs.split_first() else {
+        if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
+        }
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_operation = self
             .clone()
             .with_input_types(&primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
         let mut primal_outputs = context.bind(primal_operation, Vec::new(), primal_inputs.as_slice())?;
         check_count!("output", primal_outputs, 1, ProgramError);
-        let primal = primal_outputs.remove(0);
-        let output_primal = primal;
+        let output_primal = primal_outputs.remove(0);
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
@@ -1114,15 +1110,15 @@ where
                             check_count!("output", outputs, 1, ProgramError);
                             let cotangent = outputs.remove(0);
                             let cotangent = if let Some(dimensions) = transpose_operation.dimensions() {
-                                transpose_context
-                                    .bind(
-                                        <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                            TransposeOperation::new(dimensions.inverse()?),
-                                        ),
-                                        Vec::new(),
-                                        std::slice::from_ref(&cotangent),
-                                    )?
-                                    .remove(0)
+                                let mut outputs = transpose_context.bind(
+                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                        TransposeOperation::new(dimensions.inverse()?),
+                                    ),
+                                    Vec::new(),
+                                    std::slice::from_ref(&cotangent),
+                                )?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                outputs.remove(0)
                             } else {
                                 cotangent
                             };
@@ -1191,6 +1187,11 @@ where
             Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
             None => input_cotangent_type.clone(),
         };
+        // No inverse geometry is needed when there is no live contribution. In particular, dynamic input extents
+        // must not force residual capture for a structural-zero cotangent or a nondifferentiable input.
+        if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
+            return Ok(());
+        }
         if permuted_input_cotangent_type
             .shape()
             .dimensions()
@@ -1227,10 +1228,10 @@ where
 /// Reshapes an array using one explicit first-class dimension value per output axis.
 ///
 /// This is the shape-polymorphic counterpart of [`Reshape`], which reads its complete output geometry from
-/// [`ReshapeParameters`]. Exact dimension values describe static axes and computed dimension values describe dynamic
-/// axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime shape arithmetic stays an ordinary graph
-/// computation instead of a type-level side condition; backend lowering chooses the appropriate static, bounded, or
-/// dynamic representation from the inferred result type.
+/// [`ReshapeParameters`]. Exact dimension types describe static axes, including those produced by arithmetic, while
+/// non-exact dimension types describe dynamic axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime
+/// shape arithmetic stays an ordinary graph computation instead of a type-level side condition; backend lowering
+/// chooses the appropriate static, bounded, or dynamic representation from the inferred result type.
 ///
 /// The output extents must multiply to the input element count, including when either shape contains a zero axis.
 /// When the input types cannot prove this equality, the operation retains an ordered runtime assertion even if its
@@ -1238,38 +1239,36 @@ where
 /// or a reshape whose input and output physical capacities cannot be represented by their runtime reshape support;
 /// equal logical element counts alone do not guarantee that every bounded shape can be compiled.
 ///
-/// Exact host sizes can use [`DynamicReshape::dynamic_reshape_to_sizes`]:
+/// # Examples
+///
+/// Exact host sizes can use [`Self::dynamic_reshape_to_sizes`]:
 ///
 /// ```rust
-/// use ryft_core::operations::manipulation::DynamicReshape;
-/// use ryft_core::{Array, ArrayIrValue};
+/// # use ryft_core::{Array, ArrayIrValue, DynamicReshape, ProgramError};
 ///
-/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
-/// let output = input.dynamic_reshape_to_sizes(&[2, 3]).unwrap();
-/// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()));
+/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?);
+/// let output = input.dynamic_reshape_to_sizes(&[2, 3])?;
+/// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?));
+/// # Ok::<(), ProgramError>(())
 /// ```
 ///
 /// Computed or input dimensions remain ordinary SSA inputs, which is what makes a runtime-derived output shape
 /// expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent is read off the input while
 /// its trailing extent is an exact lifted dimension. Extents derived by first-class dimension arithmetic work the
-/// same way, using the [`DimensionArithmetic`](crate::DimensionArithmetic) capability (e.g.,
+/// same way, using the [`DimensionArithmetic`] capability (e.g.,
 /// `rows.dimension_mul(&columns)?`) directly on the composite values.
 ///
 /// ```rust
-/// use ryft_core::operations::manipulation::DynamicReshape;
-/// use ryft_core::arrays::{
-///     ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape,
-/// };
-/// use ryft_core::{
-///     Array, ArrayIrOperation, ArrayIrValue, Context, DimensionSize, StagingContext, TracingContext, Typed,
-/// };
-///
-/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+/// # use ryft_core::{
+/// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Context, DataType, Dimension, DimensionBounds,
+/// #     DimensionSize, DimensionValue, DimensionVariable, DynamicReshape, ProgramError, Shape, StagingContext,
+/// #     TracingContext, Typed,
+/// # };
 ///
 /// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
 /// let input_type =
 ///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(6)]));
-/// let context = C::new();
+/// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let input = context.input(ArrayIrType::Array(input_type));
 /// let rows = input.dimension_size(0).unwrap();
 /// let columns = context.lift(DimensionValue::constant(2).unwrap().into()).unwrap();
@@ -1317,8 +1316,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     ///     exact extents rather than capacity bounds; inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayIrType>,
-        Self::DispatchDomain: DimensionConstant,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
     {
         let output_dimensions = output_sizes
             .iter()
@@ -1397,12 +1395,18 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
         // Concrete composite values resolve every explicit extent input to its runtime value, so the mixed reshape
         // executes as the ordinary member reshape of the fully resolved output shape.
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let mut refinements = ArrayTypeRefinements::default();
         let output_shape = Shape::new(
             output_dimensions
                 .iter()
                 .map(<Self as ValueProjection<DimensionType>>::projected)
-                .map(|result| result.map(|dimension| Dimension::Static(dimension.extent())))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|result| {
+                    let dimension = result?;
+                    // Repeated identities describe one extent, even when separate eager values supply them.
+                    refinements.bind(dimension.r#type().variable(), dimension.extent())?;
+                    Ok(Dimension::Static(dimension.extent()))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?,
         );
         let mut parameters = ReshapeParameters::new(output_shape);
         if let Some(dimensions) = dimensions {
@@ -1816,8 +1820,9 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
+        DimensionOperation, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis,
+        Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::{
@@ -1831,6 +1836,64 @@ mod tests {
     use crate::tracing::Trace;
 
     use super::*;
+
+    #[test]
+    fn test_reshape_parameters_from_sizes() {
+        let input = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[3, -1]),
+            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))),
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[6]),
+            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)]))),
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[2, -1]),
+            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(0)]))),
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&Shape::new(Vec::new()), &[]),
+            Ok(ReshapeParameters::new(Shape::new(Vec::new()))),
+        );
+    }
+
+    #[test]
+    fn test_reshape_parameters_from_sizes_invalid_dimensions() {
+        let input = Shape::new(vec![Dimension::Static(6)]);
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[-1, -1]),
+            Err(TypeError::invalid("`reshape` accepts at most one inferred `-1` dimension",))
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[-2]),
+            Err(TypeError::invalid("`reshape` dimensions must be nonnegative or the inferred size `-1`",))
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[4, -1]),
+            Err(TypeError::invalid("`reshape` inferred dimension does not divide the input element count",))
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[5]),
+            Err(TypeError::invalid("`reshape` output element count 5 differs from input element count 6",))
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&input, &[isize::MAX; 3]),
+            Err(TypeError::invalid("`reshape` output element count does not fit in `usize`",))
+        );
+        assert_eq!(
+            ReshapeParameters::from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[0, -1]),
+            Err(TypeError::invalid("cannot infer a `reshape` dimension when another output dimension is zero",))
+        );
+        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+            "size",
+            DimensionBounds::new(0, Some(9)).unwrap(),
+        ))]);
+        assert_eq!(
+            ReshapeParameters::from_sizes(&dynamic, &[-1]),
+            Err(TypeError::invalid("`reshape` size inference requires a known input element count",))
+        );
+    }
 
     #[test]
     fn test_reshape() {
@@ -2047,7 +2110,9 @@ mod tests {
                 .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0)).unwrap()])
                 .unwrap_err(),
             BatchingError::UnsupportedOperation {
-                message: "`reshape` with a dynamic mapped extent requires `DynamicReshape` and explicit result-dimension inputs".to_string(),
+                message: "`reshape` with a dynamic mapped extent requires `DynamicReshape` and explicit \
+                          result-dimension inputs"
+                    .to_string(),
             },
         );
     }
@@ -2118,16 +2183,229 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_reshape() {
-        // Flattening an existing dynamic vector preserves its nominal identity and placement.
+    fn test_reshape_reshape() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.reshape(Shape::new(vec![2.into(), 3.into()])),
+            ArrayType::new_static(DataType::F64, [6]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[6] .
+                let %1:f64[2, 3] = reshape [shape=[2, 3]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // An unchanged shape carries no instruction through context dispatch.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.reshape(input.r#type().shape().clone()),
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        )
+        .unwrap();
+        assert!(program.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_reshape_reshape_invalid_output_count() {
+        use crate::parameters::Parameter;
+        use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope};
+
+        /// Array wrapper that dispatches through a deliberately malformed context.
+        #[derive(Clone, Debug)]
+        struct DispatchArray {
+            array: Array,
+            output_count: usize,
+        }
+
+        impl Display for DispatchArray {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.array)
+            }
+        }
+
+        impl Parameter for DispatchArray {}
+
+        impl Typed for DispatchArray {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                self.array.r#type()
+            }
+        }
+
+        impl Value for DispatchArray {
+            type DispatchDomain = InvalidOutputContext;
+            type ExecutionDomain = InvalidOutputContext;
+
+            fn dispatch_domain(&self) -> Self::DispatchDomain {
+                InvalidOutputContext(self.output_count)
+            }
+
+            fn execution_domain(&self) -> Self::ExecutionDomain {
+                self.dispatch_domain()
+            }
+        }
+
+        /// Context that violates the reshape output arity while accepting otherwise valid inputs.
+        #[derive(Clone)]
+        struct InvalidOutputContext(usize);
+
+        impl Domain for InvalidOutputContext {
+            type Type = ArrayType;
+            type Value = DispatchArray;
+            type Constant = Array;
+            type Operation = ReshapeOperation;
+        }
+
+        impl Context for InvalidOutputContext {
+            fn lift(&self, array: Array) -> Result<DispatchArray, ProgramError> {
+                Ok(DispatchArray { array, output_count: self.0 })
+            }
+
+            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+                &self,
+                _operation: O,
+                _driver: D,
+                inputs: &[DispatchArray],
+            ) -> Result<Vec<DispatchArray>, ProgramError> {
+                Ok(vec![inputs[0].clone(); self.0])
+            }
+
+            fn is_eager(&self) -> bool {
+                true
+            }
+
+            fn provenance(&self) -> Provenance {
+                Provenance::unknown()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+                function()
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+                function()
+            }
+        }
+
+        let array = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[3_i32, 7]).unwrap();
+        let input = InvalidOutputContext(0).lift(array.clone()).unwrap();
+        assert!(matches!(
+            input.reshape(Shape::new(vec![2.into(), 1.into()])),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
+        ));
+        let input = InvalidOutputContext(2).lift(array).unwrap();
+        assert!(matches!(
+            input.reshape(Shape::new(vec![2.into(), 1.into()])),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_reshape_reshape_to_sizes() {
+        let input = Array::vector(vec![1i32, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(input.reshape_to_sizes(&[3, -1]), Array::matrix(3, 2, vec![1i32, 2, 3, 4, 5, 6]));
+        assert_eq!(Array::scalar(7i32).unwrap().reshape_to_sizes(&[-1]), Array::vector(vec![7i32]));
+    }
+
+    #[test]
+    fn test_reshape_reshape_with_order() {
+        let input = Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(
+            input.reshape_with_order(&[3, -1], ReshapeOrder::RowMajor),
+            Array::matrix(3, 2, vec![1i32, 2, 3, 4, 5, 6])
+        );
+        assert_eq!(
+            input.reshape_with_order(&[3, -1], ReshapeOrder::ColumnMajor),
+            Array::matrix(3, 2, vec![1i32, 5, 4, 3, 2, 6])
+        );
+        assert_eq!(
+            input.reshape_with_order(&[-1], ReshapeOrder::ColumnMajor),
+            Array::vector(vec![1i32, 4, 2, 5, 3, 6])
+        );
+        assert_eq!(
+            Array::scalar(7i32).unwrap().reshape_with_order(&[], ReshapeOrder::ColumnMajor),
+            Array::scalar(7i32)
+        );
+        assert_eq!(
+            Array::vector(Vec::<i32>::new()).unwrap().reshape_with_order(&[2, -1], ReshapeOrder::ColumnMajor),
+            Array::matrix(2, 0, Vec::<i32>::new())
+        );
+    }
+
+    #[test]
+    fn test_reshape_ravel() {
+        let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
+        assert_eq!(input.ravel(), Array::vector(vec![1i32, 2, 3, 4]));
+        assert_eq!(Array::scalar(7i32).unwrap().ravel(), Array::vector(vec![7i32]));
+        assert_eq!(Array::matrix(0, 2, Vec::<i32>::new()).unwrap().ravel(), Array::vector(Vec::<i32>::new()));
+
+        // An existing dynamic vector needs no new dimension identity or element-count proof.
         let vector = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         )
         .with_memory(Memory::Host { pinned: true });
         assert_eq!(vector.ravel(), Ok(vector.clone()));
-        assert_eq!(vector.flatten(), Ok(vector));
+    }
 
+    #[test]
+    fn test_reshape_flatten() {
+        let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
+        assert_eq!(input.flatten(), Array::vector(vec![1i32, 2, 3, 4]));
+
+        // An existing dynamic vector needs no new dimension identity or element-count proof.
+        let vector = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        )
+        .with_memory(Memory::Host { pinned: true });
+        assert_eq!(vector.flatten(), Ok(vector.clone()));
+    }
+
+    #[test]
+    fn test_reshape_expand_dims() {
+        let input = Array::vector(vec![1i32, 2]).unwrap();
+        assert_eq!(input.expand_dims(0), Array::matrix(1, 2, vec![1i32, 2]));
+        assert_eq!(input.expand_dims(-1), Array::matrix(2, 1, vec![1i32, 2]));
+        assert_eq!(Array::scalar(7i32).unwrap().expand_dims(-1), Array::vector(vec![7i32]));
+        assert!(matches!(
+            input.expand_dims(2),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "axis 2 is out of bounds for rank 2",
+        ));
+    }
+
+    #[test]
+    fn test_reshape_squeeze() {
+        let input = Array::matrix(2, 1, vec![1i32, 2]).unwrap();
+        assert_eq!(input.squeeze(-1), Array::vector(vec![1i32, 2]));
+        assert_eq!(input.squeeze(Vec::<usize>::new()), Ok(input.clone()));
+        assert!(matches!(
+            input.squeeze(0),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot squeeze axis 0 whose size is not one",
+        ));
+        assert!(matches!(
+            input.squeeze([1, -1]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "axes contain duplicate axis 1",
+        ));
+    }
+
+    #[test]
+    fn test_reshape_squeeze_all() {
+        let input = Array::matrix(1, 1, vec![7i32]).unwrap();
+        assert_eq!(input.squeeze_all(), Array::scalar(7i32));
+        let vector = Array::vector(vec![1i32, 2]).unwrap();
+        assert_eq!(vector.squeeze_all(), Ok(vector));
+    }
+
+    #[test]
+    fn test_array_type_reshape() {
         // Dynamic dimensions can only be reshaped without explicit dimension inputs when equality follows directly
         // from identical shapes carrying the same symbolic identities. Other runtime relationships require the mixed
         // reshape operation and its explicit result-dimension inputs.
@@ -2202,7 +2480,10 @@ mod tests {
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                 .with_memory(Memory::Host { pinned: true })),
         );
+    }
 
+    #[test]
+    fn test_array_type_reshape_sharding() {
         // Singleton insertion preserves the corresponding non-singleton dimension placement.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
@@ -2348,7 +2629,7 @@ mod tests {
                 .unwrap()),
         );
 
-        // A genuinely merged sharded dimension cannot preserve its placement either.
+        // A replicated outer factor separates the inner sharding into non-contiguous blocks after merging.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
             .with_sharding(
@@ -2513,27 +2794,6 @@ mod tests {
                 .with_sharding(zero_requested)
                 .unwrap()),
         );
-
-        // Lifting an explicit per-item sharding moves a manual mapped axis out of the varying set and onto the new
-        // physical batch dimension.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let per_item_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                .unwrap()
-                .with_varying_manual_axes(["x"])
-                .unwrap();
-        assert_eq!(
-            lift_output_sharding_for_leading_batch_axis(&per_item_sharding, ShardingDimension::sharded(["x"])),
-            Ok(Sharding::new(
-                mesh,
-                vec![
-                    ShardingDimension::sharded(["x"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::replicated(),
-                ],
-            )
-            .unwrap()),
-        );
     }
 
     #[test]
@@ -2542,7 +2802,11 @@ mod tests {
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
+        assert!(matches!(
+            matrix.reshape(Shape::new(vec![Dimension::Static(4)])),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`reshape` changes the number of elements",
+        ));
 
         // Reshaping preserves logical order independently of the input's physical placement.
         let input_type =
@@ -2551,234 +2815,6 @@ mod tests {
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.elements::<u16>(), Ok(vec![1, 2, 3, 4, 5, 6]));
         assert_eq!(reshaped.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
-    }
-
-    #[test]
-    fn test_reshape_parameters_from_sizes() {
-        let input = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[3, -1]),
-            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))),
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[6]),
-            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)]))),
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[2, -1]),
-            Ok(ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(0)]))),
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&Shape::new(Vec::new()), &[]),
-            Ok(ReshapeParameters::new(Shape::new(Vec::new()))),
-        );
-    }
-
-    #[test]
-    fn test_reshape_parameters_from_sizes_invalid_dimensions() {
-        let input = Shape::new(vec![Dimension::Static(6)]);
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[-1, -1]),
-            Err(TypeError::invalid("`reshape` accepts at most one inferred `-1` dimension",))
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[-2]),
-            Err(TypeError::invalid("`reshape` dimensions must be nonnegative or the inferred size `-1`",))
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[4, -1]),
-            Err(TypeError::invalid("`reshape` inferred dimension does not divide the input element count",))
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[5]),
-            Err(TypeError::invalid("`reshape` output element count 5 differs from input element count 6",))
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&input, &[isize::MAX; 3]),
-            Err(TypeError::invalid("`reshape` output element count does not fit in `usize`",))
-        );
-        assert_eq!(
-            ReshapeParameters::from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[0, -1]),
-            Err(TypeError::invalid("cannot infer a `reshape` dimension when another output dimension is zero",))
-        );
-        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
-            "size",
-            DimensionBounds::new(0, Some(9)).unwrap(),
-        ))]);
-        assert_eq!(
-            ReshapeParameters::from_sizes(&dynamic, &[-1]),
-            Err(TypeError::invalid("`reshape` size inference requires a known input element count",))
-        );
-    }
-
-    #[test]
-    fn test_array_reshape_to_sizes() {
-        let input = Array::vector(vec![1i32, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(input.reshape_to_sizes(&[3, -1]), Array::matrix(3, 2, vec![1i32, 2, 3, 4, 5, 6]));
-        assert_eq!(Array::scalar(7i32).unwrap().reshape_to_sizes(&[-1]), Array::vector(vec![7i32]));
-    }
-
-    #[test]
-    fn test_array_reshape_with_order() {
-        let input = Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(
-            input.reshape_with_order(&[3, -1], ReshapeOrder::RowMajor),
-            Array::matrix(3, 2, vec![1i32, 2, 3, 4, 5, 6])
-        );
-        assert_eq!(
-            input.reshape_with_order(&[3, -1], ReshapeOrder::ColumnMajor),
-            Array::matrix(3, 2, vec![1i32, 5, 4, 3, 2, 6])
-        );
-        assert_eq!(
-            input.reshape_with_order(&[-1], ReshapeOrder::ColumnMajor),
-            Array::vector(vec![1i32, 4, 2, 5, 3, 6])
-        );
-        assert_eq!(
-            Array::scalar(7i32).unwrap().reshape_with_order(&[], ReshapeOrder::ColumnMajor),
-            Array::scalar(7i32)
-        );
-        assert_eq!(
-            Array::vector(Vec::<i32>::new()).unwrap().reshape_with_order(&[2, -1], ReshapeOrder::ColumnMajor),
-            Array::matrix(2, 0, Vec::<i32>::new())
-        );
-    }
-
-    #[test]
-    fn test_array_ravel() {
-        let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
-        assert_eq!(input.ravel(), Array::vector(vec![1i32, 2, 3, 4]));
-        assert_eq!(Array::scalar(7i32).unwrap().ravel(), Array::vector(vec![7i32]));
-        assert_eq!(Array::matrix(0, 2, Vec::<i32>::new()).unwrap().ravel(), Array::vector(Vec::<i32>::new()));
-    }
-
-    #[test]
-    fn test_array_flatten() {
-        let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
-        assert_eq!(input.flatten(), Array::vector(vec![1i32, 2, 3, 4]));
-    }
-
-    #[test]
-    fn test_array_expand_dims() {
-        let input = Array::vector(vec![1i32, 2]).unwrap();
-        assert_eq!(input.expand_dims(0), Array::matrix(1, 2, vec![1i32, 2]));
-        assert_eq!(input.expand_dims(-1), Array::matrix(2, 1, vec![1i32, 2]));
-        assert_eq!(Array::scalar(7i32).unwrap().expand_dims(-1), Array::vector(vec![7i32]));
-        assert_eq!(input.expand_dims(2).unwrap_err().to_string(), "axis 2 is out of bounds for rank 2");
-    }
-
-    #[test]
-    fn test_array_squeeze() {
-        let input = Array::matrix(2, 1, vec![1i32, 2]).unwrap();
-        assert_eq!(input.squeeze(-1), Array::vector(vec![1i32, 2]));
-        assert_eq!(input.squeeze(Vec::<usize>::new()), Ok(input.clone()));
-        assert!(
-            matches!(input.squeeze(0), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "cannot squeeze axis 0 whose size is not one")
-        );
-        assert_eq!(input.squeeze([1, -1]).unwrap_err().to_string(), "axes contain duplicate axis 1");
-    }
-
-    #[test]
-    fn test_array_squeeze_all() {
-        let input = Array::matrix(1, 1, vec![7i32]).unwrap();
-        assert_eq!(input.squeeze_all(), Array::scalar(7i32));
-        let vector = Array::vector(vec![1i32, 2]).unwrap();
-        assert_eq!(vector.squeeze_all(), Ok(vector));
-    }
-
-    #[test]
-    fn test_reshape_invalid_output_count() {
-        use crate::parameters::Parameter;
-        use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope};
-
-        /// Array wrapper that dispatches through a deliberately malformed context.
-        #[derive(Clone, Debug)]
-        struct DispatchArray {
-            array: Array,
-            output_count: usize,
-        }
-
-        impl Display for DispatchArray {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(formatter, "{}", self.array)
-            }
-        }
-
-        impl Parameter for DispatchArray {}
-
-        impl Typed for DispatchArray {
-            type Type = ArrayType;
-
-            fn r#type(&self) -> Cow<'_, ArrayType> {
-                self.array.r#type()
-            }
-        }
-
-        impl Value for DispatchArray {
-            type DispatchDomain = InvalidOutputContext;
-            type ExecutionDomain = InvalidOutputContext;
-
-            fn dispatch_domain(&self) -> Self::DispatchDomain {
-                InvalidOutputContext(self.output_count)
-            }
-
-            fn execution_domain(&self) -> Self::ExecutionDomain {
-                self.dispatch_domain()
-            }
-        }
-
-        /// Context that violates the reshape output arity while accepting otherwise valid inputs.
-        #[derive(Clone)]
-        struct InvalidOutputContext(usize);
-
-        impl Domain for InvalidOutputContext {
-            type Type = ArrayType;
-            type Value = DispatchArray;
-            type Constant = Array;
-            type Operation = ReshapeOperation;
-        }
-
-        impl Context for InvalidOutputContext {
-            fn lift(&self, array: Array) -> Result<DispatchArray, ProgramError> {
-                Ok(DispatchArray { array, output_count: self.0 })
-            }
-
-            fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
-                &self,
-                _operation: O,
-                _driver: D,
-                inputs: &[DispatchArray],
-            ) -> Result<Vec<DispatchArray>, ProgramError> {
-                Ok(vec![inputs[0].clone(); self.0])
-            }
-
-            fn is_eager(&self) -> bool {
-                true
-            }
-
-            fn provenance(&self) -> Provenance {
-                Provenance::unknown()
-            }
-
-            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
-                function()
-            }
-
-            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
-                function()
-            }
-        }
-
-        let array = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2]), &[3_i32, 7]).unwrap();
-        let input = InvalidOutputContext(0).lift(array.clone()).unwrap();
-        assert!(matches!(
-            input.reshape(Shape::new(vec![2.into(), 1.into()])),
-            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
-        ));
-        let input = InvalidOutputContext(2).lift(array).unwrap();
-        assert!(matches!(
-            input.reshape(Shape::new(vec![2.into(), 1.into()])),
-            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 2 })
-        ));
     }
 
     #[test]
@@ -2857,71 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_reshape_interpretation() {
-        // A concrete composite value resolves every explicit extent input and reshapes its array member directly.
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
-        let rows = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let columns = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        assert_eq!(
-            input.dynamic_reshape(&[rows, columns]).unwrap(),
-            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-        );
-        assert_eq!(input.dynamic_reshape_to_sizes(&[3, 2]).unwrap().r#type().to_string(), "f64[3, 2]");
-        assert_eq!(input.dynamic_reshape_to_sizes(&[6]).unwrap(), input);
-
-        // A staged reshape whose output shape is runtime-derived keeps each extent an ordinary input: the leading
-        // extent is read off the input and the trailing one is first-class dimension arithmetic.
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let input_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
-        );
-        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| {
-                // Dimension arithmetic is a composite capability, so the two static extents multiply directly.
-                let rows = input.dimension_size(0)?;
-                let columns = input.dimension_size(1)?.dimension_mul(&input.dimension_size(2)?)?;
-                input.dynamic_reshape(&[rows, columns])
-            },
-            ArrayIrType::Array(input_type),
-        )
-        .unwrap();
-        assert_eq!(output_type.to_string(), "f64[batch, 6]");
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[batch, 2, 3] .
-                let %1:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
-                    %2:dimension<2> = constant [value=2]
-                    %3:dimension<3> = constant [value=3]
-                    %4:dimension<6> = dimension_mul %2 %3
-                    %5:f64[batch, 6] = reshape [element_count_proven=true] %0 %1 %4
-                in (%5)
-            "}
-            .trim_end(),
-        );
-
-        // A static identity reshape is elided, so the only staged instruction is the dimension literal it received and
-        // never observed. Simplification drops that literal along with any other unused instruction.
-        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_reshape_to_sizes(&[6]),
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]))),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[6] .
-                let %1:dimension<6> = constant [value=6]
-                in (%0)
-            "}
-            .trim_end(),
-        );
-        assert!(program.into_simplified().unwrap().instructions().is_empty());
-    }
-
-    #[test]
-    fn test_dynamic_reshape_identity_instantiation() {
+    fn test_dynamic_reshape_type_inference_identity_instantiation() {
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
         let source_dimension_type = DimensionType::new(source.clone());
@@ -2985,6 +2957,63 @@ mod tests {
             &ArrayIrType::Array(ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(4)]),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_reshape_interpretation() {
+        // A concrete composite value resolves every explicit extent input and reshapes its array member directly.
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
+        let rows = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let columns = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            input.dynamic_reshape(&[rows.clone(), columns.clone()]).unwrap(),
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+        );
+
+        assert_eq!(
+            DynamicReshapeOperation::new().interpret(
+                &EagerContext::<ArrayIrValue<Array>>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), rows.clone(), columns.clone()],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())]),
+        );
+        assert!(matches!(
+            DynamicReshapeOperation::new().interpret(
+                &EagerContext::<ArrayIrValue<Array>>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`reshape` expects an array followed by its output extents",
+        ));
+
+        // Repeating a nominal dimension cannot describe two different extents, even if their product happens
+        // to match the input count. Check direct capability dispatch as well as operation interpretation.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let dimensions = [
+            ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 2).unwrap()),
+            ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
+        ];
+        assert_eq!(
+            input.dynamic_reshape(&dimensions),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "extent".to_owned(), expected: 2, actual: 3 }
+                    .into(),
+            )),
+        );
+        assert_eq!(
+            DynamicReshapeOperation::new().interpret(
+                &EagerContext::<ArrayIrValue<Array>>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), dimensions[0].clone(), dimensions[1].clone()],
+            ),
+            Err(ProgramError::Type(
+                DimensionError::InputDimensionMismatch { dimension: "extent".to_owned(), expected: 2, actual: 3 }
+                    .into(),
             )),
         );
     }
@@ -3126,15 +3155,10 @@ mod tests {
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap()),
             ]),
         );
+    }
 
-        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            pullback.interpret(vec![ArrayIrValue::Array(
-                Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()
-            )]),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]).unwrap())]),
-        );
-
+    #[test]
+    fn test_dynamic_reshape_differentiation_retains_input_extents() {
         // The inverse cannot recover `n` from the `[2, 2*n]` output shape without division. The reshape JVP must
         // therefore retain the original source extent as an explicit residual while it still has the source array.
         let source = DimensionVariable::new("source", DimensionBounds::new(0, Some(9)).unwrap());
@@ -3243,40 +3267,40 @@ mod tests {
         let rendered_tangent = linearization.tangent().to_string();
         assert_eq!(
             rendered_primal,
-            "
-lambda %0:f64[source, 4] .
-let %1:dimension<2> = const 2
-    %2:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
-    %3:dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
-    %4:f64[2, source * 2] = reshape %0 %1 %3
-    %5:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
-in (%4, %3, %5)
-            "
-            .trim(),
+            indoc! {"
+                lambda %0:f64[source, 4] .
+                let %1:dimension<2> = const 2
+                    %2:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %3:dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
+                    %4:f64[2, source * 2] = reshape %0 %1 %3
+                    %5:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
+                in (%4, %3, %5)
+            "}
+            .trim_end(),
         );
         assert_eq!(
             rendered_tangent,
-            "
-lambda %0:f64[source, 4], %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)> .
-let %3:dimension<2> = const 2
-    %4:f64[2, source * 2] = linear_call [residual_count=3] %3 %1 %2 %0 [
-        forward={
-            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)>, \
-%3:f64[source, 4] .
-            let %4:f64[2, source * 2] = reshape %3 %0 %1
-            in (%4)
-        },
-        transpose={
-            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, \
-%2:dimension<source ∈ [0, 9)>, %3:f64[2, source * 2] .
-            let %4:dimension<4> = constant [value=4]
-                %5:f64[source, 4] = reshape %3 %2 %4
-            in (%5)
-        },
-    ]
-in (%4)
-            "
-            .trim(),
+            indoc! {"
+                lambda %0:f64[source, 4], %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)> .
+                let %3:dimension<2> = const 2
+                    %4:f64[2, source * 2] = linear_call [residual_count=3] %3 %1 %2 %0 [
+                        forward={
+                            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)>, \
+                %3:f64[source, 4] .
+                            let %4:f64[2, source * 2] = reshape %3 %0 %1
+                            in (%4)
+                        },
+                        transpose={
+                            lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, \
+                %2:dimension<source ∈ [0, 9)>, %3:f64[2, source * 2] .
+                            let %4:dimension<4> = constant [value=4]
+                                %5:f64[source, 4] = reshape %3 %2 %4
+                            in (%5)
+                        },
+                    ]
+                in (%4)
+            "}
+            .trim_end(),
         );
         assert_eq!(linearization.tangent().input_types()[0], ArrayIrType::Array(input_type.tangent().unwrap()));
         assert!(
@@ -3374,8 +3398,24 @@ in (%4)
             )
             .unwrap();
         let linearization = program.linearize().unwrap();
-        assert!(!linearization.primal().to_string().contains("dimension_size"));
-        assert!(!linearization.tangent().to_string().contains("dimension_size"));
+        assert_eq!(
+            linearization
+                .primal()
+                .instructions()
+                .iter()
+                .filter(|instruction| { matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)) })
+                .count(),
+            0,
+        );
+        assert_eq!(
+            linearization
+                .tangent()
+                .instructions()
+                .iter()
+                .filter(|instruction| { matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)) })
+                .count(),
+            0,
+        );
     }
 
     #[test]
@@ -3630,6 +3670,132 @@ in (%4)
     }
 
     #[test]
+    fn test_dynamic_reshape_transposition() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)])).into());
+        let first_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let second_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, first_extent, second_extent], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![ArrayIrValue::Array(
+                Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],).unwrap()
+            )]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]).unwrap())]),
+        );
+
+        // Structural zeros need no inverse shape reconstruction, even with unresolved input extents.
+        let extent = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone()), 4.into()]));
+        let extent_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let output_type = input_type.clone();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let four = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap())).unwrap();
+        let mut rule_context = TranspositionContext::new(context);
+        let inputs = [
+            PartialValue::Unknown(ArrayIrType::Array(input_type.clone())),
+            PartialValue::Unknown(extent_type),
+            PartialValue::Known(four),
+        ];
+        let accumulators = rule_context.cotangent_accumulators(&inputs, &[]).unwrap();
+        DynamicReshapeOperation::new()
+            .transpose(
+                &mut rule_context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(output_type.cotangent().unwrap().into())],
+                &accumulators,
+            )
+            .unwrap();
+        let contributions = rule_context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(contributions.len(), 3);
+        assert!(contributions[0].is_zero());
+        assert_eq!(contributions[0].r#type().as_ref(), &ArrayIrType::Array(input_type.cotangent().unwrap()));
+        assert!(contributions[1].is_zero());
+        assert_eq!(contributions[1].r#type().as_ref(), &inputs[1].r#type().cotangent().unwrap());
+        assert!(contributions[2].is_zero());
+        assert_eq!(contributions[2].r#type().as_ref(), &inputs[2].r#type().cotangent().unwrap());
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_reshape() {
+        // A staged reshape whose output shape is runtime-derived keeps each extent an ordinary input: the leading
+        // extent is read off the input and the trailing one is first-class dimension arithmetic.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
+        );
+        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| {
+                // Dimension arithmetic is a composite capability, so the two static extents multiply directly.
+                let rows = input.dimension_size(0)?;
+                let columns = input.dimension_size(1)?.dimension_mul(&input.dimension_size(2)?)?;
+                input.dynamic_reshape(&[rows, columns])
+            },
+            ArrayIrType::Array(input_type),
+        )
+        .unwrap();
+        assert_eq!(output_type.to_string(), "f64[batch, 6]");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2, 3] .
+                let %1:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<3> = constant [value=3]
+                    %4:dimension<6> = dimension_mul %2 %3
+                    %5:f64[batch, 6] = reshape [element_count_proven=true] %0 %1 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        // A static identity reshape is elided, so the only staged instruction is the dimension literal it received and
+        // never observed. Simplification drops that literal along with any other unused instruction.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.dynamic_reshape_to_sizes(&[6]),
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[6] .
+                let %1:dimension<6> = constant [value=6]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+        assert!(program.into_simplified().unwrap().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_reshape_to_sizes() {
+        let input = ArrayIrValue::Array(Array::vector(vec![1_i32, 2, 3, 4, 5, 6]).unwrap());
+        assert_eq!(
+            input.dynamic_reshape_to_sizes(&[3, 2]),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![1_i32, 2, 3, 4, 5, 6]).unwrap())),
+        );
+        assert_eq!(input.dynamic_reshape_to_sizes(&[6]), Ok(input.clone()));
+        assert!(matches!(
+            input.dynamic_reshape_to_sizes(&[5]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`reshape` changes the number of elements",
+        ));
+    }
+
+    #[test]
     fn test_dynamic_reshape_dynamic_ravel() {
         let input = ArrayIrValue::Array(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -3656,48 +3822,87 @@ in (%4)
 
     #[test]
     fn test_dynamic_reshape_dynamic_flatten() {
-        check_symbolic_reshape_convenience(true);
+        // Trace each convenience once with a symbolic leading extent, then replay that same program at two
+        // sizes. This catches wrappers that accidentally bake a physical upper bound into the logical shape.
+        let dimension = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.dynamic_flatten(),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(dimension), Dimension::Static(4)]),
+            )),
+        )
+        .unwrap();
+        for size in [4, 5] {
+            let input = Array::from_elements(
+                ArrayType::new_static(DataType::F64, [size, 4]),
+                &(0..size * 4).map(|value| value as f64).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let output = program.interpret(ArrayIrValue::Array(input.clone())).unwrap();
+            let output = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(output).unwrap();
+            assert_eq!(output.to_f64s(), input.to_f64s());
+            assert_eq!(output.r#type().static_shape().unwrap().dimensions(), vec![size * 4]);
+        }
     }
 
     #[test]
     fn test_dynamic_reshape_dynamic_expand_dims() {
-        check_symbolic_reshape_convenience(false);
+        // Trace each convenience once with a symbolic leading extent, then replay that same program at two
+        // sizes. This catches wrappers that accidentally bake a physical upper bound into the logical shape.
+        let dimension = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.dynamic_expand_dims(0),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(dimension), Dimension::Static(4)]),
+            )),
+        )
+        .unwrap();
+        for size in [4, 5] {
+            let input = Array::from_elements(
+                ArrayType::new_static(DataType::F64, [size, 4]),
+                &(0..size * 4).map(|value| value as f64).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let output = program.interpret(ArrayIrValue::Array(input.clone())).unwrap();
+            let output = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(output).unwrap();
+            assert_eq!(output.to_f64s(), input.to_f64s());
+            assert_eq!(output.r#type().static_shape().unwrap().dimensions(), vec![1, size, 4]);
+        }
         let input = ArrayIrValue::Array(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap(),
         );
         assert_eq!(input.dynamic_expand_dims(-1).unwrap().r#type().to_string(), "f64[2, 3, 1]");
-        assert!(input.dynamic_expand_dims(4).is_err());
+        assert!(matches!(
+            input.dynamic_expand_dims(4),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "axis 4 is out of bounds for rank 3",
+        ));
     }
 
-    /// Checks retained symbolic specialization for the two shape-changing convenience compositions.
-    fn check_symbolic_reshape_convenience(flatten: bool) {
-        // Trace each convenience once with a symbolic leading extent, then replay that same program at two
-        // sizes. This catches wrappers that accidentally bake a physical upper bound into the logical shape.
-        {
-            let dimension = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
-            let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-                |input| if flatten { input.dynamic_flatten() } else { input.dynamic_expand_dims(0) },
-                ArrayIrType::Array(ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(dimension), Dimension::Static(4)]),
-                )),
-            )
-            .unwrap();
-            for size in [4, 5] {
-                let input = Array::from_elements(
-                    ArrayType::new_static(DataType::F64, [size, 4]),
-                    &(0..size * 4).map(|value| value as f64).collect::<Vec<_>>(),
-                )
+    #[test]
+    fn test_lift_output_sharding_for_leading_batch_axis() {
+        // Lifting an explicit per-item sharding moves a manual mapped axis out of the varying set and onto the new
+        // physical batch dimension.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let per_item_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_varying_manual_axes(["x"])
                 .unwrap();
-                let output = program.interpret(ArrayIrValue::Array(input.clone())).unwrap();
-                let output = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(output).unwrap();
-                assert_eq!(output.to_f64s(), input.to_f64s());
-                assert_eq!(
-                    output.r#type().static_shape().unwrap().dimensions(),
-                    if flatten { vec![size * 4] } else { vec![1, size, 4] }
-                );
-            }
-        }
+        assert_eq!(
+            lift_output_sharding_for_leading_batch_axis(&per_item_sharding, ShardingDimension::sharded(["x"])),
+            Ok(Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                ],
+            )
+            .unwrap()),
+        );
     }
 }

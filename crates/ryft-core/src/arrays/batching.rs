@@ -6188,7 +6188,7 @@ mod tests {
         assert_eq!(
             reshape,
             Err(BatchingError::UnsupportedOperation {
-                message: "dynamic reshape does not support bounded ragged array inputs".to_string(),
+                message: "dynamic `reshape` does not support bounded ragged array inputs".to_string(),
             }),
         );
         Ok(())

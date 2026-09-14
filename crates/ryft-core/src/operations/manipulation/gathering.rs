@@ -38,10 +38,10 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
 
-/// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scattering::Scatter). The mode does not
-/// affect the output [`Type`](crate::programs::types::Type)—only how a start index that would read or write outside
-/// the input is treated at execution time. It is shared by both operations; the scatter combiner kind lives in
-/// [`super::scattering`].
+/// Determines how [`Gather`] and [`Scatter`](crate::operations::manipulation::scattering::Scatter) handle index vectors
+/// whose windows extend outside the input. Negative indices are out of bounds; they do not count backward from an
+/// axis end. The mode changes which values are read or written, while the output shape still follows the operation's
+/// dimension numbers and window sizes.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GatherScatterMode {
     /// The caller promises every index is in bounds; out-of-bounds behavior is undefined (and gradients are wrong if
@@ -161,7 +161,16 @@ impl GatherDimensionNumbers {
     pub fn start_indices_batching_dimensions(&self) -> &[usize] {
         &self.start_indices_batching_dimensions
     }
-    /// Attaches the input/indices batching axis pair (aligned 1:1).
+
+    /// Pairs input axes with query axes so that each query reads from its corresponding input batch. Paired axes
+    /// must have equal extents, and the input batching axes cannot also be collapsed or indexed by a start vector.
+    /// These constraints are checked when inferring the gather result type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operand_batching_dimensions`: Input axes, in ascending order, whose slice sizes are at most one.
+    ///   - `start_indices_batching_dimensions`: Distinct query axes paired with the input axes in the same order.
+    ///     The trailing index-vector axis cannot be a batching axis.
     #[inline]
     pub fn with_batching_dimensions(
         mut self,
@@ -274,9 +283,9 @@ impl GatherOperation {
 
     /// Returns the explicit scalar fill constant without memory or layout annotations, if one was supplied.
     pub fn fill_value(&self) -> Option<Array> {
-        self.fill_value.as_ref().map(|(data_type, bytes)| {
-            Array::new_unchecked(ArrayType::scalar(*data_type), std::sync::Arc::new(bytes.clone()))
-        })
+        self.fill_value
+            .as_ref()
+            .map(|(data_type, bytes)| Array::new_unchecked(ArrayType::scalar(*data_type), Arc::new(bytes.clone())))
     }
 
     /// Returns the requested output sharding, if any.
@@ -284,6 +293,7 @@ impl GatherOperation {
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
     }
+
     /// Uses a scalar constant for windows outside the input in [`GatherScatterMode::FillOrDrop`] mode.
     /// The scalar must have the input element data type; its memory and layout metadata are discarded. Other modes
     /// ignore this value. Without an override, floating-point and complex inputs use NaN, signed integers use their
@@ -313,29 +323,35 @@ impl GatherOperation {
         self
     }
 
-    /// Sets the sorted-indices lowering hint.
+    /// Promises that start-index vectors are sorted. Backends may use this promise to optimize indexing; the
+    /// function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
         self.indices_are_sorted = indices_are_sorted;
         self
     }
 
-    /// Sets the unique-indices lowering hint.
+    /// Promises that gathered windows do not overlap. Backends may use this promise to optimize indexing; the
+    /// function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
         self.unique_indices = unique_indices;
         self
     }
 
-    /// Requests `output_sharding` for the result. The gather sharding rule replicates the input axes named by
-    /// [`GatherDimensionNumbers::start_index_map`] (and the index vector axis); when that leaves the output placement
-    /// ambiguous — for example because a sliced input axis is sharded over an explicit mesh axis — a requested
-    /// output sharding resolves it, bypassing inference. This mirrors `dot`/`reduce`'s `with_output_sharding`.
+    /// Requests a result placement when the window geometry does not determine one unambiguously. Complete window
+    /// axes inherit input placement and query axes inherit index placement. Partial windows on explicitly sharded
+    /// input axes require a request, as do incompatible placements on paired batching axes.
+    ///
+    /// A request selects per-axis placement while preserving the common mesh, reduction state, and manual-axis
+    /// variation. It must have the output rank and cannot reference automatic mesh axes. Passing `None` restores
+    /// inferred placement. Validation takes place when inferring the result type.
     #[inline]
     pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
         self.output_sharding = output_sharding.into();
         self
     }
+
     /// Resolves the scalar used for out-of-bounds windows in the requested input data type.
     /// Floating formats without NaN use their normal NaN conversion result. Complex NaN has a zero imaginary part.
     /// This function is shared by eager interpretation and native lowering so both use identical element encodings.
@@ -472,7 +488,8 @@ where
             if input.batch_axis_position().is_some() && input.r#type().dimension(0) != axis_dimension {
                 return Err(BatchingError::MisalignedBatchAxes {
                     message: format!(
-                        "`{GATHER_OPERATION_NAME}` mapped input extent {} does not match batching extent {axis_dimension}",
+                        "`{GATHER_OPERATION_NAME}` mapped input extent {} does not match batching extent \
+                         {axis_dimension}",
                         input.r#type().dimension(0),
                     ),
                 });
@@ -587,7 +604,7 @@ where
 // input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
 // operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped input
 // is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule below routes a
 // dynamically shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
 // transpose region rebuilds the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
@@ -617,22 +634,19 @@ where
                 }
                 // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
                 // value, so read the tracer directly.
-                let indices = inputs[1]
-                    .as_known()
-                    .expect("dispatch guarantees a known operand carries its pullback value")
-                    .clone();
+                let indices = inputs[1].as_known().unwrap().clone();
                 // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                 // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
-                let operand_cotangent_type = inputs[0].r#type().cotangent()?;
-                if operand_cotangent_type.static_shape().is_none() {
+                let input_cotangent_type = inputs[0].r#type().cotangent()?;
+                if input_cotangent_type.static_shape().is_none() {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped operand but got \
-                         {operand_cotangent_type}",
+                        "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped input but got \
+                         `{input_cotangent_type}`",
                     ))
                     .into());
                 }
-                let output_sharding = operand_cotangent_type.sharding().cloned();
-                let zeros = MaybeZero::Zero(operand_cotangent_type.clone()).materialize(&**context)?;
+                let output_sharding = input_cotangent_type.sharding().cloned();
+                let zeros = MaybeZero::Zero(input_cotangent_type.clone()).materialize(&**context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),
@@ -651,11 +665,11 @@ where
                     context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
                 check_count!("output", outputs, 1, ProgramError);
                 let mut contribution = outputs.into_iter().next().unwrap();
-                if contribution.r#type().as_ref() != &operand_cotangent_type {
+                if contribution.r#type().as_ref() != &input_cotangent_type {
                     let mut outputs = context.stage_operation(
                         BroadcastOperation::new(
-                            operand_cotangent_type.clone(),
-                            (0..operand_cotangent_type.rank()).collect(),
+                            input_cotangent_type.clone(),
+                            (0..input_cotangent_type.rank()).collect(),
                         ),
                         Vec::new(),
                         std::slice::from_ref(&contribution),
@@ -692,41 +706,41 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let destinations = context;
         let context = destinations.primal();
-        let [operand, indices] = inputs else {
+        let [input, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
-        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
-        if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
+        let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
+        if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
             return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        let mut outputs = context.bind(operation, Vec::new(), &[operand.primal().clone(), indices.primal().clone()])?;
+        let mut outputs = context.bind(operation, Vec::new(), &[input.primal().clone(), indices.primal().clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         let primal = outputs.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
-        let operand = &inputs[0];
+        let input = &inputs[0];
         let indices = &inputs[1];
         let context = destinations.tangent();
-        let tangent = match operand.tangent() {
+        let tangent = match input.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(operand_tangent) => {
+            MaybeZero::Value(input_tangent) => {
                 let mut residuals = LinearResiduals::new();
                 let indices_index = residuals.retain(indices.primal().clone());
-                let operand_shape = residuals.retain_shape(context, operand.primal())?;
+                let input_shape = residuals.retain_shape(context, input.primal())?;
                 // The linear region differentiates input data, not the primal's constant replacement value.
                 let forward_operation = if self.mode() == GatherScatterMode::FillOrDrop {
                     self.clone().with_fill_value(EagerContext::<Array>::new().zero(&ArrayType::scalar(
-                        <&ArrayType>::try_from(operand_tangent.r#type().as_ref())?.data_type(),
+                        <&ArrayType>::try_from(input_tangent.r#type().as_ref())?.data_type(),
                     ))?)?
                 } else {
                     self.clone()
                 };
-                let transpose_operand_type = operand_type.cotangent()?;
+                let transpose_operand_type = input_type.cotangent()?;
                 let dimensions = self.dimensions();
                 let transpose_operation = ScatterOperation::new(
                     ScatterDimensionNumbers::new(
@@ -747,7 +761,7 @@ where
                 let mut tangent_outputs = LinearCallOperation::stage(
                     context,
                     residuals.into_values(),
-                    vec![operand_tangent.clone()],
+                    vec![input_tangent.clone()],
                     move |residuals, linear_inputs| {
                         linear_inputs[0].dispatch_domain().bind(
                             <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
@@ -762,7 +776,7 @@ where
                                 transpose_operand_type.clone(),
                             )),
                             Vec::new(),
-                            operand_shape.dynamic_dimensions(residuals).as_slice(),
+                            input_shape.dynamic_dimensions(residuals).as_slice(),
                         )?;
                         check_count!("output", zero_outputs, 1, ProgramError);
                         let zeros = zero_outputs.remove(0);
@@ -803,7 +817,7 @@ where
     }
 }
 
-/// Value-level gather capability: the receiver-style entry point for staging or executing [`GatherOperation`].
+/// Reads windows from an array at positions supplied by an integer index array.
 ///
 /// The receiver is the input (the data source); `indices` is a separate integer-typed value whose last axis holds
 /// each start-index vector. The output assembles the sliced windows according to `operation`'s
@@ -811,7 +825,12 @@ where
 /// The input and indices must reside in the same memory space. The result retains that memory placement and clears
 /// explicit physical layout metadata because gathering changes the logical relationship between axes and storage.
 ///
-/// # Example
+/// [`Gather`] fills the same role for [`GatherOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for their
+/// corresponding arithmetic [`Operation`]s. Use [`Self::gather_axis`] to select complete slices along one axis without
+/// constructing dimension numbers, or [`DynamicGather::dynamic_gather_axis`] when query or untouched input extents
+/// must remain dynamic.
+///
+/// # Examples
 ///
 /// ```rust
 /// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOperation};
@@ -842,7 +861,8 @@ pub trait Gather: Sized {
     ///
     /// The selected axis may have a dynamic extent. All other input extents must be statically known because the
     /// underlying [`GatherOperation`] stores their complete window sizes as host integers. The index shape must also
-    /// support the homogeneous [`Reshape`] used to append its index-vector axis. Use an explicit operation for dynamic query shapes, partial windows, or a custom fill.
+    /// support the homogeneous [`Reshape`] used to append its index-vector axis. Use [`DynamicGather`] for dynamic
+    /// query shapes or an explicit operation for partial windows and custom fill values.
     ///
     /// # Parameters
     ///
@@ -899,10 +919,10 @@ impl Gather for ArrayType {
     // Type-level gather: validates the dimension numbers and slice sizes against the input and indices types and
     // computes the output shape and placement.
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let operand = self;
+        let input = self;
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
-        let operand_rank = operand.rank();
+        let input_rank = input.rank();
         let indices_rank = indices.rank();
 
         if indices_rank == 0 {
@@ -913,17 +933,17 @@ impl Gather for ArrayType {
         }
         if !indices.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` indices must be integer-typed but have type {indices}"
+                "`{GATHER_OPERATION_NAME}` indices must be integer-typed but have type `{indices}`"
             ))
             .into());
         }
         if operation.mode() == GatherScatterMode::FillOrDrop {
-            operation.resolved_fill_value(operand.data_type())?;
+            operation.resolved_fill_value(input.data_type())?;
         }
-        if operand.memory() != indices.memory() {
+        if input.memory() != indices.memory() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` operand and indices must share one memory space but reside in {} and {}",
-                operand.memory(),
+                "`{GATHER_OPERATION_NAME}` input and indices must share one memory space but reside in `{}` and `{}`",
+                input.memory(),
                 indices.memory(),
             ))
             .into());
@@ -948,28 +968,28 @@ impl Gather for ArrayType {
             GATHER_OPERATION_NAME,
             "collapsed_slice_dimensions",
             dimensions.collapsed_slice_dimensions(),
-            operand_rank,
+            input_rank,
         )?;
         validate_sorted_unique_in_range(
             GATHER_OPERATION_NAME,
             "operand_batching_dimensions",
             dimensions.operand_batching_dimensions(),
-            operand_rank,
+            input_rank,
         )?;
 
         if dimensions.start_index_map().len() != index_vector_extent {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` start_index_map has length {} but the index vector extent is \
+                "`{GATHER_OPERATION_NAME}` `start_index_map` has length {} but the index vector extent is \
                      {index_vector_extent}",
                 dimensions.start_index_map().len(),
             ))
             .into());
         }
-        validate_unique_in_range(GATHER_OPERATION_NAME, "start_index_map", dimensions.start_index_map(), operand_rank)?;
+        validate_unique_in_range(GATHER_OPERATION_NAME, "start_index_map", dimensions.start_index_map(), input_rank)?;
 
         if dimensions.start_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` operand and start-indices batching dimensions must align 1:1, but got {} \
+                "`{GATHER_OPERATION_NAME}` input and start-indices batching dimensions must align 1:1, but got {} \
                      and {}",
                 dimensions.operand_batching_dimensions().len(),
                 dimensions.start_indices_batching_dimensions().len(),
@@ -995,7 +1015,7 @@ impl Gather for ArrayType {
         for &dimension in dimensions.start_indices_batching_dimensions() {
             if dimension >= indices_rank || dimension == index_vector_dimension {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` start_indices_batching_dimensions entry {dimension} is out of range \
+                    "`{GATHER_OPERATION_NAME}` `start_indices_batching_dimensions` entry {dimension} is out of range \
                          or names the index vector dimension"
                 ))
                 .into());
@@ -1007,7 +1027,7 @@ impl Gather for ArrayType {
         let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
         if collapsed.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` collapsed_slice_dimensions and operand_batching_dimensions must be \
+                "`{GATHER_OPERATION_NAME}` `collapsed_slice_dimensions` and `operand_batching_dimensions` must be \
                      disjoint"
             ))
             .into());
@@ -1015,18 +1035,18 @@ impl Gather for ArrayType {
 
         // Slice sizes: one per input axis; size 1 on collapsed axes; size at most 1 on batching axes; within the
         // input extent when that extent is static.
-        if slice_sizes.len() != operand_rank {
+        if slice_sizes.len() != input_rank {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` slice_sizes has length {} but the operand has rank {operand_rank}",
+                "`{GATHER_OPERATION_NAME}` `slice_sizes` has length {} but the input has rank {input_rank}",
                 slice_sizes.len(),
             ))
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
-            match operand.dimension(axis) {
+            match input.dimension(axis) {
                 Dimension::Static(extent) if size > extent => {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` slice size {size} at axis {axis} exceeds the operand extent \
+                        "`{GATHER_OPERATION_NAME}` slice size {size} at axis {axis} exceeds the input extent \
                          {extent}"
                     ))
                     .into());
@@ -1034,7 +1054,7 @@ impl Gather for ArrayType {
                 Dimension::Dynamic(variable) if size > variable.bounds().lower() => {
                     return Err(TypeError::invalid(format!(
                         "`{GATHER_OPERATION_NAME}` slice size {size} exceeds the guaranteed minimum extent {} of \
-                         dynamic operand axis {axis}",
+                         dynamic input axis {axis}",
                         variable.bounds().lower(),
                     ))
                     .into());
@@ -1049,17 +1069,17 @@ impl Gather for ArrayType {
             }
             if operand_batching.contains(&axis) && size > 1 {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` operand batching dimension {axis} must have slice size at most 1 but \
+                    "`{GATHER_OPERATION_NAME}` input batching dimension {axis} must have slice size at most 1 but \
                          has {size}"
                 ))
                 .into());
             }
         }
 
-        let offset_count = operand_rank - collapsed.len() - operand_batching.len();
+        let offset_count = input_rank - collapsed.len() - operand_batching.len();
         if dimensions.offset_dimensions().len() != offset_count {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` offset_dimensions has length {} but the operand has {offset_count} \
+                "`{GATHER_OPERATION_NAME}` `offset_dimensions` has length {} but the input has {offset_count} \
                      non-collapsed, non-batching axes",
                 dimensions.offset_dimensions().len(),
             ))
@@ -1067,13 +1087,13 @@ impl Gather for ArrayType {
         }
 
         // Batch-dimension extents must match between input and indices.
-        for (&operand_axis, &indices_axis) in
+        for (&input_axis, &indices_axis) in
             dimensions.operand_batching_dimensions().iter().zip(dimensions.start_indices_batching_dimensions())
         {
-            if !dimensions_have_equal_extents(&operand.dimension(operand_axis), &indices.dimension(indices_axis)) {
+            if !dimensions_have_equal_extents(&input.dimension(input_axis), &indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` batching dimensions must have equal extents, but operand axis \
-                         {operand_axis} and indices axis {indices_axis} differ"
+                    "`{GATHER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
+                         {input_axis} and indices axis {indices_axis} differ"
                 ))
                 .into());
             }
@@ -1081,7 +1101,7 @@ impl Gather for ArrayType {
 
         // Output shape: offset positions take the (non-collapsed, non-batching) input window sizes in input-axis
         // order; the remaining positions take the indices' batch axes (every axis but the index vector) in order.
-        let operand_offset_axes: Vec<usize> = (0..operand_rank)
+        let input_offset_axes: Vec<usize> = (0..input_rank)
             .filter(|axis| !collapsed.contains(axis) && !operand_batching.contains(axis))
             .collect();
         let batch_query_sizes: Vec<Dimension> = (0..indices_rank)
@@ -1089,15 +1109,15 @@ impl Gather for ArrayType {
             .map(|axis| indices.dimension(axis))
             .collect();
         let offset_position: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
-        let mut offset_iterator = operand_offset_axes.iter();
+        let mut offset_iterator = input_offset_axes.iter();
         let mut batch_iterator = batch_query_sizes.iter();
         let output_dimensions: Vec<Dimension> = (0..output_rank)
             .map(|position| {
                 if offset_position.contains(&position) {
-                    let &operand_axis = offset_iterator.next().expect("offset axis count was validated");
-                    Dimension::Static(slice_sizes[operand_axis])
+                    let &input_axis = offset_iterator.next().unwrap();
+                    Dimension::Static(slice_sizes[input_axis])
                 } else {
-                    batch_iterator.next().expect("batch axis count was validated").clone()
+                    batch_iterator.next().unwrap().clone()
                 }
             })
             .collect();
@@ -1105,17 +1125,23 @@ impl Gather for ArrayType {
         // Retained full-window axes preserve input placement, and query axes inherit index placement. Partial
         // windows on explicitly sharded axes need an explicit output placement. Reduction and manual-axis state
         // remain part of the contract even when a placement is supplied explicitly.
-        let operand_sharding = operand.sharding();
+        let input_sharding = input.sharding();
         let indices_sharding = indices.sharding();
-        let mesh = resolve_mesh(operand_sharding, indices_sharding)?;
+        let mesh = match (input_sharding, indices_sharding) {
+            (Some(input), Some(indices)) if input.mesh() != indices.mesh() => {
+                return Err(TypeError::invalid("`gather` input and indices shardings must use the same mesh").into());
+            }
+            (Some(sharding), _) | (_, Some(sharding)) => Some(sharding.mesh().clone()),
+            (None, None) => None,
+        };
         if indices_sharding
             .is_some_and(|sharding| !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty())
         {
             return Err(TypeError::invalid("`gather` indices cannot carry reduced or unreduced mesh axes").into());
         }
-        let unreduced_axes = operand_sharding.map(Sharding::unreduced_axes).cloned().unwrap_or_default();
-        let reduced_axes = operand_sharding.map(Sharding::reduced_axes).cloned().unwrap_or_default();
-        let mut varying_manual_axes = operand_sharding.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+        let unreduced_axes = input_sharding.map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+        let reduced_axes = input_sharding.map(Sharding::reduced_axes).cloned().unwrap_or_default();
+        let mut varying_manual_axes = input_sharding.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
         if let Some(sharding) = indices_sharding {
             varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
             if (!unreduced_axes.is_empty() || !reduced_axes.is_empty())
@@ -1169,13 +1195,13 @@ impl Gather for ArrayType {
                 .chain(dimensions.collapsed_slice_dimensions())
                 .copied()
                 .collect();
-            if let Some(sharding) = operand_sharding {
+            if let Some(sharding) = input_sharding {
                 for &axis in &replicated_operand_axes {
-                    if operand.dimension(axis) != Dimension::Static(slice_sizes[axis])
+                    if input.dimension(axis) != Dimension::Static(slice_sizes[axis])
                         && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis])
                     {
                         return Err(TypeError::invalid(format!(
-                            "`{GATHER_OPERATION_NAME}` operand axis {axis} is indexed by the start indices and must \
+                            "`{GATHER_OPERATION_NAME}` input axis {axis} is indexed by the start indices and must \
                                  be replicated over explicit mesh axes; request an explicit output sharding to resolve \
                                  placement"
                         ))
@@ -1195,9 +1221,9 @@ impl Gather for ArrayType {
 
             // A partial window does not preserve the placement of the complete input axis, even when its
             // start index is implicit zero rather than supplied in the index vector.
-            for &axis in &operand_offset_axes {
-                if operand.dimension(axis) != Dimension::Static(slice_sizes[axis])
-                    && operand_sharding
+            for &axis in &input_offset_axes {
+                if input.dimension(axis) != Dimension::Static(slice_sizes[axis])
+                    && input_sharding
                         .is_some_and(|sharding| dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis]))
                 {
                     return Err(TypeError::invalid(
@@ -1212,7 +1238,7 @@ impl Gather for ArrayType {
             for (&input_axis, &indices_axis) in
                 dimensions.operand_batching_dimensions().iter().zip(dimensions.start_indices_batching_dimensions())
             {
-                let input_placement = operand_sharding
+                let input_placement = input_sharding
                     .map(|sharding| sharding.dimensions()[input_axis].clone())
                     .unwrap_or(ShardingDimension::Replicated);
                 let indices_dimension = &mut indices_placement[indices_axis];
@@ -1230,17 +1256,17 @@ impl Gather for ArrayType {
             // the indices' batch axes (every axis but the index vector), in order.
             let indices_batch_axes: Vec<usize> =
                 (0..indices.rank()).filter(|axis| *axis != index_vector_dimension).collect();
-            let mut offset_iterator = operand_offset_axes.iter();
+            let mut offset_iterator = input_offset_axes.iter();
             let mut batch_iterator = indices_batch_axes.iter();
             let placement: Vec<ShardingDimension> = (0..output_rank)
                 .map(|position| {
                     if offset_position.contains(&position) {
-                        let &operand_axis = offset_iterator.next().expect("offset axis count was validated");
-                        operand_sharding
-                            .map(|sharding| sharding.dimensions()[operand_axis].clone())
+                        let &input_axis = offset_iterator.next().unwrap();
+                        input_sharding
+                            .map(|sharding| sharding.dimensions()[input_axis].clone())
                             .unwrap_or(ShardingDimension::Replicated)
                     } else {
-                        let &indices_axis = batch_iterator.next().expect("batch axis count was validated");
+                        let &indices_axis = batch_iterator.next().unwrap();
                         indices_placement[indices_axis].clone()
                     }
                 })
@@ -1262,8 +1288,8 @@ impl Gather for ArrayType {
         } else {
             None
         };
-        ArrayType::new(operand.data_type(), Shape::new(output_dimensions))
-            .with_memory(operand.memory())
+        ArrayType::new(input.data_type(), Shape::new(output_dimensions))
+            .with_memory(input.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
@@ -1274,9 +1300,9 @@ impl Gather for Array {
         let output_type = self.r#type().gather(indices.r#type().as_ref(), operation)?;
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
-        let operand_shape = self.r#type().static_shape().unwrap();
+        let input_shape = self.r#type().static_shape().unwrap();
         let indices_shape = indices.r#type().static_shape().unwrap();
-        let operand_rank = operand_shape.rank();
+        let input_rank = input_shape.rank();
         let indices_rank = indices_shape.rank();
         let output_rank = output_type.rank();
         let index_vector_dimension = indices_rank - 1;
@@ -1286,8 +1312,8 @@ impl Gather for Array {
         // positions carry the window, the rest carry the indices' batch coordinates).
         let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
         let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
-        let operand_window_axes: Vec<usize> =
-            (0..operand_rank).filter(|axis| !collapsed.contains(axis) && !batching.contains(axis)).collect();
+        let input_window_axes: Vec<usize> =
+            (0..input_rank).filter(|axis| !collapsed.contains(axis) && !batching.contains(axis)).collect();
         let offset_positions: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
         let batch_output_positions: Vec<usize> =
             (0..output_rank).filter(|position| !offset_positions.contains(position)).collect();
@@ -1308,8 +1334,8 @@ impl Gather for Array {
         let mut output_index = vec![0usize; output_rank];
         let mut indices_index = vec![0usize; indices_rank];
         let mut starts = vec![0i128; index_vector_extent];
-        let mut operand_index = vec![0i128; operand_rank];
-        let mut operand_storage_index = vec![0usize; operand_rank];
+        let mut input_index = vec![0i128; input_rank];
+        let mut input_storage_index = vec![0usize; input_rank];
         for output_element in 0..output_addressing.element_count() {
             // Place the output's batch coordinates into the indices multi-index and read this query's start vector.
             indices_index.fill(0);
@@ -1338,27 +1364,26 @@ impl Gather for Array {
                 };
             }
             // Assemble the input multi-index: window offsets, then batching coordinates, then start offsets.
-            operand_index.fill(0);
-            for (window, &operand_axis) in operand_window_axes.iter().enumerate() {
-                operand_index[operand_axis] = output_index[dimensions.offset_dimensions()[window]] as i128;
+            input_index.fill(0);
+            for (window, &input_axis) in input_window_axes.iter().enumerate() {
+                input_index[input_axis] = output_index[dimensions.offset_dimensions()[window]] as i128;
             }
-            for (batch, &operand_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
-                operand_index[operand_axis] =
-                    indices_index[dimensions.start_indices_batching_dimensions()[batch]] as i128;
+            for (batch, &input_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                input_index[input_axis] = indices_index[dimensions.start_indices_batching_dimensions()[batch]] as i128;
             }
             let mut dropped = false;
-            for (component, &operand_axis) in dimensions.start_index_map().iter().enumerate() {
+            for (component, &input_axis) in dimensions.start_index_map().iter().enumerate() {
                 let raw = starts[component];
-                let maximum = (operand_shape[operand_axis] - slice_sizes[operand_axis]) as i128;
+                let maximum = (input_shape[input_axis] - slice_sizes[input_axis]) as i128;
                 match operation.mode() {
                     GatherScatterMode::FillOrDrop => {
                         if raw < 0 || raw > maximum {
                             dropped = true;
                         }
-                        operand_index[operand_axis] += raw;
+                        input_index[input_axis] += raw;
                     }
                     GatherScatterMode::PromiseInBounds | GatherScatterMode::Clip => {
-                        operand_index[operand_axis] += raw.clamp(0, maximum)
+                        input_index[input_axis] += raw.clamp(0, maximum)
                     }
                 }
             }
@@ -1366,10 +1391,10 @@ impl Gather for Array {
                 let (value, addressing) = dropped_fill.as_ref().unwrap();
                 &value.storage_bytes()[addressing.byte_range_for_flat_index(0)]
             } else {
-                for axis in 0..operand_rank {
-                    operand_storage_index[axis] = operand_index[axis] as usize;
+                for axis in 0..input_rank {
+                    input_storage_index[axis] = input_index[axis] as usize;
                 }
-                &self.storage_bytes()[input_addressing.byte_range_unchecked(&operand_storage_index)]
+                &self.storage_bytes()[input_addressing.byte_range_unchecked(&input_storage_index)]
             };
             bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
             output_addressing.advance_index(&mut output_index);
@@ -1403,7 +1428,7 @@ where
 
 /// Gathers complete slices with first-class dimensions for the untouched input axes and query shape.
 ///
-/// This is a composition of [`DynamicBroadcast`](crate::operations::DynamicBroadcast) and [`GatherOperation`].
+/// This is a composition of [`DynamicBroadcast`] and [`GatherOperation`].
 /// Untouched input axes become paired gather batching axes instead of runtime-sized windows. The selected axis
 /// uses a size-one window; paired axes use size zero or one according to their bounds. The output retains the exact
 /// runtime dimensions of the input and queries. Like [`Gather::gather_axis`], negative indices are out of bounds
@@ -1560,27 +1585,6 @@ pub(crate) fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &Shardi
         if axis_names.iter().any(|name| mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
 }
 
-/// Resolves the common mesh of two optional shardings, erroring on a mesh mismatch. Returns `None` when neither side
-/// is sharded.
-fn resolve_mesh(
-    operand_sharding: Option<&Sharding>,
-    indices_sharding: Option<&Sharding>,
-) -> Result<Option<LogicalMesh>, TypeError> {
-    match (operand_sharding, indices_sharding) {
-        (None, None) => Ok(None),
-        (Some(left), Some(right)) => {
-            if left.mesh() != right.mesh() {
-                return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` operand and indices shardings must use the same mesh"
-                )));
-            }
-            Ok(Some(left.mesh().clone()))
-        }
-        (Some(left), None) => Ok(Some(left.mesh().clone())),
-        (None, Some(right)) => Ok(Some(right.mesh().clone())),
-    }
-}
-
 /// Validates that `axes` is strictly ascending (sorted and unique) and that every entry is in `0..bound`. Shared with
 /// [`super::scattering`].
 pub(crate) fn validate_sorted_unique_in_range(
@@ -1628,13 +1632,15 @@ pub(crate) fn validate_unique_in_range(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::RaggedAxis;
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
         ShardingDimension, StridedLayout,
     };
     use crate::batching::batch;
@@ -1646,62 +1652,66 @@ mod tests {
     };
     use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::Trace;
 
     use super::*;
 
-    fn indices_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
-    }
-
-    fn float_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
-    }
-
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
     fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<i32>) -> V
     where
-        V: crate::programs::Value<Type = ArrayType>,
-        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
+        V: Value<Type = ArrayType>,
+        V::DispatchDomain: Context<Constant = Array>,
     {
-        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
+        let r#type = ArrayType::new_static(DataType::I32, shape);
         exemplar.dispatch_domain().lift(Array::from_elements::<i32>(r#type, &values).unwrap()).unwrap()
     }
 
-    /// Minimal operation enum hosting the primal [`GatherOperation`] (the forward gather) and the primal
-    /// [`ScatterOperation`] (its staged scatter-add adjoint) plus the structural `zero` and `add` operations the
-    /// transpose pass needs. The `Constant` variant carries the value parameter `V` so the [`Operation`] derive can
-    /// infer the primary type. [`TransposableOperation`] is hand-written rather than derived because the primal
-    /// [`ScatterOperation`] adjoint target has no transpose rule (it only ever appears in the pullback, never as a
-    /// forward instruction being transposed); the derived all-variant dispatcher would require one.
-    #[derive(Clone, Debug, ryft_macros::Operation)]
-    enum TestGatherOperation<V: Value<Type = ArrayType>> {
-        Zero(ZeroOperation<ArrayType>),
-        Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(crate::operations::math::AddOperation<ArrayType>),
-        Gather(GatherOperation),
-        Scatter(ScatterOperation),
-        Broadcast(BroadcastOperation),
+    #[test]
+    fn test_gather_scatter_mode_name() {
+        assert_eq!(GatherScatterMode::default(), GatherScatterMode::PromiseInBounds);
+        for (mode, name, debug) in [
+            (GatherScatterMode::PromiseInBounds, "promise_in_bounds", "PromiseInBounds"),
+            (GatherScatterMode::Clip, "clip", "Clip"),
+            (GatherScatterMode::FillOrDrop, "fill_or_drop", "FillOrDrop"),
+        ] {
+            assert_eq!(mode.name(), name);
+            assert_eq!(mode.to_string(), name);
+            assert_eq!(format!("{mode:?}"), debug);
+        }
     }
 
-    impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestGatherOperation<V>> for TestGatherOperation<V> {
-        fn transpose<D: TranspositionDriver<V, TestGatherOperation<V>>>(
-            &self,
-            context: &mut TranspositionContext<V, TestGatherOperation<V>>,
-            driver: &D,
-            inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
-            outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
-            accumulators: &[CotangentAccumulator],
-        ) -> Result<(), DifferentiationError> {
-            match self {
-                Self::Gather(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
-                _ => Err(ProgramError::UnsupportedOperation {
-                    message: format!("{} is not transposed in this test enum", self.name()),
-                }
-                .into()),
-            }
-        }
+    #[test]
+    fn test_gather_dimension_numbers_new() {
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        assert_eq!(dimensions.offset_dimensions(), &[1]);
+        assert_eq!(dimensions.collapsed_slice_dimensions(), &[0]);
+        assert_eq!(dimensions.start_index_map(), &[0]);
+        assert_eq!(dimensions.operand_batching_dimensions(), &[] as &[usize]);
+        assert_eq!(dimensions.start_indices_batching_dimensions(), &[] as &[usize]);
+        assert_eq!(
+            dimensions.to_string(),
+            "(offset=[1], collapsed_slice=[0], start_index_map=[0], operand_batching=[], start_indices_batching=[])",
+        );
+        assert_eq!(
+            format!("{dimensions:?}"),
+            "GatherDimensionNumbers { offset_dimensions: [1], collapsed_slice_dimensions: [0], start_index_map: [0], \
+             operand_batching_dimensions: [], start_indices_batching_dimensions: [] }",
+        );
+        let lookup = HashMap::from([(dimensions.clone(), 7)]);
+        assert_eq!(lookup.get(&dimensions), Some(&7));
+        assert_eq!(lookup.get(&GatherDimensionNumbers::default()), None);
+    }
+
+    #[test]
+    fn test_gather_dimension_numbers_with_batching_dimensions() {
+        let dimensions =
+            GatherDimensionNumbers::new(vec![2], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![1]);
+        assert_eq!(dimensions.offset_dimensions(), &[2]);
+        assert_eq!(dimensions.collapsed_slice_dimensions(), &[1]);
+        assert_eq!(dimensions.start_index_map(), &[1]);
+        assert_eq!(dimensions.operand_batching_dimensions(), &[0]);
+        assert_eq!(dimensions.start_indices_batching_dimensions(), &[1]);
     }
 
     #[test]
@@ -1711,42 +1721,94 @@ mod tests {
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
         let operation = GatherOperation::new(dimensions, vec![1, 2]);
         assert_eq!(operation.name(), GATHER_OPERATION_NAME);
+        assert_eq!(operation.dimensions(), &GatherDimensionNumbers::new(vec![1], vec![0], vec![0]));
         assert_eq!(operation.slice_sizes(), &[1, 2]);
+        assert_eq!(operation.mode(), GatherScatterMode::PromiseInBounds);
+        assert_eq!(operation.fill_value(), None);
+        assert!(!operation.indices_are_sorted());
+        assert!(!operation.unique_indices());
+        assert_eq!(operation.output_sharding(), None);
+        let configured = operation
+            .clone()
+            .with_mode(GatherScatterMode::Clip)
+            .with_indices_are_sorted(true)
+            .with_unique_indices(true);
+        assert_eq!(configured.mode(), GatherScatterMode::Clip);
+        assert!(configured.indices_are_sorted());
+        assert!(configured.unique_indices());
 
         assert_eq!(
             format!("{operation}"),
-            concat!(
-                "gather [\n",
-                "    dimensions=(offset=[1], collapsed_slice=[0], start_index_map=[0], operand_batching=[], ",
-                "start_indices_batching=[]),\n",
-                "    slice_sizes=[1, 2],\n",
-                "]",
-            ),
+            indoc! {"
+                gather [
+                    dimensions=(offset=[1], collapsed_slice=[0], start_index_map=[0], operand_batching=[], \
+                        start_indices_batching=[]),
+                    slice_sizes=[1, 2],
+                ]
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_gather_operation_resolved_fill_value() {
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(operation.resolved_fill_value(DataType::I64), Array::scalar(i64::MIN));
+        assert_eq!(operation.resolved_fill_value(DataType::U64), Array::scalar(u64::MAX));
+        assert_eq!(operation.resolved_fill_value(DataType::Boolean), Array::scalar(true));
+        assert_eq!(operation.resolved_fill_value(DataType::I1), Array::scalar(i1::new(-1).unwrap()));
+        assert_eq!(operation.resolved_fill_value(DataType::U4), Array::scalar(u4::new(15).unwrap()));
+        assert!(operation.resolved_fill_value(DataType::F32).unwrap().elements::<f32>().unwrap()[0].is_nan());
+        let complex = operation
+            .resolved_fill_value(DataType::C64)
+            .unwrap()
+            .elements::<num_complex::Complex<f32>>()
+            .unwrap()[0];
+        assert!(complex.re.is_nan());
+        assert_eq!(complex.im, 0.0);
+
+        // Explicit NaN payloads survive operation cloning and eager filling without numeric conversion.
+        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
+        let operation = operation.with_mode(GatherScatterMode::FillOrDrop).with_fill_value(fill.clone()).unwrap();
+        assert_eq!(operation.fill_value().unwrap().storage_bytes(), fill.storage_bytes());
+        assert_eq!(operation.resolved_fill_value(DataType::F32).unwrap().storage_bytes(), fill.storage_bytes());
+        assert_eq!(
+            operation.resolved_fill_value(DataType::I32),
+            Err(TypeError::invalid("`gather` fill data type `f32` does not match input data type `i32`").into())
+        );
+        let output = Array::vector(vec![1.0_f32])
+            .unwrap()
+            .gather(&Array::matrix(1, 1, vec![2_i32]).unwrap(), &operation)
+            .unwrap();
+        assert_eq!(output.storage_bytes(), fill.storage_bytes());
+        assert_eq!(
+            operation.clone().with_fill_value(Array::vector(vec![1.0_f32]).unwrap()),
+            Err(TypeError::invalid("`gather` fill value must be a numeric or Boolean scalar"))
         );
     }
 
     #[test]
     fn test_gather_type_inference() {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let operand = float_type(vec![3, 2]);
-        let indices = indices_type(vec![2, 1]);
-        let host_operand = operand.clone().with_memory(Memory::Host { pinned: true });
+        let input = ArrayType::new_static(DataType::F32, [3, 2]);
+        let indices = ArrayType::new_static(DataType::I32, [2, 1]);
+        let host_operand = input.clone().with_memory(Memory::Host { pinned: true });
         let host_indices = indices.clone().with_memory(Memory::Host { pinned: true });
-        let host_output = float_type(vec![2, 2]).with_memory(Memory::Host { pinned: true });
+        let host_output = ArrayType::new_static(DataType::F32, [2, 2]).with_memory(Memory::Host { pinned: true });
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
                 {
-                    input_types = [operand.clone(), indices.clone()],
-                    output_types = [float_type(vec![2, 2])],
+                    input_types = [input.clone(), indices.clone()],
+                    output_types = [ArrayType::new_static(DataType::F32, [2, 2])],
                 },
                 {
-                    input_types = [operand.clone()],
+                    input_types = [input.clone()],
                     error = "expected 2 inputs but got 1",
                 },
                 {
-                    input_types = [operand.clone(), float_type(vec![2, 1])],
-                    error = "`gather` indices must be integer-typed but have type f32[2, 1]",
+                    input_types = [input.clone(), ArrayType::new_static(DataType::F32, [2, 1])],
+                    error = "`gather` indices must be integer-typed but have type `f32[2, 1]`",
                 },
                 {
                     input_types = [host_operand.clone(), host_indices],
@@ -1754,8 +1816,8 @@ mod tests {
                 },
                 {
                     input_types = [host_operand, indices.clone()],
-                    error = "`gather` operand and indices must share one memory space but reside in Host[Pinned] and \
-                             Device",
+                    error = "`gather` input and indices must share one memory space but reside in `Host[Pinned]` and \
+                             `Device`",
                 },
             ],
         );
@@ -1766,8 +1828,92 @@ mod tests {
         let dynamic_indices =
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query.clone()), Dimension::Static(1)]));
         assert_eq!(
-            operation.infer_output_types(&[operand.clone(), dynamic_indices], &[]),
+            operation.infer_output_types(&[input.clone(), dynamic_indices], &[]),
             Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(2)]),)]),
+        );
+    }
+
+    #[test]
+    fn test_gather_type_inference_batched_sharding() {
+        let exact = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(1)).unwrap()));
+        let operation = GatherOperation::new(
+            GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
+            vec![0, 1],
+        );
+        // Specialization can retain an exact nominal dimension on one side of a paired batch while the other is
+        // already static. Both descriptions prove the same extent without equating unrelated symbolic dimensions.
+        for input_batch in [Dimension::Static(0), exact.clone()] {
+            for query_batch in [Dimension::Static(0), exact.clone()] {
+                let input = ArrayType::new(DataType::F64, Shape::new(vec![input_batch.clone(), Dimension::Static(4)]));
+                let indices = ArrayType::new(
+                    DataType::I32,
+                    Shape::new(vec![query_batch.clone(), Dimension::Static(2), Dimension::Static(1)]),
+                );
+                assert_eq!(
+                    input.gather(&indices, &operation).unwrap().shape(),
+                    &Shape::new(vec![query_batch, Dimension::Static(2)])
+                );
+            }
+        }
+        let input = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap())),
+                Dimension::Static(4),
+            ]),
+        );
+        let indices = ArrayType::new(
+            DataType::I32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap())),
+                Dimension::Static(2),
+                Dimension::Static(1),
+            ]),
+        );
+        assert_eq!(
+            input.gather(&indices, &operation),
+            Err(TypeError::invalid(
+                "`gather` batching dimensions must have equal extents, but input axis 0 and indices axis 0 differ",
+            )
+            .into()),
+        );
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        // Operand [4, 2] sharded only on the feature axis (axis 1); axis 0 (indexed by the start index) is replicated.
+        let input = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+                    .unwrap(),
+            )
+            .unwrap();
+        let indices = ArrayType::new_static(DataType::I32, [3, 1]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
+        let output = operation.infer_output_types(&[input, indices], &[]).unwrap();
+        assert_eq!(
+            output[0].sharding().unwrap().dimensions(),
+            &[ShardingDimension::Replicated, ShardingDimension::sharded(["y"])],
+        );
+
+        // Sharding the start-indexed input axis over an explicit mesh axis is ambiguous without an output sharding.
+        let input = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let indices = ArrayType::new_static(DataType::I32, [3, 1]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        assert_eq!(
+            operation.infer_output_types(&[input, indices], &[]),
+            Err(TypeError::invalid(
+                "`gather` input axis 0 is indexed by the start indices and must be replicated over explicit mesh axes; \
+             request an explicit output sharding to resolve placement",
+            ))
         );
     }
 
@@ -1796,9 +1942,77 @@ mod tests {
             Err(TypeError::invalid("`gather` `start_index_map` and `operand_batching_dimensions` must be disjoint"))
         );
         assert_eq!(
-            operation
-                .infer_output_types(&[], &[RegionInterface::new(vec![], vec![], crate::programs::EffectClasses::NONE)]),
+            operation.infer_output_types(&[], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1"))
+        );
+
+        let input = ArrayType::new_static(DataType::F32, [3, 2]);
+        let indices = ArrayType::new_static(DataType::I32, [2, 1]);
+
+        // start_index_map length must equal the index vector extent (here 1, not 2).
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone()], &[]),
+            Err(TypeError::invalid(
+                "`gather` `start_index_map` has length 2 but the index vector extent is 1".to_string()
+            )),
+        );
+
+        // A collapsed axis must have slice size 1.
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![2, 2]);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone()], &[]),
+            Err(TypeError::invalid(
+                "`gather` collapsed slice dimension 0 must have slice size 1 but has 2".to_string()
+            )),
+        );
+
+        // offset_dimensions count must equal the non-collapsed, non-batching input axes (here 1).
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1, 2], vec![0], vec![0]), vec![1, 2]);
+        assert_eq!(
+            operation.infer_output_types(&[input, indices], &[]),
+            Err(TypeError::invalid(
+                "`gather` `offset_dimensions` has length 2 but the input has 1 non-collapsed, non-batching \
+                          axes"
+                    .to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn test_gather_type_inference_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let indices = ArrayType::new_static(DataType::I32, [1, 1]);
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![4]);
+        let expected = ArrayType::new_static(DataType::F32, [1, 4])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated; 2])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(input.gather(&indices, &operation), Ok(expected));
+        assert_eq!(
+            input.gather(&indices, &operation.clone().with_mode(GatherScatterMode::FillOrDrop)),
+            Err(TypeError::invalid("`gather` fill mode does not support unreduced inputs").into())
+        );
+        let distributed_indices = ArrayType::new_static(DataType::I32, [2, 1])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            input.gather(&distributed_indices, &operation),
+            Err(TypeError::invalid("`gather` reduction-state inputs require replicated, invariant indices").into())
         );
     }
 
@@ -1867,60 +2081,33 @@ mod tests {
             Err(TypeError::invalid("`gather` indices cannot carry reduced or unreduced mesh axes").into())
         );
     }
-    #[test]
-    fn test_gather_type_inference_reduction_state() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input = ArrayType::new_static(DataType::F32, [4])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let indices = ArrayType::new_static(DataType::I32, [1, 1]);
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![4]);
-        let expected = ArrayType::new_static(DataType::F32, [1, 4])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated; 2])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(input.gather(&indices, &operation), Ok(expected));
-        assert_eq!(
-            input.gather(&indices, &operation.clone().with_mode(GatherScatterMode::FillOrDrop)),
-            Err(TypeError::invalid("`gather` fill mode does not support unreduced inputs").into())
-        );
-        let distributed_indices = ArrayType::new_static(DataType::I32, [2, 1])
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            input.gather(&distributed_indices, &operation),
-            Err(TypeError::invalid("`gather` reduction-state inputs require replicated, invariant indices").into())
-        );
-    }
 
     #[test]
     fn test_gather_interpretation() {
-        // Interpretation handles each out-of-bounds mode explicitly.
-        let scalar_dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let scalar_indices = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[1, 5]).unwrap();
-        let run = |mode| {
-            Array::vector(vec![10.0, 20.0, 30.0, 40.0])
-                .unwrap()
-                .gather(&scalar_indices, &GatherOperation::new(scalar_dimensions.clone(), vec![1]).with_mode(mode))
-                .unwrap()
-                .to_f64s()
-        };
-        assert_eq!(run(GatherScatterMode::Clip), vec![20.0, 40.0]);
-        assert_eq!(run(GatherScatterMode::PromiseInBounds), vec![20.0, 40.0]);
-        let filled = run(GatherScatterMode::FillOrDrop);
-        assert_eq!(filled[0], 20.0);
-        assert!(filled[1].is_nan());
+        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let input = Array::vector(vec![10.0, 20.0, 30.0, 40.0]).unwrap();
+        let indices = Array::matrix(2, 1, vec![1_i32, 3]).unwrap();
+        let operation = GatherOperation::new(dimensions, vec![1]);
+        let context = EagerContext::<Array>::new();
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), indices]),
+            Ok(vec![Array::vector(vec![20.0, 40.0]).unwrap()])
+        );
+        assert!(matches!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 })
+        ));
+
+        // Clipping moves a complete window in bounds, while fill mode replaces each invalid window.
+        let indices = Array::matrix(2, 1, vec![1_i32, 5]).unwrap();
+        assert_eq!(
+            input.gather(&indices, &operation.clone().with_mode(GatherScatterMode::Clip)),
+            Array::vector(vec![20.0, 40.0])
+        );
+        let filled = input.gather(&indices, &operation.with_mode(GatherScatterMode::FillOrDrop)).unwrap();
+        assert_eq!(filled.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
+        assert_eq!(filled.elements::<f64>().unwrap()[0], 20.0);
+        assert!(filled.elements::<f64>().unwrap()[1].is_nan());
 
         // Slicing and reshaping change the gather window geometry without changing the element type.
         let input = Array::from_elements(
@@ -1944,24 +2131,116 @@ mod tests {
     }
 
     #[test]
+    fn test_gather_interpretation_array_ir() {
+        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
+        let indices = ArrayIrValue::Array(Array::matrix(2, 1, vec![2_i32, 0]).unwrap());
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(
+            input.gather(&indices, &operation),
+            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 10]).unwrap()))
+        );
+        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
+        assert_eq!(
+            input.gather(&dimension, &operation),
+            Err(TypeError::invalid("expected array type but got dimension type").into())
+        );
+        assert_eq!(
+            dimension.gather(&indices, &operation),
+            Err(TypeError::invalid("expected array type but got dimension type").into())
+        );
+
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let staged_input = context.input(input.r#type().into_owned());
+        let staged_indices = context.lift(indices).unwrap();
+        assert_eq!(
+            ValueProjection::<ArrayType>::into_projected(staged_input.clone())
+                .unwrap()
+                .gather(&ValueProjection::<ArrayType>::into_projected(staged_indices.clone()).unwrap(), &operation)
+                .unwrap()
+                .r#type()
+                .into_owned(),
+            ArrayType::new_static(DataType::I32, [2])
+        );
+    }
+
+    #[test]
+    fn test_gather_interpretation_extreme_indices() {
+        let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
+            .with_mode(GatherScatterMode::Clip);
+        assert_eq!(
+            input.gather(&Array::matrix(2, 1, vec![0_u64, u64::MAX]).unwrap(), &operation),
+            Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
+        );
+        assert_eq!(
+            input.gather(&Array::matrix(2, 1, vec![i64::MIN, i64::MAX]).unwrap(), &operation),
+            Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
+        );
+
+        // Adding a window offset to an invalid maximal start must not overflow before the query is filled.
+        let operation = operation.with_mode(GatherScatterMode::FillOrDrop);
+        let signed = input.gather(&Array::matrix(1, 1, vec![i64::MAX]).unwrap(), &operation).unwrap();
+        let unsigned = input.gather(&Array::matrix(1, 1, vec![u64::MAX]).unwrap(), &operation).unwrap();
+        assert_eq!(signed, unsigned);
+        assert_eq!(signed, Array::matrix(1, 2, vec![i32::MIN, i32::MIN]).unwrap());
+    }
+
+    #[test]
+    fn test_gather_interpretation_layouts_and_element_types() {
+        // Gather rows 2 and 0 of a 3x2 matrix.
+        let input = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let indices = Array::matrix(2, 1, vec![2i64, 0]).unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        let gathered = input.gather(&indices, &operation).unwrap();
+        assert_eq!(gathered.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
+        assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
+
+        // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
+        // represent zero.
+        let input = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
+        let indices = Array::matrix(1, 1, vec![1i64]).unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(
+            input.gather(&indices, &operation),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80])
+        );
+
+        // Gather reads both a reversed input and reversed sub-byte indices through their physical addressing. An
+        // out-of-bounds query in fill-or-drop mode writes the default unsigned maximum into the dense result.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[10u16, 20, 30]).unwrap();
+        let indices_type =
+            ArrayType::new_static(DataType::I4, [3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+        let indices =
+            Array::from_elements(indices_type, &[i4::new(2).unwrap(), i4::new(-1).unwrap(), i4::new(1).unwrap()])
+                .unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+            .with_mode(GatherScatterMode::FillOrDrop);
+        let gathered = input.gather(&indices, &operation).unwrap();
+        assert_eq!(gathered.elements::<u16>(), Ok(vec![30, u16::MAX, 20]));
+        assert_eq!(gathered.storage_bytes(), [30, 0, 255, 255, 20, 0]);
+    }
+
+    #[test]
     fn test_gather_partial_evaluation() {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         // Partial evaluation folds fully known gathers and residualizes an unknown data input with known indices.
-        let operand_value = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        let indices_value = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap();
+        let input_value = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let indices_value = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
         let expected = Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
             operation = operation.clone(),
             cases = [
                 {
-                    inputs = [(@known, operand_value.clone()), (@known, indices_value.clone())],
+                    inputs = [(@known, input_value.clone()), (@known, indices_value.clone())],
                     outputs = [(@known, expected.clone())],
                     residual_instructions = 0,
                 },
                 {
                     inputs = [
-                        (@unknown(type = operand_value.r#type().into_owned(), replay = operand_value.clone())),
+                        (@unknown(type = input_value.r#type().into_owned(), replay = input_value.clone())),
                         (@known, indices_value.clone()),
                     ],
                     outputs = [(@residual, expected)],
@@ -1974,7 +2253,7 @@ mod tests {
     #[test]
     fn test_gather_batching() {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let indices_value = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap();
+        let indices_value = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
         // Dimension-number lifting preserves item boundaries without expanding one operation per item.
         check_operation_batching!(
             @exact,
@@ -2026,14 +2305,20 @@ mod tests {
                 {
                     inputs = [
                         (@replicated, Array::vector(vec![1_f64, 2., 3.]).unwrap()),
-                        (@mapped(axis = 0), Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2_i32, 0, 1, 1]).unwrap()),
+                        (@mapped(axis = 0), Array::from_elements(
+                            ArrayType::new_static(DataType::I32, [2, 2, 1]),
+                            &[2_i32, 0, 1, 1],
+                        ).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![3_f64, 1., 2., 2.]).unwrap())],
                 },
                 {
                     inputs = [
                         (@mapped(axis = 1), Array::matrix(3, 2, vec![1_f64, 4., 2., 5., 3., 6.]).unwrap()),
-                        (@mapped(axis = 0), Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2_i32, 0, 1, 1]).unwrap()),
+                        (@mapped(axis = 0), Array::from_elements(
+                            ArrayType::new_static(DataType::I32, [2, 2, 1]),
+                            &[2_i32, 0, 1, 1],
+                        ).unwrap()),
                     ],
                     outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![3_f64, 1., 5., 5.]).unwrap())],
                 },
@@ -2047,10 +2332,17 @@ mod tests {
             axis_size = 0,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [0, 3]), Vec::new()).unwrap()),
-                    (@mapped(axis = 0), Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap()),
+                    (@mapped(axis = 0), Array::new(
+                        ArrayType::new_static(DataType::F8E8M0FNU, [0, 3]), Vec::new(),
+                    ).unwrap()),
+                    (@mapped(axis = 0), Array::from_elements(
+                        ArrayType::new_static(DataType::I32, [0, 1, 1]),
+                        &[] as &[i32],
+                    ).unwrap()),
                 ],
-                outputs = [(@mapped(axis = 0), Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [0, 1]), Vec::new()).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::new(
+                    ArrayType::new_static(DataType::F8E8M0FNU, [0, 1]), Vec::new(),
+                ).unwrap())],
             }],
         );
 
@@ -2136,11 +2428,11 @@ mod tests {
     fn test_gather_differentiation() {
         // Forward mode selects the input coordinate feeding each gathered output.
         let jacobian = differentiate_at(Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap())
-            .jacobian_forward(|operand| {
-                let indices = index_array(&operand, vec![2, 1], vec![0, 2]);
+            .jacobian_forward(|input| {
+                let indices = index_array(&input, vec![2, 1], vec![0, 2]);
                 let operation =
                     GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                Ok(operand.gather(&indices, &operation).unwrap())
+                Ok(input.gather(&indices, &operation).unwrap())
             })
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -2179,207 +2471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_transposition() {
-        // Take rows 0 and 2 of a [3, 2] input: the input is linear and the [2, 1] index array is the known
-        // input. The gathered output and its cotangent have shape [2, 2].
-        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
-        let operation = GatherOperation::new(dimensions, vec![1, 2]);
-        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let indices = Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap();
-        let cotangent = Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]).unwrap();
-        check_operation_transposition!(
-            @exact,
-            backend = (Array, TestGatherOperation<Array>),
-            operation = operation,
-            cases = [{
-                inputs = [
-                    (@linear(type = operand.r#type().into_owned())),
-                    (@known, indices),
-                ],
-                output_cotangents = [cotangent],
-                input_cotangents = [Array::matrix(3, 2, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]).unwrap()],
-            }],
-        );
-
-        // The transpose explicitly restores the input's distribution even when the forward gather requested a
-        // different output placement. Scatter's zero base also preserves input strides and host memory.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
-        for (dimension, sharding) in [
-            (Dimension::Static(4), None),
-            (Dimension::Static(4), Some(sharded.clone())),
-            (Dimension::Dynamic(extent.clone()), None),
-            (Dimension::Dynamic(extent), Some(sharded)),
-        ] {
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dimension]))
-                .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
-                .with_memory(Memory::Host { pinned: true })
-                .with_sharding(sharding)
-                .unwrap();
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let input = builder.add_input(input_type.clone().into());
-            let indices = builder.add_constant(ArrayIrValue::Array(
-                Array::from_elements(
-                    ArrayType::new_static(DataType::I32, [2, 1]).with_memory(Memory::Host { pinned: true }),
-                    &[1_i32, 3],
-                )
-                .unwrap(),
-            ));
-            let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1])
-                .with_output_sharding(Sharding::replicated(mesh.clone(), 1));
-            let output = builder
-                .add_instruction(
-                    ArrayIrOperation::Array(ArrayOperation::Gather(operation)),
-                    Vec::new(),
-                    vec![input, indices],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            assert_eq!(
-                program.linearize().unwrap().pullback().unwrap().output_types(),
-                vec![ArrayIrType::Array(input_type.cotangent().unwrap())]
-            );
-        }
-    }
-
-    // The homogeneous gather transpose scatters into a zero of the input's cotangent type, and the homogeneous
-    // `ArrayType` family has no constructor that can supply a runtime extent for one. A dynamically shaped input is
-    // therefore part of the rule's rejected contract rather than an accident of zero construction.
-    #[test]
-    fn test_gather_transposition_rejects_dynamic_operand_shapes() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(4, Some(8)).unwrap());
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]));
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let operand = builder.add_input(dynamic_type);
-        let indices = builder.add_constant(Array::from_elements::<i32>(indices_type(vec![2, 1]), &[0, 2]).unwrap());
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let output = builder.add_instruction(operation, Vec::new(), vec![operand, indices], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        assert_eq!(
-            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
-            TypeError::invalid("`gather` transpose requires a statically shaped operand but got f32[rows, 2]").into(),
-        );
-    }
-    #[test]
-    fn test_gather_dimension_numbers() {
-        let operand = float_type(vec![3, 2]);
-        let indices = indices_type(vec![2, 1]);
-
-        // start_index_map length must equal the index vector extent (here 1, not 2).
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
-        assert_eq!(
-            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
-            Err(TypeError::invalid(
-                "`gather` start_index_map has length 2 but the index vector extent is 1".to_string()
-            )),
-        );
-
-        // A collapsed axis must have slice size 1.
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![2, 2]);
-        assert_eq!(
-            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
-            Err(TypeError::invalid(
-                "`gather` collapsed slice dimension 0 must have slice size 1 but has 2".to_string()
-            )),
-        );
-
-        // offset_dimensions count must equal the non-collapsed, non-batching input axes (here 1).
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1, 2], vec![0], vec![0]), vec![1, 2]);
-        assert_eq!(
-            operation.infer_output_types(&[operand, indices], &[]),
-            Err(TypeError::invalid(
-                "`gather` offset_dimensions has length 2 but the operand has 1 non-collapsed, non-batching \
-                          axes"
-                    .to_string()
-            )),
-        );
-    }
-
-    #[test]
-    fn test_array_type_gather() {
-        let exact = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(1)).unwrap()));
-        let operation = GatherOperation::new(
-            GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
-            vec![0, 1],
-        );
-        // Specialization can retain an exact nominal dimension on one side of a paired batch while the other is
-        // already static. Both descriptions prove the same extent without equating unrelated symbolic dimensions.
-        for input_batch in [Dimension::Static(0), exact.clone()] {
-            for query_batch in [Dimension::Static(0), exact.clone()] {
-                let input = ArrayType::new(DataType::F64, Shape::new(vec![input_batch.clone(), Dimension::Static(4)]));
-                let indices = ArrayType::new(
-                    DataType::I32,
-                    Shape::new(vec![query_batch.clone(), Dimension::Static(2), Dimension::Static(1)]),
-                );
-                assert_eq!(
-                    input.gather(&indices, &operation).unwrap().shape(),
-                    &Shape::new(vec![query_batch, Dimension::Static(2)])
-                );
-            }
-        }
-        let input = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![
-                Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap())),
-                Dimension::Static(4),
-            ]),
-        );
-        let indices = ArrayType::new(
-            DataType::I32,
-            Shape::new(vec![
-                Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(3)).unwrap())),
-                Dimension::Static(2),
-                Dimension::Static(1),
-            ]),
-        );
-        assert!(matches!(input.gather(&indices, &operation), Err(ProgramError::Type(_))));
-
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        // Operand [4, 2] sharded only on the feature axis (axis 1); axis 0 (indexed by the start index) is replicated.
-        let operand = float_type(vec![4, 2])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
-                    .unwrap(),
-            )
-            .unwrap();
-        let indices = indices_type(vec![3, 1]);
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
-        let output = operation.infer_output_types(&[operand, indices], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().unwrap().dimensions(),
-            &[ShardingDimension::Replicated, ShardingDimension::sharded(["y"])],
-        );
-
-        // Sharding the start-indexed input axis over an explicit mesh axis is ambiguous without an output sharding.
-        let operand = float_type(vec![4, 2])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap(),
-            )
-            .unwrap();
-        let indices = indices_type(vec![3, 1]);
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand, indices], &[]).is_err());
-    }
-
-    #[test]
-    fn test_array_ir_gather_differentiation() {
+    fn test_gather_differentiation_array_ir() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(6)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)]));
@@ -2419,7 +2511,15 @@ mod tests {
                 ArrayIrType::Dimension(DimensionType::new(extent)),
             ],
         );
-        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=2]"));
+        assert_eq!(
+            linearization
+                .tangent()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["linear_call"],
+        );
         let indices = ArrayIrValue::Array(Array::from_elements::<i32>(indices_type, &[1, 1, 3]).unwrap());
         let mut primal_outputs = linearization
             .primal()
@@ -2493,136 +2593,101 @@ mod tests {
     }
 
     #[test]
-    fn test_array_gather() {
-        // Gather rows 2 and 0 of a 3x2 matrix.
-        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let indices = Array::matrix(2, 1, vec![2i64, 0]).unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let gathered = operand.gather(&indices, &operation).unwrap();
-        assert_eq!(gathered.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
-        assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
-
-        // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
-        // represent zero.
-        let operand = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
-        let indices = Array::matrix(1, 1, vec![1i64]).unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
-        assert_eq!(
-            operand.gather(&indices, &operation),
-            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80])
+    fn test_gather_transposition() {
+        // Take rows 0 and 2 of a [3, 2] input: the input is linear and the [2, 1] index array is the known
+        // input. The gathered output and its cotangent have shape [2, 2].
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        let operation = GatherOperation::new(dimensions, vec![1, 2]);
+        let input = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
+        let cotangent = Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            backend = (Array, ArrayOperation<Array>),
+            operation = operation,
+            cases = [{
+                inputs = [
+                    (@linear(type = input.r#type().into_owned())),
+                    (@known, indices),
+                ],
+                output_cotangents = [cotangent],
+                input_cotangents = [Array::matrix(3, 2, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]).unwrap()],
+            }],
         );
 
-        // Gather reads both a reversed input and reversed sub-byte indices through their physical addressing. An
-        // out-of-bounds query in fill-or-drop mode writes the default unsigned maximum into the dense result.
-        let operand_type =
-            ArrayType::new_static(DataType::U16, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
-        let operand = Array::from_elements(operand_type, &[10u16, 20, 30]).unwrap();
-        let indices_type =
-            ArrayType::new_static(DataType::I4, [3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
-        let indices =
-            Array::from_elements(indices_type, &[i4::new(2).unwrap(), i4::new(-1).unwrap(), i4::new(1).unwrap()])
+        // The transpose explicitly restores the input's distribution even when the forward gather requested a
+        // different output placement. Scatter's zero base also preserves input strides and host memory.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
+        for (dimension, sharding) in [
+            (Dimension::Static(4), None),
+            (Dimension::Static(4), Some(sharded.clone())),
+            (Dimension::Dynamic(extent.clone()), None),
+            (Dimension::Dynamic(extent), Some(sharded)),
+        ] {
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dimension]))
+                .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
+                .with_memory(Memory::Host { pinned: true })
+                .with_sharding(sharding)
                 .unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
-            .with_mode(GatherScatterMode::FillOrDrop);
-        let gathered = operand.gather(&indices, &operation).unwrap();
-        assert_eq!(gathered.elements::<u16>(), Ok(vec![30, u16::MAX, 20]));
-        assert_eq!(gathered.storage_bytes(), [30, 0, 255, 255, 20, 0]);
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let indices = builder.add_constant(ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::I32, [2, 1]).with_memory(Memory::Host { pinned: true }),
+                    &[1_i32, 3],
+                )
+                .unwrap(),
+            ));
+            let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1])
+                .with_output_sharding(Sharding::replicated(mesh.clone(), 1));
+            let output = builder
+                .add_instruction(
+                    ArrayIrOperation::Array(ArrayOperation::Gather(operation)),
+                    Vec::new(),
+                    vec![input, indices],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                program.linearize().unwrap().pullback().unwrap().output_types(),
+                vec![ArrayIrType::Array(input_type.cotangent().unwrap())]
+            );
+        }
     }
 
     #[test]
-    fn test_array_gather_extreme_indices() {
-        let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
-            .with_mode(GatherScatterMode::Clip);
-        assert_eq!(
-            input.gather(&Array::matrix(2, 1, vec![0_u64, u64::MAX]).unwrap(), &operation),
-            Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
-        );
-        assert_eq!(
-            input.gather(&Array::matrix(2, 1, vec![i64::MIN, i64::MAX]).unwrap(), &operation),
-            Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
-        );
+    fn test_gather_transposition_dynamic_input_shapes() {
+        // The homogeneous gather transpose scatters into a zero of the input's cotangent type, and the homogeneous
+        // `ArrayType` family has no constructor that can supply a runtime extent for one. A dynamically shaped input is
+        // therefore part of the rule's rejected contract rather than an accident of zero construction.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(4, Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]));
 
-        // Adding a window offset to an invalid maximal start must not overflow before the query is filled.
-        let operation = operation.with_mode(GatherScatterMode::FillOrDrop);
-        let signed = input.gather(&Array::matrix(1, 1, vec![i64::MAX]).unwrap(), &operation).unwrap();
-        let unsigned = input.gather(&Array::matrix(1, 1, vec![u64::MAX]).unwrap(), &operation).unwrap();
-        assert_eq!(signed, unsigned);
-        assert_eq!(signed, Array::matrix(1, 2, vec![i32::MIN, i32::MIN]).unwrap());
-    }
-
-    #[test]
-    fn test_array_ir_gather() {
-        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
-        let indices = ArrayIrValue::Array(Array::matrix(2, 1, vec![2_i32, 0]).unwrap());
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type);
+        let indices = builder.add_constant(Array::matrix(2, 1, vec![0_i32, 2]).unwrap());
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, indices], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            input.gather(&indices, &operation),
-            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 10]).unwrap()))
-        );
-        let dimension = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
-        assert_eq!(
-            input.gather(&dimension, &operation),
-            Err(TypeError::invalid("expected array type but got dimension type").into())
-        );
-        assert_eq!(
-            dimension.gather(&indices, &operation),
-            Err(TypeError::invalid("expected array type but got dimension type").into())
-        );
-
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let staged_input = context.input(input.r#type().into_owned());
-        let staged_indices = context.lift(indices).unwrap();
-        assert_eq!(
-            ValueProjection::<ArrayType>::into_projected(staged_input.clone())
-                .unwrap()
-                .gather(&ValueProjection::<ArrayType>::into_projected(staged_indices.clone()).unwrap(), &operation)
-                .unwrap()
-                .r#type()
-                .into_owned(),
-            ArrayType::new_static(DataType::I32, [2])
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
+            TypeError::invalid("`gather` transpose requires a statically shaped input but got `f32[rows, 2]`").into(),
         );
     }
 
     #[test]
-    fn test_gather_resolved_fill_value() {
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
-        assert_eq!(operation.resolved_fill_value(DataType::I64), Array::scalar(i64::MIN));
-        assert_eq!(operation.resolved_fill_value(DataType::U64), Array::scalar(u64::MAX));
-        assert_eq!(operation.resolved_fill_value(DataType::Boolean), Array::scalar(true));
-        assert_eq!(operation.resolved_fill_value(DataType::I1), Array::scalar(i1::new(-1).unwrap()));
-        assert_eq!(operation.resolved_fill_value(DataType::U4), Array::scalar(u4::new(15).unwrap()));
-        assert!(operation.resolved_fill_value(DataType::F32).unwrap().elements::<f32>().unwrap()[0].is_nan());
-        let complex = operation
-            .resolved_fill_value(DataType::C64)
-            .unwrap()
-            .elements::<num_complex::Complex<f32>>()
-            .unwrap()[0];
-        assert!(complex.re.is_nan());
-        assert_eq!(complex.im, 0.0);
-
-        // Explicit NaN payloads survive operation cloning and eager filling without numeric conversion.
-        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
-        let operation = operation.with_mode(GatherScatterMode::FillOrDrop).with_fill_value(fill.clone()).unwrap();
-        assert_eq!(operation.fill_value().unwrap().storage_bytes(), fill.storage_bytes());
-        assert_eq!(operation.resolved_fill_value(DataType::F32).unwrap().storage_bytes(), fill.storage_bytes());
-        assert_eq!(
-            operation.resolved_fill_value(DataType::I32),
-            Err(TypeError::invalid("`gather` fill data type `f32` does not match input data type `i32`").into())
-        );
-        let output = Array::vector(vec![1.0_f32])
-            .unwrap()
-            .gather(&Array::matrix(1, 1, vec![2_i32]).unwrap(), &operation)
-            .unwrap();
-        assert_eq!(output.storage_bytes(), fill.storage_bytes());
-        assert_eq!(
-            operation.clone().with_fill_value(Array::vector(vec![1.0_f32]).unwrap()),
-            Err(TypeError::invalid("`gather` fill value must be a numeric or Boolean scalar"))
-        );
-    }
-
-    #[test]
-    fn test_array_gather_axis() {
+    fn test_gather_gather_axis() {
         let input = Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(
             input.gather_axis(&Array::vector(vec![2_i32, 0]).unwrap(), -1, GatherScatterMode::Clip),
@@ -2780,5 +2845,50 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn test_dimensions_have_equal_extents() {
+        let variable = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic = Dimension::Dynamic(variable);
+        let independent = Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap()));
+        let exact = Dimension::Dynamic(DimensionVariable::new("exact", DimensionBounds::new(3, Some(4)).unwrap()));
+        assert!(dimensions_have_equal_extents(&dynamic, &dynamic));
+        assert!(!dimensions_have_equal_extents(&dynamic, &independent));
+        assert!(dimensions_have_equal_extents(&exact, &Dimension::Static(3)));
+        assert!(dimensions_have_equal_extents(&Dimension::Static(3), &exact));
+        assert!(!dimensions_have_equal_extents(&exact, &Dimension::Static(4)));
+    }
+
+    #[test]
+    fn test_validate_sorted_unique_in_range() {
+        assert_eq!(validate_sorted_unique_in_range("gather", "axes", &[], 0), Ok(()));
+        assert_eq!(validate_sorted_unique_in_range("gather", "axes", &[0, 2], 3), Ok(()));
+        assert_eq!(
+            validate_sorted_unique_in_range("gather", "axes", &[2, 0], 3),
+            Err(TypeError::invalid("`gather` `axes` must be sorted and unique but got [2, 0]"))
+        );
+        assert_eq!(
+            validate_sorted_unique_in_range("gather", "axes", &[0, 0], 3),
+            Err(TypeError::invalid("`gather` `axes` must be sorted and unique but got [0, 0]"))
+        );
+        assert_eq!(
+            validate_sorted_unique_in_range("gather", "axes", &[3], 3),
+            Err(TypeError::invalid("`gather` `axes` entry 3 is out of range for bound 3"))
+        );
+    }
+
+    #[test]
+    fn test_validate_unique_in_range() {
+        assert_eq!(validate_unique_in_range("gather", "axes", &[], 0), Ok(()));
+        assert_eq!(validate_unique_in_range("gather", "axes", &[2, 0], 3), Ok(()));
+        assert_eq!(
+            validate_unique_in_range("gather", "axes", &[0, 0], 3),
+            Err(TypeError::invalid("`gather` `axes` must be unique but got [0, 0]"))
+        );
+        assert_eq!(
+            validate_unique_in_range("gather", "axes", &[3], 3),
+            Err(TypeError::invalid("`gather` `axes` entry 3 is out of range for bound 3"))
+        );
     }
 }

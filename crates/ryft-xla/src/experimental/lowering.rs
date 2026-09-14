@@ -21054,7 +21054,7 @@ mod tests {
         assert_eq!(
             builder.add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second], None),
             Err(ProgramError::Type(TypeError::invalid(
-                "`concatenate` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`concatenate` dynamic axis 0 requires an explicit result-dimension input".to_string(),
             ))),
         );
 
@@ -21175,7 +21175,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program.transpose().unwrap_err().to_string(),
-            "`concatenate` transpose requires a static size on axis 1 but operand 0 has size columns",
+            "`concatenate` transpose requires a static size on axis 1 but input 0 has size columns",
         );
     }
 
@@ -21565,7 +21565,7 @@ mod tests {
                 None
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`pad` dynamic axis 0 requires an explicit result-dimension input".to_string(),
             ))),
         );
     }

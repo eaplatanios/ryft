@@ -702,20 +702,6 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
-        Self::Concatenate(operation.into())
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: PadOperation<ArrayType>) -> Self {
-        Self::Pad(operation.into())
-    }
-}
-
 // Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
 // `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family lifts
 // the type-generic add into the homogeneous array member that owns elementwise addition. The source payload is

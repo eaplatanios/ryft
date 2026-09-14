@@ -1,3 +1,9 @@
+//! Array broadcasting through static output types or explicit first-class output dimensions.
+//!
+//! [`Broadcast`] carries resolved output geometry in its operation, while [`DynamicBroadcast`] keeps each output
+//! dimension available as a value. Both capabilities replicate singleton axes and route input axes to distinct output
+//! axes, preserving element values and memory placement.
+
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -47,13 +53,13 @@ pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
 /// [`Operation`] that performs general N-dimensional broadcasting over the homogeneous array language.
 ///
 /// This is the member-family broadcast primitive: complete output geometry is carried by the [`ArrayType`] metadata
-/// stored in the operation payload, so the operation has exactly one operand and no explicit extent edges. It and
+/// stored in the operation payload, so the operation has exactly one input and no explicit extent edges. It and
 /// [`ReshapeOperation`] form the homogeneous baseline that [`ProjectedContext`](crate::contexts::ProjectedContext)
-/// serves, which is why transform rules for mixed operations can delegate to them once operand geometry is resolved.
+/// serves, which is why transform rules for mixed operations can delegate to them once input geometry is resolved.
 /// Refer to the documentation of [`Broadcast`] for the underlying resolved-geometry contract.
 ///
-/// Programs that need first-class dynamic extents stage [`DynamicBroadcastOperation`] instead, which takes one
-/// explicit first-class dimension operand per output axis.
+/// Programs that need first-class dynamic extents stage [`DynamicBroadcastOperation`] instead, which takes one explicit
+/// first-class dimension input per output axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BroadcastOperation {
     /// Output [`ArrayType`].
@@ -76,8 +82,8 @@ impl BroadcastOperation {
         &self.output_type
     }
 
-    /// Returns the output axes of this [`BroadcastOperation`]. The resulting slice contains, for each input axis,
-    /// the output axis that it maps to.
+    /// Returns the output axes of this [`BroadcastOperation`]. The resulting slice contains, for each input axis, the
+    /// output axis that it maps to.
     #[inline]
     pub fn output_axes(&self) -> &[usize] {
         self.output_axes.as_slice()
@@ -204,7 +210,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
             Some(batch_axis) => {
                 // Insert the mapped axis at the same physical output position and shift every existing broadcast-axis
                 // mapping at or after that position around it.
-                let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
+                let axis_size = ArrayBatch::common_batch_size(inputs)?.unwrap();
                 let mut output_type =
                     self.output_type().with_inserted_dimension(batch_axis, Dimension::Static(axis_size))?;
                 let mut output_axes = self
@@ -311,32 +317,30 @@ impl_differentiable_operation! {
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 return Ok(());
             };
-            {
-                let contribution = MaybeZero::Value(
-                    cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
-                );
-                accumulators[0].accumulate(context, contribution)?;
-                Ok(())
-            }
+            let contribution = MaybeZero::Value(
+                cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
+            );
+            accumulators[0].accumulate(context, contribution)?;
+            Ok(())
         }
     },
 }
 
 /// Replicates an array along new axes or expands axes of size one to a requested output shape. Input axis `i` maps to
 /// output axis `output_axes[i]`; axes need not stay in increasing order, but each input axis must map to a distinct
-/// output axis. A mapped extent must equal its input extent or expand a static size-one axis to a static size. New
-/// axes must have static sizes. An existing dynamic extent can pass through unchanged; replication into a dynamic
-/// extent requires [`DynamicBroadcast`] so that its size is available as a value.
+/// output axis. A mapped extent must equal its input extent or expand a static size-one axis to a static size. New axes
+/// must have static sizes. An existing dynamic extent can pass through unchanged; replication into a dynamic extent
+/// requires [`DynamicBroadcast`] so that its size is available as a value.
 ///
 /// Broadcasting preserves the element type and memory space. The primitive accepts the complete output [`ArrayType`],
 /// including its layout and sharding. The convenience functions infer output sharding from the input axis mapping and
-/// clear the physical layout when the shape changes, since replication does not determine an output storage layout.
-/// An identity broadcast with unchanged metadata passes the input through unchanged.
+/// clear the physical layout when the shape changes, since replication does not determine an output storage layout. An
+/// identity broadcast with unchanged metadata passes the input through unchanged.
 ///
 /// [`Broadcast`] fills the same role for [`BroadcastOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
 /// their corresponding arithmetic [`Operation`]s. It also operates on [`ArrayType`] to validate output geometry without
-/// computing array values. The geometry is stored in the operation rather than supplied through dimension operands,
-/// allowing mixed-operation transform rules to use this capability once their operand extents have been resolved.
+/// computing array values. The geometry is stored in the operation rather than supplied through dimension inputs,
+/// allowing mixed-operation transform rules to use this capability once their input extents have been resolved.
 ///
 /// # Examples
 ///
@@ -352,9 +356,9 @@ impl_differentiable_operation! {
 /// ```
 pub trait Broadcast: Sized {
     /// Replicates or reorders the axes of `self` into the supplied output type. Mapped axes must have equal extents,
-    /// except that a static input extent of one may expand to any static output extent, including zero. Unmapped
-    /// output axes replicate the entire input and must have static extents. Invalid mappings, incompatible extents,
-    /// or a change of element type or memory space yield a [`TypeError`].
+    /// except that a static input extent of one may expand to any static output extent, including zero. Unmapped output
+    /// axes replicate the entire input and must have static extents. Invalid mappings, incompatible extents, or a
+    /// change of element type or memory space yield a [`TypeError`].
     ///
     /// # Parameters
     ///
@@ -372,8 +376,8 @@ pub trait Broadcast: Sized {
     /// # Parameters
     ///
     ///   - `output_shape`: Desired result shape. For example, broadcasting `[3]` to `[2, 3]` repeats the input as two
-    ///     rows. Dynamic extents may only preserve identical input extents; use [`DynamicBroadcast::dynamic_broadcast_to`]
-    ///     when a replication count is supplied by a dimension value.
+    ///     rows. Dynamic extents may only preserve identical input extents; use
+    ///     [`DynamicBroadcast::dynamic_broadcast_to`] when a replication count is supplied by a dimension value.
     #[inline]
     fn broadcast_to<S: Into<Shape>>(&self, output_shape: S) -> Result<Self, ProgramError>
     where
@@ -427,9 +431,9 @@ pub trait Broadcast: Sized {
         self.broadcast(output_type, &output_axes)
     }
 
-    /// Replicates `self` along new leading axes, preserving all existing axes and their extents. This is equivalent
-    /// to [`Broadcast::broadcast_to`] with the leading shape followed by the input shape. An empty leading shape
-    /// leaves the input unchanged. New axes have replicated sharding; existing sharding follows the shifted axes.
+    /// Replicates `self` along new leading axes, preserving all existing axes and their extents. This is equivalent to
+    /// [`Broadcast::broadcast_to`] with the leading shape followed by the input shape. An empty leading shape leaves
+    /// the input unchanged. New axes have replicated sharding; existing sharding follows the shifted axes.
     ///
     /// # Parameters
     ///
@@ -467,7 +471,8 @@ pub trait Broadcast: Sized {
 
     /// Broadcasts every input to their common shape, preserving input order and each input's element type and memory
     /// space. Only shapes are combined: this function performs no numeric promotion. Each result's layout and sharding
-    /// follow [`Self::broadcast_to`]. Empty input returns an empty vector, and incompatible shapes return a [`TypeError`].
+    /// follow [`Self::broadcast_to`]. Empty input returns an empty vector, and incompatible shapes return a
+    /// [`TypeError`].
     ///
     /// # Example
     ///
@@ -485,8 +490,8 @@ pub trait Broadcast: Sized {
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Values to align by their trailing axes. Dimension sizes must match or expand a size-one axis.
-    ///     Use [`DynamicBroadcast::dynamic_broadcast_arrays`] when replication needs runtime dimension values.
+    ///   - `inputs`: Values to align by their trailing axes. Dimension sizes must match or expand a size-one axis. Use
+    ///     [`DynamicBroadcast::dynamic_broadcast_arrays`] when replication needs runtime dimension values.
     fn broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
@@ -602,6 +607,48 @@ impl Broadcast for ArrayType {
     }
 }
 
+impl Broadcast for Array {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = self.r#type().broadcast(output_type, output_axes)?;
+        let Some(target_shape) = r#type.static_shape() else {
+            return Err(TypeError::invalid(format!(
+                "cannot materialize a value of dynamically sized type `{}`",
+                r#type
+            ))
+            .into());
+        };
+        if &r#type == self.r#type().as_ref() && output_axes.iter().copied().eq(0..r#type.rank()) {
+            return Ok(self.clone());
+        }
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_rank = input_shape.rank();
+        let target_rank = target_shape.rank();
+        let output_count = Self::materialized_element_count(&r#type)?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(r#type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        // Structural-zero elements need no storage, regardless of the logical replication count.
+        if bytes.is_empty() {
+            return Ok(Self::new_unchecked(r#type, Arc::new(bytes)));
+        }
+        let mut target_index = vec![0usize; target_rank];
+        let mut input_index = vec![0usize; input_rank];
+        // Traverse output coordinates in logical order. Singleton input axes always read coordinate zero, while
+        // every other input axis reads its mapped output coordinate. Addressing handles both physical layouts, and
+        // byte copies preserve exact encodings even for complex and low-precision elements.
+        for output_flat in 0..output_count {
+            for input_axis in 0..input_rank {
+                let target_axis = output_axes[input_axis];
+                input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
+            }
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut target_index);
+        }
+        Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
+    }
+}
+
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
     Broadcast for V
 {
@@ -621,12 +668,12 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-/// Mixed [`Operation`] that broadcasts one array using one explicit first-class dimension operand per output axis.
+/// Mixed [`Operation`] that broadcasts one array using one explicit first-class dimension input per output axis.
 ///
-/// Operand zero is the array. Every remaining operand describes the corresponding output-axis extent, in order.
-/// Exact dimension types produce static axes while non-exact dimension types retain their variables as dynamic axes.
-/// `output_axes[input_axis]` names the output axis to which that input axis maps.
-/// Refer to [`DynamicBroadcast`] for the underlying array broadcasting semantics.
+/// Input zero is the array. Every remaining input describes the corresponding output-axis extent, in order. Exact
+/// dimension types produce static axes while non-exact dimension types retain their variables as dynamic axes.
+/// `output_axes[input_axis]` names the output axis to which that input axis maps. Refer to [`DynamicBroadcast`] for the
+/// underlying array broadcasting semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicBroadcastOperation {
     /// Vector that contains, for each input axis, the output axis to which it maps.
@@ -673,11 +720,11 @@ impl DynamicBroadcastOperation {
 
     /// Returns this operation with the requested physical output `layout`.
     ///
-    /// Layout rank and structure are validated during type inference. Storage geometry depending on dynamic extents
-    /// is validated once their runtime values are available. Without an explicit layout, shape-changing broadcasts
-    /// use the default layout; identity broadcasts preserve the input layout. Mapped batching supports tiled layouts
-    /// by placing the batch axis outside each item's storage. Explicit strided layouts currently support replicated
-    /// batching only, because a leading batch stride can depend on runtime output sizes.
+    /// Layout rank and structure are validated during type inference. Storage geometry depending on dynamic extents is
+    /// validated once their runtime values are available. Without an explicit layout, shape-changing broadcasts use the
+    /// default layout; identity broadcasts preserve the input layout. Mapped batching supports tiled layouts by placing
+    /// the batch axis outside each item's storage. Explicit strided layouts currently support replicated batching only,
+    /// because a leading batch stride can depend on runtime output sizes.
     #[inline]
     pub fn with_output_layout(mut self, layout: impl Into<Option<Layout>>) -> Self {
         self.output_layout = layout.into();
@@ -732,6 +779,8 @@ impl Operation for DynamicBroadcastOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicBroadcastOperation);
 
+// Resolve dimension inputs before invoking the homogeneous capability: the operation's optional output layout
+// belongs to the complete ArrayType accepted by Broadcast, while DynamicBroadcast exposes inferred layout only.
 impl<C> InterpretableOperation<C> for DynamicBroadcastOperation
 where
     C: Domain<Type = ArrayIrType>,
@@ -791,7 +840,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
                 .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?
                 == vec![input.r#type().into_owned()]
         {
-            // A static identity broadcast cannot observe its exact dimension operands. Preserve the input directly
+            // A static identity broadcast cannot observe its exact dimension inputs. Preserve the input directly
             // so an unknown array does not leave a redundant broadcast in the residual program.
             return Ok(vec![input.clone()]);
         }
@@ -799,10 +848,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
     }
 }
 
-/// Batching rule for [`DynamicBroadcastOperation`]. A mapped input is canonicalized to a leading batch axis, which is
-/// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its
-/// declared finite bound as physical packed storage and records its per-item extent vector as transform-owned ragged
-/// metadata; replicated extents retain their existing first-class representation.
+// Batching rule for [`DynamicBroadcastOperation`]. A mapped input is canonicalized to a leading batch axis, which is
+// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its
+// declared finite bound as physical packed storage and records its per-item extent vector as transform-owned ragged
+// metadata; replicated extents retain their existing first-class representation.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicBroadcastOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -915,7 +964,9 @@ where
 
         if matches!(self.output_layout(), Some(Layout::Strided(_))) {
             return Err(BatchingError::InvalidBatchMetadata {
-                message: "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch stride, which is not supported".to_owned(),
+                message: "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch \
+                     stride, which is not supported"
+                    .to_owned(),
             });
         }
         let moved_input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
@@ -979,7 +1030,6 @@ where
         let mut ragged_axes = moved_input
             .ragged_axes()
             .iter()
-            .cloned()
             .map(|ragged_axis| {
                 let axis = if ragged_axis.axis() == 0 { 0 } else { self.output_axes()[ragged_axis.axis() - 1] + 1 };
                 let extent_axes = ragged_axis
@@ -1004,9 +1054,9 @@ where
     }
 }
 
-/// Forward-mode rule for mixed broadcast. The explicit output extents are ordinary non-differentiated shape values.
-/// Exact input geometry replays the mixed broadcast directly; dynamic input geometry retains its exact extents so the
-/// linear transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
+// Forward-mode rule for mixed broadcast. The explicit output extents are ordinary non-differentiated shape values.
+// Exact input geometry replays the mixed broadcast directly; dynamic input geometry retains its exact extents so the
+// linear transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
 impl<C> DifferentiableOperation<C> for DynamicBroadcastOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -1054,9 +1104,8 @@ where
                         .dimensions()
                         .iter()
                         .zip(output_extents)
-                        .filter_map(|(dimension, extent)| {
-                            matches!(dimension, Dimension::Dynamic(_)).then(|| extent.primal().clone())
-                        })
+                        .filter(|(dimension, _)| matches!(dimension, Dimension::Dynamic(_)))
+                        .map(|(_, extent)| extent.primal().clone())
                         .collect::<Vec<_>>();
                     let mut outputs =
                         context.bind(ZeroOperation::new(array_tangent_type), Vec::new(), dynamic_extents.as_slice())?;
@@ -1115,8 +1164,8 @@ where
                                 || transpose_output_axes.iter().any(|axis| *axis >= contribution_type.rank())
                             {
                                 return Err(TypeError::invalid(format!(
-                                    "cannot unalign cotangent type {contribution_type} to input cotangent type \
-                                     {transpose_target_type} using output axes {transpose_output_axes:?}",
+                                    "cannot unalign cotangent type `{contribution_type}` to input cotangent type \
+                                     `{transpose_target_type}` using output axes {transpose_output_axes:?}",
                                 ))
                                 .into());
                             }
@@ -1147,11 +1196,11 @@ where
                                 .map(|kept| kept_axes_by_output.iter().position(|candidate| candidate == kept).unwrap())
                                 .collect::<Vec<_>>();
                             if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
-                                contribution = Transpose::transpose(&contribution, permutation)?;
+                                contribution = contribution.transpose(permutation)?;
                             }
                             let contribution = contribution.into_value();
 
-                            // Rebind exact input geometry through ordinary dimension operands. This prevents a
+                            // Rebind exact input geometry through ordinary dimension inputs. This prevents a
                             // metadata-only identity from standing in for runtime geometry at the linear boundary.
                             let contribution_type = contribution.r#type().into_owned();
                             let mut exact_inputs = Vec::with_capacity(transpose_target_type.rank() + 1);
@@ -1200,9 +1249,9 @@ where
     }
 }
 
-/// Direct transposition rule for mixed broadcast. Static input geometry delegates to the homogeneous array pullback,
-/// while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
-/// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
+// Direct transposition rule for mixed broadcast. Static input geometry delegates to the homogeneous array pullback,
+// while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
+// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
 impl<V, O> TransposableOperation<V, O> for DynamicBroadcastOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1228,6 +1277,11 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
+        // A structural zero needs no reduction or runtime shape residual. Accumulators already hold zeros of their
+        // input cotangent types, including the dimension inputs and arrays with no cotangent space.
+        if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
+            return Ok(());
+        }
         if input_cotangent_type
             .shape()
             .dimensions()
@@ -1252,7 +1306,7 @@ where
             output_type,
             self.output_axes().to_vec(),
         ));
-        // Dimension operands do not receive cotangents; forward only the array operands' handles.
+        // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
         transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
     }
 }
@@ -1260,7 +1314,7 @@ where
 /// Replicates an array using dimension values to specify its output shape. Input axis `i` maps to output axis
 /// `output_axes[i]`; mapped extents must match or expand an input extent of one. Unmapped output axes replicate the
 /// entire input. Unlike [`Broadcast`], this capability can replicate into dynamic extents because each output size is
-/// supplied as an operand, rather than only described by type metadata. The receiver must be an array value and the
+/// supplied as an input, rather than only described by type metadata. The receiver must be an array value and the
 /// output sizes must be dimension values, even though both use the same [`ArrayIrType`] value language.
 ///
 /// Exact dimension types describe static axes, while non-exact dimension types identify dynamic axes and their bounds.
@@ -1269,8 +1323,8 @@ where
 /// the input-to-output axis mapping and new axes are replicated; callers may request output sharding explicitly.
 /// Changed geometry clears the physical layout. An identity broadcast with unchanged metadata passes through its input.
 ///
-/// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and [`std::ops::Neg`]
-/// fill for their corresponding arithmetic [`Operation`]s.
+/// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and
+/// [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 ///
 /// # Examples
 ///
@@ -1290,7 +1344,7 @@ where
 /// # }
 /// ```
 ///
-/// Computed or input dimensions remain ordinary SSA operands:
+/// Computed or input dimensions remain ordinary SSA inputs:
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -1322,7 +1376,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///
     ///   - `output_dimensions`: One dimension value per output axis, in output-axis order. Exact dimension types yield
     ///     static extents; other dimension types retain their dynamic identity and bounds in the result. These values
-    ///     are operands of the staged operation, so runtime sizes remain available during execution.
+    ///     are inputs of the staged operation, so runtime sizes remain available during execution.
     ///   - `output_axes`: Output axis receiving each input axis, in input-axis order. Its length must equal the input
     ///     rank and its entries must be distinct and less than `output_dimensions.len()`. For a vector, `[1]` maps its
     ///     sole axis to the columns of a matrix; the unmapped row axis repeats that vector.
@@ -1333,19 +1387,19 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     /// Broadcasts `self` using explicit output dimensions and an optional output sharding. Shape and axis validation
     /// are the same as for [`DynamicBroadcast::dynamic_broadcast`]. Use this function when the result needs a specified
     /// distribution instead of the distribution inferred by mapping the input sharding onto the output axes.
-    /// Broadcasting preserves the input element type and memory space; the requested sharding must match the
-    /// output rank. Invalid value kinds, extents, mappings, or sharding yield a [`TypeError`].
+    /// Broadcasting preserves the input element type and memory space; the requested sharding must match the output
+    /// rank. Invalid value kinds, extents, mappings, or sharding yield a [`TypeError`].
     ///
     /// # Parameters
     ///
     ///   - `output_dimensions`: One dimension value per output axis, in output-axis order. These determine the complete
     ///     output shape, including axes corresponding to unchanged input extents. A scalar broadcast into a matrix
     ///     therefore still supplies both row and column dimensions.
-    ///   - `output_axes`: Distinct output axis indices, one per input axis. An empty mapping broadcasts a scalar;
-    ///     `[1]` broadcasts a vector along a matrix's rows. Mapped extents must match or expand an input extent of one.
+    ///   - `output_axes`: Distinct output axis indices, one per input axis. An empty mapping broadcasts a scalar; `[1]`
+    ///     broadcasts a vector along a matrix's rows. Mapped extents must match or expand an input extent of one.
     ///   - `output_sharding`: Requested distribution of the output axes. `Some(sharding)` supplies the complete result
-    ///     sharding; `None` infers it from the input, preserving its mesh and reduction state, mapping its axis entries,
-    ///     and making newly introduced axes replicated. `None` does not remove an existing input sharding.
+    ///     sharding; `None` infers it from the input, preserving its mesh and reduction state, mapping its axis
+    ///     entries, and making newly introduced axes replicated. `None` does not remove an existing input sharding.
     fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1394,18 +1448,18 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
 
     /// Replicates `self` along new leading axes while preserving the extents of its existing axes. Existing dynamic
     /// extents are obtained from the input with [`DimensionSize::dimension_size`], so callers only supply the new axes.
-    /// For example, prepending dimensions `[2, 4]` to a vector of size three produces shape `[2, 4, 3]`. Existing sharding
-    /// follows the shifted axes and new axes are replicated. An empty leading shape preserves the input geometry.
+    /// For example, prepending dimensions `[2, 4]` to a vector of size three produces shape `[2, 4, 3]`. Existing
+    /// sharding follows the shifted axes and new axes are replicated. An empty leading shape preserves the input
+    /// geometry.
     ///
     /// # Parameters
     ///
-    ///   - `leading_dimensions`: Dimension values for the new leading axes, in output-axis order. Both exact and dynamic
-    ///     dimensions are accepted. These must be dimension values, not scalar array values.
+    ///   - `leading_dimensions`: Dimension values for the new leading axes, in output-axis order. Both exact and
+    ///     dynamic dimensions are accepted. These must be dimension values, not scalar array values.
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
         Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType>,
-        Self::DispatchDomain: DimensionConstant,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
     {
         self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
     }
@@ -1447,18 +1501,17 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
 
     /// Broadcasts `self` to host-provided sizes using trailing-axis alignment. This creates exact dimension constants
     /// in the receiver's dispatch context and delegates to [`DynamicBroadcast::dynamic_broadcast_to`]. The staged
-    /// operation therefore has explicit dimension operands even though the output shape is statically known.
-    /// Invalid ranks or incompatible extents yield a [`TypeError`].
+    /// operation therefore has explicit dimension inputs even though the output shape is statically known. Invalid
+    /// ranks or incompatible extents yield a [`TypeError`].
     ///
     /// # Parameters
     ///
-    ///   - `output_sizes`: Complete desired shape as nonnegative host sizes, including unchanged trailing axes.
-    ///     For example, `[2, 3]` repeats a vector of size three into two rows. Zero-sized axes are allowed when the
+    ///   - `output_sizes`: Complete desired shape as nonnegative host sizes, including unchanged trailing axes. For
+    ///     example, `[2, 3]` repeats a vector of size three into two rows. Zero-sized axes are allowed when the
     ///     corresponding input extent is zero or one, or when the axis is newly introduced.
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self::DispatchDomain: Context<Type = ArrayIrType>,
-        Self::DispatchDomain: DimensionConstant,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
     {
         let output_dimensions = output_sizes
             .iter()
@@ -1469,17 +1522,17 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
 
     /// Replicates `self` along new leading axes whose sizes are known on the host. This creates exact dimension
     /// constants and delegates to [`DynamicBroadcast::dynamic_broadcast_leading`], preserving existing dynamic extents
-    /// through dimension-size operands. Passing an empty slice preserves the input geometry.
+    /// through dimension-size inputs. Passing an empty slice preserves the input geometry.
     ///
     /// # Parameters
     ///
-    ///   - `leading_sizes`: Host sizes of the new axes, in output-axis order. For example, `[2]` repeats the whole input
-    ///     twice along a new first axis. Existing axes retain their extents and sharding; new axes are replicated.
+    ///   - `leading_sizes`: Host sizes of the new axes, in output-axis order. For example, `[2]` repeats the whole
+    ///     input twice along a new first axis. Existing axes retain their extents and sharding; new axes are
+    ///     replicated.
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self: DimensionSize,
-        Self::DispatchDomain: Context<Type = ArrayIrType>,
-        Self::DispatchDomain: DimensionConstant,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
     {
         let context = self.dispatch_domain();
         let leading_dimensions = leading_sizes
@@ -1493,8 +1546,8 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     /// result dimensions are read from an input that carries the corresponding dimension identity; static dimensions
     /// become exact dimension constants. No numeric promotion is performed. Empty input returns an empty vector.
     ///
-    /// Shape compatibility follows [`Broadcast::broadcast_arrays`]. Invalid array kinds or incompatible shapes return
-    /// a [`TypeError`]. The inputs must belong to compatible dispatch contexts so their dimension values can be shared.
+    /// Shape compatibility follows [`Broadcast::broadcast_arrays`]. Invalid array kinds or incompatible shapes return a
+    /// [`TypeError`]. The inputs must belong to compatible dispatch contexts so their dimension values can be shared.
     ///
     /// # Example
     ///
@@ -1557,7 +1610,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
     fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1648,7 +1701,7 @@ fn infer_explicit_broadcast_output_type(
         match (input_dimension, output_dimension) {
             // Equal axes preserve their extent, including the identity of an equal dynamic extent.
             (input_dimension, output_dimension) if input_dimension == output_dimension => {}
-            // The explicit output extent operand supplies the runtime replication count that the metadata-only
+            // The explicit output extent input supplies the runtime replication count that the metadata-only
             // homogeneous operation lacks, so a unit input may expand to either a static or dynamic extent.
             (Dimension::Static(1), _) => {}
             (Dimension::Static(input_extent), Dimension::Static(output_extent)) => {
@@ -1714,46 +1767,10 @@ fn validate_broadcast_output_layout(output_type: &ArrayType) -> Result<(), TypeE
     Ok(())
 }
 
-impl Broadcast for Array {
-    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = self.r#type().broadcast(output_type, output_axes)?;
-        let Some(target_shape) = r#type.static_shape() else {
-            return Err(
-                TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
-            );
-        };
-        if &r#type == self.r#type().as_ref() && output_axes.iter().copied().eq(0..r#type.rank()) {
-            return Ok(self.clone());
-        }
-        let input_shape = self.r#type().static_shape().unwrap();
-        let input_rank = input_shape.rank();
-        let target_rank = target_shape.rank();
-        let output_count = Self::materialized_element_count(&r#type)?;
-        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let output_addressing = ArrayAddressing::new(r#type.clone())?;
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        // Structural-zero elements need no storage, regardless of the logical replication count.
-        if bytes.is_empty() {
-            return Ok(Self::new_unchecked(r#type, Arc::new(bytes)));
-        }
-        let mut target_index = vec![0usize; target_rank];
-        let mut input_index = vec![0usize; input_rank];
-        for output_flat in 0..output_count {
-            for input_axis in 0..input_rank {
-                let target_axis = output_axes[input_axis];
-                input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
-            }
-            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            output_addressing.advance_index(&mut target_index);
-        }
-        Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashMap;
     use std::fmt::Debug;
     use std::marker::PhantomData;
 
@@ -1790,6 +1807,13 @@ mod tests {
         assert_eq!(operation.name(), BROADCAST_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "broadcast [output_type=f64[2, 3], output_axes=[1]]");
         assert_eq!(*operation.output_type(), output_type);
+        assert_eq!(operation, operation.clone());
+        assert_ne!(operation, BroadcastOperation::new(output_type.clone(), vec![0]));
+        assert_eq!(HashMap::from([(operation.clone(), "broadcast")]).get(&operation), Some(&"broadcast"));
+        assert_eq!(
+            format!("{operation:?}"),
+            format!("BroadcastOperation {{ output_type: {output_type:?}, output_axes: [1] }}"),
+        );
         assert_eq!(operation.output_axes(), &[1]);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
@@ -1836,7 +1860,8 @@ mod tests {
             )
             .infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]),
             Err(TypeError::invalid(
-                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and may alias array elements",
+                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
+                 may alias array elements",
             )),
         );
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
@@ -1867,104 +1892,6 @@ mod tests {
                     error = "broadcasting input axis 0 has size 2, which is neither 3 nor 1",
                 },
             ],
-        );
-    }
-
-    #[test]
-    fn test_array_type_broadcast() {
-        // Type-level broadcasting validates arbitrary mappings without consuming the input type.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        assert_eq!(input_type.broadcast(output_type.clone(), &[1]), Ok(output_type.clone()));
-        assert_eq!(
-            input_type.broadcast(output_type.clone().with_memory(Memory::Host { pinned: true }), &[1]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input memory Device does not match output memory Host[Pinned]".to_string(),
-            ))),
-        );
-        assert_eq!(
-            input_type.broadcast(output_type.clone(), &[2]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string(),
-            ))),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)]))
-                .broadcast(output_type, &[1, 1]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting output axes map two input axes to output axis 1".to_string(),
-            ))),
-        );
-
-        // A dynamic input dimension maps only to the identical dynamic dimension, while replicated output axes must
-        // remain static because their replication counts need to be known.
-        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
-        let output_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
-        );
-        assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
-
-        let unbounded = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()))]),
-        );
-        assert_eq!(
-            unbounded.broadcast(
-                ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
-                        "output",
-                        DimensionBounds::non_negative(Some(4)).unwrap(),
-                    ))]),
-                ),
-                &[0],
-            ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size input but the output has size output; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            ))),
-        );
-        assert_eq!(
-            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])), &[0],),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size input but the output has size 3; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            ))),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).broadcast(unbounded.clone(), &[0]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting cannot expand input axis 0 of size 1 into dynamic output size input".to_string(),
-            ))),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(unbounded, &[0]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size 3 but the output has size input; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            ))),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(
-                ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![
-                        Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
-                        Dimension::Static(3),
-                    ]),
-                ),
-                &[1],
-            ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size dynamic"
-                    .to_string(),
-            ))),
         );
     }
 
@@ -2038,94 +1965,10 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_interpretation_axis_mappings_and_metadata() {
-        // Arbitrary axis mappings replicate the payload along every unmapped target axis.
-        let target = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(2)]),
-        );
-        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap().broadcast(target, &[0, 2]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
-
-        // Static unit axes stretch to the target extent, and empty target dimensions produce empty payloads.
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let output = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]).unwrap().broadcast(target, &[0, 1]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
-        let output = Array::vector(vec![1.0, 2.0]).unwrap().broadcast(target, &[1]).unwrap();
-        assert_eq!(output.to_f64s(), Vec::<f64>::new());
-
-        // The eager backend primitive preserves leading and right-aligned axis mappings.
-        let output = Array::vector(vec![1.0, 2.0, 3.0])
-            .unwrap()
-            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
-            .unwrap();
-        assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])));
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-        let output = Array::scalar(7.0)
-            .unwrap()
-            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[])
-            .unwrap();
-        assert_eq!(output.to_f64s(), vec![7.0; 6]);
-        let output = Array::vector(vec![10.0, 20.0, 30.0])
-            .unwrap()
-            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
-            .unwrap();
-        assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
-        assert_eq!(
-            Array::scalar(1.0)
-                .unwrap()
-                .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[],),
-            Ok(Array::from_elements::<f64>(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[])
-                .unwrap()),
-        );
-
-        // Explicit output types carry placement metadata; an exact identity preserves the complete type.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
-            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap()
-            .with_memory(Memory::Host { pinned: true });
-        let input = Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0]).unwrap();
-        let identity = input.broadcast(input_type.clone(), &[0]).unwrap();
-        assert_eq!(*identity.r#type(), input_type);
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-                    .unwrap(),
-            )
-            .unwrap()
-            .with_memory(Memory::Host { pinned: true });
-        let output = input.broadcast(output_type, &[1]).unwrap();
-        assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
-        assert_eq!(output.r#type().layout(), None);
-        assert_eq!(
-            output.r#type().sharding(),
-            Some(
-                &Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],)
-                    .unwrap(),
-            ),
-        );
-
-        // Oversized target shapes fail through checked element-count arithmetic instead of panicking or wrapping.
-        assert_eq!(
-            Array::scalar(1.0).unwrap().broadcast(
-                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]),),
-                &[],
-            ),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "shape [{}, 2] element count does not fit in usize",
-                usize::MAX,
-            )))),
-        );
-    }
-
-    #[test]
     fn test_broadcast_partial_evaluation() {
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
-        // Check standard partial evaluation with known and residual operands.
+        // Check standard partial evaluation with known and residual inputs.
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
@@ -2442,7 +2285,7 @@ mod tests {
         .unwrap();
         assert_eq!(primal.r#type().as_ref(), &primal_output_type);
         assert_eq!(tangent.r#type().as_ref(), &tangent_output_type);
-        assert_eq!(tangent.to_f64s(), vec![1.0, 3.0, 1.0, 3.0]);
+        assert_eq!(tangent.elements::<f32>(), Ok(vec![1.0, 3.0, 1.0, 3.0]));
     }
 
     #[test]
@@ -2568,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_invalid_output_count() {
+    fn test_broadcast_broadcast_invalid_output_count() {
         /// Value wrapper that dispatches through a deliberately malformed context in either array language.
         #[derive(Clone, Debug)]
         struct DispatchValue<V: Value, O: Clone + Debug> {
@@ -2810,6 +2653,237 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_broadcast() {
+        // Type-level broadcasting validates arbitrary mappings without consuming the input type.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(input_type.broadcast(output_type.clone(), &[1]), Ok(output_type.clone()));
+        assert_eq!(
+            input_type.broadcast(output_type.clone().with_memory(Memory::Host { pinned: true }), &[1]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting input memory Device does not match output memory Host[Pinned]".to_string(),
+            ))),
+        );
+        assert_eq!(
+            input_type.broadcast(output_type.clone(), &[2]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string(),
+            ))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)]))
+                .broadcast(output_type, &[1, 1]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting output axes map two input axes to output axis 1".to_string(),
+            ))),
+        );
+
+        // A dynamic input dimension maps only to the identical dynamic dimension, while replicated output axes must
+        // remain static because their replication counts need to be known.
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
+        let output_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
+        );
+        assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
+
+        let unbounded = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            unbounded.broadcast(
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                        "output",
+                        DimensionBounds::non_negative(Some(4)).unwrap(),
+                    ))]),
+                ),
+                &[0],
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting input axis 0 has size input but the output has size output; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            ))),
+        );
+        assert_eq!(
+            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])), &[0],),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting input axis 0 has size input but the output has size 3; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            ))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).broadcast(unbounded.clone(), &[0]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting cannot expand input axis 0 of size 1 into dynamic output size input".to_string(),
+            ))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(unbounded, &[0]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting input axis 0 has size 3 but the output has size input; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            ))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![
+                        Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                        Dimension::Static(3),
+                    ]),
+                ),
+                &[1],
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size dynamic"
+                    .to_string(),
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_array_broadcast() {
+        let vector = Array::vector(vec![1.0, 2.0]).unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [3, 2]);
+        let broadcast = vector.broadcast(output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().into_owned(), output_type);
+        assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
+        // zero in its holes.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
+        let output_type =
+            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
+        let broadcast = input.broadcast(output_type.clone(), &[1]).unwrap();
+        assert_eq!(broadcast.r#type().as_ref(), &output_type);
+        assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
+        assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
+
+        // Deliberately malformed concrete values with dynamic types fail through the structured materialization
+        // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
+        );
+        let dynamic = Array::with_unchecked_type(
+            dynamic_type.clone(),
+            [1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect(),
+        );
+        for output_axes in [vec![0, 1], vec![1, 0]] {
+            assert!(matches!(
+                dynamic.broadcast(dynamic_type.clone(), output_axes.as_slice()),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == "cannot materialize a value of dynamically sized type `f64[dynamic, dynamic]`",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_array_broadcast_axis_mappings_and_metadata() {
+        // Arbitrary axis mappings replicate the payload along every unmapped target axis.
+        let target = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(2)]),
+        );
+        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap().broadcast(target, &[0, 2]).unwrap();
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
+
+        // Static unit axes stretch to the target extent, and empty target dimensions produce empty payloads.
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let output = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]).unwrap().broadcast(target, &[0, 1]).unwrap();
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
+        let output = Array::vector(vec![1.0, 2.0]).unwrap().broadcast(target, &[1]).unwrap();
+        assert_eq!(output.to_f64s(), Vec::<f64>::new());
+
+        // The eager backend primitive preserves leading and right-aligned axis mappings.
+        let output = Array::vector(vec![1.0, 2.0, 3.0])
+            .unwrap()
+            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
+            .unwrap();
+        assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])));
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let output = Array::scalar(7.0)
+            .unwrap()
+            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[])
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![7.0; 6]);
+        let output = Array::vector(vec![10.0, 20.0, 30.0])
+            .unwrap()
+            .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])), &[1])
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+        assert_eq!(
+            Array::scalar(1.0)
+                .unwrap()
+                .broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[],),
+            Ok(Array::from_elements::<f64>(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])), &[])
+                .unwrap()),
+        );
+
+        // Explicit output types carry placement metadata; an exact identity preserves the complete type.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let input = Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0]).unwrap();
+        let identity = input.broadcast(input_type.clone(), &[0]).unwrap();
+        assert_eq!(*identity.r#type(), input_type);
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let output = input.broadcast(output_type, &[1]).unwrap();
+        assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
+        assert_eq!(output.r#type().layout(), None);
+        assert_eq!(
+            output.r#type().sharding(),
+            Some(
+                &Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],)
+                    .unwrap(),
+            ),
+        );
+
+        // Oversized target shapes fail through checked element-count arithmetic instead of panicking or wrapping.
+        assert_eq!(
+            Array::scalar(1.0).unwrap().broadcast(
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]),),
+                &[],
+            ),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "shape [{}, 2] element count does not fit in usize",
+                usize::MAX,
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_array_broadcast_structural_zero() {
+        let input = Array::new(ArrayType::scalar(DataType::Zero), vec![]).unwrap();
+        let output_type = ArrayType::new_static(DataType::Zero, [usize::MAX]);
+        let output = input.broadcast(output_type.clone(), &[]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        assert!(output.storage_bytes().is_empty());
+    }
+
+    #[test]
     fn test_dynamic_broadcast() {
         let operation = DynamicBroadcastOperation::new(vec![1]);
         assert_eq!(operation.name(), BROADCAST_OPERATION_NAME);
@@ -2818,6 +2892,13 @@ mod tests {
         assert_eq!(operation.output_axes(), &[1]);
         assert_eq!(operation.output_sharding(), None);
         assert_eq!(operation.output_layout(), None);
+        assert_eq!(
+            format!("{operation:?}"),
+            "DynamicBroadcastOperation { output_axes: [1], output_sharding: None, output_layout: None }",
+        );
+        assert_eq!(operation, operation.clone());
+        assert_ne!(operation, DynamicBroadcastOperation::new(vec![0]));
+        assert_eq!(HashMap::from([(operation.clone(), "broadcast")]).get(&operation), Some(&"broadcast"));
         let layout = Layout::Strided(StridedLayout::new(vec![24, 8]));
         assert_eq!(operation.with_output_layout(layout.clone()).output_layout(), Some(&layout));
     }
@@ -3047,7 +3128,8 @@ mod tests {
                 .with_output_layout(Layout::Strided(StridedLayout::new(vec![2])))
                 .interpret(&context, &EmptyRegionDriver, &inputs),
             Err(ProgramError::Type(TypeError::invalid(
-                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and may alias array elements",
+                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
+                 may alias array elements",
             ))),
         );
     }
@@ -3125,54 +3207,11 @@ mod tests {
                 },
             ],
         );
-        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
-        let first_extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        let second_extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let expected_output = ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap());
-        let input_type = input.r#type().into_owned();
-        check_operation_partial_evaluation!(
-            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = DynamicBroadcastOperation::new(vec![1]),
-            cases = [
-                {
-                    inputs = [
-                        (@known, input.clone()),
-                        (@known, first_extent.clone()),
-                        (@known, second_extent.clone()),
-                    ],
-                    outputs = [(@known, expected_output.clone())],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = input_type, replay = input.clone())),
-                        (@known, first_extent.clone()),
-                        (@known, second_extent.clone()),
-                    ],
-                    outputs = [(@residual, expected_output.clone())],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-
-        let identity_input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0]).unwrap());
-        check_operation_partial_evaluation!(
-            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = DynamicBroadcastOperation::new(vec![0]),
-            cases = [{
-                inputs = [
-                    (@unknown(type = identity_input.r#type().into_owned(), replay = identity_input.clone())),
-                    (@known, second_extent.clone()),
-                ],
-                outputs = [(@residual, identity_input)],
-                residual_instructions = 0,
-            }],
-        );
     }
 
     #[test]
     fn test_dynamic_broadcast_partial_evaluation_identity() {
-        // Exact dimension operands make an identity independent of the unknown array payload.
+        // Exact dimension inputs make an identity independent of the unknown array payload.
         let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
         check_operation_partial_evaluation!(
@@ -3388,7 +3427,8 @@ mod tests {
                 .with_output_layout(Layout::Strided(StridedLayout::new(vec![4])))
                 .batch(&context, &EmptyRegionDriver, &inputs),
             Err(BatchingError::InvalidBatchMetadata { message })
-                if message == "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch stride, which is not supported",
+                if message == "mapped dynamic broadcasting with an explicit strided output layout requires a runtime \
+                               batch stride, which is not supported",
         ));
     }
 
@@ -3396,10 +3436,9 @@ mod tests {
     fn test_dynamic_broadcast_batching_preserves_declared_dynamic_extent() {
         // A mapped array input canonicalizes to a leading batch axis, and the declared output extents cross the
         // batching rule untouched: the lifted broadcast consumes the transform's own batch extent followed by exactly
-        // the original extent operands. A declared *dynamic* extent makes that forwarding observable, because a rule
-        // that reconstructed output geometry from the operand type would have to stage its own `dimension_size` read.
-        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let trace = TraceContext::new();
+        // the original extent inputs. A declared *dynamic* extent makes that forwarding observable, because a rule
+        // that reconstructed output geometry from the input type would have to stage its own `dimension_size` read.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_extent = trace.input(DimensionType::new(columns.clone()).into());
         let input = trace
@@ -3432,7 +3471,7 @@ mod tests {
         let output_id = output.into_value().atom_id().unwrap();
 
         // The mapped axis already sits at position zero, so no axis move is staged and the single lifted broadcast
-        // forwards the declared extent operand by identity.
+        // forwards the declared extent input by identity.
         let builder = trace.builder().borrow();
         let [instruction] = builder.instructions() else {
             panic!("expected exactly one lifted broadcast instruction");
@@ -3516,7 +3555,6 @@ mod tests {
             .unwrap();
         assert!(matches!(program.instructions()[0].operation(), ArrayIrOperation::Broadcast(_)));
         assert_eq!(program.instructions()[0].inputs(), &[input, first_extent, second_extent]);
-        assert!(program.to_string().contains("broadcast [output_axes=[1]]"));
 
         let jvp = program.jvp().unwrap();
         assert_eq!(
@@ -3553,10 +3591,20 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert!(dynamic_program.jvp().is_ok());
         let linearization = dynamic_program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
-        assert!(linearization.tangent().to_string().contains("linear_call [residual_count=1]"));
+        assert_eq!(
+            linearization
+                .tangent()
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.operation() {
+                    ArrayIrOperation::LinearCall(operation) => Some(operation.residual_count()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![1],
+        );
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dynamic_extent, 3).unwrap());
         let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
@@ -3666,6 +3714,76 @@ mod tests {
             pullback.apply(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())),
             Ok(ArrayIrValue::Array(Array::vector(vec![5.0, 7.0, 9.0]).unwrap())),
         );
+
+        // A zero cotangent needs no dynamic geometry residual and leaves every input accumulator structural.
+        let size = DimensionVariable::new("size", DimensionBounds::positive(Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let input_types = vec![ArrayIrType::Array(input_type), DimensionType::new(size).into()];
+        let operation = DynamicBroadcastOperation::new(vec![0]);
+        let output_type = operation.infer_output_types(&input_types, &[]).unwrap().remove(0);
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let mut transpose = TranspositionContext::new(context.clone());
+        let inputs = input_types.iter().cloned().map(PartialValue::Unknown).collect::<Vec<_>>();
+        let accumulators = transpose.cotangent_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(
+                &mut transpose,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(output_type.cotangent().unwrap())],
+                &accumulators,
+            )
+            .unwrap();
+        let cotangents = transpose.take_cotangents(&accumulators).unwrap();
+        assert_eq!(cotangents.len(), 2);
+        for (cotangent, input_type) in cotangents.iter().zip(&input_types) {
+            assert!(cotangent.is_zero());
+            assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent().unwrap());
+        }
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_dynamic_broadcast() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
+        let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        assert_eq!(value.dynamic_broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
+        // tracing retains the operation even though its input and output types are equal.
+        let square_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]).unwrap());
+        assert_eq!(square.dynamic_broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
+
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = context.input(square_type.into());
+        let extent = context.constant(two);
+        let output = value.dynamic_broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected one shape-preserving broadcast instruction");
+            };
+            let ArrayIrOperation::Broadcast(operation) = instruction.operation() else {
+                panic!("expected a broadcast instruction");
+            };
+            assert_eq!(operation.output_axes(), &[1, 0]);
+        }
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.interpret(vec![square]), Ok(vec![expected]));
     }
 
     #[test]
@@ -3703,58 +3821,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_broadcast_to_first_class_dimensions() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        let eager = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
-        assert_eq!(
-            eager.dynamic_broadcast_leading_sizes(&[2]),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0],).unwrap())),
-        );
-
-        let context = TestContext::new();
-        let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).into());
-        let extent = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
-        assert_eq!(value.dynamic_broadcast(&[extent], &[0]).unwrap().atom_id(), value.atom_id());
-        assert!(context.builder().borrow().instructions().is_empty());
-
-        // A shape-preserving axis permutation is still a real broadcast. Eager execution transposes the payload and
-        // tracing retains the operation even though its input and output types are equal.
-        let square_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let square = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
-        let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let expected = ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 3.0, 2.0, 4.0]).unwrap());
-        assert_eq!(square.dynamic_broadcast(&[two.clone(), two.clone()], &[1, 0]), Ok(expected.clone()));
-
-        let context = TestContext::new();
-        let value = context.input(square_type.into());
-        let extent = context.constant(two);
-        let output = value.dynamic_broadcast(&[extent.clone(), extent], &[1, 0]).unwrap();
-        {
-            let builder = context.builder().borrow();
-            let [instruction] = builder.instructions() else {
-                panic!("expected one shape-preserving broadcast instruction");
-            };
-            let ArrayIrOperation::Broadcast(operation) = instruction.operation() else {
-                panic!("expected a broadcast instruction");
-            };
-            assert_eq!(operation.output_axes(), &[1, 0]);
-        }
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(program.interpret(vec![square]), Ok(vec![expected]));
-
+    fn test_dynamic_broadcast_dynamic_broadcast_to_first_class_dimensions() {
         let extent_type =
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
-        let context = TestContext::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let scalar = context.input(ArrayType::scalar(DataType::F64).into());
         let extent = context.input(extent_type.clone().into());
         let output = scalar.dynamic_broadcast_to(std::slice::from_ref(&extent)).unwrap();
@@ -3793,7 +3863,7 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f64).unwrap())]),
         );
 
-        let context = TestContext::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let value = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
         let rows = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let columns = context.constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
@@ -3812,34 +3882,6 @@ mod tests {
             program.interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64]).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![7.0_f64; 6]).unwrap())]),
         );
-
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let context = TestContext::new();
-        let value = context.input(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]))
-                .into(),
-        );
-        let output = value.dynamic_broadcast_leading_sizes(&[2]).unwrap();
-        assert_eq!(
-            output.r#type().as_ref(),
-            &ArrayIrType::Array(ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch), Dimension::Static(3)]),
-            )),
-        );
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let rendered = program.to_string();
-        assert_eq!(rendered.matches("dimension_size").count(), 1);
-        assert!(rendered.contains("broadcast [output_axes=[1, 2]]"));
     }
 
     #[test]
@@ -3944,6 +3986,50 @@ mod tests {
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
         );
         assert_eq!(input.dynamic_broadcast_leading_sizes(&[]), Ok(input));
+
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = context.input(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let output = value.dynamic_broadcast_leading_sizes(&[2]).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch), Dimension::Static(3)]),
+            )),
+        );
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program
+                .instructions()
+                .iter()
+                .filter(|instruction| { matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)) })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            program
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.operation() {
+                    ArrayIrOperation::Broadcast(operation) => Some(operation.output_axes()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![&[1, 2][..]],
+        );
     }
 
     #[test]
@@ -4008,56 +4094,9 @@ mod tests {
                     .with_layout(Layout::Strided(StridedLayout::new(vec![2])))
             ),
             Err(TypeError::invalid(
-                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and may alias array elements",
+                "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
+                 may alias array elements",
             )),
         );
-    }
-
-    #[test]
-    fn test_array_broadcast() {
-        let vector = Array::vector(vec![1.0, 2.0]).unwrap();
-        let output_type = ArrayType::new_static(DataType::F64, [3, 2]);
-        let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
-        assert_eq!(broadcast.r#type().into_owned(), output_type);
-        assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
-
-        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
-        // zero in its holes.
-        let input_type =
-            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
-        let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
-        let output_type =
-            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
-        let broadcast = input.broadcast(output_type.clone(), &[1]).unwrap();
-        assert_eq!(broadcast.r#type().as_ref(), &output_type);
-        assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
-        assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
-
-        // Deliberately malformed concrete values with dynamic types fail through the structured materialization
-        // diagnostic before either the identity fast path or static-shape payload logic can accept or panic on them.
-        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
-        let dynamic_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]),
-        );
-        let dynamic = Array::with_unchecked_type(
-            dynamic_type.clone(),
-            [1.0f64, 2.0, 3.0, 4.0].into_iter().flat_map(f64::to_le_bytes).collect(),
-        );
-        for output_axes in [vec![0, 1], vec![1, 0]] {
-            assert!(matches!(
-                dynamic.broadcast(dynamic_type.clone(), output_axes.as_slice()),
-                Err(ProgramError::Type(TypeError::Invalid { message }))
-                    if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
-            ));
-        }
-    }
-    #[test]
-    fn test_array_broadcast_structural_zero() {
-        let input = Array::new(ArrayType::scalar(DataType::Zero), vec![]).unwrap();
-        let output_type = ArrayType::new_static(DataType::Zero, [usize::MAX]);
-        let output = input.broadcast(output_type.clone(), &[]).unwrap();
-        assert_eq!(output.r#type().as_ref(), &output_type);
-        assert!(output.storage_bytes().is_empty());
     }
 }
