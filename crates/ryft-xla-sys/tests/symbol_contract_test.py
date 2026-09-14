@@ -238,6 +238,28 @@ def discover_required_symbols(
     return required_symbols
 
 
+def check_mosaic_runtime_symbols(jax_root: Path) -> None:
+    """Requires every built-in Mosaic host function to be registered in its plugin-local JIT."""
+    runtime = read(jax_root, MOSAIC_RUNTIME_DIRECTORY / "runtime.cc")
+    header = read(jax_root, MOSAIC_RUNTIME_DIRECTORY / "runtime.h")
+    custom_call = read(jax_root, MOSAIC_RUNTIME_DIRECTORY / "custom_call.cc")
+    definitions = set(re.findall(r"\b(?:void|CUresult)\s+(mosaic_gpu_\w+)\s*\(", runtime))
+    declarations = set(re.findall(r"\b(?:void|CUresult)\s+(mosaic_gpu_\w+)\s*\(", header))
+    registrations = re.findall(
+        r'mangleAndIntern\("(mosaic_gpu_\w+)"\)\]\s*=\s*'
+        r'llvm::orc::ExecutorSymbolDef::fromPtr\(&(mosaic_gpu_\w+),',
+        custom_call,
+    )
+    if not definitions:
+        raise ContractError("Mosaic GPU runtime declares no host functions")
+    require_equal_sets("Mosaic GPU runtime declarations", definitions, declarations)
+    require_equal_sets("Mosaic GPU JIT runtime symbols", definitions, {name for name, _ in registrations})
+    if any(name != pointer for name, pointer in registrations):
+        raise ContractError("Mosaic GPU JIT runtime symbol is bound to a different function")
+    if "llvm::orc::absoluteSymbols(std::move(runtime_symbols))" not in custom_call:
+        raise ContractError("Mosaic GPU JIT does not define its runtime symbols locally")
+
+
 def check_versions_and_routes(jax_root: Path, ryft_xla_sys_root: Path, ryft_mlir_root: Path) -> None:
     """Validates Mosaic versions, targets, passes, formats, and unsupported native ABIs."""
     serde_path = MOSAIC_RUNTIME_DIRECTORY / "serde.cc"
@@ -378,6 +400,7 @@ def check_sources(args: argparse.Namespace) -> set[str]:
     extract_revision(llvm_workspace, "LLVM_COMMIT", llvm_workspace_path.as_posix())
 
     check_mosaic_surface(jax_root, ryft_mlir_root)
+    check_mosaic_runtime_symbols(jax_root)
     required_symbols = discover_required_symbols(jax_root, llvm_root, ryft_xla_sys_root)
     check_versions_and_routes(jax_root, ryft_xla_sys_root, ryft_mlir_root)
     check_standard_dialects(llvm_root, ryft_xla_sys_root)
@@ -631,8 +654,16 @@ XLA_FFI_REGISTER_HANDLER(api, "mosaic_gpu_v2", "CUDA", handlers);
 void** MosaicGpuCompile(const char* module, int size);
 void MosaicGpuUnload(void** value);
 void MosaicGpuClearKernelCache();
+runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_init_tma_desc")] =
+    llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_init_tma_desc, flags);
+runtime_symbols[lljit->mangleAndIntern("mosaic_gpu_launch_kernel")] =
+    llvm::orc::ExecutorSymbolDef::fromPtr(&mosaic_gpu_launch_kernel, flags);
+llvm::orc::absoluteSymbols(std::move(runtime_symbols));
 """,
         )
+        runtime_declarations = "void mosaic_gpu_init_tma_desc();\nCUresult mosaic_gpu_launch_kernel();\n"
+        self.write(self.jax, "jaxlib/mosaic/gpu/runtime.h", runtime_declarations)
+        self.write(self.jax, "jaxlib/mosaic/gpu/runtime.cc", runtime_declarations)
         self.write(
             self.jax,
             "jaxlib/mosaic/gpu/passes.h",
@@ -897,6 +928,41 @@ class ContractTests(unittest.TestCase):
         self.assertIn("mlirRegisterLowerVectorMaskPass", symbols)
         self.assertIn("ryftProfilerStart", symbols)
         self.assertFalse(any("tpu" in symbol.lower() for symbol in symbols))
+
+    def test_mosaic_runtime_symbols_rejects_missing_registration(self) -> None:
+        """Rejects a runtime function that the JIT cannot resolve inside a local plugin."""
+        custom_call = self.fixture.jax / MOSAIC_RUNTIME_DIRECTORY / "custom_call.cc"
+        original = custom_call.read_text()
+        custom_call.write_text(
+            original.replace('mangleAndIntern("mosaic_gpu_launch_kernel")', 'mangleAndIntern("other")')
+        )
+        with self.assertRaisesRegex(ContractError, "Mosaic GPU JIT runtime symbols differs"):
+            check_mosaic_runtime_symbols(self.fixture.jax)
+
+    def test_mosaic_runtime_symbols_rejects_wrong_function(self) -> None:
+        """Rejects a name mapped to a different runtime function's address."""
+        custom_call = self.fixture.jax / MOSAIC_RUNTIME_DIRECTORY / "custom_call.cc"
+        custom_call.write_text(
+            custom_call.read_text().replace("&mosaic_gpu_launch_kernel,", "&mosaic_gpu_init_tma_desc,")
+        )
+        with self.assertRaisesRegex(ContractError, "bound to a different function"):
+            check_mosaic_runtime_symbols(self.fixture.jax)
+
+    def test_mosaic_runtime_symbols_rejects_unregistered_new_function(self) -> None:
+        """Requires upstream runtime additions to extend the shared declarations and JIT map."""
+        runtime = self.fixture.jax / MOSAIC_RUNTIME_DIRECTORY / "runtime.cc"
+        runtime.write_text(runtime.read_text() + "void mosaic_gpu_new_runtime_function() {}\n")
+        with self.assertRaisesRegex(ContractError, "Mosaic GPU runtime declarations differs"):
+            check_mosaic_runtime_symbols(self.fixture.jax)
+
+    def test_mosaic_runtime_symbols_rejects_missing_local_definition(self) -> None:
+        """Rejects constructing the symbol map without installing it in the JIT."""
+        custom_call = self.fixture.jax / MOSAIC_RUNTIME_DIRECTORY / "custom_call.cc"
+        custom_call.write_text(
+            custom_call.read_text().replace("llvm::orc::absoluteSymbols(std::move(runtime_symbols))", "")
+        )
+        with self.assertRaisesRegex(ContractError, "does not define its runtime symbols locally"):
+            check_mosaic_runtime_symbols(self.fixture.jax)
 
     def test_cli_reports_invalid_pin(self) -> None:
         arguments = self.fixture.args()

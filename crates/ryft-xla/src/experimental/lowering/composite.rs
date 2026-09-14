@@ -607,6 +607,7 @@ where
         | ArrayIrOperation::ReferenceWrite(_)
         | ArrayIrOperation::ReferenceSwap(_)
         | ArrayIrOperation::ReferenceAddUpdate(_)
+        | ArrayIrOperation::ReferenceAtomicAddUpdate(_)
         | ArrayIrOperation::ReferenceFreeze(_)) => {
             Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
         }

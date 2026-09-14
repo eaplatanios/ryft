@@ -1857,9 +1857,12 @@ version = "0.1.0"
 dependencies = [
  "indoc",
  "pretty_assertions",
+ "ryft-core",
  "ryft-cuda",
  "ryft-mlir",
+ "ryft-mosaic",
  "ryft-pjrt",
+ "ryft-xla",
  "ryft-xla-sys",
  "serde",
  "serde_json",
@@ -1881,7 +1884,9 @@ dependencies = [
 name = "ryft-macros-tests"
 version = "0.0.0"
 dependencies = [
+ "pretty_assertions",
  "ryft",
+ "ryft-core",
  "trybuild",
 ]
 
@@ -1895,6 +1900,19 @@ dependencies = [
  "pretty_assertions",
  "ryft-xla-sys",
  "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ryft-mosaic"
+version = "0.0.3"
+dependencies = [
+ "indoc",
+ "pretty_assertions",
+ "ryft-core",
+ "ryft-mlir",
+ "ryft-xla-sys",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -1926,8 +1944,10 @@ dependencies = [
  "pretty_assertions",
  "prost",
  "ryft-core",
+ "ryft-cuda",
  "ryft-macros",
  "ryft-mlir",
+ "ryft-mosaic",
  "ryft-pjrt",
  "ryft-xla-sys",
  "serde",

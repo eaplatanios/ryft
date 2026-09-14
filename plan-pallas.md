@@ -1,9 +1,11 @@
 # Ryft Pallas-Style Kernels: Architecture and Implementation Plan
 
-Status: proposed. The reference architecture formerly recorded in `plan-references.md` is complete through its
-preserved-reference boundary. This plan begins the separate program required to turn that boundary into a production
-kernel language. No phase in this document is implemented merely because a lower-level wrapper or mock validator
-already exists.
+Status (2026-09-14): Phases 6–14 are implemented for the documented experimental subset. The Phase 14 Mosaic GPU
+adapter and macro-authored experiments pass local compiler tests and native DGX Spark qualification. Phase 5 has
+local Mac/DGX Spark qualification; the remaining platform matrix is deferred with user approval. The cuTile and
+Triton compiler adapters remain assigned to their later phases. This file is the current implementation record;
+detailed command logs and review notes are retained in `.tasks/plan_kernel_phases_5_13.md` and
+`.tasks/plan_kernel_phase_14.md`.
 
 This is a source-sensitive plan. Mosaic, cuTile, Triton, and their runtime integrations are evolving systems, so
 Phase 0 refreshes the first-release non-TPU inventory against the selected OpenXLA, JAX, CUDA, and cuTile revisions;
@@ -1023,7 +1025,12 @@ single launch path. Portable mock/lifecycle tests pass; actual cubin/cuTile exec
 
 ### Phase 5: GPU/cuTile lower-layer vertical-slice gate
 
-**Prerequisites:** Phases 1-4. This gate blocks every later non-TPU production phase.
+**Prerequisites:** Phases 1-4. This gate normally blocks every later non-TPU production phase.
+
+**Approved development exception (2026-09-14):** the user authorized phases 6–13 to proceed using the DGX Spark and
+local Mac for verification, deferring the remaining platform matrix. Spark CUDA 13 execution/AOT and sanitizer
+qualification passes for Mosaic GPU and cuTile; CPU archive isolation is verified locally. This exception does not
+claim CUDA 12, x86_64 GPU, Windows, or ROCm qualification, and those checks remain open before release.
 
 **Owners:** lower-layer integration tests, fixtures, and reusable artifact-inspection/qualification tooling only.
 
@@ -1054,17 +1061,12 @@ inspection or qualification tools; fixtures remain test code.
 **Exit criterion:** GPU and cuTile lower-layer paths are real, inspectable, repeatable, and safe. If either path fails,
 revise its seam before designing the language around it. TPU remains entirely deferred to Phase 21.
 
-**Implementation status (2026-09-02):** the slices, tooling, and CI are implemented; hardware execution remains
-gated on the NVIDIA workflow. Typed `ryft-mlir` vector-add and tiled-matmul Mosaic GPU modules mirror the pinned JAX
-host ABI, verify natively, serialize through the exact `mosaic_gpu-serde` pipeline (version 6), round-trip as bytecode
-without text conversion, and are wrapped in the exact `custom_call @mosaic_gpu_v2` program; their CUDA execution, AOT
-reload, PTX evidence, and upstream diagnostics are env-gated tests run by `pallas_gpu_seam_probes.yaml` on a
-CUDA 12/13 matrix with PTX dumps and `compute-sanitizer` memcheck/leak-check. `ryft-cuda` now inspects cubin ELF
-headers and checks device compute capability before loading, so wrong-SM artifacts fail with prelaunch diagnostics on
-every host; wrong-calling-convention artifacts and concurrent cache stress are covered portably. CPU archives are
-proven free of Mosaic/CUDA/cuTile symbols and Linux CUDA plugins prove `mosaic_gpu_v2` retention. The fresh macOS
-native archive also allowed the full `ryft-mlir` suite to run for the first time, which surfaced and fixed 84 Phase 3
-fixture and rendering bugs (now 3121/3121). aarch64 GPU runners are unavailable, so aarch64 stays build-only.
+**Implementation status (2026-09-14):** local qualification passes on macOS and DGX Spark (aarch64 NVIDIA GB10).
+Mosaic vector-add/matmul and cuTile native fixtures execute through their pinned runtime routes, including artifact,
+persistence and generated-code checks. Sanitizer race/sync/init checks pass; the memcheck allocation residue matches
+an unchanged cuDNN control and is not claimed leak-free. The broader CUDA/platform matrix remains deferred with user
+approval; no CI run or publication is required to continue. Current Mosaic source serde is version 8. Exact commands,
+artifacts, source checksums and limitations are in `.tasks/plan_kernel_phases_5_13.md` and its evidence directory.
 
 ### Phase 6: Restore reference program analysis and kernel validation foundations
 
@@ -1131,21 +1133,21 @@ and the three-rung ladder are unchanged.
 
 **Owners:** `ryft_core::kernels`, reusing existing core modules; no target dialect or runtime dependency.
 
-- [ ] Promote the proven experimental boundary into a backend-neutral higher-order `KernelCallOperation` and region.
-- [ ] Define grid, parameter, static-argument, access, alias, scratch, source-location, capability-requirement, and
+- [x] Promote the proven experimental boundary into a backend-neutral higher-order `KernelCallOperation` and region.
+- [x] Define grid, parameter, static-argument, access, alias, scratch, source-location, capability-requirement, and
       portable policy types without backend-specific fields. Keep backend binding/options outside the definition.
-- [ ] Reuse `ArrayType`, `ReferenceType`, `ArrayReferenceView`, the Phase 6 restored `ReferenceAnalysis`, effects,
+- [x] Reuse `ArrayType`, `ReferenceType`, `ArrayReferenceView`, the Phase 6 restored `ReferenceAnalysis`, effects,
       identities, and parameter structures rather than copying them.
-- [ ] Define kernel-specific effect/resource classes for memory, async operations, barriers, and atomics while keeping
+- [x] Define kernel-specific effect/resource classes for memory, async operations, barriers, and atomics while keeping
       ordinary program effect semantics intact.
-- [ ] Specify deterministic display, hashing, equality, identity renaming, refinement, serialization eligibility, and
+- [x] Specify deterministic display, hashing, equality, identity renaming, refinement, serialization eligibility, and
       source schema version.
-- [ ] Define the core-owned extension contract from §3.3 and parameterize the kernel operation family over it. Use
+- [x] Define the core-owned extension contract from §3.3 and parameterize the kernel operation family over it. Use
       an empty extension family for portable kernels; adapters supply concrete families in their owning phases.
       Reuse existing operation traits, reject opaque semantic payloads, and avoid a central backend enum in core.
-- [ ] Define the logical signature and verified-body boundary from §6.6-§6.7. Keep physical launch types, native
+- [x] Define the logical signature and verified-body boundary from §6.6-§6.7. Keep physical launch types, native
       artifacts, and XLA envelopes outside core; semantic rewrites require renewed validation.
-- [ ] Add dependency checks proving core contains no adapter/native compiler/runtime dependency, including through
+- [x] Add dependency checks proving core contains no adapter/native compiler/runtime dependency, including through
       features. Serialization and interpretation of the portable family must work with core alone.
 
 **Tests/docs:** exhaustive type/value/operation projections, malformed regions, deterministic render/hash, reference
@@ -1158,18 +1160,25 @@ root/view/access reuse, no target enum leakage, and compile-fail examples for es
 **Exit criterion:** a kernel is a first-class staged operation with a stable semantic identity but no backend or
 runtime assumptions in its core types.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+Core owns `KernelCallOperation`, `KernelDefinition`, `KernelOperation<Extension>`, logical signatures and
+`VerifiedKernel`. Exact semantic keys normalize nominal identities and preserve literal bits. Checked serde
+reconstructs the documented local portable subset; unsupported payloads and arbitrary extension identities fail
+explicitly. A renamed core-only consumer proves execution and serialization without backend dependencies.
+
 ### Phase 8: Add grids, block mappings, indexing, and bounds
 
 **Prerequisites:** Phase 7.
 
 **Owners:** `ryft-core` kernel modules and array indexing utilities.
 
-- [ ] Implement grid rank/extents, named dimension semantics, program IDs, number of programs, and scalar prefetch.
-- [ ] Define block shapes and pure block mappings with static result shape and bounded starts.
-- [ ] Add dynamic slice/index components, broadcasting advanced indices, masks, padding/`other`, and boundary policies.
-- [ ] Prove mapping purity and reject reference/data-dependent mappings.
-- [ ] Add checked index arithmetic, dynamic-bound refinement, and precise overlap/disjointness summaries.
-- [ ] Define specialization of static parameters and dynamic grid bounds without specializing on incidental pointer
+- [x] Implement grid rank/extents, named dimension semantics, program IDs, number of programs, and scalar prefetch.
+- [x] Define block shapes and pure block mappings with static result shape and bounded starts.
+- [x] Add dynamic slice/index components, broadcasting advanced indices, masks, padding/`other`, and boundary policies.
+- [x] Prove mapping purity and reject reference/data-dependent mappings.
+- [x] Add checked index arithmetic, dynamic-bound refinement, and precise overlap/disjointness summaries.
+- [x] Define specialization of static parameters and dynamic grid bounds without specializing on incidental pointer
       alignment or runtime values.
 
 **Tests/docs:** grid enumeration, mapping/oracle equivalence, singleton and zero-extent grids, logical-to-physical rank
@@ -1183,22 +1192,30 @@ specialization keys.
 **Exit criterion:** every operand window and boundary behavior is statically described or explicitly masked before a
 kernel body executes.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+Grids, named/sequential axes, pure dimension mappings, masked windows, scalar prefetch and specialization are
+implemented. Full dynamic shapes specialize through canonical refinements before parameter construction/tracing;
+retained dynamic bodies are not restaged. Broadcast advanced indexing composes canonical
+broadcast/select/gather/scatter; indexed stores are whole-window read-modify-write and require initialized
+destinations.
+
 ### Phase 9: Complete references, scratch, atomics, and synchronization
 
 **Prerequisites:** Phases 7-8.
 
 **Owners:** `ryft-core` kernel verifier and operations.
 
-- [ ] Add scoped uninitialized/initialized scratch allocation with memory-space, shape, layout eligibility, alignment,
+- [x] Add scoped uninitialized/initialized scratch allocation with memory-space, shape, layout eligibility, alignment,
       lifetime, and non-escape validation.
-- [ ] Implement path-sensitive definite initialization through conditions and fixed-point loops. Derive each transfer
+- [x] Implement path-sensitive definite initialization through conditions and fixed-point loops. Derive each transfer
       from the exact access mode together with its root-relative view, mask, and proven coverage; do not add a generic
       whole-reference initialization classifier to `ReferenceAccessMode`, because a partial or masked write does not
       necessarily initialize its complete root.
-- [ ] Add masked load/store/swap, ordered accumulation, device-scoped sequentially consistent atomics, and async-copy
+- [x] Add masked load/store/swap, ordered accumulation, device-scoped sequentially consistent atomics, and async-copy
       tokens/waits with exact operation-local reference semantics. Define the typed extension contract used later by
       target barriers and semaphores without pretending they are portable operations.
-- [ ] Introduce the generic `ReferenceAccessMode::AtomicAccumulate` mode and `reference_atomic_add_update` operation
+- [x] Introduce the generic `ReferenceAccessMode::AtomicAccumulate` mode and `reference_atomic_add_update` operation
       carrying the atomic/commutative semantics that the `Accumulate` documentation in
       `crates/ryft-core/src/programs/references/semantics.rs` explicitly excludes from the ordered mode (§5.6). The
       fixed exact-mode set forces every classifier, summary, display rendering,
@@ -1208,12 +1225,12 @@ kernel body executes.
       commutative contract. The update operand stays linear and therefore transposable. The first release keeps
       `EffectClass::OrderedState` so that only the kernel boundary exploits same-root commutation; generic transforms gain
       no reordering rights.
-- [ ] Define the portable sequentially consistent atomic model and device scope. Reject invalid combinations
+- [x] Define the portable sequentially consistent atomic model and device scope. Reject invalid combinations
       in core; defer otherwise valid but unavailable dtype/scope combinations to backend capability selection.
-- [ ] Add root/view overlap and race analysis for common affine block mappings.
-- [ ] Preserve dead swap-result store optimization only when old contents and untouched root elements are provably
+- [x] Add root/view overlap and race analysis for common affine block mappings.
+- [x] Preserve dead swap-result store optimization only when old contents and untouched root elements are provably
       unnecessary.
-- [ ] Record in this plan that the preserved-reference boundary formerly captured in `plan-references.md` is
+- [x] Record in this plan that the preserved-reference boundary formerly captured in `plan-references.md` is
       superseded by this production contract. Its `reference_kernels.rs` mock was already deleted when the
       interpreter-style discharge landed, so no mock-removal coordination remains.
 
@@ -1230,6 +1247,13 @@ parallel regions; token linearity; statically provable async ordering/races; and
 and synchronization contract, and rejects programs outside its proof subset. Dynamic interleaving, deadlock, and
 execution conformance become executable acceptance criteria in Phase 11.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+Qualified scratch, masked load/store/swap, device-scoped atomic accumulation, race/coverage proofs and same-region
+async copy/wait tokens are implemented. Loop initialization uses a conservative monotone proof; unsupported aliases,
+lifetimes and synchronization structures are rejected. Target-specific barriers remain adapter work; portable copies
+retain their explicit completion contract.
+
 ### Phase 10: Add the macro DSL, tracing integration, builders, and public kernel-call surface
 
 **Prerequisites:** Phases 7-9.
@@ -1238,30 +1262,30 @@ execution conformance become executable acceptance criteria in Phase 11.
 compilation/tracing/operations, and `ryft-macros-tests` integration coverage; `ryft` portable re-exports after
 stabilization. Macro expansion depends on core APIs only in emitted code, preserving the dependency direction.
 
-- [ ] Add typed builders for kernels, grid/block specs, scratch specs, static parameters, and portable schedules.
+- [x] Add typed builders for kernels, grid/block specs, scratch specs, static parameters, and portable schedules.
       Keep typed compiler options in adapter crates and backend binding in the execution integration.
-- [ ] Demonstrate one reusable portable definition staged without an adapter and prepare it for the Phase 11
+- [x] Demonstrate one reusable portable definition staged without an adapter and prepare it for the Phase 11
       core-only interpreter gate. Record its logical specialization/fingerprint so Phase 16 can compile that same
       body through two adapters.
-- [ ] Implement `#[kernel]`, shape requirements, and consumed input/output attributes from §3.4 in `ryft-macros`,
+- [x] Implement `#[kernel]`, shape requirements, and consumed input/output attributes from §3.4 in `ryft-macros`,
       re-exported through `ryft_core::kernels`. Use `Array` and canonical dtype/rank metadata rather than new matrix
       or typed-array types.
-- [ ] Generate typed staging functions and functional outer-call metadata; infer unambiguous output grids, create
+- [x] Generate typed staging functions and functional outer-call metadata; infer unambiguous output grids, create
       disjoint output views, and enforce full-array shape constraints separately from tile-shape constraints.
-- [ ] Translate the §3.5 supported Rust subset into capability calls and explicit staged control flow. Carry mutable
+- [x] Translate the §3.5 supported Rust subset into capability calls and explicit staged control flow. Carry mutable
       locals through nested loop/branch parameters and reject unsupported host behavior or control flow.
-- [ ] Trace generated and explicit closures through existing root/nested tracing, `StagingContext`, and
+- [x] Trace generated and explicit closures through existing root/nested tracing, `StagingContext`, and
       `Context::bind`, preserving reference restrictions. Reuse `InterpretableOperation` for tracer-valued replay;
       no new tracing graph, direct AST-to-native lowering, or macro-specific operation semantics.
-- [ ] Preserve fallible staging behavior, poison/finalization diagnostics, source spans, and hygienic emitted paths.
+- [x] Preserve fallible staging behavior, poison/finalization diagnostics, source spans, and hygienic emitted paths.
       Document supported helper/capture rules and expose expansion plus canonical IR for inspection.
-- [ ] Admit the minimal existing scalar-index, `f32` zero/add/dot, and structured-control-flow capabilities needed
+- [x] Admit the minimal existing scalar-index, `f32` zero/add/dot, and structured-control-flow capabilities needed
       to stage the §3.4 example through the kernel operation family. Reuse their canonical type/numerical contracts;
       Phase 11 interprets this subset and Phase 12 completes the wider portable operation/schedule coverage.
-- [ ] Infer parameter trees, result trees, aliases, source locations, and static specialization constraints.
-- [ ] Add user-facing load/store/indexing sugar only over the canonical operations; no second semantic path.
-- [ ] Seal regions atomically after validation and preserve exact diagnostics through nested helper calls.
-- [ ] Keep the surface experimental and out of broad crate-root exports until Phase 20.
+- [x] Infer parameter trees, result trees, aliases, source locations, and static specialization constraints.
+- [x] Add user-facing load/store/indexing sugar only over the canonical operations; no second semantic path.
+- [x] Seal regions atomically after validation and preserve exact diagnostics through nested helper calls.
+- [x] Keep the surface experimental and out of broad crate-root exports until Phase 20.
 
 **Tests/docs:** macro parse/expansion tests in `ryft-macros`; compile-pass/fail integration in `ryft-macros-tests`;
 isolated core-only macro consumer; renamed-crate/import hygiene; parameter/capture restrictions; output/grid inference;
@@ -1279,19 +1303,26 @@ opaque macro semantics, implicit backend selection, and a second tracer/compiler
 same normalized semantic IR/effects as explicit builders, with precise failures. Phase 11 proves interpreter results
 and Phase 16 proves both backend lowerings using these same macro-authored definitions.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+The `#[kernel]` macro uses ordinary Ryft tracing and canonical `Array` operations, including padded tiles, staged
+loops/branches, dot and functional outputs. Tiled matmul covers nine shapes and matches explicit staging. Escaping
+references and unsupported host syntax have compile-fail coverage. The surface remains experimental; broader
+operation sugar is added with demonstrated consumers.
+
 ### Phase 11: Build the semantic interpreter and debugging model
 
 **Prerequisites:** Phases 7-10.
 
 **Owners:** `ryft-core` interpreter and test utilities; thin `ryft-xla` debug integration later.
 
-- [ ] Execute grids, block mappings, references, scratch, masks, sequentially consistent atomics, async completion
+- [x] Execute grids, block mappings, references, scratch, masks, sequentially consistent atomics, async completion
       tokens, and bounded control flow deterministically on host arrays.
-- [ ] Add configurable race, bounds, initialization, NaN/precision, and async-token diagnostics.
-- [ ] Model concurrency with a deterministic scheduler capable of exploring small interleavings for litmus tests.
-- [ ] Preserve source locations and render an execution trace with grid point, operation, reference root/view, and
+- [x] Add configurable race, bounds, initialization, NaN/precision, and async-token diagnostics.
+- [x] Model concurrency with a deterministic scheduler capable of exploring small interleavings for litmus tests.
+- [x] Preserve source locations and render an execution trace with grid point, operation, reference root/view, and
       synchronization state.
-- [ ] Add property generators for small well-typed kernels and shrink failing cases.
+- [x] Add property generators for small well-typed kernels and shrink failing cases.
 
 **Tests/docs:** operation semantics, random interpreter/oracle checks, race/OOB/token reports, deterministic traces,
 and tutorial debugging workflows. Target barrier/deadlock simulation belongs to its backend phase.
@@ -1303,23 +1334,31 @@ and tutorial debugging workflows. Target barrier/deadlock simulation belongs to 
 **Exit criterion:** every portable kernel has an accelerator-independent executable specification suitable for
 backend conformance testing.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+The host interpreter qualifies bounds, initialization and races before private execution, preserves
+source/operation/root/view traces, and optionally checks NaNs. Canonical resumable replay drives bounded
+scalar-atomic interleaving exploration. Nested regions, masked windows and vector atomics are outside interleaving
+exploration, although ordinary interpretation supports the documented wider subset. Safety checks cannot be disabled
+to execute an invalid kernel.
+
 ### Phase 12: Complete portable value operations and scheduling contracts
 
 **Prerequisites:** Phases 7-11.
 
 **Owners:** `ryft-core` portable kernel operations and schedule metadata.
 
-- [ ] Admit the scalar/tile arithmetic, reductions, shape operations, dot, and block-scaled-dot families required by
+- [x] Admit the scalar/tile arithmetic, reductions, shape operations, dot, and block-scaled-dot families required by
       representative elementwise, reduction, matmul, convolution, and attention kernels.
-- [ ] Define portable layout constraints, pipeline stages, buffering depth, placement, and resource budgets as optional
+- [x] Define portable layout constraints, pipeline stages, buffering depth, placement, and resource budgets as optional
       schedules. Target agent membership, collective mode, and synchronization topology are semantic fields in the
       typed target launch/operation contract and are never erased as schedule hints.
-- [ ] Canonicalize and DCE pure work while retaining effects and all live target resources.
-- [ ] Validate operation-specific precision, rounding, saturation, and accumulator behavior.
-- [ ] Specify the minimal compiler capability in §6.6 using the Phase 5 GPU/cuTile native probes and existing
+- [x] Canonicalize and DCE pure work while retaining effects and all live target resources.
+- [x] Validate operation-specific precision, rounding, saturation, and accumulator behavior.
+- [x] Specify the minimal compiler capability in §6.6 using the Phase 5 GPU/cuTile native probes and existing
       compilation-domain hooks. Prototype only the necessary typed boundary; do not confuse hand-authored native
       probes with completed DSL lowerers. Validate the contract in Phases 14/16 before stabilizing it in Phase 20.
-- [ ] Separate portable semantic requirements from adapter target/options and associated output types. Add no
+- [x] Separate portable semantic requirements from adapter target/options and associated output types. Add no
       universal launcher, central target enum, or adapter registry to core. Phase 21 adds only proven TPU needs.
 
 **Tests/docs:** exact inference, folding, liveness, schedule validation, numerical edge cases, block scaling, and
@@ -1332,6 +1371,13 @@ interpreter equivalence for representative kernels.
 **Exit criterion:** the portable subset can describe useful kernels and all result-preserving schedule hints can be
 erased without changing results; target execution-agent and synchronization contracts remain intact.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+Portable arithmetic, reductions, shapes, dot/scaled-dot and attention reuse canonical operations and precision
+semantics. A tile-load/dot stencil demonstrates convolution-style windows. DCE retains effects. Layout/placement use
+existing array/scratch types; pipeline, buffering and scratch budgets are separate hints. `KernelCompiler` retains
+typed target/options/output without a core backend registry.
+
 ### Phase 13: Connect compiler adapters to XLA dispatch, ABI, caching, and execution
 
 **Prerequisites:** Phases 5-12.
@@ -1340,24 +1386,24 @@ erased without changing results; target execution-agent and synchronization cont
 compilation-domain hooks, selection, embedding, and persistence. Concrete compiler implementations follow in their
 adapter phases; shared native wrappers and platform artifacts retain their existing owners.
 
-- [ ] Add the higher-order kernel call to the XLA operation family and preserve its body until backend selection.
-- [ ] Implement the four ownership contracts in §6.7: core logical signature, adapter output, platform launch ABI,
+- [x] Add the higher-order kernel call to the XLA operation family and preserve its body until backend selection.
+- [x] Implement the four ownership contracts in §6.7: core logical signature, adapter output, platform launch ABI,
       and XLA embedding/persistence envelope. Consume canonical types without duplicating metadata.
-- [ ] Bind a portable definition to typed adapter options at the integration boundary; preserve body identity across
+- [x] Bind a portable definition to typed adapter options at the integration boundary; preserve body identity across
       compiler choices. Keep any heterogeneous adapter/extension enum here, not in core or a low-level runtime.
-- [ ] Join adapter-normalized target/compiler facts with PJRT execution facts before selection or compilation.
+- [x] Join adapter-normalized target/compiler facts with PJRT execution facts before selection or compilation.
       Keep core semantic capabilities independent of compiler-version and device-name enums.
-- [ ] Add explicit enabled-adapter selection with exact user override, portable fallback policy, and target-operation
+- [x] Add explicit enabled-adapter selection with exact user override, portable fallback policy, and target-operation
       rejection.
-- [ ] Embed backend artifacts in StableHLO custom calls with operation-local aliases and side effects, never external
+- [x] Embed backend artifacts in StableHLO custom calls with operation-local aliases and side effects, never external
       reference-state entry aliases.
-- [ ] Reuse existing core compilation-domain dispatch/cache hooks, PJRT fences, persistent executables, and
+- [x] Reuse existing core compilation-domain dispatch/cache hooks, PJRT fences, persistent executables, and
       replacement validation. Do not create a kernel-specific JIT lifecycle or duplicate the CUDA module cache.
-- [ ] Test typed ready-artifact and deferred-payload integration with hand-authored fixtures. Confirm an adapter
+- [x] Test typed ready-artifact and deferred-payload integration with hand-authored fixtures. Confirm an adapter
       output can be constructed and validated without an XLA-owned type or dependency.
-- [ ] Return host-asynchronous single-host execution through existing fences from the first backend; awaiting a fence
+- [x] Return host-asynchronous single-host execution through existing fences from the first backend; awaiting a fence
       must not require a second kernel-specific completion type.
-- [ ] Key caches by §6.3 and make compiler crashes/timeouts/cancellation non-poisoning to unrelated calls.
+- [x] Key caches by §6.3 and make compiler crashes/timeouts/cancellation non-poisoning to unrelated calls.
 
 **Tests/docs:** exact StableHLO ABI, zero external-state slots, capability failures, cache separation, persistence
 corruption, dropped execution, replacement mismatch, and reference-kernel interaction.
@@ -1370,6 +1416,13 @@ corruption, dropped execution, replacement mismatch, and reference-kernel intera
 identity, persistence validation, and host-asynchronous fence plumbing, demonstrated with a mock or hand-authored
 lower-layer artifact. Production lowering and device execution begin in Phase 14.
 
+**Implementation status (2026-09-14):** complete for the following admitted baseline.
+
+XLA preserves the attached kernel body until explicit compiler selection and joins live execution facts before
+admission/cache lookup. Ready/deferred outputs use the existing StableHLO, persistence and fence lifecycle. On DGX
+Spark, a hand-authored CUDA fixture passes selection, execution, persistence reload and cleanup. This validates
+integration; macro-to-Mosaic GPU lowering is Phase 14.
+
 ### Phase 14: Implement the Mosaic GPU baseline
 
 **Prerequisites:** Phases 5-13.
@@ -1377,19 +1430,19 @@ lower-layer artifact. Production lowering and device execution begin in Phase 14
 **Owners:** new `ryft_mosaic::kernels::gpu` lowerer, extensions, options, and target simulation using `ryft-mlir`;
 `ryft_xla::kernels` owns only selection and StableHLO/PJRT embedding.
 
-- [ ] Create the GPU-only `ryft-mosaic` adapter with the dependency rules in §3.2. Compile/validate adapter outputs
+- [x] Create the GPU-only `ryft-mosaic` adapter with the dependency rules in §3.2. Compile/validate adapter outputs
       in tests without linking `ryft-xla`; enable no TPU compiler/runtime dependency in this phase.
-- [ ] Lower grids to CUDA block/CTA launch semantics and portable references to GMEM/SMEM/register operations.
-- [ ] Lower scalar/tile arithmetic, masks, layouts, slices, broadcasts, reductions, ordinary dot, and bounded control
+- [x] Lower grids to CUDA block/CTA launch semantics and portable references to GMEM/SMEM/register operations.
+- [x] Lower scalar/tile arithmetic, masks, layouts, slices, broadcasts, reductions, ordinary dot, and bounded control
       flow for the supported Hopper-or-newer baseline.
-- [ ] Lower Mosaic GPU target barriers and basic asynchronous GMEM/SMEM transfers with declared agent membership and
+- [x] Lower Mosaic GPU target barriers and basic asynchronous GMEM/SMEM transfers with declared agent membership and
       verified lifetimes.
-- [ ] Implement deterministic target simulation for baseline CTA/barrier/async behavior and compare ordering,
+- [x] Implement deterministic target simulation for baseline CTA/barrier/async behavior and compare ordering,
       deadlock, and race outcomes with GPU execution.
-- [ ] Produce adapter-owned launch/resource metadata and compiler payloads; in `ryft-xla`, derive and verify
+- [x] Produce adapter-owned launch/resource metadata and compiler payloads; in `ryft-xla`, derive and verify
       StableHLO custom-call aliases/effects from the core logical contract and adapter physical mapping.
-- [ ] Add target legality for compute capability, CUDA/PTX/toolkit versions, shapes, layouts, and resource limits.
-- [ ] Compare interpreter, immutable oracle, Mosaic MLIR, target IR/PTX, and device results.
+- [x] Add target legality for compute capability, CUDA/PTX/toolkit versions, shapes, layouts, and resource limits.
+- [x] Compare interpreter, immutable oracle, Mosaic MLIR, target IR/PTX, and device results.
 
 **Tests/docs:** exact MLIR snapshots, verifier negatives, PTX feature assertions, GPU numerical suites, resource-limit
 errors, and vector/reduction/matmul examples.
@@ -1400,6 +1453,42 @@ errors, and vector/reduction/matmul examples.
 
 **Exit criterion:** representative portable kernels execute correctly through Mosaic GPU on the baseline supported
 architecture with inspectable code generation.
+
+**Implementation status (2026-09-14):** complete for the documented baseline, qualified on the DGX Spark.
+
+The adapter emits cooperative scalar GPU code from canonical kernel programs, including masked references, sum,
+ordinary dot, array-valued conditions and semantically bounded loops. The admitted numerical types are Boolean,
+I32/U32, I64/U64 and F32/F64; arithmetic operand element types must agree.
+Grid extents and shapes must be specialized. Asynchronous copies currently require whole static global roots and
+shared scratch destinations with 4- or 8-byte elements, followed by a wait before further cooperative work. The
+emitted copy groups and barriers are checked by the adapter simulator; core qualification retains logical reference
+initialization and lifetime checks. Advanced communication remains Phase 15.
+
+The necessary shared changes are lossless binary custom-call attributes and a correction to an existing MLIR unary
+wrapper's context/thread-pool lifetime. XLA embeds the binary source with exact architecture, pinned CUDA/PJRT and
+physical-layout checks. Native PTX/compiler-provider and driver compatibility remain checked by the native pipeline.
+No duplicate executable cache or launcher was introduced.
+
+Verification currently passes 60 adapter tests, 68 macro unit tests, 14 kernel macro integration tests, five XLA Mosaic
+embedding tests, the corrected MLIR wrapper regression, and the full affected XLA suite (704 passed, five existing
+tests ignored). The experimental vector-add, reduction, partial-tile matmul and explicit async-copy cases pass their
+independent host oracles. These results cover verified/serialized MLIR, bounds and reference views, loop carries,
+resource failures, and synchronization simulation. Native execution now passes all four cases on the DGX Spark
+(GB10, compute capability 12.1): vector addition (1003 elements), reduction (257 elements), partial-tile matrix
+multiplication (33×35 by 35×34), and asynchronous copy (67 elements). Each GPU result agrees with both core
+interpretation and an independent scalar oracle. PTX and native pass logs were emitted.
+
+Native qualification exposed three integration defects, now corrected and covered: unchanged dimension captures in
+bounded loops, ordered-assertion token propagation/native buffer slot gaps, and NVGPU token parsing before dialect
+registration. Serialization lowers async token operations to NVVM before versioned transport; a regression reproduces
+the runtime's parse order. The XLA bridge retains assertion effects and token dependencies. PTX feature assertions
+pass for all four kernels: PTX 9.2 targets `sm_121a`, with shared storage and CTA barriers, scalar dot/reduction arithmetic, and actual `cp.async`
+copy/commit/wait instructions. The isolated invalid-conversion case triggers a device trap and reports the CUDA
+failure through the execution fence. CUDA racecheck passes all four positive cases with zero hazards (zero errors
+and warnings), and synccheck reports zero errors. Final positive and isolated negative reruns also pass.
+Simulator negatives cover malformed membership, pending-copy accesses, and deadlocks; device checks cover valid
+emitted schedules. Broader hardware/platform qualification remains deferred under the Phase 5 exception. Detailed
+commands and source snapshots are recorded in `.tasks/plan_kernel_phase_14.md` and `.tasks/kernel-phase-14-evidence/`.
 
 ### Phase 15: Add advanced Hopper and Blackwell Mosaic GPU support
 
@@ -2263,3 +2352,15 @@ begins, and revalidate the direct Triton and ROCm sources only when Phase 22 beg
 - [x] Added the proposed `Array`-based macro matmul and explicit macro-to-existing-tracing design. Assigned frontend
       work to `ryft-macros`, retained canonical array/reference/program ownership, specified staged control flow and
       signature/boundary checks, and expanded Phase 10 scope, budgets, macro integration tests, and portability gates.
+
+- [x] Updated implementation status through Phase 13 from executable evidence: 3,293 core tests, 694 CPU XLA tests,
+      66 macro unit tests, 53 macro integration tests, 31 affected PJRT tests and 104 doctests pass. Native DGX Spark
+      selection/execution/persistence also passes. HTML documentation renders; strict link checking still identifies
+      40 unresolved links in unchanged non-kernel modules. Phase 14 qualification is recorded separately below.
+
+- [x] Completed Phase 14's Mosaic GPU baseline and macro-authored experiments. The adapter has 60 passing tests;
+      704 XLA tests pass with five existing ignores; 68 macro unit tests and 14 kernel integration tests pass.
+      On DGX Spark, vector addition, reduction, partial-tile matmul, and asynchronous copy agree with independent
+      oracles and the core interpreter. The isolated device assertion test passes, PTX features are verified, and
+      CUDA racecheck/synccheck report zero hazards/errors. The main phase record documents admitted operations,
+      resource/layout restrictions, necessary shared changes, and deferred platform coverage.

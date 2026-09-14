@@ -47,11 +47,16 @@ use crate::arrays_v0::{
     BoundedMaterializationWaiter, ExecuteArguments,
 };
 use crate::experimental::operations::ShardMapOperation;
+use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
 use crate::{Array, ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt};
 
 /// Error type returned by [`XlaDomain`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XlaDomainError {
+    /// Typed kernel embedding or session-owned native support failed.
+    #[error(transparent)]
+    Kernel(#[from] KernelEmbeddingError),
+
     /// Error surfaced while lowering a traced XLA program to StableHLO/Shardy MLIR.
     #[error("{0}")]
     Lowering(#[from] ShardMapTraceError),
@@ -212,6 +217,27 @@ pub struct XlaSession<'c> {
     cache: CompilationContext<XlaDomain<'c>>,
     /// Default ordering and completion scope shared by domains and arrays created through this session.
     default_effect_scope: Arc<EffectScope<'c>>,
+
+    /// Stable allocation borrowed by CUDA FFI invocations; destroyed after all retained completions.
+    cuda_kernel_runtime: Mutex<Option<Box<CudaKernelRuntime>>>,
+
+    /// Existing whole-execution fences protecting borrowed CUDA contexts even after outputs are dropped.
+    cuda_kernel_completions: Mutex<Vec<ExecutionFence>>,
+}
+
+impl Drop for XlaSession<'_> {
+    fn drop(&mut self) {
+        let completions = self.cuda_kernel_completions.get_mut().expect("cuda completion owner mutex poisoned");
+        for completion in completions.drain(..) {
+            match completion.block_until_ready() {
+                // An execution error is terminal too. It belongs to the caller's existing fence/error channel;
+                // cleanup only needs to ensure no queued handler can still access the borrowed session resources.
+                Ok(()) | Err(_) => {}
+            }
+        }
+        // Drop uses the CUDA owner's existing cleanup/error retention policy while our client borrow is alive.
+        drop(self.cuda_kernel_runtime.get_mut().expect("cuda runtime owner mutex poisoned").take());
+    }
 }
 
 impl<'c> XlaSession<'c> {
@@ -222,7 +248,13 @@ impl<'c> XlaSession<'c> {
 
     /// Creates a session with an explicitly configured compilation cache.
     pub fn with_compilation_context(client: &'c Client<'c>, cache: CompilationContext<XlaDomain<'c>>) -> Self {
-        Self { client, cache, default_effect_scope: Arc::new(EffectScope::default()) }
+        Self {
+            client,
+            cache,
+            default_effect_scope: Arc::new(EffectScope::default()),
+            cuda_kernel_runtime: Mutex::new(None),
+            cuda_kernel_completions: Mutex::new(Vec::new()),
+        }
     }
 
     /// Returns the externally owned PJRT client.
@@ -1753,6 +1785,9 @@ impl BucketedDispatchSignature {
 /// flags, backend lowering choices, and retained-dispatch policies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XlaOptions {
+    /// Explicit compiler and typed embedding used to select retained portable kernel calls.
+    pub kernel_compiler: Option<crate::kernels::XlaKernelCompilerBinding>,
+
     /// Concrete device mesh the compiled program runs against.
     pub mesh: DeviceMesh,
 
@@ -1783,6 +1818,7 @@ impl XlaOptions {
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
         Self {
+            kernel_compiler: None,
             mesh,
             in_shardings: None,
             out_shardings: None,
@@ -1791,6 +1827,12 @@ impl XlaOptions {
             input_bound_bucketing: None,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
         }
+    }
+
+    /// Selects one immutable compiler and typed embedding for portable kernel calls in this compilation.
+    pub fn with_kernel_compiler(mut self, compiler: crate::kernels::XlaKernelCompilerBinding) -> Self {
+        self.kernel_compiler = Some(compiler);
+        self
     }
 
     /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
@@ -1872,6 +1914,7 @@ impl std::hash::Hash for XlaOptions {
         self.feedback_directed_profile.hash(state);
         self.input_bound_bucketing.hash(state);
         self.ragged_dot_lowering_strategy.hash(state);
+        self.kernel_compiler.hash(state);
     }
 }
 
@@ -1925,6 +1968,9 @@ pub struct XlaLoweredProgram {
     /// Device kinds in the exact mesh order used by this lowering.
     device_kinds: Arc<[String]>,
 
+    /// Exact live execution facts for selected kernels; ordinary executables leave this absent.
+    kernel_execution_facts: Option<Vec<u8>>,
+
     /// Exact Ryft, OpenXLA, and JAX build identity used by this lowering.
     compiler_identity: Arc<str>,
 
@@ -1970,10 +2016,10 @@ impl XlaLoweredProgram {
     }
 }
 
-const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA7";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 7;
-const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 3;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 7;
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA8";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 8;
+const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 8;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -2072,9 +2118,9 @@ pub struct XlaOptimizedProgram {
     pub bytes: Vec<u8>,
 }
 
-/// Stable cache-key payload for the V7 executable and external-reference ABI.
+/// Stable cache-key payload for the V8 executable and external-reference ABI.
 #[derive(Serialize)]
-struct XlaPersistentKeyV7<'a> {
+struct XlaPersistentKeyV8<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
@@ -2086,6 +2132,10 @@ struct XlaPersistentKeyV7<'a> {
     output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
+
+    /// Native CUDA launcher requirement derived from selected calls.
+    requires_cuda_kernel_runtime: bool,
+
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
     /// Whether completion includes unordered I/O without a boundary slot.
@@ -2099,15 +2149,16 @@ struct XlaPersistentKeyV7<'a> {
     expected_argument_shardings: Vec<PersistentShardingV1>,
     mesh: PersistentDeviceMeshV1,
     device_kinds: &'a [String],
+    kernel_execution_facts: Option<&'a [u8]>,
     platform_name: &'a str,
     platform_version: &'a str,
     compiler_identity: &'a str,
     xla_flags: &'a str,
 }
 
-/// Stable V7 metadata envelope stored before serialized PJRT executable bytes.
+/// Stable V8 metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV7 {
+struct XlaPersistentExecutableMetadataV8 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
@@ -2119,6 +2170,11 @@ struct XlaPersistentExecutableMetadataV7 {
     output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
+
+    /// Native CUDA launcher requirement derived from selected calls.
+    #[serde(default)]
+    requires_cuda_kernel_runtime: bool,
+
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
     /// Whether completion includes unordered I/O without a boundary slot.
@@ -2132,6 +2188,9 @@ struct XlaPersistentExecutableMetadataV7 {
     expected_argument_shardings: Vec<PersistentShardingV1>,
     mesh: PersistentDeviceMeshV1,
     device_kinds: Vec<String>,
+
+    /// Exact live kernel execution facts, revalidated before loading native executable bytes.
+    kernel_execution_facts: Option<Vec<u8>>,
     replica_count: u64,
     partition_count: u64,
     device_assignment: Vec<u64>,
@@ -2775,6 +2834,9 @@ pub struct XlaCompiledProgram<'c> {
     platform_name: Arc<str>,
     platform_version: Arc<str>,
     device_kinds: Arc<[String]>,
+
+    /// Exact live execution facts for selected kernels; ordinary executables leave this absent.
+    kernel_execution_facts: Option<Vec<u8>>,
     compiler_identity: Arc<str>,
     xla_flags: Arc<str>,
     compilation_duration: Option<Duration>,
@@ -2793,6 +2855,7 @@ struct XlaInvocationMetadata<'a> {
     expected_argument_shardings: &'a [Sharding],
     mesh: &'a DeviceMesh,
     requires_assertion_handler: bool,
+    kernel_execution_facts: Option<&'a [u8]>,
 }
 
 impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
@@ -2808,6 +2871,7 @@ impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
             expected_argument_shardings: &program.expected_argument_shardings,
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
+            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
         }
     }
 }
@@ -2825,6 +2889,7 @@ impl<'a> From<&'a XlaLoweredProgram> for XlaInvocationMetadata<'a> {
             expected_argument_shardings: &program.expected_argument_shardings,
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
+            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
         }
     }
 }
@@ -2862,6 +2927,8 @@ fn incompatible_xla_invocation_field(
         Some("argument shardings")
     } else if current.mesh != other.mesh {
         Some("device mesh")
+    } else if current.kernel_execution_facts != other.kernel_execution_facts {
+        Some("kernel execution facts")
     } else if current.requires_assertion_handler != other.requires_assertion_handler {
         Some("assertion-handler requirement")
     } else {
@@ -2926,6 +2993,20 @@ impl<'c> XlaDomain<'c> {
         signature: &XlaExecutableSignature,
         platform_name: &str,
     ) -> Result<(), XlaDomainError> {
+        if signature.requires_cuda_kernel_runtime() {
+            if !platform_name.eq_ignore_ascii_case("cuda") {
+                return Err(XlaDomainError::InvalidCompilationOptions {
+                    reason: "cuda artifact calls require a cuda platform".to_owned(),
+                });
+            }
+            let session = self.session.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+                reason: "cuda artifact calls require an owning XlaSession".to_owned(),
+            })?;
+            let mut runtime = session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
+            if runtime.is_none() {
+                *runtime = Some(Box::new(CudaKernelRuntime::new(self.client()?)?));
+            }
+        }
         // I/O uses the shared registered-handler surface. Register the built-in print target at compilation and
         // reload on the platforms whose handler exists (CPU, and CUDA with a `cuda-*` feature), so ordinary eager
         // printing needs no separate process-global initialization by the caller.
@@ -3741,6 +3822,15 @@ impl<'c> XlaDomain<'c> {
         capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        // Kernel selection validates the actual attached body and discharges only its owned local state before the
+        // ordinary reference-discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
+        let selected = crate::kernels::select_kernels(program, options.kernel_compiler.as_ref(), || {
+            let client = self
+                .client()
+                .map_err(|error| crate::kernels::KernelEmbeddingError::Invalid { message: error.to_string() })?;
+            crate::kernels::XlaKernelExecutionFacts::from_client(client, &options.mesh)
+        })?;
+        let program = selected.as_ref().unwrap_or(program);
         if capture_count > program.input_count() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -4059,6 +4149,20 @@ impl<'c> XlaDomain<'c> {
             platform_name: client.platform_name()?.into_owned().into(),
             platform_version: client.platform_version()?.into_owned().into(),
             device_kinds: ordered_device_kinds(client, &options.mesh)?.into(),
+            kernel_execution_facts: if program.entry_region_ref().computation_regions().any(|region| {
+                region.instructions().iter().any(|instruction| match instruction.operation() {
+                    XlaOperation::CustomCall(operation)
+                    | XlaOperation::Array(ArrayOperation::CustomCall(operation)) => {
+                        operation.target_name() == crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET
+                            || operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
+                    }
+                    _ => false,
+                })
+            }) {
+                Some(crate::kernels::XlaKernelExecutionFacts::from_client(client, &options.mesh)?.configuration_key()?)
+            } else {
+                None
+            },
             compiler_identity: XLA_COMPILER_IDENTITY.as_str().into(),
             xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default().into(),
         })
@@ -4066,7 +4170,7 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV7 {
+        let key = XlaPersistentKeyV8 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
@@ -4078,6 +4182,7 @@ impl<'c> XlaDomain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
+            requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -4091,6 +4196,7 @@ impl<'c> XlaDomain<'c> {
                 .collect(),
             mesh: PersistentDeviceMeshV1::from(&program.mesh),
             device_kinds: &program.device_kinds,
+            kernel_execution_facts: program.kernel_execution_facts.as_deref(),
             platform_name: &program.platform_name,
             platform_version: &program.platform_version,
             compiler_identity: &program.compiler_identity,
@@ -4126,6 +4232,7 @@ impl<'c> XlaDomain<'c> {
             platform_name: Arc::clone(&program.platform_name),
             platform_version: Arc::clone(&program.platform_version),
             device_kinds: Arc::clone(&program.device_kinds),
+            kernel_execution_facts: program.kernel_execution_facts.clone(),
             compiler_identity: Arc::clone(&program.compiler_identity),
             xla_flags: Arc::clone(&program.xla_flags),
             compilation_duration: Some(compilation_duration),
@@ -4178,7 +4285,7 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV7 {
+        let metadata = XlaPersistentExecutableMetadataV8 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
@@ -4190,6 +4297,7 @@ impl<'c> XlaDomain<'c> {
             output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
+            requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -4203,6 +4311,7 @@ impl<'c> XlaDomain<'c> {
                 .collect(),
             mesh: PersistentDeviceMeshV1::from(&program.mesh),
             device_kinds: program.device_kinds.to_vec(),
+            kernel_execution_facts: program.kernel_execution_facts.clone(),
             replica_count: device_assignment.replica_count() as u64,
             partition_count: device_assignment.computation_count() as u64,
             device_assignment: flatten_device_assignment(&device_assignment)?,
@@ -4245,7 +4354,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV7 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV8 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -4261,6 +4370,16 @@ impl<'c> XlaDomain<'c> {
         }
 
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
+        if metadata.requires_cuda_kernel_runtime && metadata.kernel_execution_facts.is_none() {
+            return Err(persistent_error("cuda kernel executable is missing execution facts"));
+        }
+        if let Some(expected) = &metadata.kernel_execution_facts {
+            let actual =
+                crate::kernels::XlaKernelExecutionFacts::from_client(self.client()?, &mesh)?.configuration_key()?;
+            if expected != &actual {
+                return Ok(None);
+            }
+        }
         let capture_count = checked_usize(metadata.capture_count)?;
         let output_count = checked_usize(metadata.output_count)?;
         let reference_states = decode_persistent_reference_states(metadata.reference_states, capture_count)?;
@@ -4337,12 +4456,14 @@ impl<'c> XlaDomain<'c> {
         if metadata.device_ordered_io && !metadata.ordered_io {
             return Err(persistent_error("device-ordered I/O metadata requires an ordered boundary slot"));
         }
-        let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice()).with_effects(
-            metadata.ordered_io,
-            metadata.unordered_io,
-            metadata.requires_assertion_handler,
-            metadata.device_ordered_io,
-        );
+        let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice())
+            .with_effects(
+                metadata.ordered_io,
+                metadata.unordered_io,
+                metadata.requires_assertion_handler,
+                metadata.device_ordered_io,
+            )
+            .with_cuda_kernel_runtime(metadata.requires_cuda_kernel_runtime);
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
             || persistent_input_dimensions(&signature) != metadata.input_dimensions
@@ -4454,6 +4575,7 @@ impl<'c> XlaDomain<'c> {
             platform_name: metadata.platform_name.into(),
             platform_version: metadata.platform_version.into(),
             device_kinds: metadata.device_kinds.into(),
+            kernel_execution_facts: metadata.kernel_execution_facts,
             compiler_identity: metadata.compiler_identity.into(),
             xla_flags: metadata.xla_flags.into(),
             compilation_duration,
@@ -4922,8 +5044,12 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::ReferenceWrite(_)
         | XlaOperation::ReferenceSwap(_)
         | XlaOperation::ReferenceAddUpdate(_)
+        | XlaOperation::ReferenceAtomicAddUpdate(_)
         | XlaOperation::ReferenceFreeze(_) => {
             Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
+        }
+        XlaOperation::Kernel(_) => {
+            Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
         }
         XlaOperation::ShardMap(_) => {
             Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
@@ -5902,10 +6028,26 @@ impl<'c> XlaDomain<'c> {
                 reason: "injected failure before execution submission".to_string(),
             });
         }
+        let context = if program.signature.requires_cuda_kernel_runtime() {
+            let session = self.session.as_ref().unwrap();
+            let runtime = session.cuda_kernel_runtime.lock().expect("cuda runtime owner mutex poisoned");
+            // ensure_runtime_requirements initialized the stable boxed owner. This session cannot drop during this
+            // borrow; immediately after successful submission its existing fence is retained before output work.
+            Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()?) }?)
+        } else {
+            None
+        };
         let (mut device_outputs, fence) = program
             .executable
-            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, context, Some(file!()), None, None)?
             .into_parts();
+        if program.signature.requires_cuda_kernel_runtime() {
+            let session = self.session.as_ref().unwrap();
+            let mut completions = session.cuda_kernel_completions.lock().expect("cuda completion owner mutex poisoned");
+            // Failed fences are terminal and retain their diagnostics in the caller's existing execution object.
+            completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
+            completions.push(fence.clone());
+        }
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(&fence);
         let output_count = program.signature.physical_output_count();
@@ -6530,7 +6672,17 @@ mod tests {
             expected_argument_shardings: &[],
             mesh: &mesh,
             requires_assertion_handler: false,
+            kernel_execution_facts: None,
         };
+        let replacement = XlaInvocationMetadata { kernel_execution_facts: Some(b"changed"), ..current };
+        assert!(matches!(validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible kernel execution facts"));
+        let cuda_signature = signature.clone().with_cuda_kernel_runtime(true);
+        let replacement = XlaInvocationMetadata { signature: &cuda_signature, ..current };
+        assert!(matches!(validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible executable signature"));
         let replacement = XlaInvocationMetadata { donation_flags: &[true], ..current };
 
         assert!(matches!(
@@ -10145,7 +10297,40 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV7 =
+        // Reload validates the live facts before handing any native executable bytes to PJRT.
+        let encode = |metadata: XlaPersistentExecutableMetadataV8| {
+            let metadata = serde_json::to_vec(&metadata).unwrap();
+            let mut encoded = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+            encoded.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(&metadata);
+            encoded.extend_from_slice(&bytes[metadata_end..]);
+            encoded
+        };
+        let mut matching: XlaPersistentExecutableMetadataV8 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert_eq!(matching.kernel_execution_facts, None);
+        let facts = crate::kernels::XlaKernelExecutionFacts::from_client(&client, &mesh).unwrap();
+        matching.kernel_execution_facts = Some(facts.configuration_key().unwrap());
+        let matching = domain.deserialize_program(&encode(matching)).unwrap().unwrap();
+        assert_eq!(matching.kernel_execution_facts, Some(facts.configuration_key().unwrap()));
+        let mut mismatch: XlaPersistentExecutableMetadataV8 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        let mut changed_facts = facts;
+        changed_facts.pjrt_version.minor += 1;
+        mismatch.kernel_execution_facts = Some(changed_facts.configuration_key().unwrap());
+        assert!(domain.deserialize_program(&encode(mismatch)).unwrap().is_none());
+        let mut corrupt: XlaPersistentExecutableMetadataV8 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        corrupt.kernel_execution_facts = Some(vec![255]);
+        assert!(domain.deserialize_program(&encode(corrupt)).unwrap().is_none());
+        let mut missing: XlaPersistentExecutableMetadataV8 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        missing.requires_cuda_kernel_runtime = true;
+        assert!(matches!(domain.deserialize_program(&encode(missing)),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "cuda kernel executable is missing execution facts"));
+
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -10158,7 +10343,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV7 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -10343,7 +10528,7 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV7 {
+        let metadata = XlaPersistentExecutableMetadataV8 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
@@ -10355,6 +10540,7 @@ mod tests {
             output_count: 0,
             reference_states: Vec::new(),
             requires_assertion_handler: false,
+            requires_cuda_kernel_runtime: false,
             ordered_io: false,
             unordered_io: false,
             device_ordered_io: false,
@@ -10367,6 +10553,7 @@ mod tests {
                 devices: Vec::new(),
             },
             device_kinds: Vec::new(),
+            kernel_execution_facts: None,
             replica_count: 0,
             partition_count: 0,
             device_assignment: Vec::new(),
@@ -11715,7 +11902,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let corrupt = |metadata: XlaPersistentExecutableMetadataV7| {
+        let corrupt = |metadata: XlaPersistentExecutableMetadataV8| {
             let metadata = serde_json::to_vec(&metadata).unwrap();
             let mut corrupted = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
             corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
@@ -11723,7 +11910,7 @@ mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
-        let mut metadata: XlaPersistentExecutableMetadataV7 =
+        let mut metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
         assert_eq!(metadata.reference_states[0].logical_input_index, 0);
@@ -11737,7 +11924,7 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        let mut metadata: XlaPersistentExecutableMetadataV7 =
+        let mut metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
         let corrupted = corrupt(metadata);
@@ -11748,7 +11935,7 @@ mod tests {
         ));
 
         // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_outputs: XlaPersistentExecutableMetadataV7 =
+        let mut invalid_outputs: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_outputs.output_count = 3;
         let corrupted = corrupt(invalid_outputs);
@@ -11760,7 +11947,7 @@ mod tests {
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
         // no reference-state input could be checked against its own expected sharding.
-        let mut truncated_expected_shardings: XlaPersistentExecutableMetadataV7 =
+        let mut truncated_expected_shardings: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
         truncated_expected_shardings.expected_argument_shardings.pop();
@@ -11771,7 +11958,7 @@ mod tests {
                 if reason == "expected argument shardings do not match the physical input count",
         ));
 
-        let mut reordered: XlaPersistentExecutableMetadataV7 =
+        let mut reordered: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
         let corrupted = corrupt(reordered);
@@ -11781,7 +11968,7 @@ mod tests {
                 if reason == "reference states are not in canonical logical input order",
         ));
 
-        let mut foreign_process_mesh: XlaPersistentExecutableMetadataV7 =
+        let mut foreign_process_mesh: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         foreign_process_mesh.mesh.devices[0].process_index += 1;
         let corrupted = corrupt(foreign_process_mesh);
@@ -11791,7 +11978,7 @@ mod tests {
                 if reason == "reference-state mesh is not fully addressable by this process",
         ));
 
-        let mut mismatched_expected_sharding: XlaPersistentExecutableMetadataV7 =
+        let mut mismatched_expected_sharding: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
@@ -11801,7 +11988,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_input: XlaPersistentExecutableMetadataV7 =
+        let mut mismatched_input: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_input.signature.input_types[0]
             .sharding
@@ -11822,7 +12009,7 @@ mod tests {
                 if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
         ));
 
-        let mut mismatched_output: XlaPersistentExecutableMetadataV7 =
+        let mut mismatched_output: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mismatched_output.signature.output_types[1]
             .sharding
@@ -11837,7 +12024,7 @@ mod tests {
                 if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
 
-        let mut zero_space: XlaPersistentExecutableMetadataV7 =
+        let mut zero_space: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         zero_space.signature.input_types[0].data_type = encode_data_type(DataType::Zero);
         let corrupted = corrupt(zero_space);
@@ -11847,7 +12034,7 @@ mod tests {
                 if reason == "reference-state input has a zero-space type",
         ));
 
-        let mut host_memory: XlaPersistentExecutableMetadataV7 =
+        let mut host_memory: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         host_memory.signature.input_types[0].memory = PersistentMemoryV1::Host(true);
         let corrupted = corrupt(host_memory);
@@ -11857,7 +12044,7 @@ mod tests {
                 if reason == "reference-state input is not in device memory",
         ));
 
-        let mut unbounded_dynamic: XlaPersistentExecutableMetadataV7 =
+        let mut unbounded_dynamic: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         unbounded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "unbounded".to_string(),
@@ -11874,7 +12061,7 @@ mod tests {
                 if reason == "reference-state input has an unbounded dynamic dimension",
         ));
 
-        let mut mutated_dynamic: XlaPersistentExecutableMetadataV7 =
+        let mut mutated_dynamic: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         mutated_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_mutation".to_string(),
@@ -11892,7 +12079,7 @@ mod tests {
                               compatibility has not been verified",
         ));
 
-        let mut sharded_dynamic: XlaPersistentExecutableMetadataV7 =
+        let mut sharded_dynamic: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         sharded_dynamic.signature.variables.push(PersistentDimensionVariableV3 {
             name: "bounded_sharded".to_string(),
@@ -12875,7 +13062,7 @@ mod tests {
         let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         let metadata_size = u64::from_le_bytes(serialized[8..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut metadata: XlaPersistentExecutableMetadataV7 =
+        let mut metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&serialized[header_size..metadata_end]).unwrap();
         metadata.ordered_io = false;
         let metadata = serde_json::to_vec(&metadata).unwrap();
@@ -13509,6 +13696,226 @@ mod tests {
         assert!(domain.effects_barrier().is_ok());
         assert!(domain.acknowledge_effect_errors().is_ok());
         assert!(domain.fork_effect_scope().session().is_none());
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_xla_session_cuda_kernel_execution_and_persistence() {
+        use std::convert::Infallible;
+
+        use ryft_core::kernels::{
+            KernelCompilationError, KernelCompiler, KernelDefinition, KernelSchedule, VerifiedKernel,
+        };
+        use ryft_core::{Add, OneLike, ProjectedValue, Tracer};
+        use ryft_cuda::{
+            CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
+        };
+
+        use crate::kernels::{
+            CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, XlaKernelCompilerBinding, stage_kernel,
+        };
+
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Arc::new(XlaSession::new(&client));
+        let domain = session.domain();
+        let definition: KernelDefinition =
+            KernelDefinition::trace(crate::kernels::tests::definition().operation().clone(), |(references, _)| {
+                let value = ProjectedValue::new(references[0].read()?, ArrayType::scalar(DataType::I32));
+                references[0].write(value.add(&value.one_like()?)?.value())?;
+                Ok(())
+            })
+            .unwrap();
+        // The observable scalar increment must execute through the handler. Keeping inputs live verifies that XLA
+        // preserves functional array semantics while supplying an initialized aliased writable result.
+        let artifact = CudaKernelArtifact::new(
+            CudaArtifactFormat::Ptx,
+            b".version 7.0\n.target sm_80\n.address_size 64\n.visible .entry increment(.param .u64 data) {\n.reg .b64 pointer;\n.reg .b32 value;\nld.param.u64 pointer, [data];\nld.global.u32 value, [pointer];\nadd.u32 value, value, 1;\nst.global.u32 [pointer], value;\nret;\n}\n"
+                .to_vec(),
+            "increment",
+            "compute_80",
+            CudaKernelLaunchDimensions::new([1; 3], [1; 3], 0).unwrap(),
+            CudaKernelAbi::new("ryft.kernel.pointer", 1, vec![CudaKernelParameterType::DevicePointer]).unwrap(),
+        )
+        .unwrap();
+        /// Hand-authored artifact fixture admitted only for the exact verified scalar increment body.
+        struct IncrementCompiler {
+            artifact: CudaKernelArtifact,
+            semantic: String,
+        }
+        /// PTX fixture target requiring the actual CUDA platform, FFI ABI, and supported device architecture.
+        struct IncrementTarget;
+        impl crate::kernels::XlaKernelTarget for IncrementTarget {
+            fn admit_execution(
+                &self,
+                facts: &crate::kernels::XlaKernelExecutionFacts,
+            ) -> Result<(), crate::kernels::KernelEmbeddingError> {
+                let supported_devices = !facts.devices.is_empty()
+                    && facts.devices.iter().all(|device| match device.attributes.get("compute_capability") {
+                        Some(ryft_pjrt::Value::String(capability)) => capability
+                            .split('.')
+                            .next()
+                            .and_then(|major| major.parse::<usize>().ok())
+                            .is_some_and(|major| major >= 8),
+                        _ => false,
+                    });
+                if !facts.platform_name.eq_ignore_ascii_case("cuda")
+                    || !facts.has_ffi_extension
+                    || facts.pjrt_version.major != ryft_pjrt::VERSION.major
+                    || facts.pjrt_version.minor < ryft_pjrt::VERSION.minor
+                    || !supported_devices
+                {
+                    return Err(crate::kernels::KernelEmbeddingError::Invalid {
+                        message:
+                            "increment fixture requires CUDA compute capability 8.0 or newer and compatible PJRT FFI"
+                                .to_owned(),
+                    });
+                }
+                Ok(())
+            }
+        }
+        impl KernelCompiler for IncrementCompiler {
+            type Target = IncrementTarget;
+            type Options = ();
+            type Output = CudaKernelArtifact;
+            type Error = Infallible;
+
+            fn admit(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                _target: &IncrementTarget,
+                _options: &(),
+                _schedule: &KernelSchedule,
+            ) -> Result<(), KernelCompilationError<Infallible>> {
+                if kernel.definition().semantic_key().unwrap() != self.semantic {
+                    return Err(KernelCompilationError::Incompatible {
+                        message: "increment fixture body changed".to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            fn configuration_key(
+                &self,
+                _target: &IncrementTarget,
+                _options: &(),
+                _schedule: &KernelSchedule,
+            ) -> Result<Vec<u8>, KernelCompilationError<Infallible>> {
+                let mut key = b"increment-fixture-v1;compute_80;pointer-abi-v1;grid1;block1;shared0".to_vec();
+                key.extend_from_slice(self.artifact.bytes());
+                Ok(key)
+            }
+            fn compile(
+                &self,
+                _kernel: &VerifiedKernel<'_>,
+                _target: &IncrementTarget,
+                _options: &(),
+                _schedule: &KernelSchedule,
+            ) -> Result<CudaKernelArtifact, KernelCompilationError<Infallible>> {
+                Ok(self.artifact.clone())
+            }
+        }
+        let compiler = XlaKernelCompilerBinding::new(
+            IncrementCompiler { artifact, semantic: definition.semantic_key().unwrap() },
+            IncrementTarget,
+            (),
+            KernelSchedule::default(),
+            CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]),
+            1,
+        )
+        .unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel(inputs[0].context(), &definition, &inputs)
+            },
+            definition.operation().input_types(),
+        )
+        .unwrap();
+        assert!(program.effects().classes().contains(EffectClass::OrderedState));
+        let options = XlaOptions::new(mesh.clone()).with_kernel_compiler(compiler);
+        let lowered = domain.lower_xla_program(&program, 0, &options).unwrap();
+        assert!(lowered.signature.requires_cuda_kernel_runtime());
+        assert!(lowered.kernel_execution_facts.is_some());
+        assert!(!lowered.signature.has_effects());
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let input = session.array(scalar, mesh, 42_i32.to_ne_bytes()).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input.clone()]).unwrap();
+        let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
+        let restored_session = Arc::new(XlaSession::new(&client));
+        let restored_domain = restored_session.domain();
+        let restored = restored_domain.deserialize_xla_program(&bytes).unwrap().unwrap();
+        assert!(restored.signature.requires_cuda_kernel_runtime());
+        assert!(restored_session.cuda_kernel_runtime.lock().unwrap().is_some());
+        let restored_outputs = restored_domain.execute_xla_program(&restored, vec![outputs[0].clone()]).unwrap();
+        let device = client.addressable_devices().unwrap()[0].id().unwrap();
+        for (array, expected) in [(&input, 42), (&outputs[0], 43), (&restored_outputs[0], 44)] {
+            let bytes =
+                array.device_shard(device).unwrap().buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<i32>(&bytes), vec![expected]);
+        }
+        drop(outputs);
+        drop(restored_outputs);
+        // Both sessions retain their native launchers until the final queued execution completes, even though
+        // neither this call's outputs nor the session's public handles are retained by the caller.
+        drop(domain.execute_xla_program(&compiled, vec![input.clone()]).unwrap());
+        drop(restored_domain.execute_xla_program(&restored, vec![input.clone()]).unwrap());
+        drop(input);
+        drop(restored_domain);
+        drop(restored_session);
+        drop(domain);
+        drop(session);
+    }
+
+    #[test]
+    fn test_xla_session_drop_retains_cuda_completion_after_dropped_outputs() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let session = XlaSession::new(&client);
+        let (first, first_promise) = client.event(()).unwrap();
+        let (second, second_promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![first, second]);
+        session.cuda_kernel_completions.lock().unwrap().push(fence.clone());
+        drop(fence);
+        std::thread::scope(|threads| {
+            let (started, waiting) = std::sync::mpsc::channel();
+            let (released, completed) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                started.send(()).unwrap();
+                drop(session);
+                released.send(()).unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                completed.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            first_promise.set(Some(ryft_pjrt::Error::aborted("terminal test failure"))).unwrap();
+            assert!(matches!(
+                completed.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            second_promise.set(None).unwrap();
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+    }
+
+    #[test]
+    fn test_xla_domain_cuda_runtime_rejects_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let session = Arc::new(XlaSession::new(&client));
+        let signature = XlaExecutableSignature::new(&[], &[]).with_cuda_kernel_runtime(true);
+        assert!(!signature.has_effects());
+        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "cuda artifact calls require a cuda platform"));
+        assert!(session.cuda_kernel_runtime.lock().unwrap().is_none());
     }
 
     #[test]

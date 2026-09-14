@@ -3,6 +3,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ryft_core::kernels::KernelReferenceOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
@@ -30,28 +31,29 @@ use ryft_core::{
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, Log1pOperation,
-    LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
-    OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
+    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
+    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
-    ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
-    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot,
-    RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
-    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
-    reapply_array_reference_view, validate_array_reference_view,
+    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
+    ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
+    ReferenceSwapOperation, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation,
+    RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
+    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    discharge_positional_region_operation, reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
 use crate::experimental::operations::ShardMapOperation;
+use crate::kernels::XlaKernelOperation;
 
 /// Lifetime-free reference to an array member captured by an XLA program.
 pub type XlaArrayConstant = CaptureReference<ArrayType>;
@@ -247,6 +249,9 @@ pub enum XlaOperation<Constant = XlaConstant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
+    /// Portable kernel instruction whose actual body remains attached until explicit XLA compiler selection.
+    Kernel(XlaKernelOperation),
+
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
     /// kinds: it consumes dimension members and produces an array member.
@@ -299,6 +304,9 @@ where
 
     /// Unresolved additive update through a root reference or derived view retained until reference discharge.
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
+
+    /// Unresolved atomic additive update retained until sequential reference discharge or a supporting kernel lowering.
+    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>),
 
     /// Unresolved consuming whole-array reference freeze retained until reference discharge.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
@@ -388,6 +396,7 @@ where
         // The view derivations are the only members whose effects declare a view alias, each at its
         // single output; every other member and every backend-owned higher-order operation derives no view.
         match self {
+            Self::Kernel(operation) => operation.operation().reference_view(output_index),
             Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
@@ -410,6 +419,18 @@ where
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
         reapply_array_reference_view(context, view, source, symbols)
+    }
+}
+
+impl<Constant> KernelReferenceOperation for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn swap_output_index(&self) -> Option<usize> {
+        match self {
+            Self::Kernel(operation) => operation.operation().swap_output_index(),
+            _ => matches!(self, Self::ReferenceSwap(_)).then_some(0),
+        }
     }
 }
 
@@ -472,6 +493,7 @@ where
             ArrayIrOperation::ReferenceWrite(operation) => Self::ReferenceWrite(operation),
             ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
             ArrayIrOperation::ReferenceAddUpdate(operation) => Self::ReferenceAddUpdate(operation),
+            ArrayIrOperation::ReferenceAtomicAddUpdate(operation) => Self::ReferenceAtomicAddUpdate(operation),
             ArrayIrOperation::ReferenceFreeze(operation) => Self::ReferenceFreeze(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
@@ -737,6 +759,7 @@ where
             Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(*operation),
             Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
             Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
+            Self::ReferenceAtomicAddUpdate(operation) => ArrayIrOperation::ReferenceAtomicAddUpdate(*operation),
             Self::ReferenceFreeze(operation) => ArrayIrOperation::ReferenceFreeze(*operation),
             Self::DimensionFromScalar(operation) => ArrayIrOperation::DimensionFromScalar(operation.clone()),
             Self::DimensionToScalar(operation) => ArrayIrOperation::DimensionToScalar(*operation),
@@ -751,7 +774,8 @@ where
             Self::ParallelSumScatter(operation) => ArrayIrOperation::ParallelSumScatter(operation.clone()),
             Self::AllToAll(operation) => ArrayIrOperation::AllToAll(operation.clone()),
             Self::RaggedAllToAll(operation) => ArrayIrOperation::RaggedAllToAll(operation.clone()),
-            Self::Condition(_)
+            Self::Kernel(_)
+            | Self::Condition(_)
             | Self::While(_)
             | Self::Scan(_)
             | Self::CustomJvp(_)
@@ -882,8 +906,12 @@ impl<T: Type> Operation for JitCallOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-        (region_index == 0).then_some(input_index)
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1440,15 +1468,15 @@ mod tests {
         Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
         DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation,
-        EffectClasses, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
-        Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget,
-        ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
-        ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
-        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
-        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-        WhileOperation, ZeroOperation,
+        EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
+        ReferenceDischargeTarget, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation,
+        ReferenceViewValidationError, ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef,
+        RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
+        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
+        ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1499,8 +1527,8 @@ mod tests {
         // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
         // output provenance are all index-preserving for the single callee region and absent for any other region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
-        assert_eq!(operation.input_region_provenance(0, 3), Some(3));
-        assert_eq!(operation.input_region_provenance(1, 3), None);
+        assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::Input { index: 3 });
+        assert_eq!(operation.input_region_provenance(1, 3), InputRegionProvenance::None);
         assert_eq!(operation.region_capture_input_count(0), Some(2));
         assert_eq!(operation.region_capture_input_count(1), None);
         assert_eq!(
@@ -1668,6 +1696,12 @@ mod tests {
             ArrayIrOperation::<XlaArrayConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()).into();
         assert!(matches!(&add_update, XlaOperation::ReferenceAddUpdate(_)));
         assert!(matches!(add_update.to_core_operation(), Some(ArrayIrOperation::ReferenceAddUpdate(_)),));
+
+        let atomic_update: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new())
+                .into();
+        assert!(matches!(&atomic_update, XlaOperation::ReferenceAtomicAddUpdate(_)));
+        assert!(matches!(atomic_update.to_core_operation(), Some(ArrayIrOperation::ReferenceAtomicAddUpdate(_))));
 
         let freeze: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();

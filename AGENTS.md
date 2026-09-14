@@ -301,6 +301,7 @@ update this file so that they do not need to remind you again in the future.
   add documentation for all variants in that enum.
 - When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
   unit variants or small enums.
+- Keep an empty line between adjacent documented struct fields, including fields of private implementation structs.
 - Do not attach rustdoc comments (i.e., `///`) to trait implementation blocks. Put reusable public contract
   documentation on the trait or implementing type, and explain implementation mechanics and invariants with ordinary
   code comments (i.e., `//`) at the beginning of the implementation or relevant method body.

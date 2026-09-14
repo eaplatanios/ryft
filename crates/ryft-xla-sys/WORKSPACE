@@ -29,7 +29,10 @@ http_archive(
 http_archive(
     name = "jax",
     patch_args = ["-p1"],
-    patches = ["//patches:jax-mosaic-c-api-visibility.patch"],
+    patches = [
+        "//patches:jax-mosaic-c-api-visibility.patch",
+        "//patches:jax-mosaic-gpu-runtime-symbols.patch",
+    ],
     sha256 = JAX_SHA256,
     strip_prefix = "jax-{commit}".format(commit = JAX_COMMIT),
     urls = [

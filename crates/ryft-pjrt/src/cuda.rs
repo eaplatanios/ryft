@@ -1,7 +1,7 @@
 //! Adapts CUDA PJRT clients and XLA FFI resources for launching precompiled kernels with [`ryft_cuda`].
 //!
 //! This module is available with the `cuda-12` or `cuda-13` feature. [`Client::cuda_version`] reads the client's
-//! required CUDA version, and [`Client::cuda_kernel_launcher`] creates a [`CudaKernelLauncher`] using a compatible
+//! CUDA runtime version, and [`Client::cuda_kernel_launcher`] creates a [`CudaKernelLauncher`] using a compatible
 //! system driver. Artifact validation, argument packing, module caching, and CUDA driver calls remain in `ryft_cuda`.
 //!
 //! Inside an XLA FFI handler, [`FfiBuffer::cuda_kernel_argument`] borrows a buffer's device address and
@@ -39,10 +39,10 @@ use crate::clients::Client;
 use crate::extensions::ffi::{FfiBuffer, FfiExecutionContext};
 
 impl Client<'_> {
-    /// Returns the [`CudaVersion`] reported by this [`Client`]'s PJRT plugin. This is the client's required CUDA
-    /// version and not a query of the installed driver or the device's compute capability. The platform name must be
-    /// `cuda` (case-insensitive), and its version must have the form `cuda <encoded-version>`, where CUDA encodes
-    /// versions as `1000 * major + 10 * minor`.
+    /// Returns the CUDA runtime [`CudaVersion`] reported by this [`Client`]'s PJRT plugin. This is not a minimum
+    /// driver version or a query of the device's compute capability. The platform name must be `cuda`
+    /// (case-insensitive), and its version must have the form `cuda <encoded-version>`, where CUDA encodes versions as
+    /// `1000 * major + 10 * minor`.
     ///
     /// Returns [`Error::Integration`] for a non-CUDA client, failed platform queries, or an unparseable version
     /// string. Parsed values are validated by [`CudaVersion::from_encoded`], which requires a supported encoding.
@@ -51,7 +51,7 @@ impl Client<'_> {
             .platform_name()
             .map_err(|error| Error::integration(format!("failed to query the PJRT client platform name: {error}")))?;
 
-        // Reject other platforms before interpreting their unrelated version metadata as a CUDA requirement.
+        // Reject other platforms before interpreting their unrelated version metadata as a CUDA runtime version.
         if !platform_name.eq_ignore_ascii_case("cuda") {
             return Err(Error::integration(format!(
                 "CUDA kernel launchers require a CUDA PJRT client, but the provided client uses platform \
@@ -76,16 +76,21 @@ impl Client<'_> {
         CudaVersion::from_encoded(encoded_version)
     }
 
-    /// Creates a [`CudaKernelLauncher`] using the CUDA version reported by this [`Client`]. Loads a compatible system
-    /// CUDA driver and creates an empty module cache with the launcher's default limits. The launcher does not retain
-    /// the client or select a device; CUDA contexts and streams are supplied at launch time. Reuse the launcher across
-    /// invocations and shut it down before destroying contexts whose modules it caches.
+    /// Creates a [`CudaKernelLauncher`] requiring the major-version baseline of this client's CUDA runtime, following
+    /// [NVIDIA's rules](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html). For
+    /// example, a CUDA 13.2 runtime requires a driver supporting CUDA 13.0 for this launcher's API. Artifacts using
+    /// newer PTX or driver features may still fail during loading or execution; their driver errors are preserved.
+    ///
+    /// Loads the system CUDA driver and creates an empty module cache with the launcher's default limits. The launcher
+    /// does not retain the client or select a device; CUDA contexts and streams are supplied at launch time. Reuse the
+    /// launcher across invocations and shut it down before destroying contexts whose modules it caches.
     ///
     /// Propagates errors from [`Self::cuda_version`] and [`CudaKernelLauncher::new`], including an unavailable or
     /// incompatible driver. No kernel is compiled, loaded, or submitted by this function.
     #[inline]
     pub fn cuda_kernel_launcher(&self) -> Result<CudaKernelLauncher, Error> {
-        CudaKernelLauncher::new(self.cuda_version()?)
+        let version = self.cuda_version()?;
+        CudaKernelLauncher::new(CudaVersion::from_encoded(version.major() * 1000)?)
     }
 }
 
@@ -205,7 +210,7 @@ mod tests {
             match platform {
                 TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
                     let mut launcher = client.cuda_kernel_launcher().unwrap();
-                    assert_eq!(launcher.cuda_version(), client.cuda_version().unwrap());
+                    assert_eq!(launcher.cuda_version().encoded(), client.cuda_version().unwrap().major() * 1000);
                     // No work has been submitted, and the client still owns any external CUDA contexts.
                     assert_eq!(unsafe { launcher.shutdown() }, Ok(()));
                 }

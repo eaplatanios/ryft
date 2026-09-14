@@ -17,7 +17,10 @@ ryft-pjrt.workspace = true
 [dev-dependencies]
 indoc.workspace = true
 pretty_assertions.workspace = true
+ryft-core.workspace = true
 ryft-mlir.workspace = true
+ryft-mosaic.workspace = true
+ryft-xla.workspace = true
 ryft-xla-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,5 +28,6 @@ sha2.workspace = true
 
 [features]
 default = []
-cuda-12 = ["dep:ryft-cuda", "ryft-pjrt/cuda-12"]
-cuda-13 = ["dep:ryft-cuda", "ryft-pjrt/cuda-13"]
+cuda-12 = ["dep:ryft-cuda", "ryft-pjrt/cuda-12", "ryft-xla/cuda-12"]
+cuda-13 = ["dep:ryft-cuda", "ryft-pjrt/cuda-13", "ryft-xla/cuda-13"]
+mosaic-gpu = ["ryft-xla/mosaic-gpu"]

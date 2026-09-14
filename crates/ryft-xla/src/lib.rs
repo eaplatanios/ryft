@@ -5,6 +5,7 @@ pub mod eager;
 pub mod errors;
 pub mod experimental;
 pub mod jit;
+pub mod kernels;
 pub mod mlir;
 pub mod pjrt;
 pub mod profile_guided;

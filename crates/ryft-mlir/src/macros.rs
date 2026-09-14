@@ -782,7 +782,7 @@ macro_rules! mlir_unary_op {
             pub fn $op<'v, 'c: 'v, 't: 'c, V: $crate::Value<'v, 'c, 't>, L: $crate::Location<'c, 't>>(
                 input: V,
                 location: L,
-            ) -> Result<[<Detached $op:camel Operation>]<'c, 'c>, $crate::errors::Error> {
+            ) -> Result<[<Detached $op:camel Operation>]<'c, 't>, $crate::errors::Error> {
                 let context = location.context();
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));

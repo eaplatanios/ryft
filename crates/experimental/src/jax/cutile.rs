@@ -24,7 +24,6 @@ struct CutileMetadata {
     schema_version: u32,
     artifact: CutileArtifactMetadata,
     kernel: CutileKernelMetadata,
-    verification: CutileVerificationMetadata,
 }
 
 #[derive(Deserialize)]
@@ -57,11 +56,6 @@ struct CutileParameterMetadata {
     stride_constant: Option<Vec<i64>>,
     value: Option<i64>,
     abi: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct CutileVerificationMetadata {
-    jax_cutile_call_contract: bool,
 }
 
 /// A test-only cuTile artifact loaded from the bounded AOT export tool.
@@ -108,10 +102,6 @@ fn parse_cutile_artifact(metadata_json: &str, cubin_path: &Path, cubin: Vec<u8>)
     if architecture.is_empty() || !architecture.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!("invalid cuTile target architecture `{}`", metadata.artifact.target_sm));
     }
-    if !metadata.verification.jax_cutile_call_contract {
-        return Err("cuTile metadata does not record a successful JAX calling-convention verification".to_string());
-    }
-
     if metadata.kernel.calling_convention != "cutile_python_v2" {
         return Err(format!("unsupported cuTile calling convention `{}`", metadata.kernel.calling_convention,));
     }
@@ -355,15 +345,24 @@ fn test_cutile_cubin_on_xla_ffi_cuda_stream() {
             assert_eq!(compute_capability.replace('.', ""), target_sm.to_string());
 
             let options = test_compilation_options();
-            let executable = client.compile(&test_program(), &options).unwrap();
-            execute_cutile_add(&client, &executable, &device);
+            // Repeated executable and module lifetimes let the sanitizer observe allocation and cleanup across
+            // independent compilations, including the enclosing executable's ahead-of-time persistence path.
+            for _ in 0..8 {
+                let executable = client.compile(&test_program(), &options).unwrap();
+                execute_cutile_add(&client, &executable, &device);
 
-            // Ahead-of-time persistence: serialize the executable, reload it, and launch the cubin again through it.
-            let serialized = executable.executable().unwrap().serialize().unwrap();
-            let reloaded = client
-                .deserialize_and_load_executable(serialized.data(), Some(&options), &LoadOptions::default())
-                .unwrap();
-            execute_cutile_add(&client, &reloaded, &device);
+                let serialized = executable.executable().unwrap().serialize().unwrap();
+                let reloaded = client
+                    .deserialize_and_load_executable(serialized.data(), Some(&options), &LoadOptions::default())
+                    .unwrap();
+                execute_cutile_add(&client, &reloaded, &device);
+                drop(reloaded);
+                drop(executable);
+
+                // SAFETY: Both executions and host copies have completed, no graph capture is active, and this
+                // test owns the live client. Clearing forces the next iteration to load the cubin again.
+                unsafe { CUTILE_TEST_STATE.lock().unwrap().as_mut().unwrap().launcher.clear() }.unwrap();
+            }
 
             // Unload cached modules before dropping the PJRT client that owns their CUDA contexts.
             let mut state = CUTILE_TEST_STATE.lock().unwrap().take().unwrap();
@@ -433,9 +432,6 @@ fn test_cutile_metadata_contract() {
                 },
             ],
         },
-        "verification": {
-            "jax_cutile_call_contract": true,
-        },
     });
 
     let artifact = parse_cutile_artifact(metadata.to_string().as_str(), cubin_path, cubin.clone()).unwrap();
@@ -476,7 +472,7 @@ fn test_cutile_metadata_contract() {
     invalid_metadata["artifact"]["target_sm"] = serde_json::Value::String("sm_90".to_string());
     assert_eq!(
         parse_cutile_artifact(invalid_metadata.to_string().as_str(), cubin_path, cubin).unwrap_err(),
-        "invalid cuTile kernel artifact: cuda cubin ELF header targets `sm_100`, but the artifact records target \
+        "invalid cuTile kernel artifact: CUDA cubin ELF header targets `sm_100`, but the artifact records target \
          architecture `sm_90`",
     );
 }

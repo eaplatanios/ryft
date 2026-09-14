@@ -10,8 +10,6 @@ pub mod lowering;
 pub mod operations;
 /// Backend-owned staged operation types for traced XLA programs.
 pub mod ops;
-/// Experimental preserved-reference kernel boundary for externally stateful XLA kernels.
-pub mod reference_kernels;
 pub mod shard_map;
 
 pub use lowering::RaggedDotLoweringStrategy;

@@ -500,6 +500,8 @@ fn device_compute_capability(device: &Device<'_>) -> (u32, u32) {
 
 /// One executable Mosaic GPU slice: the kernel module, its host inputs, and the host oracle for the single output.
 struct MosaicGpuSlice {
+    /// Exact CUDA entry whose PTX must be emitted when target dumps are enabled.
+    ptx_entry: &'static str,
     kernel_module: for<'c, 't> fn(&'c Context<'t>, (u32, u32)) -> Result<Module<'c, 't>, Error>,
     input_shapes: Vec<Vec<usize>>,
     output_shape: Vec<usize>,
@@ -512,6 +514,7 @@ fn vector_add_slice() -> MosaicGpuSlice {
     let rhs = (0..VECTOR_ADD_LENGTH).map(|index| (VECTOR_ADD_LENGTH - index) as f32).collect::<Vec<_>>();
     let expected = lhs.iter().zip(&rhs).map(|(lhs, rhs)| lhs + rhs).collect();
     MosaicGpuSlice {
+        ptx_entry: "vector_add_mosaic_gpu_kernel",
         kernel_module: vector_add_module,
         input_shapes: vec![vec![VECTOR_ADD_LENGTH], vec![VECTOR_ADD_LENGTH]],
         output_shape: vec![VECTOR_ADD_LENGTH],
@@ -536,6 +539,7 @@ fn tiled_matmul_slice() -> MosaicGpuSlice {
         }
     }
     MosaicGpuSlice {
+        ptx_entry: "tiled_matmul_mosaic_gpu_kernel",
         kernel_module: tiled_matmul_module,
         input_shapes: vec![vec![MATMUL_M, MATMUL_K], vec![MATMUL_K, MATMUL_N]],
         output_shape: vec![MATMUL_M, MATMUL_N],
@@ -620,11 +624,13 @@ fn run_slice_on_cuda(client: &Client<'_>, slice: &MosaicGpuSlice) {
 
     if let (Ok(dump_directory), Ok(_)) = (env::var("MOSAIC_GPU_DUMP_TO"), env::var("MOSAIC_GPU_DUMP_PTX")) {
         let target = format!(".target sm_{}{}", compute_capability.0, compute_capability.1);
+        let entry = format!(".entry {}(", slice.ptx_entry);
         let ptx_files = ptx_dumps(Path::new(dump_directory.as_str()));
         assert!(!ptx_files.is_empty(), "no `.ptx` dump was written to `{dump_directory}`");
         assert!(
-            ptx_files.iter().any(|ptx| ptx.contains(target.as_str())),
-            "no dumped PTX names the device target `{target}` in `{dump_directory}`",
+            ptx_files.iter().any(|ptx| ptx.contains(target.as_str()) && ptx.contains(entry.as_str())),
+            "no dumped PTX defines `{}` for device target `{target}` in `{dump_directory}`",
+            slice.ptx_entry,
         );
     }
 }

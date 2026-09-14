@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Exports the Phase 0 cuTile vector-add fixture and records its launch contract."""
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import importlib.metadata
@@ -28,13 +26,14 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _array_constraint(compilation: Any, tile: Any, alias_group: str) -> Any:
+def _array_constraint(compilation: Any, tile: Any) -> Any:
+    """Describes one disjoint, contiguous input or output array for the fixture."""
     return compilation.ArrayConstraint(
         tile.int32,
         1,
         index_dtype=tile.int32,
         stride_lower_bound_incl=0,
-        alias_groups=(alias_group,),
+        alias_groups=(),
         may_alias_internally=False,
         stride_constant=(1,),
         shape_constant=(VECTOR_LENGTH,),
@@ -60,12 +59,13 @@ def _export_fixture(arguments: argparse.Namespace) -> dict[str, Any]:
         rhs_tile = tile.load(rhs, index=(block_id,), shape=(tile_size,))
         tile.store(output, index=(block_id,), tile=lhs_tile + rhs_tile)
 
+    # The native PJRT probe verifies this v2 cubin's ABI by executing it and checking the result.
     calling_convention = compilation.CallingConvention.cutile_python_v2()
     signature = compilation.KernelSignature(
         [
-            _array_constraint(compilation, tile, "lhs"),
-            _array_constraint(compilation, tile, "rhs"),
-            _array_constraint(compilation, tile, "output"),
+            _array_constraint(compilation, tile),
+            _array_constraint(compilation, tile),
+            _array_constraint(compilation, tile),
             compilation.ConstantConstraint(TILE_SIZE),
         ],
         calling_convention,
@@ -80,29 +80,6 @@ def _export_fixture(arguments: argparse.Namespace) -> dict[str, Any]:
             gpu_code=arguments.gpu_code,
             output_format="cubin",
         )
-
-        jax_contract_verified = False
-        if arguments.verify_jax_contract:
-            try:
-                import jax
-                import jax.numpy as jax_numpy
-                from cuda.tile.jax import OutputPlaceholder, cutile_call
-            except ImportError as error:
-                raise RuntimeError("JAX cuTile interoperability is unavailable") from error
-
-            @jax.jit
-            def jax_vector_add(lhs, rhs):
-                output = OutputPlaceholder(lhs.shape, lhs.dtype)
-                return cutile_call((1,), vector_add, (lhs, rhs, output, TILE_SIZE))
-
-            result = jax_vector_add(
-                jax_numpy.asarray([7], dtype=jax_numpy.int32),
-                jax_numpy.asarray([35], dtype=jax_numpy.int32),
-            )
-            result.block_until_ready()
-            if result.tolist() != [42]:
-                raise RuntimeError(f"JAX `cutile_call` returned {result.tolist()}, expected [42]")
-            jax_contract_verified = True
 
     cubin = Path(arguments.output_cubin).read_bytes()
     return {
@@ -129,7 +106,8 @@ def _export_fixture(arguments: argparse.Namespace) -> dict[str, Any]:
                     "index_dtype": "int32",
                     "shape_constant": [VECTOR_LENGTH],
                     "stride_constant": [1],
-                    "alias_groups": [name],
+                    "alias_groups": [],
+                    # v2 retains shape and stride arguments even when their constraints specify constants.
                     "abi": ["device_pointer", "shape_i32", "stride_i32"],
                 }
                 for name in ("lhs", "rhs", "output")
@@ -143,15 +121,10 @@ def _export_fixture(arguments: argparse.Namespace) -> dict[str, Any]:
                 }
             ],
         },
-        "verification": {
-            "jax_cutile_call_contract": jax_contract_verified,
-        },
         "toolchain": {
             "python": sys.version.split()[0],
             "cuda_tile": _package_version("cuda-tile"),
             "nvidia_cuda_tileiras": _package_version("nvidia-cuda-tileiras"),
-            "jax": _package_version("jax"),
-            "jaxlib": _package_version("jaxlib"),
         },
     }
 
@@ -193,8 +166,6 @@ def _orchestrate(arguments: argparse.Namespace) -> int:
         "--compiler-timeout-seconds",
         str(arguments.compiler_timeout_seconds),
     ]
-    if arguments.verify_jax_contract:
-        command.append("--verify-jax-contract")
 
     diagnostics: dict[str, Any] = {
         "schema_version": 1,
@@ -218,11 +189,16 @@ def _orchestrate(arguments: argparse.Namespace) -> int:
             }
         )
     except subprocess.TimeoutExpired as error:
+        # Timeout output can remain bytes despite text=True and may end in an incomplete UTF-8 sequence.
         diagnostics.update(
             {
                 "status": "timed_out",
-                "stdout": error.stdout or "",
-                "stderr": error.stderr or "",
+                "stdout": (
+                    error.stdout.decode("utf-8", errors="replace") if isinstance(error.stdout, bytes) else error.stdout or ""
+                ),
+                "stderr": (
+                    error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr or ""
+                ),
             }
         )
         diagnostics_path.write_text(json.dumps(diagnostics, indent=2, sort_keys=True) + "\n")
@@ -261,7 +237,6 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gpu-code", required=True, help="cuTile target, for example `sm_100`")
     parser.add_argument("--compiler-timeout-seconds", type=int, default=120)
     parser.add_argument("--process-timeout-seconds", type=int, default=150)
-    parser.add_argument("--verify-jax-contract", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if arguments.compiler_timeout_seconds <= 0:

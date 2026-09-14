@@ -29,8 +29,10 @@ pre-release-replacements = [
 
 [dependencies]
 ryft-core.workspace = true
+ryft-cuda.workspace = true
 ryft-macros.workspace = true
 ryft-mlir.workspace = true
+ryft-mosaic = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 ryft-xla-sys.workspace = true
 half.workspace = true
@@ -53,6 +55,7 @@ program-statistics = []
 differential-testing = []
 performance-benchmarking = []
 ndarray = ["dep:ndarray"]
+mosaic-gpu = ["dep:ryft-mosaic"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
 rocm-7 = ["ryft-pjrt/rocm-7"]

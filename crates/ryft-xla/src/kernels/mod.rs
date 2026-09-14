@@ -1,0 +1,506 @@
+//! Typed compiler-output embedding into the existing XLA custom-call and compilation lifecycle.
+//!
+//! Compiler outputs retain their adapter ownership. An XLA-owned [`KernelOutputEmbedding`] validates and translates
+//! one concrete output type; [`CompiledKernel`] retains the verified source until that selection is complete and
+//! emits the canonical custom call into ordinary staging. Existing XLA lowering, executable caching, persistence,
+//! and PJRT fences then own the program. This module does not introduce a second executable or module cache.
+
+use std::collections::BTreeSet;
+
+use ryft_core::kernels::{
+    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelSchedule, NoKernelExtension, VerifiedKernel,
+};
+use ryft_core::operations::custom_call::CustomCallOperation;
+use ryft_core::{
+    ArrayIrType, ArrayReferenceView, ArrayType, Context, EffectClass, Operation, ProgramError, ReferenceViewOperation,
+    TypeError, Typed,
+};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+mod cuda;
+#[cfg(feature = "mosaic-gpu")]
+pub(crate) mod mosaic;
+mod staging;
+
+#[cfg(feature = "mosaic-gpu")]
+pub use mosaic::MosaicGpuEmbedding;
+
+pub(crate) use staging::select_kernels;
+pub use staging::{
+    XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelOperation, XlaKernelTarget,
+    stage_kernel,
+};
+
+pub(crate) use cuda::CudaKernelRuntime;
+pub use cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding};
+
+/// Invalid compiler output or unsupported XLA embedding contract.
+#[derive(Debug, Error)]
+pub enum KernelEmbeddingError {
+    /// PJRT registration or execution-context setup failed.
+    #[error(transparent)]
+    Runtime(#[from] ryft_pjrt::Error),
+
+    /// Canonical CUDA artifact validation failed.
+    #[error(transparent)]
+    Cuda(#[from] ryft_cuda::Error),
+
+    /// Versioned payload serialization or parsing failed.
+    #[error(transparent)]
+    Payload(#[from] serde_json::Error),
+
+    /// Adapter admission or compilation failed, retaining the concrete source chain.
+    #[error("kernel compilation failed: {0}")]
+    Compiler(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// A canonical type or custom-call alias check failed.
+    #[error(transparent)]
+    Type(#[from] TypeError),
+
+    /// The output's signature, alias, payload, or execution contract is invalid.
+    #[error("invalid kernel embedding: {message}")]
+    Invalid {
+        /// Exact contract mismatch.
+        message: String,
+    },
+
+    /// This bridge cannot represent an externally observable effect of the kernel.
+    #[error("kernel embedding does not support external effect `{effect}`")]
+    UnsupportedEffect {
+        /// Effect that requires a separate supported token/handler contract.
+        effect: EffectClass,
+    },
+}
+
+/// XLA-owned conversion of one adapter-owned compiler output into a canonical custom call.
+///
+/// Implementations are trusted integration code: they must validate the output's version, physical argument map,
+/// required buffers, target requirements, and serialized payload before returning. An adapter output never needs to
+/// depend on this trait: XLA integration implements the trait for its own bridge over the foreign output type.
+/// Ready and deferred outputs use the same boundary; a deferred bridge additionally validates its native decoder
+/// and compiler-input schema. Registration and target capability checks must precede native loading or execution.
+///
+/// [`CompiledKernel`] independently validates the logical signature, operation-local aliases, and effects, adds
+/// semantic/compiler identity, and discharges only the definition's proven-local reference state. A bridge cannot
+/// request external reference-state slots or alter the kernel's logical inputs and results. An embedding implementing
+/// native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their token chain;
+/// a pure call cannot discharge or silently discard an observable assertion.
+pub trait KernelOutputEmbedding<Output, Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
+    /// Returns deterministic bytes covering target names, physical mappings, payload schemas, and plugin ABI facts.
+    fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError>;
+
+    /// Validates the typed output and builds its complete target call, including payload attributes.
+    fn custom_call(
+        &self,
+        kernel: &VerifiedKernel<'_, Extension>,
+        output: &Output,
+    ) -> Result<CustomCallOperation, KernelEmbeddingError>;
+}
+
+/// Selected compiler output together with the immutable source definition and its canonical custom-call embedding.
+///
+/// Selection is explicit; no constructor falls back to another compiler. The retained definition prevents an opaque
+/// payload from masquerading as an unverified kernel. Binding emits the selected custom call only after validating
+/// the exact logical inputs. Its attributes participate in existing StableHLO-based compilation and persistence keys.
+#[derive(Clone, Debug)]
+pub struct CompiledKernel<Extension: Operation<Type = ArrayIrType> = NoKernelExtension> {
+    /// Immutable body and boundary that were verified before compilation and embedding.
+    definition: KernelDefinition<Extension>,
+
+    /// Canonical array custom call selected for this exact definition and compiler configuration.
+    custom_call: CustomCallOperation,
+}
+
+impl<Extension> CompiledKernel<Extension>
+where
+    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+{
+    /// Admits and compiles the verified definition with one explicitly selected adapter, then embeds its typed output.
+    /// Compiler configuration is recorded even when it does not alter the emitted native bytes.
+    pub fn from_compiler<C, B>(
+        kernel: &VerifiedKernel<'_, Extension>,
+        compiler: &C,
+        target: &C::Target,
+        options: &C::Options,
+        schedule: &KernelSchedule,
+        embedding: &B,
+    ) -> Result<Self, KernelEmbeddingError>
+    where
+        C: KernelCompiler<Extension, Error: 'static + Send + Sync>,
+        B: KernelOutputEmbedding<C::Output, Extension>,
+    {
+        let output = kernel
+            .compile(compiler, target, options, schedule)
+            .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
+        let configuration = compiler
+            .configuration_key(target, options, schedule)
+            .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
+        Self::from_output(kernel, &configuration, &output, embedding)
+    }
+
+    /// Embeds an already available typed output, permitting runtime-only use when its native format supports it.
+    /// `configuration` must be the complete key emitted by the compiler that produced `output`; an integration must
+    /// validate persisted adapter/schema/plugin compatibility before invoking this constructor on reloaded output.
+    pub fn from_output<Output, B: KernelOutputEmbedding<Output, Extension>>(
+        kernel: &VerifiedKernel<'_, Extension>,
+        configuration: &[u8],
+        output: &Output,
+        embedding: &B,
+    ) -> Result<Self, KernelEmbeddingError> {
+        // The immutable verified definition owns every body reference input and forbids reference constants,
+        // captures, consumption, and escaping references. Removing only this local OrderedState is semantic
+        // reference discharge at the operation boundary. External effects need a separately supported token ABI.
+        let effects = kernel.definition().body().effects();
+        if effects.has_explicit_ordered_state() {
+            return Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedState });
+        }
+        let mut required_effect = None;
+        for effect in effects.classes() {
+            match effect {
+                EffectClass::OrderedState => (),
+                EffectClass::OrderedAssertion => required_effect = Some(effect),
+                _ => return Err(KernelEmbeddingError::UnsupportedEffect { effect }),
+            }
+        }
+        let mut custom_call = embedding.custom_call(kernel, output)?;
+        // An assertion is observable even when every array result is unused. A trusted embedding must implement
+        // that exact effect with its native handler and preserve the canonical assertion token chain.
+        if custom_call.effect_class() != required_effect {
+            return Err(KernelEmbeddingError::UnsupportedEffect {
+                effect: required_effect.or(custom_call.effect_class()).unwrap(),
+            });
+        }
+        let logical = kernel.definition().operation();
+        let expected = logical.output_types();
+        let actual = custom_call.output_types().iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>();
+        if actual != expected {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "compiler output types differ from the logical kernel results".to_owned(),
+            });
+        }
+        let aliases = custom_call
+            .input_output_aliases()
+            .iter()
+            .map(|alias| (alias.output_index(), alias.input_index()))
+            .collect::<Vec<_>>();
+        if aliases != logical.aliases() {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "compiler aliases differ from the logical kernel aliases".to_owned(),
+            });
+        }
+        if custom_call.target_name().is_empty() || custom_call.target_name().contains('\0') {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "custom-call target must be nonempty and contain no NUL".to_owned(),
+            });
+        }
+        let mut names = BTreeSet::new();
+        for (name, _) in custom_call.attributes() {
+            if name.starts_with("ryft.kernel.") || !names.insert(name) {
+                return Err(KernelEmbeddingError::Invalid {
+                    message: format!("duplicate or reserved custom-call attribute `{name}`"),
+                });
+            }
+        }
+        custom_call = custom_call
+            .with_attribute("ryft.kernel.schema", i64::from(KERNEL_SCHEMA_VERSION))
+            .with_attribute(
+                "ryft.kernel.semantic",
+                format!("{:x}", Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
+            )
+            .with_attribute("ryft.kernel.configuration", format!("{:x}", Sha256::digest(configuration)));
+        let input_types = logical
+            .input_types()
+            .iter()
+            .map(|value| <&ArrayType>::try_from(value).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        custom_call.infer_output_types(&input_types, &[])?;
+        Ok(Self { definition: kernel.definition().clone(), custom_call })
+    }
+
+    /// Returns the immutable source retained across adapter selection.
+    pub fn definition(&self) -> &KernelDefinition<Extension> {
+        &self.definition
+    }
+
+    /// Returns the selected canonical custom call, including deterministic semantic and compiler configuration keys.
+    pub fn custom_call(&self) -> &CustomCallOperation {
+        &self.custom_call
+    }
+
+    /// Binds the selected call through ordinary staging or an existing compilation domain after exact input checking.
+    /// External reference-state arguments are absent; all operands and outputs are ordinary array values.
+    pub fn bind<C>(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
+    where
+        C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>,
+    {
+        let actual = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        if actual != self.definition.operation().input_types() {
+            return Err(TypeError::invalid("compiled kernel input types do not match its logical signature").into());
+        }
+        context.bind(self.custom_call.clone(), Vec::new(), inputs)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::convert::Infallible;
+
+    use indoc::formatdoc;
+    use pretty_assertions::assert_eq;
+    use ryft_core::kernels::{
+        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
+        KernelParameterAccess,
+    };
+    use ryft_core::{
+        Array, ArrayIrOperation, ArrayIrValue, DataType, Placeholder, ProgramBuilder, ReferenceRead, ReferenceWrite,
+    };
+
+    use crate::experimental::lowering::lower_mlir_module_for_program;
+    use crate::experimental::ops::{XlaConstant, XlaProgramBuilder};
+
+    use super::*;
+
+    /// A scalar identity with a functional read-write alias and no external reference slot.
+    pub(crate) fn definition() -> KernelDefinition {
+        let mapping = BlockMapping::new(
+            ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+                .build(vec![], vec![], vec![])
+                .unwrap(),
+            vec![],
+            BoundaryPolicy::InBounds,
+        )
+        .unwrap();
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite, mapping)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        KernelDefinition::trace(operation, |(references, _)| {
+            references[0].write(&references[0].read()?)?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// A versioned deferred compiler input owned independently of any XLA representation.
+    struct DeferredCopy {
+        /// Exact decoder schema version.
+        schema: u32,
+    }
+
+    /// XLA decoder integration for the fixture's explicit deferred schema.
+    struct DeferredEmbedding;
+
+    impl KernelOutputEmbedding<DeferredCopy> for DeferredEmbedding {
+        fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+            Ok(b"ryft.test.deferred_copy.schema1".to_vec())
+        }
+        fn custom_call(
+            &self,
+            kernel: &VerifiedKernel<'_>,
+            output: &DeferredCopy,
+        ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+            if output.schema != 1 {
+                return Err(KernelEmbeddingError::Invalid {
+                    message: format!("unsupported deferred copy schema `{}`", output.schema),
+                });
+            }
+            let logical = kernel.definition().operation();
+            if logical.parameters().len() != 1 || logical.parameters()[0].access() != KernelParameterAccess::ReadWrite {
+                return Err(KernelEmbeddingError::Invalid {
+                    message: "deferred copy expects one read-write parameter".to_owned(),
+                });
+            }
+            Ok(CustomCallOperation::new("ryft.test.deferred_copy", vec![logical.parameters()[0].r#type().into_owned()])
+                .with_attribute("deferred.schema", i64::from(output.schema))
+                .with_input_output_alias(0, 0)?)
+        }
+    }
+
+    /// Compiler that returns a typed deferred payload, exercising ordinary admission and configuration identity.
+    struct Compiler;
+
+    impl KernelCompiler for Compiler {
+        type Target = bool;
+        type Options = u32;
+        type Output = DeferredCopy;
+        type Error = Infallible;
+
+        fn admit(
+            &self,
+            _kernel: &VerifiedKernel<'_>,
+            target: &bool,
+            _options: &u32,
+            _schedule: &KernelSchedule,
+        ) -> Result<(), KernelCompilationError<Infallible>> {
+            if *target {
+                Ok(())
+            } else {
+                Err(KernelCompilationError::Unavailable { message: "fixture target unavailable".to_owned() })
+            }
+        }
+        fn configuration_key(
+            &self,
+            _target: &bool,
+            options: &u32,
+            _schedule: &KernelSchedule,
+        ) -> Result<Vec<u8>, KernelCompilationError<Infallible>> {
+            Ok(options.to_le_bytes().to_vec())
+        }
+        fn compile(
+            &self,
+            _kernel: &VerifiedKernel<'_>,
+            _target: &bool,
+            _options: &u32,
+            _schedule: &KernelSchedule,
+        ) -> Result<DeferredCopy, KernelCompilationError<Infallible>> {
+            Ok(DeferredCopy { schema: 1 })
+        }
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_compiler() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let schedule = KernelSchedule::default();
+        let first =
+            CompiledKernel::from_compiler(&verified, &Compiler, &true, &1, &schedule, &DeferredEmbedding).unwrap();
+        let second =
+            CompiledKernel::from_compiler(&verified, &Compiler, &true, &2, &schedule, &DeferredEmbedding).unwrap();
+        assert_eq!(first.definition().semantic_key().unwrap(), second.definition().semantic_key().unwrap());
+        assert_ne!(first.custom_call().to_string(), second.custom_call().to_string());
+        assert_eq!(
+            first.definition().body().effects().classes().into_iter().collect::<Vec<_>>(),
+            vec![EffectClass::OrderedState]
+        );
+        assert!(first.custom_call().effects().classes().is_empty());
+        assert!(matches!(
+            CompiledKernel::from_compiler(&verified, &Compiler, &false, &1, &schedule, &DeferredEmbedding),
+            Err(KernelEmbeddingError::Compiler(_))
+        ));
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_rejects_deferred_schema() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"configuration", &DeferredCopy { schema: 2 }, &DeferredEmbedding),
+            Err(KernelEmbeddingError::Invalid { message }) if message == "unsupported deferred copy schema `2`",
+        ));
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_rejects_changed_aliases_and_effects() {
+        /// Supplies an intentionally mismatched typed embedding to test the independent logical checks.
+        struct ChangedEmbedding(bool);
+        impl KernelOutputEmbedding<()> for ChangedEmbedding {
+            fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+                Ok(b"ryft.test.changed.schema1".to_vec())
+            }
+            fn custom_call(
+                &self,
+                _kernel: &VerifiedKernel<'_>,
+                _output: &(),
+            ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+                let operation = CustomCallOperation::new("test.changed", vec![ArrayType::scalar(DataType::I32)]);
+                if self.0 {
+                    Ok(operation.with_input_output_alias(0, 0)?.with_effect_class(EffectClass::OrderedIo))
+                } else {
+                    Ok(operation)
+                }
+            }
+        }
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"config", &(), &ChangedEmbedding(false)),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "compiler aliases differ from the logical kernel aliases",
+        ));
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"config", &(), &ChangedEmbedding(true)),
+            Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedIo })
+        ));
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_rejects_external_body_effects() {
+        use ryft_core::ArrayOperation;
+        use ryft_core::kernels::KernelOperation;
+
+        for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
+            let logical = definition().operation().clone();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            builder.add_input(logical.parameters()[0].body_type());
+            builder
+                .add_instruction(
+                    ArrayOperation::<Array>::CustomCall(
+                        CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
+                    ),
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap();
+            let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+            let definition = KernelDefinition::new(logical, body).unwrap();
+            let verified = VerifiedKernel::new(&definition, 1).unwrap();
+            assert!(matches!(
+                CompiledKernel::from_output(&verified, b"config", &DeferredCopy { schema: 1 }, &DeferredEmbedding),
+                Err(KernelEmbeddingError::UnsupportedEffect { effect: actual }) if actual == effect,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_compiled_kernel_custom_call_stable_hlo() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let compiled = CompiledKernel::from_output(
+            &verified,
+            b"fixture configuration",
+            &DeferredCopy { schema: 1 },
+            &DeferredEmbedding,
+        )
+        .unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar.clone().into());
+        let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(program.reference_analysis(0).unwrap().roots().next().is_none());
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![scalar.clone()],
+            &vec![scalar],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (module, _signature, requires_assertion_handler) = lowered.into_parts();
+        assert!(!requires_assertion_handler);
+        let semantic = format!("{:x}", Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
+        let configuration = format!("{:x}", Sha256::digest(b"fixture configuration"));
+        assert_eq!(
+            module,
+            formatdoc! {r#"
+            module {{
+              func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
+                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 1 : i64, ryft.kernel.semantic = "{semantic}"}}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]}} : (tensor<i32>) -> tensor<i32>
+                return %0 : tensor<i32>
+              }}
+            }}
+        "#}
+        );
+    }
+}

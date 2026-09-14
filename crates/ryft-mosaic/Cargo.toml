@@ -1,0 +1,21 @@
+[package]
+name = "ryft-mosaic"
+version = "0.0.3"
+description = "Mosaic compiler adapters for Ryft kernels."
+readme = "README.md"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ryft-core.workspace = true
+ryft-mlir.workspace = true
+ryft-xla-sys.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+pretty_assertions.workspace = true

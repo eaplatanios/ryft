@@ -127,6 +127,7 @@ fn try_same_mesh<'o>(
     let bare_input_type = ArrayType::new(element_type, shape.clone().into());
 
     let xla_options = XlaOptions {
+        kernel_compiler: None,
         mesh: dst_mesh.clone(),
         in_shardings: Some(vec![src_sharding.clone()]),
         out_shardings: Some(vec![dst_sharding.clone()]),

@@ -210,6 +210,9 @@ pub(crate) struct XlaExecutableSignature {
 
     /// Whether lowering emitted a runtime assertion, including synthesized checks.
     requires_assertion_handler: bool,
+
+    /// Whether native CUDA artifact calls require the session launcher and execution-context user data.
+    requires_cuda_kernel_runtime: bool,
 }
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
@@ -327,6 +330,7 @@ impl XlaExecutableSignature {
             device_ordered_io: false,
             unordered_io: false,
             requires_assertion_handler: false,
+            requires_cuda_kernel_runtime: false,
         }
     }
 
@@ -365,6 +369,17 @@ impl XlaExecutableSignature {
     /// Returns whether execution requires the runtime assertion handler.
     pub(crate) fn requires_assertion_handler(&self) -> bool {
         self.requires_assertion_handler
+    }
+
+    /// Returns whether execution needs session-owned CUDA artifact resources.
+    pub(crate) fn requires_cuda_kernel_runtime(&self) -> bool {
+        self.requires_cuda_kernel_runtime
+    }
+
+    /// Restores the persisted CUDA runtime requirement without changing the program's effect classes.
+    pub(crate) fn with_cuda_kernel_runtime(mut self, required: bool) -> Self {
+        self.requires_cuda_kernel_runtime = required;
+        self
     }
 
     /// Returns whether execution participates in the effect barrier.
@@ -4637,8 +4652,8 @@ fn lower_custom_call_memory_layouts(
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
 /// (`api_version = 4`). Typed attributes become the `backend_config` dictionary, array layouts become complete
 /// StableHLO operand/result layout lists, and flat input/output aliases become StableHLO output-operand aliases.
-/// An ordered call additionally consumes and produces the current ordered-I/O token so multiple such calls
-/// remain ordered even when their array results do not carry a data dependency. An unordered impure call retains
+/// An ordered call additionally consumes and produces the current token for its assertion or I/O effect, so calls
+/// in that effect class remain ordered even when their array results do not carry a data dependency. An unordered impure call retains
 /// the same handler ABI but uses a fresh local token without joining the ordered chain. Handlers are resolved by the XLA
 /// runtime through the target name at execution time (e.g., registered via `ryft-pjrt`'s
 /// `Client::register_ffi_handler`).
@@ -4654,8 +4669,15 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     // Every impure registered handler keeps its trailing token ABI; unordered calls use an independent local chain.
     let mut local_tokens = EffectTokens::default();
-    let joins_ordered_chain =
-        matches!(operation.effect_class(), Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo));
+    let joins_ordered_chain = matches!(
+        operation.effect_class(),
+        Some(EffectClass::OrderedIo | EffectClass::DeviceOrderedIo | EffectClass::OrderedAssertion)
+    );
+    let token_class = if operation.effect_class() == Some(EffectClass::OrderedAssertion) {
+        EffectClass::OrderedAssertion
+    } else {
+        EffectClass::OrderedIo
+    };
     let effect_tokens = if joins_ordered_chain { effect_tokens } else { &mut local_tokens };
     check_count!("input", input_types, input_values.len(), ProgramError);
     let attributes = operation
@@ -4664,6 +4686,9 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         .map(|(name, value)| {
             let value = match value {
                 CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
+                CustomCallAttribute::Bytes(bytes) => {
+                    context.string_attribute(StringRef::from(bytes.as_slice())).as_ref()
+                }
                 CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
                 CustomCallAttribute::I64(integer) => {
                     context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
@@ -4675,9 +4700,22 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         .collect::<Vec<_>>();
     let backend_config = context.dictionary_attribute(&attributes);
     let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, operation.has_side_effect())?;
+    #[cfg(feature = "mosaic-gpu")]
+    let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
+    {
+        let mut layouts = crate::kernels::mosaic::memory_layouts(input_types, output_types)
+            .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
+        if operation.has_side_effect() {
+            layouts.operands.push(Vec::new());
+            layouts.results.push(Vec::new());
+        }
+        Some(layouts)
+    } else {
+        memory_layouts
+    };
     let mut lowered_inputs = input_values.to_vec();
     if operation.has_side_effect() {
-        lowered_inputs.push(current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?);
+        lowered_inputs.push(current_or_new_token(token_class, effect_tokens, block, location)?);
     }
     let mut lowered_output_types = output_types
         .iter()
@@ -4710,7 +4748,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     )?)?;
     if operation.has_side_effect() {
         effect_tokens.set(
-            EffectClass::OrderedIo,
+            token_class,
             lowered
                 .result(output_types.len())
                 .expect("a side-effecting custom call should return one trailing token result")
@@ -6856,6 +6894,13 @@ where
     }
     // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
     // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
+    signature.requires_cuda_kernel_runtime = program.entry_region_ref().computation_regions().any(|region| {
+        region.instructions().iter().any(|instruction| {
+            matches!(instruction.operation(),
+            XlaOperation::CustomCall(operation) | XlaOperation::Array(ArrayOperation::CustomCall(operation))
+                if operation.target_name() == crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET)
+        })
+    });
     signature.requires_assertion_handler |= collective_state.has_assertions.get();
     let requires_assertion_handler = signature.requires_assertion_handler;
     Ok(LoweredXlaModule {
@@ -9186,6 +9231,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     }
 
     match operation {
+        XlaOperation::Kernel(operation) => Err(LoweringError::UnsupportedOp {
+            op: format!("unselected kernel operation `{}` requires an explicit XLA compiler binding", operation.name()),
+        }),
         XlaOperation::Condition(_) => lowerer.lower_condition(regions, input_values),
         XlaOperation::While(operation) => lowerer.lower_while(operation, regions, input_values),
         XlaOperation::Scan(operation) => lowerer.lower_scan(operation, regions, input_values),
@@ -18699,6 +18747,128 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_threads_custom_call_assertions() {
+        use ryft_mlir::{DialectHandle, WalkOrder, WalkResult};
+        let scalar = ArrayType::scalar(DataType::I64);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar.clone());
+        #[cfg(not(feature = "mosaic-gpu"))]
+        let target = "ryft.test.assertion";
+        #[cfg(feature = "mosaic-gpu")]
+        let target = ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET;
+        let call =
+            CustomCallOperation::new(target, vec![scalar.clone()]).with_effect_class(EffectClass::OrderedAssertion);
+        let first = builder.add_instruction(call.clone(), vec![], vec![input], None).unwrap()[0];
+        builder.add_instruction(call, vec![], vec![input], None).unwrap();
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![first], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let text = to_mlir_module_for_program(&program, &[], &vec![scalar.clone()], &vec![scalar], "main", None, None)
+            .unwrap();
+        let context = MlirContext::new();
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
+        let module = context.parse_module(&text).unwrap();
+        assert_eq!(module.verify(), Ok(true));
+        let mut calls = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str() == Ok("stablehlo.custom_call") {
+                calls.push(operation);
+            }
+            WalkResult::Advance
+        });
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].operand_count(), 2);
+        assert_eq!(calls[0].result_count(), 2);
+        #[cfg(feature = "mosaic-gpu")]
+        {
+            let operands = calls[0].array_attribute("operand_layouts").unwrap();
+            let results = calls[0].array_attribute("result_layouts").unwrap();
+            assert_eq!(operands.len(), 2);
+            assert_eq!(results.len(), 2);
+            assert_eq!(operands.element(1).unwrap().to_string(), "dense<> : tensor<0xindex>");
+            assert_eq!(results.element(1).unwrap().to_string(), "dense<> : tensor<0xindex>");
+        }
+        assert_eq!(calls[1].operand(1).unwrap().value().unwrap(), calls[0].result(1).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_threads_assertions_without_array_results() {
+        use ryft_mlir::{DialectHandle, WalkOrder, WalkResult};
+        let mut builder = XlaProgramBuilder::new();
+        let call =
+            CustomCallOperation::new("ryft.test.assertion", vec![]).with_effect_class(EffectClass::OrderedAssertion);
+        builder.add_instruction(call.clone(), vec![], vec![], None).unwrap();
+        builder.add_instruction(call, vec![], vec![], None).unwrap();
+        let program = builder.build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![], vec![]).unwrap();
+        let program = unproject_plain_program(program);
+        let text = to_mlir_module_for_program(
+            &program,
+            &[],
+            &Vec::<ArrayType>::new(),
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let context = MlirContext::new();
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
+        let module = context.parse_module(&text).unwrap();
+        assert_eq!(module.verify(), Ok(true));
+        let mut calls = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str() == Ok("stablehlo.custom_call") {
+                calls.push(operation);
+            }
+            WalkResult::Advance
+        });
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].operand_count(), 1);
+        assert_eq!(calls[0].result_count(), 1);
+        assert_eq!(calls[1].operand(0).unwrap().value().unwrap(), calls[0].result(0).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_binary_custom_call_attributes() {
+        let mut builder = XlaProgramBuilder::new();
+        builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.binary", vec![])
+                    .with_attribute("module", vec![0u8, 0x80, 0xff])
+                    .with_attribute("empty", Vec::<u8>::new()),
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+        let program = builder.build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![], vec![]).unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &Vec::<ArrayType>::new(),
+                &Vec::<ArrayType>::new(),
+                "main",
+                None,
+                None
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main() {
+                    stablehlo.custom_call @ryft.test.binary() {api_version = 4 : i32, backend_config = {empty = "", module = "\00\80\FF"}} : () -> ()
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_lowers_dynamic_custom_call_alias() {
         use ryft_core::operations::custom_call::CustomCallOperation;
 
@@ -22941,5 +23111,35 @@ mod tests {
         assert!(stablehlo.contains("%arg0") && stablehlo.contains("%arg1"), "should reference both inputs");
         // No sine (sin derivative = cosine, not sine).
         assert!(!stablehlo.contains("stablehlo.sine"), "gradient should not contain sine");
+    }
+
+    #[test]
+    fn test_xla_lowering_rejects_preserved_reference_entries() {
+        use ryft_core::kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
+        use ryft_core::{ReferenceReadOperation, ReferenceType};
+
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadOnly)]);
+        assert!(validate_kernel_body(program.entry_region_ref(), &contract).is_ok());
+        assert!(matches!(
+            lower_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![scalar_type.clone()],
+                &vec![scalar_type],
+                "main",
+                None,
+                None,
+                None,
+            ),
+            Err(LoweringError::UnresolvedReference { construct }) if construct == "program",
+        ));
     }
 }

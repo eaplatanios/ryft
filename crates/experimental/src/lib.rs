@@ -6,6 +6,9 @@ pub use ryft_pjrt::*;
 mod jax;
 
 #[cfg(test)]
+mod kernels;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
 
