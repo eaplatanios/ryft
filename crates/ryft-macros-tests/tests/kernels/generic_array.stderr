@@ -1,0 +1,5 @@
+error: kernel parameters must use the canonical non-generic `Array`
+ --> tests/kernels/generic_array.rs:4:64
+  |
+4 | fn invalid(#[output(data_type = F32, shape = [])] output: &mut Array<f32>) {}
+  |                                                                ^^^^^^^^^^

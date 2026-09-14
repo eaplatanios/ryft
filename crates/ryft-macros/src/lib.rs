@@ -1,6 +1,7 @@
 use proc_macro::TokenStream;
 
 mod helpers;
+mod kernels;
 mod operations;
 mod parameters;
 
@@ -59,4 +60,18 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
     operations::generate_operation_impl(input)
+}
+
+/// Defines an experimental portable kernel using canonical `Array` signature annotations.
+///
+/// The current subset supports whole-array and padded tiled access, shape requirements, local arithmetic,
+/// zero tiles, matrix multiplication, and `.sum([axes])` reductions with literal axes. It produces a functional
+/// callable and a same-name module exposing `definition`. Bounded range loops and value-dependent conditionals stage
+/// canonical control-flow regions.
+/// Unbounded control flow and arbitrary host calls are rejected instead of executing as host Rust.
+#[proc_macro_attribute]
+pub fn kernel(attributes: TokenStream, input: TokenStream) -> TokenStream {
+    kernels::expand(attributes.into(), input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }

@@ -15,6 +15,22 @@ pub(crate) use self::partial::{
     PartiallyEvaluatableOperation,
 };
 
+/// Stand-in for the complete input provenance contract emitted by the operation derive.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InputRegionProvenance {
+    /// No input origin is declared.
+    None,
+
+    /// The region input corresponds to an operation operand.
+    Input {
+        /// Position of the supplying operation operand.
+        index: usize,
+    },
+
+    /// The operation creates the region input.
+    Local,
+}
+
 /// Stand-in for `ryft_core::TypeIdentity`.
 trait TypeIdentity: Clone {}
 
@@ -273,8 +289,8 @@ trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<usize> {
-        None
+    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> InputRegionProvenance {
+        InputRegionProvenance::None
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1083,11 +1099,12 @@ impl Operation for PrintOperation {
         Ok(input_types.to_vec())
     }
 
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         match region_index {
-            0 => Some(input_index),
-            1 => Some(input_index + 1),
-            _ => None,
+            0 => InputRegionProvenance::Input { index: input_index },
+            1 => InputRegionProvenance::Input { index: input_index + 1 },
+            2 if input_index == 0 => InputRegionProvenance::Local,
+            _ => InputRegionProvenance::None,
         }
     }
 
@@ -1492,9 +1509,12 @@ fn test_operation_generates_operation_forwarding() {
     assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
     assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
     assert!(!print.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
-    assert_eq!(add.input_region_provenance(0, 0), None);
-    assert_eq!(print.input_region_provenance(0, 2), Some(2));
-    assert_eq!(print.input_region_provenance(1, 2), Some(3));
+    assert_eq!(add.input_region_provenance(0, 0), InputRegionProvenance::None);
+    assert_eq!(print.input_region_provenance(0, 2), InputRegionProvenance::Input { index: 2 });
+    assert_eq!(print.input_region_provenance(1, 2), InputRegionProvenance::Input { index: 3 });
+
+    assert_eq!(print.input_region_provenance(2, 0), InputRegionProvenance::Local);
+
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));

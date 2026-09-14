@@ -12,4 +12,8 @@ license.workspace = true
 
 [dependencies]
 ryft = { path = "../ryft" }
+ryft-core = { path = "../ryft-core" }
 trybuild.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

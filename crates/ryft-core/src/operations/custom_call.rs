@@ -36,15 +36,18 @@ use crate::programs::{
 };
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
-/// The variants deliberately cover only the encodings every supporting backend must decode: strings, Booleans,
-/// 64-bit signed integers, and 64-bit floating-point values. The `From` conversions let attribute values be passed
-/// directly to [`CustomCallOperation::with_attribute`] (e.g., `.with_attribute("scale", 2.0)`); `&str` and `String`
-/// convert into [`String`](Self::String), `bool` into [`Boolean`](Self::Boolean), `i64` into [`I64`](Self::I64),
-/// and `f64` into [`F64`](Self::F64).
+/// The variants distinguish UTF-8 strings, arbitrary binary data, Booleans, signed integers, and floating-point
+/// values. Binary payloads preserve every byte, including NUL and invalid UTF-8, without an implicit text encoding.
+/// The `From` conversions allow direct arguments to [`CustomCallOperation::with_attribute`]: `&str` and `String`
+/// become [`String`](Self::String), `&[u8]` and `Vec<u8>` become [`Bytes`](Self::Bytes), and `bool`, `i64`, and `f64`
+/// become their corresponding scalar variants. Backends must preserve these values or reject unsupported variants.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CustomCallAttribute {
     /// UTF-8 string value.
     String(String),
+
+    /// Opaque binary data with no UTF-8 requirement.
+    Bytes(Vec<u8>),
 
     /// Boolean value.
     Boolean(bool),
@@ -60,6 +63,7 @@ impl Display for CustomCallAttribute {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::String(string) => formatter.write_str(string),
+            Self::Bytes(bytes) => write!(formatter, "bytes {bytes:02x?}"),
             Self::Boolean(boolean) => write!(formatter, "{boolean}"),
             Self::I64(integer) => write!(formatter, "{integer}"),
             Self::F64(float) => write!(formatter, "{float:?}"),
@@ -76,6 +80,18 @@ impl From<&str> for CustomCallAttribute {
 impl From<String> for CustomCallAttribute {
     fn from(value: String) -> Self {
         Self::String(value)
+    }
+}
+
+impl From<&[u8]> for CustomCallAttribute {
+    fn from(value: &[u8]) -> Self {
+        Self::Bytes(value.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for CustomCallAttribute {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
     }
 }
 
@@ -2100,6 +2116,22 @@ mod tests {
         fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
             function()
         }
+    }
+
+    #[test]
+    fn test_custom_call_attribute_bytes() {
+        let bytes = vec![0, 0x80, 0xff];
+        let attribute = CustomCallAttribute::from(bytes.clone());
+        assert_eq!(attribute, CustomCallAttribute::Bytes(bytes.clone()));
+        assert_eq!(CustomCallAttribute::from(bytes.as_slice()), attribute);
+        assert_eq!(attribute.to_string(), "bytes [00, 80, ff]");
+        assert_eq!(format!("{attribute:?}"), "Bytes([0, 128, 255])");
+        assert_eq!(CustomCallAttribute::Bytes(vec![]).to_string(), "bytes []");
+        assert_ne!(attribute, CustomCallAttribute::String("bytes [00, 80, ff]".to_owned()));
+        assert_eq!(
+            CustomCallOperation::new("binary", vec![]).with_attribute("payload", bytes.clone()).attributes(),
+            &[("payload".to_owned(), CustomCallAttribute::Bytes(bytes))],
+        );
     }
 
     #[test]

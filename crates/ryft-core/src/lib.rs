@@ -77,8 +77,7 @@ pub use differentiation::{
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
-    ContextRegionInterpretation, InterpretableOperation, InterpretationDriver, MemberInterpretableOperation,
-    RegionInterpretation, interpret_projected_operation,
+    InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
 };
 pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add,

@@ -967,6 +967,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                     Self::semantic_field(key, "string");
                     Self::semantic_field(key, value);
                 }
+                CustomCallAttribute::Bytes(value) => Self::semantic_field(key, &format!("bytes {value:02x?}")),
                 CustomCallAttribute::Boolean(value) => Self::semantic_field(key, &format!("boolean {value}")),
                 CustomCallAttribute::I64(value) => Self::semantic_field(key, &format!("i64 {value}")),
                 CustomCallAttribute::F64(value) => Self::semantic_field(key, &format!("f64 {:016x}", value.to_bits())),
@@ -2119,6 +2120,7 @@ mod tests {
         for attributes in [
             [CustomCallAttribute::String("true".to_owned()), CustomCallAttribute::Boolean(true)],
             [CustomCallAttribute::String("1".to_owned()), CustomCallAttribute::I64(1)],
+            [CustomCallAttribute::Bytes(vec![0, 255]), CustomCallAttribute::String("bytes [00, ff]".to_owned())],
             [
                 CustomCallAttribute::F64(f64::from_bits(0x7ff8_0000_0000_0001)),
                 CustomCallAttribute::F64(f64::from_bits(0x7ff8_0000_0000_0002)),

@@ -1769,7 +1769,7 @@ struct InstantiatedRegionMapping<T: Type> {
     identity_renaming: TypeIdentityRenaming<T::Identity>,
 }
 
-/// Describes how an operation supplies an attached [`Region`] input. The region and its input are selected by
+/// Describes how an [`Operation`] supplies an attached [`Region`] input. The region and its input are selected by
 /// [`Operation::input_region_provenance`]. Operand indices refer to the attaching instruction's inputs.
 /// This describes semantic dataflow, independently of diagnostic [`Provenance`](crate::Provenance).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]

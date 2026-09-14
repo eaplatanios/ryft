@@ -1,0 +1,5 @@
+error: unsupported shape metadata expression
+ --> tests/kernels/host_shape.rs:4:46
+  |
+4 | fn invalid(#[output(data_type = F32, shape = host_callback())] output: &mut Array) {}
+  |                                              ^^^^^^^^^^^^^^^

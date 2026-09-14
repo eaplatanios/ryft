@@ -1,0 +1,5 @@
+error: kernel functions must be safe, synchronous, non-generic, and return through output parameters
+ --> tests/kernels/escaping_reference.rs:4:1
+  |
+4 | fn invalid(#[output(data_type = F32, shape = [])] output: &mut Array) -> &mut Array {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

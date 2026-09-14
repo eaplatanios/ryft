@@ -6293,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_region_summary_new_rejects_local_input_bindings() {
+    fn test_reference_discharge_region_summary_new_local_input_bindings() {
         /// Operation that creates a local input, owning any reference it lends to its computation region.
         #[derive(Clone, Debug)]
         struct LocalInputOperation;

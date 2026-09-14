@@ -1,0 +1,7 @@
+error: unsupported kernel expression; control flow requires staged lowering and cannot execute as host Rust
+ --> tests/kernels/host_loop.rs:5:5
+  |
+5 | /     loop {
+6 | |         output.store(0.0f32);
+7 | |     }
+  | |_____^

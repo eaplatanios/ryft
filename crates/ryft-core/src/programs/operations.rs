@@ -526,11 +526,11 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Describes how this operation supplies input `input_index` of the attached region at `region_index`.
-    /// [`InputRegionProvenance::Input`] records operand correspondence rather than equal runtime values (e.g., a `scan`
-    /// operation may supply a slice of a stacked array or an evolving carry). Forwarded references preserve complete
-    /// handle identity and construct any views inside the region. [`InputRegionProvenance::Local`] instead declares an
-    /// input created by the operation; reference ownership rules follow from the region input's type.
+    /// Describes how this operation supplies input `input_index` of the attached [`Region`](crate::Region) at
+    /// `region_index`. [`InputRegionProvenance::Input`] records operand correspondence rather than equal runtime values
+    /// (e.g., a `scan` operation may supply a slice of a stacked array or an evolving carry). Forwarded references
+    /// preserve complete handle identity and construct any views inside the region. [`InputRegionProvenance::Local`]
+    /// instead declares an input created by the operation; its type determines the reference ownership rules.
     ///
     /// This is the input counterpart of [`Self::output_region_provenance`]. For a condition with operands
     /// `(predicate, value)`, branch input `0` corresponds to operand `1`, while instruction output `0` may come from

@@ -919,7 +919,7 @@ impl OperationEnum {
                     &self,
                     region_index: usize,
                     input_index: usize,
-                ) -> ::std::option::Option<usize> {
+                ) -> #ryft::InputRegionProvenance {
                     match self { #(#input_region_provenance_arms)* }
                 }
 
