@@ -11,9 +11,10 @@
 //! derived metadata such as [`EffectClasses`] cannot become stale.
 //!
 //! [`RegionInterface`] is the type-and-effect summary passed to [`Operation::infer_output_types`]. It deliberately
-//! exposes a region boundary without exposing the region body. [`Operation::input_region_provenance`] maps an attached
-//! region input to the corresponding operation input index. [`OutputRegionProvenance`] identifies both the attached
-//! region and its output when an operation output originates there rather than directly from that [`Instruction`].
+//! exposes a region boundary without exposing the region body. [`Operation::input_region_provenance`] returns an
+//! [`InputRegionProvenance`] describing operand correspondence, local creation, or unspecified provenance for a region
+//! input. [`OutputRegionProvenance`] identifies both the attached region and its output when an operation output
+//! originates there rather than directly from that [`Instruction`].
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
 //! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
@@ -1768,6 +1769,29 @@ struct InstantiatedRegionMapping<T: Type> {
     identity_renaming: TypeIdentityRenaming<T::Identity>,
 }
 
+/// Describes how an operation supplies an attached [`Region`] input. The region and its input are selected by
+/// [`Operation::input_region_provenance`]. Operand indices refer to the attaching instruction's inputs.
+/// This describes semantic dataflow, independently of diagnostic [`Provenance`](crate::Provenance).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InputRegionProvenance {
+    /// No provenance is declared. This does not imply local creation and is invalid for an executed reference input.
+    #[default]
+    None,
+
+    /// The input corresponds to an operation operand. Ordinary values may be sliced or evolve across iterations;
+    /// references forward the complete caller handle and construct any views inside the region.
+    Input {
+        /// Position of the supplying operand in the attaching instruction.
+        index: usize,
+    },
+
+    /// The operation creates the input for the region invocation without forwarding a caller input. Ordinary values
+    /// carry no reference ownership. A reference receives a distinct operation-owned root borrowed by the region;
+    /// it cannot be consumed or escape through a reference output. The operation owns initialization and publication
+    /// as ordinary outputs. This declaration alone grants no initialization or memory-access permission.
+    Local,
+}
+
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
 /// [`Operation`] application: [`region_index`](Self::region_index) selects an entry from [`Instruction::regions`],
 /// and [`output_index`](Self::output_index) selects an output of that attached region. Refer to
@@ -3068,6 +3092,24 @@ mod tests {
         let replacement_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(replacement_driver.import_into(&replacement, &[None]), Ok(vec![RegionId::new(1)]));
         assert_eq!(mappings.destinations.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_input_region_provenance() {
+        let input = InputRegionProvenance::Input { index: 2 };
+        let local = InputRegionProvenance::Local;
+        assert_eq!(InputRegionProvenance::default(), InputRegionProvenance::None);
+        assert_ne!(input, local);
+        assert_ne!(input, InputRegionProvenance::Input { index: 3 });
+        assert_ne!(local, InputRegionProvenance::None);
+        assert_eq!(format!("{input:?}"), "Input { index: 2 }");
+        assert_eq!(format!("{local:?}"), "Local");
+        assert_eq!(format!("{:?}", InputRegionProvenance::None), "None");
+        let entries = std::collections::HashMap::from([(input, 1), (local, 2), (InputRegionProvenance::None, 3)]);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[&input], 1);
+        assert_eq!(entries[&local], 2);
+        assert_eq!(entries[&InputRegionProvenance::None], 3);
     }
 
     #[test]

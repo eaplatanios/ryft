@@ -5,7 +5,9 @@ use crate::programs::ProgramError;
 use crate::programs::effects::{Effects, ReferenceAccessMode};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::{Program, ProgramRenderingMode};
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
+use crate::programs::regions::{
+    InputRegionProvenance, OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot,
+};
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 
@@ -524,27 +526,26 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Returns the index of the operation input supplying input `input_index` of the attached [`Region`](crate::Region)
-    /// at `region_index`, or `None` when that region input has no corresponding operation input. This describes
-    /// dataflow correspondence rather than equal runtime values. For example, a `scan` operation supplies a slice of
-    /// a stacked array and an evolving carry. Reference inputs preserve complete handle identity and derive any views
-    /// inside the region.
+    /// Describes how this operation supplies input `input_index` of the attached region at `region_index`.
+    /// [`InputRegionProvenance::Input`] records operand correspondence rather than equal runtime values (e.g., a `scan`
+    /// operation may supply a slice of a stacked array or an evolving carry). Forwarded references preserve complete
+    /// handle identity and construct any views inside the region. [`InputRegionProvenance::Local`] instead declares an
+    /// input created by the operation; reference ownership rules follow from the region input's type.
     ///
-    /// This is the input side counterpart of [`Self::output_region_provenance`]. The region is already selected by
-    /// `region_index`, so only the source input index is returned. The output hook instead identifies both the region
-    /// and its output for each possible source. Together they describe value flow across an operation's attached region
-    /// boundary. For example, for a condition with inputs `(predicate, value)`, branch input `0` comes from instruction
-    /// input `1`, while instruction output `0` may come from output `0` of either branch. Analyses use the input
-    /// relation to carry identities and canonical resource roots into nested regions without guessing from equal types
-    /// or matching positions. Reference views are constructed explicitly inside a region from complete reference roots.
-    /// The default is correct when no region input originates from an operation input.
+    /// This is the input counterpart of [`Self::output_region_provenance`]. For a condition with operands
+    /// `(predicate, value)`, branch input `0` corresponds to operand `1`, while instruction output `0` may come from
+    /// output `0` of either branch. Analyses use these declarations to carry identities and resource roots across
+    /// boundaries without guessing from equal types or matching positions. Unlike diagnostic
+    /// [`Provenance`](crate::Provenance), these declarations carry semantics used by analyses and transforms.
     ///
-    /// Note that, unlike the diagnostic [`Provenance`](crate::Provenance), this mapping carries semantics used
-    /// by analyses and transforms.
+    /// The default declares no provenance. Executed reference inputs require an explicit operand or local origin;
+    /// local references remain borrowed, cannot escape or be consumed, and gain no initialization or access permission
+    /// from this declaration. Region access policies still apply and executed region effects still contribute to the
+    /// operation. The operation owns initialization and publication of local references as ordinary value outputs.
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         let _ = (region_index, input_index);
-        None
+        InputRegionProvenance::None
     }
 
     /// Returns the attached [`Region`](crate::Region) outputs that may directly supply output `output_index` of the
@@ -653,9 +654,10 @@ pub trait Operation: Clone {
     /// apply its effects, the predicate becomes a trailing carry, and the rebuilt body runs the original body followed
     /// by the original condition, publishing the condition's updates through the body's state carries. The condition
     /// therefore permits [`ReferenceAccessMode::Read`], [`ReferenceAccessMode::Write`],
-    /// [`ReferenceAccessMode::ReadWrite`], and [`ReferenceAccessMode::Accumulate`] through its input and rejects only
-    /// [`ReferenceAccessMode::Consume`], because a consumed allocation has no successor state for a carry to hold.
-    /// A `while` implementation consequently reports:
+    /// [`ReferenceAccessMode::ReadWrite`], [`ReferenceAccessMode::Accumulate`], and
+    /// [`ReferenceAccessMode::AtomicAccumulate`] through its input and rejects only
+    /// [`ReferenceAccessMode::Consume`], because a consumed allocation has no successor
+    /// state for a carry to hold. A `while` implementation consequently reports:
     ///
     /// ```text
     /// condition + read:    true
@@ -806,7 +808,7 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         self.as_ref().input_region_provenance(region_index, input_index)
     }
 
@@ -1134,8 +1136,12 @@ mod tests {
             Ok(input_types.iter().chain(region_interfaces[0].output_types()).cloned().collect())
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            (region_index == 0).then_some(input_index + 1)
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+            match region_index {
+                0 => InputRegionProvenance::Input { index: input_index + 1 },
+                1 if input_index == 0 => InputRegionProvenance::Local,
+                _ => InputRegionProvenance::None,
+            }
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1297,8 +1303,10 @@ mod tests {
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
-        assert_eq!(operation.input_region_provenance(0, 2), Some(3));
-        assert_eq!(operation.input_region_provenance(1, 2), None);
+        assert_eq!(operation.input_region_provenance(0, 2), InputRegionProvenance::Input { index: 3 });
+        assert_eq!(operation.input_region_provenance(1, 2), InputRegionProvenance::None);
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::Local);
+
         assert_eq!(
             operation.infer_output_types(&[DataType::F32], &region_interfaces),
             Ok(vec![DataType::F32, DataType::F64]),

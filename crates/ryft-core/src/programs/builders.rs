@@ -16,7 +16,7 @@ use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
 use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
 use crate::programs::regions::{
-    Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
+    InputRegionProvenance, Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -216,14 +216,24 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             )?;
             let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
                 Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
-                    // Map the complete region input handle back to the caller operand supplying its root.
-                    let input_index =
-                        operation.input_region_provenance(output.region_index, input_index).ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
+                    // Map a forwarded handle to its caller operand; an operation-owned root cannot escape.
+                    let input_index = match operation.input_region_provenance(output.region_index, input_index) {
+                        InputRegionProvenance::Input { index } => index,
+                        InputRegionProvenance::Local => {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "operation `{}` forwards local reference input {} of region {} through an output",
+                                operation.name(),
+                                input_index,
+                                output.region_index,
+                            )));
+                        }
+                        InputRegionProvenance::None => {
+                            return Err(ProgramError::MalformedProgram(format!(
                                 "operation `{}` does not describe a forwarded reference input",
                                 operation.name(),
-                            ))
-                        })?;
+                            )));
+                        }
+                    };
                     let input = instruction.inputs().get(input_index).copied().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "operation `{}` forwards an unknown input",
@@ -386,10 +396,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 continue;
             }
 
-            // Every reference-typed region input must name the operation input from which it originates.
-            // The provenance also distinguishes an unchanged handle from a view created at the boundary.
+            // References require an explicit operand or local origin; ordinary values carry no allocation ownership.
             for (input_index, input_type) in region_input_types.iter().enumerate() {
-                if input_type.is_reference() && operation.input_region_provenance(region_index, input_index).is_none() {
+                if input_type.is_reference()
+                    && operation.input_region_provenance(region_index, input_index) == InputRegionProvenance::None
+                {
                     return Err(ProgramError::MalformedProgram(format!(
                         "operation `{}` passes a reference into region {} input {} without \
                          declaring which input supplies it",
@@ -805,6 +816,7 @@ impl ReferenceLifetimes {
                         ReferenceAccessMode::Write => "writes",
                         ReferenceAccessMode::ReadWrite => "reads and writes",
                         ReferenceAccessMode::Accumulate => "accumulates into",
+                        ReferenceAccessMode::AtomicAccumulate => "atomically accumulates into",
                         ReferenceAccessMode::Consume => "consumes",
                     },
                     consumer,
@@ -946,8 +958,8 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
-            Some(input_index)
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+            InputRegionProvenance::Input { index: input_index }
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1936,10 +1948,10 @@ mod tests {
                 }
             }
 
-            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
                 match self {
-                    Self::ForwardingRegion => Some(input_index),
-                    _ => None,
+                    Self::ForwardingRegion => InputRegionProvenance::Input { index: input_index },
+                    _ => InputRegionProvenance::None,
                 }
             }
 

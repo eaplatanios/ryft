@@ -219,6 +219,13 @@ pub enum ReferenceAccessMode {
     /// atomic/commutative accumulation is not supported by this mode.
     Accumulate,
 
+    /// Adds an update atomically to each selected element with device-scoped sequential consistency. Atomic accesses
+    /// share a total order consistent with [`Program`](crate::Program)-instance order (e.g., an entire array update
+    /// need not be indivisible). The caller accepts any allowed ordering, including floating-point variation. Mixing
+    /// conflicting non-atomic accesses requires synchronization. Sequential replay selects one admitted order, and this
+    /// mode retains [`EffectClass::OrderedState`] without granting generic transforms reordering rights.
+    AtomicAccumulate,
+
     /// Consumes the allocation. After such an access, the allocation and its entire alias family are invalid.
     /// Consumption is a lifetime event, and not a type of memory-access.
     /// [`ReferenceFreezeOperation`](crate::ReferenceFreezeOperation) is the canonical consuming access operations
@@ -230,7 +237,7 @@ impl ReferenceAccessMode {
     /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference allocation.
     pub const fn is_consuming(self) -> bool {
         match self {
-            Self::Read | Self::Write | Self::ReadWrite | Self::Accumulate => false,
+            Self::Read | Self::Write | Self::ReadWrite | Self::Accumulate | Self::AtomicAccumulate => false,
             Self::Consume => true,
         }
     }
@@ -244,6 +251,7 @@ impl Display for ReferenceAccessMode {
             Self::Write => write!(formatter, "write"),
             Self::ReadWrite => write!(formatter, "read/write"),
             Self::Accumulate => write!(formatter, "accumulate"),
+            Self::AtomicAccumulate => write!(formatter, "atomic accumulate"),
             Self::Consume => write!(formatter, "consume"),
         }
     }
@@ -860,6 +868,7 @@ mod tests {
             (ReferenceAccessMode::Write, "write", false),
             (ReferenceAccessMode::ReadWrite, "read/write", false),
             (ReferenceAccessMode::Accumulate, "accumulate", false),
+            (ReferenceAccessMode::AtomicAccumulate, "atomic accumulate", false),
             (ReferenceAccessMode::Consume, "consume", true),
         ];
         for (mode, display, is_consuming) in cases {

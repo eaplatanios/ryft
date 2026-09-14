@@ -147,9 +147,9 @@ pub use references::{
     validate_reference_boundary,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
-    RegionSlot, ReplayRegionDriver,
+    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
+    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
+    RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

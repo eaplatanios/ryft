@@ -6,7 +6,6 @@
 
 use crate::arrays::arrays::Array;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
@@ -22,13 +21,14 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValuePro
 
 // TODO(eaplatanios): Review this.
 
-impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>
-    for RngBitGeneratorOperation<ArrayIrType>
+impl<A, O> InterpretableOperation<EagerContext<ArrayIrValue<A>, O>> for RngBitGeneratorOperation<ArrayIrType>
+where
+    A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>,
+    O: Operation<Type = ArrayIrType>,
 {
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, O>>>(
         &self,
-        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
+        _context: &EagerContext<ArrayIrValue<A>, O>,
         _driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {

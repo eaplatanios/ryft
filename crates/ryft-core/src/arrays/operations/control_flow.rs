@@ -222,16 +222,17 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
     }
 }
 
-impl<A> ScanInterpretation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for ArrayIrType
+impl<A, O> ScanInterpretation<EagerContext<ArrayIrValue<A>, O>> for ArrayIrType
 where
     A: Reshape + Slice + UpdateSlice + Value<Type = ArrayType>,
+    O: Operation<Type = ArrayIrType>,
     EagerContext<A, ArrayOperation<A>>: Fill<i64, A> + Zero<A>,
 {
-    fn interpret_scan<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
+    fn interpret_scan<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, O>>>(
         carry_count: usize,
         length: &Dimension,
         reverse: bool,
-        context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
+        context: &EagerContext<ArrayIrValue<A>, O>,
         driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {

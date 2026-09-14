@@ -543,6 +543,23 @@ impl ViewSelection {
 /// a scan body selects a view of a stacked reference using its explicit index input.
 pub type ArrayReferenceViewPath<Binding = ValueId> = ReferenceViewPath<ArrayReferenceView, Binding>;
 
+impl ArrayReferenceViewPath {
+    /// Returns a static, rank-preserving slice of the root selecting the same elements as this path. Indexed axes
+    /// become size-one ranges. Symbolic indices, dynamic root shapes, and invalid compositions return `None` rather
+    /// than claiming a definite selection. The returned view describes root coordinates, not the path's result rank.
+    pub fn root_slice(&self, root_type: &ArrayType) -> Option<ArrayReferenceView> {
+        let indices = RootIndexSelection::fold(&root_type.static_shape()?, self.steps())?;
+        let axes = indices
+            .into_iter()
+            .map(|selection| match selection {
+                RootIndexSelection::Range { start, limit } => Some(ArraySliceAxis::new(start, limit - start, 1)),
+                RootIndexSelection::Symbolic { .. } => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(ArrayReferenceView::Slice { axes })
+    }
+}
+
 impl<Binding> ArrayReferenceViewPath<Binding> {
     /// Returns the exact view type derived from `root_type`.
     pub fn output_type(&self, root_type: &ArrayType) -> Result<ArrayType, TypeError> {
@@ -797,6 +814,11 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     #[inline]
     pub fn id(&self) -> ReferenceId {
         self.root.id()
+    }
+
+    /// Returns the canonical transforms selecting this handle's elements from its shared root allocation.
+    pub fn view(&self) -> &ArrayReferenceViewPath<NoReferenceViewBinding> {
+        &self.view
     }
 
     /// Returns whether this is an unrenamed root handle accepted at a backend runtime state boundary.
@@ -1604,6 +1626,36 @@ mod tests {
     }
 
     #[test]
+    fn test_array_reference_view_path_root_slice() {
+        let root_type = ArrayType::new_static(DataType::I32, vec![4, 5]);
+        let path = ArrayReferenceViewPath::root()
+            .with_view(ArrayReferenceView::Slice {
+                axes: vec![ArraySliceAxis::new(1, 3, 1), ArraySliceAxis::new(2, 3, 1)],
+            })
+            .with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
+        assert_eq!(
+            path.root_slice(&root_type),
+            Some(ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(2, 1, 1), ArraySliceAxis::new(2, 3, 1)] }),
+        );
+        assert_eq!(
+            ArrayReferenceViewPath::root().root_slice(&ArrayType::new_static(DataType::I32, vec![])),
+            Some(ArrayReferenceView::Slice { axes: vec![] }),
+        );
+        let symbolic = ArrayReferenceViewPath::root().with_step(
+            ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(0) },
+            vec![ValueId::new(RegionId::new(0), AtomId::new(0))],
+        );
+        assert_eq!(symbolic.root_slice(&root_type), None);
+        let dynamic = ArrayType::new(
+            DataType::I32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(ArrayReferenceViewPath::root().root_slice(&dynamic), None);
+        let invalid = path.with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(3) });
+        assert_eq!(invalid.root_slice(&root_type), None);
+    }
+
+    #[test]
     fn test_array_reference_view_path_output_type() {
         let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
         let root: ArrayReferenceViewPath = ArrayReferenceViewPath::root();
@@ -1707,6 +1759,15 @@ mod tests {
         assert_eq!(root.id(), root.clone().id());
         assert_eq!(root.id(), view.id());
         assert_ne!(root.id(), ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap()).id());
+    }
+
+    #[test]
+    fn test_array_reference_view() {
+        let root = ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap());
+        assert!(root.view().is_root());
+        let transform = ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
+        let view = root.with_transform(transform.clone()).unwrap();
+        assert_eq!(view.view().views().cloned().collect::<Vec<_>>(), vec![transform]);
     }
 
     #[test]

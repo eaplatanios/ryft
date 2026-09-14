@@ -56,8 +56,8 @@ use ryft_core::{
     CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType, DifferentiableOperation,
     DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses, Effects,
-    ExternalReferenceBinding, InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero,
-    MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
+    ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
+    MaybeZero, MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
     OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
     ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
@@ -633,8 +633,12 @@ impl Operation for RegisterOperation {
         }
     }
 
-    fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
-        matches!(self, Self::Call).then_some(input_index)
+    fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+        if matches!(self, Self::Call) {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {

@@ -55,14 +55,15 @@ use crate::operations::{
     LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
     NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
     ParallelReduceOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
-    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
-    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh,
-    TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
-    WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
+    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
+    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation,
+    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient,
+    StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -466,6 +467,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Adds an array update into the value selected by a root reference or derived view in program order.
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
 
+    /// Atomically adds an array update into the elements selected by a root reference or derived view.
+    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>),
+
     /// Consumes a whole-array reference and returns its final value.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
@@ -559,7 +563,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
 ///     [`DynamicReshape`], the whole-value reference capabilities [`ReferenceNew`], [`ReferenceRead`],
-///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`ReferenceFreeze`], and the reference view
+///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and [`ReferenceFreeze`], and the reference view
 ///     derivations [`ReferenceIndex`], [`ReferenceDynamicIndex`], and [`ReferenceSlice`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
@@ -636,7 +640,7 @@ pub trait ArrayIrOperations:
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
     + ReferenceNew + ReferenceDynamicIndex + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
-    + ReferenceAddUpdate
+    + ReferenceAddUpdate + ReferenceAtomicAddUpdate
     + ReferenceFreeze
 {
 }
@@ -655,7 +659,7 @@ where
         + ReferenceRead
         + ReferenceWrite
         + ReferenceSwap,
-    V: ReferenceAddUpdate,
+    V: ReferenceAddUpdate + ReferenceAtomicAddUpdate,
     V: ReferenceFreeze,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
@@ -2954,7 +2958,9 @@ mod tests {
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
-            ArrayIrOperation::ReferenceAddUpdate(_) => MemberKindSignature::ReferenceAndArrayToUnit,
+            ArrayIrOperation::ReferenceAddUpdate(_) | ArrayIrOperation::ReferenceAtomicAddUpdate(_) => {
+                MemberKindSignature::ReferenceAndArrayToUnit
+            }
             ArrayIrOperation::ReferenceFreeze(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
@@ -3037,6 +3043,10 @@ mod tests {
             ),
             (
                 ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                MemberKindSignature::ReferenceAndArrayToUnit,
+            ),
+            (
+                ArrayIrOperation::ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation::new()),
                 MemberKindSignature::ReferenceAndArrayToUnit,
             ),
             (ArrayIrOperation::ReferenceFreeze(ReferenceFreezeOperation::new()), MemberKindSignature::ReferenceToArray),
@@ -3134,7 +3144,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 35);
+        assert_eq!(expected.len(), 36);
         assert_eq!(
             expected
                 .iter()
@@ -3176,7 +3186,7 @@ mod tests {
                 .iter()
                 .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToUnit)
                 .count(),
-            2,
+            3,
         );
     }
 }

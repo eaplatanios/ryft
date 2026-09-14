@@ -21,8 +21,8 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot, Type, TypeError,
-    Typed, Value,
+    InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface,
+    RegionSlot, Type, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -313,10 +313,14 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         // The primal computation region receives every operand at its own position. The forward and backward regions
         // are dormant rules that reference analysis does not enter, so they declare no provenance.
-        (region_index == 0).then_some(input_index)
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
     }
 
     #[inline]
@@ -1104,9 +1108,9 @@ mod tests {
 
         // The primal computation region receives every operand at its own position and its outputs are the call's,
         // while the dormant rule regions declare no operand provenance.
-        assert_eq!(operation.input_region_provenance(0, 0), Some(0));
-        assert_eq!(operation.input_region_provenance(1, 0), None);
-        assert_eq!(operation.input_region_provenance(2, 0), None);
+        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::None);
+        assert_eq!(operation.input_region_provenance(2, 0), InputRegionProvenance::None);
         assert_eq!(
             operation.output_region_provenance(0),
             vec![OutputRegionProvenance { region_index: 0, output_index: 0 }],

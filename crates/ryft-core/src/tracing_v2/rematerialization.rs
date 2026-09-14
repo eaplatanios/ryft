@@ -78,9 +78,10 @@ use crate::operations::{
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, EffectClass, EffectClasses, InstructionId, Operation, OperationFormatter, OutputRegionProvenance,
-    Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot,
-    Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
+    ReferenceMemberType, ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value,
+    ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -374,14 +375,20 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         // The primal and forward regions receive the operands positionally. The backward and tangent regions receive
         // only the leading non-differentiated operands positionally; the rest of their boundaries is bound by the
         // forward tail and by the transform that consumes the rule, not by the operands directly.
         match region_index {
-            0 | 1 => Some(input_index),
-            2 | 3 => (input_index < self.non_differentiated_count).then_some(input_index),
-            _ => None,
+            0 | 1 => InputRegionProvenance::Input { index: input_index },
+            2 | 3 => {
+                if input_index < self.non_differentiated_count {
+                    InputRegionProvenance::Input { index: input_index }
+                } else {
+                    InputRegionProvenance::None
+                }
+            }
+            _ => InputRegionProvenance::None,
         }
     }
 
@@ -941,7 +948,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
             // operand provenance back to the caller, including scan slices whose enclosing output is stacked again.
             // A caller input still has no producer and remains unclassified.
             let source = if let Some(input_index) = region.input_ids().iter().position(|input| *input == atom)
-                && let Some(input_index) =
+                && let InputRegionProvenance::Input { index: input_index } =
                     instruction.operation().input_region_provenance(origin.region_index, input_index)
             {
                 let atom = instruction.inputs().get(input_index).copied().ok_or_else(|| {
@@ -4820,8 +4827,8 @@ mod tests {
                 }])
             }
 
-            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
-                Some(input_index)
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+                InputRegionProvenance::Input { index: input_index }
             }
 
             fn effects(&self) -> Cow<'_, Effects> {

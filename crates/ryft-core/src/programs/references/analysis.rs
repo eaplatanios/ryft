@@ -5,7 +5,7 @@
 //! capture, and region-boundary rules of the reference model. It relies only on generic [`Operation`] hooks (i.e.,
 //! [`Operation::effects`], [`Operation::input_region_provenance`], [`Operation::output_region_provenance`],
 //! [`Operation::region_capture_input_count`], [`Operation::reference_output_identity_input`], and
-//! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`], and
+//! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`],
 //! so it knows nothing about arrays, view descriptions, or any particular [`Value`] family.
 //!
 //! Transform rules, kernel boundary validation, diagnostics, and lowering obtain structural facts through
@@ -26,14 +26,15 @@
 //! [`ReferenceRoot::Constant`]). Every region's values resolve to roots in that region's own _namespace_ (i.e., its own
 //! inputs, its own allocations, and the capture roots it inherits from an enclosing scope). The analysis never rewrites
 //! a nested region's records into its parent's namespace. Instead, each attachment of a nested region records one
-//! [`ReferenceRegionInputBinding`] per reference-typed region input, mapping that formal input to the caller root
-//! it denotes, and the attaching instruction's [`ReferenceTransitiveAccess`] summary is expressed in the caller's
-//! namespace after substituting those bindings and dropping the nested region's local allocations. Only
-//! [`RegionRole::Computation`] regions are entered as a dormant [`RegionRole::Rule`] region (e.g., a derived
-//! rematerialization or custom derivative rule) is an input to a later transform rather than an executed child of the
-//! attaching instruction, its reference-typed inputs are bound by that transform rather than by the instruction's
-//! operands, and the transform validates it separately, so the analysis neither enters it nor attributes its accesses
-//! to the instruction (i.e., the same rule by which [`Effects`](crate::Effects) exclude [`RegionRole::Rule`] regions).
+//! [`ReferenceRegionInputBinding`] per forwarded reference input, mapping that formal input to its caller root. An
+//! explicitly local input instead borrows a distinct root owned by the attaching operation and has no caller binding.
+//! The attaching instruction's [`ReferenceTransitiveAccess`] summary substitutes forwarded bindings and drops both
+//! operation-owned local inputs and the nested region's local allocations. Only [`RegionRole::Computation`] regions are
+//! entered as a dormant [`RegionRole::Rule`] region (e.g., a derived rematerialization or custom derivative rule) is an
+//! input to a later transform rather than an executed child of the attaching instruction, its reference-typed inputs
+//! are bound by that transform rather than by the instruction's operands, and the transform validates it separately,
+//! so the analysis neither enters it nor attributes its accesses to the instruction (i.e., the same rule by which
+//! [`Effects`](crate::Effects) exclude [`RegionRole::Rule`] regions).
 //!
 //! # Capture Scopes
 //!
@@ -49,6 +50,10 @@
 //! strict capture-lifted analysis so a successful open region analysis cannot hide a missing capture in a closed one.
 //!
 //! # Boundaries
+//!
+//! [`InputRegionProvenance::Local`] declares an input created by the attaching operation. When its type is a reference,
+//! it remains borrowed and cannot leave the region as a reference. The operation owns local-reference initialization
+//! and publication; locality grants no memory-access permission. Ordinary local values have no allocation ownership.
 //!
 //! Complete-value handles cross region boundaries. [`Operation::input_region_provenance`] maps a nested region input
 //! to the caller root of the named operation input, and a forwarded region output denotes the root it carried in.
@@ -93,7 +98,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::ReferenceSource;
 use crate::programs::references::values::ReferenceId;
-use crate::programs::regions::{Region, RegionId, RegionRef, RegionRole};
+use crate::programs::regions::{InputRegionProvenance, Region, RegionId, RegionRef, RegionRole};
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -418,15 +423,13 @@ impl ReferenceRoot {
     /// # Parameters
     ///
     ///   - `attached`: [`RegionId`] of the attached [`Region`] whose input bindings are being substituted.
-    ///   - `entering`: Caller [`ReferenceRoot`] for each reference input of the attached region, or [`None`] for
+    ///   - `entering`: Caller root or local owner for each reference input of the attached region, or [`None`] for
     ///     non-reference inputs. A [`Traversal`] must have validated these bindings before calling this function.
-    fn substitute(self, attached: RegionId, entering: &[Option<ReferenceRoot>]) -> ReferenceSubstitution {
+    fn substitute(self, attached: RegionId, entering: &[Option<ReferenceSubstitution>]) -> ReferenceSubstitution {
         match self {
             // Every reference-typed input of the attached region is bound before the region is analyzed, so the
             // binding exists by construction.
-            Self::RegionInput { region, input_index } if region == attached => {
-                ReferenceSubstitution::Caller(entering[input_index].unwrap())
-            }
+            Self::RegionInput { region, input_index } if region == attached => entering[input_index].unwrap(),
             Self::RegionInput { .. } | Self::Constant { .. } => ReferenceSubstitution::Caller(self),
             Self::Allocation { instruction, .. } if instruction.region() == attached => {
                 ReferenceSubstitution::Local(instruction)
@@ -450,13 +453,14 @@ impl Display for ReferenceRoot {
 }
 
 /// Result of substituting an attached [`Region`]'s input bindings into a [`ReferenceRoot`].
+#[derive(Copy, Clone)]
 enum ReferenceSubstitution {
     /// [`ReferenceRoot`] visible to the attaching [`Instruction`](crate::Instruction), either supplied through
     /// a [`Region`] input or captured from an enclosing scope.
     Caller(ReferenceRoot),
 
-    /// Allocation created inside the attached [`Region`] by the given [`Instruction`](crate::Instruction),
-    /// which cannot escape through a region output.
+    /// Reference created by the given instruction, either inside the attached [`Region`] or for a local region input.
+    /// This reference cannot escape through the attached region's output.
     Local(InstructionId),
 }
 
@@ -652,13 +656,17 @@ impl ReferenceTransitiveAccess {
     }
 
     /// Returns whether `root` is accessed with any of the [`ReferenceAccessMode::Write`],
-    /// [`ReferenceAccessMode::ReadWrite`], and [`ReferenceAccessMode::Accumulate`] modes.
+    /// [`ReferenceAccessMode::ReadWrite`], [`ReferenceAccessMode::Accumulate`], or
+    /// [`ReferenceAccessMode::AtomicAccumulate`] modes.
     #[inline]
     pub fn is_mutated(&self, root: ReferenceRoot) -> bool {
         self.access_modes_for(root).any(|mode| {
             matches!(
                 mode,
-                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate
+                ReferenceAccessMode::Write
+                    | ReferenceAccessMode::ReadWrite
+                    | ReferenceAccessMode::Accumulate
+                    | ReferenceAccessMode::AtomicAccumulate
             )
         })
     }
@@ -682,15 +690,16 @@ impl ReferenceTransitiveAccess {
 /// the capture roots it inherits from an enclosing capture scope (i.e., the first `capture_count` inputs of the
 /// analyzed region, or the fresh prefix an operation declares through [`Operation::region_capture_input_count`]).
 /// Nested regions are analyzed in their own namespace, shared regions exactly once; each attachment records one
-/// [`ReferenceRegionInputBinding`] per reference-typed region input, and the attaching instruction's
-/// [`ReferenceTransitiveAccess`] summary is expressed in the caller's namespace with nested-local allocations dropped.
+/// [`ReferenceRegionInputBinding`] per forwarded reference input. Explicitly local inputs borrow roots owned by the
+/// attaching operation. The attaching instruction's [`ReferenceTransitiveAccess`] summary is expressed in the caller's
+/// namespace with local inputs and nested-local allocations dropped.
 ///
 /// The analysis validates the following reference rules:
 ///
 ///   - Operation effect declarations and region hooks must describe valid inputs, outputs, and attached regions.
 ///   - References passed into or returned from attached regions must denote complete values. An attaching operation
-///     may create a view for a region input, as described in the module documentation, but a view cannot be returned
-///     from the region.
+///     may construct a local complete root for a region input, but local inputs cannot also forward a caller root
+///     or escape through a region output. Views are constructed inside the region and cannot cross its boundary.
 ///   - A reference output that preserves a declared input identity must have that input's root. Any attached region
 ///     outputs forwarded to it must agree on that root; without a declared input identity, they establish the root
 ///     instead. An allocation created inside an attached region cannot escape through a region output.
@@ -884,7 +893,10 @@ impl ReferenceAnalysis {
         self.access_modes_for(root).any(|mode| {
             matches!(
                 mode,
-                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate
+                ReferenceAccessMode::Write
+                    | ReferenceAccessMode::ReadWrite
+                    | ReferenceAccessMode::Accumulate
+                    | ReferenceAccessMode::AtomicAccumulate
             )
         })
     }
@@ -1454,19 +1466,23 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         entering.push(None);
                         continue;
                     }
-
-                    // A reference-typed region input forwards a complete handle. Views are constructed inside
-                    // the region, so supplying a narrowed operand here is always a boundary violation.
                     let supplying_index = match operation.input_region_provenance(region_index, input_index) {
-                        None => {
+                        InputRegionProvenance::Local => {
+                            // The operation owns this root; the child only borrows it. No caller binding or self-edge
+                            // enters the public region-input binding graph.
+                            entering.push(Some(ReferenceSubstitution::Local(id)));
+                            continue;
+                        }
+                        InputRegionProvenance::Input { index } => index,
+                        InputRegionProvenance::None => {
                             return Err(malformed(format!(
                                 "reference input {input_index} of region {region_index} has no declared supplying \
                                  input",
                             )));
                         }
-                        Some(input_index) => input_index,
                     };
 
+                    // Forwarded references retain complete handles and views are constructed inside the region.
                     let atom = input_atom(supplying_index, "region-supplying")?;
                     let record = self.resolve(value_id(atom), name, id, supplying_index)?;
                     if record.narrows {
@@ -1486,8 +1502,23 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         root: record.root,
                     });
 
-                    entering.push(Some(record.root));
+                    entering.push(Some(ReferenceSubstitution::Caller(record.root)));
                 }
+
+                // Boundary replay substitutes caller identities; local inputs retain their own distinct formal
+                // roots in both traversal modes. Local ownership is retained separately for outward substitution.
+                let bound_inputs = entering
+                    .iter()
+                    .enumerate()
+                    .map(|(input_index, binding)| {
+                        binding.map(|binding| match binding {
+                            ReferenceSubstitution::Caller(root) => root,
+                            ReferenceSubstitution::Local(_) => {
+                                ReferenceRoot::RegionInput { region: attached_id, input_index }
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
 
                 let nested_scope = match operation.region_capture_input_count(region_index) {
                     None => Rc::clone(&scope),
@@ -1512,7 +1543,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             .map(|(input_index, input)| {
                                 nested_is_reference(*input).then(|| {
                                     if inputs.is_some() {
-                                        entering[input_index].unwrap()
+                                        bound_inputs[input_index].unwrap()
                                     } else {
                                         ReferenceRoot::RegionInput { region: attached_id, input_index }
                                     }
@@ -1523,7 +1554,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 };
 
                 let nested_summary =
-                    self.visit_region(nested, nested_scope, inputs.is_some().then_some(entering.as_slice()))?;
+                    self.visit_region(nested, nested_scope, inputs.is_some().then_some(bound_inputs.as_slice()))?;
+
+                for (output_index, output) in nested_summary.outputs.iter().enumerate() {
+                    if let Some((root @ ReferenceRoot::RegionInput { region, .. }, _)) = output
+                        && *region == attached_id
+                        && let ReferenceSubstitution::Local(_) = root.substitute(attached_id, &entering)
+                    {
+                        return Err(malformed(format!(
+                            "local reference input of region {region_index} escapes through output {output_index}",
+                        )));
+                    }
+                }
 
                 summary.reached.extend(nested_summary.reached.iter().filter_map(|root| {
                     match root.substitute(attached_id, &entering) {
@@ -1533,8 +1575,19 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 }));
 
                 for (nested_root, modes) in &nested_summary.accesses {
-                    let ReferenceSubstitution::Caller(root) = nested_root.substitute(attached_id, &entering) else {
-                        continue;
+                    let (root, propagates) = match nested_root.substitute(attached_id, &entering) {
+                        ReferenceSubstitution::Caller(root) => (root, true),
+                        ReferenceSubstitution::Local(_)
+                            if matches!(
+                            nested_root,
+                            ReferenceRoot::RegionInput { region, .. } if *region == attached_id,
+                            ) =>
+                        {
+                            // The region borrows this operation-owned input. Its access policy still applies,
+                            // but its accesses name no caller reference and cannot widen a discharge boundary.
+                            (*nested_root, false)
+                        }
+                        ReferenceSubstitution::Local(_) => continue,
                     };
 
                     for mode in modes.iter().copied() {
@@ -1547,10 +1600,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                                 mode,
                             });
                         }
-                        if let Some(consumer) = consumed.get(&root) {
-                            return Err(use_after_consume(root, *consumer));
+
+                        if propagates {
+                            if let Some(consumer) = consumed.get(&root) {
+                                return Err(use_after_consume(root, *consumer));
+                            }
+                            self.record_mode(id, root, mode, &mut summary);
                         }
-                        self.record_mode(id, root, mode, &mut summary);
                     }
                 }
 
@@ -1749,8 +1805,8 @@ struct AttachedRegion {
     /// Attached region.
     id: RegionId,
 
-    /// Caller root entering through each region input, or [`None`] for value inputs.
-    entering: Vec<Option<ReferenceRoot>>,
+    /// Caller root or local owner for each region input, or [`None`] for value inputs.
+    entering: Vec<Option<ReferenceSubstitution>>,
 
     /// Root and narrowing of each region output, in the nested namespace.
     outputs: Vec<Option<(ReferenceRoot, bool)>>,
@@ -1936,6 +1992,7 @@ mod tests {
         Condition,
         Scan { carry_count: usize },
         Opaque,
+        LocalCall { read_only: bool },
         Malformed(Effects),
     }
 
@@ -1965,6 +2022,7 @@ mod tests {
                 Self::Condition => "test.condition",
                 Self::Scan { .. } => "test.scan",
                 Self::Opaque => "test.opaque",
+                Self::LocalCall { .. } => "test.local_call",
                 Self::Malformed(_) => "test.malformed",
             }
         }
@@ -1975,7 +2033,9 @@ mod tests {
                 Self::CallWithRule => const { &[RegionSlot::rule("rule"), RegionSlot::computation("callee")] },
                 Self::While => const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] },
                 Self::Condition => const { &[RegionSlot::computation("true"), RegionSlot::computation("false")] },
-                Self::Scan { .. } | Self::Opaque => const { &[RegionSlot::computation("body")] },
+                Self::Scan { .. } | Self::Opaque | Self::LocalCall { .. } => {
+                    const { &[RegionSlot::computation("body")] }
+                }
                 _ => &[],
             }
         }
@@ -1996,25 +2056,31 @@ mod tests {
                 Self::View | Self::Identity => referent(0).map(|_| vec![input_types[0].clone()]),
                 Self::While => Ok(input_types.to_vec()),
                 Self::CallWithRule => Ok(region_interfaces[1].output_types().to_vec()),
-                Self::Call | Self::CallWithCaptures(_) | Self::Condition | Self::Scan { .. } | Self::Opaque => {
-                    Ok(region_interfaces[0].output_types().to_vec())
-                }
+                Self::Call
+                | Self::CallWithCaptures(_)
+                | Self::Condition
+                | Self::Scan { .. }
+                | Self::Opaque
+                | Self::LocalCall { .. } => Ok(region_interfaces[0].output_types().to_vec()),
                 Self::Malformed(_) => Ok(Vec::new()),
             }
         }
 
-        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
             match self {
-                Self::Call | Self::CallWithCaptures(_) | Self::CallWithRule | Self::While => Some(input_index),
-                Self::Condition => Some(input_index + 1),
-                Self::Scan { .. } => Some(input_index),
-                _ => None,
+                Self::Call | Self::CallWithCaptures(_) | Self::CallWithRule | Self::While => {
+                    InputRegionProvenance::Input { index: input_index }
+                }
+                Self::Condition => InputRegionProvenance::Input { index: input_index + 1 },
+                Self::Scan { .. } => InputRegionProvenance::Input { index: input_index },
+                Self::LocalCall { .. } => InputRegionProvenance::Local,
+                _ => InputRegionProvenance::None,
             }
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
             match self {
-                Self::Call | Self::CallWithCaptures(_) | Self::Scan { .. } => {
+                Self::Call | Self::CallWithCaptures(_) | Self::Scan { .. } | Self::LocalCall { .. } => {
                     vec![OutputRegionProvenance { region_index: 0, output_index }]
                 }
                 Self::While | Self::CallWithRule => vec![OutputRegionProvenance { region_index: 1, output_index }],
@@ -2042,6 +2108,9 @@ mod tests {
         }
 
         fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+            if matches!(self, Self::LocalCall { read_only: true, .. }) {
+                return mode == ReferenceAccessMode::Read;
+            }
             !matches!(self, Self::While) || region_index != 0 || mode == ReferenceAccessMode::Read
         }
 
@@ -3247,6 +3316,141 @@ mod tests {
                     && message == "operation `test.call_with_captures` at ^1[0] declares a capture prefix of 2 inputs \
                                    but the region has 1 inputs",
         ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_local_region_inputs() {
+        let mut callee = TestBuilder::new();
+        let reference = callee.add_input(reference_type(0));
+        callee.add_instruction(TestOperation::Write, Vec::new(), vec![reference], None).unwrap();
+        let snapshot = callee.add_instruction(TestOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let callee = build(callee, vec![snapshot]);
+        let mut body = TestBuilder::new();
+        let callee = body.import_region(callee.entry_region_ref());
+        let reference = body.add_input(reference_type(0));
+        let snapshot = body.add_instruction(TestOperation::Call, vec![callee], vec![reference], None).unwrap()[0];
+        let body = build(body, vec![snapshot]);
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(TestType::Value(0));
+        let output = builder
+            .add_instruction(TestOperation::LocalCall { read_only: false }, vec![body], vec![input], None)
+            .unwrap()[0];
+        let program = build(builder, vec![output]);
+        let region = program.entry_region_ref();
+        let analysis = ReferenceAnalysis::new(region, Some(0), false, &[]).unwrap();
+        assert_eq!(analysis.root_of(value_id(1, 0)), Some(input_root(1, 0)));
+        assert_eq!(analysis.region_input_bindings().len(), 1);
+        assert_eq!(analysis.region_input_bindings()[0].root(), input_root(1, 0));
+        assert_eq!(analysis.transitive_access(instruction_id(2, 0)), None);
+        assert_eq!(analysis.output_roots(), &[None]);
+
+        // The uncached traversal used by discharge must omit the same local roots from caller state.
+        let summary = ReferenceAnalysis::summarize_boundary(region, &[None], &[], 0).unwrap();
+        assert_eq!(summary.accesses, BTreeMap::new());
+        assert_eq!(summary.reached, BTreeSet::new());
+        assert_eq!(summary.outputs, vec![None]);
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_local_reference_escape() {
+        let mut body = TestBuilder::new();
+        let reference = body.add_input(reference_type(0));
+        let body = build(body, vec![reference]);
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        builder.add_instruction_unchecked(Instruction::new(
+            TestOperation::LocalCall { read_only: false },
+            Vec::new(),
+            Vec::new(),
+            vec![body],
+        ));
+        let program = build(builder, Vec::new());
+        assert!(matches!(
+            ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]),
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration { message, .. })
+                if message == "local reference input of region 0 escapes through output 0",
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_local_input_consumption() {
+        let mut body = TestBuilder::new();
+        let reference = body.add_input(reference_type(0));
+        let value = body.add_instruction(TestOperation::Consume, Vec::new(), vec![reference], None).unwrap()[0];
+        let body = build(body, vec![value]);
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(TestOperation::LocalCall { read_only: false }, vec![body], Vec::new(), None)
+            .unwrap()
+            .to_vec();
+        let program = build(builder, outputs);
+        assert_eq!(
+            ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).err(),
+            Some(ReferenceAnalysisError::ConsumptionOutsideCreationScope {
+                operation: "test.consume",
+                instruction: instruction_id(0, 0),
+                region: RegionId::new(0),
+                root: input_root(0, 0),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_new_validates_local_input_policy() {
+        let mut body = TestBuilder::new();
+        let reference = body.add_input(reference_type(0));
+        body.add_instruction(TestOperation::Write, Vec::new(), vec![reference], None).unwrap();
+        let body = build(body, Vec::new());
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        builder
+            .add_instruction(TestOperation::LocalCall { read_only: true }, vec![body], Vec::new(), None)
+            .unwrap();
+        let program = build(builder, Vec::new());
+        assert_eq!(
+            ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).err(),
+            Some(ReferenceAnalysisError::DisallowedRegionAccess {
+                operation: "test.local_call",
+                instruction: instruction_id(1, 0),
+                region_index: 0,
+                root: input_root(0, 0),
+                mode: ReferenceAccessMode::Write,
+            }),
+        );
+        assert_eq!(
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[], &[], 0).err(),
+            Some(ReferenceAnalysisError::DisallowedRegionAccess {
+                operation: "test.local_call",
+                instruction: instruction_id(1, 0),
+                region_index: 0,
+                root: input_root(0, 0),
+                mode: ReferenceAccessMode::Write,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_new_local_value_input() {
+        let mut body = TestBuilder::new();
+        let value = body.add_input(TestType::Value(0));
+        let body = build(body, vec![value]);
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(TestOperation::LocalCall { read_only: false }, vec![body], Vec::new(), None)
+            .unwrap()
+            .to_vec();
+        let program = build(builder, outputs);
+        let region = program.entry_region_ref();
+        let analysis = ReferenceAnalysis::new(region, Some(0), false, &[]).unwrap();
+        assert_eq!(analysis.region_input_bindings().len(), 0);
+        assert_eq!(analysis.output_roots(), &[None]);
+        let summary = ReferenceAnalysis::summarize_boundary(region, &[], &[], 0).unwrap();
+        assert_eq!(summary.accesses, BTreeMap::new());
+        assert_eq!(summary.reached, BTreeSet::new());
+        assert_eq!(summary.outputs, vec![None]);
     }
 
     #[test]

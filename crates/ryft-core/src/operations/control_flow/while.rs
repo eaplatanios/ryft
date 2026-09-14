@@ -52,12 +52,12 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
-    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
-    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection,
+    AtomId, CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
+    OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
+    ReferenceAccessMode, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
+    Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -209,8 +209,8 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-        (region_index < 2).then_some(input_index)
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        if region_index < 2 { InputRegionProvenance::Input { index: input_index } } else { InputRegionProvenance::None }
     }
 
     #[inline]
@@ -3036,8 +3036,8 @@ mod tests {
         // Operation identity, declared region slots, reference flow, and payload-free rendering.
         assert_eq!(operation.name(), WHILE_OPERATION_NAME);
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("condition"), RegionSlot::computation("body")]);
-        assert_eq!(operation.input_region_provenance(0, 0), Some(0));
-        assert_eq!(operation.input_region_provenance(1, 0), Some(0));
+        assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
+        assert_eq!(operation.input_region_provenance(1, 0), InputRegionProvenance::Input { index: 0 });
         assert_eq!(
             operation.output_region_provenance(0),
             vec![OutputRegionProvenance { region_index: 1, output_index: 0 }],
@@ -3047,6 +3047,7 @@ mod tests {
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Accumulate));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::AtomicAccumulate));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Consume));
         assert!(operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Write));
         assert!(operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::ReadWrite));

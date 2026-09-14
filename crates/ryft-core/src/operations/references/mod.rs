@@ -170,6 +170,7 @@ pub(crate) fn forwarded_tangent<V: Value<Type: DifferentiableType>, F: FnOnce(&V
 }
 
 mod reference_add_update;
+mod reference_atomic_add_update;
 mod reference_freeze;
 mod reference_new;
 mod reference_read;
@@ -179,6 +180,10 @@ mod reference_write;
 pub use reference_add_update::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
     ReferenceAddUpdateOperationProvider,
+};
+pub use reference_atomic_add_update::{
+    REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperationProvider,
 };
 pub use reference_freeze::{
     REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider,

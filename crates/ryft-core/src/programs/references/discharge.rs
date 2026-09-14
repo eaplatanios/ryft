@@ -158,7 +158,8 @@ use crate::programs::programs::Program;
 use crate::programs::references::analysis::{ReferenceAnalysis, ReferenceRoot};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
-    EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+    EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -1506,6 +1507,22 @@ impl ReferenceDischargeRegionSummary {
     ) -> Result<Self, ProgramError> {
         check_count!("input", inputs, region.input_ids().len(), ProgramError);
 
+        if let Some(input_index) = region.input_ids().iter().enumerate().find_map(|(index, input)| {
+            (region.atoms()[input.index()].r#type().is_reference()
+                && operation.input_region_provenance(region_index, index) == InputRegionProvenance::Local)
+                .then_some(index)
+        }) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` constructs local reference input {} of region {}; preserving or rewriting this boundary \
+                     requires its owning reference discharge rule",
+                    operation.name(),
+                    input_index,
+                    region_index,
+                ),
+            });
+        }
+
         // Public boundaries supply caller identities; source-local identities exist only during traversal.
         // Reject a missing reference binding rather than treating it as a locally allocated reference.
         if let Some((index, _)) = region.input_ids().iter().zip(inputs).enumerate().find(|(_, (input, allocation))| {
@@ -1645,7 +1662,10 @@ impl ReferenceDischargeRegionSummary {
         self.access_modes(allocation).any(|mode| {
             matches!(
                 mode,
-                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate,
+                ReferenceAccessMode::Write
+                    | ReferenceAccessMode::ReadWrite
+                    | ReferenceAccessMode::Accumulate
+                    | ReferenceAccessMode::AtomicAccumulate,
             )
         })
     }
@@ -4712,6 +4732,7 @@ mod tests {
         Write,
         Swap,
         AddUpdate,
+        AtomicAddUpdate,
         Freeze,
         UnreportedFreeze,
         Call,
@@ -4747,6 +4768,7 @@ mod tests {
                 Self::Write => "list.write",
                 Self::Swap => "list.swap",
                 Self::AddUpdate => "list.add_update",
+                Self::AtomicAddUpdate => "list.atomic_add_update",
                 Self::Freeze => "list.freeze",
                 Self::UnreportedFreeze => "test.unreported_freeze",
                 Self::Call => "list.call",
@@ -4759,40 +4781,6 @@ mod tests {
                 Self::ScopedCall { dormant: true, .. } => const { &[RegionSlot::rule("rule")] },
                 Self::Call | Self::ScopedCall { .. } => const { &[RegionSlot::computation("callee")] },
                 _ => &[],
-            }
-        }
-
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            (matches!(self, Self::Call | Self::ScopedCall { dormant: false, .. }) && region_index == 0)
-                .then_some(input_index)
-        }
-
-        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-            match self {
-                Self::Call | Self::ScopedCall { .. } => vec![OutputRegionProvenance { region_index: 0, output_index }],
-                _ => Vec::new(),
-            }
-        }
-
-        fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
-            match self {
-                Self::ScopedCall { capture_count, .. } => *capture_count,
-                _ => None,
-            }
-        }
-
-        fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
-            matches!(self, Self::ScopedCall { identity: true, .. }).then_some(output_index)
-        }
-
-        fn allows_reference_access_through_region_input(
-            &self,
-            _region_index: usize,
-            mode: ReferenceAccessMode,
-        ) -> bool {
-            match self {
-                Self::ScopedCall { allowed: Some(allowed), .. } => mode == *allowed,
-                _ => true,
             }
         }
 
@@ -4868,7 +4856,7 @@ mod tests {
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![ListIrType::List(referent(0)?)])
                 }
-                Self::AddUpdate => {
+                Self::AddUpdate | Self::AtomicAddUpdate => {
                     check_count!("input", input_types, 2, TypeError);
                     referent(0)?;
                     Ok(Vec::new())
@@ -4878,6 +4866,43 @@ mod tests {
                     check_count!("input", input_types, region_interfaces[0].input_types().len(), TypeError);
                     Ok(region_interfaces[0].output_types().to_vec())
                 }
+            }
+        }
+
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+            if matches!(self, Self::Call | Self::ScopedCall { dormant: false, .. }) && region_index == 0 {
+                InputRegionProvenance::Input { index: input_index }
+            } else {
+                InputRegionProvenance::None
+            }
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            match self {
+                Self::Call | Self::ScopedCall { .. } => vec![OutputRegionProvenance { region_index: 0, output_index }],
+                _ => Vec::new(),
+            }
+        }
+
+        fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+            match self {
+                Self::ScopedCall { capture_count, .. } => *capture_count,
+                _ => None,
+            }
+        }
+
+        fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+            matches!(self, Self::ScopedCall { identity: true, .. }).then_some(output_index)
+        }
+
+        fn allows_reference_access_through_region_input(
+            &self,
+            _region_index: usize,
+            mode: ReferenceAccessMode,
+        ) -> bool {
+            match self {
+                Self::ScopedCall { allowed: Some(allowed), .. } => mode == *allowed,
+                _ => true,
             }
         }
 
@@ -4901,6 +4926,7 @@ mod tests {
                 Self::Write => access(ReferenceAccessMode::Write),
                 Self::Swap => access(ReferenceAccessMode::ReadWrite),
                 Self::AddUpdate => access(ReferenceAccessMode::Accumulate),
+                Self::AtomicAddUpdate => access(ReferenceAccessMode::AtomicAccumulate),
                 Self::Freeze => access(ReferenceAccessMode::Consume),
                 Self::UnreportedFreeze => Effects::explicit(EffectClasses::single(EffectClass::OrderedState)),
                 Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Call | Self::ScopedCall { .. } => {
@@ -4991,7 +5017,7 @@ mod tests {
                     let replacement = inputs[1].try_as_value("a replacement value")?.clone();
                     Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
                 }
-                Self::AddUpdate => {
+                Self::AddUpdate | Self::AtomicAddUpdate => {
                     check_count!("input", inputs, 2, ProgramError);
                     let reference = inputs[0].try_as_reference("a reference to accumulate into")?;
                     let update = inputs[1].try_as_value("an update value")?.clone();
@@ -6267,6 +6293,87 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_discharge_region_summary_new_rejects_local_input_bindings() {
+        /// Operation that creates a local input, owning any reference it lends to its computation region.
+        #[derive(Clone, Debug)]
+        struct LocalInputOperation;
+
+        impl Display for LocalInputOperation {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.name())
+            }
+        }
+
+        impl Operation for LocalInputOperation {
+            type Type = ListIrType;
+
+            fn name(&self) -> &'static str {
+                "local_input"
+            }
+
+            fn infer_output_types(
+                &self,
+                _inputs: &[ListIrType],
+                _regions: &[RegionInterface<ListIrType>],
+            ) -> Result<Vec<ListIrType>, TypeError> {
+                Ok(Vec::new())
+            }
+
+            fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+                if region_index == 0 && input_index == 0 {
+                    InputRegionProvenance::Local
+                } else {
+                    InputRegionProvenance::None
+                }
+            }
+        }
+
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        for binding in [None, Some(reference.allocation_id())] {
+            assert_eq!(
+                ReferenceDischargeRegionSummary::new(
+                    &LocalInputOperation,
+                    0,
+                    program.entry_region_ref(),
+                    &[binding],
+                    context.captures(),
+                ),
+                Err(ProgramError::UnsupportedOperation {
+                    message: "`local_input` constructs local reference input 0 of region 0; preserving or rewriting \
+                              this boundary requires its owning reference discharge rule"
+                        .to_string(),
+                }),
+            );
+        }
+
+        // Local ordinary values need no allocation binding or owner-specific reference discharge rule.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let summary = ReferenceDischargeRegionSummary::new(
+            &LocalInputOperation,
+            0,
+            program.entry_region_ref(),
+            &[None],
+            context.captures(),
+        )
+        .unwrap();
+        assert_eq!(summary.reached_allocations().count(), 0);
+        assert_eq!(summary.accessed_allocations().count(), 0);
+        assert_eq!(summary.output_allocations(), &[None]);
+    }
+
+    #[test]
     fn test_reference_discharge_region_summary_new_resolves_input_capture_aliases() {
         let mut builder = ProgramBuilder::<ListCapture, ListOperation>::new();
         let reference_type = ListIrType::Reference(ReferenceType::new(ListType { length: 2 }));
@@ -6511,6 +6618,7 @@ mod tests {
             ReferenceAccessMode::Write,
             ReferenceAccessMode::ReadWrite,
             ReferenceAccessMode::Accumulate,
+            ReferenceAccessMode::AtomicAccumulate,
         ];
 
         for accessed in modes {
@@ -6536,6 +6644,11 @@ mod tests {
                         .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, replacement], None)
                         .unwrap();
                 }
+                ReferenceAccessMode::AtomicAccumulate => {
+                    builder
+                        .add_instruction(ListOperation::AtomicAddUpdate, Vec::new(), vec![reference, replacement], None)
+                        .unwrap();
+                }
                 ReferenceAccessMode::Consume => unreachable!(),
             }
             let region = builder
@@ -6559,7 +6672,8 @@ mod tests {
                             accessed,
                             ReferenceAccessMode::Write
                                 | ReferenceAccessMode::ReadWrite
-                                | ReferenceAccessMode::Accumulate,
+                                | ReferenceAccessMode::Accumulate
+                                | ReferenceAccessMode::AtomicAccumulate,
                         ),
                     );
                 } else {
@@ -9109,10 +9223,10 @@ mod tests {
                 }
             }
 
-            fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+            fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
                 match self {
                     Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
-                    Self::Call => Some(input_index),
+                    Self::Call => InputRegionProvenance::Input { index: input_index },
                 }
             }
 

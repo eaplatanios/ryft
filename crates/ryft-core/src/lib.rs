@@ -11,6 +11,7 @@ pub mod contexts;
 pub mod differentiation;
 pub mod errors;
 pub mod interpretation;
+pub mod kernels;
 pub mod macros;
 pub mod operations;
 pub mod parameters;
@@ -76,7 +77,8 @@ pub use differentiation::{
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
-    InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
+    ContextRegionInterpretation, InterpretableOperation, InterpretationDriver, MemberInterpretableOperation,
+    RegionInterpretation, interpret_projected_operation,
 };
 pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add,
@@ -122,22 +124,24 @@ pub use operations::{
     REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME,
     ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RUNTIME_DIMENSION_DATA_TYPE, RaggedDot, RaggedDotDimensionNumbers,
     RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceFreezeOperationProvider, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshapeOrder, ReshapeParameters, Reshard,
-    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME,
-    SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME, SHARDING_CONSTRAINT_OPERATION_NAME, SIGN_OPERATION_NAME,
-    SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME,
-    ScaledDot, ScaledDotOperation, ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers,
-    ScatterOperation, ScatterReductionKind, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation,
-    Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients,
-    Sub, SubOperation, TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
-    TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, TransferToMemory, TransferToMemoryOperation,
-    Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
-    WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp,
-    custom_vjp, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceAtomicAddUpdate,
+    ReferenceAtomicAddUpdateOperation, ReferenceAtomicAddUpdateOperationProvider, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceFreezeOperationProvider, ReferenceNew, ReferenceNewOperation,
+    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshapeOrder,
+    ReshapeParameters, Reshard, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME,
+    SHARDING_CONSTRAINT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
+    SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation,
+    ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation,
+    TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag,
+    TagOperation, Tanh, TanhOperation, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation,
+    WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
+    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp, custom_vjp,
+    forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -152,11 +156,12 @@ pub use partial::{
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BatchableReferenceView, BindingRegionDriver, CalleeRegionDriver,
     Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary, EmptyRegionDriver,
-    ExternalReferenceBinding, FlatProgram, Instruction, InstructionId, MaybeZero, MemberOperation, NoIdentity,
-    NoReferenceViewBinding, NoReferent, Operation, OperationFormatter, OperationProjection, OperationProvider,
-    OutputRegionProvenance, ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceReplacement,
-    Program, ProgramBuilder, ProgramBuilderId, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics,
-    ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
+    ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction, InstructionId, MaybeZero,
+    MemberOperation, NoIdentity, NoReferenceViewBinding, NoReferent, Operation, OperationFormatter,
+    OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
+    PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder, ProgramBuilderId,
+    ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance,
+    ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
     RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessMode, ReferenceAccumulationPolicy,
     ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysis, ReferenceAnalysisError,
     ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
