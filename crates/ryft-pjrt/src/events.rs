@@ -102,6 +102,9 @@ impl<O> Event<O> {
     /// been invoked. The PJRT runtime may release threads blocked in an await before, after, or concurrently with
     /// invoking "on-ready" callbacks (which typically run on the thread that completed the event), so callers must not
     /// rely on any ordering between the two.
+    ///
+    /// Returns [`Error::MissingFunction`] if native await cannot be dispatched; that error does not imply readiness.
+    /// This function consumes the event and its payload on failure, as it does for native computation errors.
     pub fn r#await(self) -> Result<O, Error> {
         use ffi::PJRT_Event_Await_Args;
 
@@ -579,9 +582,12 @@ mod tests {
 
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
+    use pretty_assertions::assert_eq;
 
+    use crate::errors::Error;
     use crate::tests::{test_cpu_client, test_for_each_platform};
-    use crate::{Error, Event};
+
+    use super::*;
 
     fn assert_send<T: Send>() {}
 
@@ -652,6 +658,51 @@ mod tests {
             unsafe { Event::from_c_api(std::ptr::null_mut(), client.api(), ()) },
             Err(Error::InvalidArgument { message, .. })
                 if message == "the provided PJRT event handle is a null pointer",
+        ));
+    }
+
+    #[test]
+    fn test_event_await_missing_function() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_Await = None;
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let error = event.r#await().unwrap_err();
+        assert!(matches!(error, Error::MissingFunction { function_name: "PJRT_Event_Await", .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("`PJRT_Event_Await` is not available in the loaded PJRT plugin (version {})", api.version(),)
+        );
+        promise.set(None).unwrap();
+    }
+
+    #[test]
+    fn test_event_await_truncated_api() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let original_size = table.struct_size;
+        table.struct_size = std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Event_Await) + 1;
+        let error = event.r#await().unwrap_err();
+        assert!(matches!(error, Error::MissingFunction { function_name: "PJRT_Event_Await", .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("`PJRT_Event_Await` is not available in the loaded PJRT plugin (version {})", api.version(),)
+        );
+        table.struct_size = original_size;
+        promise.set(None).unwrap();
+    }
+
+    #[test]
+    fn test_event_await_native_unimplemented() {
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(Error::unimplemented("test terminal failure"))).unwrap();
+        assert!(matches!(
+            event.r#await(),
+            Err(Error::Unimplemented { message, .. }) if message == "test terminal failure",
         ));
     }
 

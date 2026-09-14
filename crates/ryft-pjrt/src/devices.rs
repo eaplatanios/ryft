@@ -120,7 +120,9 @@ impl Device<'_> {
                 });
                 match attributes {
                     Ok(attributes) => Ok(attributes),
-                    Err(Error::Unimplemented { .. }) => Ok(self.description()?.attributes()?.clone()),
+                    Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }) => {
+                        Ok(self.description()?.attributes()?.clone())
+                    }
                     Err(error) => Err(error),
                 }
             })

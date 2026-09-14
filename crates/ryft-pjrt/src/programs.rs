@@ -1248,8 +1248,9 @@ impl ExecutionFenceState {
 }
 
 /// Shared completion state for one asynchronous PJRT execution across all participating addressable devices. PJRT
-/// execution is enqueued before this value is constructed. Creating or cloning an [`ExecutionFence`] never waits.
-/// Native event callbacks join device completion into one immutable terminal result shared by blocking waiters,
+/// execution is enqueued before this value is constructed. Creation is asynchronous when native callback registration
+/// succeeds while registration failure waits for the affected event before publishing its terminal error. Cloning never
+/// waits. Native event callbacks join device completion into one immutable terminal result shared by blocking waiters,
 /// readiness queries, and callbacks registered through [`Self::on_ready`]. Call [`Self::block_until_ready`] only
 /// at an explicit host synchronization boundary. This fence plays the role that [`tsl::JoinFutures`](
 /// https://github.com/openxla/xla/blob/main/xla/tsl/concurrency/future.h) plays for JAX. XLA joins the per-device
@@ -1264,7 +1265,9 @@ pub struct ExecutionFence {
 }
 
 impl ExecutionFence {
-    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s.
+    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s. Callback registration
+    /// failures wait for native completion before publishing an error. A plugin missing both native completion
+    /// functions leaves the fence pending because device completion cannot be established safely.
     pub fn new(events: Vec<Event<()>>) -> Self {
         let event_count = events.len();
         let state = Arc::new(ExecutionFenceState {
@@ -1277,13 +1280,26 @@ impl ExecutionFence {
             }),
             ready: Condvar::new(),
         });
-        for event in &events {
+
+        let mut retained_events = Vec::with_capacity(event_count);
+        for event in events {
             let callback_state = Arc::clone(&state);
             if let Err(error) = event.on_ready(move |error| callback_state.record(error)) {
-                state.record(Some(error));
+                // Registration failure is not device completion. Only a dispatched native await establishes readiness.
+                // Dropping its unit-payload event does not complete this fence. Execution owners still retain their
+                // resources while the fence is pending.
+                match event.r#await() {
+                    Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. }) => continue,
+                    Err(error) => state.record(Some(error)),
+                    Ok(()) => state.record(Some(error)),
+                }
+            } else {
+                retained_events.push(event);
             }
         }
-        *state.events.lock().expect("execution fence events mutex poisoned") = events;
+
+        *state.events.lock().expect("execution fence events mutex poisoned") = retained_events;
+
         // If every event completed while its callback was still being registered, the terminal transition has already
         // run against an empty retention vector, and no later `record` call will release the events that were just
         // installed. Releasing them here, on the constructing thread, keeps the ownership cycle bounded in that race
@@ -1292,6 +1308,7 @@ impl ExecutionFence {
         if state.completion.lock().expect("execution fence completion mutex poisoned").result.is_some() {
             drop(std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned")));
         }
+
         Self { state }
     }
 
@@ -2934,7 +2951,7 @@ pub(crate) mod ffi {
 mod tests {
     use std::collections::HashMap;
     use std::mem::ManuallyDrop;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -3837,6 +3854,64 @@ mod tests {
             fence.block_until_ready().unwrap();
             eprintln!("CPU client destruction returned before pending effect release: {dropped_early}");
         });
+    }
+
+    #[test]
+    fn test_execution_fence_new_waits_after_failed_callback_registration() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        std::thread::scope(|threads| {
+            let (started, waiting) = mpsc::channel();
+            let (sender, completed) = mpsc::channel();
+            threads.spawn(move || {
+                started.send(()).unwrap();
+                sender.send(ExecutionFence::new(vec![event])).unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(completed.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+            promise.set(Some(Error::aborted("test terminal failure"))).unwrap();
+            let fence = completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(fence.block_until_ready(), Err(Error::Aborted { .. })));
+        });
+        drop(table);
+    }
+
+    #[test]
+    fn test_execution_fence_new_missing_await_remains_pending() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        table.PJRT_Event_Await = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let completed = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::clone(&completed);
+        fence.on_ready(move |_| recorded.store(true, Ordering::SeqCst));
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(!completed.load(Ordering::SeqCst));
+        promise.set(None).unwrap();
+        // Without either observation mechanism, even later native completion cannot complete this fence.
+        assert_eq!(fence.is_ready(), Ok(false));
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_execution_fence_new_native_unimplemented_is_terminal() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_Event_OnReady = None;
+        let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
+        let (event, promise) = api.event(()).unwrap();
+        promise.set(Some(Error::unimplemented("test terminal failure"))).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        assert!(matches!(
+            fence.block_until_ready(),
+            Err(Error::Unimplemented { message, .. }) if message == "test terminal failure",
+        ));
     }
 
     #[test]

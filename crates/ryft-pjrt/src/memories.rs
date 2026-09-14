@@ -141,9 +141,12 @@ impl PartialEq for Memory<'_> {
         let other_kind_id = other.kind_id();
         match (&self_kind_id, &other_kind_id) {
             (Ok(_), Ok(_)) => self_kind_id == other_kind_id,
-            (Err(Error::Unimplemented { .. }), Ok(_))
-            | (Ok(_), Err(Error::Unimplemented { .. }))
-            | (Err(Error::Unimplemented { .. }), Err(Error::Unimplemented { .. })) => {
+            (Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }), Ok(_))
+            | (Ok(_), Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }))
+            | (
+                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
+                Err(Error::MissingFunction { .. } | Error::Unimplemented { .. }),
+            ) => {
                 let self_kind = self.kind();
                 let other_kind = other.kind();
                 self_kind.is_ok() && other_kind.is_ok() && self_kind == other_kind

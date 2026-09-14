@@ -4,7 +4,7 @@
 /// API error returned by the function (if that function returned an error pointer) and converting it to a Rust
 /// [`Error`](crate::Error) value if something went wrong. Note that if the requested function is not available in
 /// the loaded plugin, this macro will generate code that returns an
-/// [`Error::Unimplemented`](crate::Error::Unimplemented) error.
+/// [`Error::MissingFunction`](crate::Error::MissingFunction) error.
 ///
 /// This macro is not intended to be used directly. Instead, use [`invoke_pjrt_api_void_fn!`] for functions that
 /// do not return errors, or [`invoke_pjrt_api_error_fn!`] for functions that may return errors.
@@ -36,12 +36,8 @@ macro_rules! invoke_pjrt_api_fn_helper {
                 let api_handle = unsafe { $api.to_c_api() };
                 let api_fn_offset = std::mem::offset_of!(crate::ffi::PJRT_Api, $fn);
                 let api_struct_size = unsafe { (*api_handle).struct_size } as usize;
-                if api_struct_size <= api_fn_offset {
-                    Err($crate::errors::Error::unimplemented(format!(
-                        "`{}` is not available in the loaded PJRT plugin (version {})",
-                        stringify!($fn).to_owned(),
-                        $api.api().version(),
-                    )))
+                if api_struct_size < api_fn_offset + size_of::<Option<unsafe extern "C" fn()>>() {
+                    Err($crate::errors::Error::missing_function(stringify!($fn), $api.api().version()))
                 } else {
                     $crate::invoke_pjrt_api_fn_helper!(
                         @unchecked $api,
@@ -64,12 +60,8 @@ macro_rules! invoke_pjrt_api_fn_helper {
                 let api_handle = unsafe { $api.to_c_api() };
                 let api_fn_offset = std::mem::offset_of!($api_ty, $fn);
                 let api_struct_size = unsafe { (*api_handle).base.struct_size } as usize;
-                if api_struct_size <= api_fn_offset {
-                    Err($crate::errors::Error::unimplemented(format!(
-                        "`{}` is not available in the loaded PJRT plugin (version {})",
-                        stringify!($fn).to_owned(),
-                        $api.api().version(),
-                    )))
+                if api_struct_size < api_fn_offset + size_of::<Option<unsafe extern "C" fn()>>() {
+                    Err($crate::errors::Error::missing_function(stringify!($fn), $api.api().version()))
                 } else {
                     $crate::invoke_pjrt_api_fn_helper!(
                         @unchecked $api,
@@ -89,11 +81,10 @@ macro_rules! invoke_pjrt_api_fn_helper {
     ) => {
         paste::paste! {
             unsafe {
-                let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| $crate::errors::Error::unimplemented(format!(
-                    "`{}` is not implemented in the loaded PJRT plugin (version {})",
-                    stringify!($fn).to_owned(),
+                let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| $crate::errors::Error::missing_function(
+                    stringify!($fn),
                     $api.api().version(),
-                )));
+                ));
                 match api_fn {
                     Ok(api_fn) => {
                         let mut args = [<$fn _Args>]::new($($input_value),*);

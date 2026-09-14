@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   launcher behind the `cuda-12` and `cuda-13` features.
 - Fixed dangling native pointers to temporary buffer-layout descriptors and executable compilation options, and
   preserved valid zero generated-code sizes instead of reporting them as unavailable.
+- Introduced `Error::MissingFunction`.
 
 ### Changed
 
@@ -80,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
+- Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures.
 
 ### Fixed
 

@@ -4056,8 +4056,8 @@ mod tests {
                 TestPlatform::Mps => {
                     assert!(matches!(
                         buffer.copy_raw_to_host(2, 3),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHost` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(Error::MissingFunction { function_name: "PJRT_Buffer_CopyRawToHost", pjrt_version, .. })
+                            if pjrt_version == client.version(),
                     ));
                 }
                 _ => {
@@ -4081,8 +4081,8 @@ mod tests {
                 TestPlatform::Mps => {
                     assert!(matches!(
                         buffer.copy_raw_to_host_buffer(&mut destination, 1),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHost` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(Error::MissingFunction { function_name: "PJRT_Buffer_CopyRawToHost", pjrt_version, .. })
+                            if pjrt_version == client.version(),
                     ));
                     assert_eq!(destination.as_slice(), vec![0u8; 3]);
                 }
@@ -4106,8 +4106,13 @@ mod tests {
                         .unwrap();
                     assert!(matches!(
                         buffer.copy_raw_to_host_buffer_future::<Vec<u8>>(0),
-                        Err(Error::Unimplemented { message, .. })
-                            if message == "`PJRT_Buffer_CopyRawToHostFuture` is not implemented in the loaded PJRT plugin (version 0.104)",
+                        Err(
+                            Error::MissingFunction {
+                                function_name: "PJRT_Buffer_CopyRawToHostFuture",
+                                pjrt_version,
+                                ..
+                            }
+                        ) if pjrt_version == client.version(),
                     ));
                 }
                 _ => {
