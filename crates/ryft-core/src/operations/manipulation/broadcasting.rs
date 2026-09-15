@@ -1701,7 +1701,7 @@ fn infer_explicit_broadcast_output_type(
             (input_dimension, output_dimension) => {
                 return Err(TypeError::invalid(format!(
                     "broadcasting input axis {input_axis} has size {input_dimension} but the output has size \
-                     {}output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
+                     {output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
                 )));
             }
         }

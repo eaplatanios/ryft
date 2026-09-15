@@ -605,6 +605,19 @@ impl From<&DimensionVariable> for Dimension {
 
 /// Represents an array's ordered [`Dimension`]s. Note that the [`Display`] implementation of [`Shape`] renders shapes
 /// as the rendered dimension sizes in a comma-separated list surrounded by square brackets.
+///
+/// Converting host-size arrays, slices, or vectors creates static dimensions in the same order. Empty collections
+/// represent a scalar shape, and zero sizes represent empty axes. Borrowed collections are copied into the shape.
+///
+/// # Examples
+///
+/// ```rust
+/// # use ryft_core::Shape;
+/// let shape = Shape::from([2, 3]);
+/// assert_eq!(shape.to_string(), "[2, 3]");
+/// assert_eq!(shape, Shape::from(vec![2, 3]));
+/// assert_eq!(shape, Shape::from([2, 3].as_slice()));
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Shape {
     /// [`Dimension`]s ordered from outermost to innermost.
@@ -754,13 +767,50 @@ impl<A: Into<Axis>> Index<A> for Shape {
     }
 }
 
+impl<const N: usize> From<[usize; N]> for Shape {
+    #[inline]
+    fn from(dimensions: [usize; N]) -> Self {
+        Self::new(dimensions.into_iter().map(Dimension::Static).collect())
+    }
+}
+
+impl<const N: usize> From<&[usize; N]> for Shape {
+    #[inline]
+    fn from(dimensions: &[usize; N]) -> Self {
+        Self::from(dimensions.as_slice())
+    }
+}
+
+impl From<&[usize]> for Shape {
+    #[inline]
+    fn from(dimensions: &[usize]) -> Self {
+        Self::new(dimensions.iter().copied().map(Dimension::Static).collect())
+    }
+}
+
+impl From<Vec<usize>> for Shape {
+    #[inline]
+    fn from(dimensions: Vec<usize>) -> Self {
+        Self::new(dimensions.into_iter().map(Dimension::Static).collect())
+    }
+}
+
+impl From<&Vec<usize>> for Shape {
+    #[inline]
+    fn from(dimensions: &Vec<usize>) -> Self {
+        Self::from(dimensions.as_slice())
+    }
+}
+
 impl From<StaticShape> for Shape {
+    #[inline]
     fn from(value: StaticShape) -> Self {
         Self::new(value.dimensions.into_iter().map(Dimension::Static).collect())
     }
 }
 
 impl From<&StaticShape> for Shape {
+    #[inline]
     fn from(value: &StaticShape) -> Self {
         Self::new(value.dimensions.iter().copied().map(Dimension::Static).collect())
     }
@@ -1209,6 +1259,23 @@ mod tests {
         assert_eq!(format!("{s3}"), "[4, depth]");
         assert_eq!(format!("{s4}"), "[rows, 42, columns]");
         assert_eq!(format!("{s5}"), "[42, columns]");
+    }
+
+    #[test]
+    fn test_shape_from_sizes() {
+        let expected = Shape::new(vec![Dimension::Static(2), Dimension::Static(0), Dimension::Static(3)]);
+        assert_eq!(Shape::from([2, 0, 3]), expected);
+        assert_eq!(Shape::from(&[2, 0, 3]), expected);
+        assert_eq!(Shape::from([2, 0, 3].as_slice()), expected);
+        assert_eq!(Shape::from(vec![2, 0, 3]), expected);
+        assert_eq!(Shape::from(&vec![2, 0, 3]), expected);
+
+        // Empty collections describe scalars, rather than a zero-sized axis.
+        assert_eq!(Shape::from([]), Shape::scalar());
+        assert_eq!(Shape::from(&[]), Shape::scalar());
+        assert_eq!(Shape::from([].as_slice()), Shape::scalar());
+        assert_eq!(Shape::from(Vec::<usize>::new()), Shape::scalar());
+        assert_eq!(Shape::from(&Vec::<usize>::new()), Shape::scalar());
     }
 
     #[test]
