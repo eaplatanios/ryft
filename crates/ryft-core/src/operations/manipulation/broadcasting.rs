@@ -1,16 +1,11 @@
-//! Array broadcasting through static output types or explicit first-class output dimensions.
-//!
-//! [`Broadcast`] carries resolved output geometry in its operation, while [`DynamicBroadcast`] keeps each output
-//! dimension available as a value. Both capabilities replicate singleton axes and route input axes to distinct output
-//! axes, preserving element values and memory placement.
-
 use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
-    DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, TiledLayout,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Broadcastable, Dimension,
+    DimensionType, DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension,
+    TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -45,8 +40,6 @@ use crate::programs::{
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name shared by [`BroadcastOperation`] and [`DynamicBroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
 
@@ -54,8 +47,8 @@ pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
 ///
 /// This is the member-family broadcast primitive: complete output geometry is carried by the [`ArrayType`] metadata
 /// stored in the operation payload, so the operation has exactly one input and no explicit extent edges. It and
-/// [`ReshapeOperation`] form the homogeneous baseline that [`ProjectedContext`](crate::contexts::ProjectedContext)
-/// serves, which is why transform rules for mixed operations can delegate to them once input geometry is resolved.
+/// [`ReshapeOperation`] form the homogeneous baseline that [`ProjectedContext`](crate::ProjectedContext) serves,
+/// which is why transform rules for mixed operations can delegate to them once input geometry is resolved.
 /// Refer to the documentation of [`Broadcast`] for the underlying resolved-geometry contract.
 ///
 /// Programs that need first-class dynamic extents stage [`DynamicBroadcastOperation`] instead, which takes one explicit
@@ -235,6 +228,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                 };
                 output_type.sharding =
                     output_sharding.map(|sharding| sharding.batched(batch_axis, axis_sharding)).transpose()?;
+
                 // Broadcast packed storage using its physical extents, then remap the logical ragged geometry.
                 let mut dimensions = output_type.shape().dimensions().to_vec();
                 let ragged_axes = inputs[0]
@@ -252,10 +246,12 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                     })
                     .collect::<Vec<_>>();
                 output_type = output_type.with_shape(Shape::new(dimensions));
-                let output_value = inputs[0].value().broadcast(output_type, output_axes.as_slice())?;
                 Ok(vec![
-                    ArrayBatch::new(output_value, BatchAxis::from_position(batch_axis))?
-                        .with_ragged_axes(ragged_axes)?,
+                    ArrayBatch::new(
+                        inputs[0].value().broadcast(output_type, output_axes.as_slice())?,
+                        BatchAxis::from_position(batch_axis),
+                    )?
+                    .with_ragged_axes(ragged_axes)?,
                 ]
                 .into())
             }
@@ -270,7 +266,7 @@ impl_differentiable_operation! {
         C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode differentiation rule for `BroadcastOperation`. Broadcasting is structural-linear, so
+            // Forward-mode differentiation rule for `BroadcastOperation`. Broadcasting is structural-linear, and so the
             // tangent follows the same axis mapping as the primal. A structural-zero input tangent remains structural
             // and acquires the primal output's tangent type.
             check_count!("input", inputs, 1, ProgramError);
@@ -290,17 +286,17 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
+            + From<ZeroLikeOperation<ArrayType>>
             + From<AddOperation<ArrayType>>
-            + From<BroadcastOperation>
             + From<ConvertElementTypeOperation<ArrayType>>
-            + From<ReduceOperation>
             + From<TransposeOperation>
             + From<ReshapeOperation>
-            + From<ReshardOperation>
-            + From<ZeroLikeOperation<ArrayType>>,
+            + From<BroadcastOperation>
+            + From<ReduceOperation>
+            + From<ReshardOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum-reduction over
+            // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum reduction over the
             // output axis the input was replicated along (i.e., the axes of the target type that are not named in
             // `output_axes`, plus the mapped axes whose input extent is `1` stretched to a larger target extent).
             // After the reduction, the surviving axes are reordered into input-axis order when `output_axes` is not
@@ -327,15 +323,16 @@ impl_differentiable_operation! {
 }
 
 /// Replicates an array along new axes or expands axes of size one to a requested output shape. Input axis `i` maps to
-/// output axis `output_axes[i]`; axes need not stay in increasing order, but each input axis must map to a distinct
+/// output axis `output_axes[i]`. The axes need not stay in increasing order, but each input axis must map to a distinct
 /// output axis. A mapped extent must equal its input extent or expand a static size-one axis to a static size. New axes
 /// must have static sizes. An existing dynamic extent can pass through unchanged; replication into a dynamic extent
 /// requires [`DynamicBroadcast`] so that its size is available as a value.
 ///
-/// Broadcasting preserves the element type and memory space. The primitive accepts the complete output [`ArrayType`],
-/// including its layout and sharding. The convenience functions infer output sharding from the input axis mapping and
-/// clear the physical layout when the shape changes, since replication does not determine an output storage layout. An
-/// identity broadcast with unchanged metadata passes the input through unchanged.
+/// Broadcasting preserves the element [`DataType`](crate::DataType) and [`Memory`](crate::Memory) space. The primitive
+/// accepts the complete output [`ArrayType`], including its [`Layout`] and [`Sharding`]. The convenience functions
+/// infer output sharding from the input axis mapping and clear the physical layout when the shape changes, since
+/// replication does not determine an output storage layout. An identity broadcast with unchanged metadata passes
+/// the input through unchanged.
 ///
 /// [`Broadcast`] fills the same role for [`BroadcastOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
 /// their corresponding arithmetic [`Operation`]s. It also operates on [`ArrayType`] to validate output geometry without
@@ -388,12 +385,12 @@ pub trait Broadcast: Sized {
 
     /// Broadcasts to `output_shape` with trailing-axis alignment and an optional complete output sharding. Shape,
     /// element type, memory, and layout behavior follow [`Self::broadcast_to`]. An explicit sharding is applied even
-    /// when the shape is unchanged; invalid sharding ranks return a [`TypeError`].
+    /// when the shape is unchanged. Invalid sharding ranks return a [`TypeError`].
     ///
     /// # Parameters
     ///
     ///   - `output_shape`: Desired result shape, including unchanged trailing input dimensions.
-    ///   - `output_sharding`: Requested result distribution. `None` maps the input sharding onto the aligned axes and
+    ///   - `output_sharding`: Requested result [`Sharding`]. `None` maps the input sharding onto the aligned axes and
     ///     replicates new axes; it does not remove existing sharding. `Some(sharding)` replaces that inferred result.
     fn broadcast_to_with_output_sharding<S: Into<Shape>>(
         &self,
@@ -500,8 +497,8 @@ pub trait Broadcast: Sized {
             return Ok(Vec::new());
         }
         let shapes = inputs.iter().map(|input| input.r#type().shape().clone()).collect::<Vec<_>>();
-        let output_shape: Shape = crate::arrays::Broadcastable::broadcasted(&shapes)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let output_shape: Shape =
+            Broadcastable::broadcasted(&shapes).map_err(|error| TypeError::invalid(error.to_string()))?;
         inputs.iter().map(|input| input.broadcast_to(output_shape.clone())).collect()
     }
 }
@@ -557,15 +554,20 @@ impl Broadcast for ArrayType {
             let input_dimension = self.dimension(input_axis);
             let output_dimension = output_type.dimension(output_axis);
             match (input_dimension, output_dimension.clone()) {
-                // Identical sizes always map through, including identical dynamic sizes.
-                (input_dimension, output_dimension) if input_dimension == output_dimension => {}
-                // A singleton dynamic bound proves the same extent even when a residual has refined it to static.
+                (input_dimension, output_dimension) if input_dimension == output_dimension => {
+                    // Identical sizes always map through, including identical dynamic sizes.
+                }
                 (Dimension::Static(size), Dimension::Dynamic(variable))
-                    if variable.bounds() == Dimension::Static(size).bounds() => {}
-                // A static size-1 input dimension is replicated to match any static output extent. Expanding it
-                // into a dynamic output dimension is unsupported because the replication count is unknown.
-                (Dimension::Static(1), Dimension::Static(_)) => {}
+                    if variable.bounds() == Dimension::Static(size).bounds() =>
+                {
+                    // A singleton dynamic bound proves the same extent even when a residual has refined it to static.
+                }
+                (Dimension::Static(1), Dimension::Static(_)) => {
+                    // A static size-1 input dimension is replicated to match any static output extent.
+                }
                 (Dimension::Static(1), Dimension::Dynamic(_)) => {
+                    // Expanding a static size-1 input dimension into a dynamic output dimension is unsupported
+                    // because the replication count is unknown.
                     return Err(TypeError::invalid(format!(
                         "broadcasting cannot expand input axis {} of size 1 into dynamic output size {}",
                         input_axis, output_dimension,
@@ -579,8 +581,8 @@ impl Broadcast for ArrayType {
                     ))
                     .into());
                 }
-                // All remaining combinations pair a dynamic size with a mismatched size on the other side.
                 (input_dimension, output_dimension) => {
+                    // All remaining combinations pair a dynamic size with a mismatched size on the other side.
                     return Err(TypeError::invalid(format!(
                         "broadcasting input axis {input_axis} has size {input_dimension} but the output has size \
                             {output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
@@ -602,10 +604,13 @@ impl Broadcast for ArrayType {
                 .into());
             }
         }
+
         validate_broadcast_output_layout(&output_type)?;
         Ok(output_type)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Broadcast for Array {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
