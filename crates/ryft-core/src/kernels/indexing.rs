@@ -269,7 +269,9 @@ mod tests {
             .unwrap()[0];
         let indices = builder
             .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Concatenate(ConcatenateOperation::new(2, 3).unwrap())),
+                ArrayIrOperation::Array(ArrayOperation::Concatenate(
+                    ConcatenateOperation::<ArrayType>::new(2, 3).unwrap(),
+                )),
                 vec![],
                 vec![rows, components[1]],
                 None,

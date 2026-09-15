@@ -6138,7 +6138,7 @@ mod tests {
                 let width = value.context().dimension_constant(2)?;
                 let repeated = value.dynamic_broadcast_to(&[extent, width])?;
                 let result_extent = value.context().dimension_constant(4)?;
-                let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+                let operation = ConcatenateOperation::<ArrayIrType>::new(
                     1,
                     &[
                         repeated.r#type().into_owned(),
@@ -7407,7 +7407,7 @@ mod tests {
         let extent = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
         let extent_type = <&DimensionType>::try_from(extent.r#type().as_ref()).unwrap().clone();
         let concatenate = ArrayIrOperation::<Array>::from(
-            ConcatenateOperation::<ArrayIrType>::from_input_types(
+            ConcatenateOperation::<ArrayIrType>::new(
                 0,
                 &[
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),

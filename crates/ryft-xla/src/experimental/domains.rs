@@ -7512,7 +7512,7 @@ mod tests {
                     let doubled = builder
                         .add_instruction(DimensionOperation::Add(addition), vec![], vec![extent, extent], None)
                         .unwrap()[0];
-                    let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+                    let operation = ConcatenateOperation::<ArrayIrType>::new(
                         0,
                         &[
                             input_type.clone().into(),

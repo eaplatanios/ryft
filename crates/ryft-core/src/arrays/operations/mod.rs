@@ -1436,7 +1436,7 @@ mod tests {
     fn test_array_ir_operation_forwards_payload_effects() {
         // A statically proven mixed concatenate is pure. The derived dispatcher must read that payload classification
         // rather than declaring the composite family effectful.
-        let concatenate = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let concatenate = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
@@ -1452,7 +1452,7 @@ mod tests {
         // A dynamic axis sum remains an ordered assertion and reaches the outer family unchanged.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(9)).unwrap());
         let result = DimensionVariable::new("result", DimensionBounds::positive(Some(12)).unwrap());
-        let concatenate = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let concatenate = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])).into(),
@@ -1934,7 +1934,7 @@ mod tests {
         let left_atom = left.atom_id().unwrap();
         let right_atom = right.atom_id().unwrap();
         let extent_atom = extent.atom_id().unwrap();
-        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[left.r#type().into_owned(), right.r#type().into_owned(), extent.r#type().into_owned()],
         )
@@ -3062,7 +3062,7 @@ mod tests {
             (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::GeometryMixed),
             (
                 ArrayIrOperation::Concatenate(
-                    ConcatenateOperation::<ArrayIrType>::from_input_types(
+                    ConcatenateOperation::<ArrayIrType>::new(
                         0,
                         &[
                             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),

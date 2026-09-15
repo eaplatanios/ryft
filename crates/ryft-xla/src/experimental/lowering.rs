@@ -21196,7 +21196,12 @@ mod tests {
         let first = builder.add_input(first_type);
         let second = builder.add_input(second_type);
         let joined = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second], None)
+            .add_instruction(
+                ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(),
+                Vec::new(),
+                vec![first, second],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
@@ -21222,7 +21227,12 @@ mod tests {
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
         assert_eq!(
-            builder.add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second], None),
+            builder.add_instruction(
+                ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(),
+                Vec::new(),
+                vec![first, second],
+                None
+            ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`concatenate` dynamic axis 0 requires an explicit result-dimension input".to_string(),
             ))),
@@ -21233,7 +21243,7 @@ mod tests {
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let result_extent = DimensionValue::constant(4).unwrap();
-        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
@@ -21291,7 +21301,7 @@ mod tests {
                 .unwrap();
         let result_extent_type =
             DimensionType::new(DimensionVariable::new(add_operation.output_name(), add_operation.output_bounds()));
-        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )
@@ -21338,7 +21348,7 @@ mod tests {
         let left = builder.add_input(left_type);
         let right = builder.add_input(right_type);
         let joined = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
+            .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
@@ -21373,7 +21383,7 @@ mod tests {
                 let first_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("first", Some(5))]));
                 let second_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("second", Some(5))]));
                 let extent_type = extent.r#type().into_owned();
-                let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+                let operation = ConcatenateOperation::<ArrayIrType>::new(
                     0,
                     &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
                 )
@@ -21568,8 +21578,9 @@ mod tests {
     fn test_lower_concatenate_tree() {
         let mut builder = XlaProgramBuilder::new();
         let inputs = (0..33).map(|_| builder.add_input(test_vector_type(1))).collect::<Vec<_>>();
-        let joined =
-            builder.add_instruction(ConcatenateOperation::new(0, 1).unwrap(), Vec::new(), inputs, None).unwrap()[0];
+        let joined = builder
+            .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), inputs, None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
             .unwrap();

@@ -607,7 +607,7 @@ mod tests {
         let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
         let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
         let one_value = DimensionValue::constant(1).unwrap();
-        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[input_type.clone().into(), input_type.clone().into(), sum_type.into()],
         )
