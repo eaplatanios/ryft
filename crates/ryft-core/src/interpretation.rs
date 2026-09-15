@@ -409,7 +409,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         lift_fn: LiftFn,
         mut interpret_fn: InterpretFn,
     ) -> Result<Vec<RuntimeValue>, Error> {
-        let mut interpretation = RegionInterpretationState::new(self, inputs, lift_fn)?;
+        let mut interpretation = RegionInterpreterState::new(self, inputs, lift_fn)?;
         while !interpretation.is_complete() {
             interpretation = interpretation.step(&mut interpret_fn)?;
         }
@@ -418,7 +418,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
 }
 
 /// Resumable context-driven interpreter with the same boundary refinements, provenance, identity renaming, and
-/// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps [`RegionInterpretationState`] to retain
+/// nested-region driver as [`RegionRef::interpret_in_context`]. This wraps [`RegionInterpreterState`] to retain
 /// context-specific validation and binding between steps. Each step completes one outer instruction; an attached
 /// region executes through the context's ordinary operation rule within that step.
 pub(crate) struct RegionInterpreter<'r, C: Context> {
@@ -433,7 +433,7 @@ pub(crate) struct RegionInterpreter<'r, C: Context> {
     /// by this interpreter. Each [`Self::step`] supplies context-aware dispatch to this state, which gathers operands
     /// and retains live results. Refinement checks, identity substitutions, and attached-region mappings stay in this
     /// interpreter so ordinary replay and scheduler-selected steps share the same traversal and value-transfer rules.
-    state: RegionInterpretationState<'r, C::Constant, C::Operation, C::Value>,
+    state: RegionInterpreterState<'r, C::Constant, C::Operation, C::Value>,
 
     /// Facts established by comparing the complete declared input signature with the supplied values, expressed
     /// under the input identities selected for this replay. For example, an actual static extent can refine a
@@ -613,7 +613,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 .collect::<Result<Vec<_>, _>>()?;
             <C::Type as Type>::Refinements::establish(declared.iter(), inputs.iter().map(Typed::r#type))?
         };
-        let state = RegionInterpretationState::new(region, inputs, |_, constant| {
+        let state = RegionInterpreterState::new(region, inputs, |_, constant| {
             context.lift(constant.rename_type_identities(&identity_renaming.borrow())?)
         })?;
         Ok(Self { context, state, refinements, input_refinements, identity_renaming, region_mappings })
@@ -848,7 +848,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
 /// [`RegionRef::interpret_with`] supplies constant lifting and instruction dispatch through functions that can use
 /// arbitrary runtime values and errors without a [`Context`]. [`RegionInterpreter`] wraps this state to add context
 /// binding and validation while sharing the same traversal and liveness rules.
-struct RegionInterpretationState<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue> {
+struct RegionInterpreterState<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue> {
     /// Borrowed canonical source region and its attached region arena.
     region: RegionRef<'r, V, O>,
 
@@ -878,10 +878,8 @@ struct RegionInterpretationState<'r, V: Value, O: Operation<Type = V::Type>, Run
     instruction_inputs: Vec<RuntimeValue>,
 }
 
-impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone>
-    RegionInterpretationState<'r, V, O, RuntimeValue>
-{
-    /// Creates a new [`RegionInterpretationState`] by checking flat input arity, recording atom uses, and lifting live
+impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone> RegionInterpreterState<'r, V, O, RuntimeValue> {
+    /// Creates a new [`RegionInterpreterState`] by checking flat input arity, recording atom uses, and lifting live
     /// constants exactly once. Instruction dispatch has not started when this function returns. The caller supplies the
     /// same value semantics as ordinary flat replay.
     fn new<Error: From<ProgramError>, LiftFn: FnMut(AtomId, &V) -> Result<RuntimeValue, Error>>(
@@ -1868,23 +1866,20 @@ mod tests {
     }
 
     #[test]
-    fn test_region_interpretation_state_new() {
+    fn test_region_interpreter_state_new() {
         let program = stepping_program();
         let mut lifted = 0;
-        let state = RegionInterpretationState::new(
-            program.entry_region_ref(),
-            vec![Array::scalar(2f32).unwrap()],
-            |_, value| {
+        let state =
+            RegionInterpreterState::new(program.entry_region_ref(), vec![Array::scalar(2f32).unwrap()], |_, value| {
                 lifted += 1;
                 Ok::<_, ProgramError>(value.clone())
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(lifted, 1);
         assert_eq!(state.next_instruction, 0);
         assert_eq!(state.remaining_uses[program.output_ids()[0].index()], 2);
         assert!(matches!(
-            RegionInterpretationState::new(program.entry_region_ref(), Vec::<Array>::new(), |_, value| {
+            RegionInterpreterState::new(program.entry_region_ref(), Vec::<Array>::new(), |_, value| {
                 Ok::<_, ProgramError>(value.clone())
             }),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -1892,11 +1887,11 @@ mod tests {
     }
 
     #[test]
-    fn test_region_interpretation_state_is_complete() {
+    fn test_region_interpreter_state_is_complete() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let value = builder.add_constant(Array::scalar(3f32).unwrap());
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![], vec![Placeholder]).unwrap();
-        let state = RegionInterpretationState::new(program.entry_region_ref(), vec![], |_, value| {
+        let state = RegionInterpreterState::new(program.entry_region_ref(), vec![], |_, value| {
             Ok::<_, ProgramError>(value.clone())
         })
         .unwrap();
@@ -1905,14 +1900,13 @@ mod tests {
     }
 
     #[test]
-    fn test_region_interpretation_state_step() {
+    fn test_region_interpreter_state_step() {
         let program = stepping_program();
-        let state = RegionInterpretationState::new(
-            program.entry_region_ref(),
-            vec![Array::scalar(2f32).unwrap()],
-            |_, value| Ok::<_, ProgramError>(value.clone()),
-        )
-        .unwrap();
+        let state =
+            RegionInterpreterState::new(program.entry_region_ref(), vec![Array::scalar(2f32).unwrap()], |_, value| {
+                Ok::<_, ProgramError>(value.clone())
+            })
+            .unwrap();
         let mut dispatched = Vec::new();
         let mut dispatch = |instruction: &Instruction<TestArrayOperation>, inputs: &[Array]| {
             dispatched.push(instruction.operation().name());
@@ -1927,14 +1921,13 @@ mod tests {
     }
 
     #[test]
-    fn test_region_interpretation_state_step_rejects_wrong_output_count() {
+    fn test_region_interpreter_state_step_rejects_wrong_output_count() {
         let program = stepping_program();
-        let state = RegionInterpretationState::new(
-            program.entry_region_ref(),
-            vec![Array::scalar(2f32).unwrap()],
-            |_, value| Ok::<_, ProgramError>(value.clone()),
-        )
-        .unwrap();
+        let state =
+            RegionInterpreterState::new(program.entry_region_ref(), vec![Array::scalar(2f32).unwrap()], |_, value| {
+                Ok::<_, ProgramError>(value.clone())
+            })
+            .unwrap();
         assert!(matches!(
             state.step(|_, _| Ok::<Vec<Array>, ProgramError>(vec![])),
             Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
@@ -1942,14 +1935,13 @@ mod tests {
     }
 
     #[test]
-    fn test_region_interpretation_state_finish() {
+    fn test_region_interpreter_state_finish() {
         let program = stepping_program();
-        let state = RegionInterpretationState::new(
-            program.entry_region_ref(),
-            vec![Array::scalar(2f32).unwrap()],
-            |_, value| Ok::<_, ProgramError>(value.clone()),
-        )
-        .unwrap();
+        let state =
+            RegionInterpreterState::new(program.entry_region_ref(), vec![Array::scalar(2f32).unwrap()], |_, value| {
+                Ok::<_, ProgramError>(value.clone())
+            })
+            .unwrap();
         assert_eq!(
             state.finish(),
             Err(ProgramError::MalformedProgram(

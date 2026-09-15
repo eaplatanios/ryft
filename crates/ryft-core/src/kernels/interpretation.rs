@@ -503,7 +503,7 @@ impl KernelCallOperation {
                 pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
             };
             if order.is_some() {
-                scheduled.push(Some(RegionInterpreter::new(body, qualified, windows)?));
+                scheduled.push(Some(RegionInterpreter::new(qualified, body, windows)?));
                 continue;
             }
             qualified.check_step(self.name())?;
