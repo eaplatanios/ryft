@@ -657,8 +657,6 @@ impl Broadcast for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
     Broadcast for V
 {
@@ -679,11 +677,10 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 }
 
 /// Mixed [`Operation`] that broadcasts one array using one explicit first-class dimension input per output axis.
-///
 /// Input zero is the array. Every remaining input describes the corresponding output-axis extent, in order. Exact
 /// dimension types produce static axes while non-exact dimension types retain their variables as dynamic axes.
-/// `output_axes[input_axis]` names the output axis to which that input axis maps. Refer to [`DynamicBroadcast`] for the
-/// underlying array broadcasting semantics.
+/// `output_axes[input_axis]` names the output axis to which that input axis maps.
+/// Refer to [`DynamicBroadcast`] for information on the underlying array broadcasting semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicBroadcastOperation {
     /// Vector that contains, for each input axis, the output axis to which it maps.
@@ -692,15 +689,34 @@ pub struct DynamicBroadcastOperation {
     /// Optional requested output [`Sharding`].
     output_sharding: Option<Sharding>,
 
-    /// Optional requested physical output layout.
+    /// Optional requested output [`Layout`].
     output_layout: Option<Layout>,
 }
 
 impl DynamicBroadcastOperation {
-    /// Creates a broadcast with the supplied input-to-output axis mapping.
+    /// Creates a new [`DynamicBroadcastOperation`] with the supplied input-to-output axis mapping.
     #[inline]
     pub fn new(output_axes: Vec<usize>) -> Self {
         Self { output_axes, output_sharding: None, output_layout: None }
+    }
+
+    /// Returns this operation with the provided requested output [`Sharding`].
+    #[inline]
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Self {
+        self.output_sharding = sharding.into();
+        self
+    }
+
+    /// Returns this operation with the provided requested output [`Layout`]`. Layout rank and structure are validated
+    /// during type inference. Storage geometry depending on dynamic extents is validated once their runtime values are
+    /// available. Without an explicit layout, shape-changing broadcasts use the default layout; identity broadcasts
+    /// preserve the input layout. Mapped batching supports tiled layouts by placing the batch axis outside each item's
+    /// storage. Explicit strided layouts currently support replicated batching only because a leading batch stride can
+    /// depend on runtime output sizes.
+    #[inline]
+    pub fn with_output_layout<L: Into<Option<Layout>>>(mut self, layout: L) -> Self {
+        self.output_layout = layout.into();
+        self
     }
 
     /// Returns the output axes. The resulting slice contains, for each input axis, the output axis to which it maps.
@@ -709,38 +725,20 @@ impl DynamicBroadcastOperation {
         self.output_axes.as_slice()
     }
 
-    /// Returns the requested output sharding, if any.
+    /// Returns the requested output [`Sharding`], if any.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
     }
 
-    /// Returns the requested physical output layout, if any.
+    /// Returns the requested output [`Layout`], if any.
     #[inline]
     pub fn output_layout(&self) -> Option<&Layout> {
         self.output_layout.as_ref()
     }
-
-    /// Returns this operation with the requested output `sharding`.
-    #[inline]
-    pub fn with_output_sharding(mut self, sharding: impl Into<Option<Sharding>>) -> Self {
-        self.output_sharding = sharding.into();
-        self
-    }
-
-    /// Returns this operation with the requested physical output `layout`.
-    ///
-    /// Layout rank and structure are validated during type inference. Storage geometry depending on dynamic extents is
-    /// validated once their runtime values are available. Without an explicit layout, shape-changing broadcasts use the
-    /// default layout; identity broadcasts preserve the input layout. Mapped batching supports tiled layouts by placing
-    /// the batch axis outside each item's storage. Explicit strided layouts currently support replicated batching only,
-    /// because a leading batch stride can depend on runtime output sizes.
-    #[inline]
-    pub fn with_output_layout(mut self, layout: impl Into<Option<Layout>>) -> Self {
-        self.output_layout = layout.into();
-        self
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Display for DynamicBroadcastOperation {
     #[inline]
@@ -765,7 +763,7 @@ impl Operation for DynamicBroadcastOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid(format!(
-                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents"
+                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents",
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
