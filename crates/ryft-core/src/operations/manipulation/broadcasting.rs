@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Broadcastable, Dimension,
-    DimensionType, DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension,
-    TiledLayout,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
+    DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::elementwise::reduce_broadcast_cotangent;
 use crate::differentiation::{
     BroadcastDerivativeAlignment, CotangentAccumulator, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
@@ -28,7 +28,7 @@ use crate::operations::manipulation::reshaping::{
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
-use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
+use crate::operations::math::reduce::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -497,8 +497,8 @@ pub trait Broadcast: Sized {
             return Ok(Vec::new());
         }
         let shapes = inputs.iter().map(|input| input.r#type().shape().clone()).collect::<Vec<_>>();
-        let output_shape: Shape =
-            Broadcastable::broadcasted(&shapes).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let output_shape: Shape = crate::arrays::Broadcastable::broadcasted(&shapes)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         inputs.iter().map(|input| input.broadcast_to(output_shape.clone())).collect()
     }
 }
@@ -1074,7 +1074,10 @@ where
         + From<DynamicReshapeOperation>
         + From<ZeroOperation<ArrayType>>
         + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType, Projected: From<ReduceOperation> + From<TransposeOperation>>,
+        + OperationProjection<
+            ArrayType,
+            Projected: From<BroadcastOperation> + From<ReduceOperation> + From<TransposeOperation>,
+        >,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1165,90 +1168,49 @@ where
                         },
                         move |residuals, output_cotangents| {
                             let transpose_context = output_cotangents[0].dispatch_domain();
-                            let mut contribution =
+                            let cotangent =
                                 <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
                                     output_cotangents[0].clone(),
                                 )?;
+                            let contribution =
+                                reduce_broadcast_cotangent(&cotangent, &transpose_target_type, &transpose_output_axes)?
+                                    .into_value();
                             let contribution_type = contribution.r#type().into_owned();
-                            if transpose_output_axes.len() != transpose_target_type.rank()
-                                || transpose_output_axes.iter().any(|axis| *axis >= contribution_type.rank())
-                            {
-                                return Err(TypeError::invalid(format!(
-                                    "cannot unalign cotangent type `{contribution_type}` to input cotangent type \
-                                     `{transpose_target_type}` using output axes {transpose_output_axes:?}",
-                                ))
-                                .into());
-                            }
-                            let mut kept_axes = Vec::with_capacity(transpose_target_type.rank());
-                            for (target_axis, output_axis) in transpose_output_axes.iter().copied().enumerate() {
-                                let target_dimension = transpose_target_type.dimension(target_axis);
-                                let output_dimension = contribution_type.dimension(output_axis);
-                                if target_dimension == output_dimension {
-                                    kept_axes.push((target_axis, output_axis));
-                                } else if target_dimension != Dimension::Static(1) {
-                                    return Err(TypeError::invalid(format!(
-                                        "cannot unalign cotangent axis {output_axis} of size {output_dimension} to \
-                                         input axis {target_axis} of size {target_dimension}",
-                                    ))
-                                    .into());
-                                }
-                            }
-                            let reduce_axes = (0..contribution_type.rank())
-                                .filter(|axis| kept_axes.iter().all(|(_, output_axis)| output_axis != axis))
-                                .collect::<Vec<_>>();
-                            if !reduce_axes.is_empty() {
-                                contribution = contribution.reduce(reduce_axes.as_slice(), ReductionKind::Sum);
-                            }
-                            let mut kept_axes_by_output = kept_axes.clone();
-                            kept_axes_by_output.sort_by_key(|(_, output_axis)| *output_axis);
-                            let permutation = kept_axes
-                                .iter()
-                                .map(|kept| kept_axes_by_output.iter().position(|candidate| candidate == kept).unwrap())
-                                .collect::<Vec<_>>();
-                            if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
-                                contribution = contribution.transpose(permutation)?;
-                            }
-                            let contribution = contribution.into_value();
-
-                            // Rebind exact input geometry through ordinary dimension inputs. This prevents a
-                            // metadata-only identity from standing in for runtime geometry at the linear boundary.
-                            let contribution_type = contribution.r#type().into_owned();
+                            let contribution_type = <&ArrayType>::try_from(&contribution_type)?;
                             let mut exact_inputs = Vec::with_capacity(transpose_target_type.rank() + 1);
                             exact_inputs.push(contribution);
                             exact_inputs.extend(input_shape.dimensions(&transpose_context, residuals)?);
-                            let contribution_type = <&ArrayType>::try_from(&contribution_type)?;
-                            if contribution_type.shape() == transpose_target_type.shape() {
+
+                            // Keep runtime geometry on explicit input edges, including when the shape is unchanged.
+                            let mut outputs = if contribution_type.shape() == transpose_target_type.shape() {
                                 transpose_context.bind(
                                     DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
                                         .with_output_sharding(transpose_target_type.sharding().cloned())
                                         .with_output_layout(transpose_target_type.layout().cloned()),
                                     Vec::new(),
                                     exact_inputs.as_slice(),
-                                )
+                                )?
                             } else {
-                                let mut outputs = transpose_context.bind(
+                                transpose_context.bind(
                                     DynamicReshapeOperation::new()
                                         .with_output_sharding(transpose_target_type.sharding().cloned()),
                                     Vec::new(),
                                     exact_inputs.as_slice(),
+                                )?
+                            };
+                            check_count!("output", outputs, 1, ProgramError);
+                            let mut contribution =
+                                <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
+                                    outputs.remove(0),
                                 )?;
-                                check_count!("output", outputs, 1, ProgramError);
 
-                                // Reshaping restores geometry but clears layout. Reapply the input cotangent's
-                                // complete storage metadata at the linear boundary.
-                                if transpose_target_type.layout().is_some() {
-                                    exact_inputs[0] = outputs.remove(0);
-                                    transpose_context.bind(
-                                        DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
-                                            .with_output_sharding(transpose_target_type.sharding().cloned())
-                                            .with_output_layout(transpose_target_type.layout().cloned()),
-                                        Vec::new(),
-                                        exact_inputs.as_slice(),
-                                    )
-                                } else {
-                                    Ok(outputs)
-                                }
+                            // Optional dynamic-operation metadata means inference, so it cannot clear a layout or
+                            // sharding. Once geometry is explicit, pin the complete target type with a broadcast.
+                            if contribution.r#type().as_ref() != &transpose_target_type {
+                                let output_axes = (0..transpose_target_type.rank()).collect::<Vec<_>>();
+                                contribution = contribution.broadcast(transpose_target_type.clone(), &output_axes)?;
                             }
+                            Ok(vec![contribution.into_value()])
                         },
                     )?;
 
@@ -1332,16 +1294,14 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Replicates an array using dimension values to specify its output shape. Input axis `i` maps to output axis
-/// `output_axes[i]`; mapped extents must match or expand an input extent of one. Unmapped output axes replicate the
+/// `output_axes[i]` and mapped extents must match or expand an input extent of one. Unmapped output axes replicate the
 /// entire input. Unlike [`Broadcast`], this capability can replicate into dynamic extents because each output size is
 /// supplied as an input, rather than only described by type metadata. The receiver must be an array value and the
 /// output sizes must be dimension values, even though both use the same [`ArrayIrType`] value language.
 ///
 /// Exact dimension types describe static axes, while non-exact dimension types identify dynamic axes and their bounds.
-/// Both forms bind [`DynamicBroadcastOperation`]; backend lowering chooses a static, bounded, or dynamic representation
+/// Both forms bind [`DynamicBroadcastOperation`]. Backend lowering chooses a static, bounded, or dynamic representation
 /// from the inferred result type. Broadcasting preserves element type and memory space. By default, sharding follows
 /// the input-to-output axis mapping and new axes are replicated; callers may request output sharding explicitly.
 /// Changed geometry clears the physical layout. An identity broadcast with unchanged metadata passes through its input.
@@ -1367,7 +1327,7 @@ where
 /// # }
 /// ```
 ///
-/// Computed or input dimensions remain ordinary SSA inputs:
+/// Computed or input dimensions remain ordinary Single Static Assignment (SSA) inputs:
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -1376,9 +1336,7 @@ where
 /// # };
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-///
-/// let context = C::new();
+/// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
 /// let extent = context.input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
 ///     "extent",
@@ -1403,6 +1361,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///   - `output_axes`: Output axis receiving each input axis, in input-axis order. Its length must equal the input
     ///     rank and its entries must be distinct and less than `output_dimensions.len()`. For a vector, `[1]` maps its
     ///     sole axis to the columns of a matrix; the unmapped row axis repeats that vector.
+    #[inline]
     fn dynamic_broadcast(&self, output_dimensions: &[Self], output_axes: &[usize]) -> Result<Self, ProgramError> {
         self.dynamic_broadcast_with_output_sharding(output_dimensions, output_axes, None)
     }
@@ -1439,6 +1398,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///
     ///   - `output_dimensions`: Dimension values describing the complete desired shape, including unchanged trailing
     ///     axes. Use [`DynamicBroadcast::dynamic_broadcast_to_sizes`] when every desired size is a host integer.
+    #[inline]
     fn dynamic_broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
         self.dynamic_broadcast_to_with_output_sharding(output_dimensions, None)
     }
@@ -1479,6 +1439,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///
     ///   - `leading_dimensions`: Dimension values for the new leading axes, in output-axis order. Both exact and
     ///     dynamic dimensions are accepted. These must be dimension values, not scalar array values.
+    #[inline]
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
         Self: DimensionSize,
@@ -1532,6 +1493,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///   - `output_sizes`: Complete desired shape as nonnegative host sizes, including unchanged trailing axes. For
     ///     example, `[2, 3]` repeats a vector of size three into two rows. Zero-sized axes are allowed when the
     ///     corresponding input extent is zero or one, or when the axis is newly introduced.
+    #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
@@ -1552,6 +1514,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///   - `leading_sizes`: Host sizes of the new axes, in output-axis order. For example, `[2]` repeats the whole
     ///     input twice along a new first axis. Existing axes retain their extents and sharding; new axes are
     ///     replicated.
+    #[inline]
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self: DimensionSize,
@@ -1577,13 +1540,13 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     /// ```rust
     /// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DynamicBroadcast, ProgramError};
     /// let inputs = [
-    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::I32), &[7_i32])?),
-    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1_f32, 2.0])?),
+    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::I32), &[7i32])?),
+    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.0])?),
     /// ];
     /// let outputs = ArrayIrValue::dynamic_broadcast_arrays(&inputs)?;
     /// assert_eq!(
     ///     outputs[0],
-    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[7_i32, 7])?),
+    ///     ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[7i32, 7])?),
     /// );
     /// # Ok::<(), ProgramError>(())
     /// ```
@@ -1663,7 +1626,6 @@ impl<V: Value<Type = ArrayIrType>> DynamicBroadcast for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
-    #[inline]
     fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1679,7 +1641,6 @@ where
         if input_type == &output_type && output_axes.iter().copied().eq(0..input_type.rank()) {
             return Ok(self.clone());
         }
-
         let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
         inputs.push(self.clone());
         inputs.extend_from_slice(output_dimensions);
@@ -1712,21 +1673,25 @@ fn infer_explicit_broadcast_output_type(
                 input_axis, output_axis, output_rank,
             )));
         }
+
         if mapped_output_axes[output_axis] {
             return Err(TypeError::invalid(format!(
                 "broadcasting output axes map two input axes to output axis {output_axis}",
             )));
         }
+
         mapped_output_axes[output_axis] = true;
 
         let input_dimension = input.dimension(input_axis);
         let output_dimension = output_shape.dimensions()[output_axis].clone();
         match (input_dimension, output_dimension) {
-            // Equal axes preserve their extent, including the identity of an equal dynamic extent.
-            (input_dimension, output_dimension) if input_dimension == output_dimension => {}
-            // The explicit output extent input supplies the runtime replication count that the metadata-only
-            // homogeneous operation lacks, so a unit input may expand to either a static or dynamic extent.
-            (Dimension::Static(1), _) => {}
+            (input_dimension, output_dimension) if input_dimension == output_dimension => {
+                // Equal axes preserve their extent, including the identity of an equal dynamic extent.
+            }
+            (Dimension::Static(1), _) => {
+                // The explicit output extent input supplies the runtime replication count that the metadata-only
+                // homogeneous operation lacks, so a unit input may expand to either a static or dynamic extent.
+            }
             (Dimension::Static(input_extent), Dimension::Static(output_extent)) => {
                 return Err(TypeError::invalid(format!(
                     "broadcasting input axis {} has size {}, which is neither {} nor 1",
@@ -1736,7 +1701,7 @@ fn infer_explicit_broadcast_output_type(
             (input_dimension, output_dimension) => {
                 return Err(TypeError::invalid(format!(
                     "broadcasting input axis {input_axis} has size {input_dimension} but the output has size \
-                        {output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
+                     {}output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
                 )));
             }
         }
@@ -1759,9 +1724,11 @@ fn infer_explicit_broadcast_output_type(
         }
         .with_sharding(output_sharding)
         .map_err(|error| TypeError::invalid(error.to_string()))?;
+
     if let Some(layout) = operation.output_layout() {
         output_type = output_type.with_layout(layout.clone());
     }
+
     validate_broadcast_output_layout(&output_type)?;
     Ok(output_type)
 }
@@ -1840,7 +1807,6 @@ mod tests {
         assert_eq!(operation.output_axes(), &[1]);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        // Program rendering uses the canonical operation name and includes the captured metadata.
         let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output =
@@ -1889,6 +1855,7 @@ mod tests {
         );
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
+
         // Type inference validates the axis mapping and returns the target type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_type_inference!(
@@ -1922,6 +1889,7 @@ mod tests {
     fn test_broadcast_interpretation() {
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
+
         // Interpretation replicates the payload along the added axis.
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let output = operation
@@ -1991,6 +1959,7 @@ mod tests {
     fn test_broadcast_partial_evaluation() {
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
+
         // Check standard partial evaluation with known and residual inputs.
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
@@ -2313,9 +2282,9 @@ mod tests {
 
     #[test]
     fn test_broadcast_transposition() {
+        // The pullback sums the output cotangent over every newly replicated output axis.
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
-        // The pullback sums the output cotangent over every newly replicated output axis.
         check_operation_transposition!(
             @exact,
             operation = operation,
@@ -2384,7 +2353,6 @@ mod tests {
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
         let input_cotangent_type = input_type.cotangent().unwrap();
         let output_cotangent_type = output_type.cotangent().unwrap();
-
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let contributions = {
             let mut rule_context = TranspositionContext::new(context.clone());
@@ -2649,9 +2617,9 @@ mod tests {
 
     #[test]
     fn test_broadcast_broadcast_arrays() {
+        // Common shape inference must not promote either payload to the other's element type.
         let integers = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1_i32, 2]).unwrap();
         let floats = Array::from_elements(ArrayType::new_static(DataType::F32, [3]), &[3_f32, 4.0, 5.0]).unwrap();
-        // Common shape inference must not promote either payload to the other's element type.
         assert_eq!(
             Array::broadcast_arrays(&[integers.clone(), floats]),
             Ok(vec![
@@ -2781,8 +2749,8 @@ mod tests {
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
 
-        // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
-        // zero in its holes.
+        // Broadcasting reads a reversed input layout and writes the output's requested physical layout,
+        // retaining zero in its holes.
         let input_type =
             ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
@@ -3725,6 +3693,177 @@ mod tests {
             pullback.interpret(pullback_inputs).unwrap()[0],
             ArrayIrValue::Array(Array::from_elements(concrete_type, &[6f32, 15.]).unwrap(),)
         );
+
+        // An identity broadcast can add layout metadata that must be removed from its input cotangent.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let layout = Layout::Strided(StridedLayout::new(vec![4]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let dimension = builder.add_input(DimensionType::new(size).into());
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![0]).with_output_layout(layout.clone()),
+                Vec::new(),
+                vec![input, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.]).unwrap(),
+                ),
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            ])
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [2]).with_layout(layout);
+        assert_eq!(
+            primal_outputs[0],
+            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[1f32, 2.]).unwrap(),)
+        );
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::from_elements(output_type, &[3f32, 4.]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.interpret(pullback_inputs).unwrap()[0],
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[3f32, 4.]).unwrap(),)
+        );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_differentiation_dynamic_input_sharding() {
+        // Output placement does not become the placement of an originally unsharded input cotangent.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let dimension = builder.add_input(DimensionType::new(size).into());
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![0]).with_output_sharding(sharding.clone()),
+                Vec::new(),
+                vec![input, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.]).unwrap(),
+                ),
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            ])
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding).unwrap();
+        assert_eq!(
+            primal_outputs[0],
+            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[1f32, 2.]).unwrap(),)
+        );
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::from_elements(output_type, &[3f32, 4.]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.interpret(pullback_inputs).unwrap()[0],
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[3f32, 4.]).unwrap(),)
+        );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_differentiation_dynamic_input_permutation() {
+        // The pullback sums the expanded unit axis and restores the input axis order and singleton dimension.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), 1.into()]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let dimension = builder.add_input(DimensionType::new(size).into());
+        let three = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicBroadcastOperation::new(vec![1, 0]),
+                Vec::new(),
+                vec![input, three, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1]), &[1f32, 2.]).unwrap(),
+                ),
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            primal_outputs[0],
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [3, 2]), &[1f32, 2., 1., 2., 1., 2.],)
+                    .unwrap()
+            )
+        );
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let mut pullback_inputs = vec![ArrayIrValue::Array(
+            Array::from_elements(ArrayType::new_static(DataType::F32, [3, 2]), &[1f32, 2., 3., 4., 5., 6.]).unwrap(),
+        )];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.interpret(pullback_inputs).unwrap()[0],
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2, 1]), &[9f32, 12.]).unwrap(),
+            )
+        );
+
+        // Empty dynamic extents preserve the input geometry without introducing any cotangent elements.
+        let empty_input = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 1]), &[]).unwrap(),
+        );
+        let empty_output = ArrayIrValue::Array(
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [3, 0]), &[]).unwrap(),
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![empty_input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap())])
+            .unwrap();
+        assert_eq!(primal_outputs[0], empty_output);
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let mut pullback_inputs = vec![empty_output];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs).unwrap()[0], empty_input);
     }
 
     #[test]

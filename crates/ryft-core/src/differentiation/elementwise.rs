@@ -184,60 +184,7 @@ where
     V: Reduce + ZeroLike,
 {
     fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError> {
-        // The broadcast being transposed mapped each `target` axis to the axis of this cotangent named by the
-        // corresponding `output_axes` entry, so the mapping must name one in-range axis per `target` axis. Anything
-        // else means the caller's axis mapping and the operand type disagree.
-        let value_type = self.r#type();
-        if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
-            return Err(TypeError::invalid(format!(
-                "cannot unalign cotangent type {} to input cotangent type {} using output axes {:?}",
-                value_type, target, output_axes,
-            ))
-            .into());
-        }
-
-        // Classify each `target` axis. An axis whose extent survived the broadcast unchanged is *kept* (i.e., its
-        // cotangent flows straight through), while an axis the broadcast stretched from extent one is dropped here and
-        // summed over below, with its unit extent restored by the later reshaping (i.e., the adjoint of stretching is
-        // summation). Any other extent mismatch means that the mapping never described a valid broadcast.
-        let mut kept_axes = Vec::with_capacity(target.rank());
-        for (target_axis, &output_axis) in output_axes.iter().enumerate() {
-            let target_dimension = target.dimension(target_axis);
-            let value_dimension = value_type.dimension(output_axis);
-            if target_dimension != value_dimension {
-                if target_dimension != Dimension::Static(1) {
-                    return Err(TypeError::invalid(format!(
-                        "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
-                        output_axis, value_dimension, target_axis, target_dimension,
-                    ))
-                    .into());
-                }
-            } else {
-                kept_axes.push((target_axis, output_axis));
-            }
-        }
-
-        // Sum-reduce every non-kept axis of this cotangent: both the axes the broadcast introduced outright (i.e.,
-        // that are never named by a kept `target` axis) and the stretched axes classified above. This is the core
-        // adjoint step, since a broadcast duplicates values along exactly these axes.
-        let reduce_axes = (0..value_type.rank())
-            .filter(|axis| kept_axes.iter().all(|(_, value_axis)| value_axis != axis))
-            .collect::<Vec<_>>();
-        let mut contribution =
-            if reduce_axes.is_empty() { self.clone() } else { self.reduce(reduce_axes.as_slice(), ReductionKind::Sum) };
-
-        // The reduction leaves the kept axes in this cotangent's axis order but an explicit broadcast may have permuted
-        // them relative to `target`, so compute the permutation that restores `target`'s axis order and transpose only
-        // when it is not the identity.
-        let mut kept_axes_by_value = kept_axes.clone();
-        kept_axes_by_value.sort_by_key(|(_, value_axis)| *value_axis);
-        let permutation = kept_axes
-            .iter()
-            .map(|kept| kept_axes_by_value.iter().position(|candidate| candidate == kept).unwrap())
-            .collect::<Vec<_>>();
-        if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
-            contribution = Transpose::transpose(&contribution, permutation)?;
-        }
+        let mut contribution = reduce_broadcast_cotangent(self, target, output_axes)?;
 
         // Reinstate the stretched axes (reduced away entirely above) as unit axes so the shape matches `target`.
         if contribution.r#type().shape() != target.shape() {
@@ -278,6 +225,80 @@ where
 
         Ok(contribution)
     }
+}
+
+/// Reduces broadcast copies and restores surviving axes to input order. Stretched singleton axes remain omitted;
+/// callers restore those axes and exact type metadata using their static or retained runtime geometry. The mapping
+/// must name one distinct output axis per target axis. A mapped dimension must either match its target dimension or
+/// be an expansion of a statically singleton target dimension.
+pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + Transpose>(
+    cotangent: &V,
+    target: &ArrayType,
+    output_axes: &[usize],
+) -> Result<V, DifferentiationError> {
+    // The broadcast being transposed mapped each `target` axis to the axis of this cotangent named by the
+    // corresponding `output_axes` entry, so the mapping must name one in-range axis per `target` axis.
+    // Anything else means the caller's axis mapping and the operand type disagree.
+    let value_type = cotangent.r#type();
+    if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
+        return Err(TypeError::invalid(format!(
+            "cannot unalign cotangent type {} to input cotangent type {} using output axes {:?}",
+            value_type, target, output_axes,
+        ))
+        .into());
+    }
+
+    if output_axes.iter().enumerate().any(|(index, axis)| output_axes[..index].contains(axis)) {
+        return Err(TypeError::invalid("`broadcast` output axes must be distinct").into());
+    }
+
+    // Classify each `target` axis. An axis whose extent survived the broadcast unchanged is _kept_ (i.e., its
+    // cotangent flows straight through), while an axis the broadcast stretched from extent one is dropped here and
+    // summed over below, with its unit extent restored by the later reshaping (i.e., the adjoint of stretching is
+    // summation). Any other extent mismatch means that the mapping never described a valid broadcast.
+    let mut kept_axes = Vec::with_capacity(target.rank());
+    for (target_axis, &output_axis) in output_axes.iter().enumerate() {
+        let target_dimension = target.dimension(target_axis);
+        let value_dimension = value_type.dimension(output_axis);
+        if target_dimension != value_dimension {
+            if target_dimension != Dimension::Static(1) {
+                return Err(TypeError::invalid(format!(
+                    "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
+                    output_axis, value_dimension, target_axis, target_dimension,
+                ))
+                .into());
+            }
+        } else {
+            kept_axes.push((target_axis, output_axis));
+        }
+    }
+
+    // Sum-reduce every non-kept axis of this cotangent: both the axes the broadcast introduced outright (i.e.,
+    // that are never named by a kept `target` axis) and the stretched axes classified above. This is the core
+    // adjoint step, since a broadcast duplicates values along exactly these axes.
+    let reduce_axes = (0..value_type.rank())
+        .filter(|axis| kept_axes.iter().all(|(_, value_axis)| value_axis != axis))
+        .collect::<Vec<_>>();
+    let mut contribution = if reduce_axes.is_empty() {
+        cotangent.clone()
+    } else {
+        cotangent.reduce(reduce_axes.as_slice(), ReductionKind::Sum)
+    };
+
+    // The reduction leaves the kept axes in this cotangent's axis order but an explicit broadcast may have permuted
+    // them relative to `target`, so compute the permutation that restores `target`'s axis order and transpose only
+    // when it is not the identity.
+    let mut kept_axes_by_value = kept_axes.clone();
+    kept_axes_by_value.sort_by_key(|(_, value_axis)| *value_axis);
+    let permutation = kept_axes
+        .iter()
+        .map(|kept| kept_axes_by_value.iter().position(|candidate| candidate == kept).unwrap())
+        .collect::<Vec<_>>();
+    if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
+        contribution = Transpose::transpose(&contribution, permutation)?;
+    }
+
+    Ok(contribution)
 }
 
 /// Represents operands handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
@@ -670,6 +691,51 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message
                     == "cannot unalign cotangent type f64[3, 2, 4] to input cotangent type f64[2] using output axes [3]",
+        ));
+    }
+
+    #[test]
+    fn test_reduce_broadcast_cotangent() {
+        // Introduced and stretched axes are summed away; restoring the stretched unit axis and element type belongs
+        // to the caller, so this result deliberately has a compact shape and the cotangent's original element type.
+        let cotangent = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [3, 2, 4]),
+            &(1..=24).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let target = ArrayType::new_static(DataType::F32, [2, 1]);
+        assert_eq!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[1, 2]),
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2]), &[126_f64, 174.]).unwrap()),
+        );
+
+        // Reducing an introduced middle axis preserves the relative physical order of the others until the inverse
+        // permutation puts them back in the input's axis order.
+        let cotangent = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 3, 4]),
+            &(1..=24).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let target = ArrayType::new_static(DataType::F64, [4, 2]);
+        let contribution = reduce_broadcast_cotangent(&cotangent, &target, &[2, 0]).unwrap();
+        assert_eq!(contribution.r#type().shape(), target.shape());
+        assert_eq!(contribution.elements::<f64>(), Ok(vec![15., 51., 18., 54., 21., 57., 24., 60.]));
+
+        // Summing an empty introduced axis yields zero, including when the target itself is nonempty.
+        let cotangent = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 2]), &[]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [2]);
+        assert_eq!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[1]),
+            Ok(Array::from_elements(target, &[0_f64, 0.]).unwrap()),
+        );
+
+        let cotangent =
+            Array::from_elements(ArrayType::new_static(DataType::F64, [2, 2]), &[1_f64, 2., 3., 4.]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [2, 2]);
+        assert!(matches!(
+            reduce_broadcast_cotangent(&cotangent, &target, &[0, 0]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`broadcast` output axes must be distinct",
         ));
     }
 
