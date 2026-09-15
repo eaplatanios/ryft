@@ -810,8 +810,10 @@ impl XlaKernelExecutionFacts {
         })
     }
 
-    /// Encodes every fact with explicit variant tags, lengths, and exact floating-point bits.
-    pub(crate) fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+    /// Encodes platform, plugin and ordered device capabilities using exact attribute variants and floating-point bits.
+    /// Profiling and tuning records can hash these same bytes to reject incompatible measurements. Logical placement
+    /// and process/device identifiers remain part of the caller's mesh contract, independently of capability identity.
+    pub fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         /// Encodes the finite PJRT attribute family without lossy floating-point formatting.
         fn attributes(values: &BTreeMap<String, ryft_pjrt::Value>) -> serde_json::Value {
             serde_json::Value::Array(
@@ -1143,7 +1145,7 @@ pub(crate) fn select_kernels(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::EffectClass;
     use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
@@ -1245,6 +1247,19 @@ mod tests {
             )
             .with_input_output_alias(0, 0)?)
         }
+    }
+
+    /// Shares an inert compiler identity for persistence tests that execute ordinary PJRT programs.
+    pub(crate) fn binding(options: u32) -> XlaKernelCompilerBinding {
+        XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            options,
+            KernelSchedule::default(),
+            Embedding("ryft.test.aot"),
+            1,
+        )
+        .unwrap()
     }
 
     /// A scalar floating-point identity whose native body stays opaque to derivative construction.

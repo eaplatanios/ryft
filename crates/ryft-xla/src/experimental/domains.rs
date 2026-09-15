@@ -2957,6 +2957,11 @@ impl<'c> XlaCompiledProgram<'c> {
         &self.executable
     }
 
+    /// Returns the canonical ordinary input boundary retained by the compiled executable.
+    pub(crate) fn input_types(&self) -> &[ArrayType] {
+        &self.input_types
+    }
+
     /// Returns the public logical flat output types in user-visible order, including reconstructed zero-space
     /// leaves but excluding the hidden final-state output suffix appended by reference discharge.
     #[inline]
@@ -2968,6 +2973,14 @@ impl<'c> XlaCompiledProgram<'c> {
     #[inline]
     pub(crate) fn requires_stateful_call(&self) -> bool {
         !self.reference_states.is_empty()
+    }
+
+    /// Checks a capture-free, stateless public boundary before an independently loaded executable is exposed.
+    pub(crate) fn matches_stateless_signature(&self, inputs: &[ArrayType], outputs: &[ArrayType]) -> bool {
+        self.capture_count == 0
+            && !self.requires_stateful_call()
+            && self.input_types.as_ref() == inputs
+            && self.output_types() == outputs
     }
 
     /// Returns the mesh the compiled program runs against.
@@ -3086,6 +3099,9 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<PreparedXlaExecution<'c>, XlaDomainError> {
         ensure_effect_dispatch_allowed()?;
         self.validate_xla_program_owner(program)?;
+        if program.kernel_execution_facts.is_some() || program.signature.requires_cuda_kernel_runtime() {
+            crate::kernels::distributed::validate_kernel_participants(self.client()?, &program.mesh)?;
+        }
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
@@ -6634,6 +6650,42 @@ mod tests {
                 vec![Placeholder; 5],
             )
             .unwrap()
+    }
+
+    #[test]
+    fn test_prepare_compiled_execution_kernel_participants() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "device", 1);
+        let domain = XlaDomain::new(&client);
+        let input = f32_vector(&client, &mesh, &[2.0, 5.0]);
+        let mut builder = XlaProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![argument], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&source, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let mut program = domain.compile_xla_program(&lowered).unwrap();
+        // Attach the same validated marker carried by native-kernel executables. The identity program isolates
+        // submission admission from any backend-specific kernel compiler or custom-call handler.
+        program.kernel_execution_facts = Some(
+            crate::kernels::XlaKernelExecutionFacts::from_client(&client, &mesh)
+                .unwrap()
+                .configuration_key()
+                .unwrap(),
+        );
+        let execution = domain.execute_compiled_async(&program, vec![input.clone()]).unwrap();
+        execution.fence().block_until_ready().unwrap();
+        assert_eq!(read_f32s(&client, &execution.output()[0]), vec![2.0, 5.0]);
+        program.mesh = DeviceMesh::new(
+            mesh.logical_mesh().clone(),
+            vec![Device::new(mesh.devices()[0].id(), client.process_index().unwrap() + 1)],
+        )
+        .unwrap();
+        // A topology change cannot reach resharding, donation, or PJRT execution; the retained input stays readable.
+        assert!(matches!(domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
+            Err(XlaDomainError::Kernel(crate::kernels::KernelEmbeddingError::Invalid { message }))
+                if message == "cross-process kernel execution requires a qualified collective ordering and completion contract"));
+        assert_eq!(read_f32s(&client, &input), vec![2.0, 5.0]);
     }
 
     #[test]

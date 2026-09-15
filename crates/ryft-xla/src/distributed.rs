@@ -473,7 +473,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ryft_core::CompilationArtifactExchange;
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, KeyValueStore, load_cpu_plugin};
+    use ryft_pjrt::{
+        ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
+        KeyValueStore, load_cpu_plugin,
+    };
     use sha2::{Digest, Sha256};
 
     use super::{
@@ -491,6 +494,17 @@ mod tests {
     fn loopback_address() -> Option<String> {
         let listener = TcpListener::bind("127.0.0.1:0").ok()?;
         Some(format!("127.0.0.1:{}", listener.local_addr().unwrap().port()))
+    }
+
+    #[test]
+    fn test_initialize_with_options_participant_identity() {
+        let plugin = load_cpu_plugin().unwrap();
+        assert!(matches!(DistributedRuntime::initialize_with_options(
+            &plugin, "unused.invalid:1", 0,
+            DistributedRuntimeServiceOptions { num_nodes: 2, ..Default::default() },
+            DistributedRuntimeClientOptions { node_id: 1, ..Default::default() },
+        ), Err(ryft_pjrt::Error::InvalidArgument { message, .. })
+            if message == "distributed runtime participant coordinates disagree"));
     }
 
     #[test]

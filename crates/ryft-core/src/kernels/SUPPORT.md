@@ -140,6 +140,13 @@ protocol cannot mutate caller-owned inputs. Successful readiness records are imm
 may prevent delivery to one host after another receives its result; readiness is not an atomic all-host transaction.
 Native cross-process meshes, aliased external-state publication and synthesized collectives remain unsupported.
 
+The existing `kernels::gpu::test_aot_on_cuda` and `kernels::cutile::test_aot_on_cuda` experimental fixtures also exercise
+this route when `RYFT_KERNEL_DISTRIBUTED_ADDRESS` is set. Run two separate invocations of the same exact fixture,
+setting `RYFT_KERNEL_DISTRIBUTED_PROCESS` to `0` and `1` respectively and the same reachable coordinator address on
+both. Keep the normal CUDA/compiler environment gates enabled. The fixture routes one input from its peer, checks a
+distinct local round, awaits exact outputs and checks that both original inputs remain unchanged. It prints a required
+`distributed GPU passed` marker for each process; a skipped CUDA prerequisite is not a successful distributed test.
+
 ## Qualification and regression policy
 
 Start each potentially expensive command with `timeout 300`; coordinate Cargo so lock waits do not consume the budget.
@@ -178,6 +185,26 @@ historically calibrated golden thresholds; a same-source comparison demonstrates
 release-complete claim follows from this inventory while fuzz/stress, long-run, hardware or independent-review gates
 remain unqualified. New profiling/AOT/tuning interfaces must retain unavailable fields explicitly and validate their
 semantic, compiler and execution identities before reuse.
+
+## Diagnosing a failed kernel
+
+Start with the earliest failing boundary and retain its original error chain. Interpret the unchanged definition with
+bounded debug options and an independent oracle before investigating target code. A correct interpreter result does
+not establish adapter admission or native correctness.
+
+| Failure | Inspect and resolve |
+|---|---|
+| Macro diagnostic | Use its source span; verify annotations and the documented staged syntax. Forwarded literal metadata is supported, arbitrary host callbacks are not. |
+| Core verification | Inspect the canonical definition, block mappings, boundary policy and reference initialization/write ownership. |
+| Compiler admission | Compare operation, dtype, shape, layout, schedule and explicit target capabilities with the adapter's support matrix. |
+| Native numerical mismatch | Retain semantic identity, inputs and oracle; inspect emitted MLIR/PTX or cuTile artifacts and declared accumulation/rounding choices. |
+| AOT import | Check bundle schema/checksum, expected compiler binding and live execution facts. Recompile retained source explicitly when incompatible. |
+| Distributed deadline | Check identical coordinator/call order, participant availability and byte/round budgets. Await or drop retained completions to drain submitted native work. |
+| Unstable timing comparison | Retain every sample; check fingerprint, warmup, cache policy and contention before recollecting. Do not change budgets to make a run pass. |
+
+Use the seeded stress descriptor and retained binary/tool versions to reproduce compiler failures by seed and iteration
+in a fresh output directory. Run native assertion failures in isolated processes; a CUDA error may poison that context.
+Inspect sanitizer errors separately from the controlled initialization-retention delta described above.
 
 ## Upgrades and migration
 

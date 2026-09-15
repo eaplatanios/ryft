@@ -1671,6 +1671,35 @@ rejection, with no accidental effect duplication.
 
 ### Phase 18: Add profiling, autotuning, persistence, and AOT workflows
 
+**Implementation status (2026-09-15):** kernel-owned profiling/report, tuning, AOT and scoped regression workflows are
+implemented;
+the supported GB10 workflows are qualified as recorded in `.tasks/plan_kernel_phases_18_20.md`.
+`KernelCompilationReport` correlates semantic,
+compiler and source identities with existing typed XLA/PJRT analysis. Its staging/lowering and compile-or-cache
+measurements are host wall times; register, occupancy, spill, TMEM and device-counter values remain unavailable unless
+the existing provider actually reports them. No measured value is inferred from a conservative resource bound.
+
+`KernelTuningRequest` constructs identity without invoking compiler admission. `KernelTuner` serializes an explicit
+finite candidate list, and its runner performs admission/preparation under cooperative time/cancellation checks.
+Submitted executions are always awaited. Completed measurements use a separate checksummed auxiliary-cache namespace;
+failed runs publish no partial measurement. Independent cache instances reserve temporary files with exclusive creation.
+The isolated tuning owner harness passes 16 tests; exact-current cache owner isolation passes 15, including
+independent-instance publication. Both native adapter tuning examples also pass with two candidates, one warmup and two completed samples
+each, including declared host readback and independent numerical validation. These short runs establish the workflow,
+not a statistically stable performance ranking.
+
+`KernelAotBundle` carries the canonical portable source codec and the complete existing XLA executable envelope,
+including backend artifacts, diagnostics and compatibility facts. Import validates bounded sections, checksum, source,
+compiler binding and current execution facts before the existing native deserializer; loaded calls reuse existing
+execution handles and fences. Compilation currently requires a capture-free portable definition with at least one
+ordinary input. Exact extensions lacking the portable source codec are rejected before compilation; ordinary native
+executable persistence remains available separately. Reload never implicitly recompiles or selects a fallback. A
+checksum detects corruption, not an untrusted producer. Both Mosaic and cuTile GPU AOT examples pass fresh-session
+reload and 128 repeated awaited invocations. The isolated AOT owner harness passes ten tests; provenance correlation
+and both native adapter report paths pass. The full current-tree XLA unit suite was rechecked on 2026-09-15:
+753 passed, 5 ignored, zero failures. The final continuation suite passes 765 tests with five ignored, including the
+new distributed failure/cancellation coverage. The earlier batching-trait compilation blocker is resolved.
+
 **Prerequisites:** Phase 13 plus the participating non-TPU backend: Phase 14 for Mosaic GPU or Phase 16 for cuTile.
 Phase 15 metadata is required only when profiling or persisting advanced GPU extensions; TPU work stays in Phase 21.
 
@@ -1678,15 +1707,18 @@ Phase 15 metadata is required only when profiling or persisting advanced GPU ext
 `ryft-xla` owns profiling correlation, tuning integration, and executable persistence; `ryft-pjrt` changes only for
 proven profiling gaps.
 
-- [ ] Attach source-aware kernel metadata to PJRT/XLA profiling and backend compiler reports.
-- [ ] Report compile stages, target IR, register/scratch/TMEM use, occupancy, spills, and launch timing where the
-      backend exposes them.
-- [ ] Define bounded, deterministic schedule-search spaces and an explicit tuning budget.
-- [ ] Store measurements with device/compiler/environment fingerprints; reject stale results.
-- [ ] Make tuning concurrency-safe, cancellable, reproducible, and isolated from the ordinary executable cache.
-- [ ] Export/import complete AOT bundles with semantic IR, backend artifact, metadata, compatibility manifest, and
-      optional fallback policy.
-- [ ] Add golden performance thresholds only after stable baselines and variance controls exist.
+- [x] Attach source-aware kernel metadata to existing XLA custom calls and compilation reports. The provenance
+      owner regression passes; both native adapter report/AOT paths pass. Unsupported hardware counters remain absent.
+- [x] Report host compile stages, selected StableHLO, available typed PJRT memory/code analysis and completed launch
+      samples. Registers, TMEM, occupancy, spills and device timestamps remain absent where the provider lacks them.
+- [x] Define bounded, deterministic schedule-search spaces and an explicit tuning budget.
+- [x] Store measurements with device/compiler/environment fingerprints; reject stale results.
+- [x] Make tuning concurrency-safe, cancellable, reproducible, and isolated from the ordinary executable cache.
+- [x] Implement export/import of complete AOT bundles with semantic IR, backend artifacts, metadata and compatibility
+      manifest through existing persistence. Recompilation/fallback is explicit; both native adapter reload tests pass.
+- [x] Add fingerprinted regression budgets after repeatable baselines and variance controls exist. The initial
+      five-process baseline/candidate comparisons pass with fixed CPU-class affinity and unchanged declared budgets.
+      Budgets are provisional and workload-specific; historical or cross-machine golden performance is not implied.
 
 **Tests/docs:** metadata correlation, cache corruption/version mismatch, concurrent tuning, timeout/cancellation,
 deterministic search, AOT relocation/reload, target incompatibility, and benchmark methodology.
@@ -1701,20 +1733,52 @@ or compatibility checks.
 
 ### Phase 19: Add distributed coordination and asynchronous cross-host transfers
 
+**Implementation status (2026-09-15):** the experimental functional host-staged route is implemented and qualified for
+the documented scope. Evidence and exact limits are recorded in `.tasks/plan_kernel_phases_18_20.md`.
+
+`DistributedKernel` uses the existing `DistributedRuntime` launch identity and ordered coordinator reservations. It
+compares semantic/compiler identity, transport options, routing and the ordered manifest of live participant facts.
+Each participant loads an admitted AOT kernel for one fully addressable local device. PJRT downloads/uploads and
+bounded checksummed KV chunks implement explicit host-staged input routing; source-process rows support local calls,
+rings and broadcasts. Fresh buffers preserve caller-owned inputs even for local sources.
+
+`call_async` performs blocking preflight and host transfers before returning the canonical `ReferenceExecution`.
+Its existing native fence drains submitted work; awaiting then joins participant readiness before exposing functional
+outputs. The coordinator retains and awaits the previous completion before starting another round. Cooperative
+cancellation, deadlines, peer failures and last-handle abandonment propagate through the same completion chain.
+Successful readiness records are immutable. External references and observable I/O are rejected before submission:
+all-ready proves native completion, not atomic delivery to every host after a network fault.
+
+The initial real two-process CPU suite passes pending routing, local rounds, recreated coordinator namespaces,
+pre- and post-submission cancellation, invalid routing, mismatched coordinator order/compiler identity, dropped
+completion and immutable successful readiness after later peer failure. On DGX Spark, both Mosaic and
+cuTile pass two-process native GPU routing followed by a numerically distinct local round, 63-byte partial chunks,
+awaited output checks and unchanged input checks. These are independent processes on one machine; they qualify the
+host transport and GPU completion path, not multi-machine hardware or direct GPU networking.
+
+Native multi-process meshes, synthesized collectives, external-state mutation and direct GPU-to-GPU transfers remain
+unsupported. KV records are bounded per coordinator and retained until runtime shutdown. Participants must be trusted:
+the existing store allocates returned values before this layer validates their lengths. TPU is still Phase 21.
+
 **Prerequisites:** Phases 17-18 plus the relevant Phase 14/15 GPU contract. TPU distributed work stays in Phase 21.
 
 **Owners:** `ryft-core` launch semantics, `ryft-xla` runtime, existing `ryft-pjrt` distributed/transfer APIs.
 
-- [ ] Define process/device launch IDs, collective ordering, cross-host failure propagation, and artifact agreement.
-- [ ] Thread asynchronous kernel completion into existing execution fences and external-reference generation/lease
-      chains without backend side maps.
-- [ ] Add asynchronous input/output transfers and remote buffers with explicit lifetime and cancellation.
-- [ ] For aliased distributed outputs, add coordinator epochs with prepare, commit, and abort records. Publish only
+- [x] Define runtime-owned launch/coordinator/round identities, deterministic call order, peer failure propagation
+      and semantic/compiler agreement with collectively acknowledged live participant facts.
+- [x] Thread pending completion through existing execution fences and `ReferenceExecution`, without backend side
+      maps. Reject external-reference publication before submission for this functional route.
+- [x] Add bounded host-staged remote input routing with existing PJRT transfer ownership, awaited uploads/downloads,
+      pending native completion and cooperative cancellation. Preflight and host staging block; outputs stay private
+      until readiness. Direct GPU networking and transfer/computation overlap are not implied.
+- [x] For aliased distributed outputs, add coordinator epochs with prepare, commit, and abort records. Publish only
       after every participant prepares. Use shadow output buffers until commit; an exclusive donated input may be
       reused only when no retained or external alias exists and uncertain completion poisons it until reconciliation.
       If that protocol is not supported, admit only functionally returned outputs without observable in-place state.
-- [ ] Reject distributed launches on plugins lacking a trustworthy collective fence and ordering contract.
-- [ ] Add topology-aware artifact selection without compiling one process against a different target contract.
+- [x] Reject cross-process or nonaddressable native kernel participants before submission when a trustworthy
+      collective ordering/completion contract is unavailable. Qualify the rejection and local fence path separately.
+- [x] Admit each loaded artifact against its live local topology and require a shared semantic/compiler contract;
+      acknowledge the ordered topology manifest before transferring inputs or dispatching native work.
 
 **Tests/docs:** deterministic multi-process ordering, mismatched launch IDs/artifacts, cancellation, dropped handles,
 partial host failure, collective failure, remote-buffer lifetime, and supported topology matrix.
@@ -1727,33 +1791,85 @@ partial host failure, collective failure, remote-buffer lifetime, and supported 
 plus atomic publication or an explicit no-external-alias restriction; unsupported coordination is rejected before
 submission.
 
-### Phase 20: Stabilize non-TPU APIs, documentation, CI, and production quality
+### Phase 20: Stabilize non-TPU APIs, documentation, and production quality
+
+**Implementation status (2026-09-15):** complete for the documented portable/non-TPU software and GB10 qualification
+scope, including final fingerprinted regression measurements. Evidence remains in
+`.tasks/plan_kernel_phases_18_20.md` and its continuation logs. No CI execution or publication was performed.
+
+The stable portable contract is documented in `crates/ryft-core/src/kernels/SUPPORT.md`: macro-first `Array` authoring,
+canonical definitions/verification, logical grids/mappings, access/boundary policies and documented transform rules.
+Mosaic GPU, CUDA cuTile, raw artifacts, exact GPU extensions and the new XLA integration workflows remain experimental.
+The support matrix, existing runnable examples, troubleshooting, migration and pinned-tool upgrade guides distinguish
+GB10 native execution from Hopper/datacenter compiler-only coverage. No parallel public facade or compatibility bridge
+was added. The local pinned-surface checker requires explicit digest-bound decisions for upstream changes.
+
+The seeded process-isolated compiler driver now executes real vector and staged-matmul compilations through both
+adapters, with independent exact scalar oracles, edge/interior extents and three tile widths. Four malformed source
+variants accompany every iteration. It preserves replay descriptors, IR, inputs, native logs and binary identity before
+execution, enforces per-process/campaign deadlines, and rejects a zero-test process without a native completion marker.
+Three campaigns pass all 128 cases through both adapters, including a final 32-case campaign against a retained
+executable and matching source archive. This is reproducible bounded mutation coverage, not arbitrary
+operation coverage or an unbounded campaign. A forwarded-literal stress case exposed a transparent macro-group parser
+bug; the narrow parser fix and actual partial-tile macro integration regression pass.
+
+Current qualification passes 765 XLA tests (five ignored), 278 core kernel tests, 69 macro unit tests, 55 macro
+integration tests and both public kernel doctests. Spark matrices pass 130 launcher-only, 138 cuTile-runtime,
+155 compiler-enabled CUDA and 136 Mosaic tests. Six final feature graphs retain backend-free core, optional CUDA
+compiler dependencies and adapter ownership. Both backends pass actual two-process native host-staged routing and
+input-preservation tests. All 23 experimental Python tooling tests pass, alongside six pinned-surface checker tests.
+Existing native-family and tuning/AOT qualification remains valid for its recorded source/artifact identities.
+
+AOT racecheck and synccheck report zero errors. Memcheck over 8192 invocations per adapter (16,384 total) retains only
+the same six cuDNN initialization allocations (18,448 bytes) as the ordinary PJRT control; this is a controlled delta,
+not an absolute zero-leak claim. Unavailable Hopper/datacenter hardware remains outside the qualified native matrix.
+
+`kernel_baseline.py` merges independent process reports and rejects mismatched semantic/compiler/execution/methodology
+identity, changed baseline hashes, malformed or undersampled data and unstable samples. The existing native AOT runner
+exports host completion/readback/oracle medians, lowering and compile-or-cache durations, exact bundle/binary sizes,
+raw timings and source/binary provenance. Physical GPU/driver and workload controls are explicit. Separate immutable
+core-only clean/incremental Rust builds measure crate costs; XLA compile time is never relabeled as Rust build time.
+Provisional budgets are declared before collection. A same-source comparison establishes repeatability and a future
+gate, not historical improvement. Both native backend comparisons pass under unchanged budgets after fixing process affinity to one Spark CPU
+class. Initial unrestricted measurements remain recorded as failed; no samples or budgets were silently replaced. The 300-second command deadline is an operational limit, not the performance budget.
+
+Independent reviews of correctness, conventions, lifetime/failure handling and complexity found no remaining production
+issues after correcting unbudgeted adapter admission, cache temporary-file collisions and readiness-record mutation.
 
 **Prerequisites:** Phases 14-19 for the selected non-TPU backends; Phase 19 may remain experimental if it is not
 release-ready.
 
 **Owners:** all touched crates and the `ryft` facade.
 
-- [ ] Require the §3 dependency boundaries and §10 portability gates with both Mosaic GPU and cuTile, including
+- [x] Require the §3 dependency boundaries and §10 portability gates with both Mosaic GPU and cuTile, including
       backend-free core builds, adapter-only compilation tests, and no backend-specific fields in portable definitions.
-- [ ] Publish macro-first authoring docs under `ryft_core::kernels`, including `Array` annotations, staged versus
+- [x] Add macro-first authoring docs under `ryft_core::kernels`, including `Array` annotations, staged versus
       static control flow, supported helpers, shape/boundary validation, and generated diagnostics. Keep explicit
       builder docs available. Publish compiler/extension docs under each adapter and runtime binding docs under
       `ryft_xla::kernels`; show changing the compiler without changing a portable macro-authored kernel body.
-- [ ] Choose the stable portable surface and keep Mosaic GPU, cuTile, raw artifact, and exact target operations
+- [x] Choose the stable portable surface and keep Mosaic GPU, cuTile, raw artifact, and exact target operations
       explicitly experimental until their upstream ABIs stabilize.
-- [ ] Remove mock boundaries, temporary bridges, parallel metadata, deprecated names, and compatibility shims; update
+- [x] Remove production mock boundaries, temporary bridges, parallel metadata, deprecated names and compatibility
+      shims; keep test fixtures scoped to their owner tests and update
       all in-repo users directly.
-- [ ] Publish a support matrix by backend, architecture, dtype, operation, memory space, transform, distribution, and
+- [x] Add a support matrix by backend, architecture, dtype, operation, memory space, transform, distribution, and
       toolchain version for the non-TPU release. Phase 21 adds TPU rows without rewriting existing contracts.
-- [ ] Add end-to-end examples: elementwise, reduction, matmul, attention, masked partial tiles, scratch pipeline,
-      Hopper WGMMA, Blackwell NVFP4 `tcgen05`, cuTile, custom AD, batching, sharding, AOT, and debugging.
-- [ ] Establish upgrade tooling that directly compares pinned Mosaic GPU surfaces and forces an explicit decision for
+- [x] Add end-to-end examples: elementwise, reduction, matmul, attention, masked partial tiles, scratch pipeline,
+      Hopper WGMMA, Blackwell NVFP4 `tcgen05`, cuTile, custom AD, batching, sharding, AOT, and debugging. Native
+      examples are qualified on GB10; WGMMA/TCGEN examples retain explicit compiler-only hardware boundaries.
+- [x] Establish upgrade tooling that directly compares pinned Mosaic GPU surfaces and forces an explicit decision for
       every addition, removal, or semantic change. Phase 21 adds the isolated TPU contract workflow.
-- [ ] Run compiler fuzzing, malformed artifact tests, sanitizers, concurrency stress, long-run leak tests, and hardware
-      qualification.
-- [ ] Set compile-time, binary-size, runtime, numerical, and benchmark regression budgets.
-- [ ] Require independent correctness, convention, security, and complexity audits with zero remaining findings.
+- [x] Run seeded compiler mutation campaigns, malformed artifact tests, sanitizers, concurrency stress and long-run
+      leak tests for the supported GB10 scope. Retain unavailable Hopper/datacenter hardware gates explicitly under
+      the existing hardware qualification exception; no CI execution is required for these local/Spark checks.
+- [x] Set scoped compile-time, binary-size, runtime and numerical regression budgets. The fixed native workload uses
+      five independent process samples per side, maximum relative spread 0.5 for time/0.01 for size, and ratios
+      1.25 for time/1.05 for size. Core-only clean/incremental Rust builds use 240s/15s absolute budgets; ten clean
+      builds plus nine incremental invocations per immutable target pass, with unchanged 0.5 spread/1.25 ratio
+      checks. All raw observations and initial failed comparisons remain retained. These are supported-workload
+      budgets, not a release-wide claim for every workspace crate, kernel or hardware counter.
+- [x] Independently audit the implemented changes for correctness, conventions, security and complexity; resolve
+      all findings. Release-wide verification gaps above remain explicit.
 
 **Tests/docs:** complete named-family matrix in §10, public doctests, examples, release qualification, migration and
 troubleshooting guides, and exact verification record.

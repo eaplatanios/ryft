@@ -11,6 +11,19 @@
 //! [`KernelDefinition::specialize_prefetch`] before XLA staging; transforms never read captured device buffers back
 //! to the host. Local per-shard compilation retains full sharding metadata and requires every manual axis to be bound
 //! by an enclosing shard map with the same axis descriptor. Automatic partitioning and collectives are rejected.
+//!
+//! [`KernelTuningRequest`] defines a finite, fingerprinted schedule search. Call [`KernelTuner::load`] or
+//! [`KernelTuner::run`] explicitly, sharing a tuner per device and controlling external contention. Samples measure
+//! host submission through actual completion; any runner-owned readback must be part of its declared methodology.
+//! Cancellation stops further submissions and awaits work already submitted. Measurements do not imply portable
+//! performance rankings or device-only timing.
+//!
+//! [`KernelAotBundle`] exports checked portable source, [`KernelCompilationReport`], StableHLO, compatibility facts,
+//! and the existing complete executable envelope. Import checks compatibility before native loading and returns a
+//! [`LoadedKernel`] using the ordinary asynchronous execution path. Unsupported source codecs fail explicitly;
+//! recompilation after incompatibility is an explicit caller decision. [`DistributedKernel`] coordinates functional
+//! calls over an existing distributed runtime using explicit host staging and the canonical pending completion.
+//! See [`distributed`] for ordering, cancellation, topology admission and publication semantics.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,17 +40,26 @@ use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod aot;
 mod cuda;
 #[cfg(feature = "cutile")]
 mod cutile;
+pub mod distributed;
 #[cfg(feature = "mosaic-gpu")]
 pub(crate) mod mosaic;
 mod staging;
+mod tuning;
 
 #[cfg(feature = "cutile")]
 pub use cutile::CuTileEmbedding;
 #[cfg(feature = "mosaic-gpu")]
 pub use mosaic::MosaicGpuEmbedding;
+
+pub use aot::{KernelAotBundle, KernelAotError, KernelCompilationReport, LoadedKernel};
+pub use distributed::{DistributedKernel, DistributedKernelError, DistributedKernelOptions};
+pub use tuning::{
+    KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest, KernelTuningResult, KernelTuningRunner,
+};
 
 pub(crate) use staging::select_kernels;
 pub use staging::{
@@ -231,6 +253,19 @@ where
                 format!("{:x}", Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
             )
             .with_attribute("ryft.kernel.configuration", format!("{:x}", configuration_hash.finalize()));
+        let provenance = kernel
+            .definition()
+            .body()
+            .regions()
+            .iter()
+            .flat_map(|region| region.instructions())
+            .filter(|instruction| !instruction.provenance().is_unknown())
+            .map(|instruction| instruction.provenance().to_string())
+            .filter(|origin| !origin.is_empty())
+            .collect::<BTreeSet<_>>();
+        if !provenance.is_empty() {
+            custom_call = custom_call.with_attribute("ryft.kernel.provenance", serde_json::to_string(&provenance)?);
+        }
         let input_types = logical
             .input_types()
             .iter()
@@ -343,7 +378,8 @@ pub(crate) mod tests {
         KernelParameterAccess,
     };
     use ryft_core::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, Placeholder, ProgramBuilder, ReferenceRead, ReferenceWrite,
+        Array, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder, ProgramBuilder, ReferenceRead,
+        ReferenceWrite,
     };
 
     use crate::experimental::lowering::lower_mlir_module_for_program;
@@ -514,6 +550,33 @@ pub(crate) mod tests {
         .unwrap();
         let embedded = CompiledKernel::from_output(&verified, &1u32.to_le_bytes(), &output, &Embedding(b"bc")).unwrap();
         assert_eq!(compiled.custom_call().to_string(), embedded.custom_call().to_string());
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_provenance() {
+        let operation = definition().operation().clone();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            references[0]
+                .context()
+                .invoke_with_provenance_scope(ryft_core::ProvenanceScope::new("copy_output"), || {
+                    references[0].write(&references[0].read()?)
+                })
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let compiled =
+            CompiledKernel::from_output(&verified, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
+                .unwrap();
+        let metadata = compiled.custom_call().to_string();
+        assert!(metadata.contains("ryft.kernel.provenance"));
+        assert!(metadata.contains("copy_output"));
+        assert!(metadata.contains("ryft.kernel.semantic"));
+        let unknown = super::tests::definition();
+        let unknown = VerifiedKernel::new(&unknown, 1).unwrap();
+        let compiled =
+            CompiledKernel::from_output(&unknown, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
+                .unwrap();
+        assert!(!compiled.custom_call().to_string().contains("ryft.kernel.provenance"));
     }
 
     #[test]

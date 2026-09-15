@@ -200,6 +200,37 @@ fn async_copy_case(shape: &[usize]) -> KernelCase {
     }
 }
 
+/// Generates eight fixed compiler cases around warp and tile boundaries. Partial tiles exercise the macro's
+/// generated valid-lane masks; this is bounded compiler qualification, not a sustained fuzz campaign. Integer-valued
+/// inputs keep the independent scalar oracle exact in FP32, including cancellation, negative values, and zeros.
+fn generated_vector_cases() -> Vec<KernelCase> {
+    [
+        (1, "generated_vector_1"),
+        (31, "generated_vector_31"),
+        (32, "generated_vector_32"),
+        (33, "generated_vector_33"),
+        (255, "generated_vector_255"),
+        (256, "generated_vector_256"),
+        (257, "generated_vector_257"),
+        (1003, "generated_vector_1003"),
+    ]
+    .into_iter()
+    .map(|(extent, name)| {
+        let r#type = ArrayType::new_static(DataType::F32, [extent]);
+        let left = (0..extent).map(|index| ((index * 17) % 37) as f32 - 18.0).collect::<Vec<_>>();
+        let right = (0..extent).map(|index| ((index * 13 + 5) % 29) as f32 - 14.0).collect::<Vec<_>>();
+        let expected = left.iter().zip(&right).map(|(left, right)| left + right).collect();
+        KernelCase {
+            name,
+            definition: vector_add::definition(&r#type, &r#type).unwrap(),
+            input_types: vec![r#type.clone(), r#type],
+            inputs: vec![left, right],
+            expected,
+        }
+    })
+    .collect()
+}
+
 /// Constructs deterministic exact-integer floating-point cases so reduction ordering cannot obscure a wrong result.
 fn kernel_cases() -> Vec<KernelCase> {
     let vector_type = ArrayType::new_static(DataType::F32, [1003]);
@@ -299,6 +330,18 @@ fn interpret_case(case: &KernelCase) {
 }
 
 #[test]
+fn test_generated_vector_cases() {
+    let cases = generated_vector_cases();
+    assert_eq!(
+        cases.iter().map(|case| case.expected.len()).collect::<Vec<_>>(),
+        vec![1, 31, 32, 33, 255, 256, 257, 1003],
+    );
+    for case in cases {
+        interpret_case(&case);
+    }
+}
+
+#[test]
 fn test_macro_kernels_interpretation() {
     for case in kernel_cases().into_iter().chain([precision_case(), batched_case()]) {
         interpret_case(&case);
@@ -326,6 +369,203 @@ fn test_attention_interpretation() {
     check_attention(&outputs[0].elements::<f32>().unwrap(), &case.expected);
 }
 
+/// Exports a macro-authored whole-array kernel, reloads it in a fresh session, and awaits its native output.
+#[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+fn execute_aot_case<'c>(
+    plugin: &crate::Plugin,
+    client: &'c crate::Client<'c>,
+    binding: ryft_xla::kernels::XlaKernelCompilerBinding,
+    backend: &str,
+) {
+    use std::io::Read;
+    use std::sync::Arc;
+
+    use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use sha2::{Digest, Sha256};
+
+    use ryft_xla::kernels::{KernelAotBundle, XlaKernelExecutionFacts};
+    use ryft_xla::{FromPjrt, XlaOptions, XlaSession};
+
+    /// Uses the portable source codec's whole-array subset with no hidden captures or runtime references.
+    #[ryft_core::kernels::kernel]
+    fn add(
+        #[input(data_type = F32, rank = 1)] left: &Array,
+        #[input(data_type = F32, rank = 1)] right: &Array,
+        #[output(data_type = F32, shape = [left.shape()[0]])] output: &mut Array,
+    ) {
+        output.store(left.load() + right.load());
+    }
+
+    let r#type = ArrayType::new_static(DataType::F32, [64]);
+    let definition = add::definition(&r#type, &r#type).unwrap();
+    let device = client.addressable_devices().unwrap().remove(0);
+    let mesh = DeviceMesh::new(
+        LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+        vec![Device::from_pjrt(&device).unwrap()],
+    )
+    .unwrap();
+    let producer = Arc::new(XlaSession::new(client));
+    let bundle = KernelAotBundle::compile(
+        &definition,
+        &producer.domain(),
+        XlaOptions::new(mesh.clone()).with_kernel_compiler(binding.clone()),
+        1024,
+    )
+    .unwrap();
+    assert!(bundle.stable_hlo().contains("ryft.kernel.semantic"));
+    assert_eq!(bundle.report()["semantic_digest"].as_str().unwrap().len(), 64);
+    let report = bundle.report().clone();
+    let bytes = bundle.to_bytes().unwrap();
+    drop(bundle);
+    drop(producer);
+    let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
+    let runtime = Arc::new(XlaSession::new(client));
+    let loaded = restored.load(&runtime.domain(), &binding, &mesh).unwrap();
+    let inputs: Vec<_> = [1.0f32, 2.0]
+        .into_iter()
+        .map(|value| runtime.array(r#type.clone(), mesh.clone(), value.to_ne_bytes().repeat(64)).unwrap())
+        .collect();
+    let iterations = std::env::var("RYFT_KERNEL_AOT_ITERATIONS")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(128);
+    assert!((1..=8192).contains(&iterations), "AOT stress iterations must be within `1..=8192`");
+    // One completed warmup drains uploads and first-invocation setup before recorded latency samples.
+    loaded.call(inputs.clone()).unwrap().block_until_ready().unwrap();
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = std::time::Instant::now();
+        let outputs = loaded.call(inputs.clone()).unwrap().block_until_ready().unwrap();
+        let output = outputs[0]
+            .device_shard(device.id().unwrap())
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(output, 3.0f32.to_ne_bytes().repeat(64));
+        samples.push(u64::try_from(start.elapsed().as_nanos()).unwrap());
+    }
+    if let Some(directory) = std::env::var_os("RYFT_KERNEL_PROFILE_DIRECTORY") {
+        let facts = XlaKernelExecutionFacts::from_client(client, &mesh).unwrap();
+        let lowering: std::time::Duration = serde_json::from_value(report["lowering_duration"].clone()).unwrap();
+        let compilation: std::time::Duration = serde_json::from_value(report["compilation_duration"].clone()).unwrap();
+        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let executable_bytes = executable.metadata().unwrap().len();
+        let mut executable_digest = Sha256::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = executable.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            executable_digest.update(&buffer[..count]);
+        }
+        let executable_digest = format!("{:x}", executable_digest.finalize());
+        let source = std::env::var("RYFT_KERNEL_SOURCE_SHA256").unwrap();
+        let environment = std::env::var("RYFT_KERNEL_PROFILE_ENVIRONMENT").unwrap();
+        assert!(!environment.trim().is_empty());
+        assert!(source.len() == 64 && source.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        // Independent process runs contribute one robust latency summary; retain all observations separately.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{backend}-samples.json")),
+            serde_json::to_vec_pretty(&samples).unwrap(),
+        )
+        .unwrap();
+        samples.sort_unstable();
+        let profile = serde_json::json!({
+            "schema": 1,
+            "identity": {
+                "semantic_digest": report["semantic_digest"],
+                "configuration_digest": report["configuration_digest"],
+                "execution_digest": format!("{:x}", Sha256::digest(facts.configuration_key().unwrap())),
+                "environment": format!("{backend}; {environment}; host={}/{}; fixed-f32-add-64; ordinary-cache; iterations={iterations}",
+                    std::env::consts::OS, std::env::consts::ARCH),
+                "methodology": concat!(
+                    "one completed warmup; per-process upper median of host completion/readback/oracle samples; ",
+                    "one lowering and compile-or-cache sample per process",
+                ),
+            },
+            "provenance": [{ "source_sha256": source, "binary_sha256": executable_digest }],
+            "metrics": {
+                "host_completion_readback": { "unit": "ns", "samples": [samples[samples.len() / 2]] },
+                "lowering": { "unit": "ns", "samples": [u64::try_from(lowering.as_nanos()).unwrap()] },
+                "compile_or_cache": { "unit": "ns", "samples": [u64::try_from(compilation.as_nanos()).unwrap()] },
+                "aot_bundle": { "unit": "bytes", "samples": [bytes.len()] },
+                "test_binary": { "unit": "bytes", "samples": [executable_bytes] },
+            },
+        });
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{backend}.json")),
+            serde_json::to_vec_pretty(&profile).unwrap(),
+        )
+        .unwrap();
+    }
+    if let Ok(address) = std::env::var("RYFT_KERNEL_DISTRIBUTED_ADDRESS") {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use ryft_xla::DistributedRuntime;
+
+        use ryft_xla::kernels::{DistributedKernel, DistributedKernelOptions};
+
+        use crate::KeyValueStore;
+
+        let process = std::env::var("RYFT_KERNEL_DISTRIBUTED_PROCESS").unwrap().parse::<usize>().unwrap();
+        assert!(process < 2);
+        let coordination = DistributedRuntime::initialize(plugin, &address, 2, process as u32).unwrap();
+        let options =
+            DistributedKernelOptions::new(1024, Duration::from_secs(30)).unwrap().with_chunk_bytes(63).unwrap();
+        let mut distributed = DistributedKernel::new(&coordination, &loaded, options).unwrap();
+        let inputs = [10.0 + process as f32, 20.0 + process as f32]
+            .into_iter()
+            .map(|value| runtime.array(r#type.clone(), mesh.clone(), value.to_ne_bytes().repeat(64)).unwrap())
+            .collect::<Vec<_>>();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // Cross-process and local routes must differ numerically; partial chunks exercise exact reassembly.
+        for (sources, expected) in
+            [([1 - process, process], 31.0f32), ([process, process], 30.0 + 2.0 * process as f32)]
+        {
+            let pending = distributed.call_async(inputs.clone(), &sources, Arc::clone(&cancelled)).unwrap();
+            let outputs = pending.r#await().unwrap();
+            let actual = outputs[0]
+                .device_shard(device.id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            assert_eq!(actual, expected.to_ne_bytes().repeat(64));
+        }
+        for (input, expected) in inputs.iter().zip([10.0 + process as f32, 20.0 + process as f32]) {
+            let actual = input
+                .device_shard(device.id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            assert_eq!(actual, expected.to_ne_bytes().repeat(64));
+        }
+        coordination.key_value_store().put(format!("gpu-finished-{process}").as_bytes(), b"done").unwrap();
+        assert_eq!(
+            coordination
+                .key_value_store()
+                .get(format!("gpu-finished-{}", 1 - process).as_bytes(), Duration::from_secs(30))
+                .unwrap(),
+            b"done"
+        );
+        eprintln!("distributed GPU passed: backend={backend} process={process} rounds=2");
+    }
+    eprintln!("AOT: {} bytes; fresh-session reload and {iterations} awaited native outputs verified", bytes.len());
+}
+
 #[cfg(feature = "mosaic-gpu")]
 mod gpu {
     use std::env;
@@ -346,6 +586,30 @@ mod gpu {
 
     use super::*;
 
+    #[test]
+    fn test_aot_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_MOSAIC_GPU_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
+                let binding = XlaKernelCompilerBinding::new(
+                    Compiler,
+                    device_target(&client),
+                    Options::default(),
+                    KernelSchedule::default(),
+                    MosaicGpuEmbedding,
+                    1024,
+                )
+                .unwrap();
+                execute_aot_case(&_plugin, &client, binding, "mosaic");
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled Mosaic AOT qualification did not execute a CUDA platform");
+    }
+
     /// Builds an explicit target from the actual CUDA device's reported compute capability.
     fn device_target(client: &crate::Client<'_>) -> Target {
         let device = client.addressable_devices().unwrap().remove(0);
@@ -357,7 +621,7 @@ mod gpu {
     }
 
     /// Compiles and executes the canonical kernel definition through the selected Mosaic adapter and XLA GPU runtime.
-    fn execute_case<'c>(
+    pub(super) fn execute_case<'c>(
         client: &'c crate::Client<'c>,
         case: KernelCase,
         options: Options,
@@ -828,6 +1092,27 @@ mod gpu {
         run_nvfp4(true, true);
     }
 
+    /// Executes the same eight generated definitions used by cuTile, checking every valid output lane.
+    #[test]
+    fn test_generated_vectors_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_MOSAIC_GPU_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
+                for case in generated_vector_cases() {
+                    let expected = case.expected.clone();
+                    let name = case.name;
+                    let actual = execute_case(&client, case, Options::default()).unwrap();
+                    assert_eq!(actual, expected, "{name}");
+                }
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled generated Mosaic qualification did not execute CUDA");
+    }
+
     #[test]
     fn test_vector_add_on_cuda() {
         execute_on_cuda("vector_add");
@@ -979,6 +1264,36 @@ mod cutile {
 
     use super::*;
 
+    #[test]
+    fn test_aot_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                    panic!("missing CUDA compute capability")
+                };
+                let (major, minor) = capability.split_once('.').unwrap();
+                let python = PathBuf::from(env::var_os("RYFT_CUTILE_PYTHON").unwrap());
+                let binding = XlaKernelCompilerBinding::new(
+                    Compiler::new(python),
+                    Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
+                    Options::default(),
+                    KernelSchedule::default(),
+                    CuTileEmbedding,
+                    1024,
+                )
+                .unwrap();
+                execute_aot_case(&_plugin, &client, binding, "cutile");
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled cuTile AOT qualification did not execute a CUDA platform");
+    }
+
     /// Constructs two ordered updates to one read-write root, retaining the declared input/output alias.
     fn alias_case() -> KernelCase {
         let r#type = ArrayType::new_static(DataType::F32, [67]);
@@ -1012,7 +1327,7 @@ mod cutile {
     }
 
     /// Uses the selected adapter, then disables compilation before manifest and executable restoration.
-    fn execute_case<'c>(
+    pub(super) fn execute_case<'c>(
         client: &'c crate::Client<'c>,
         case: KernelCase,
         repeated_input: bool,
@@ -1154,6 +1469,24 @@ mod cutile {
             }
         });
         assert!(executed, "enabled cuTile qualification did not execute a CUDA platform");
+    }
+
+    /// Reuses the generated Mosaic definitions and the existing compile, reload, completion, and oracle checks.
+    #[test]
+    fn test_generated_vectors_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                for case in generated_vector_cases() {
+                    execute_case(&client, case, false).unwrap();
+                }
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled generated cuTile qualification did not execute CUDA");
     }
 
     #[test]
@@ -1349,5 +1682,532 @@ mod cutile {
             }
         });
         assert!(executed, "enabled cuTile assertion qualification did not execute CUDA");
+    }
+}
+
+/// Bounded real-device schedule measurements; host readback and numerical validation are part of each sample.
+#[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+mod tuning {
+    use std::env;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use pretty_assertions::assert_eq;
+    use ryft_core::kernels::{KernelCompiler, KernelSchedule, VerifiedKernel};
+    use ryft_core::{
+        ArrayIrType, ArrayIrValue, CompilationCall, CompilationDomain, CompilationStagingRequest, CompilationTracer,
+        Device, DeviceMesh, ExecutableFunction, LogicalMesh, MeshAxis, MeshAxisType, ReferenceExecution,
+        StatefulCompilationDomain,
+    };
+    use ryft_xla::kernels::{
+        KernelOutputEmbedding, KernelTuner, KernelTuningBudget, KernelTuningError, KernelTuningRequest,
+        KernelTuningRunner, XlaKernelCompilerBinding, XlaKernelExecutionFacts, XlaKernelTarget, stage_kernel,
+    };
+    use ryft_xla::{Array as XlaArray, FromPjrt, XlaDomain, XlaOptions, XlaSession};
+
+    use crate::tests::{TestPlatform, test_for_each_platform};
+
+    use super::*;
+
+    /// One immutable workload with ordinary compiled-function ownership; no alternate execution engine is introduced.
+    struct Runner<'c> {
+        /// Existing XLA execution domain and session owner.
+        domain: XlaDomain<'c>,
+
+        /// Fixed independent oracle and canonical input signature.
+        case: KernelCase,
+
+        /// Exact physical device placement used by compilation and invocation.
+        mesh: DeviceMesh,
+
+        /// Ordinary typed bindings for the finite requested schedule list.
+        bindings: Vec<(KernelSchedule, XlaKernelCompilerBinding)>,
+
+        /// Prepared ordinary executable, replaced only between candidates.
+        executable: Option<ExecutableFunction<XlaDomain<'c>, Vec<ArrayIrType>, Vec<ArrayIrType>>>,
+
+        /// Fixed functional inputs reused across all samples.
+        inputs: Vec<ArrayIrValue<XlaArray<'c>>>,
+    }
+
+    impl<'c> KernelTuningRunner for Runner<'c> {
+        fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            for input in &self.inputs {
+                let ArrayIrValue::Array(input) = input else {
+                    unreachable!();
+                };
+                input.block_until_ready().map_err(error)?;
+            }
+            let binding = self.bindings.iter().find(|(candidate, _)| candidate == schedule).unwrap().1.clone();
+            let staged = self
+                .domain
+                .stage(CompilationStagingRequest::<_, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+                    |_, _, inputs: Vec<CompilationTracer<XlaDomain<'c>>>| {
+                        Ok(stage_kernel(inputs[0].context(), &self.case.definition, &inputs)?)
+                    },
+                    vec![],
+                    self.case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+                    XlaOptions::new(self.mesh.clone()).with_kernel_compiler(binding),
+                ))
+                .map_err(error)?;
+            // The existing lower/compile path performs real adapter admission before artifact lookup.
+            let compiled = self.domain.compile(self.domain.lower(staged).map_err(error)?).map_err(error)?;
+            self.executable = Some(compiled.executable_function().clone());
+            Ok(())
+        }
+
+        fn execute(&mut self) -> ReferenceExecution<(), KernelTuningError> {
+            let result = (|| {
+                let outputs = self
+                    .domain
+                    .call_statefully_async(CompilationCall::new(self.executable.as_ref().unwrap(), self.inputs.clone()))
+                    .r#await()
+                    .map_err(error)?;
+                let ArrayIrValue::Array(output) = &outputs[0] else {
+                    return Err(KernelTuningError::Invalid { message: "expected an ordinary array output".into() });
+                };
+                let bytes = output
+                    .device_shard(self.mesh.devices()[0].id())
+                    .ok_or_else(|| error("missing output device shard"))?
+                    .buffer()
+                    .ok_or_else(|| error("missing output device buffer"))?
+                    .copy_to_host(None)
+                    .map_err(error)?
+                    .r#await()
+                    .map_err(error)?;
+                let actual = bytes
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                if actual != self.case.expected {
+                    return Err(KernelTuningError::Invalid {
+                        message: "native tuning output differs from the independent oracle".into(),
+                    });
+                }
+                Ok(())
+            })();
+            // Every native invocation and readback has really completed before this ready wrapper is returned.
+            ReferenceExecution::ready(result)
+        }
+    }
+
+    /// Preserves concrete integration diagnostics in the tuner-owned error family.
+    fn error(error: impl std::fmt::Display) -> KernelTuningError {
+        KernelTuningError::Compiler { message: error.to_string() }
+    }
+
+    /// Measures two explicit schedule choices through the same real runtime and functional workload.
+    fn measure<'c, Compiler, Embedding>(
+        client: &'c crate::Client<'c>,
+        compiler: Compiler,
+        target: Compiler::Target,
+        options: Compiler::Options,
+        embedding: Embedding,
+        cancellation: &AtomicBool,
+    ) where
+        Compiler: 'static + Clone + Send + Sync + KernelCompiler<Error: 'static + Send + Sync>,
+        Compiler::Target: 'static + Clone + Send + Sync + XlaKernelTarget,
+        Compiler::Options: 'static + Clone + Send + Sync,
+        Embedding: 'static + Clone + Send + Sync + KernelOutputEmbedding<Compiler::Output>,
+    {
+        let case = kernel_cases().into_iter().find(|case| case.name == "vector_add").unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        let facts = XlaKernelExecutionFacts::from_client(client, &mesh).unwrap();
+        let candidates = vec![
+            KernelSchedule::default(),
+            KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(2).unwrap()),
+        ];
+        let environment = format!(
+            concat!(
+                "vector-add-1003-integer-f32-v1; fixed-inputs; exclusive-test-process; host={}/{}; ",
+                "includes-host-readback-and-oracle",
+            ),
+            env::consts::OS,
+            env::consts::ARCH,
+        );
+        let request = KernelTuningRequest::new(
+            &VerifiedKernel::new(&case.definition, 1024).unwrap(),
+            &compiler,
+            &target,
+            &options,
+            &embedding,
+            &facts,
+            environment.as_bytes(),
+            candidates.clone(),
+            KernelTuningBudget::new(2, 1, 2, Duration::from_secs(120)).unwrap(),
+        )
+        .unwrap();
+        let bindings = candidates
+            .into_iter()
+            .map(|schedule| {
+                let binding = XlaKernelCompilerBinding::new(
+                    compiler.clone(),
+                    target.clone(),
+                    options.clone(),
+                    schedule.clone(),
+                    embedding.clone(),
+                    1024,
+                )
+                .unwrap();
+                (schedule, binding)
+            })
+            .collect();
+        let session = Arc::new(XlaSession::new(client));
+        let inputs = case
+            .input_types
+            .iter()
+            .zip(&case.inputs)
+            .map(|(r#type, values)| {
+                ArrayIrValue::Array(
+                    session
+                        .array(
+                            r#type.clone(),
+                            mesh.clone(),
+                            values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let mut runner = Runner { domain: session.domain(), case, mesh, bindings, executable: None, inputs };
+        let result = KernelTuner::new(None).run(&request, &mut runner, cancellation).unwrap();
+        assert_eq!(result.samples().iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
+        assert!(result.best_candidate() < request.candidates().len());
+        eprintln!(
+            "tuning: candidate={} host-completion-readback-samples={:?}",
+            result.best_candidate(),
+            result.samples()
+        );
+    }
+
+    #[cfg(feature = "mosaic-gpu")]
+    #[test]
+    fn test_mosaic_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_MOSAIC_GPU_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                    panic!("missing CUDA compute capability");
+                };
+                let (major, minor) = capability.split_once('.').unwrap();
+                measure(
+                    &client,
+                    ryft_mosaic::kernels::gpu::Compiler,
+                    ryft_mosaic::kernels::gpu::Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
+                    ryft_mosaic::kernels::gpu::Options::default(),
+                    ryft_xla::kernels::MosaicGpuEmbedding,
+                    &AtomicBool::new(false),
+                );
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled Mosaic tuning did not execute CUDA");
+    }
+
+    #[cfg(feature = "cutile")]
+    #[test]
+    fn test_cutile_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                    panic!("missing CUDA compute capability");
+                };
+                let (major, minor) = capability.split_once('.').unwrap();
+                let cancellation = Arc::new(AtomicBool::new(false));
+                let compiler = ryft_cuda::kernels::cutile::Compiler::new(std::path::PathBuf::from(
+                    env::var_os("RYFT_CUTILE_PYTHON").unwrap(),
+                ))
+                .with_cancellation(cancellation.clone());
+                measure(
+                    &client,
+                    compiler,
+                    ryft_cuda::kernels::cutile::Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap(),
+                    ryft_cuda::kernels::cutile::Options::default(),
+                    ryft_xla::kernels::CuTileEmbedding,
+                    &cancellation,
+                );
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled cuTile tuning did not execute CUDA");
+    }
+}
+
+/// Seeded compiler stress driven in isolated processes by `tools/kernel_stress.py`.
+mod stress {
+    #[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+    use std::env;
+    use std::path::Path;
+
+    use pretty_assertions::assert_eq;
+    use serde::Serialize;
+
+    use super::*;
+
+    // Defines another tile width using the existing portable macro and its canonical valid-lane masking.
+    macro_rules! tiled_add {
+        ($name:ident, $width:literal) => {
+            #[ryft_core::kernels::kernel]
+            fn $name(
+                #[input(data_type = F32, rank = 1)] left: &Array,
+                #[input(data_type = F32, rank = 1)] right: &Array,
+                #[output(data_type = F32, shape = [left.shape()[0]], tile = [$width], boundary = masked)]
+                output: &mut Array,
+            ) {
+                let [block] = output.tile_index();
+                let left_tiles = left.tiles([$width]).pad(0.0);
+                let right_tiles = right.tiles([$width]).pad(0.0);
+                output.store(left_tiles.load([block]) + right_tiles.load([block]));
+            }
+        };
+    }
+
+    tiled_add!(add32, 32);
+    tiled_add!(add128, 128);
+
+    /// A codec-supported mutation source, independent of tile-load codec eligibility.
+    #[ryft_core::kernels::kernel]
+    fn codec_add(
+        #[input(data_type = F32, rank = 1)] left: &Array,
+        #[input(data_type = F32, rank = 1)] right: &Array,
+        #[output(data_type = F32, shape = [left.shape()[0]])] output: &mut Array,
+    ) {
+        output.store(left.load() + right.load());
+    }
+
+    /// Reconstructible generator state; no compiler-generated expected values enter the oracle.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    struct StressCase {
+        /// User-selected deterministic campaign seed.
+        seed: u64,
+
+        /// Independently replayable mutation index.
+        iteration: u64,
+
+        /// Vector length or matrix row count.
+        rows: usize,
+
+        /// Matrix output width; zero selects vector addition.
+        columns: usize,
+
+        /// Contraction depth for matrix multiplication.
+        depth: usize,
+
+        /// Vector tile width, selected from the three compiled macro forms.
+        tile: usize,
+    }
+
+    impl StressCase {
+        /// Produces bounded edge-biased shapes and reproducible pseudo-random interior dimensions.
+        fn new(seed: u64, iteration: u64) -> Self {
+            let mut state = seed.wrapping_add(iteration.wrapping_mul(0x9e3779b97f4a7c15));
+            let edges = [1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1003, 2049];
+            let rows = if iteration % 2 == 0 {
+                edges[(next(&mut state) % edges.len() as u64) as usize]
+            } else {
+                (next(&mut state) % 2049) as usize + 1
+            };
+            if iteration % 4 == 3 {
+                Self {
+                    seed,
+                    iteration,
+                    rows: rows.min(35),
+                    columns: (next(&mut state) % 35) as usize + 1,
+                    depth: (next(&mut state) % 65) as usize + 1,
+                    tile: 32,
+                }
+            } else {
+                Self {
+                    seed,
+                    iteration,
+                    rows,
+                    columns: 0,
+                    depth: 0,
+                    tile: [32, 128, 256][(next(&mut state) % 3) as usize],
+                }
+            }
+        }
+
+        /// Builds existing macro definitions and an independent exact-integer scalar oracle.
+        fn kernel(&self) -> KernelCase {
+            let mut state = self.seed ^ self.iteration.rotate_left(17);
+            if self.columns == 0 {
+                let r#type = ArrayType::new_static(DataType::F32, [self.rows]);
+                let left = (0..self.rows).map(|_| (next(&mut state) % 17) as f32 - 8.0).collect::<Vec<_>>();
+                let right = (0..self.rows).map(|_| (next(&mut state) % 17) as f32 - 8.0).collect::<Vec<_>>();
+                let expected = left.iter().zip(&right).map(|(left, right)| left + right).collect();
+                let definition = match self.tile {
+                    32 => add32::definition(&r#type, &r#type),
+                    128 => add128::definition(&r#type, &r#type),
+                    256 => vector_add::definition(&r#type, &r#type),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                KernelCase {
+                    name: "stress_vector",
+                    definition,
+                    input_types: vec![r#type.clone(), r#type],
+                    inputs: vec![left, right],
+                    expected,
+                }
+            } else {
+                let left_type = ArrayType::new_static(DataType::F32, [self.rows, self.depth]);
+                let right_type = ArrayType::new_static(DataType::F32, [self.depth, self.columns]);
+                let left = (0..self.rows * self.depth).map(|_| (next(&mut state) % 5) as f32 - 2.0).collect::<Vec<_>>();
+                let right =
+                    (0..self.depth * self.columns).map(|_| (next(&mut state) % 5) as f32 - 2.0).collect::<Vec<_>>();
+                let mut expected = vec![0.0; self.rows * self.columns];
+                for row in 0..self.rows {
+                    for column in 0..self.columns {
+                        for depth in 0..self.depth {
+                            expected[row * self.columns + column] +=
+                                left[row * self.depth + depth] * right[depth * self.columns + column];
+                        }
+                    }
+                }
+                KernelCase {
+                    name: "stress_matmul",
+                    definition: matmul::definition(&left_type, &right_type).unwrap(),
+                    input_types: vec![left_type, right_type],
+                    inputs: vec![left, right],
+                    expected,
+                }
+            }
+        }
+
+        /// Checks canonical roundtrip plus four rejected mutations, saving every reproducer before decode.
+        fn check_codec(&self, directory: Option<&Path>) {
+            let r#type = ArrayType::new_static(DataType::F32, [self.rows]);
+            let definition = codec_add::definition(&r#type, &r#type).unwrap();
+            let bytes = serde_json::to_vec(&definition).unwrap();
+            assert!(bytes.len() <= 1024 * 1024);
+            let restored: KernelDefinition = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.semantic_key().unwrap(), definition.semantic_key().unwrap());
+            for mutation in 0..4 {
+                let mut wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                match mutation {
+                    0 => wire["version"] = serde_json::json!(999),
+                    1 => wire["body"]["entry"] = serde_json::json!(u64::MAX),
+                    2 => wire["unexpected"] = serde_json::json!(self.seed),
+                    _ => {}
+                }
+                let mut malformed = serde_json::to_vec(&wire).unwrap();
+                if mutation == 3 {
+                    malformed.truncate((self.iteration % (malformed.len() - 1) as u64) as usize + 1);
+                }
+                if let Some(directory) = directory {
+                    std::fs::write(directory.join(format!("malformed-{mutation}.json")), &malformed).unwrap();
+                }
+                let error = serde_json::from_slice::<KernelDefinition>(&malformed).unwrap_err();
+                match mutation {
+                    0 => assert_eq!(error.to_string(), "unsupported kernel source schema version 999"),
+                    1 => {
+                        assert_eq!(error.to_string(), "invalid serialized kernel source: entry region is out of bounds")
+                    }
+                    2 => assert_eq!(error.classify(), serde_json::error::Category::Data),
+                    _ => assert!(matches!(
+                        error.classify(),
+                        serde_json::error::Category::Eof | serde_json::error::Category::Syntax
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Advances a deterministic wrapping generator; no statistical or cryptographic randomness claim is made.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
+
+    #[test]
+    fn test_stress_case_new() {
+        assert_eq!(StressCase::new(7, 13), StressCase::new(7, 13));
+        assert_ne!(StressCase::new(7, 13), StressCase::new(8, 13));
+        for iteration in 0..32 {
+            let case = StressCase::new(7, iteration);
+            assert!((1..=2049).contains(&case.rows));
+            assert!([32, 128, 256].contains(&case.tile));
+            assert!(case.columns <= 35 && case.depth <= 65);
+        }
+    }
+
+    #[test]
+    fn test_stress_case_kernel() {
+        for iteration in 0..8 {
+            interpret_case(&StressCase::new(7, iteration).kernel());
+        }
+    }
+
+    #[test]
+    fn test_stress_case_check_codec() {
+        for iteration in 0..8 {
+            StressCase::new(7, iteration).check_codec(None);
+        }
+    }
+
+    #[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+    #[test]
+    #[ignore = "seeded native compiler stress is launched by tools/kernel_stress.py"]
+    fn test_compiler_case_on_cuda() {
+        let seed = env::var("RYFT_KERNEL_STRESS_SEED").unwrap().parse().unwrap();
+        let iteration = env::var("RYFT_KERNEL_STRESS_ITERATION").unwrap().parse().unwrap();
+        let backend = env::var("RYFT_KERNEL_STRESS_BACKEND").unwrap();
+        assert!(["mosaic", "cutile", "both"].contains(&backend.as_str()));
+        let directory = std::path::PathBuf::from(env::var_os("RYFT_KERNEL_STRESS_CASE_DIRECTORY").unwrap());
+        let descriptor = StressCase::new(seed, iteration);
+        std::fs::write(directory.join("case.json"), serde_json::to_vec_pretty(&descriptor).unwrap()).unwrap();
+        let case = descriptor.kernel();
+        std::fs::write(directory.join("source.txt"), case.definition.body().to_string()).unwrap();
+        std::fs::write(directory.join("semantic.txt"), case.definition.semantic_key().unwrap()).unwrap();
+        descriptor.check_codec(Some(&directory));
+        interpret_case(&case);
+        let mut executed = false;
+        crate::tests::test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, crate::tests::TestPlatform::Cuda13) {
+                if backend == "mosaic" || backend == "both" {
+                    #[cfg(feature = "mosaic-gpu")]
+                    {
+                        let actual = super::gpu::execute_case(
+                            &client,
+                            descriptor.kernel(),
+                            ryft_mosaic::kernels::gpu::Options::default(),
+                        )
+                        .unwrap();
+                        assert_eq!(actual, case.expected);
+                    }
+                    #[cfg(not(feature = "mosaic-gpu"))]
+                    panic!("compiler stress requires the `mosaic-gpu` feature");
+                }
+                if backend == "cutile" || backend == "both" {
+                    #[cfg(feature = "cutile")]
+                    super::cutile::execute_case(&client, descriptor.kernel(), false).unwrap();
+                    #[cfg(not(feature = "cutile"))]
+                    panic!("compiler stress requires the `cutile` feature");
+                }
+                executed = true;
+            }
+        });
+        assert!(executed, "compiler stress must execute the CUDA 13 platform");
+        eprintln!("compiler stress passed: seed={seed} iteration={iteration} backend={backend}");
     }
 }
