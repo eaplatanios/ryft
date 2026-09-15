@@ -92,8 +92,6 @@ impl ConcatenateOperation<ArrayType> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ConcatenateOperation<ArrayIrType> {
     /// Creates a mixed [`ConcatenateOperation`] for the provided complete input signature. `input_types` contains one
     /// or more leading arrays followed by the explicit result-extent dimension. The operation is pure exactly when
@@ -105,10 +103,92 @@ impl ConcatenateOperation<ArrayIrType> {
     ///   - `input_types`: Complete mixed input signature, including the trailing result-extent dimension.
     #[inline]
     pub fn new<A: Into<Axis>>(axis: A, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
-        let (axis, _, requires_runtime_assertion) = infer_array_ir_concatenation(input_types, axis.into())?;
+        let (axis, _, requires_runtime_assertion) = Self::infer_signature(input_types, axis.into())?;
         Ok(Self { axis, requires_runtime_assertion, marker: PhantomData })
     }
+
+    /// Validates a complete mixed input signature and infers everything this operation derives from it, returned as
+    /// a tuple of the normalized concatenation axis, the output [`ArrayType`], and a flag that is `true` exactly when
+    /// the explicit result extent must be asserted at runtime. This function is the single source of truth shared by
+    /// [`Self::new`], which stores the axis and the flag in the payload, and by [`Operation::infer_output_types`],
+    /// which returns the output type and rejects inputs whose flag is set when the payload's flag is not.
+    ///
+    /// `input_types` must contain one or more leading arrays followed by exactly one trailing dimension that holds the
+    /// explicit result extent along `axis`. The arrays must share one data type, one rank, and one memory space, and
+    /// must agree on every dimension other than `axis`. When every input axis extent is static, the result extent must
+    /// equal their sum, and any mismatch is a type error. When at least one input axis extent is dynamic, the equality
+    /// cannot be checked statically and the returned flag reports whether it must be asserted at runtime. The only
+    /// dynamic case that is proven statically is a single input whose axis dimension is the very same dimension as
+    /// the result extent.
+    ///
+    /// The output type has the shape of the first input with `axis` replaced by the result extent, and it carries the
+    /// first input's memory space and the sharding inferred from all inputs. A single input whose shape already equals
+    /// the output shape is returned unchanged so that its sharding and layout metadata survive.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Complete mixed input signature, including the trailing result-extent dimension.
+    ///   - `axis`: Axis along which the leading array inputs are joined, normalized against the rank of the first
+    ///     input.
+    fn infer_signature(input_types: &[ArrayIrType], axis: Axis) -> Result<(usize, ArrayType, bool), TypeError> {
+        let Some((result_extent, inputs)) = input_types.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",
+            )));
+        };
+        if inputs.is_empty() {
+            return match result_extent {
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
+                ))),
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
+                ))),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
+                ))),
+            };
+        }
+        let inputs = inputs.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
+        let result_extent = <&DimensionType>::try_from(result_extent)?;
+        let rank = inputs[0].rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` axis {axis} is out of bounds for inputs of rank {rank}",
+            ))
+        })?;
+        let static_sum = validate_concatenation_inputs(&inputs, axis)?;
+        let result_dimension = result_extent.to_dimension();
+        if let Some(static_sum) = static_sum
+            && result_dimension != Dimension::Static(static_sum)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{}` result extent is {} but the static input extent sum is {}",
+                CONCATENATE_OPERATION_NAME, result_dimension, static_sum,
+            )));
+        }
+
+        let first = inputs[0];
+        let mut dimensions = first.shape().dimensions().to_vec();
+        dimensions[axis] = result_dimension;
+        let output_shape = Shape::new(dimensions);
+        let output_type = if inputs.len() == 1 && first.shape() == &output_shape {
+            first.clone()
+        } else {
+            ArrayType::new(first.data_type(), output_shape)
+                .with_memory(first.memory())
+                .with_sharding(infer_concatenation_sharding(&inputs)?)
+                .map_err(|error| TypeError::invalid(error.to_string()))?
+        };
+
+        // A singleton with the same dimension identity already proves the extent equality, even when it is dynamic.
+        let requires_runtime_assertion =
+            static_sum.is_none() && !(inputs.len() == 1 && first.dimension(axis) == result_extent.to_dimension());
+        Ok((axis, output_type, requires_runtime_assertion))
+    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type> ConcatenateOperation<T> {
     /// Returns the axis along which this [`ConcatenateOperation`] joins its inputs.
@@ -213,8 +293,7 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
-        let (_, output_type, requires_runtime_assertion) =
-            infer_array_ir_concatenation(input_types, Axis::from(self.axis))?;
+        let (_, output_type, requires_runtime_assertion) = Self::infer_signature(input_types, Axis::from(self.axis))?;
         if !self.requires_runtime_assertion && requires_runtime_assertion {
             return Err(TypeError::invalid(format!(
                 "`{}` was constructed for an input signature that proves its result extent, but the provided input \
@@ -1188,71 +1267,6 @@ where
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
-}
-
-/// Infers a mixed concatenation's normalized axis, output type, and runtime-assertion requirement.
-fn infer_array_ir_concatenation(
-    input_types: &[ArrayIrType],
-    axis: Axis,
-) -> Result<(usize, ArrayType, bool), TypeError> {
-    let Some((result_extent, inputs)) = input_types.split_last() else {
-        return Err(TypeError::invalid(format!(
-            "`{}` expects at least one array followed by its result extent",
-            CONCATENATE_OPERATION_NAME,
-        )));
-    };
-    if inputs.is_empty() {
-        return match result_extent {
-            ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
-                "`{}` expects a trailing result-extent dimension",
-                CONCATENATE_OPERATION_NAME,
-            ))),
-            ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
-                "`{}` expects at least one array before its result extent",
-                CONCATENATE_OPERATION_NAME,
-            ))),
-            ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
-                "`{}` expects a trailing result-extent dimension",
-                CONCATENATE_OPERATION_NAME,
-            ))),
-        };
-    }
-    let inputs = inputs.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
-    let result_extent = <&DimensionType>::try_from(result_extent)?;
-    let rank = inputs[0].rank();
-    let axis = axis.normalize(rank).map_err(|_| {
-        TypeError::invalid(format!(
-            "`{}` axis {axis} is out of bounds for inputs of rank {rank}",
-            CONCATENATE_OPERATION_NAME,
-        ))
-    })?;
-    let static_sum = validate_concatenation_inputs(&inputs, axis)?;
-    let result_dimension = result_extent.to_dimension();
-    if let Some(static_sum) = static_sum
-        && result_dimension != Dimension::Static(static_sum)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{}` result extent is {} but the static input extent sum is {static_sum}",
-            CONCATENATE_OPERATION_NAME, result_dimension,
-        )));
-    }
-
-    let first = inputs[0];
-    let mut dimensions = first.shape().dimensions().to_vec();
-    dimensions[axis] = result_dimension;
-    let output_shape = Shape::new(dimensions);
-    let output_type = if inputs.len() == 1 && first.shape() == &output_shape {
-        first.clone()
-    } else {
-        ArrayType::new(first.data_type(), output_shape)
-            .with_memory(first.memory())
-            .with_sharding(infer_concatenation_sharding(&inputs)?)
-            .map_err(|error| TypeError::invalid(error.to_string()))?
-    };
-    // A singleton with the same dimension identity already proves the extent equality, even when it is dynamic.
-    let requires_runtime_assertion =
-        static_sum.is_none() && !(inputs.len() == 1 && first.dimension(axis) == result_extent.to_dimension());
-    Ok((axis, output_type, requires_runtime_assertion))
 }
 
 /// Validates concatenation array inputs and returns their axis sum when every input axis is static. Callers provide at
