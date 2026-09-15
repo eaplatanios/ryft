@@ -27,6 +27,7 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [features]
+cutile = ["dep:ryft-cuda", "ryft-cuda/cutile-compiler", "ryft-xla/cutile-compiler"]
 default = []
 cuda-12 = ["dep:ryft-cuda", "ryft-pjrt/cuda-12", "ryft-xla/cuda-12"]
 cuda-13 = ["dep:ryft-cuda", "ryft-pjrt/cuda-13", "ryft-xla/cuda-13"]

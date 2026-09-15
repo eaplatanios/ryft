@@ -1,7 +1,10 @@
 //! Producer-neutral CUDA cubin/PTX artifact loading and kernel launch support.
 //!
 //! This crate launches producer-independent CUDA artifacts on streams borrowed from external runtimes. It does not
-//! depend on PJRT, XLA, a CUDA toolkit, or compiler-specific schemas for Mosaic, cuTile, and other kernel producers.
+//! depend on PJRT or XLA. Default features require neither a CUDA toolkit nor compiler dependencies. Enable `cutile`
+//! for cuTile artifact validation and `cutile-compiler` for optional ahead-of-time compilation through the pinned
+//! Python tool. Those APIs live in the optional cuTile module under [`kernels`]; the shared launcher remains
+//! producer-independent.
 //!
 //! # Type and Ownership Model
 //!
@@ -82,6 +85,7 @@
 mod artifacts;
 mod drivers;
 mod errors;
+pub mod kernels;
 mod launchers;
 mod launches;
 mod versions;

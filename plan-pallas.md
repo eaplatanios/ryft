@@ -4,7 +4,7 @@ Status (2026-09-14): Phases 6–15 are implemented for the documented experiment
 compiler tests and native DGX Spark qualification. Hopper WGMMA and datacenter Blackwell TMEM/tcgen05 additionally
 pass serialized target-code and assembler checks; their numerical device qualification requires hardware unavailable
 on the Spark. Phase 5 has local Mac/DGX Spark qualification; the remaining platform matrix is deferred with user
-approval. The cuTile and Triton compiler adapters remain assigned to their later phases. This file is the current
+approval. Phases 16 and 17 (cuTile and transforms/composition) are in progress; Triton remains assigned to its later phase. This file is the current
 implementation record; detailed logs and reviews are retained in `.tasks/plan_kernel_phases_5_13.md`,
 `.tasks/plan_kernel_phase_14.md`, and `.tasks/plan_kernel_phase_15.md`.
 
@@ -18,9 +18,10 @@ upstream stability promise.
 
 1. **Ryft owns a backend-neutral Pallas-style kernel language and semantic IR.** Mosaic GPU, Mosaic TPU, cuTile, and
    direct Triton are compiler backends. NVIDIA and AMD GPUs and Google TPUs are hardware targets. These layers must
-   not be conflated. `ryft_core::kernels` owns the portable DSL and semantics. Separate `ryft-mosaic`,
-   `ryft-cutile`, and `ryft-triton` crates own compiler adapters and exact extensions; `ryft-cuda` remains the shared
-   producer-neutral CUDA launcher. `ryft-xla` integrates those adapters with outer XLA programs and PJRT execution.
+   not be conflated. `ryft_core::kernels` owns the portable DSL and semantics. `ryft-mosaic`, optional
+   `ryft_cuda::kernels::cutile`, and `ryft-triton` own compiler adapters and exact extensions. Existing producer-neutral
+   CUDA artifacts and the launcher remain independently usable in `ryft-cuda` without cuTile features. `ryft-xla`
+   integrates those adapters with outer XLA programs and PJRT execution.
 2. **Finish the non-TPU lower layers first.** Phases 0-5 complete and prove the missing GPU/cuTile `ryft-xla-sys`,
    `ryft-mlir`, `ryft-cuda`, and `ryft-pjrt` foundations. No production change in `ryft-core` or `ryft-xla` may begin
    before the Phase 5 gate passes. Every TPU-specific inventory, wrapper, runtime, lowering, test, and qualification
@@ -119,7 +120,7 @@ Rust kernel closure using ryft_core::kernels
     -> core verification, specialization, and portable canonicalization
     -> verified kernel + logical call contract
        -> ryft-mosaic: Mosaic GPU module or Mosaic TPU compiler payload
-       -> ryft-cutile: cuTile compiler input -> versioned AOT CUDA artifact
+       -> ryft_cuda::kernels::cutile: cuTile compiler input -> versioned AOT CUDA artifact
        -> ryft-triton: typed TTIR -> pinned compiler -> NVIDIA or AMD artifact
     -> ryft-xla: adapter selection, StableHLO embedding, outer executable integration
     -> ryft-pjrt: compile/load/execute/fence
@@ -144,7 +145,7 @@ All new crate, module, and contract names in this section are planned APIs, not 
 |---|---|
 | `ryft_core::kernels` | Portable DSL, kernel IR, verification, interpreter, logical signature, extension contract |
 | `ryft_mosaic::kernels` | Mosaic GPU/TPU lowering, exact extensions, target simulation, compiler payloads |
-| `ryft_cutile::kernels` | cuTile lowering/tool invocation, compiler options, subset checks, manifest interpretation |
+| `ryft_cuda::kernels::cutile` | cuTile lowering/tool invocation, compiler options, subset checks, manifest interpretation |
 | `ryft_triton::kernels` | Direct Triton lowering, typed TTIR, compiler invocation, target legality and metadata |
 | `ryft-cuda` | Producer-neutral CUDA artifacts, physical launch ABI, driver loading, module cache, stream launch |
 | `ryft-mlir` / `ryft-xla-sys` | Typed compiler IR, native compiler bridges, source pins and low-level build surfaces |
@@ -156,27 +157,29 @@ The allowed dependency direction is:
 
 ```text
 ryft-xla      -> ryft-core, ryft-mlir, ryft-pjrt, ryft-xla-sys
-              -> optional ryft-mosaic / ryft-cutile / ryft-triton
+              -> optional ryft-mosaic / ryft-cuda cuTile features / ryft-triton
 ryft-mosaic   -> ryft-core, ryft-mlir, required ryft-xla-sys compiler bridges
-ryft-cutile   -> ryft-core, ryft-cuda
 ryft-triton   -> ryft-core, ryft-pjrt's existing Triton compiler extension
               -> ryft-mlir only for required typed TTIR; ryft-cuda for NVIDIA artifacts
 ryft-pjrt     -> ryft-xla-sys, optional ryft-cuda
 ryft-mlir     -> ryft-xla-sys
-ryft-cuda     -> driver-loading and artifact utilities only
+ryft-cuda     -> driver-loading and artifact utilities
+              -> optional ryft-core, serde, serde_json with cutile
+              -> optional tempfile and compiler module with cutile-compiler
 ryft-core     -> existing backend-independent dependencies only
 ```
 
 `ryft-core` must never depend on the adapter crates, `ryft-cuda`, `ryft-pjrt`, `ryft-mlir`, or `ryft-xla-sys`.
-No compiler adapter depends on `ryft-xla`, and neither `ryft-cuda` nor `ryft-pjrt` depends on a compiler adapter.
-In particular, adding PJRT-dependent compilation to `ryft-cuda` would reverse the existing PJRT-to-CUDA edge.
-Keeping cuTile in `ryft-cutile` preserves the lightweight launcher without feature-dependent dependency cycles.
+No compiler adapter depends on `ryft-xla`. Neither `ryft-cuda` nor `ryft-pjrt` gains a dependency on another compiler
+adapter crate. PJRT-dependent compilation in `ryft-cuda` would reverse the existing PJRT-to-CUDA edge. The optional
+cuTile module uses core and serialization/tool utilities only, preserving an acyclic graph. Both `cutile` and
+`cutile-compiler` are disabled by default; existing CUDA APIs and launcher build requirements remain unchanged.
 Backend independence does not require compiler adapters to avoid native XLA libraries: Mosaic may need
 `ryft-xla-sys`, and the selected Triton route deliberately uses the PJRT compiler extension.
 
 Create adapter crates when their implementation phase begins, not as empty scaffolding. Introduce `ryft-mosaic`
-with GPU support in Phase 14, `ryft-cutile` in Phase 16, and `ryft-triton` in Phase 22. Add Mosaic TPU behind an
-explicit feature only in Phase 21. Keep optional compiler dependencies, external tools, and accelerator test features
+with GPU support in Phase 14 and `ryft-triton` in Phase 22; add the optional CUDA cuTile module in Phase 16. Add Mosaic
+TPU behind an explicit feature only in Phase 21. Keep optional compiler dependencies, external tools, and accelerator test features
 out of the core and default launcher builds. Verify isolated and combined feature graphs; Cargo feature unification
 must not activate an unwanted compiler, TPU runtime, or a circular dependency.
 
@@ -607,7 +610,7 @@ uses XLA as the first production execution integration without making it part of
 4. In `ryft-xla`, select an enabled compiler adapter from caller policy and validated compiler/device capabilities.
    Ask the adapter to admit the verified semantic contract before artifact lookup or compiler invocation.
 5. Apply portable schedule decisions and target-specific legalization.
-6. In the selected adapter crate, lower to Mosaic GPU MLIR, Mosaic TPU compiler payload, the supported cuTile subset,
+6. In the selected compiler adapter, lower to Mosaic GPU MLIR, Mosaic TPU compiler payload, the supported cuTile subset,
    or Phase 22's supported direct-Triton subset.
 7. The adapter verifies target IR and invokes its pinned compiler/tool, or produces a validated deferred compiler
    payload when final code generation occurs during outer XLA/PJRT compilation.
@@ -728,8 +731,9 @@ Keep four contracts separate and reference their canonical types instead of copy
 | Outer execution | `ryft-xla` | StableHLO embedding, PJRT integration, executable cache/AOT envelope |
 
 The adapter maps logical parameters to the physical ABI, including pointer/shape/stride expansion, omitted static
-arguments, resource metadata, and entry symbols. `ryft-cuda` remains unaware of cuTile or Triton semantics and validates
-only its producer-neutral artifact/launch contract. No adapter-specific schema is added to `ryft-pjrt` unless an
+arguments, resource metadata, and entry symbols. The generic CUDA artifact/launcher APIs remain unaware of cuTile or Triton
+semantics and validate only their producer-neutral contract. cuTile-specific interpretation stays inside the optional
+`ryft_cuda::kernels::cutile` module. No adapter-specific schema is added to `ryft-pjrt` unless an
 upstream API owns it. `ryft-xla` validates aliases, effects, layouts, required buffers, and execution compatibility
 when embedding the output; the compiler adapter never needs the XLA envelope to represent its own result.
 
@@ -779,7 +783,7 @@ built-in plugin, or dynamic launcher route; alternatives are never summed.
 | 13 | Adapter contract and XLA integration | 1,500-2,400 | 1,200-1,900 | 350-550 |
 | 14 | `ryft-mosaic` GPU baseline | 1,800-2,900 | 1,500-2,400 | 400-700 |
 | 15 | Hopper/Blackwell Mosaic GPU | 2,300-3,800 | 2,000-3,300 | 500-850 |
-| 16 | `ryft-cutile` adapter and portability gate | 1,800-3,000 | 1,500-2,500 | 450-750 |
+| 16 | CUDA cuTile adapter and portability gate | 1,800-3,000 | 1,500-2,500 | 450-750 |
 | 17 | Transforms and composition | 1,400-2,300 | 1,600-2,600 | 400-650 |
 | 18 | Profiling, autotuning, persistence, AOT | 1,500-2,500 | 1,400-2,300 | 400-650 |
 | 19 | Distributed and asynchronous kernels | 1,200-2,000 | 1,200-2,100 | 350-600 |
@@ -1558,35 +1562,58 @@ ordering and numerics, and fail exactly elsewhere.
 
 ### Phase 16: Implement the optional Ryft-to-cuTile compiler backend
 
+**Implementation status (2026-09-14):** implemented and locally qualified on DGX Spark; details and evidence are tracked in
+`.tasks/plan_kernel_phases_16_17.md`. `ryft_cuda::kernels::cutile` owns deterministic lowering and an optional, bounded
+official AOT compiler worker; its runtime-only artifact decoder has no XLA/PJRT/MLIR or Python dependency. The
+adapter-authored manifest validates the full logical signature and semantic identity, pointer/I32 shape/stride ABI,
+tool versions, launch geometry, and cubin hash/target. XLA uses the existing CUDA launcher, including ordered assertion
+tokens.
+
+DGX Spark (`sm_121`) passes partial vector tiles, scalar reduction, partial matmul, exact FP32 precision, independent
+batches, aliases, repeated inputs, local manual shard execution, and serialized reload with compilation disabled.
+An isolated negative test proves native bounds assertions propagate through awaited execution. Five unchanged portable
+definitions have identical semantic digests across Mosaic and cuTile. Other accepted targets are not device-qualified.
+Final owner suites pass 25 cuTile, 3,306 core, 738 XLA, and 136 Mosaic tests. Macro integration passes 54 tests
+and macro units pass 68. Runtime-only and combined feature builds, rustdoc, and scoped formatting checks pass.
+The final native suite passes 23 selected tests (three ignored), plus the isolated assertion-failure test.
+The subsequent ownership consolidation into CUDA passes 130 default-runtime, 138 cuTile-runtime, and 155
+compiler-enabled CUDA tests, 738 XLA tests, and eight native cuTile cases; the default CUDA dependency graph stays
+unchanged. This move is tracked in `.tasks/plan_cutile_into_cuda.md`.
+The supported subset and exact exclusions are documented in the cuTile section of `crates/ryft-cuda/README.md`;
+block-scaled/FP4 operations remain rejected because the pinned tool's packing and scale contracts do not preserve the
+canonical operations.
+
 **Prerequisites:** Phases 4-5, Phase 12, Phase 13, and a still-supported Phase 0 seam to start implementation.
 Phase 14 must also pass before the two-compiler portability tests and this phase's exit gate can complete; cuTile
 lowering may otherwise proceed in parallel with the Mosaic GPU baseline.
 
-**Owners:** new `ryft_cutile::kernels` compiler adapter/tool driver; `ryft-cuda` shared artifact/launch runtime;
+**Owners:** optional `ryft_cuda::kernels::cutile` compiler adapter/tool driver; existing CUDA artifact/launcher APIs;
 `ryft-pjrt` stream/FFI adaptation; `ryft_xla::kernels` embedding and selection.
 
-- [ ] Create `ryft-cutile` with core and CUDA artifact dependencies, independent of `ryft-xla` and `ryft-pjrt`.
+- [x] Place the adapter in `ryft_cuda::kernels::cutile`, independent of `ryft-xla` and `ryft-pjrt`.
+      Gate manifest/types behind `cutile` (optional core/serde/serde_json), and compiler/tool support behind
+      `cutile-compiler` (also tempfile); preserve the default feature graph and existing CUDA APIs.
       Keep the compiler tool optional and absent from the launcher/runtime-only dependency path.
-- [ ] Define the exact portable subset compatible with cuTile's block-level tile model, immutable local objects,
+- [x] Define the exact portable subset compatible with cuTile's block-level tile model, immutable local objects,
       global arrays, control flow, atomics, and no explicit intra-block synchronization.
-- [ ] Translate verified kernel IR to deterministic cuTile source or an official compiler input; never translate
+- [x] Translate verified kernel IR to deterministic cuTile source or an official compiler input; never translate
       arbitrary target-specific Mosaic operations.
-- [ ] Compile in an isolated, cancellable, time-limited build-time process and export a `cutile_python_v2` cubin and
+- [x] Compile in an isolated, cancellable, time-limited build-time process and export a `cutile_python_v2` cubin and
       manifest for the exact target GPU.
-- [ ] Interpret the cuTile-owned manifest in `ryft-cutile` and produce the canonical `ryft-cuda` artifact plus a
-      validated logical-to-physical mapping: pointer/shape/stride expansion, static-shape constraints, constants,
-      tuples, entry symbols, alignment, no-alias requirements, grid, and compiler hints. `ryft-xla` consumes this
+- [x] Interpret the adapter-authored cuTile manifest in `ryft_cuda::kernels::cutile` and produce the canonical CUDA
+      artifact plus a validated logical-to-physical mapping: pointer/shape/stride expansion, static-shape constraints,
+      constants, tuples, entry symbols, alignment, no-alias requirements, grid, and compiler hints. `ryft-xla` consumes this
       output through the Phase 13 embedding contract; the adapter never imports the XLA persistence envelope.
-- [ ] Execute through the one Phase 4 stream/custom-call launcher, retain compiler logs, and keep the runtime
+- [x] Execute through the one Phase 4 stream/custom-call launcher, retain compiler logs, and keep the runtime
       Python-free.
-- [ ] Include cuTile/compiler/CUDA versions and target GPU in adapter compatibility metadata and cache/AOT identity.
-- [ ] Compile the unchanged Phase 10 portable definitions through both Mosaic GPU and cuTile. Compare core semantic
+- [x] Include cuTile/compiler/CUDA versions and target GPU in adapter compatibility metadata and cache/AOT identity.
+- [x] Compile the unchanged Phase 10 portable definitions through both Mosaic GPU and cuTile. Compare core semantic
       identity, oracle/interpreter results, outputs, aliases, and effects; keep backend options outside the body.
       Include the §3.4 macro-authored matmul, elementwise, masked boundary-tile, reduction, and supported dot cases
       plus an exact Mosaic rejection. Compare explicit-builder and macro definitions before adapter lowering.
-- [ ] Validate the minimal adapter contract against both real lowerers. Remove provisional duplication, check isolated
+- [x] Validate the minimal adapter contract against both real lowerers. Remove provisional duplication, check isolated
       and combined Cargo feature graphs, and document unsupported subsets before transform/release qualification.
-- [ ] Support portable FP4/block-scaled operations only when the selected cuTile version documents them; exact Mosaic
+- [x] Support portable FP4/block-scaled operations only when the selected cuTile version documents them; exact Mosaic
       operations remain rejected.
 
 **Tests/docs:** generated-source snapshots, AOT manifest/calling convention, tool failure and timeout, compiler sandbox,
@@ -1604,19 +1631,32 @@ also compile through Mosaic GPU without body changes, and the two adapters have 
 
 ### Phase 17: Add transforms, composition, and sharding
 
+**Implementation status (2026-09-14):** implemented and locally qualified on DGX Spark; details and evidence are tracked in
+`.tasks/plan_kernel_phases_16_17.md`. Canonical batching rewrites grids and disjoint block mappings and validates writes.
+Partial evaluation specializes concrete scalar prefetch while residualizing the whole effectful call. XLA staging uses
+existing custom JVP/VJP carriers and a validated pure fallback; numerical derivative tests pass. Control flow,
+rematerialization, external references, graph memory transfers, and manual shard-map composition have explicit tests.
+Local shard types retain their complete metadata, and selection checks enclosing manual axes by full descriptor.
+
+Mapped outer `shard_map` batching, automatic partitioning, collectives, implicit mutable-body AD, and unproven target
+extension transforms reject explicitly. XLA captured scalar prefetch must be specialized on the host before staging;
+transforms never read device buffers back. Necessary existing-module changes generalize condition/scan capture bounds,
+enable the canonical XLA batching derive, and complete JIT/replicated-shard-map batching through the existing driver.
+No separate transform dispatcher, derivative family, or kernel runtime was introduced.
+
 **Prerequisites:** Phase 13 plus the selected non-TPU backend: Phase 14 for Mosaic GPU or Phase 16 for cuTile. Phase 15
 is required only for transforms over advanced GPU target extensions. TPU transform work remains in Phase 21.
 
 **Owners:** `ryft-core` transform rules; compiler adapters own post-transform target legality; `ryft-xla` owns
 outer-program composition and execution integration.
 
-- [ ] Implement batching as a grid/block-mapping transform with write-conflict validation.
-- [ ] Add explicit custom JVP/VJP rules and pure fallback differentiation; keep implicit mutable-body AD rejected.
-- [ ] Specialize static arguments and block mappings through partial evaluation without executing effects.
-- [ ] Preserve kernel calls as indivisible effectful operations under rematerialization unless an explicit pure rule is
+- [x] Implement batching as a grid/block-mapping transform with write-conflict validation.
+- [x] Add explicit custom JVP/VJP rules and pure fallback differentiation; keep implicit mutable-body AD rejected.
+- [x] Specialize static arguments and block mappings through partial evaluation without executing effects.
+- [x] Preserve kernel calls as indivisible effectful operations under rematerialization unless an explicit pure rule is
       provided.
-- [ ] Compose kernel calls with condition/while/scan/call, external references, shard maps, and device-memory transfers.
-- [ ] Add sharding rules for local per-shard launches and reject unsupported automatic partitioning, collectives, and
+- [x] Compose kernel calls with condition/while/scan/call, external references, shard maps, and device-memory transfers.
+- [x] Add sharding rules for local per-shard launches and reject unsupported automatic partitioning, collectives, and
       overlapping writes.
 
 **Tests/docs:** batched grid equivalence, conflict negatives, custom AD versus pure oracle, remat non-duplication,
@@ -1911,11 +1951,13 @@ independent correctness, conventions, security, and simplicity audits reporting 
 - No dependency on `ryft-xla`, outer-program buffer allocation, custom-call site construction, or PJRT fence wrapper.
   Backend-specific payload encoding belongs here; XLA call-site construction belongs to the integration.
 
-### `ryft-cutile` (new in Phase 16)
+### `ryft_cuda::kernels::cutile` (optional CUDA module added in Phase 16)
 
 - Portable-subset checks, deterministic compiler input, optional isolated tool invocation, cuTile manifest decoding,
   typed compiler options, target/version validation, source diagnostics, and logical-to-physical argument mapping.
-- Reuse `ryft-cuda` artifacts and launcher; keep producer-specific knowledge out of CUDA and PJRT wrappers.
+- Reuse existing CUDA artifacts and the launcher; keep producer-specific knowledge inside this optional module
+  and out of generic CUDA APIs and PJRT wrappers. Enable manifest/types with `cutile` and compiler tools with
+  `cutile-compiler`; both features are disabled by default.
 - No `ryft-xla`/`ryft-pjrt` dependency, second kernel IR, second CUDA launcher, or deployment-time Python requirement.
 
 ### `ryft-triton` (new in Phase 22)
@@ -2090,8 +2132,8 @@ Mosaic GPU in `ryft-mosaic`. Prove adapter compilation without `ryft-xla` and ex
 
 ### Milestone D: latest hardware and optional backend breadth
 
-Phases 15-16: Hopper/Blackwell in `ryft-mosaic` and cuTile in `ryft-cutile`, sharing the established CUDA launcher
-where the artifact route applies. Pass the unchanged portable-definition gate across both compiler adapters.
+Phases 15-16: Hopper/Blackwell in `ryft-mosaic` and cuTile in `ryft_cuda::kernels::cutile`, sharing the established
+CUDA launcher where the artifact route applies. Pass the unchanged portable-definition gate across both compiler adapters.
 
 ### Milestone E: composition and production operations
 
@@ -2135,11 +2177,10 @@ Expected production ownership:
 |---|---:|---|
 | `ryft-xla-sys` | 4% | missing registration/serde/runtime bridges and builds |
 | `ryft-mlir` | 25% | typed compiler dialects, Mosaic parity, verification, and pipelines |
-| `ryft-cuda` | 3% | producer-neutral CUDA artifact and launch runtime |
+| `ryft-cuda` | 8% | producer-neutral artifact/launch runtime and optional cuTile compiler/manifest module |
 | `ryft-pjrt` | 5% | demonstrated generic gaps, adapters, Triton extension, selected ROCm execution path |
 | `ryft-core` / `ryft-macros` | 22% | macro DSL/tracing, IR, verifier, interpreter, transforms, adapter contracts |
 | `ryft-mosaic` | 20% | GPU/TPU compiler adapters, exact extensions, simulation, target policy |
-| `ryft-cutile` | 5% | cuTile compiler adapter, tool isolation, manifests and physical mapping |
 | `ryft-triton` | 6% | direct Triton compiler adapter, target policy and artifact mapping |
 | `ryft-xla` | 8% | selection, embedding, existing cache integration, execution, tuning |
 | facade/examples/tooling | 2% | stable exports, examples, manifests, qualification tools |
@@ -2210,7 +2251,7 @@ lookup or compilation.
 **Risk:** a large trait hierarchy encodes guesses and makes target-specific work harder.
 
 **Mitigation:** specify the small compiler capability from core semantics and native probes, then validate it with
-real `ryft-mosaic` and `ryft-cutile` lowerers before stabilization. Keep adapter options/outputs concrete through
+real Mosaic and CUDA cuTile lowerers before stabilization. Keep adapter options/outputs concrete through
 associated types and CUDA/ROCm launchers separate. Reuse existing compilation-domain/cache/fence contracts. TPU may
 return deferred compiler input; do not force every compiler through an eagerly compiled GPU binary contract.
 
@@ -2379,8 +2420,8 @@ begins, and revalidate the direct Triton and ROCm sources only when Phase 22 beg
 - [x] Added optional post-v1 Phase 22 for direct Triton and ROCm support, explicitly excluding deprecated JAX Pallas
       compatibility, selecting one ROCm execution route, and reconciling dependencies, estimates, CI, risks, review
       gates, completion criteria, and references.
-- [x] Revised the architecture around `ryft_core::kernels`, separate `ryft-mosaic`/`ryft-cutile`/`ryft-triton`
-      compiler adapters, the retained `ryft-cuda` launcher, and narrower `ryft-xla` execution integration. Specified
+- [x] Revised the architecture around `ryft_core::kernels`, `ryft-mosaic`/optional CUDA cuTile/`ryft-triton`
+      compiler adapters, the retained generic CUDA launcher, and narrower `ryft-xla` execution integration. Specified
       acyclic dependencies, portable/extension contracts, ready/deferred compiler outputs, ABI/AOT ownership, and
       core-only/adapter-only/same-definition qualification. Updated future phase owners, milestones, risk reviews,
       and estimate allocations without marking new implementation complete or changing completed lower-layer evidence.

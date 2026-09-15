@@ -1,7 +1,7 @@
 //! XLA staging carriers for portable and enabled adapter kernels with ordinary attached computation regions.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
@@ -11,10 +11,12 @@ use ryft_core::kernels::{
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayReferenceView, Atom, AtomId, ConstantOperation, Context,
-    CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction,
-    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance, PartialValue,
+    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceView, Atom,
+    AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
+    Context, CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, Effects, InputRegionProvenance,
+    Instruction, InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceViewOperation, ReferenceViewValidationError, Region, RegionInterface, RegionSlot, Tracer, TracingContext,
@@ -23,7 +25,7 @@ use ryft_core::{
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
-use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding};
+use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, validate_kernel_sharding};
 
 /// Adapter operation families enabled in this XLA integration.
 ///
@@ -372,7 +374,65 @@ impl<C: Domain> InterpretableOperation<C> for XlaKernelOperation {
     }
 }
 
-impl<C: Context> PartiallyEvaluatableOperation<C> for XlaKernelOperation where Self: Into<C::Operation> {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for XlaKernelOperation
+where
+    Self: Into<C::Operation>,
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let regions = driver.regions().map(|region| region.to_program()).collect();
+        if let KernelOperation::Call(call) = &self.0 {
+            let prefetch_count = call.prefetch_types().len();
+            if prefetch_count != 0 && inputs[inputs.len() - prefetch_count..].iter().all(|input| input.is_known()) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message:
+                        "XLA scalar-prefetched kernel inputs must be specialized on the host before partial evaluation"
+                            .to_owned(),
+                });
+            }
+            context.residualize(self.clone(), regions, inputs)
+        } else {
+            context.fold_or_residualize(self.clone(), regions, inputs)
+        }
+    }
+}
+
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for XlaKernelOperation
+where
+    C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        let KernelOperation::Call(call) = &self.0 else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("kernel operation `{}` must be batched through its complete kernel call", self.name()),
+            });
+        };
+        let definition = definition_from_body(call, driver.region(0)?)?;
+        let (definition, axes) = definition
+            .batched_inputs(inputs, ryft_core::kernels::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS)
+            .map_err(ProgramError::custom)?;
+        let values = stage_kernel(
+            context.parent(),
+            &definition,
+            &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+        )?;
+        values
+            .into_iter()
+            .zip(axes)
+            .map(|(value, axis)| ArrayIrBatch::new(value, axis.map(|axis| axis as isize)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Into::into)
+    }
+}
 
 impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for XlaKernelOperation {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -468,7 +528,9 @@ fn stage_body<Extension: KernelExtension + Into<XlaKernelExtension>>(
 ///
 /// Portable instructions and enabled typed extensions remain visible to ordinary region, effect, and reference
 /// traversal. Compiler selection belongs to the enclosing XLA domain's immutable compilation options. Staging itself
-/// neither invokes an adapter nor acquires native runtime resources.
+/// neither invokes an adapter nor acquires native runtime resources. Bind concrete scalar-prefetch values with
+/// [`KernelDefinition::specialize_prefetch`] before staging when they are intended as compile-time parameters. XLA
+/// capture references cannot be materialized as host scalars by partial evaluation without an explicit transfer.
 pub fn stage_kernel<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
@@ -484,6 +546,128 @@ where
         ))),
         vec![stage_body(definition)?],
         inputs,
+    )
+}
+
+/// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
+/// active tangents and returns primal results followed by their tangents, as checked by
+/// [`ryft_core::CustomJvpOperation`]. The supplied rule owns derivative semantics; the mutable kernel body is never
+/// implicitly differentiated.
+pub fn stage_kernel_with_jvp<C, Extension>(
+    context: &C,
+    definition: &KernelDefinition<Extension>,
+    jvp: &FlatXlaProgram,
+    inputs: &[C::Value],
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+    Extension: KernelExtension + Into<XlaKernelExtension>,
+{
+    context.bind(
+        ryft_core::CustomJvpOperation::<ArrayIrType>::new(),
+        vec![kernel_primal(definition)?, jvp.clone()],
+        inputs,
+    )
+}
+
+/// Stages a native kernel primal with explicit canonical forward and backward VJP regions. The forward region returns
+/// primal outputs and residuals; the backward region receives residuals and output cotangents and returns input
+/// cotangents. [`ryft_core::CustomVjpOperation`] validates these boundaries and retains its reverse-mode-only contract.
+/// A forward rule may itself stage a kernel when its primal must execute natively during differentiation.
+pub fn stage_kernel_with_vjp<C, Extension>(
+    context: &C,
+    definition: &KernelDefinition<Extension>,
+    forward: &FlatXlaProgram,
+    backward: &FlatXlaProgram,
+    inputs: &[C::Value],
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+    Extension: KernelExtension + Into<XlaKernelExtension>,
+{
+    context.bind(
+        ryft_core::CustomVjpOperation::<ArrayIrType>::new(),
+        vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
+        inputs,
+    )
+}
+
+/// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the
+/// native kernel primal. This is an AD contract, not compiler-error recovery: the caller guarantees equivalence for
+/// every admitted input. Complete input/output types must agree. The fallback cannot contain references or effects,
+/// and the native body cannot declare observable effects beyond its confined local reference state.
+/// Existing canonical JVP construction derives the fallback rule, so reverse mode uses the same primitive transpose
+/// machinery and rematerialization can recompute only the explicitly selected pure derivative computation.
+pub fn stage_kernel_with_fallback<C, Extension>(
+    context: &C,
+    definition: &KernelDefinition<Extension>,
+    fallback: &FlatXlaProgram,
+    inputs: &[C::Value],
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+    Extension: KernelExtension + Into<XlaKernelExtension>,
+{
+    if fallback.input_types() != definition.operation().input_types()
+        || fallback.output_types() != definition.operation().output_types()
+    {
+        return Err(ProgramError::Type(TypeError::invalid(
+            "pure kernel fallback must preserve the complete signature",
+        )));
+    }
+    if definition
+        .body()
+        .effects()
+        .classes()
+        .into_iter()
+        .any(|effect| effect != ryft_core::EffectClass::OrderedState)
+    {
+        return Err(ProgramError::UnsupportedOperation {
+            message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
+        });
+    }
+    if !fallback.effects().classes().is_empty()
+        || fallback
+            .regions()
+            .iter()
+            .flat_map(|region| region.atoms())
+            .any(|atom| matches!(atom.r#type().as_ref(), ArrayIrType::Reference(_)))
+    {
+        return Err(ProgramError::UnsupportedOperation {
+            message: "pure kernel fallback cannot contain references or observable effects".to_owned(),
+        });
+    }
+    let jvp = fallback.jvp().map_err(ProgramError::from)?;
+    stage_kernel_with_jvp(context, definition, &jvp, inputs)
+}
+
+/// Builds the ordinary functional primal region shared by canonical custom derivative carriers.
+fn kernel_primal<Extension: KernelExtension + Into<XlaKernelExtension>>(
+    definition: &KernelDefinition<Extension>,
+) -> Result<FlatXlaProgram, ProgramError> {
+    let mut builder = ryft_core::ProgramBuilder::new();
+    let inputs = definition
+        .operation()
+        .input_types()
+        .into_iter()
+        .map(|r#type| builder.add_input(r#type))
+        .collect::<Vec<_>>();
+    let body = stage_body(definition)?;
+    let body_region = builder.import_region(body.entry_region_ref());
+    let outputs = builder
+        .add_instruction(
+            XlaOperation::Kernel(XlaKernelOperation::new(KernelOperation::<NoKernelExtension>::Call(
+                definition.operation().clone(),
+            ))),
+            vec![body_region],
+            inputs.clone(),
+            None,
+        )?
+        .to_vec();
+    builder.build(
+        outputs,
+        vec![Placeholder; inputs.len()],
+        vec![Placeholder; definition.operation().output_types().len()],
     )
 }
 
@@ -843,21 +1027,38 @@ pub(crate) fn select_kernels(
 ) -> Result<Option<FlatXlaProgram>, KernelEmbeddingError> {
     // A selected call owns its entire body. Do not separately select descendants that its compiler consumes.
     // Ordinary computation edges remain visible; dormant rule edges are retained without being compiled.
-    let mut executable_regions = HashSet::new();
-    let mut pending = vec![program.entry()];
+    let mut executable_regions = HashMap::<_, BTreeMap<String, ryft_core::MeshAxis>>::new();
+    let mut pending = vec![(program.entry(), BTreeMap::new())];
     let mut has_kernel = false;
-    while let Some(id) = pending.pop() {
-        if !executable_regions.insert(id) {
-            continue;
+    while let Some((id, mut bound_axes)) = pending.pop() {
+        if let Some(previous) = executable_regions.get(&id) {
+            // A shared region must be safe under every executable caller, including an unbound caller.
+            bound_axes = previous
+                .iter()
+                .filter_map(|(name, axis)| (bound_axes.get(name) == Some(axis)).then(|| (name.clone(), axis.clone())))
+                .collect();
+            if previous == &bound_axes {
+                continue;
+            }
         }
+        executable_regions.insert(id, bound_axes.clone());
         let region = program.region_ref(id).unwrap();
         for instruction in region.instructions() {
             if matches!(instruction.operation(), XlaOperation::Kernel(XlaKernelOperation(KernelOperation::Call(_)))) {
                 has_kernel = true;
                 continue;
             }
+            let mut child_axes = bound_axes.clone();
+            if let XlaOperation::ShardMap(operation) = instruction.operation() {
+                let map = operation.shard_map();
+                child_axes.extend(map.manual_axes().iter().map(|name| {
+                    let index = map.mesh().axis_index(name).unwrap();
+                    (name.clone(), map.mesh().axes()[index].clone())
+                }));
+            }
             pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                (instruction.operation().region_role(index) == Some(ryft_core::RegionRole::Computation)).then_some(id)
+                (instruction.operation().region_role(index) == Some(ryft_core::RegionRole::Computation))
+                    .then(|| (id, child_axes.clone()))
             }));
         }
     }
@@ -878,7 +1079,7 @@ pub(crate) fn select_kernels(
                 .instructions()
                 .iter()
                 .map(|instruction| {
-                    if executable_regions.contains(&ryft_core::RegionId::new(index)) {
+                    if let Some(bound_axes) = executable_regions.get(&ryft_core::RegionId::new(index)) {
                         if let XlaOperation::Kernel(XlaKernelOperation(KernelOperation::Call(operation))) =
                             instruction.operation()
                         {
@@ -886,6 +1087,14 @@ pub(crate) fn select_kernels(
                                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
                             let definition = definition_from_body(operation, body)
                                 .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                            validate_kernel_sharding(
+                                &operation
+                                    .parameters()
+                                    .iter()
+                                    .map(|parameter| parameter.r#type().into_owned())
+                                    .collect::<Vec<_>>(),
+                                bound_axes,
+                            )?;
                             let compiled = binding.compile(&definition, &facts)?;
                             selected = true;
                             return Ok(Instruction::new(
@@ -941,6 +1150,7 @@ mod tests {
     use ryft_core::operations::custom_call::CustomCallOperation;
 
     use crate::FromPjrt;
+    use crate::experimental::ops::XlaProgramBuilder;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
     use super::*;
@@ -1037,6 +1247,87 @@ mod tests {
         }
     }
 
+    /// A scalar floating-point identity whose native body stays opaque to derivative construction.
+    fn differentiable_definition() -> KernelDefinition {
+        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
+        use ryft_core::{ArrayType, DataType, ReferenceRead, ReferenceWrite};
+
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadWrite).unwrap()],
+        )
+        .unwrap();
+        KernelDefinition::trace(call, |(references, _)| {
+            references[0].write(&references[0].read()?)?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Compiles derivative-only scalar programs through the existing XLA domain and waits for concrete results.
+    fn execute_derivative(program: &FlatXlaProgram, inputs: &[f32]) -> Vec<f32> {
+        use ryft_core::{
+            ArrayType, CompilationDomain, CompilationStagingRequest, CompilationTracer, Device, DeviceMesh,
+            LogicalMesh, StagedFunction, call_function,
+        };
+
+        use crate::experimental::domains::{XlaDomain, XlaOptions};
+
+        /// Keeps the traced input and output value lifetimes tied to the same execution client.
+        fn replay<'c>(
+            program: &FlatXlaProgram,
+            inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
+        ) -> Result<Vec<CompilationTracer<XlaDomain<'c>>>, crate::experimental::domains::XlaDomainError> {
+            let context = inputs[0].context().clone();
+            Ok(program.interpret_in_context(&context, inputs)?)
+        }
+
+        let client = crate::tests::execution_client();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
+        )
+        .unwrap();
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let request = CompilationStagingRequest::<_, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+            |_, _, inputs| replay(program, inputs),
+            vec![],
+            program.input_types(),
+            XlaOptions::new(mesh.clone()),
+        );
+        let staged: StagedFunction<XlaDomain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain.stage(request).unwrap();
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let inputs = inputs
+            .iter()
+            .zip(program.input_types())
+            .map(|(value, r#type)| {
+                let r#type = <&ArrayType>::try_from(&r#type).unwrap().clone();
+                ArrayIrValue::Array(
+                    crate::Array::from_host_buffer(&client, r#type, mesh.clone(), value.to_ne_bytes()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        call_function(&domain, compiled.executable_function(), inputs)
+            .unwrap()
+            .into_iter()
+            .map(|value| {
+                let ArrayIrValue::Array(value) = value else { panic!("derivative returned a non-array value") };
+                value.block_until_ready().unwrap();
+                let bytes = value
+                    .addressable_shards()
+                    .next()
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                f32::from_ne_bytes(bytes.as_slice().try_into().unwrap())
+            })
+            .collect()
+    }
+
     /// Creates an ordinary XLA graph with a real attached scalar kernel body.
     fn program() -> FlatXlaProgram {
         let definition = crate::kernels::tests::definition();
@@ -1048,6 +1339,169 @@ mod tests {
         )
         .unwrap()
         .1
+    }
+
+    #[test]
+    fn test_xla_kernel_operation_new() {
+        let definition = crate::kernels::tests::definition();
+        let carrier = XlaKernelOperation::new(KernelOperation::Call(definition.operation().clone()));
+        assert_eq!(carrier.name(), definition.operation().name());
+        assert_eq!(carrier.region_slots(), definition.operation().region_slots());
+        assert_eq!(carrier.input_region_provenance(0, 0), InputRegionProvenance::Local);
+    }
+
+    #[test]
+    fn test_xla_kernel_operation_partially_evaluate_prefetch() {
+        use ryft_core::kernels::{BlockMapping, BoundaryPolicy, Grid, KernelParameter, KernelParameterAccess};
+        use ryft_core::{
+            ArrayIrOperation, ArrayType, DataType, DimensionBounds, DimensionType, DimensionVariable, ProgramBuilder,
+            ReferenceWrite, StagingContext,
+        };
+
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mut mapping = ProgramBuilder::<ArrayIrValue<CpuArray>, ArrayIrOperation<CpuArray>>::new();
+        mapping.add_input(
+            DimensionType::new(DimensionVariable::new("prefetched", DimensionBounds::non_negative(Some(4)).unwrap()))
+                .into(),
+        );
+        let parameter = KernelParameter::new(
+            scalar.clone(),
+            KernelParameterAccess::WriteOnly,
+            BlockMapping::new(
+                mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+                vec![],
+                BoundaryPolicy::InBounds,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace_with_prefetch(
+            KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![parameter], vec![scalar.clone()])
+                .unwrap(),
+            |(references, _, values)| references[0].write(&values[0]),
+        )
+        .unwrap();
+        let program = kernel_primal(&definition).unwrap();
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(scalar.clone().into());
+        assert_eq!(
+            program.partially_evaluate_in_context(&outer, &[PartialValue::Known(known)]).unwrap_err(),
+            ProgramError::UnsupportedOperation {
+                message:
+                    "XLA scalar-prefetched kernel inputs must be specialized on the host before partial evaluation"
+                        .to_owned(),
+            }
+        );
+        let residual = program.partially_evaluate_in_context(&outer, &[PartialValue::Unknown(scalar.into())]).unwrap();
+        assert_eq!(residual.program().instructions().len(), 1);
+        assert!(matches!(residual.program().instructions()[0].operation(), XlaOperation::Kernel(_)));
+    }
+
+    #[test]
+    fn test_xla_kernel_operation_batch() {
+        use ryft_core::batching::RecursiveBatchingDriver;
+        use ryft_core::{ArrayType, CalleeRegionDriver, DataType, DimensionValue, StagingContext};
+
+        let definition = differentiable_definition();
+        let callees = [Arc::new(stage_body(&definition).unwrap())];
+        let regions = CalleeRegionDriver::new(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let (outputs, _) =
+                    XlaKernelOperation::new(KernelOperation::<NoKernelExtension>::Call(definition.operation().clone()))
+                        .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?
+                        .into_parts();
+                Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
+            },
+            vec![vector.clone()],
+        )
+        .unwrap();
+        assert_eq!(program.input_types(), vec![vector.clone()]);
+        assert_eq!(program.output_types(), vec![vector]);
+        let XlaOperation::Kernel(operation) = program.instructions()[0].operation() else {
+            panic!("expected a batched kernel call");
+        };
+        let KernelOperation::Call(call) = operation.operation() else {
+            panic!("expected a kernel call");
+        };
+        assert_eq!(call.grid().dimensions().len(), 1);
+        assert_eq!(call.aliases(), vec![(0, 0)]);
+        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
+        assert_eq!(definition_from_body(call, body).unwrap().operation().input_types(), program.input_types());
+    }
+
+    #[test]
+    fn test_stage_body() {
+        let definition = crate::kernels::tests::definition();
+        let body = stage_body(&definition).unwrap();
+        assert_eq!(body.input_types(), definition.body().input_types());
+        assert_eq!(body.regions().len(), definition.body().regions().len());
+        let restored = definition_from_body(definition.operation(), body.entry_region_ref()).unwrap();
+        assert_eq!(restored.semantic_key().unwrap(), definition.semantic_key().unwrap());
+        assert_eq!(restored.body().effects().classes(), definition.body().effects().classes());
+    }
+
+    #[test]
+    fn test_stage_body_materializes_array_literals() {
+        let operation = crate::kernels::tests::definition().operation().clone();
+        let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<CpuArray>, KernelOperation>::new();
+        let reference = builder.add_input(operation.body_input_types()[0].clone());
+        let literal = builder.add_constant(ArrayIrValue::Array(CpuArray::scalar(42_i32).unwrap()));
+        builder
+            .add_instruction(
+                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType>::new(),
+                vec![],
+                vec![reference, literal],
+                None,
+            )
+            .unwrap();
+        let definition =
+            KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+        let staged = stage_body(&definition).unwrap();
+        assert_eq!(staged.instructions().len(), 2);
+        assert!(matches!(
+            staged.instructions()[0].operation(),
+            XlaOperation::Array(ryft_core::ArrayOperation::Constant(value))
+                if value.value() == &CpuArray::scalar(42_i32).unwrap(),
+        ));
+        assert_eq!(staged.instructions()[0].outputs(), &[literal]);
+        let restored = definition_from_body(definition.operation(), staged.entry_region_ref()).unwrap();
+        let portable = KernelDefinition::new(
+            restored.operation().clone(),
+            restored
+                .body()
+                .map_operations(|operation| operation.clone().map_extension(NoKernelExtension::try_from))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            portable.interpret(vec![CpuArray::scalar(0_i32).unwrap()], 1).unwrap(),
+            vec![CpuArray::scalar(42_i32).unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_stage_kernel() {
+        let program = program();
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.instructions()[0].regions().len(), 1);
+        assert!(program.effects().classes().contains(EffectClass::OrderedState));
+    }
+
+    #[test]
+    fn test_stage_kernel_rejects_implicit_differentiation() {
+        let program = kernel_primal(&differentiable_definition()).unwrap();
+        assert_eq!(
+            program.jvp().unwrap_err(),
+            DifferentiationError::from(ProgramError::MalformedProgram(
+                "unselected kernel operation `kernel_call` has no differentiation rule".to_owned(),
+            ))
+        );
     }
 
     #[test]
@@ -1096,69 +1550,162 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_kernel_operation_new() {
-        let definition = crate::kernels::tests::definition();
-        let carrier = XlaKernelOperation::new(KernelOperation::Call(definition.operation().clone()));
-        assert_eq!(carrier.name(), definition.operation().name());
-        assert_eq!(carrier.region_slots(), definition.operation().region_slots());
-        assert_eq!(carrier.input_region_provenance(0, 0), InputRegionProvenance::Local);
-    }
-
-    #[test]
-    fn test_stage_body() {
-        let definition = crate::kernels::tests::definition();
-        let body = stage_body(&definition).unwrap();
-        assert_eq!(body.input_types(), definition.body().input_types());
-        assert_eq!(body.regions().len(), definition.body().regions().len());
-        let restored = definition_from_body(definition.operation(), body.entry_region_ref()).unwrap();
-        assert_eq!(restored.semantic_key().unwrap(), definition.semantic_key().unwrap());
-        assert_eq!(restored.body().effects().classes(), definition.body().effects().classes());
-    }
-
-    #[test]
-    fn test_stage_body_materializes_array_literals() {
-        let operation = crate::kernels::tests::definition().operation().clone();
-        let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<CpuArray>, KernelOperation>::new();
-        let reference = builder.add_input(operation.body_input_types()[0].clone());
-        let literal = builder.add_constant(ArrayIrValue::Array(CpuArray::scalar(42_i32).unwrap()));
-        builder
+    fn test_stage_kernel_with_jvp() {
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut builder = XlaProgramBuilder::new();
+        let primal = builder.add_input(scalar.clone());
+        let tangent = builder.add_input(scalar.clone());
+        let doubled = builder
             .add_instruction(
-                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType>::new(),
+                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
                 vec![],
-                vec![reference, literal],
+                vec![tangent, tangent],
                 None,
             )
+            .unwrap()[0];
+        let rule = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![primal, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
             .unwrap();
-        let definition =
-            KernelDefinition::new(operation, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
-        let staged = stage_body(&definition).unwrap();
-        assert_eq!(staged.instructions().len(), 2);
-        assert!(
-            matches!(staged.instructions()[0].operation(), XlaOperation::Array(ryft_core::ArrayOperation::Constant(value))
-            if value.value() == &CpuArray::scalar(42_i32).unwrap())
-        );
-        assert_eq!(staged.instructions()[0].outputs(), &[literal]);
-        let restored = definition_from_body(definition.operation(), staged.entry_region_ref()).unwrap();
-        let portable = KernelDefinition::new(
-            restored.operation().clone(),
-            restored
-                .body()
-                .map_operations(|operation| operation.clone().map_extension(NoKernelExtension::try_from))
-                .unwrap(),
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_jvp(inputs[0].context(), &definition, &rule, &inputs)
+            },
+            vec![scalar],
         )
         .unwrap();
+        assert_eq!(program.instructions()[0].operation().name(), "custom_jvp");
+        assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_stage_kernel_with_vjp() {
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut forward = XlaProgramBuilder::new();
+        let input = forward.add_input(scalar.clone());
+        let forward = forward
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut backward = XlaProgramBuilder::new();
+        let cotangent = backward.add_input(scalar.clone());
+        let doubled = backward
+            .add_instruction(
+                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                vec![],
+                vec![cotangent, cotangent],
+                None,
+            )
+            .unwrap()[0];
+        let tripled = backward
+            .add_instruction(
+                ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                vec![],
+                vec![doubled, cotangent],
+                None,
+            )
+            .unwrap()[0];
+        let backward = backward
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![tripled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_vjp(inputs[0].context(), &definition, &forward, &backward, &inputs)
+            },
+            vec![scalar],
+        )
+        .unwrap();
+        assert_eq!(program.instructions()[0].operation().name(), "custom_vjp");
+        let linearization = program.linearize().unwrap();
+        let backward = linearization.tangent().transpose().unwrap();
+        assert_eq!(execute_derivative(&backward, &[2.0]), vec![6.0]);
+    }
+
+    #[test]
+    fn test_stage_kernel_with_fallback() {
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar.clone());
+        let fallback = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+            },
+            vec![scalar],
+        )
+        .unwrap();
+        assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 4.0]);
         assert_eq!(
-            portable.interpret(vec![CpuArray::scalar(0_i32).unwrap()], 1).unwrap(),
-            vec![CpuArray::scalar(42_i32).unwrap()]
+            program
+                .regions()
+                .iter()
+                .flat_map(|region| region.instructions())
+                .filter(|instruction| {
+                    matches!(instruction.operation(), XlaOperation::Kernel(operation)
+                if matches!(operation.operation(), KernelOperation::Call(_)))
+                })
+                .count(),
+            1
         );
     }
 
     #[test]
-    fn test_stage_kernel() {
-        let program = program();
-        assert_eq!(program.regions().len(), 2);
-        assert_eq!(program.instructions()[0].regions().len(), 1);
-        assert!(program.effects().classes().contains(EffectClass::OrderedState));
+    fn test_stage_kernel_with_fallback_rejects_observable_primal_effects() {
+        use ryft_core::{
+            DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionType, DimensionValue,
+            DimensionVariable, ProgramBuilder,
+        };
+
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let mut body = ProgramBuilder::<ArrayIrValue<CpuArray>, KernelOperation>::new();
+        let inputs =
+            definition.body().input_types().into_iter().map(|r#type| body.add_input(r#type)).collect::<Vec<_>>();
+        body.splice_program(definition.body(), &inputs).unwrap();
+        let variable =
+            DimensionType::new(DimensionVariable::new("checked", DimensionBounds::non_negative(Some(2)).unwrap()));
+        let left = DimensionValue::new(variable.clone(), 0).unwrap();
+        let right = DimensionValue::constant(1).unwrap();
+        let requirement = DimensionRequirementOperation::equal(&variable, right.r#type().as_ref());
+        let left = body.add_constant(ArrayIrValue::Dimension(left));
+        let right = body.add_constant(ArrayIrValue::Dimension(right));
+        body.add_instruction(
+            KernelOperation::from(DimensionOperation::Requirement(requirement)),
+            vec![],
+            vec![left, right],
+            None,
+        )
+        .unwrap();
+        let definition = KernelDefinition::new(
+            definition.operation().clone(),
+            body.build(vec![], vec![Placeholder], vec![]).unwrap(),
+        )
+        .unwrap();
+        let mut fallback = XlaProgramBuilder::new();
+        let input = fallback.add_input(scalar.clone());
+        let fallback = fallback
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let error = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_fallback(inputs[0].context(), &definition, &fallback, &inputs)
+            },
+            vec![scalar],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "pure kernel fallback cannot replace observable kernel effects".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -1482,6 +2029,323 @@ mod tests {
         assert_eq!(selected.input_types(), program.input_types());
         assert_eq!(selected.output_types(), program.output_types());
         assert!(matches!(selected.instructions()[0].operation(), XlaOperation::CustomCall(_)));
+    }
+
+    #[test]
+    fn test_select_kernels_in_shard_map() {
+        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
+        use ryft_core::{ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        use crate::experimental::operations::ShardMapOperation;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap();
+        let global = ArrayType::new_static(DataType::I32, [4]).with_sharding(sharding.clone()).unwrap();
+        let local = ArrayType::new_static(DataType::I32, [2])
+            .with_sharding(sharding.clone().with_varying_manual_axes(["device"]).unwrap())
+            .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(
+            KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![whole_array_parameter(local, KernelParameterAccess::ReadWrite).unwrap()],
+            )
+            .unwrap(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let body = kernel_primal(&definition).unwrap();
+        let operation = ShardMapOperation::from_program(
+            &body,
+            vec![global.clone().into()],
+            mesh,
+            vec![sharding.clone()],
+            vec![sharding],
+            vec!["device".to_owned()],
+            true,
+        )
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(global.clone().into());
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![region], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.sharded"),
+            1,
+        )
+        .unwrap();
+        let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+        assert_eq!(selected.input_types(), vec![ArrayIrType::Array(global.clone())]);
+        assert_eq!(selected.output_types(), vec![ArrayIrType::Array(global)]);
+        assert!(matches!(selected.instructions()[0].operation(), XlaOperation::ShardMap(_)));
+        let local = selected.region_ref(selected.instructions()[0].regions()[0]).unwrap();
+        assert!(matches!(local.instructions()[0].operation(), XlaOperation::CustomCall(_)));
+        assert_eq!(local.input_types(), body.input_types());
+        assert!(matches!(select_kernels(&body, Some(&binding), facts),
+            Err(KernelEmbeddingError::Invalid { message }) if message ==
+                "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`"));
+    }
+
+    #[test]
+    fn test_select_kernels_preserves_call_and_rematerialization_regions() {
+        use ryft_core::RematerializeOperation;
+
+        use crate::experimental::ops::JitCallOperation;
+
+        let definition = differentiable_definition();
+        let body = kernel_primal(&definition).unwrap();
+        let scalar = body.input_types()[0].clone();
+        let mut identity = XlaProgramBuilder::new();
+        let input = identity.add_input(scalar.clone());
+        let identity = identity
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.composed"),
+            1,
+        )
+        .unwrap();
+        for operation in [
+            XlaOperation::JitCall(JitCallOperation::new(0)),
+            XlaOperation::Rematerialize(RematerializeOperation::new()),
+        ] {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(scalar.clone());
+            let primal = builder.import_region(body.entry_region_ref());
+            let mut regions = vec![primal];
+            if matches!(operation, XlaOperation::Rematerialize(_)) {
+                let derivative = builder.import_region(identity.entry_region_ref());
+                regions.extend([derivative; 3]);
+            }
+            let outputs = builder.add_instruction(operation.clone(), regions, vec![input], None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+            assert_eq!(selected.instructions()[0].operation().to_string(), operation.to_string());
+            assert_eq!(selected.input_types(), program.input_types());
+            assert_eq!(selected.output_types(), program.output_types());
+            assert_eq!(
+                selected
+                    .regions()
+                    .iter()
+                    .flat_map(|region| region.instructions())
+                    .filter(|instruction| { matches!(instruction.operation(), XlaOperation::CustomCall(_)) })
+                    .count(),
+                1
+            );
+            assert_eq!(selected.instructions()[0].regions().len(), program.instructions()[0].regions().len());
+        }
+    }
+
+    #[test]
+    fn test_select_kernels_preserves_condition_and_while_regions() {
+        use ryft_core::{ConditionOperation, WhileOperation};
+
+        let body = kernel_primal(&differentiable_definition()).unwrap();
+        let scalar = body.input_types()[0].clone();
+        let mut predicate = XlaProgramBuilder::new();
+        predicate.add_input(scalar.clone());
+        let result = predicate
+            .add_instruction(ConstantOperation::new(CpuArray::scalar(true).unwrap()), vec![], vec![], None)
+            .unwrap()[0];
+        let predicate = predicate
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.control"),
+            1,
+        )
+        .unwrap();
+        for operation in [
+            XlaOperation::Condition(ConditionOperation::new()),
+            XlaOperation::While(WhileOperation::new().with_iteration_bound(2).unwrap()),
+        ] {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(scalar.clone());
+            let body_region = builder.import_region(body.entry_region_ref());
+            let (regions, inputs) = if operation.name() == "condition" {
+                let choice = builder
+                    .add_instruction(ConstantOperation::new(CpuArray::scalar(true).unwrap()), vec![], vec![], None)
+                    .unwrap()[0];
+                (vec![body_region, body_region], vec![choice, input])
+            } else {
+                let predicate_region = builder.import_region(predicate.entry_region_ref());
+                (vec![predicate_region, body_region], vec![input])
+            };
+            let outputs = builder.add_instruction(operation.clone(), regions, inputs, None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+            assert_eq!(selected.instructions().last().unwrap().operation().to_string(), operation.to_string());
+            assert_eq!(selected.input_types(), program.input_types());
+            assert_eq!(selected.output_types(), program.output_types());
+            assert_eq!(
+                selected
+                    .regions()
+                    .iter()
+                    .flat_map(|region| region.instructions())
+                    .filter(|instruction| { matches!(instruction.operation(), XlaOperation::CustomCall(_)) })
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_kernels_preserves_scan_region() {
+        use ryft_core::{ArrayType, DataType, ScanOperation};
+
+        let primal = kernel_primal(&differentiable_definition()).unwrap();
+        let scalar = primal.input_types()[0].clone();
+        let mut body = XlaProgramBuilder::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar.clone());
+        let outputs = body.splice_program(&primal, &[carry]).unwrap();
+        let body = body
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let carry = builder.add_input(scalar);
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(ScanOperation::new(1, 3usize)), vec![region], vec![carry], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.scan"),
+            1,
+        )
+        .unwrap();
+        let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+        assert_eq!(
+            selected.instructions()[0].operation().to_string(),
+            program.instructions()[0].operation().to_string()
+        );
+        assert_eq!(selected.input_types(), program.input_types());
+        assert_eq!(selected.output_types(), program.output_types());
+        let body = selected.region_ref(selected.instructions()[0].regions()[0]).unwrap();
+        assert_eq!(body.instructions().len(), 1);
+        assert!(matches!(body.instructions()[0].operation(), XlaOperation::CustomCall(_)));
+    }
+
+    #[test]
+    fn test_select_kernels_preserves_external_reference_order() {
+        use ryft_core::{ArrayType, ReferenceReadOperation, ReferenceType, ReferenceWriteOperation};
+
+        let body = kernel_primal(&differentiable_definition()).unwrap();
+        let ArrayIrType::Array(scalar) = body.input_types()[0].clone() else {
+            panic!("expected an array");
+        };
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar));
+        let mut builder = XlaProgramBuilder::new();
+        let reference = builder.add_input(reference_type.clone());
+        let value = builder
+            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), vec![], vec![reference], None)
+            .unwrap()[0];
+        let outputs = builder.splice_program(&body, &[value]).unwrap();
+        builder
+            .add_instruction(
+                ReferenceWriteOperation::<ArrayType, ArrayIrType>::new(),
+                vec![],
+                vec![reference, outputs[0]],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.reference"),
+            1,
+        )
+        .unwrap();
+        let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+        assert_eq!(selected.input_types(), vec![reference_type]);
+        assert_eq!(selected.output_types(), program.output_types());
+        assert_eq!(
+            selected.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_read", "custom_call", "reference_write"]
+        );
+        assert!(selected.effects().classes().contains(EffectClass::OrderedState));
+        assert_eq!(selected.instructions()[0].inputs(), selected.instructions()[2].inputs().get(..1).unwrap());
+    }
+
+    #[test]
+    fn test_select_kernels_preserves_memory_transfers() {
+        use ryft_core::{Memory, TransferToMemoryOperation};
+
+        let body = kernel_primal(&differentiable_definition()).unwrap();
+        let ArrayIrType::Array(scalar) = body.input_types()[0].clone() else {
+            panic!("expected an array");
+        };
+        let host = scalar.with_memory(Memory::Host { pinned: true });
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Array(host.clone()));
+        let device = builder
+            .add_instruction(TransferToMemoryOperation::new(Memory::Device), vec![], vec![input], None)
+            .unwrap()[0];
+        let result = builder.splice_program(&body, &[device]).unwrap()[0];
+        let output = builder
+            .add_instruction(TransferToMemoryOperation::new(Memory::Host { pinned: true }), vec![], vec![result], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let binding = XlaKernelCompilerBinding::new(
+            Compiler,
+            FixtureTarget(true),
+            1,
+            KernelSchedule::default(),
+            Embedding("ryft.test.transfer"),
+            1,
+        )
+        .unwrap();
+        let selected = select_kernels(&program, Some(&binding), facts).unwrap().unwrap();
+        assert_eq!(selected.input_types(), vec![ArrayIrType::Array(host.clone())]);
+        assert_eq!(selected.output_types(), vec![ArrayIrType::Array(host)]);
+        assert_eq!(
+            selected.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["transfer_to_memory", "custom_call", "transfer_to_memory"]
+        );
+        assert_eq!(
+            selected.instructions()[0].operation().to_string(),
+            program.instructions()[0].operation().to_string()
+        );
+        assert_eq!(
+            selected.instructions()[2].operation().to_string(),
+            program.instructions()[2].operation().to_string()
+        );
     }
 
     #[test]

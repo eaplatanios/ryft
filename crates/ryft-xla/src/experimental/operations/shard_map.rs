@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array as CpuArray, ArrayIrType, ArrayOperation, ArrayReferenceDischarge, ArrayType, BroadcastOperation,
+    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayReferenceDischarge,
+    ArrayType, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
     CalleeRegionDriver, CaptureConstant, Concretizable, ConstantOperation, Context, ConvertElementType,
     CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
@@ -40,6 +41,9 @@ pub(crate) const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// identity, which the operation states through its crate-private `output_forwarding` accessor; an output whose
 /// forwarding is not declared is rejected by type inference, so a reference output is never accepted on provenance the
 /// operation cannot name.
+///
+/// Batching preserves the boundary when all inputs are replicated. Mapped batching across a shard-map boundary is
+/// rejected; callers can explicitly batch a local kernel before constructing its manual shard-map boundary.
 #[derive(Clone, Debug)]
 pub struct ShardMapOperation<V> {
     /// Manual SPMD metadata (mesh, boundary shardings, and manual axes) governing the attached body region.
@@ -933,6 +937,37 @@ where
                 (XlaOperation::ShardMap(Box::new(staged_operation)), vec![packed_residual_program])
             },
         )
+    }
+}
+
+impl<V, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation<V>
+where
+    V: Value<Type = ArrayIrType>,
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<Self>,
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        if inputs.iter().any(|input| !input.batch_axis().is_replicated()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "batching across `shard_map` requires an explicitly batched local kernel".to_owned(),
+            });
+        }
+        Ok(context
+            .parent()
+            .bind(
+                self.clone(),
+                vec![driver.region(0)?.to_program()],
+                &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+            )?
+            .into_iter()
+            .map(ArrayIrBatch::replicated)
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 
@@ -2630,6 +2665,59 @@ mod tests {
         assert_eq!(builder.instructions()[0].regions().len(), 1);
     }
 
+    #[test]
+    fn test_shard_map_operation_batch() {
+        use ryft_core::batching::RecursiveBatchingDriver;
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, BatchingError,
+            CalleeRegionDriver, DimensionValue,
+        };
+
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar.clone());
+        let body = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let metadata = single_input_test_shard_map();
+        let operation = ShardMapOperation::from_program(
+            &body,
+            vec![scalar.clone()],
+            metadata.mesh().clone(),
+            metadata.in_shardings().to_vec(),
+            metadata.out_shardings().to_vec(),
+            metadata.manual_axes().to_vec(),
+            true,
+        )
+        .unwrap();
+        let callees = [Arc::new(body)];
+        let regions = CalleeRegionDriver::new(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let parent = TracingContext::<XlaConstant, XlaOperation>::new();
+        let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+        let mapped = parent.input(ArrayType::new_static(DataType::F32, [3]).into());
+        assert_eq!(
+            operation.batch(&context, &driver, &[ArrayIrBatch::new(mapped, Some(0)).unwrap()]).unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "batching across `shard_map` requires an explicitly batched local kernel".to_owned(),
+            },
+        );
+        let replicated = parent.input(scalar.clone());
+        let (outputs, _) =
+            operation.batch(&context, &driver, &[ArrayIrBatch::replicated(replicated)]).unwrap().into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].batch_axis().is_replicated());
+        assert_eq!(
+            outputs[0].value().r#type().as_ref(),
+            &ArrayIrType::Array(
+                ArrayType::scalar(DataType::F32)
+                    .with_sharding(Sharding::replicated(metadata.mesh().clone(), 0))
+                    .unwrap(),
+            )
+        );
+    }
+
     /// Online partial evaluation of a mixed `shard_map` against a live outer trace: the known half of the local body
     /// is rewrapped as a known-side `shard_map` staged into the outer program over the symbolic known input, the
     /// unknown half stays behind a residual `shard_map`, the known→unknown residual edges flow between them, and the
@@ -2810,8 +2898,8 @@ mod tests {
 
     /// Type inference over a reference-bearing boundary: a reference operand must reach the body as a reference to
     /// its local shard, and a reference output must name the input it forwards under an equal output sharding.
-    /// Batching a reference input along a manual axis is unreachable here because the XLA operation family has no
-    /// batching dispatch, so the boundary contract is only checked by type inference and the transform rules.
+    /// Mapped batching across the manual boundary is rejected explicitly; callers can batch a local kernel before
+    /// constructing its shard-map boundary. Replicated batching retains this reference contract unchanged.
     #[test]
     fn test_shard_map_reference_boundary_type_inference() {
         let sharded = Sharding::new(manual_mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();

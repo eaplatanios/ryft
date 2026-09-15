@@ -10,15 +10,15 @@
 
 use ryft_core::kernels::{KernelExtension, KernelParameterAccess, VerifiedKernel};
 use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::{ArrayType, DataType, EffectClass, Layout, Memory, Typed};
-use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
+use ryft_core::{EffectClass, Typed};
 use ryft_mosaic::kernels::gpu::{CompiledKernel, Target};
 use ryft_xla_sys::mlir::dialects::mosaic::gpu::{
     MOSAIC_GPU_FFI_TARGET, MOSAIC_GPU_RESOURCE_SCHEMA_VERSION, MOSAIC_GPU_SERDE_VERSION,
 };
 use sha2::{Digest, Sha256};
 
-use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::staging::{XlaKernelExecutionFacts, XlaKernelTarget};
+use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 
 /// Embeds checked Mosaic GPU source using the pinned native binary-source and resource schemas.
 #[derive(Copy, Clone, Debug, Default)]
@@ -79,7 +79,7 @@ impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension
                 message: "mosaic GPU host-buffer ABI differs from the logical kernel boundary".to_owned(),
             });
         }
-        memory_layouts(&inputs, &outputs)?;
+        dense_memory_layouts(&inputs, &outputs, "mosaic GPU")?;
         if output.module().is_empty() || Sha256::digest(output.module()).as_slice() != output.hash() {
             return Err(KernelEmbeddingError::Invalid {
                 message: "mosaic GPU binary source does not match its native cache hash".to_owned(),
@@ -151,51 +151,17 @@ impl XlaKernelTarget for Target {
     }
 }
 
-/// Validates the native memref ABI and fixes complete row-major operand/result layouts, including default types.
-pub(crate) fn memory_layouts(
-    inputs: &[ArrayType],
-    outputs: &[ArrayType],
-) -> Result<CustomCallMemoryLayouts, KernelEmbeddingError> {
-    for r#type in inputs.iter().chain(outputs) {
-        if r#type.memory() != Memory::Device
-            || r#type.static_shape().is_none()
-            || matches!(r#type.data_type(), DataType::Zero | DataType::Token)
-        {
-            return Err(KernelEmbeddingError::Invalid {
-                message: "mosaic GPU requires static device array buffers".to_owned(),
-            });
-        }
-        if let Some(layout) = r#type.layout() {
-            let valid = match layout {
-                Layout::Tiled(layout) => {
-                    layout.tiles().is_empty() && layout.minor_to_major().iter().copied().eq((0..r#type.rank()).rev())
-                }
-                Layout::Strided(_) => false,
-            };
-            if !valid {
-                return Err(KernelEmbeddingError::Invalid {
-                    message: "mosaic GPU requires untiled dense row-major array layouts".to_owned(),
-                });
-            }
-        }
-    }
-    Ok(CustomCallMemoryLayouts {
-        operands: inputs.iter().map(|r#type| (0..r#type.rank()).rev().collect()).collect(),
-        results: outputs.iter().map(|r#type| (0..r#type.rank()).rev().collect()).collect(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::TiledLayout;
     use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
     use ryft_core::operations::custom_call::CustomCallAttribute;
+    use ryft_core::{ArrayType, DataType};
     use ryft_mosaic::kernels::gpu::{Compiler, Options};
 
-    use crate::kernels::XlaKernelDeviceFacts;
+    use crate::kernels::staging::XlaKernelDeviceFacts;
 
     use super::*;
 
@@ -352,19 +318,5 @@ mod tests {
         execution.platform_version = "cuda 13020".to_owned();
         assert!(matches!(legacy.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "compute capability `10.1` requires the pinned CUDA 12.9 runtime"));
-    }
-
-    #[test]
-    fn test_memory_layouts() {
-        let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
-        let scalar = ArrayType::new_static(DataType::F32, []);
-        let layouts = memory_layouts(&[matrix.clone(), scalar.clone()], &[matrix.clone()]).unwrap();
-        assert_eq!(layouts.operands, vec![vec![1, 0], vec![]]);
-        assert_eq!(layouts.results, vec![vec![1, 0]]);
-        let explicit = matrix.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
-        assert_eq!(memory_layouts(&[explicit], &[]).unwrap().operands, vec![vec![1, 0]]);
-        let column_major = matrix.with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        assert!(matches!(memory_layouts(&[column_major], &[]), Err(KernelEmbeddingError::Invalid { message })
-            if message == "mosaic GPU requires untiled dense row-major array layouts"));
     }
 }

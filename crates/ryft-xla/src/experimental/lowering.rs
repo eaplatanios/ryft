@@ -4703,7 +4703,23 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
     #[cfg(feature = "mosaic-gpu")]
     let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
     {
-        let mut layouts = crate::kernels::mosaic::memory_layouts(input_types, output_types)
+        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")
+            .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
+        if operation.has_side_effect() {
+            layouts.operands.push(Vec::new());
+            layouts.results.push(Vec::new());
+        }
+        Some(layouts)
+    } else {
+        memory_layouts
+    };
+    // Compiler-provided static strides require fixed layouts even when the logical array type leaves them implicit.
+    let memory_layouts = if operation
+        .attributes()
+        .iter()
+        .any(|(name, value)| name == "ryft.cuda.row_major" && *value == CustomCallAttribute::Boolean(true))
+    {
+        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "cuda kernel")
             .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
         if operation.has_side_effect() {
             layouts.operands.push(Vec::new());

@@ -109,3 +109,27 @@ RYFT_PJRT_RUN_MOSAIC_GPU_ASSERTION_FAILURE=1 \
         ),
     )
   ```
+
+The cuTile adapter experiments reuse the same `vector_add`, `sum`, and partial-tile `matmul` macro definitions and
+independent scalar/interpreter oracles as Mosaic. Additional cases exercise two ordered updates through one
+read-write parameter, repeated read-only arguments backed by the same device allocation, and canonical batching of
+the unchanged vector definition. A separate `shard_map` case builds a kernel from the actual local tracer type on a
+single-device manual mesh, retaining its varying-manual-axis metadata through native execution. A fractional matmul case
+uses non-TF32-representable operands and an exact independently computed FP32 result to detect reduced precision. They select
+`ryft_cuda::kernels::cutile` through `CuTileEmbedding`, validate the adapter manifest against the verified body and
+cubin, and serialize/reload the enclosing XLA executable in a fresh session after setting the compiler's cancellation
+flag.
+The reload and execution path must not invoke Python. Existing handwritten cuTile ABI probes remain separate.
+
+Set `RYFT_CUTILE_PYTHON` to the Python executable containing the pinned cuTile toolchain, then run
+`RYFT_PJRT_RUN_CUTILE_KERNELS=1 cargo test -p ryft-experimental --features cutile,cuda-13 kernels::cutile`.
+An enabled request requires an actual CUDA13 platform and propagates compiler or device failures. Optionally set
+`RYFT_CUTILE_ARTIFACT_DIRECTORY` to retain cubins, validated manifests, and serialized executables; the test log
+records SHA256 hashes for all three. Numerical execution through both adapters is distinct from merely passing the
+host oracle or parsing generated source. Native qualification results belong in the task evidence ledger.
+
+After positive cuTile tests, run the isolated negative check with
+`RYFT_PJRT_RUN_CUTILE_ASSERTION_FAILURE=1 cargo test -p ryft-experimental --features cutile,cuda-13 kernels::cutile::test_assertion_failure_on_cuda -- --ignored --exact`.
+It feeds a runtime value outside a checked dimension's bounds and requires a terminal CUDA assertion/launch error;
+compiler or deserialization failures do not satisfy this check. Run it in its own process because a device assertion
+can poison the CUDA context.

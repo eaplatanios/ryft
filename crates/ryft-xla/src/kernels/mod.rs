@@ -4,34 +4,51 @@
 //! one concrete output type; [`CompiledKernel`] retains the verified source until that selection is complete and
 //! emits the canonical custom call into ordinary staging. Existing XLA lowering, executable caching, persistence,
 //! and PJRT fences then own the program. This module does not introduce a second executable or module cache.
+//!
+//! [`stage_kernel`] preserves the complete kernel call through batching, control flow, and rematerialization.
+//! Differentiation requires an explicit [`stage_kernel_with_jvp`], [`stage_kernel_with_vjp`], or pure
+//! [`stage_kernel_with_fallback`] contract. Specialize scalar-prefetched values with
+//! [`KernelDefinition::specialize_prefetch`] before XLA staging; transforms never read captured device buffers back
+//! to the host. Local per-shard compilation retains full sharding metadata and requires every manual axis to be bound
+//! by an enclosing shard map with the same axis descriptor. Automatic partitioning and collectives are rejected.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ryft_core::kernels::{
     KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
     VerifiedKernel,
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::{ArrayIrType, ArrayType, Context, EffectClass, Operation, ProgramError, TypeError, Typed};
+use ryft_core::{
+    ArrayIrType, ArrayType, Context, DataType, EffectClass, Layout, Memory, MeshAxis, MeshAxisType, Operation,
+    ProgramError, ShardingDimension, TypeError, Typed,
+};
+use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod cuda;
+#[cfg(feature = "cutile")]
+mod cutile;
 #[cfg(feature = "mosaic-gpu")]
 pub(crate) mod mosaic;
 mod staging;
 
+#[cfg(feature = "cutile")]
+pub use cutile::CuTileEmbedding;
 #[cfg(feature = "mosaic-gpu")]
 pub use mosaic::MosaicGpuEmbedding;
 
 pub(crate) use staging::select_kernels;
 pub use staging::{
     XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelExtension, XlaKernelOperation,
-    XlaKernelTarget, stage_kernel,
+    XlaKernelTarget, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_vjp,
 };
 
 pub(crate) use cuda::CudaKernelRuntime;
-pub use cuda::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding};
+pub use cuda::{
+    CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding, CudaKernelParameterBinding,
+};
 
 /// Invalid compiler output or unsupported XLA embedding contract.
 #[derive(Debug, Error)]
@@ -245,6 +262,74 @@ where
         }
         context.bind(self.custom_call.clone(), Vec::new(), inputs)
     }
+}
+
+/// Validates the native memref ABI and fixes complete row-major operand/result layouts, including default types.
+pub(crate) fn dense_memory_layouts(
+    inputs: &[ArrayType],
+    outputs: &[ArrayType],
+    owner: &str,
+) -> Result<CustomCallMemoryLayouts, KernelEmbeddingError> {
+    for r#type in inputs.iter().chain(outputs) {
+        if r#type.memory() != Memory::Device
+            || r#type.static_shape().is_none()
+            || matches!(r#type.data_type(), DataType::Zero | DataType::Token)
+        {
+            return Err(KernelEmbeddingError::Invalid {
+                message: format!("{owner} requires static device array buffers"),
+            });
+        }
+        if let Some(layout) = r#type.layout() {
+            let valid = match layout {
+                Layout::Tiled(layout) => {
+                    layout.tiles().is_empty() && layout.minor_to_major().iter().copied().eq((0..r#type.rank()).rev())
+                }
+                Layout::Strided(_) => false,
+            };
+            if !valid {
+                return Err(KernelEmbeddingError::Invalid {
+                    message: format!("{owner} requires untiled dense row-major array layouts"),
+                });
+            }
+        }
+    }
+    Ok(CustomCallMemoryLayouts {
+        operands: inputs.iter().map(|r#type| (0..r#type.rank()).rev().collect()).collect(),
+        results: outputs.iter().map(|r#type| (0..r#type.rank()).rev().collect()).collect(),
+    })
+}
+
+/// Requires already-local manual shards; adapter selection never synthesizes partitioning or a collective.
+pub(crate) fn validate_kernel_sharding(
+    parameters: &[ArrayType],
+    bound_axes: &BTreeMap<String, MeshAxis>,
+) -> Result<(), KernelEmbeddingError> {
+    for (index, parameter) in parameters.iter().enumerate() {
+        let Some(sharding) = parameter.sharding() else { continue };
+        let invalid = || KernelEmbeddingError::Invalid {
+            message: format!(
+                "kernel parameter {index} requires a local shard with all partitioned axes bound by `shard_map`"
+            ),
+        };
+        if !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty() {
+            return Err(invalid());
+        }
+        let mut axes = sharding.varying_manual_axes().clone();
+        for dimension in sharding.dimensions() {
+            match dimension {
+                ShardingDimension::Replicated => {}
+                ShardingDimension::Sharded(names) => axes.extend(names.iter().cloned()),
+                ShardingDimension::Unconstrained => return Err(invalid()),
+            }
+        }
+        if axes.iter().any(|axis| {
+            sharding.mesh().axis_type(axis) != Some(MeshAxisType::Manual)
+                || sharding.mesh().axis_index(axis).map(|index| &sharding.mesh().axes()[index]) != bound_axes.get(axis)
+        }) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -549,5 +634,74 @@ pub(crate) mod tests {
             }}
         "#}
         );
+    }
+    #[test]
+    fn test_dense_memory_layouts() {
+        use ryft_core::TiledLayout;
+
+        let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
+        let scalar = ArrayType::new_static(DataType::F32, []);
+        let layouts = dense_memory_layouts(&[matrix.clone(), scalar.clone()], &[matrix.clone()], "mosaic GPU").unwrap();
+        assert_eq!(layouts.operands, vec![vec![1, 0], vec![]]);
+        assert_eq!(layouts.results, vec![vec![1, 0]]);
+        let explicit = matrix.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
+        assert_eq!(dense_memory_layouts(&[explicit], &[], "mosaic GPU").unwrap().operands, vec![vec![1, 0]]);
+        let column_major = matrix.with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        assert!(
+            matches!(dense_memory_layouts(&[column_major], &[], "mosaic GPU"), Err(KernelEmbeddingError::Invalid { message })
+            if message == "mosaic GPU requires untiled dense row-major array layouts")
+        );
+        assert!(matches!(
+            dense_memory_layouts(&[scalar.with_memory(Memory::Host { pinned: false })], &[], "cuda kernel"),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "cuda kernel requires static device array buffers",
+        ));
+    }
+
+    #[test]
+    fn test_validate_kernel_sharding() {
+        use ryft_core::{LogicalMesh, MeshAxis, Sharding};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(vec!["device".to_owned()])])
+            .unwrap()
+            .with_varying_manual_axes(["device"])
+            .unwrap();
+        let local = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let bound = BTreeMap::from([("device".to_owned(), mesh.axes()[0].clone())]);
+        assert!(validate_kernel_sharding(&[local.clone()], &bound).is_ok());
+        assert!(matches!(
+            validate_kernel_sharding(&[local.clone()], &BTreeMap::new()),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+        ));
+        let mismatched =
+            BTreeMap::from([("device".to_owned(), MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap())]);
+        assert!(matches!(
+            validate_kernel_sharding(&[local], &mismatched),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+        ));
+        let replicated = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        assert!(validate_kernel_sharding(&[replicated], &BTreeMap::new()).is_ok());
+        let unconstrained = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::Unconstrained]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            validate_kernel_sharding(&[unconstrained], &bound),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+        ));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let automatic = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::Sharded(vec!["device".to_owned()])]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            validate_kernel_sharding(&[automatic], &bound),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
+        ));
     }
 }

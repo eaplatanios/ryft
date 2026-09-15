@@ -92,6 +92,108 @@ through `Error::take_cleanup_errors`; context destruction ultimately releases an
 and synchronous eviction share one mutex. Cache partitions have separate resource budgets and pending cleanup retries,
 but slow module operations can delay other partitions.
 
+## Optional cuTile Compiler
+
+`ryft_cuda::kernels::cutile` compiles verified portable `ryft_core::kernels` definitions through NVIDIA's official
+cuTile Python AOT interface. This optional module owns source generation, compiler admission, tool isolation, and
+the adapter-authored manifest. It reuses this crate's producer-neutral artifacts and launcher without depending on
+XLA, PJRT, or MLIR.
+
+Enable `cutile` for the target, immutable output, and validated manifest decoder; it adds optional `ryft-core`,
+`serde`, and `serde_json` dependencies. Enable `cutile-compiler` where ahead-of-time compilation runs; it includes
+`cutile` and adds the compiler and `tempfile` dependency. Both features are disabled by default, preserving the
+existing lightweight CUDA APIs. Python is not needed for manifest validation, CUDA loading, invocation, or executable
+reload. XLA selection and `CuTileEmbedding` remain owned by `ryft-xla`.
+
+### Installation and identity
+
+Use an explicit Python executable with `cuda-tile==1.5.0`, `nvidia-cuda-tileiras==13.3.36`,
+`nvidia-cuda-nvcc==13.3.73`, and `nvidia-nvvm==13.3.73`. The compiler checks
+installed versions before invoking the exporter and the worker rechecks them before compilation. Configuration
+identity includes the source schema, bundled worker hash, pinned versions, explicit executable path, target and
+schedule. Cache identity construction does not start Python. Process timeouts and cancellation are control policies,
+not numerical or scheduling choices. The worker verifies the actual distribution-owned compiler executable version
+and namespace selection, selects bytecode version `13.3`, clears frontend environment overrides (including test flags
+that can remove token ordering), and uses isolated temporary/cache directories. It does not silently fall back to a
+system CUDA toolkit.
+
+Supported target spellings are `sm_100`, `sm_103`, `sm_110`, `sm_120`, and `sm_121`, as accepted by the pinned tool.
+Acceptance by the compiler does not establish driver compatibility or hardware execution qualification. The execution
+integration must establish the actual device and CUDA runtime facts before dispatch.
+
+### Artifact and ABI
+
+The worker uses explicit `ArrayConstraint` values and `CallingConvention.cutile_python_v2()`. It never derives
+constraints from example arrays or addresses. Physical arguments are a pointer followed by every signed I32 shape
+component and then every signed I32 element stride. Static shapes and strides remain in this ABI. Constant values
+inside the generated body do not become runtime arguments. Logical scalar arrays retain their rank-zero canonical
+types but use a physical one-element array constraint `[1]`, stride `[1]`: the public AOT partition-view contract does
+not support rank-zero array parameters. The lowerer loads/stores this element and reshapes private scalar values.
+
+`Argument::Array(index)` refers to the canonical kernel parameter order. The execution integration maps read-only
+parameters to inputs and writable parameters to results, retaining its ordinary input liveness and alias policy.
+Zero-sized external arrays are rejected before compilation because the shared runtime does not admit null CUDA
+pointers. An empty logical grid over nonempty arrays remains a valid no-op.
+When two or more parameters exist, array constraints share an alias group so repeated read-only inputs remain legal.
+A single parameter has an empty alias-group list because the exporter rejects redundant singleton alias groups.
+Dense row-major storage has no internal element aliases; address alignment is conservatively one byte. Launch block
+dimensions are `(1,1,1)` under CUDA Tile's launch convention, not a promise about the compiler's physical thread
+allocation.
+
+`CompiledKernel::from_manifest` checks the exact verified body identity, full logical parameter types, physical ABI,
+producer versions and configuration, derived launch grid, cubin size/hash, and canonical ELF architecture. The
+manifest is a Ryft adapter format, not an upstream cuTile schema. These checks detect mismatches and corruption;
+executing artifacts still requires trusting their producer.
+
+### Compiler process
+
+Compilation runs in a fresh temporary directory and Unix process group. A caller-owned atomic cancellation signal,
+a wall-clock deadline, and bounded diagnostic capture terminate the whole compiler group. Partial stdout and stderr
+remain in errors. A failed invocation publishes no artifact and cannot poison an independent compilation. Successful
+output retains diagnostics for inspection. The `cutile` feature does not impose a host operating-system requirement;
+only the current compiler process implementation requires Unix.
+
+### Portable subset
+
+Source admission is operation-driven. Static dense arrays, bounded dimensions and reference windows use the same
+canonical definition as other adapters. Arithmetic, shape operations, reductions and dot preserve their declared
+numerical policies. Floating-point dot must not silently substitute reduced-precision TF32. Explicit masks govern
+edge-window memory accesses. Unsupported operations, memory layouts, synchronization, target extensions and numerical
+modes are rejected before the compiler process starts; no implicit backend fallback occurs.
+
+The initial concrete subset is:
+
+| Area | Admitted operations | Explicit limits |
+|---|---|---|
+| Values | Boolean, I32/U32, I64/U64, F16/BF16, F32/F64 | Static dense device arrays; manual-only local sharding |
+| Arithmetic | Add/subtract/multiply/negate, floating divide, exp, min/max, compare/select | Native dtype contract |
+| Shape | Reshape, broadcast, transpose, element conversion | Checked physical tile shapes and conversion mode |
+| Reduction | Sum and maximum | Explicit neutral padding, admitted axes only |
+| Dot | Ordinary matrix multiplication | Supported canonical dimensions and declared accumulation |
+| References | Read, write, swap, bounded tile load | Global windows with explicit clipped gather/scatter masks |
+| Control | Static grids, bounded while, condition | Reference ownership preserved; parallel carry assignment |
+
+Explicit scratch, async copy, wait/barrier protocols, atomics, target extensions and block-scaled dot are not admitted.
+Full manual-only sharding metadata remains on logical types; the execution integration must bind every named manual
+axis in an enclosing `shard_map`. Automatic or explicit partitioning and unconstrained placement are rejected.
+A scratch-byte schedule bound is rejected because this compiler cannot certify cuTile's physical scratch allocation.
+The implementation's source owner tests define the detailed shape restrictions.
+Native qualification compares unchanged definitions against the core interpreter and Mosaic GPU, rather than using
+example-name recognition or hard-coded generated kernels.
+
+Checked indexing retains native device assertions. XLA integration carries their ordered effect tokens outside the
+CUDA argument list and reports failures when execution completes. The negative assertion test runs in a separate
+process because a failed device assertion can invalidate its CUDA context.
+
+DGX Spark qualification covers `sm_121`: partial vector tiles, scalar reduction, partial matrix multiplication,
+FP32 precision, independent batches, read-write aliases, repeated input buffers, and a local manual shard map.
+Serialized kernels reload in a fresh session with compiler cancellation enabled. Other accepted architectures need
+their own device qualification.
+
+Sources: [official compilation and export](https://docs.nvidia.com/cuda/cutile-python/compilation.html),
+[CUDA Tile launch contract](https://github.com/NVIDIA/cuda-tile), and
+[cuTile data model](https://docs.nvidia.com/cuda/cutile-python/data.html).
+
 ## Verification
 
 Portable unit tests exercise the real driver adapter through function-pointer stubs, the bootstrap resolver, artifact
@@ -99,6 +201,7 @@ validation, every scalar storage representation, and deterministic cache concurr
 
 ```sh
 cargo test -p ryft-cuda
+cargo test -p ryft-cuda --features cutile-compiler --lib kernels::cutile
 cargo clippy -p ryft-cuda --all-targets --all-features -- -D warnings
 cargo +nightly fmt -p ryft-cuda --check
 ```

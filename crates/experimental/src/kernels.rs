@@ -249,6 +249,37 @@ fn kernel_cases() -> Vec<KernelCase> {
     ]
 }
 
+/// Uses fractional operands that IEEE FP32 retains but TF32 rounds, with a single exact oracle product.
+fn precision_case() -> KernelCase {
+    let left_type = ArrayType::new_static(DataType::F32, [33, 1]);
+    let right_type = ArrayType::new_static(DataType::F32, [1, 34]);
+    let left = 1.0f32 + 1.0 / 4096.0;
+    let right = 1.0f32 + 1.0 / 8192.0;
+    let expected = (f64::from(left) * f64::from(right)) as f32;
+    assert_ne!(expected, 1.0);
+    KernelCase {
+        name: "matmul_precision",
+        definition: matmul::definition(&left_type, &right_type).unwrap(),
+        input_types: vec![left_type, right_type],
+        inputs: vec![vec![left; 33], vec![right; 34]],
+        expected: vec![expected; 33 * 34],
+    }
+}
+
+/// Batches the unchanged vector macro through the canonical reference-index transform.
+fn batched_case() -> KernelCase {
+    let mut case = kernel_cases().into_iter().find(|case| case.name == "vector_add").unwrap();
+    case.name = "batched_vector_add";
+    case.definition = case.definition.batched(2, &[Some(0), Some(0), Some(0)], 1024).unwrap();
+    case.input_types = vec![ArrayType::new_static(DataType::F32, [2, 1003]); 2];
+    for (index, values) in case.inputs.iter_mut().enumerate() {
+        let offset = if index == 0 { 3.0 } else { -1.0 };
+        values.extend(values.clone().into_iter().map(|value| value + offset));
+    }
+    case.expected.extend(case.expected.clone().into_iter().map(|value| value + 2.0));
+    case
+}
+
 /// Checks the portable reference interpreter against the independent scalar oracle.
 fn interpret_case(case: &KernelCase) {
     let inputs = case
@@ -269,7 +300,7 @@ fn interpret_case(case: &KernelCase) {
 
 #[test]
 fn test_macro_kernels_interpretation() {
-    for case in kernel_cases() {
+    for case in kernel_cases().into_iter().chain([precision_case(), batched_case()]) {
         interpret_case(&case);
     }
 }
@@ -302,6 +333,7 @@ mod gpu {
     use std::time::Instant;
 
     use pretty_assertions::assert_eq;
+    use sha2::{Digest, Sha256};
 
     use ryft_core::kernels::{KernelExtension, KernelOperation, KernelSchedule};
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, ProjectedValue, Typed};
@@ -330,6 +362,7 @@ mod gpu {
         case: KernelCase,
         options: Options,
     ) -> Result<Vec<f32>, XlaDomainError> {
+        eprintln!("Mosaic {}: semantic={:x}", case.name, Sha256::digest(case.definition.semantic_key().unwrap()));
         let bytes = case
             .inputs
             .into_iter()
@@ -441,7 +474,11 @@ mod gpu {
         assert!(cfg!(any(feature = "cuda-12", feature = "cuda-13")), "GPU execution requires a CUDA feature");
         test_for_each_platform!(|_plugin, client, platform| {
             if matches!(platform, TestPlatform::Cuda12 | TestPlatform::Cuda13) {
-                let case = kernel_cases().into_iter().find(|case| case.name == name).unwrap();
+                let case = match name {
+                    "matmul_precision" => precision_case(),
+                    "batched_vector_add" => batched_case(),
+                    _ => kernel_cases().into_iter().find(|case| case.name == name).unwrap(),
+                };
                 interpret_case(&case);
                 let expected = case.expected.clone();
                 assert_eq!(execute_case(&client, case, Options::default()).unwrap(), expected, "{name}");
@@ -807,6 +844,16 @@ mod gpu {
     }
 
     #[test]
+    fn test_matmul_precision_on_cuda() {
+        execute_on_cuda("matmul_precision");
+    }
+
+    #[test]
+    fn test_batched_vector_add_on_cuda() {
+        execute_on_cuda("batched_vector_add");
+    }
+
+    #[test]
     fn test_attention_on_cuda() {
         if env::var("RYFT_PJRT_RUN_MOSAIC_GPU_KERNELS").ok().as_deref() != Some("1") {
             return;
@@ -904,5 +951,403 @@ mod gpu {
                 );
             }
         });
+    }
+}
+
+#[cfg(feature = "cutile")]
+mod cutile {
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use pretty_assertions::assert_eq;
+    use sha2::{Digest, Sha256};
+
+    use ryft_core::kernels::{KernelSchedule, VerifiedKernel};
+    use ryft_core::{
+        AddOperation, ArrayIrType, ArrayIrValue, ArrayOperation, CompilationCacheDomain, CompilationDomain,
+        CompilationStagingRequest, ConstantOperation, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
+        call_function,
+    };
+    use ryft_cuda::kernels::cutile::{CompiledKernel, Compiler, Options, Target};
+    use ryft_xla::experimental::XlaDomainError;
+    use ryft_xla::kernels::{CuTileEmbedding, XlaKernelCompilerBinding, stage_kernel};
+    use ryft_xla::{FromPjrt, XlaDomain, XlaSession};
+
+    use crate::tests::{TestPlatform, test_for_each_platform};
+
+    use super::*;
+
+    /// Constructs two ordered updates to one read-write root, retaining the declared input/output alias.
+    fn alias_case() -> KernelCase {
+        let r#type = ArrayType::new_static(DataType::F32, [67]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadWrite).unwrap()],
+        )
+        .unwrap();
+        let ones = Array::from_elements(r#type.clone(), &[1.0f32; 67]).unwrap();
+        let definition = KernelDefinition::trace(call, |(references, _)| {
+            let context = references[0].context();
+            let one = context.bind(ArrayOperation::Constant(ConstantOperation::new(ones)), vec![], &[])?.remove(0);
+            let first = context
+                .bind(ArrayOperation::Add(AddOperation::new()), vec![], &[references[0].read()?, one.clone()])?
+                .remove(0);
+            references[0].write(&first)?;
+            let second = context
+                .bind(ArrayOperation::Add(AddOperation::new()), vec![], &[references[0].read()?, one])?
+                .remove(0);
+            references[0].write(&second)
+        })
+        .unwrap();
+        let values = (0..67).map(|index| index as f32 - 20.0).collect::<Vec<_>>();
+        KernelCase {
+            name: "alias",
+            definition,
+            input_types: vec![r#type],
+            inputs: vec![values.clone()],
+            expected: values.into_iter().map(|value| value + 2.0).collect(),
+        }
+    }
+
+    /// Uses the selected adapter, then disables compilation before manifest and executable restoration.
+    fn execute_case<'c>(
+        client: &'c crate::Client<'c>,
+        case: KernelCase,
+        repeated_input: bool,
+    ) -> Result<(), XlaDomainError> {
+        if case.name != "assertion_failure" {
+            interpret_case(&case);
+        }
+        let device = client.addressable_devices().unwrap().remove(0);
+        let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+            panic!("missing CUDA compute capability")
+        };
+        let (major, minor) = capability.split_once('.').unwrap();
+        let target = Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let python = PathBuf::from(
+            env::var_os("RYFT_CUTILE_PYTHON").expect("`RYFT_CUTILE_PYTHON` must name the pinned compiler Python"),
+        );
+        let compiler = Compiler::new(python).with_cancellation(Arc::clone(&cancellation));
+        let schedule = KernelSchedule::default();
+        let options = Options::default();
+        eprintln!("cuTile {}: semantic={:x}", case.name, Sha256::digest(case.definition.semantic_key().unwrap()));
+        let verified = VerifiedKernel::new(&case.definition, 1024).unwrap();
+        let output = verified.compile(&compiler, &target, &options, &schedule).unwrap();
+        let binding =
+            XlaKernelCompilerBinding::new(compiler, target, options, schedule, CuTileEmbedding, 1024).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        let producer = Arc::new(XlaSession::new(client));
+        let domain = producer.domain();
+        let staged = domain
+            .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+                |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
+                    Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
+                },
+                vec![],
+                case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+                ryft_xla::XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+            ))
+            .unwrap();
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let executable_bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        cancellation.store(true, Ordering::Release);
+        let restored_output =
+            CompiledKernel::from_manifest(&verified, output.manifest(), output.artifact().bytes().to_vec()).unwrap();
+        assert_eq!(restored_output.artifact().bytes(), output.artifact().bytes());
+        assert_eq!(restored_output.arguments(), output.arguments());
+        let runtime_session = Arc::new(XlaSession::new(client));
+        let runtime = runtime_session.domain();
+        let restored = runtime.deserialize_program(&executable_bytes).unwrap().unwrap();
+        let executable = compiled
+            .executable_function()
+            .with_compiled_program(Arc::new(restored), compiled.executable_function().output_types().to_vec());
+        let mut arrays = case
+            .input_types
+            .iter()
+            .zip(&case.inputs)
+            .map(|(r#type, values)| {
+                runtime_session
+                    .array(
+                        r#type.clone(),
+                        mesh.clone(),
+                        values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        if repeated_input {
+            arrays[1] = arrays[0].clone();
+        }
+        let original = arrays[0].clone();
+        let results = call_function(&runtime, &executable, arrays.into_iter().map(ArrayIrValue::Array).collect())?;
+        let ArrayIrValue::Array(result) = &results[0] else { panic!("kernel output must be an array") };
+        let bytes =
+            result.device_shard(device.id().unwrap()).unwrap().buffer().unwrap().copy_to_host(None)?.r#await()?;
+        let values = bytes
+            .chunks_exact(size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, case.expected, "{}", case.name);
+        let original_bytes = original
+            .device_shard(device.id().unwrap())
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        let original_values = original_bytes
+            .chunks_exact(size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(original_values, case.inputs[0], "live input for {}", case.name);
+        eprintln!(
+            "cuTile {}: cubin={:x}; manifest={:x}; executable={:x}; Python disabled before reload",
+            case.name,
+            Sha256::digest(output.artifact().bytes()),
+            Sha256::digest(output.manifest()),
+            Sha256::digest(&executable_bytes)
+        );
+        if let Some(directory) = env::var_os("RYFT_CUTILE_ARTIFACT_DIRECTORY") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let name = if repeated_input { "repeated_input" } else { case.name };
+            std::fs::write(directory.join(format!("{name}.cubin")), output.artifact().bytes()).unwrap();
+            std::fs::write(directory.join(format!("{name}.json")), output.manifest()).unwrap();
+            std::fs::write(directory.join(format!("{name}.executable")), executable_bytes).unwrap();
+        }
+        Ok(())
+    }
+
+    /// Selects the pinned CUDA platform explicitly; an enabled GPU request cannot pass without executing it.
+    fn run(name: &str, repeated_input: bool) {
+        if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        assert!(cfg!(feature = "cuda-13"), "cuTile qualification requires the `cuda-13` feature");
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let mut case = if name == "alias" {
+                    alias_case()
+                } else if name == "batched_vector_add" {
+                    batched_case()
+                } else if name == "matmul_precision" {
+                    precision_case()
+                } else {
+                    kernel_cases().into_iter().find(|case| case.name == name).unwrap()
+                };
+                if repeated_input {
+                    case.inputs[1] = case.inputs[0].clone();
+                    case.expected = case.inputs[0].iter().map(|value| value * 2.0).collect();
+                }
+                execute_case(&client, case, repeated_input).unwrap();
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled cuTile qualification did not execute a CUDA platform");
+    }
+
+    #[test]
+    fn test_vector_add_on_cuda() {
+        run("vector_add", false);
+    }
+
+    #[test]
+    fn test_sum_on_cuda() {
+        run("sum", false);
+    }
+
+    #[test]
+    fn test_matmul_on_cuda() {
+        run("matmul", false);
+    }
+
+    #[test]
+    fn test_matmul_precision_on_cuda() {
+        run("matmul_precision", false);
+    }
+
+    #[test]
+    fn test_batched_vector_add_on_cuda() {
+        run("batched_vector_add", false);
+    }
+
+    #[test]
+    fn test_alias_on_cuda() {
+        run("alias", false);
+    }
+
+    #[test]
+    fn test_repeated_input_on_cuda() {
+        run("vector_add", true);
+    }
+
+    #[test]
+    fn test_shard_map_on_cuda() {
+        use ryft_core::{ProjectedValue, Sharding, ShardingDimension, Typed};
+        use ryft_xla::experimental::{ShardMapTracer, shard_map};
+        use ryft_xla::{CompiledXlaFunction, XlaCompileTracer, XlaOptions, compile_with_options};
+
+        if env::var("RYFT_PJRT_RUN_CUTILE_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        assert!(cfg!(feature = "cuda-13"), "cuTile qualification requires the `cuda-13` feature");
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                    panic!("missing CUDA compute capability")
+                };
+                let (major, minor) = capability.split_once('.').unwrap();
+                let target = Target::new(major.parse().unwrap(), minor.parse().unwrap()).unwrap();
+                let compiler = Compiler::new(PathBuf::from(env::var_os("RYFT_CUTILE_PYTHON").unwrap()));
+                let binding = XlaKernelCompilerBinding::new(
+                    compiler,
+                    target,
+                    Options::default(),
+                    KernelSchedule::default(),
+                    CuTileEmbedding,
+                    1024,
+                )
+                .unwrap();
+                let logical_mesh =
+                    LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Manual).unwrap()]).unwrap();
+                let sharding =
+                    Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
+                let r#type = ArrayType::new_static(DataType::F32, [17]).with_sharding(sharding.clone()).unwrap();
+                let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::from_pjrt(&device).unwrap()]).unwrap();
+                let session = Arc::new(XlaSession::new(&client));
+                let domain = session.domain();
+                let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_options(
+                    |input: XlaCompileTracer<'_>| {
+                        shard_map::<_, _, ArrayType, _>(
+                            |local: ShardMapTracer| {
+                                let local_type = local.r#type().into_owned();
+                                let definition: KernelDefinition = KernelDefinition::trace(
+                                    KernelCallOperation::new(
+                                        Grid::new(vec![]).unwrap(),
+                                        vec![
+                                            whole_array_parameter(local_type.clone(), KernelParameterAccess::ReadWrite)
+                                                .unwrap(),
+                                        ],
+                                    )
+                                    .unwrap(),
+                                    |(references, _)| references[0].write(&references[0].read()?),
+                                )
+                                .unwrap();
+                                let value = local.into_value();
+                                let output =
+                                    stage_kernel(value.context(), &definition, &[value.clone()]).unwrap().remove(0);
+                                ProjectedValue::new(output, local_type)
+                            },
+                            input,
+                            logical_mesh.clone(),
+                            sharding.clone(),
+                            sharding.clone(),
+                        )
+                        .unwrap()
+                    },
+                    r#type.clone(),
+                    &domain,
+                    XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+                )
+                .unwrap();
+                let expected = (0..17).map(|value| value as f32 - 8.0).collect::<Vec<_>>();
+                let input = session
+                    .array(r#type, mesh, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>())
+                    .unwrap();
+                let output = domain.interpret(&compiled.executable_function(), input).unwrap();
+                let bytes = output
+                    .device_shard(device.id().unwrap())
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                let actual = bytes
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled cuTile shard-map qualification did not execute CUDA");
+    }
+
+    #[test]
+    #[ignore = "device assertion failure must run in a separate process after positive GPU tests"]
+    fn test_assertion_failure_on_cuda() {
+        use ryft_core::{
+            ArrayIrOperation, ConvertElementTypeOperation, DimensionBounds, DimensionFromScalarOperation,
+            DimensionVariable,
+        };
+
+        assert_eq!(env::var("RYFT_PJRT_RUN_CUTILE_ASSERTION_FAILURE").as_deref(), Ok("1"));
+        assert!(cfg!(feature = "cuda-13"), "cuTile qualification requires the `cuda-13` feature");
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let r#type = ArrayType::scalar(DataType::F32);
+                let call = KernelCallOperation::new(
+                    Grid::new(vec![]).unwrap(),
+                    vec![whole_array_parameter(r#type.clone(), KernelParameterAccess::ReadWrite).unwrap()],
+                )
+                .unwrap();
+                let definition = KernelDefinition::trace(call, |(references, _)| {
+                    let context = references[0].context();
+                    let value = references[0].read()?;
+                    let integer = context
+                        .bind(
+                            ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false)),
+                            vec![],
+                            &[value.clone()],
+                        )?
+                        .remove(0);
+                    context.bind(
+                        ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(
+                            DimensionVariable::new("checked", DimensionBounds::new(0, Some(2))?),
+                        )),
+                        vec![],
+                        &[integer],
+                    )?;
+                    references[0].write(&value)
+                })
+                .unwrap();
+                let error = execute_case(
+                    &client,
+                    KernelCase {
+                        name: "assertion_failure",
+                        definition,
+                        input_types: vec![r#type],
+                        inputs: vec![vec![-1.0]],
+                        expected: vec![],
+                    },
+                    false,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("CUDA_ERROR_ASSERT")
+                        || error.contains("CUDA_ERROR_LAUNCH_FAILED")
+                        || error.contains("CUDA_ERROR_ILLEGAL_INSTRUCTION"),
+                    "{error}",
+                );
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled cuTile assertion qualification did not execute CUDA");
     }
 }

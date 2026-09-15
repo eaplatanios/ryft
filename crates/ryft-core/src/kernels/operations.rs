@@ -9,23 +9,26 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView, ArrayType, DimensionOperation,
-    DimensionType, DimensionValue, ReferenceDynamicIndexOperation, ReferenceIndexOperation, ReferenceSliceOperation,
-    reapply_array_reference_view, validate_array_reference_view,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArrayType,
+    DimensionOperation, DimensionType, DimensionValue, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
+    ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::kernels::calls::KernelCallOperation;
+use crate::kernels::calls::{KernelCallOperation, KernelDefinition};
 use crate::kernels::indexing::TileLoadOperation;
 use crate::kernels::memory::{
     AsyncCopyOperation, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation, ScratchOperation, WaitOperation,
 };
 use crate::kernels::validation::KernelReferenceOperation;
 use crate::operations::{
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+    ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation,
 };
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
+};
 use crate::programs::{
     Effects, InputRegionProvenance, Operation, OperationProjection, OutputRegionProvenance, ProgramError,
     ReferenceAccessMode, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, RegionSlot, Type,
@@ -468,11 +471,45 @@ where
     }
 }
 
-impl<C: Context, Extension: Operation<Type = ArrayIrType>> PartiallyEvaluatableOperation<C>
-    for KernelOperation<Extension>
+impl<C, Extension: KernelExtension> PartiallyEvaluatableOperation<C> for KernelOperation<Extension>
 where
-    Self: Into<C::Operation>,
+    C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = Self>,
 {
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let regions = driver.regions().map(|region| region.to_program()).collect();
+        if let Self::Call(call) = self {
+            // Only concrete scalar-prefetch values specialize the call. Ordinary data inputs remain residual,
+            // even when known: static transforms must never execute a kernel's mutations.
+            if !call.prefetch_types().is_empty() {
+                let remaining = inputs.len() - call.prefetch_types().len();
+                let values = inputs[remaining..]
+                    .iter()
+                    .map(|input| match context.parent().resolve(input.as_known()?).into_constant()? {
+                        ArrayIrValue::Array(array) => Some(array),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(values) = values {
+                    let definition = KernelDefinition::new(call.clone(), driver.region(0)?.to_program())
+                        .and_then(|definition| definition.specialize_prefetch(&values))
+                        .map_err(ProgramError::custom)?;
+                    return context.residualize(
+                        Self::Call(definition.operation().clone()),
+                        vec![definition.body().clone()],
+                        &inputs[..remaining],
+                    );
+                }
+            }
+            context.residualize(self.clone(), regions, inputs)
+        } else {
+            context.fold_or_residualize(self.clone(), regions, inputs)
+        }
+    }
 }
 
 impl<Extension> ReferenceViewOperation for KernelOperation<Extension>
@@ -530,6 +567,9 @@ kernel_operation_from!(
     ArrayIrOperation<Array>,
     ArrayOperation<Array>,
     DimensionOperation<DimensionValue>,
+    ConstantOperation<DimensionValue>,
+    DimensionSizeOperation,
+    DynamicBroadcastOperation,
     ReferenceNewOperation<ArrayType, ArrayIrType>,
     ReferenceReadOperation<ArrayType, ArrayIrType>,
     ReferenceWriteOperation<ArrayType, ArrayIrType>,
@@ -840,5 +880,72 @@ mod tests {
                 "cannot project extension operation `unavailable_extension` into a canonical reference swap",
             )),
         );
+    }
+    #[test]
+    fn test_kernel_operation_partially_evaluate() {
+        use crate::arrays::{DimensionBounds, DimensionVariable};
+        use crate::kernels::calls::KernelParameter;
+        use crate::kernels::grids::Grid;
+        use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
+        use crate::kernels::validation::KernelParameterAccess;
+        use crate::operations::ReferenceWrite;
+        use crate::parameters::Placeholder;
+        use crate::partial::{PartialEvaluationOutput, PartialValue};
+        use crate::programs::ProgramBuilder;
+
+        let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        mapping.add_input(
+            DimensionType::new(DimensionVariable::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()))
+                .into(),
+        );
+        let call = KernelCallOperation::new_with_prefetch(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                KernelParameter::new(
+                    ArrayType::scalar(DataType::I32),
+                    KernelParameterAccess::WriteOnly,
+                    BlockMapping::new(
+                        mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
+                        vec![],
+                        BoundaryPolicy::InBounds,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ],
+            vec![ArrayType::scalar(DataType::I32)],
+        )
+        .unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace_with_prefetch(call, |(references, _, values)| references[0].write(&values[0]))
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let region = builder.import_region(definition.body().entry_region_ref());
+        let outputs = builder
+            .add_instruction(KernelOperation::Call(definition.operation().clone()), vec![region], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let value = ArrayIrValue::Array(Array::scalar(2i32).unwrap());
+        let evaluation = program.partially_evaluate(&[PartialValue::Known(value.clone())]).unwrap();
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(evaluation.program().instructions().len(), 1);
+        assert!(evaluation.program().input_types().is_empty());
+        let KernelOperation::Call(specialized) = evaluation.program().instructions()[0].operation() else {
+            panic!("expected a residual kernel call");
+        };
+        assert!(specialized.prefetch_types().is_empty());
+        assert!(specialized.parameters()[0].mapping().program().input_types().is_empty());
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]).unwrap(), vec![value]);
+        let unknown = program
+            .partially_evaluate(&[PartialValue::Unknown(ArrayType::scalar(DataType::I32).into())])
+            .unwrap();
+        let KernelOperation::Call(residual) = unknown.program().instructions()[0].operation() else {
+            panic!("expected a residual kernel call");
+        };
+        assert_eq!(residual.prefetch_types(), definition.operation().prefetch_types());
     }
 }

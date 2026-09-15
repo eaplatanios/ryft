@@ -18,6 +18,7 @@ pub mod memory;
 pub mod operations;
 pub mod scheduling;
 pub mod serialization;
+pub mod transforms;
 pub mod validation;
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub use memory::{
 pub use operations::{KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension};
 pub use scheduling::{KernelInterleaving, KernelSchedulingError};
 pub use serialization::KernelSerializationError;
+pub use transforms::KernelTransformError;
 
 pub use validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelParameterSummary, KernelReferenceOperation,

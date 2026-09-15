@@ -16,39 +16,40 @@ use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
-    AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy,
-    ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView, ArrayReferenceViewOperation, ArrayType,
-    Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext,
-    BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference,
-    CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
-    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CotangentDestinationKind,
-    CotangentDestinations, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
-    CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation,
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
-    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
-    DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation,
-    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
-    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
-    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
-    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
-    ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
-    ReferenceSwapOperation, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation,
-    RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
-    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
-    discharge_positional_region_operation, reapply_array_reference_view, validate_array_reference_view,
+    AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView,
+    ArrayReferenceViewOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
+    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
+    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CompareOperation, CompiledCallOperation,
+    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
+    CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeLogSumExpOperation,
+    CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
+    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension,
+    DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation,
+    LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation,
+    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    Operation, OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation,
+    ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceViewOperation,
+    ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
+    ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
+    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
+    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -244,7 +245,7 @@ impl Concretizable<bool> for XlaConstant {
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(crate = "ryft_core", type = ArrayIrType, constant = Constant)]
 #[ryft(members(ArrayType, structural(DimensionType)))]
-#[ryft(dispatch(discharge, differentiation, transposition))]
+#[ryft(dispatch(discharge, batching, differentiation, transposition))]
 pub enum XlaOperation<Constant = XlaConstant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -269,7 +270,7 @@ where
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed composite carrier when an
     /// array operation is lifted into this family.
     #[ryft(projected(ArrayType), skip_from)]
-    Array(ArrayOperation<Constant::Projected>),
+    Array(ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>),
 
     /// Homogeneous first-class-dimension operation.
     #[ryft(projected(DimensionType, structural))]
@@ -1050,6 +1051,50 @@ where
 // client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
 // staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
 // `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<Self>,
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
+        if axes.iter().all(BatchAxis::is_replicated) {
+            return Ok(context
+                .parent()
+                .bind(
+                    *self,
+                    vec![driver.region(0)?.to_program()],
+                    &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayIrBatch::replicated)
+                .collect::<Vec<_>>()
+                .into());
+        }
+        // The canonical composite transform threads one leading dimension through the callee. Treat it as an
+        // additional explicit capture and remove only its bookkeeping output; the original capture order remains.
+        let (callee, axes) = driver
+            .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
+        let mut values = vec![context.axis_extent().clone()];
+        values.extend(inputs.iter().map(|input| input.value().clone()));
+        let mut outputs = context.parent().bind(Self::new(self.capture_count() + 1), vec![callee], &values)?;
+        check_count!("output", outputs, axes.len() + 1, ProgramError);
+        outputs.remove(0);
+        Ok(outputs
+            .into_iter()
+            .zip(axes)
+            .map(|(value, axis)| ArrayIrBatch::new(value, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
+    }
+}
+
 impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
@@ -2009,6 +2054,44 @@ mod tests {
                 .unwrap(),
             vec![array_type, dimension_type],
         );
+    }
+
+    #[test]
+    fn test_jit_call_operation_batch() {
+        use ryft_core::batching::RecursiveBatchingDriver;
+        use ryft_core::{ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, CalleeRegionDriver};
+
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let callees = [Arc::new(callee)];
+        let regions = CalleeRegionDriver::new(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(XlaConstant::Dimension(DimensionValue::constant(3).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let (outputs, _) = JitCallOperation::<ArrayIrType>::new(0)
+                    .batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?
+                    .into_parts();
+                Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
+            },
+            vec![vector.clone()],
+        )
+        .unwrap();
+        assert_eq!(program.input_types(), vec![vector.clone()]);
+        assert_eq!(program.output_types(), vec![vector]);
+        let XlaOperation::JitCall(call) = program.instructions()[0].operation() else {
+            panic!("expected jit_call");
+        };
+        assert_eq!(call.capture_count(), 1);
+        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
+        assert_eq!(body.input_types().len(), 2);
+        assert_eq!(body.output_ids()[0], body.input_ids()[0]);
     }
 
     #[test]

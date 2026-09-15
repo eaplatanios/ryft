@@ -1,20 +1,21 @@
-//! CUDA pointer-ABI embedding and validated payload reconstruction.
+//! CUDA array/scalar ABI embedding and validated payload reconstruction.
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use std::sync::OnceLock;
 
 use ryft_core::kernels::{KernelParameterAccess, VerifiedKernel};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::{ArrayIrType, DataType, Memory, Operation, Typed};
-#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-use ryft_cuda::CudaKernelLauncher;
+use ryft_core::{ArrayIrType, DataType, EffectClass, Memory, Operation, Typed};
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
+    CudaScalarType,
 };
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_cuda::{CudaKernelArgument, CudaKernelLauncher, CudaScalarValue};
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::{
-    FfiAttribute, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
-    FfiTypeInformation, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    FfiAttribute, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
+    FfiOutput, FfiTypeInformation, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
 };
 use ryft_pjrt::extensions::ffi::{FfiTypeId, FfiUserData};
 use ryft_pjrt::{Client, ExecutionContext};
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ToPjrt;
-use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
+use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_layouts};
 
 /// Registered handler for versioned ready CUDA artifacts embedded in StableHLO.
 pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
@@ -31,7 +32,7 @@ pub const CUDA_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.cuda";
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 static CUDA_RUNTIME_REGISTRATION: OnceLock<Result<FfiTypeId, ryft_pjrt::Error>> = OnceLock::new();
 
-/// Custom-call buffer supplying one physical CUDA pointer argument.
+/// Custom-call buffer supplying one logical CUDA array parameter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CudaKernelBufferBinding {
     /// Read-only custom-call operand at the specified index.
@@ -41,13 +42,34 @@ pub enum CudaKernelBufferBinding {
     Output(usize),
 }
 
-/// XLA embedding of a ready [`CudaKernelArtifact`] whose parameters are array pointers.
+/// Physical CUDA argument supplied by a logical array or an exact static scalar.
 ///
-/// `parameter_order` maps each physical CUDA argument to a logical kernel parameter. The complete permutation is
-/// required: read-only parameters use custom-call operands, writable parameters use custom-call results, and
-/// read-write parameters also carry their canonical operand/result alias. This baseline rejects scalar-expanded
-/// ABIs instead of inventing shape/stride arguments. A compiler-specific bridge can implement
-/// [`KernelOutputEmbedding`] for a richer adapter-owned output without changing the CUDA artifact contract.
+/// Array indices refer to [`KernelCallOperation::parameters`](ryft_core::kernels::KernelCallOperation::parameters),
+/// including read-write parameters. Scalars are copied into each launch frame and never read from device memory.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CudaKernelParameterBinding {
+    /// Device address of the indexed logical kernel parameter.
+    Array(usize),
+
+    /// Static signed 32-bit argument, including compiler-declared shape and stride values.
+    I32(i32),
+}
+
+impl CudaKernelParameterBinding {
+    /// Returns the canonical CUDA ABI type required by this physical argument.
+    fn parameter_type(self) -> CudaKernelParameterType {
+        match self {
+            Self::Array(_) => CudaKernelParameterType::DevicePointer,
+            Self::I32(_) => CudaKernelParameterType::Scalar(CudaScalarType::I32),
+        }
+    }
+}
+
+/// XLA embedding of a ready [`CudaKernelArtifact`] with array pointers and static scalar arguments.
+///
+/// Every logical array must appear exactly once in the physical parameter bindings. Read-only arrays use custom-call
+/// operands; writable arrays use results, and read-write arrays retain their canonical operand/result alias. Static
+/// scalars expand a compiler-owned ABI without adding logical array parameters or a second launch path.
 ///
 /// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the session-owned native handler. The XLA domain initializes
 /// its launcher during compilation and reload, supplies execution-context user data at submission, and retains
@@ -58,17 +80,29 @@ pub struct CudaKernelEmbedding {
     /// Registered XLA FFI target that decodes this envelope.
     target_name: String,
 
-    /// Physical argument index to logical parameter index.
-    parameter_order: Vec<usize>,
+    /// Physical argument sources, in canonical CUDA ABI order.
+    parameters: Vec<CudaKernelParameterBinding>,
+
+    /// Whether the compiled ABI requires complete dense row-major buffer layouts.
+    row_major_layouts: bool,
+
+    /// Whether the native kernel implements ordered device assertions with trailing FFI token slots.
+    assertions: bool,
 }
 
 impl CudaKernelEmbedding {
     /// Creates a pointer-ABI mapping for an explicitly selected registered target.
     pub fn new(target_name: String, parameter_order: Vec<usize>) -> Self {
-        Self { target_name, parameter_order }
+        Self::from_parameters(target_name, parameter_order.into_iter().map(CudaKernelParameterBinding::Array).collect())
     }
 
-    /// Reconstructs and validates a serialized CUDA artifact and its pointer mapping before any native loading.
+    /// Creates an array/scalar mapping for an explicitly selected registered target.
+    /// The complete logical signature and physical ABI are validated when the artifact is embedded.
+    pub fn from_parameters(target_name: String, parameters: Vec<CudaKernelParameterBinding>) -> Self {
+        Self { target_name, parameters, row_major_layouts: false, assertions: false }
+    }
+
+    /// Reconstructs and validates a serialized CUDA artifact and its argument mapping before any native loading.
     /// Unknown versions, corruption, invalid canonical artifact metadata, and disagreement with the verified
     /// logical signature or buffer mapping are rejected. This does not invoke a compiler or load native code.
     pub fn from_custom_call<Extension: Operation<Type = ArrayIrType>>(
@@ -90,19 +124,19 @@ impl CudaKernelEmbedding {
             return Err(KernelEmbeddingError::Invalid { message: "cuda payload digest mismatch".to_owned() });
         }
         let envelope: CudaEnvelope = serde_json::from_str(payload)?;
-        if envelope.version != 1 {
+        if envelope.version != 2 {
             return Err(KernelEmbeddingError::Invalid {
                 message: format!("unsupported CUDA embedding schema `{}`", envelope.version),
             });
         }
-        if envelope.argument_bindings.len() != envelope.parameter_order.len() {
+        if envelope.argument_bindings.len() != envelope.parameter_types.len() {
             return Err(KernelEmbeddingError::Invalid {
                 message: "cuda buffer binding count differs from its physical ABI".to_owned(),
             });
         }
         for binding in &envelope.argument_bindings {
             let valid = match binding {
-                CudaKernelBufferBinding::Input(index) => *index < envelope.parameter_order.len(),
+                CudaKernelBufferBinding::Input(index) => *index < envelope.input_count,
                 CudaKernelBufferBinding::Output(index) => *index < operation.output_types().len(),
             };
             if !valid {
@@ -111,7 +145,9 @@ impl CudaKernelEmbedding {
                 });
             }
         }
-        let embedding = Self::new(operation.target_name().to_owned(), envelope.parameter_order.clone());
+        let embedding = Self::from_parameters(operation.target_name().to_owned(), envelope.parameters.clone())
+            .with_row_major_layouts(envelope.row_major_layouts)
+            .with_assertions(envelope.assertions);
         if embedding.argument_bindings(kernel)? != envelope.argument_bindings {
             return Err(KernelEmbeddingError::Invalid {
                 message: "cuda buffer bindings differ from the logical kernel signature".to_owned(),
@@ -119,7 +155,8 @@ impl CudaKernelEmbedding {
         }
         let artifact = envelope.artifact()?;
         let expected = embedding.custom_call(kernel, &artifact)?;
-        if operation.output_types() != expected.output_types()
+        if operation.effect_class() != expected.effect_class()
+            || operation.output_types() != expected.output_types()
             || operation.input_output_aliases() != expected.input_output_aliases()
             || expected.attributes().iter().any(|attribute| !operation.attributes().contains(attribute))
         {
@@ -130,17 +167,46 @@ impl CudaKernelEmbedding {
         Ok((embedding, artifact))
     }
 
-    /// Returns the physical argument to logical parameter permutation.
-    pub fn parameter_order(&self) -> &[usize] {
-        &self.parameter_order
+    /// Returns the physical argument sources in CUDA ABI order.
+    pub fn parameters(&self) -> &[CudaKernelParameterBinding] {
+        &self.parameters
     }
 
-    /// Resolves each physical pointer to the existing custom-call input/result buffer slots.
+    /// Requires dense row-major layouts for all logical buffers, including arrays without an explicit layout.
+    /// This is part of the compiler ABI and is preserved through executable serialization.
+    pub fn with_row_major_layouts(mut self, required: bool) -> Self {
+        self.row_major_layouts = required;
+        self
+    }
+
+    /// Declares that the native artifact implements every ordered assertion in the verified body. XLA supplies
+    /// trailing input/result tokens, while the shared CUDA handler submits work on the invocation stream. Device
+    /// failures propagate through the existing whole-execution fence; tokens are never passed as kernel arguments.
+    pub fn with_assertions(mut self, enabled: bool) -> Self {
+        self.assertions = enabled;
+        self
+    }
+
+    /// Resolves each logical array, in declaration order, to the existing custom-call input/result buffer slots.
     /// Writable arguments use results so input liveness and donation remain XLA's ordinary functional alias policy.
     pub fn argument_bindings<Extension: Operation<Type = ArrayIrType>>(
         &self,
         kernel: &VerifiedKernel<'_, Extension>,
     ) -> Result<Vec<CudaKernelBufferBinding>, KernelEmbeddingError> {
+        let mut sorted = self
+            .parameters
+            .iter()
+            .filter_map(|parameter| match parameter {
+                CudaKernelParameterBinding::Array(index) => Some(*index),
+                CudaKernelParameterBinding::I32(_) => None,
+            })
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        if sorted != (0..kernel.definition().operation().parameters().len()).collect::<Vec<_>>() {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "cuda pointer mapping must name every logical parameter exactly once".to_owned(),
+            });
+        }
         let mut input = 0;
         let mut output = 0;
         let logical = kernel
@@ -167,14 +233,7 @@ impl CudaKernelEmbedding {
                 }
             })
             .collect::<Vec<_>>();
-        self.parameter_order
-            .iter()
-            .map(|&parameter| {
-                logical.get(parameter).copied().ok_or_else(|| KernelEmbeddingError::Invalid {
-                    message: format!("cuda mapping references missing logical parameter `{parameter}`"),
-                })
-            })
-            .collect()
+        Ok(logical)
     }
 }
 
@@ -182,7 +241,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
     for CudaKernelEmbedding
 {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
-        Ok(serde_json::to_vec(&(1u32, &self.target_name, &self.parameter_order))?)
+        Ok(serde_json::to_vec(&(2u32, &self.target_name, &self.parameters, self.row_major_layouts, self.assertions))?)
     }
 
     fn custom_call(
@@ -191,16 +250,17 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
         output: &CudaKernelArtifact,
     ) -> Result<CustomCallOperation, KernelEmbeddingError> {
         let logical = kernel.definition().operation();
-        let mut sorted = self.parameter_order.clone();
-        sorted.sort_unstable();
-        if sorted != (0..logical.parameters().len()).collect::<Vec<_>>() {
+        if !logical.prefetch_types().is_empty() {
             return Err(KernelEmbeddingError::Invalid {
-                message: "cuda pointer mapping must name every logical parameter exactly once".to_owned(),
+                message: "cuda embedding requires scalar prefetch specialization".to_owned(),
             });
         }
-        if output.abi().parameters() != vec![CudaKernelParameterType::DevicePointer; self.parameter_order.len()] {
+        let argument_bindings = self.argument_bindings(kernel)?;
+        if output.abi().parameters()
+            != self.parameters.iter().map(|parameter| parameter.parameter_type()).collect::<Vec<_>>()
+        {
             return Err(KernelEmbeddingError::Invalid {
-                message: "cuda artifact ABI does not match the declared pointer mapping".to_owned(),
+                message: "cuda artifact ABI does not match the declared parameter mapping".to_owned(),
             });
         }
         for parameter in logical.parameters() {
@@ -217,9 +277,24 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
                 });
             }
         }
+        if self.row_major_layouts {
+            let inputs = logical
+                .parameters()
+                .iter()
+                .filter(|parameter| parameter.access() != KernelParameterAccess::WriteOnly)
+                .map(|parameter| parameter.r#type().into_owned())
+                .collect::<Vec<_>>();
+            let outputs = logical
+                .parameters()
+                .iter()
+                .filter(|parameter| parameter.access() != KernelParameterAccess::ReadOnly)
+                .map(|parameter| parameter.r#type().into_owned())
+                .collect::<Vec<_>>();
+            dense_memory_layouts(&inputs, &outputs, "cuda kernel")?;
+        }
         let launch = output.launch_dimensions();
         let envelope = CudaEnvelope {
-            version: 1,
+            version: 2,
             format: match output.format() {
                 CudaArtifactFormat::Cubin => "cubin",
                 CudaArtifactFormat::Ptx => "ptx",
@@ -233,18 +308,22 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
             grid: launch.grid(),
             block: launch.block(),
             shared_memory_bytes: launch.dynamic_shared_memory_bytes(),
-            parameter_order: self.parameter_order.clone(),
-            argument_bindings: self.argument_bindings(kernel)?,
+            parameters: self.parameters.clone(),
+            row_major_layouts: self.row_major_layouts,
+            assertions: self.assertions,
+            argument_bindings,
             input_count: logical
                 .parameters()
                 .iter()
                 .filter(|parameter| parameter.access() != KernelParameterAccess::WriteOnly)
-                .count(),
+                .count()
+                + usize::from(self.assertions),
             output_count: logical
                 .parameters()
                 .iter()
                 .filter(|parameter| parameter.access() != KernelParameterAccess::ReadOnly)
-                .count(),
+                .count()
+                + usize::from(self.assertions),
             parameter_types: logical
                 .parameters()
                 .iter()
@@ -269,6 +348,12 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKernelA
         )
         .with_attribute("ryft.cuda.sha256", format!("{:x}", Sha256::digest(payload.as_bytes())))
         .with_attribute("ryft.cuda.payload", payload);
+        if self.row_major_layouts {
+            operation = operation.with_attribute("ryft.cuda.row_major", true);
+        }
+        if self.assertions {
+            operation = operation.with_effect_class(EffectClass::OrderedAssertion);
+        }
         for (output, input) in logical.aliases() {
             operation = operation.with_input_output_alias(input, output)?;
         }
@@ -311,36 +396,67 @@ struct CudaEnvelope {
     /// Dynamic shared-memory byte count.
     shared_memory_bytes: u32,
 
-    /// Physical pointer arguments mapped to logical kernel parameters.
-    parameter_order: Vec<usize>,
+    /// Physical argument sources, with array indices in logical declaration order.
+    parameters: Vec<CudaKernelParameterBinding>,
 
-    /// Physical pointers resolved to canonical custom-call buffer slots.
+    /// Whether native indexing requires complete dense row-major layouts.
+    row_major_layouts: bool,
+
+    /// Whether the native kernel implements ordered device assertions with trailing FFI token slots.
+    assertions: bool,
+
+    /// Logical arrays resolved to canonical custom-call buffer slots.
     argument_bindings: Vec<CudaKernelBufferBinding>,
 
     /// Exact logical element types and static shapes used to validate native FFI buffers.
     parameter_types: Vec<(String, Vec<usize>)>,
 
-    /// Exact custom-call operand count, including entering read-write arrays.
+    /// Exact FFI operand count, including entering read-write arrays and an optional trailing assertion token.
     input_count: usize,
 
-    /// Exact custom-call result count, including updated read-write arrays.
+    /// Exact FFI result count, including updated read-write arrays and an optional trailing assertion token.
     output_count: usize,
 }
 
 impl CudaEnvelope {
+    /// Checks physical FFI counts and trailing assertion tokens before accessing the execution context.
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    fn validate_frame(&self, frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+        if frame.input_count() != self.input_count || frame.output_count() != self.output_count {
+            return Err(FfiError::invalid_argument("cuda frame buffer counts differ from the declared signature"));
+        }
+        if self.assertions {
+            let FfiInput::Buffer { buffer: input } = frame.input(self.input_count - 1)?;
+            let FfiOutput::Buffer { buffer: output } = frame.output(self.output_count - 1)?;
+            if input.element_type() != FfiBufferType::Token || output.element_type() != FfiBufferType::Token {
+                return Err(FfiError::invalid_argument("cuda assertion ABI requires trailing input and result tokens"));
+            }
+        }
+        Ok(())
+    }
+
     /// Reconstructs the canonical driver artifact after validating the versioned envelope.
     fn artifact(&self) -> Result<CudaKernelArtifact, KernelEmbeddingError> {
-        if self.version != 1
-            || self.argument_bindings.len() != self.parameter_order.len()
-            || self.parameter_types.len() != self.parameter_order.len()
-        {
+        if self.version != 2 || self.argument_bindings.len() != self.parameter_types.len() {
             return Err(KernelEmbeddingError::Invalid {
                 message: "invalid cuda embedding schema or parameter count".to_owned(),
             });
         }
-        let mut order = self.parameter_order.clone();
+        if self.assertions && (self.input_count == 0 || self.output_count == 0) {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "cuda assertion ABI requires trailing input and result tokens".to_owned(),
+            });
+        }
+        let mut order = self
+            .parameters
+            .iter()
+            .filter_map(|parameter| match parameter {
+                CudaKernelParameterBinding::Array(index) => Some(*index),
+                CudaKernelParameterBinding::I32(_) => None,
+            })
+            .collect::<Vec<_>>();
         order.sort_unstable();
-        if order != (0..order.len()).collect::<Vec<_>>() {
+        if order != (0..self.parameter_types.len()).collect::<Vec<_>>() {
             return Err(KernelEmbeddingError::Invalid {
                 message: "cuda parameter order is not a permutation".to_owned(),
             });
@@ -353,7 +469,7 @@ impl CudaEnvelope {
         let abi = CudaKernelAbi::new(
             self.abi_schema.clone(),
             self.abi_version,
-            vec![CudaKernelParameterType::DevicePointer; self.parameter_order.len()],
+            self.parameters.iter().map(|parameter| parameter.parameter_type()).collect::<Vec<_>>(),
         )?;
         let launch = CudaKernelLaunchDimensions::new(self.grid, self.block, self.shared_memory_bytes)?;
         Ok(CudaKernelArtifact::new(
@@ -447,9 +563,7 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     let envelope: CudaEnvelope =
         serde_json::from_str(payload).map_err(|error| FfiError::invalid_argument(error.to_string()))?;
     let artifact = envelope.artifact().map_err(|error| FfiError::invalid_argument(error.to_string()))?;
-    if frame.input_count() != envelope.input_count || frame.output_count() != envelope.output_count {
-        return Err(FfiError::invalid_argument("cuda frame buffer counts differ from the declared signature"));
-    }
+    envelope.validate_frame(frame)?;
     let context = frame.context()?;
     let type_id = CUDA_RUNTIME_REGISTRATION
         .get()
@@ -464,7 +578,7 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     // waits every whole-program execution before destruction, including dropped output handles.
     let runtime = unsafe { &*data.cast::<CudaKernelRuntime>() };
     let mut buffers = Vec::with_capacity(envelope.argument_bindings.len());
-    for (physical, binding) in envelope.argument_bindings.iter().enumerate() {
+    for (logical, binding) in envelope.argument_bindings.iter().enumerate() {
         let buffer = match *binding {
             CudaKernelBufferBinding::Input(index) => {
                 let FfiInput::Buffer { buffer } = frame.input(index)?;
@@ -475,7 +589,7 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
                 buffer
             }
         };
-        let (element_type, dimensions) = &envelope.parameter_types[envelope.parameter_order[physical]];
+        let (element_type, dimensions) = &envelope.parameter_types[logical];
         if buffer.element_type().to_string() != *element_type
             || buffer
                 .dimensions()
@@ -490,9 +604,13 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         }
         buffers.push(buffer);
     }
-    let arguments = buffers
+    let arguments = envelope
+        .parameters
         .iter()
-        .map(|buffer| unsafe { buffer.cuda_kernel_argument() })
+        .map(|parameter| match *parameter {
+            CudaKernelParameterBinding::Array(index) => unsafe { buffers[index].cuda_kernel_argument() },
+            CudaKernelParameterBinding::I32(value) => Ok(CudaKernelArgument::Scalar(CudaScalarValue::I32(value))),
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
     // XLA owns buffer readiness, functional aliasing and the invocation stream. CUDA owner checks context, device,
@@ -525,7 +643,6 @@ unsafe extern "C" fn cuda_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::VerifiedKernel;
-    use ryft_cuda::CudaScalarType;
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
@@ -549,7 +666,66 @@ mod tests {
     #[test]
     fn test_cuda_kernel_embedding_new() {
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
-        assert_eq!(embedding.parameter_order(), &[0]);
+        assert_eq!(embedding.parameters(), &[CudaKernelParameterBinding::Array(0)]);
+    }
+
+    #[test]
+    fn test_cuda_kernel_parameter_binding_parameter_type() {
+        assert_eq!(CudaKernelParameterBinding::Array(3).parameter_type(), CudaKernelParameterType::DevicePointer);
+        assert_eq!(
+            CudaKernelParameterBinding::I32(-4).parameter_type(),
+            CudaKernelParameterType::Scalar(CudaScalarType::I32),
+        );
+    }
+
+    #[test]
+    fn test_cuda_kernel_embedding_from_parameters() {
+        let parameters = vec![
+            CudaKernelParameterBinding::I32(4),
+            CudaKernelParameterBinding::Array(0),
+            CudaKernelParameterBinding::I32(1),
+        ];
+        let embedding = CudaKernelEmbedding::from_parameters("ryft.test.ready".to_owned(), parameters.clone());
+        assert_eq!(embedding.parameters(), parameters);
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let output = artifact(vec![
+            CudaKernelParameterType::Scalar(CudaScalarType::I32),
+            CudaKernelParameterType::DevicePointer,
+            CudaKernelParameterType::Scalar(CudaScalarType::I32),
+        ]);
+        let compiled = CompiledKernel::from_output(&verified, b"static strides", &output, &embedding).unwrap();
+        let (decoded, decoded_artifact) =
+            CudaKernelEmbedding::from_custom_call(&verified, compiled.custom_call()).unwrap();
+        assert_eq!(decoded, embedding);
+        assert_eq!(decoded_artifact.abi(), output.abi());
+        assert_eq!(decoded.argument_bindings(&verified).unwrap(), vec![CudaKernelBufferBinding::Output(0)]);
+        let changed = CudaKernelEmbedding::from_parameters(
+            "ryft.test.ready".to_owned(),
+            vec![
+                CudaKernelParameterBinding::I32(5),
+                CudaKernelParameterBinding::Array(0),
+                CudaKernelParameterBinding::I32(1),
+            ],
+        );
+        assert_ne!(
+            <CudaKernelEmbedding as KernelOutputEmbedding<CudaKernelArtifact>>::configuration_key(&embedding).unwrap(),
+            <CudaKernelEmbedding as KernelOutputEmbedding<CudaKernelArtifact>>::configuration_key(&changed).unwrap(),
+        );
+        assert!(matches!(
+            embedding.custom_call(&verified, &artifact(vec![CudaKernelParameterType::DevicePointer])),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "cuda artifact ABI does not match the declared parameter mapping",
+        ));
+        let missing = CudaKernelEmbedding::from_parameters(
+            "ryft.test.ready".to_owned(),
+            vec![CudaKernelParameterBinding::I32(0)],
+        );
+        assert!(matches!(
+            missing.custom_call(&verified, &output),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "cuda pointer mapping must name every logical parameter exactly once",
+        ));
     }
 
     #[test]
@@ -624,6 +800,170 @@ mod tests {
     }
 
     #[test]
+    fn test_cuda_kernel_embedding_with_row_major_layouts() {
+        use ryft_core::{ArrayType, DataType, Placeholder};
+
+        use crate::experimental::lowering::lower_mlir_module_for_program;
+        use crate::experimental::ops::{XlaConstant, XlaProgramBuilder};
+
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
+        let original = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
+        let embedding = original.clone().with_row_major_layouts(true);
+        let operation = embedding.custom_call(&verified, &artifact).unwrap();
+        assert_eq!(
+            operation.attributes().iter().find(|(name, _)| name == "ryft.cuda.row_major"),
+            Some(&("ryft.cuda.row_major".to_owned(), CustomCallAttribute::Boolean(true))),
+        );
+        let (decoded, _) = CudaKernelEmbedding::from_custom_call(&verified, &operation).unwrap();
+        assert_eq!(decoded, embedding);
+        assert_ne!(
+            <CudaKernelEmbedding as KernelOutputEmbedding<CudaKernelArtifact>>::configuration_key(&original).unwrap(),
+            <CudaKernelEmbedding as KernelOutputEmbedding<CudaKernelArtifact>>::configuration_key(&embedding).unwrap(),
+        );
+        assert_eq!(embedding.with_row_major_layouts(false), original);
+
+        // The layout contract applies to caller-registered CUDA targets as well as the built-in target.
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar.clone().into());
+        let output = builder.add_instruction(operation, vec![], vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![scalar.clone()],
+            &vec![scalar],
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap();
+        let (module, _, _) = lowered.into_parts();
+        assert!(module.contains("operand_layouts = [dense<> : tensor<0xindex>]"));
+        assert!(module.contains("result_layouts = [dense<> : tensor<0xindex>]"));
+    }
+
+    #[test]
+    fn test_cuda_kernel_embedding_with_assertions() {
+        use ryft_core::kernels::KernelDefinition;
+        use ryft_core::{
+            ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
+            ReferenceWrite,
+        };
+
+        let template = definition();
+        let definition: KernelDefinition = KernelDefinition::trace(template.operation().clone(), |(references, _)| {
+            let value = references[0].read()?;
+            references[0].context().bind(
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
+                    "index",
+                    DimensionBounds::new(0, Some(1))?,
+                ))),
+                vec![],
+                &[value.clone()],
+            )?;
+            references[0].write(&value)
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
+        let embedding =
+            CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]).with_assertions(true);
+        let compiled = CompiledKernel::from_output(&verified, b"checked index", &artifact, &embedding).unwrap();
+        assert_eq!(compiled.custom_call().effect_class(), Some(EffectClass::OrderedAssertion));
+        let (decoded, _) = CudaKernelEmbedding::from_custom_call(&verified, compiled.custom_call()).unwrap();
+        assert_eq!(decoded, embedding);
+        let without_assertions = embedding.with_assertions(false);
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"checked index", &artifact, &without_assertions),
+            Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedAssertion }),
+        ));
+    }
+
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    #[test]
+    fn test_cuda_envelope_validate_frame() {
+        use ryft_pjrt::extensions::ffi::{
+            XLA_FFI_ArgType_BUFFER, XLA_FFI_Buffer, XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN,
+            XLA_FFI_RetType_BUFFER,
+        };
+
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let embedding =
+            CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]).with_assertions(true);
+        let operation =
+            embedding.custom_call(&verified, &artifact(vec![CudaKernelParameterType::DevicePointer])).unwrap();
+        let payload = operation
+            .attributes()
+            .iter()
+            .find_map(|(name, attribute)| match (name.as_str(), attribute) {
+                ("ryft.cuda.payload", CustomCallAttribute::String(value)) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        let envelope: CudaEnvelope = serde_json::from_str(payload).unwrap();
+
+        // All C fields are integers or pointers, so zero initialization is valid. Only buffer metadata is read:
+        // these frames deliberately have no API, execution context, device allocation, or initialized runtime.
+        let validate = |input_count, output_count, input_type, output_type, missing_input| {
+            let mut input: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
+            input.struct_size = size_of::<XLA_FFI_Buffer>();
+            input.data_type = input_type;
+            let mut output: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
+            output.struct_size = size_of::<XLA_FFI_Buffer>();
+            output.data_type = output_type;
+            let mut input_types = [XLA_FFI_ArgType_BUFFER; 2];
+            let mut output_types = [XLA_FFI_RetType_BUFFER; 2];
+            let mut inputs = [std::ptr::null_mut(), (&mut input as *mut XLA_FFI_Buffer).cast()];
+            let mut outputs = [std::ptr::null_mut(), (&mut output as *mut XLA_FFI_Buffer).cast()];
+            if missing_input {
+                inputs[1] = std::ptr::null_mut();
+            }
+            let mut raw: XLA_FFI_CallFrame = unsafe { std::mem::zeroed() };
+            raw.struct_size = size_of::<XLA_FFI_CallFrame>();
+            raw.args.struct_size = std::mem::size_of_val(&raw.args);
+            raw.args.size = input_count;
+            raw.args.types = input_types.as_mut_ptr();
+            raw.args.args = inputs.as_mut_ptr();
+            raw.rets.struct_size = std::mem::size_of_val(&raw.rets);
+            raw.rets.size = output_count;
+            raw.rets.types = output_types.as_mut_ptr();
+            raw.rets.rets = outputs.as_mut_ptr();
+            // The frame and all metadata pointees remain alive until validation returns.
+            let frame = unsafe { FfiCallFrame::from_c_api(&mut raw) }.unwrap();
+            envelope.validate_frame(&frame)
+        };
+        assert_eq!(validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false), Ok(()));
+        for (inputs, outputs) in [(1, 2), (2, 1), (0, 0), (3, 2)] {
+            assert!(matches!(
+                validate(inputs, outputs, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false),
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "cuda frame buffer counts differ from the declared signature",
+            ));
+        }
+        for (input, output) in
+            [(XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN), (XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_S32)]
+        {
+            assert!(matches!(
+                validate(2, 2, input, output, false),
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "cuda assertion ABI requires trailing input and result tokens",
+            ));
+        }
+        assert!(matches!(
+            validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, true),
+            Err(FfiError::InvalidArgument { message, .. })
+                if message == "encountered null buffer pointer for XLA FFI input",
+        ));
+    }
+
+    #[test]
     fn test_cuda_kernel_embedding_from_custom_call_rejects_changed_buffer_metadata() {
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -691,6 +1031,6 @@ mod tests {
         let scalar = artifact(vec![CudaKernelParameterType::Scalar(CudaScalarType::I32)]);
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
         assert!(matches!(embedding.custom_call(&verified, &scalar), Err(KernelEmbeddingError::Invalid { message })
-            if message == "cuda artifact ABI does not match the declared pointer mapping"));
+            if message == "cuda artifact ABI does not match the declared parameter mapping"));
     }
 }

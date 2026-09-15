@@ -38,9 +38,18 @@ search = "<!-- next-header -->"
 replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n"
 exactly = 1
 
+[features]
+default = []
+cutile = ["dep:ryft-core", "dep:serde", "dep:serde_json"]
+cutile-compiler = ["cutile", "dep:tempfile"]
+
 [dependencies]
+ryft-core = { workspace = true, optional = true }
 libloading.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 sha2.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
