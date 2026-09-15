@@ -1610,10 +1610,8 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_concatenate_operation_new_array_ir() {
+        // Test mixed/dynamic concatenate operation construction.
         let operation = ConcatenateOperation::<ArrayType>::new(-2, 2).unwrap();
         let mixed_operation = ConcatenateOperation::<ArrayIrType>::from(operation.clone());
         assert_eq!(operation.axis(), 0);
@@ -1682,9 +1680,8 @@ mod tests {
         assert_eq!(
             proven_operation.infer_output_types(&dynamic_input_types, &[]),
             Err(TypeError::invalid(format!(
-                "`{}` was constructed for an input signature that proves its result extent, but the provided input \
-                 types require a runtime extent check",
-                CONCATENATE_OPERATION_NAME,
+                "`{CONCATENATE_OPERATION_NAME}` was constructed for an input signature that proves its result extent, \
+                 but the provided input types require a runtime extent check",
             ))),
         );
 
@@ -1779,7 +1776,9 @@ mod tests {
             ConcatenateOperation::<ArrayType>::new(1, 2)
                 .unwrap()
                 .infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[],),
-            Err(TypeError::invalid("`concatenate` axis 1 is out of bounds for inputs of rank 1")),
+            Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` axis 1 is out of bounds for inputs of rank 1"
+            ))),
         );
         assert_eq!(
             ConcatenateOperation::<ArrayType>::new(0, 1).unwrap().infer_output_types(
@@ -1830,12 +1829,14 @@ mod tests {
                 {
                     type = ArrayType,
                     input_types = [dynamic_stack, fixed_slice.clone()],
-                    error = "`concatenate` dynamic axis 0 requires an explicit result-dimension input",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` dynamic axis 0 requires an explicit \
+                                     result-dimension input"),
                 },
                 {
                     type = ArrayType,
                     input_types = [bounded_stack, fixed_slice],
-                    error = "`concatenate` dynamic axis 0 requires an explicit result-dimension input",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` dynamic axis 0 requires an explicit \
+                                     result-dimension input"),
                 },
                 {
                     type = ArrayType,
@@ -1848,12 +1849,13 @@ mod tests {
                 {
                     type = ArrayType,
                     input_types = [],
-                    error = "`concatenate` expects at least one input but got none",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` expects at least one input but got none"),
                 },
                 {
                     type = ArrayType,
                     input_types = [first_type.clone(), ArrayType::scalar(DataType::F64)],
-                    error = "`concatenate` inputs must share one rank but input 1 has rank 0 and input 0 has rank 2",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` inputs must share one rank but input 1 has rank 0 \
+                                     and input 0 has rank 2"),
                 },
                 {
                     type = ArrayType,
@@ -1861,8 +1863,9 @@ mod tests {
                         first_type.clone(),
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
                     ],
-                    error = "`concatenate` inputs must share one data type but input 1 has data type `f32` and \
-                             input 0 has data type `f64`",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` inputs must share one data type but input 1 has \
+                                     data type `f32` and \
+                             input 0 has data type `f64`"),
                 },
                 {
                     type = ArrayType,
@@ -1870,8 +1873,9 @@ mod tests {
                         first_type.clone(),
                         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(5)])),
                     ],
-                    error = "`concatenate` inputs must agree on every axis other than 0 but input 1 has size 5 \
-                             on axis 1 and input 0 has size 2",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` inputs must agree on every axis other than 0 but \
+                                     input 1 has size 5 \
+                             on axis 1 and input 0 has size 2"),
                 },
                 {
                     type = ArrayType,
@@ -1888,21 +1892,23 @@ mod tests {
                             ]),
                         ),
                     ],
-                    error = "`concatenate` inputs must agree on every axis other than 0 but input 1 has size \
-                             dynamic on axis 1 and input 0 has size dynamic",
+                    error = format!("`{CONCATENATE_OPERATION_NAME}` inputs must agree on every axis other than 0 but \
+                                     input 1 has size \
+                             dynamic on axis 1 and input 0 has size dynamic"),
                 },
             ],
         );
         assert_eq!(ConcatenateOperation::<ArrayType>::new(-1, 2).unwrap().axis(), 1);
         assert_eq!(
             ConcatenateOperation::<ArrayType>::new(2, 2),
-            Err(TypeError::invalid("`concatenate` axis 2 is out of bounds for inputs of rank 2".to_string())),
+            Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` axis 2 is out of bounds for inputs of rank 2"
+            ))),
         );
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_array_ir_concatenate_type_inference_identity_instantiation() {
+    fn test_concatenate_type_inference_array_ir_identity_instantiation() {
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(12)).unwrap());
@@ -2014,7 +2020,7 @@ mod tests {
                 assert!(matches!(
                     operation.infer_output_types(&inputs, &[]),
                     Err(TypeError::Invalid { message }) if message == format!(
-                        "`concatenate` inputs must be sharded identically, but got {} and {}",
+                        "`{CONCATENATE_OPERATION_NAME}` inputs must be sharded identically, but got {} and {}",
                         inputs[0].sharding().unwrap(), inputs[1].sharding().unwrap(),
                     )
                 ));
@@ -2046,19 +2052,19 @@ mod tests {
             (
                 replicated.clone().with_unreduced_axes(["m"]).unwrap(),
                 replicated.clone().with_unreduced_axes(["n"]).unwrap(),
-                "`concatenate` inputs must be unreduced over the same nonempty axis set",
+                format!("`{CONCATENATE_OPERATION_NAME}` inputs must be unreduced over the same nonempty axis set"),
             ),
             (
                 replicated.clone().with_reduced_axes(["m"]).unwrap(),
                 replicated.clone().with_reduced_axes(["n"]).unwrap(),
-                "`concatenate` inputs must be reduced over the same nonempty axis set",
+                format!("`{CONCATENATE_OPERATION_NAME}` inputs must be reduced over the same nonempty axis set"),
             ),
         ] {
             for inputs in [
                 [row(Some(left.clone())), row(Some(right.clone()))],
                 [row(Some(right.clone())), row(Some(left.clone()))],
             ] {
-                assert_eq!(operation.infer_output_types(&inputs, &[]), Err(TypeError::invalid(message)));
+                assert_eq!(operation.infer_output_types(&inputs, &[]), Err(TypeError::invalid(message.as_str())));
             }
         }
         assert_eq!(
@@ -2108,9 +2114,10 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError::Invalid { message }) if message ==
-                "`concatenate` cannot make input varying over axes {\"m\"} while it is reduced or unreduced over \
-                 any of those axes"
+            Err(TypeError::Invalid { message }) if message == format!("`{CONCATENATE_OPERATION_NAME}` cannot make \
+                                                                       input varying over axes {{\"m\"}} while it is \
+                                                                       reduced or unreduced over \
+                 any of those axes")
         ));
     }
 
@@ -2118,6 +2125,7 @@ mod tests {
     fn test_concatenate_interpretation() {
         let operation = ConcatenateOperation::<ArrayType>::new(0, 2).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [4, 2]);
+
         // Interpretation joins the row-major payloads along axis 0, while the sole-input fast path returns its input
         // without inspecting the axis.
         let first = Array::from_elements(ArrayType::new_static(DataType::F64, [1, 2]), &[1_f64, 2.]).unwrap();
@@ -2130,10 +2138,8 @@ mod tests {
         assert_eq!(output[0].elements::<f64>(), Ok(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
         assert_eq!(Array::concatenate([&first, &second], -2), Ok(output[0].clone()));
         assert_eq!(Array::concatenate([&first], 2), Ok(first.clone()));
-    }
 
-    #[test]
-    fn test_array_ir_concatenate_interpretation() {
+        // Test mixed/dynamic concatenate operation interpretation.
         let left = ArrayIrValue::Array(
             Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2]), &[1.0_f32, 2.0]).unwrap(),
         );
@@ -2181,8 +2187,8 @@ mod tests {
             ),
             Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "`{}` result extent must equal the sum of input axis 0 extents; expected 3 but got 4",
-                    CONCATENATE_OPERATION_NAME,
+                    "`{CONCATENATE_OPERATION_NAME}` result extent must equal the sum of input axis 0 extents; \
+                     expected 3 but got 4",
                 ),
             }),
         );
@@ -2641,7 +2647,8 @@ mod tests {
         assert!(matches!(
             ConcatenateOperation::<ArrayType>::new(1, 2).unwrap().batch(&context, &EmptyRegionDriver, &[input.clone(), input]),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`concatenate` batching cannot concatenate a ragged axis or an axis indexing its extents",
+                if message == format!("`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
+                                       axis indexing its extents"),
         ));
 
         // The mixed operation preserves the same metadata while treating its result extent as a shape input.
@@ -3149,8 +3156,8 @@ mod tests {
             program.transpose_with_respect_to(&[0, 1], &[]),
             Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(
                 TypeError::Invalid { message },
-            ))) if message
-                == "`concatenate` transpose requires a static size on axis 1 but input 0 has size columns",
+            ))) if message == format!("`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis 1 but \
+                                       input 0 has size columns"),
         ));
     }
 
@@ -3293,8 +3300,9 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of a dynamic `concatenate` requires linearization so its input \
-                               extents can be retained as residuals",
+                if message == format!("direct transposition of a dynamic `{CONCATENATE_OPERATION_NAME}` requires \
+                                       linearization so its input \
+                               extents can be retained as residuals"),
         ));
         assert_eq!(
             program.linearize().unwrap().pullback().unwrap().output_types(),
@@ -3355,11 +3363,10 @@ mod tests {
                 ],
                 0,
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`concatenate` inputs must share one memory space but input 1 resides in Device and \
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` inputs must share one memory space but input 1 resides in Device and \
                     input 0 resides in Host[Pinned]"
-                    .to_string(),
-            ))),
+            )))),
         );
 
         // Invalid signed axes and output-size overflow report exact type errors.
@@ -3371,9 +3378,9 @@ mod tests {
                 ],
                 -3,
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`concatenate` axis -3 is out of bounds for inputs of rank 2".to_string(),
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` axis -3 is out of bounds for inputs of rank 2"
+            )))),
         );
         assert_eq!(
             ArrayType::concatenate(
@@ -3383,9 +3390,9 @@ mod tests {
                 ],
                 0,
             ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`concatenate` output size overflows usize on axis 0".to_string(),
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` output size overflows usize on axis 0"
+            )))),
         );
     }
 
@@ -3517,7 +3524,9 @@ mod tests {
         );
         assert_eq!(
             ArrayIrValue::<Array>::concatenate([], 0),
-            Err(ProgramError::Type(TypeError::invalid("`concatenate` expects at least one input but got none")))
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one input but got none"
+            ))))
         );
     }
 
@@ -3582,8 +3591,10 @@ mod tests {
                 0
             ),
             Err(ProgramError::InvalidArgument {
-                message: "`concatenate` result extent must equal the sum of input axis 0 extents; expected 3 but got 4"
-                    .into(),
+                message: format!(
+                    "`{CONCATENATE_OPERATION_NAME}` result extent must equal the sum of input axis 0 extents; expected \
+                     3 but got 4"
+                ),
             })
         );
     }
@@ -3611,8 +3622,10 @@ mod tests {
                 0,
             ),
             Err(ProgramError::InvalidArgument {
-                message: "`concatenate` result extent must equal the sum of input axis 0 extents; expected 3 but got 4"
-                    .into(),
+                message: format!(
+                    "`{CONCATENATE_OPERATION_NAME}` result extent must equal the sum of input axis 0 extents; expected \
+                     3 but got 4"
+                ),
             })
         );
     }
@@ -3640,18 +3653,21 @@ mod tests {
         assert!(matches!(
             validate_concatenation_ragged_axes(&[&first, &second], 1),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`concatenate` batching cannot concatenate a ragged axis or an axis indexing its extents",
+                if message == format!("`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
+                                       axis indexing its extents"),
         ));
         assert!(matches!(
             validate_concatenation_ragged_axes(&[&first, &second], 0),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`concatenate` batching cannot concatenate a ragged axis or an axis indexing its extents",
+                if message == format!("`{CONCATENATE_OPERATION_NAME}` batching cannot concatenate a ragged axis or an \
+                                       axis indexing its extents"),
         ));
         // Missing metadata cannot be interpreted as ordinary dense geometry for the other input.
         assert!(matches!(
             validate_concatenation_ragged_axes(&[&first, &second[..1]], 3),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`concatenate` batching requires matching ragged dimensions and extent axes",
+                if message == format!("`{CONCATENATE_OPERATION_NAME}` batching requires matching ragged dimensions and \
+                                       extent axes"),
         ));
     }
 }
