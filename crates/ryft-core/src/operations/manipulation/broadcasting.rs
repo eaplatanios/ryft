@@ -610,8 +610,6 @@ impl Broadcast for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Broadcast for Array {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = self.r#type().broadcast(output_type, output_axes)?;
@@ -622,9 +620,11 @@ impl Broadcast for Array {
             ))
             .into());
         };
+
         if &r#type == self.r#type().as_ref() && output_axes.iter().copied().eq(0..r#type.rank()) {
             return Ok(self.clone());
         }
+
         let input_shape = self.r#type().static_shape().unwrap();
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
@@ -632,15 +632,17 @@ impl Broadcast for Array {
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(r#type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
+
         // Structural-zero elements need no storage, regardless of the logical replication count.
         if bytes.is_empty() {
             return Ok(Self::new_unchecked(r#type, Arc::new(bytes)));
         }
-        let mut target_index = vec![0usize; target_rank];
-        let mut input_index = vec![0usize; input_rank];
+
         // Traverse output coordinates in logical order. Singleton input axes always read coordinate zero, while
         // every other input axis reads its mapped output coordinate. Addressing handles both physical layouts, and
         // byte copies preserve exact encodings even for complex and low-precision elements.
+        let mut target_index = vec![0usize; target_rank];
+        let mut input_index = vec![0usize; input_rank];
         for output_flat in 0..output_count {
             for input_axis in 0..input_rank {
                 let target_axis = output_axes[input_axis];
@@ -650,9 +652,12 @@ impl Broadcast for Array {
                 .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             output_addressing.advance_index(&mut target_index);
         }
+
         Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
     Broadcast for V
