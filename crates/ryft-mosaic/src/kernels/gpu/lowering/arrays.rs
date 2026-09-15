@@ -1,7 +1,7 @@
 //! Scalar-loop implementations of canonical array operations over cooperative flat storage.
 
 use ryft_core::{Array, ArrayOperation, ArrayType, ComparisonDirection, DataType, Operation, ReductionKind};
-use ryft_mlir::dialects::{arith, scf};
+use ryft_mlir::dialects::{arith, math, scf};
 use ryft_mlir::{Block, DetachedBlock, Type, Value};
 
 use crate::kernels::gpu::Error;
@@ -18,6 +18,11 @@ pub(super) fn validate(
         if !matches!(
             r#type.data_type(),
             DataType::Boolean
+                | DataType::U8
+                | DataType::F8E4M3FN
+                | DataType::F8E8M0FNU
+                | DataType::F16
+                | DataType::BF16
                 | DataType::I32
                 | DataType::U32
                 | DataType::I64
@@ -28,6 +33,45 @@ pub(super) fn validate(
             return Err(unsupported(operation, "element type has no baseline scalar implementation"));
         }
         checked_count(operation, &shape(r#type)?)?;
+    }
+    if inputs
+        .iter()
+        .chain(std::iter::once(output))
+        .any(|r#type| matches!(r#type.data_type(), DataType::F16 | DataType::BF16))
+        && !matches!(
+            operation,
+            ArrayOperation::Constant(_)
+                | ArrayOperation::ConvertElementType(_)
+                | ArrayOperation::Transpose(_)
+                | ArrayOperation::Broadcast(_)
+                | ArrayOperation::Reshape(_)
+                | ArrayOperation::StopGradient(_)
+                | ArrayOperation::Select(_)
+        )
+    {
+        return Err(unsupported(
+            operation,
+            "half-precision storage supports only bit-preserving operations and numeric conversion",
+        ));
+    }
+    if inputs
+        .iter()
+        .chain(std::iter::once(output))
+        .any(|r#type| matches!(r#type.data_type(), DataType::U8 | DataType::F8E4M3FN | DataType::F8E8M0FNU))
+        && !matches!(
+            operation,
+            ArrayOperation::Constant(_)
+                | ArrayOperation::Transpose(_)
+                | ArrayOperation::Broadcast(_)
+                | ArrayOperation::Reshape(_)
+                | ArrayOperation::StopGradient(_)
+                | ArrayOperation::Select(_)
+        )
+    {
+        return Err(unsupported(
+            operation,
+            "packed operand and scale storage supports only bit-preserving array operations",
+        ));
     }
     let expected = operation.infer_output_types(inputs, &[])?;
     if expected.as_slice() != [output.clone()] {
@@ -58,8 +102,17 @@ pub(super) fn validate(
         | ArrayOperation::StopGradient(_) => Ok(()),
         ArrayOperation::Iota(_) if output.data_type() != DataType::Boolean => Ok(()),
         ArrayOperation::Div(_) if is_float(output.data_type()) => Ok(()),
+        ArrayOperation::Exp(_) if matches!(output.data_type(), DataType::F32 | DataType::F64) => Ok(()),
+        ArrayOperation::ConvertElementType(operation)
+            if !operation.bitcast() && is_float(inputs[0].data_type()) && is_float(output.data_type()) =>
+        {
+            Ok(())
+        }
         ArrayOperation::Reduce(reduction)
-            if reduction.kind() == ReductionKind::Sum && reduction.output_sharding().is_none() =>
+            if reduction.output_sharding().is_none()
+                && (reduction.kind() == ReductionKind::Sum
+                    || reduction.kind() == ReductionKind::Max
+                        && matches!(output.data_type(), DataType::F32 | DataType::F64)) =>
         {
             let input_shape = shape(&inputs[0])?;
             checked_count(operation, &reduction.axes().iter().map(|&axis| input_shape[axis]).collect::<Vec<_>>())?;
@@ -126,6 +179,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     let bytes = constant.value().logical_bytes();
                     let width = match data_type {
                         DataType::Boolean => 1,
+                        DataType::F16 | DataType::BF16 => 16,
                         DataType::F32 | DataType::I32 | DataType::U32 => 4,
                         _ => 8,
                     };
@@ -197,6 +251,11 @@ impl<'c, 't> Lowering<'c, 't> {
                         body,
                         reduction_shape.iter().product(),
                         data_type,
+                        match (reduction.kind(), data_type) {
+                            (ReductionKind::Max, DataType::F32) => f32::NEG_INFINITY.to_bits() as u64,
+                            (ReductionKind::Max, DataType::F64) => f64::NEG_INFINITY.to_bits(),
+                            _ => 0,
+                        },
                         |lowering, body, reduction_index, accumulator| {
                             let reduction_coordinates =
                                 lowering.coordinates(body, reduction_index, &reduction_shape)?;
@@ -212,7 +271,11 @@ impl<'c, 't> Lowering<'c, 't> {
                             }
                             let source = lowering.flat_index(body, &source_coordinates, &input_shapes[0])?;
                             let value = lowering.load(body, &inputs[0], source)?;
-                            lowering.add(body, data_type, accumulator, value)
+                            if reduction.kind() == ReductionKind::Max {
+                                append(body, arith::maximumf(accumulator, value, lowering.location)?)
+                            } else {
+                                lowering.add(body, data_type, accumulator, value)
+                            }
                         },
                     )?
                 }
@@ -228,6 +291,7 @@ impl<'c, 't> Lowering<'c, 't> {
                         body,
                         contraction_shape.iter().product(),
                         data_type,
+                        0,
                         |lowering, body, contraction_index, accumulator| {
                             let contraction_coordinates =
                                 lowering.coordinates(body, contraction_index, &contraction_shape)?;
@@ -345,6 +409,8 @@ impl<'c, 't> Lowering<'c, 't> {
     ) -> Result<KernelValue<'c, 't>, Error> {
         let width = match data_type {
             DataType::Boolean => 1,
+            DataType::U8 | DataType::F8E4M3FN | DataType::F8E8M0FNU => 8,
+            DataType::F16 | DataType::BF16 => 16,
             DataType::F32 | DataType::I32 | DataType::U32 => 32,
             _ => 64,
         };
@@ -368,6 +434,7 @@ impl<'c, 't> Lowering<'c, 't> {
         block: &mut DetachedBlock<'c, 't>,
         count: usize,
         data_type: DataType,
+        identity: u64,
         function: impl FnOnce(
             &mut Self,
             &mut DetachedBlock<'c, 't>,
@@ -378,7 +445,7 @@ impl<'c, 't> Lowering<'c, 't> {
         let lower = self.index(block, 0)?;
         let upper = self.index(block, count)?;
         let step = self.index(block, 1)?;
-        let zero = self.literal(block, data_type, 0)?;
+        let identity = self.literal(block, data_type, identity)?;
         let mut body = self.context.block(&[
             (self.context.index_type().as_ref(), self.location),
             (element_type(self.context, data_type)?, self.location),
@@ -387,7 +454,7 @@ impl<'c, 't> Lowering<'c, 't> {
         let accumulator = body.argument(1)?.as_ref();
         let result = function(self, &mut body, index, accumulator)?;
         body.append_operation(scf::r#yield(&[result], self.location)?)?;
-        append(block, scf::r#for(lower, upper, step, &[zero], false, body.try_into()?, self.location)?)
+        append(block, scf::r#for(lower, upper, step, &[identity], false, body.try_into()?, self.location)?)
     }
 
     /// Adds values using the admitted scalar element type.
@@ -416,6 +483,34 @@ impl<'c, 't> Lowering<'c, 't> {
     ) -> Result<KernelValue<'c, 't>, Error> {
         let location = self.location;
         Ok(match operation {
+            ArrayOperation::Exp(_) => append(block, math::exp(values[0], location)?)?,
+            ArrayOperation::ConvertElementType(_) => {
+                let source = inputs[0].r#type.data_type();
+                if source == data_type {
+                    values[0]
+                } else {
+                    let source_width = match source {
+                        DataType::F64 => 64,
+                        DataType::F32 => 32,
+                        _ => 16,
+                    };
+                    let target_width = match data_type {
+                        DataType::F64 => 64,
+                        DataType::F32 => 32,
+                        _ => 16,
+                    };
+                    let target_type = element_type(self.context, data_type)?;
+                    if source_width < target_width {
+                        append(block, arith::extf(values[0], target_type, location)?)?
+                    } else if source_width > target_width {
+                        append(block, arith::truncf(values[0], target_type, location)?)?
+                    } else {
+                        // F16 and BF16 share a storage width but have different exponent and significand ranges.
+                        let widened = append(block, arith::extf(values[0], self.context.float32_type(), location)?)?;
+                        append(block, arith::truncf(widened, target_type, location)?)?
+                    }
+                }
+            }
             ArrayOperation::Add(_) => self.add(block, data_type, values[0], values[1])?,
             ArrayOperation::Sub(_) if is_float(data_type) => {
                 append(block, arith::subf(values[0], values[1], location)?)?
@@ -495,7 +590,7 @@ impl<'c, 't> Lowering<'c, 't> {
 
 /// Identifies scalar floating-point types admitted by the baseline.
 fn is_float(data_type: DataType) -> bool {
-    matches!(data_type, DataType::F32 | DataType::F64)
+    matches!(data_type, DataType::F16 | DataType::BF16 | DataType::F32 | DataType::F64)
 }
 
 /// Returns the exact encoding of one at the admitted scalar type.
@@ -521,8 +616,8 @@ mod tests {
         whole_array_parameter,
     };
     use ryft_core::{
-        AddOperation, ArrayIrOperation, Context, DotDimensionNumbers, DotOperation, ReduceOperation, ReferenceRead,
-        ReferenceWrite,
+        AddOperation, ArrayIrOperation, Context, ConvertElementTypeOperation, DotDimensionNumbers, DotOperation,
+        ExpOperation, ReduceOperation, ReferenceRead, ReferenceWrite,
     };
     use ryft_mlir::{Context as MlirContext, Operation as MlirOperation, WalkOrder, WalkResult};
 
@@ -558,7 +653,10 @@ mod tests {
         let mut operations = Vec::new();
         module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
             let name = operation.name().to_string();
-            if matches!(name.as_str(), "arith.addf" | "arith.mulf") {
+            if matches!(
+                name.as_str(),
+                "arith.addf" | "arith.mulf" | "arith.maximumf" | "math.exp" | "arith.extf" | "arith.truncf"
+            ) {
                 operations.push(name);
             }
             WalkResult::Advance
@@ -654,6 +752,53 @@ mod tests {
                 vec![ArrayType::new_static(DataType::F32, [2, 3, 4])],
             ),
             vec!["arith.addf"],
+        );
+    }
+
+    #[test]
+    fn test_array_reduce_max() {
+        assert_eq!(
+            lowered_arithmetic(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)),
+                vec![ArrayType::new_static(DataType::F32, [2, 3])],
+            ),
+            vec!["arith.maximumf"]
+        );
+    }
+
+    #[test]
+    fn test_array_exp() {
+        assert_eq!(
+            lowered_arithmetic(
+                ArrayOperation::Exp(ExpOperation::new()),
+                vec![ArrayType::new_static(DataType::F32, [2, 3])]
+            ),
+            vec!["math.exp"]
+        );
+    }
+
+    #[test]
+    fn test_array_convert_element_type() {
+        assert_eq!(
+            lowered_arithmetic(
+                ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::F16, false)),
+                vec![ArrayType::new_static(DataType::F32, [2, 3])],
+            ),
+            vec!["arith.truncf"]
+        );
+        assert_eq!(
+            lowered_arithmetic(
+                ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::F32, false)),
+                vec![ArrayType::new_static(DataType::BF16, [2, 3])],
+            ),
+            vec!["arith.extf"]
+        );
+        assert_eq!(
+            lowered_arithmetic(
+                ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::BF16, false)),
+                vec![ArrayType::new_static(DataType::F16, [2, 3])],
+            ),
+            vec!["arith.extf", "arith.truncf"]
         );
     }
 

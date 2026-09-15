@@ -1,4 +1,4 @@
-//! XLA staging carriers for portable kernels with ordinary attached computation regions.
+//! XLA staging carriers for portable and enabled adapter kernels with ordinary attached computation regions.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -6,21 +6,232 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use ryft_core::kernels::{
-    KernelCallOperation, KernelCompiler, KernelDefinition, KernelOperation, KernelSchedule, VerifiedKernel,
+    KernelCallOperation, KernelCompiler, KernelDefinition, KernelExtension, KernelExtensionMemory, KernelOperation,
+    KernelSchedule, NoKernelExtension, VerifiedKernel,
 };
+use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    Array as CpuArray, ArrayIrType, ArrayIrValue, Atom, AtomId, ConstantOperation, Context, CotangentAccumulator,
-    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance, PartialValue, PartiallyEvaluatableOperation,
-    Placeholder, Program, ProgramError, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface,
-    RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value,
+    Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayReferenceView, Atom, AtomId, ConstantOperation, Context,
+    CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction,
+    InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceViewOperation, ReferenceViewValidationError, Region, RegionInterface, RegionSlot, Tracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
+    Value,
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
 use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding};
+
+/// Adapter operation families enabled in this XLA integration.
+///
+/// Portable operations remain ordinary `KernelOperation` variants. This enum owns only the typed conversion between
+/// enabled adapter families and XLA staging; it does not choose a compiler or erase extension semantics.
+#[derive(Clone, Debug)]
+pub enum XlaKernelExtension {
+    /// Exact Mosaic GPU instruction semantics, admitted only by an explicitly selected Mosaic compiler.
+    #[cfg(feature = "mosaic-gpu")]
+    Mosaic(ryft_mosaic::kernels::gpu::GpuOperation),
+}
+
+impl From<NoKernelExtension> for XlaKernelExtension {
+    fn from(extension: NoKernelExtension) -> Self {
+        match extension {}
+    }
+}
+
+impl TryFrom<XlaKernelExtension> for NoKernelExtension {
+    type Error = ProgramError;
+
+    fn try_from(extension: XlaKernelExtension) -> Result<Self, Self::Error> {
+        match extension {
+            #[cfg(feature = "mosaic-gpu")]
+            XlaKernelExtension::Mosaic(_) => Err(ProgramError::UnsupportedOperation {
+                message: "portable kernel compiler binding cannot consume a Mosaic GPU extension".to_owned(),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "mosaic-gpu")]
+impl From<ryft_mosaic::kernels::gpu::GpuOperation> for XlaKernelExtension {
+    fn from(extension: ryft_mosaic::kernels::gpu::GpuOperation) -> Self {
+        Self::Mosaic(extension)
+    }
+}
+
+#[cfg(feature = "mosaic-gpu")]
+impl TryFrom<XlaKernelExtension> for ryft_mosaic::kernels::gpu::GpuOperation {
+    type Error = ProgramError;
+
+    fn try_from(extension: XlaKernelExtension) -> Result<Self, Self::Error> {
+        match extension {
+            XlaKernelExtension::Mosaic(extension) => Ok(extension),
+        }
+    }
+}
+
+impl Display for XlaKernelExtension {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl ReferenceViewOperation for XlaKernelExtension {
+    type View = ArrayReferenceView;
+
+    fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.reference_view(_output_index),
+        }
+    }
+
+    fn validate_reference_view(
+        view: &ArrayReferenceView,
+        source: &ArrayIrType,
+        target: &ArrayIrType,
+    ) -> Result<(), ReferenceViewValidationError> {
+        ryft_core::validate_array_reference_view(view, source, target)
+    }
+
+    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+        _context: &C,
+        _view: &ArrayReferenceView,
+        _source: C::Value,
+        _symbols: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "XLA extension family cannot construct portable reference views".to_owned(),
+        })
+    }
+}
+
+impl KernelExtension for XlaKernelExtension {
+    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.semantic_key(),
+        }
+    }
+
+    fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.memory_semantics(),
+        }
+    }
+}
+
+impl Operation for XlaKernelExtension {
+    type Type = ArrayIrType;
+
+    fn name(&self) -> &'static str {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.name(),
+        }
+    }
+
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.region_slots(),
+        }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        _input_types: &[ArrayIrType],
+        _region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.infer_region_input_types(_input_types, _region_interfaces),
+        }
+    }
+
+    fn infer_output_types(
+        &self,
+        _input_types: &[ArrayIrType],
+        _region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.infer_output_types(_input_types, _region_interfaces),
+        }
+    }
+
+    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> InputRegionProvenance {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.input_region_provenance(_region_index, _input_index),
+        }
+    }
+
+    fn output_region_provenance(&self, _output_index: usize) -> Vec<OutputRegionProvenance> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.output_region_provenance(_output_index),
+        }
+    }
+
+    fn is_zero(&self, _output_index: usize) -> bool {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.is_zero(_output_index),
+        }
+    }
+
+    fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.region_capture_input_count(_region_index),
+        }
+    }
+
+    fn reference_output_identity_input(&self, _output_index: usize) -> Option<usize> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.reference_output_identity_input(_output_index),
+        }
+    }
+
+    fn allows_reference_access_through_region_input(&self, _region_index: usize, _mode: ReferenceAccessMode) -> bool {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.allows_reference_access_through_region_input(_region_index, _mode),
+        }
+    }
+
+    fn effects(&self) -> Cow<'_, Effects> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.effects(),
+        }
+    }
+
+    fn render(&self, formatter: &mut Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+        #[cfg(not(feature = "mosaic-gpu"))]
+        let _ = &formatter;
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.render(formatter, _indentation),
+        }
+    }
+
+    fn rename_type_identities(
+        &self,
+        _renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => Ok(Self::Mosaic(operation.rename_type_identities(_renaming)?)),
+        }
+    }
+}
 
 /// Canonical kernel instruction retained inside the XLA operation family until explicit compiler selection.
 ///
@@ -28,17 +239,33 @@ use crate::kernels::{CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding
 /// program, so effect, reference, identity, and structural validation continue to inspect the actual current body.
 /// Generic differentiation and reference discharge require an owner-supported kernel rule and reject this carrier.
 #[derive(Clone, Debug)]
-pub struct XlaKernelOperation(pub(crate) KernelOperation);
+pub struct XlaKernelOperation(pub(crate) KernelOperation<XlaKernelExtension>);
 
 impl XlaKernelOperation {
     /// Wraps a canonical portable instruction without changing its semantic contract.
     pub fn new(operation: KernelOperation) -> Self {
-        Self(operation)
+        Self::from(operation)
     }
 
     /// Returns the canonical operation metadata; computations belong to the containing instruction's regions.
-    pub fn operation(&self) -> &KernelOperation {
+    pub fn operation(&self) -> &KernelOperation<XlaKernelExtension> {
         &self.0
+    }
+}
+
+impl<Extension: Operation<Type = ArrayIrType> + Into<XlaKernelExtension>> From<KernelOperation<Extension>>
+    for XlaKernelOperation
+{
+    fn from(operation: KernelOperation<Extension>) -> Self {
+        // This conversion only widens a supported family and cannot fail.
+        Self(
+            operation
+                .map_extension(|extension| match Into::<XlaKernelExtension>::into(extension) {
+                    #[cfg(feature = "mosaic-gpu")]
+                    extension @ XlaKernelExtension::Mosaic(_) => Ok(extension),
+                })
+                .unwrap(),
+        )
     }
 }
 
@@ -186,7 +413,9 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
 /// This is a whole-arena structural conversion, like `Program::map_operations`: atom and region identifiers stay
 /// stable, including shared descendants. Array literal atoms become variables defined by existing constant
 /// instructions at the region entrance. No runtime buffers, captures, or references become literal XLA values.
-fn stage_body(definition: &KernelDefinition) -> Result<FlatXlaProgram, ProgramError> {
+fn stage_body<Extension: KernelExtension + Into<XlaKernelExtension>>(
+    definition: &KernelDefinition<Extension>,
+) -> Result<FlatXlaProgram, ProgramError> {
     let body = definition.body();
     let regions = body
         .regions()
@@ -222,7 +451,7 @@ fn stage_body(definition: &KernelDefinition) -> Result<FlatXlaProgram, ProgramEr
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             instructions.extend(region.instructions().iter().map(|instruction| {
                 Instruction::new(
-                    XlaOperation::Kernel(XlaKernelOperation::new(instruction.operation().clone())),
+                    XlaOperation::Kernel(XlaKernelOperation::from(instruction.operation().clone())),
                     instruction.inputs().to_vec(),
                     instruction.outputs().to_vec(),
                     instruction.regions().to_vec(),
@@ -235,20 +464,24 @@ fn stage_body(definition: &KernelDefinition) -> Result<FlatXlaProgram, ProgramEr
     Program::new(vec![Placeholder; body.input_count()], vec![Placeholder; body.output_count()], regions, body.entry())
 }
 
-/// Binds an unselected portable kernel with its real body attached to the surrounding XLA program.
+/// Binds an unselected kernel with its real body attached to the surrounding XLA program.
 ///
-/// Compiler selection belongs to the enclosing XLA domain's immutable compilation options. Staging itself neither
-/// invokes an adapter nor acquires native runtime resources.
-pub fn stage_kernel<C>(
+/// Portable instructions and enabled typed extensions remain visible to ordinary region, effect, and reference
+/// traversal. Compiler selection belongs to the enclosing XLA domain's immutable compilation options. Staging itself
+/// neither invokes an adapter nor acquires native runtime resources.
+pub fn stage_kernel<C, Extension>(
     context: &C,
-    definition: &KernelDefinition,
+    definition: &KernelDefinition<Extension>,
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
     C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+    Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        XlaOperation::Kernel(XlaKernelOperation::new(KernelOperation::Call(definition.operation().clone()))),
+        XlaOperation::Kernel(XlaKernelOperation::new(KernelOperation::<NoKernelExtension>::Call(
+            definition.operation().clone(),
+        ))),
         vec![stage_body(definition)?],
         inputs,
     )
@@ -258,7 +491,7 @@ where
 fn definition_from_body(
     operation: &KernelCallOperation,
     body: ryft_core::RegionRef<'_, XlaConstant, XlaOperation>,
-) -> Result<KernelDefinition, ProgramError> {
+) -> Result<KernelDefinition<XlaKernelExtension>, ProgramError> {
     let body = body.to_program();
     let regions = body
         .regions()
@@ -292,7 +525,7 @@ fn definition_from_body(
                         }
                         operation => {
                             return Err(ProgramError::MalformedProgram(format!(
-                                "XLA operation `{}` has no portable kernel reconstruction",
+                                "XLA operation `{}` has no kernel reconstruction",
                                 operation.name(),
                             )));
                         }
@@ -454,7 +687,10 @@ pub struct XlaKernelCompilerBinding {
 
     /// Typed adapter and embedding retained behind the XLA-owned selection boundary.
     compile: Arc<
-        dyn Fn(&KernelDefinition, &XlaKernelExecutionFacts) -> Result<CompiledKernel, KernelEmbeddingError>
+        dyn Fn(
+                &KernelDefinition<XlaKernelExtension>,
+                &XlaKernelExecutionFacts,
+            ) -> Result<CustomCallOperation, KernelEmbeddingError>
             + Send
             + Sync,
     >,
@@ -479,6 +715,36 @@ impl XlaKernelCompilerBinding {
         C::Options: 'static + Send + Sync,
         B: 'static + Send + Sync + KernelOutputEmbedding<C::Output>,
     {
+        Self::new_with_extensions::<C, B, NoKernelExtension>(
+            compiler,
+            target,
+            options,
+            schedule,
+            embedding,
+            maximum_programs,
+        )
+    }
+
+    /// Binds an explicitly selected extension family without changing portable constructor inference.
+    ///
+    /// Before compilation, the current attached body is reconstructed into this exact family. An operation owned by
+    /// another family fails conversion rather than falling back to a different compiler. Validation and embedding
+    /// then use the same execution-facts and immutable-configuration path as ordinary portable kernels.
+    pub fn new_with_extensions<C, B, Extension>(
+        compiler: C,
+        target: C::Target,
+        options: C::Options,
+        schedule: KernelSchedule,
+        embedding: B,
+        maximum_programs: usize,
+    ) -> Result<Self, KernelEmbeddingError>
+    where
+        C: 'static + Send + Sync + KernelCompiler<Extension, Error: 'static + Send + Sync>,
+        C::Target: 'static + Send + Sync + XlaKernelTarget,
+        C::Options: 'static + Send + Sync,
+        B: 'static + Send + Sync + KernelOutputEmbedding<C::Output, Extension>,
+        Extension: 'static + Send + Sync + KernelExtension + TryFrom<XlaKernelExtension, Error = ProgramError>,
+    {
         let adapter_configuration = compiler
             .configuration_key(&target, &options, &schedule)
             .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
@@ -488,33 +754,43 @@ impl XlaKernelCompilerBinding {
             configuration.extend_from_slice(&(component.len() as u64).to_le_bytes());
             configuration.extend_from_slice(component);
         }
-        let output_configuration = configuration.clone();
-        let compile = Arc::new(move |definition: &KernelDefinition, facts: &XlaKernelExecutionFacts| {
-            target.admit_execution(facts)?;
-            let current_configuration = compiler
-                .configuration_key(&target, &options, &schedule)
-                .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
-            if current_configuration != adapter_configuration {
-                return Err(KernelEmbeddingError::Invalid {
-                    message: "selected kernel compiler configuration changed after binding".to_owned(),
-                });
-            }
-            if embedding.configuration_key()? != embedding_configuration {
-                return Err(KernelEmbeddingError::Invalid {
-                    message: "selected kernel embedding configuration changed after binding".to_owned(),
-                });
-            }
-            let verified = VerifiedKernel::new(definition, maximum_programs)
-                .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
-            let output = verified
-                .compile(&compiler, &target, &options, &schedule)
-                .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
-            let facts_configuration = facts.configuration_key()?;
-            let mut configuration = output_configuration.clone();
-            configuration.extend_from_slice(&(facts_configuration.len() as u64).to_le_bytes());
-            configuration.extend_from_slice(&facts_configuration);
-            CompiledKernel::from_output(&verified, &configuration, &output, &embedding)
-        });
+        let compile =
+            Arc::new(move |definition: &KernelDefinition<XlaKernelExtension>, facts: &XlaKernelExecutionFacts| {
+                target.admit_execution(facts)?;
+                let current_configuration = compiler
+                    .configuration_key(&target, &options, &schedule)
+                    .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
+                if current_configuration != adapter_configuration {
+                    return Err(KernelEmbeddingError::Invalid {
+                        message: "selected kernel compiler configuration changed after binding".to_owned(),
+                    });
+                }
+                if embedding.configuration_key()? != embedding_configuration {
+                    return Err(KernelEmbeddingError::Invalid {
+                        message: "selected kernel embedding configuration changed after binding".to_owned(),
+                    });
+                }
+                let body = definition
+                    .body()
+                    .map_operations(|operation| operation.clone().map_extension(Extension::try_from))
+                    .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                let definition = KernelDefinition::new(definition.operation().clone(), body)
+                    .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                let verified = VerifiedKernel::new(&definition, maximum_programs)
+                    .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                let output = verified
+                    .compile(&compiler, &target, &options, &schedule)
+                    .map_err(|error| KernelEmbeddingError::Compiler(Box::new(error)))?;
+                let facts_configuration = facts.configuration_key()?;
+                // The common embedding boundary appends the embedding key exactly once. This component retains
+                // compiler and execution-facts identity; the binding separately checks both captured configurations.
+                let mut configuration = Vec::new();
+                configuration.extend_from_slice(&(adapter_configuration.len() as u64).to_le_bytes());
+                configuration.extend_from_slice(&adapter_configuration);
+                configuration.extend_from_slice(&(facts_configuration.len() as u64).to_le_bytes());
+                configuration.extend_from_slice(&facts_configuration);
+                Ok(CompiledKernel::from_output(&verified, &configuration, &output, &embedding)?.custom_call().clone())
+            });
         Ok(Self { configuration, maximum_programs, compile })
     }
 
@@ -526,9 +802,9 @@ impl XlaKernelCompilerBinding {
     /// Compiles the current attached body after core verification and exact selected-adapter admission.
     pub(crate) fn compile(
         &self,
-        definition: &KernelDefinition,
+        definition: &KernelDefinition<XlaKernelExtension>,
         facts: &XlaKernelExecutionFacts,
-    ) -> Result<CompiledKernel, KernelEmbeddingError> {
+    ) -> Result<CustomCallOperation, KernelEmbeddingError> {
         (self.compile)(definition, facts)
     }
 }
@@ -613,7 +889,7 @@ pub(crate) fn select_kernels(
                             let compiled = binding.compile(&definition, &facts)?;
                             selected = true;
                             return Ok(Instruction::new(
-                                compiled.custom_call().clone().into(),
+                                compiled.into(),
                                 instruction.inputs().to_vec(),
                                 instruction.outputs().to_vec(),
                                 vec![],
@@ -781,7 +1057,7 @@ mod tests {
             ReferenceWrite,
         };
         let logical = crate::kernels::tests::definition().operation().clone();
-        let definition = KernelDefinition::trace(logical, |(references, _)| {
+        let definition = KernelDefinition::<NoKernelExtension>::trace(logical, |(references, _)| {
             let value = references[0].read()?;
             references[0].context().bind(
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
@@ -863,8 +1139,16 @@ mod tests {
         );
         assert_eq!(staged.instructions()[0].outputs(), &[literal]);
         let restored = definition_from_body(definition.operation(), staged.entry_region_ref()).unwrap();
+        let portable = KernelDefinition::new(
+            restored.operation().clone(),
+            restored
+                .body()
+                .map_operations(|operation| operation.clone().map_extension(NoKernelExtension::try_from))
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            restored.interpret(vec![CpuArray::scalar(0_i32).unwrap()], 1).unwrap(),
+            portable.interpret(vec![CpuArray::scalar(0_i32).unwrap()], 1).unwrap(),
             vec![CpuArray::scalar(42_i32).unwrap()]
         );
     }
@@ -977,6 +1261,125 @@ mod tests {
         assert_ne!(first, different);
     }
 
+    #[cfg(feature = "mosaic-gpu")]
+    #[test]
+    fn test_xla_kernel_compiler_binding_new_with_extensions() {
+        use ryft_core::kernels::{Grid, KernelParameterAccess, whole_array_parameter};
+        use ryft_core::{ArrayType, DataType, ReferenceRead, ReferenceWrite};
+        use ryft_mosaic::kernels::gpu::{Compiler as GpuCompiler, GpuOperation, Mma, Options, Target};
+
+        use crate::kernels::MosaicGpuEmbedding;
+
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(
+                    ArrayType::new_static(DataType::F16, vec![64, 16]),
+                    KernelParameterAccess::ReadOnly,
+                )
+                .unwrap(),
+                whole_array_parameter(
+                    ArrayType::new_static(DataType::F16, vec![16, 8]),
+                    KernelParameterAccess::ReadOnly,
+                )
+                .unwrap(),
+                whole_array_parameter(
+                    ArrayType::new_static(DataType::F32, vec![64, 8]),
+                    KernelParameterAccess::WriteOnly,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let definition = KernelDefinition::<GpuOperation>::trace(call, |(references, _)| {
+            let left = references[0].read()?;
+            let right = references[1].read()?;
+            let output = references[0].context().bind(
+                KernelOperation::Extension(GpuOperation::Wgmma),
+                vec![],
+                &[left, right],
+            )?;
+            references[2].write(&output[0])
+        })
+        .unwrap();
+        let (_, program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel(inputs[0].context(), &definition, &inputs)
+            },
+            definition.operation().input_types(),
+        )
+        .unwrap();
+        let body_id = program.instructions()[0].regions()[0];
+        assert_eq!(
+            program
+                .region_ref(body_id)
+                .unwrap()
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.operation(),
+                        XlaOperation::Kernel(XlaKernelOperation(KernelOperation::Extension(
+                            XlaKernelExtension::Mosaic(GpuOperation::Wgmma)
+                        )))
+                    )
+                })
+                .count(),
+            1
+        );
+        let restored = definition_from_body(definition.operation(), program.region_ref(body_id).unwrap()).unwrap();
+        assert_eq!(restored.semantic_key().unwrap(), definition.semantic_key().unwrap());
+
+        let target = Target::new(9, 0).unwrap().with_threads_per_block(128).unwrap();
+        let options = Options::default().with_mma(Mma::Wgmma);
+        let gpu_facts = || {
+            Ok(XlaKernelExecutionFacts {
+                platform_name: "CUDA".to_owned(),
+                platform_version: "cuda 13020".to_owned(),
+                pjrt_version: ryft_pjrt::VERSION,
+                has_ffi_extension: true,
+                attributes: BTreeMap::new(),
+                devices: vec![XlaKernelDeviceFacts {
+                    kind: "fixture GPU".to_owned(),
+                    attributes: BTreeMap::from([(
+                        "compute_capability".to_owned(),
+                        ryft_pjrt::Value::String("9.0".to_owned()),
+                    )]),
+                }],
+            })
+        };
+        let portable = XlaKernelCompilerBinding::new(
+            GpuCompiler,
+            target.clone(),
+            options.clone(),
+            KernelSchedule::default(),
+            MosaicGpuEmbedding,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(select_kernels(&program, Some(&portable), gpu_facts),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "portable kernel compiler binding cannot consume a Mosaic GPU extension"));
+
+        let binding = XlaKernelCompilerBinding::new_with_extensions::<_, _, GpuOperation>(
+            GpuCompiler,
+            target,
+            options,
+            KernelSchedule::default(),
+            MosaicGpuEmbedding,
+            1,
+        )
+        .unwrap();
+        // Identical compiler configuration never bypasses the current body's family admission.
+        assert_eq!(portable.configuration(), binding.configuration());
+        let selected = select_kernels(&program, Some(&binding), gpu_facts).unwrap().unwrap();
+        assert_eq!(selected.instructions().len(), 1);
+        assert_eq!(selected.instructions()[0].operation().name(), "custom_call");
+        assert_eq!(selected.output_types(), definition.operation().output_types());
+        assert!(!selected.effects().classes().contains(EffectClass::OrderedState));
+        assert_eq!(selected.regions().len(), 1);
+    }
+
     #[test]
     fn test_xla_kernel_compiler_binding_compile() {
         let binding = XlaKernelCompilerBinding::new(
@@ -988,13 +1391,15 @@ mod tests {
             1,
         )
         .unwrap();
-        let definition = crate::kernels::tests::definition();
+        let portable = crate::kernels::tests::definition();
+        let staged = stage_body(&portable).unwrap();
+        let definition = definition_from_body(portable.operation(), staged.entry_region_ref()).unwrap();
         let first_facts = facts().unwrap();
         let first = binding.compile(&definition, &first_facts).unwrap();
         let mut changed = first_facts.clone();
         changed.platform_version = "2".to_owned();
         let second = binding.compile(&definition, &changed).unwrap();
-        assert_ne!(first.custom_call().attributes(), second.custom_call().attributes());
+        assert_ne!(first.attributes(), second.attributes());
         changed.platform_name = "other".to_owned();
         assert!(matches!(binding.compile(&definition, &changed), Err(KernelEmbeddingError::Invalid { message })
             if message == "fixture execution platform mismatch"));
@@ -1046,7 +1451,9 @@ mod tests {
             1,
         )
         .unwrap();
-        let definition = crate::kernels::tests::definition();
+        let portable = crate::kernels::tests::definition();
+        let staged = stage_body(&portable).unwrap();
+        let definition = definition_from_body(portable.operation(), staged.entry_region_ref()).unwrap();
         assert!(binding.compile(&definition, &facts().unwrap()).is_ok());
         configuration.store(1, Ordering::SeqCst);
         assert!(matches!(

@@ -3,25 +3,29 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, VerifiedKernel};
+use ryft_core::kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArraySliceAxis, ArrayType, Atom, AtomId,
-    ConstantOperation, DataType, InstructionId, Operation as CoreOperation, RegionRef, Typed, ValueId,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArraySliceAxis, ArrayType,
+    Atom, AtomId, ConstantOperation, DataType, InstructionId, Operation as CoreOperation, RegionRef, Typed, ValueId,
 };
-use ryft_mlir::dialects::{arith, gpu, llvm, memref, scf};
+use ryft_mlir::dialects::{arith, gpu, llvm, memref, nvvm, scf};
 use ryft_mlir::{
     Block, Context, DetachedBlock, DetachedOp, Module, Operation, Type, TypeRef, UnknownLocationRef, Value, ValueRef,
 };
 
+use crate::kernels::gpu::lowering::memory::CopyToken;
 use crate::kernels::gpu::lowering::module::element_type;
+use crate::kernels::gpu::lowering::tmem::{Tmem, TmemToken};
 use crate::kernels::gpu::synchronization::{CtaSynchronization, SynchronizationEvent};
-
-use crate::kernels::gpu::{Error, Options, Target};
+use crate::kernels::gpu::{Error, GpuOperation, Options, Target, TmemOperation};
 
 mod arrays;
 mod dimensions;
 mod memory;
+mod mma;
 mod module;
+mod nvfp4;
+mod tmem;
 mod validation;
 
 pub(super) use module::serialize;
@@ -76,7 +80,9 @@ enum Lowered<'c, 't> {
     Array(Buffer<'c, 't>),
     Dimension(KernelValue<'c, 't>),
     Reference(Reference<'c, 't>),
-    Token(KernelValue<'c, 't>),
+    Token(CopyToken<'c, 't>),
+    Tmem(Tmem<'c, 't>),
+    TmemToken(TmemToken<'c, 't>),
 }
 
 impl<'c, 't> Lowered<'c, 't> {
@@ -113,11 +119,23 @@ struct Lowering<'c, 't> {
     /// Declared participant count, represented as an index value.
     threads: KernelValue<'c, 't>,
 
+    /// Local CTA rank in a two-block cluster; absent for ordinary single-CTA programs.
+    cluster_rank: Option<KernelValue<'c, 't>>,
+
     /// Preallocated transport storage, keyed by the canonical source value identity.
     storage: HashMap<ValueId, Buffer<'c, 't>>,
 
+    /// Native by-value TMA descriptor pointers, keyed by the canonical completion token.
+    tma_descriptors: HashMap<ValueId, KernelValue<'c, 't>>,
+
+    /// Native operand transports owned by their canonical matrix instruction.
+    instruction_scratch: HashMap<InstructionId, Vec<KernelValue<'c, 't>>>,
+
+    /// Maximum outstanding committed warpgroup groups.
+    mma_stages: usize,
+
     /// Actual emitted copy groups and CTA rendezvous, absent only in isolated arithmetic construction tests.
-    synchronization: Option<CtaSynchronization>,
+    synchronization: Option<Vec<CtaSynchronization>>,
 
     /// Canonical source operation currently being lowered.
     current_instruction: Option<InstructionId>,
@@ -163,7 +181,17 @@ impl<'c, 't> Lowering<'c, 't> {
         index: KernelValue<'c, 't>,
         value: KernelValue<'c, 't>,
     ) -> Result<(), Error> {
-        block.append_operation(memref::store(value, buffer.value, &[index], false, None, self.location)?)?;
+        if let Some(rank) = self.cluster_rank.filter(|_| !buffer.shared) {
+            let zero = self.index(block, 0)?;
+            let leader =
+                append(block, arith::cmpi(rank, zero, arith::IntegerComparisonPredicate::Equal, self.location)?)?;
+            let mut body = self.context.block(&[] as &[(TypeRef, UnknownLocationRef)]);
+            body.append_operation(memref::store(value, buffer.value, &[index], false, None, self.location)?)?;
+            body.append_operation(scf::r#yield(&[], self.location)?)?;
+            block.append_operation(scf::r#if(leader, &[], body.try_into()?, None, self.location)?)?;
+        } else {
+            block.append_operation(memref::store(value, buffer.value, &[index], false, None, self.location)?)?;
+        }
         Ok(())
     }
 
@@ -191,15 +219,147 @@ impl<'c, 't> Lowering<'c, 't> {
 
     /// Publishes completed shared-memory writes before subsequent cross-thread reads.
     fn barrier(&mut self, block: &mut DetachedBlock<'c, 't>) -> Result<(), Error> {
-        if let (Some(synchronization), Some(instruction)) = (&mut self.synchronization, self.current_instruction) {
-            for thread in 0..synchronization.participants().get() {
-                synchronization
-                    .record(thread, instruction, SynchronizationEvent::Barrier { site: self.next_barrier })
-                    .map_err(|error| Error::Synchronization { message: error.to_string() })?;
+        if let Some(plans) = &self.synchronization {
+            let participants = plans[0].participants().get();
+            for thread in 0..participants {
+                self.record_synchronization(None, thread, SynchronizationEvent::Barrier { site: self.next_barrier })?;
             }
             self.next_barrier += 1;
         }
         block.append_operation(gpu::barrier(None, self.location)?)?;
+        self.cluster_barrier(block)
+    }
+
+    /// Publishes completed CTA-local writes to the peer and keeps replicated program execution in lockstep.
+    fn cluster_barrier(&mut self, block: &mut DetachedBlock<'c, 't>) -> Result<(), Error> {
+        if self.cluster_rank.is_none() {
+            return Ok(());
+        }
+        if let Some(plans) = &self.synchronization {
+            let participants = plans[0].participants().get();
+            for thread in 0..participants {
+                self.record_synchronization(
+                    None,
+                    thread,
+                    SynchronizationEvent::ClusterBarrier { site: self.next_barrier },
+                )?;
+            }
+            self.next_barrier += 1;
+        }
+        block.append_operation(nvvm::cluster_arrive(&[], &[], &[], false, self.location)?)?;
+        block.append_operation(nvvm::cluster_wait(&[], &[], &[], false, self.location)?)?;
+        Ok(())
+    }
+
+    /// Copies the peer's completed rows into this CTA's replicated result, with cluster rendezvous around all reads.
+    /// The native collective load has already written exactly this CTA's `rows_per_cta` contiguous rows.
+    fn cluster_gather_rows(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        buffer: &Buffer<'c, 't>,
+        rows_per_cta: usize,
+    ) -> Result<(), Error> {
+        let dimensions = shape(&buffer.r#type)?;
+        let participants = self.synchronization.as_ref().unwrap()[0].participants().get();
+        if !buffer.shared
+            || dimensions.len() != 2
+            || dimensions[0] != 2 * rows_per_cta
+            || rows_per_cta != participants as usize
+            || self.cluster_rank.is_none()
+        {
+            return Err(Error::Invalid {
+                message: "cluster row replication requires one shared row per declared thread in each cta".to_owned(),
+            });
+        }
+        self.barrier(block)?;
+        let columns = dimensions[1];
+        for cta in 0..2 {
+            for thread in 0..participants {
+                let row = (1 - cta) * rows_per_cta + thread as usize;
+                let view = ArrayReferenceView::Slice {
+                    axes: vec![ArraySliceAxis::new(row, 1, 1), ArraySliceAxis::new(0, columns, 1)],
+                };
+                self.record_synchronization(
+                    Some(cta),
+                    thread,
+                    SynchronizationEvent::DistributedCopy {
+                        source_block: (1 - cta) as u32,
+                        source: (buffer.owner, view.clone()),
+                        destination: (buffer.owner, view),
+                    },
+                )?;
+            }
+        }
+        let rank = self.cluster_rank.unwrap();
+        let one = self.index(block, 1)?;
+        let peer = append(block, arith::subi(one, rank, self.location)?)?;
+        let peer_i32 =
+            append(block, arith::index_castui(peer, self.context.signless_integer_type(32), self.location)?)?;
+        let row_count = self.index(block, rows_per_cta)?;
+        let row_start = append(block, arith::muli(peer, row_count, self.location)?)?;
+        let row_width = self.index(block, columns)?;
+        let bytes = ryft_core::ArrayAddressing::new(buffer.r#type.clone())?.element_byte_width();
+        let element_bytes = self.index(block, bytes)?;
+        let base = append(block, memref::extract_aligned_pointer_as_index(buffer.value, self.location)?)?;
+        self.distributed(block, rows_per_cta, |lowering, body, row| {
+            let row = append(body, arith::addi(row_start, row, lowering.location)?)?;
+            let row_offset = append(body, arith::muli(row, row_width, lowering.location)?)?;
+            let zero = lowering.index(body, 0)?;
+            let one = lowering.index(body, 1)?;
+            let mut copy = lowering.context.block(&[(lowering.context.index_type().as_ref(), lowering.location)]);
+            let column = copy.argument(0)?.as_ref();
+            let index = append(&mut copy, arith::addi(row_offset, column, lowering.location)?)?;
+            let offset = append(&mut copy, arith::muli(index, element_bytes, lowering.location)?)?;
+            let address = append(&mut copy, arith::addi(base, offset, lowering.location)?)?;
+            let address = append(
+                &mut copy,
+                arith::index_castui(address, lowering.context.signless_integer_type(64), lowering.location)?,
+            )?;
+            let address =
+                append(&mut copy, llvm::inttoptr(address, lowering.context.llvm_pointer_type(3)?, lowering.location)?)?;
+            let address = append(
+                &mut copy,
+                nvvm::mapa(
+                    &[address, peer_i32],
+                    &[lowering.context.llvm_pointer_type(7)?.as_ref()],
+                    &[],
+                    false,
+                    lowering.location,
+                )?,
+            )?;
+            let value = append(
+                &mut copy,
+                llvm::load(
+                    address,
+                    element_type(lowering.context, buffer.r#type.data_type())?,
+                    Some(bytes as i64),
+                    false,
+                    lowering.location,
+                )?,
+            )?;
+            lowering.store(&mut copy, buffer, index, value)?;
+            copy.append_operation(scf::r#yield(&[], lowering.location)?)?;
+            body.append_operation(scf::r#for(zero, row_width, one, &[], false, copy.try_into()?, lowering.location)?)?;
+            Ok(())
+        })?;
+        self.barrier(block)
+    }
+
+    /// Records the actual emitted instruction in each participating CTA, or only in one explicitly elected CTA.
+    fn record_synchronization(
+        &mut self,
+        block: Option<usize>,
+        thread: u32,
+        event: SynchronizationEvent,
+    ) -> Result<(), Error> {
+        if let (Some(plans), Some(instruction)) = (&mut self.synchronization, self.current_instruction) {
+            for (index, plan) in plans.iter_mut().enumerate() {
+                if block.is_none_or(|block| block == index) {
+                    plan.record(thread, instruction, event.clone())
+                        .map_err(|error| Error::Synchronization { message: error.to_string() })?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -221,8 +381,8 @@ fn shape(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
 }
 
 /// Checks source support before any native module is constructed or an artifact cache is consulted.
-pub(super) fn validate(
-    kernel: &VerifiedKernel<'_>,
+pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
+    kernel: &VerifiedKernel<'_, Extension>,
     target: &Target,
     options: &Options,
     schedule: &KernelSchedule,
@@ -313,6 +473,15 @@ pub(super) fn validate(
                         .is_some_and(|instruction| matches!(instruction.operation(), KernelOperation::Scratch(_)))
             }
             KernelOperation::Wait(_) => true,
+            KernelOperation::Extension(extension) => {
+                matches!(
+                    extension.clone().into(),
+                    GpuOperation::Wgmma
+                        | GpuOperation::Nvfp4 { .. }
+                        | GpuOperation::Nvfp4Sparse { .. }
+                        | GpuOperation::Tmem(_)
+                )
+            }
             _ => false,
         };
         if !supported {
@@ -326,9 +495,9 @@ pub(super) fn validate(
 }
 
 /// Constructs the checked source module and its physical argument mapping.
-pub(super) fn module<'c, 't>(
+pub(super) fn module<'c, 't, Extension: KernelExtension + Into<GpuOperation>>(
     context: &'c Context<'t>,
-    kernel: &VerifiedKernel<'_>,
+    kernel: &VerifiedKernel<'_, Extension>,
     target: &Target,
     options: &Options,
     schedule: &KernelSchedule,
@@ -344,7 +513,18 @@ pub(super) fn module<'c, 't>(
         .map(|(_, extent)| *extent)
         .product::<usize>();
     let empty = plan.grid_extents.contains(&0);
-    let shared_types = plan.storage.iter().map(|(_, r#type)| r#type.clone()).collect::<Vec<_>>();
+    let shared_types = plan
+        .storage
+        .iter()
+        .map(|(_, r#type)| r#type.clone())
+        .chain(plan.instruction_scratch.iter().flat_map(|(_, types)| types.iter().cloned()))
+        .collect::<Vec<_>>();
+    let shared_alignments = plan
+        .storage
+        .iter()
+        .map(|(owner, _)| if plan.tma_copies.iter().any(|copy| copy.destination == *owner) { 128 } else { 16 })
+        .chain(std::iter::repeat_n(256, plan.instruction_scratch.iter().map(|(_, types)| types.len()).sum()))
+        .collect::<Vec<_>>();
     let has_assertions =
         kernel.definition().body().effects().classes().contains(ryft_core::EffectClass::OrderedAssertion);
     let input_count = call.input_types().len();
@@ -360,8 +540,10 @@ pub(super) fn module<'c, 't>(
         "ryft_kernel",
         &arguments,
         &shared_types,
-        [parallel_count.max(1), 1, 1],
-        |block, globals, shared| {
+        &shared_alignments,
+        &plan.tma_copies.iter().map(|copy| plan.parameter_slots[copy.source_parameter]).collect::<Vec<_>>(),
+        [parallel_count.max(1) * target.blocks_per_cluster() as usize, 1, 1],
+        |block, globals, shared, descriptors| {
             if empty {
                 return Ok(());
             }
@@ -372,6 +554,18 @@ pub(super) fn module<'c, 't>(
                 synchronization_storage
                     .insert(ValueId::new(region.id(), region.input_ids()[index]), parameter.r#type().into_owned());
             }
+            for instruction in region.instructions() {
+                if matches!(instruction.operation(), KernelOperation::Extension(extension)
+                if matches!(extension.clone().into(), GpuOperation::Tmem(
+                    TmemOperation::Allocate { .. } | TmemOperation::AllocateScales { .. }
+                ))) {
+                    let owner = instruction.outputs()[0];
+                    let r#type = region.atoms()[owner.index()].r#type();
+                    let ArrayIrType::Reference(reference) = r#type.as_ref() else { unreachable!() };
+                    // The native address slot shares the source owner; simulation tracks its logical TMEM contents.
+                    synchronization_storage.insert(ValueId::new(region.id(), owner), reference.referent().clone());
+                }
+            }
             let synchronization =
                 CtaSynchronization::new(NonZeroU32::new(target.threads_per_block()).unwrap(), synchronization_storage)
                     .map_err(|error| Error::Synchronization { message: error.to_string() })?;
@@ -380,7 +574,37 @@ pub(super) fn module<'c, 't>(
                 location,
                 thread: block.argument(3)?.as_ref(),
                 threads: block.argument(9)?.as_ref(),
-                synchronization: Some(synchronization),
+                cluster_rank: if target.blocks_per_cluster() == 2 {
+                    let size = append(
+                        block,
+                        arith::constant(
+                            context.integer_attribute(context.index_type(), i64::from(target.blocks_per_cluster())),
+                            location,
+                        )?,
+                    )?;
+                    Some(append(block, arith::remui(block.argument(0)?.as_ref(), size, location)?)?)
+                } else {
+                    None
+                },
+                tma_descriptors: plan
+                    .tma_copies
+                    .iter()
+                    .zip(descriptors)
+                    .map(|(copy, descriptor)| (copy.token, *descriptor))
+                    .collect(),
+                instruction_scratch: {
+                    let mut offset = plan.storage.len();
+                    plan.instruction_scratch
+                        .iter()
+                        .map(|(instruction, types)| {
+                            let values = shared[offset..offset + types.len()].to_vec();
+                            offset += types.len();
+                            (*instruction, values)
+                        })
+                        .collect()
+                },
+                mma_stages: schedule.pipeline_stages().map(|stages| stages.get()).unwrap_or(1),
+                synchronization: Some(vec![synchronization; target.blocks_per_cluster() as usize]),
                 current_instruction: None,
                 next_barrier: 0,
                 storage: plan
@@ -392,7 +616,7 @@ pub(super) fn module<'c, 't>(
                     })
                     .collect(),
             };
-            let mut remaining = block.argument(0)?.as_ref();
+            let mut remaining = block.argument(if target.blocks_per_cluster() == 2 { 12 } else { 0 })?.as_ref();
             let mut coordinates = vec![lowering.index(block, 0)?; plan.grid_extents.len()];
             for axis in (0..coordinates.len()).rev() {
                 if call.grid().dimensions()[axis].execution() == GridExecution::Parallel {
@@ -402,12 +626,19 @@ pub(super) fn module<'c, 't>(
                 }
             }
             lowering.grid(block, kernel, &plan, globals, &mut coordinates, 0)?;
-            lowering
-                .synchronization
-                .as_ref()
-                .unwrap()
-                .simulate()
-                .map_err(|error| Error::Synchronization { message: error.to_string() })?;
+            if plan.uses_tmem {
+                lowering.tmem_relinquish(block)?;
+            }
+            let synchronization = lowering.synchronization.as_ref().unwrap();
+            if target.blocks_per_cluster() == 2 {
+                synchronization[0]
+                    .simulate_cluster(&synchronization[1])
+                    .map_err(|error| Error::Synchronization { message: error.to_string() })?;
+            } else {
+                synchronization[0]
+                    .simulate()
+                    .map_err(|error| Error::Synchronization { message: error.to_string() })?;
+            }
             Ok(())
         },
     )?;
@@ -417,10 +648,10 @@ pub(super) fn module<'c, 't>(
 
 impl<'c, 't> Lowering<'c, 't> {
     /// Nests sequential grid axes inside each parallel CTA while preserving the declared traversal order.
-    fn grid(
+    fn grid<Extension: KernelExtension + Into<GpuOperation>>(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
-        kernel: &VerifiedKernel<'_>,
+        kernel: &VerifiedKernel<'_, Extension>,
         plan: &validation::Plan,
         globals: &[KernelValue<'c, 't>],
         coordinates: &mut [KernelValue<'c, 't>],
@@ -466,6 +697,9 @@ impl<'c, 't> Lowering<'c, 't> {
         }
         inputs.extend(coordinates.iter().copied().map(Lowered::Dimension));
         self.region(block, kernel.definition().body().entry_region_ref(), &inputs)?;
+        if self.cluster_rank.is_some() {
+            self.barrier(block)?;
+        }
         Ok(())
     }
 
@@ -630,10 +864,10 @@ impl<'c, 't> Lowering<'c, 't> {
     }
 
     /// Replays one canonical region, preserving its local identities and ordered reference effects.
-    fn region(
+    fn region<Extension: KernelExtension + Into<GpuOperation>>(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
-        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation>,
+        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         inputs: &[Lowered<'c, 't>],
     ) -> Result<Vec<Lowered<'c, 't>>, Error> {
         let mut values = vec![None; region.atoms().len()];
@@ -673,9 +907,132 @@ impl<'c, 't> Lowering<'c, 't> {
             let results = match instruction.operation() {
                 KernelOperation::Portable(ArrayIrOperation::Array(operation)) => {
                     let arrays = inputs.iter().map(|input| input.array().clone()).collect::<Vec<_>>();
-                    self.array(block, operation, &arrays, output())?;
+                    if let Some(scratch) = self.instruction_scratch.get(&self.current_instruction.unwrap()).cloned() {
+                        let scales = if let ArrayOperation::ScaledDot(operation) = operation {
+                            [
+                                operation.has_lhs_scale().then(|| &arrays[2]),
+                                operation.has_rhs_scale().then(|| &arrays[2 + usize::from(operation.has_lhs_scale())]),
+                            ]
+                        } else {
+                            [None, None]
+                        };
+                        self.wgmma(block, &arrays[..2], output(), &[scratch[0], scratch[1]], self.mma_stages, scales)?;
+                    } else {
+                        self.array(block, operation, &arrays, output())?;
+                    }
                     vec![Lowered::Array(output().clone())]
                 }
+                KernelOperation::Extension(extension) => match extension.clone().into() {
+                    GpuOperation::Tmem(operation) => match operation {
+                        TmemOperation::Allocate { columns, .. } => vec![Lowered::Tmem(self.tmem_allocate(
+                            block,
+                            output_ids[0],
+                            usize::from(columns),
+                            output().value,
+                            None,
+                        )?)],
+                        TmemOperation::AllocateScales { rows, blocks, data_type } => {
+                            let scale_signs = if data_type == DataType::F8E4M3FN {
+                                Some(Buffer {
+                                    owner: output_ids[0],
+                                    shared: true,
+                                    value: self.instruction_scratch[&self.current_instruction.unwrap()][0],
+                                    r#type: ArrayType::new_static(
+                                        DataType::U8,
+                                        [usize::from(rows), usize::from(blocks)],
+                                    ),
+                                })
+                            } else {
+                                None
+                            };
+                            vec![Lowered::Tmem(self.tmem_allocate(
+                                block,
+                                output_ids[0],
+                                tmem::scale_columns(usize::from(rows), usize::from(blocks))?,
+                                output().value,
+                                scale_signs,
+                            )?)]
+                        }
+                        TmemOperation::CopyScales => {
+                            let Lowered::Tmem(destination) = &inputs[1] else { unreachable!() };
+                            let scratch = self.instruction_scratch[&self.current_instruction.unwrap()].clone();
+                            vec![Lowered::TmemToken(self.tmem_scale_copy(
+                                block,
+                                inputs[0].array(),
+                                destination,
+                                output_ids[0],
+                                output().value,
+                                scratch[0],
+                            )?)]
+                        }
+                        TmemOperation::Mma { accumulate }
+                        | TmemOperation::MmaBlockScaled { accumulate }
+                        | TmemOperation::MmaNvfp4 { accumulate } => {
+                            let scaled = !matches!(operation, TmemOperation::Mma { .. });
+                            let Lowered::Tmem(destination) = &inputs[if scaled { 4 } else { 2 }] else {
+                                unreachable!()
+                            };
+                            let scales = if scaled {
+                                let (Lowered::Tmem(left), Lowered::Tmem(right)) = (&inputs[2], &inputs[3]) else {
+                                    unreachable!()
+                                };
+                                Some([left.clone(), right.clone()])
+                            } else {
+                                None
+                            };
+                            let scratch = self.instruction_scratch[&self.current_instruction.unwrap()].clone();
+                            vec![Lowered::TmemToken(self.tmem_mma(
+                                block,
+                                &[inputs[0].array().clone(), inputs[1].array().clone()],
+                                destination,
+                                output_ids[0],
+                                output().value,
+                                &[scratch[0], scratch[1]],
+                                accumulate,
+                                scales.as_ref(),
+                            )?)]
+                        }
+                        TmemOperation::Commit => {
+                            // Commit observes the same token again at Wait; update its canonical value slot.
+                            let Some(Lowered::TmemToken(token)) = &mut values[instruction.inputs()[0].index()] else {
+                                unreachable!()
+                            };
+                            self.tmem_commit(block, token)?;
+                            Vec::new()
+                        }
+                        TmemOperation::Wait => {
+                            let Lowered::TmemToken(token) = &inputs[0] else { unreachable!() };
+                            self.tmem_wait(block, token.clone())?;
+                            Vec::new()
+                        }
+                        TmemOperation::Load => {
+                            let Lowered::Tmem(source) = &inputs[0] else { unreachable!() };
+                            self.tmem_load(block, source, output())?;
+                            vec![Lowered::Array(output().clone())]
+                        }
+                        TmemOperation::Release => {
+                            let Lowered::Tmem(source) = &inputs[0] else { unreachable!() };
+                            self.tmem_release(block, source.clone())?;
+                            Vec::new()
+                        }
+                    },
+                    GpuOperation::Wgmma => {
+                        let arrays = inputs.iter().map(|input| input.array().clone()).collect::<Vec<_>>();
+                        let scratch = self.instruction_scratch[&self.current_instruction.unwrap()].clone();
+                        self.wgmma(block, &arrays, output(), &[scratch[0], scratch[1]], self.mma_stages, [None, None])?;
+                        vec![Lowered::Array(output().clone())]
+                    }
+                    GpuOperation::Nvfp4 { tensor_scale } => {
+                        let arrays = inputs.iter().map(|input| input.array().clone()).collect::<Vec<_>>();
+                        self.nvfp4(block, &arrays, output(), tensor_scale)?;
+                        vec![Lowered::Array(output().clone())]
+                    }
+                    GpuOperation::Nvfp4Sparse { tensor_scale } => {
+                        let arrays = inputs.iter().map(|input| input.array().clone()).collect::<Vec<_>>();
+                        self.nvfp4_sparse(block, &arrays, output(), tensor_scale)?;
+                        vec![Lowered::Array(output().clone())]
+                    }
+                },
                 KernelOperation::Portable(ArrayIrOperation::Dimension(operation)) => self
                     .dimension(block, operation, &inputs.iter().map(Lowered::dimension).collect::<Vec<_>>())?
                     .into_iter()
@@ -779,7 +1136,12 @@ impl<'c, 't> Lowering<'c, 't> {
                 }
                 KernelOperation::Scratch(_) => vec![Lowered::Reference(self.reference(block, output().clone())?)],
                 KernelOperation::AsyncCopy(_) => {
-                    vec![Lowered::Token(self.async_copy(block, inputs[0].reference(), inputs[1].reference())?)]
+                    vec![Lowered::Token(self.async_copy(
+                        block,
+                        inputs[0].reference(),
+                        inputs[1].reference(),
+                        output_ids[0],
+                    )?)]
                 }
                 KernelOperation::Wait(_) => {
                     for input in &inputs {
@@ -1044,7 +1406,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             references[0].write(&references[0].read()?)?;
             Ok(())
         })
@@ -1075,6 +1437,46 @@ mod tests {
     }
 
     #[test]
+    fn test_module_cluster_coordinates() {
+        use ryft_mlir::{BlockArgumentRef, OperationResultRef};
+        let grid = Grid::new(vec![GridDimension::new(Dimension::Static(4), GridExecution::Parallel)]).unwrap();
+        let definition: KernelDefinition =
+            KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |_| Ok(())).unwrap();
+        let verified = VerifiedKernel::new(&definition, 4).unwrap();
+        let context = Context::new();
+        let (module, _, _, _) = module(
+            &context,
+            &verified,
+            &Target::new(9, 0).unwrap().with_blocks_per_cluster(2).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
+        let mut divisions = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str().unwrap() == "arith.remui" {
+                let numerator =
+                    operation.operand_value(0).unwrap().cast::<BlockArgumentRef>().unwrap().argument_index();
+                let denominator = operation
+                    .operand_value(1)
+                    .unwrap()
+                    .cast::<OperationResultRef>()
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .attribute("value")
+                    .unwrap()
+                    .unwrap()
+                    .to_string();
+                divisions.push((numerator, denominator));
+            }
+            WalkResult::Advance
+        });
+        assert_eq!(divisions, vec![(0, "2 : index".to_owned()), (12, "4 : index".to_owned())]);
+        assert_serializes(&module);
+    }
+
+    #[test]
     fn test_module_masked_vector_load() {
         let r#type = ArrayType::new_static(DataType::I32, [4]);
         let operation = KernelCallOperation::new(
@@ -1085,7 +1487,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context();
             let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true, false, true, false])?))?;
             let other = context.lift(ArrayIrValue::Array(Array::vector(vec![-1i32; 4])?))?;
@@ -1114,7 +1516,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context().clone();
             let input = references[0].read()?;
             let types = vec![ArrayIrType::Array(ArrayType::scalar(DataType::I64))];
@@ -1176,7 +1578,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context();
             let first = references[0].read()?;
             let second = context.lift(ArrayIrValue::Array(Array::scalar(11i64)?))?;
@@ -1206,7 +1608,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let value = references[0].read()?;
             value.context().bind(
                 ArrayIrOperation::from(ArrayOperation::Sqrt(ryft_core::SqrtOperation::new())),
@@ -1231,7 +1633,7 @@ mod tests {
         {
             let grid =
                 Grid::new(vec![GridDimension::new(Dimension::Static(extent), GridExecution::Sequential)]).unwrap();
-            let definition =
+            let definition: KernelDefinition =
                 KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |_| Ok(())).unwrap();
             let verified = VerifiedKernel::new(&definition, 2).unwrap();
             let context = Context::new();
@@ -1268,14 +1670,20 @@ mod tests {
                 "clamped_index",
                 &[(0, source_type.clone()), (1, index_type.clone())],
                 &[],
+                &[],
+                &[],
                 [1, 1, 1],
-                |block, globals, _| {
+                |block, globals, _, _| {
                     let lowering = Lowering {
                         context: &context,
                         location: context.unknown_location(),
                         thread: block.argument(3)?.as_ref(),
                         threads: block.argument(9)?.as_ref(),
                         storage: HashMap::new(),
+                        tma_descriptors: HashMap::new(),
+                        instruction_scratch: HashMap::new(),
+                        mma_stages: 1,
+                        cluster_rank: None,
                         synchronization: None,
                         current_instruction: None,
                         next_barrier: 0,
@@ -1337,14 +1745,20 @@ mod tests {
             "masked_scalar",
             &[(0, source_type.clone())],
             &[],
+            &[],
+            &[],
             [1, 1, 1],
-            |block, globals, _| {
+            |block, globals, _, _| {
                 let lowering = Lowering {
                     context: &context,
                     location: context.unknown_location(),
                     thread: block.argument(3)?.as_ref(),
                     threads: block.argument(9)?.as_ref(),
                     storage: HashMap::new(),
+                    tma_descriptors: HashMap::new(),
+                    instruction_scratch: HashMap::new(),
+                    mma_stages: 1,
+                    cluster_rank: None,
                     synchronization: None,
                     current_instruction: None,
                     next_barrier: 0,
@@ -1392,7 +1806,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context().clone();
             let predicate = references[0].read()?;
             let value = references[1].read()?;
@@ -1492,7 +1906,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let definition = KernelDefinition::trace(call, |(references, _)| {
+            let definition: KernelDefinition = KernelDefinition::trace(call, |(references, _)| {
                 let context = references[0].context();
                 let source = references[0].read()?;
                 let dimension = context.bind(
@@ -1562,7 +1976,7 @@ mod tests {
     fn test_module_while_preserves_dimension_captures() {
         for replace_coordinate in [false, true] {
             let grid = Grid::new(vec![GridDimension::new(Dimension::Static(2), GridExecution::Parallel)]).unwrap();
-            let definition =
+            let definition: KernelDefinition =
                 KernelDefinition::trace(KernelCallOperation::new(grid, vec![]).unwrap(), |(_, coordinates)| {
                     let context = coordinates[0].context().clone();
                     let types = vec![coordinates[0].r#type().into_owned(); 2];
@@ -1589,10 +2003,11 @@ mod tests {
             let verified = VerifiedKernel::new(&definition, 2).unwrap();
             let context = Context::new();
             if replace_coordinate {
-                assert!(
-                    matches!(validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
-                    Err(Error::Unsupported { operation: "while", reason }) if reason == "operation has no baseline GPU lowering")
-                );
+                assert!(matches!(
+                    validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
+                    Err(Error::Unsupported { operation: "while", reason })
+                        if reason == "operation has no baseline GPU lowering"
+                ));
             } else {
                 let (module, _, _, _) = module(
                     &context,
@@ -1614,7 +2029,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context().clone();
             let types = vec![references[0].r#type().into_owned()];
             let (_, condition) = NestedTracingContext::trace(

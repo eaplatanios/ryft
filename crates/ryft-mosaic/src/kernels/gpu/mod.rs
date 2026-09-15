@@ -1,17 +1,51 @@
 //! Mosaic GPU compilation for the Hopper-or-newer baseline.
 //!
-//! A logical program executes within one CUDA thread block. Tile values use cooperative, thread-strided work and
-//! CTA-local storage; ordinary dot uses scalar multiply/add accumulation rather than target tensor-core instructions.
+//! A logical program executes within one CUDA thread block or a two-block cluster. Tile values use cooperative,
+//! thread-strided work and CTA-local storage. Cluster execution replicates local arrays, assigns global writes to
+//! one block, and preserves visibility with cluster barriers. Ordinary dot uses scalar accumulation by default;
+//! explicit options or GPU extensions select checked native tensor-core instructions.
 //! Uniform control flow preserves barrier participation. Admission rejects unsupported operations and memory layouts
 //! before source compilation. The native Mosaic runtime owns subsequent PTX/cubin compilation and execution.
+//!
+//! # Native instruction selection
+//!
+//! [`Options::with_mma`] selects [`Mma::Wgmma`] for compatible portable dot and scaled-dot operations. The latter
+//! requires BF16 operands and scales so packing can preserve the canonical BF16 multiplication rounding. Explicit
+//! [`GpuOperation`] values retain their own numerical and storage contracts through tracing and executable caching.
+//! In particular, packed NVFP4 operands are not an alternative interpretation of portable scaled-dot operands.
+//!
+//! The current instruction families have separate admission rules:
+//!
+//!   | Family            | Compute capability | Threads per block | Main operand contract       |
+//!   | ----------------- | ------------------ | ----------------- | --------------------------- |
+//!   | WGMMA             | 9.0                | 128               | F16/BF16, FP32 accumulation |
+//!   | NVFP4 warp MMA    | 12.0, 12.1         | 32                | Packed E2M1, E4M3 block16   |
+//!   | [`TmemOperation`] | 10.0, 10.1, 11.0   | 128               | One/two-CTA tensor memory   |
+//!
+//! Matrix shapes, layouts, and compiler support impose further checks documented on each operation. Family names
+//! such as Blackwell do not imply support for every instruction family. The pinned CUDA 12.9 runtime admits
+//! compute capability 10.1; CUDA 13.2 uses compute capability 11.0 and PTX 9.0 instead. XLA checks this toolchain
+//! distinction before execution. [`Options::with_tma`] selects whole-box global-to-shared transfers with checked
+//! descriptor geometry; completion still uses the canonical copy token.
+//!
+//! Shared operand packing, barrier slots, and alignment gaps contribute to the conservative shared-memory bound.
+//! WGMMA uses [`KernelSchedule::pipeline_stages`] for its bounded commit/wait schedule. Tensor-memory references
+//! must be explicitly released after their completion tokens have been committed and waited; ordinary reference
+//! operations cannot access their physical storage. The compiler consumes the emitted communication events through
+//! [`synchronization`] before accepting a module.
 
-use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
+use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelExtension, KernelSchedule, VerifiedKernel};
 use ryft_core::{ArrayType, ProgramError, TypeError};
 use ryft_mlir::{Context, Module};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod lowering;
+mod operations;
+mod tmem;
+
+pub use operations::GpuOperation;
+pub use tmem::TmemOperation;
 pub mod synchronization;
 
 /// GPU target, lowering and native source verification errors.
@@ -24,7 +58,7 @@ pub enum Error {
         message: String,
     },
 
-    /// A valid portable operation has no implementation in the admitted baseline.
+    /// An operation has no implementation for the admitted target or operand contract.
     #[error("mosaic GPU cannot lower `{operation}`: {reason}")]
     Unsupported {
         /// Canonical operation requiring support.
@@ -77,6 +111,9 @@ pub struct Target {
     /// Number of agents participating in every CTA-wide barrier.
     threads_per_block: u32,
 
+    /// Cooperative thread blocks assigned to one logical kernel program.
+    blocks_per_cluster: u32,
+
     /// Admitted CTA-local memory capacity; execution facts must support this bound.
     maximum_shared_memory_bytes: usize,
 }
@@ -84,12 +121,17 @@ pub struct Target {
 impl Target {
     /// Creates an exact Hopper or Blackwell target with 32 threads and a conservative 48 KiB shared-memory limit.
     pub fn new(major: u32, minor: u32) -> Result<Self, Error> {
-        if !matches!(major, 9 | 10 | 12) || minor > 9 {
+        if !matches!(major, 9 | 10 | 11 | 12) || minor > 9 {
             return Err(Error::Invalid {
                 message: format!("unsupported compute capability `{major}.{minor}`; expected Hopper or Blackwell"),
             });
         }
-        Ok(Self { compute_capability: (major, minor), threads_per_block: 32, maximum_shared_memory_bytes: 48 * 1024 })
+        Ok(Self {
+            compute_capability: (major, minor),
+            threads_per_block: 32,
+            blocks_per_cluster: 1,
+            maximum_shared_memory_bytes: 48 * 1024,
+        })
     }
 
     /// Returns the exact admitted CUDA compute capability.
@@ -97,9 +139,14 @@ impl Target {
         self.compute_capability
     }
 
-    /// Returns the number of threads in each logical program's CUDA block.
+    /// Returns the number of threads in each CUDA block.
     pub fn threads_per_block(&self) -> u32 {
         self.threads_per_block
+    }
+
+    /// Returns the number of cooperative thread blocks assigned to one logical kernel program.
+    pub fn blocks_per_cluster(&self) -> u32 {
+        self.blocks_per_cluster
     }
 
     /// Returns the declared per-block shared-memory capacity.
@@ -116,6 +163,17 @@ impl Target {
         Ok(self)
     }
 
+    /// Selects one block or a two-block cluster per logical kernel program. Local arrays are replicated in each
+    /// block, global writes have one owner, and cluster barriers preserve visibility between replicated operations.
+    /// Explicit collective matrix operations distribute and reconstruct their results within that cluster.
+    pub fn with_blocks_per_cluster(mut self, blocks: u32) -> Result<Self, Error> {
+        if !matches!(blocks, 1 | 2) {
+            return Err(Error::Invalid { message: "blocks per cluster must be 1 or 2".to_owned() });
+        }
+        self.blocks_per_cluster = blocks;
+        Ok(self)
+    }
+
     /// Sets a capacity which the execution integration must validate against actual device facts.
     /// A zero capacity is valid and admits only kernels requiring no shared storage.
     pub fn with_maximum_shared_memory_bytes(mut self, bytes: usize) -> Result<Self, Error> {
@@ -129,16 +187,29 @@ impl Target {
     }
 }
 
+/// Exact native matrix multiplication implementation selected for portable dot operations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Mma {
+    /// Hopper warpgroup matrix multiplication with explicit FP32 accumulation.
+    Wgmma,
+}
+
 /// Source-compilation limits independent of numerical semantics and target agent membership.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Options {
     /// Maximum source work admitted before native IR construction: instructions plus individual literal elements.
     maximum_instructions: usize,
+
+    /// Whether eligible global-to-shared copies use the tensor memory accelerator.
+    tma: bool,
+
+    /// Explicit native matrix multiplication selection, absent for the scalar baseline.
+    mma: Option<Mma>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { maximum_instructions: 16_384 }
+        Self { maximum_instructions: 16_384, tma: false, mma: None }
     }
 }
 
@@ -148,15 +219,38 @@ impl Options {
         self.maximum_instructions
     }
 
+    /// Returns whether asynchronous copies require the tensor memory accelerator.
+    pub fn tma(&self) -> bool {
+        self.tma
+    }
+
+    /// Returns the explicitly selected native matrix multiplication implementation.
+    pub fn mma(&self) -> Option<Mma> {
+        self.mma
+    }
+
     /// Limits source construction work. Each instruction and each array-literal element contributes one unit;
     /// dimension literals contribute one unit. Zero admits only bodies without instructions or literals.
     pub fn with_maximum_instructions(mut self, maximum: usize) -> Self {
         self.maximum_instructions = maximum;
         self
     }
+
+    /// Selects TMA for asynchronous global-to-shared copies. The compiler checks descriptor geometry, alignment,
+    /// and target support before construction; an ineligible copy is rejected rather than silently changed.
+    pub fn with_tma(mut self, tma: bool) -> Self {
+        self.tma = tma;
+        self
+    }
+
+    /// Selects a native matrix implementation; unsupported targets and operation contracts fail admission.
+    pub fn with_mma(mut self, mma: Mma) -> Self {
+        self.mma = Some(mma);
+        self
+    }
 }
 
-/// Checked binary compiler input and the native host-buffer ABI derived from a portable kernel.
+/// Checked binary compiler input and the native host-buffer ABI derived from a verified kernel.
 ///
 /// Native buffer order is every logical input followed by every logical result, retaining aliased duplicates.
 /// A body with ordered assertions reserves a token slot after the inputs and another after the results. Tokens carry
@@ -177,10 +271,10 @@ pub struct CompiledKernel {
     /// Array input and result types in native order, excluding assertion tokens.
     argument_types: Vec<ArrayType>,
 
-    /// Native slot selecting each portable body reference.
+    /// Native slot selecting each logical body reference.
     parameter_slots: Vec<usize>,
 
-    /// Actual CTA-local storage required by lowered values and scratch.
+    /// Conservative CTA-local storage bound, including alignment gaps and instruction transport allocations.
     shared_memory_bytes: usize,
 }
 
@@ -210,22 +304,22 @@ impl CompiledKernel {
         &self.parameter_slots
     }
 
-    /// Returns actual shared-memory usage, including temporary value storage.
+    /// Returns the conservative shared-memory bound, including temporary values and possible alignment gaps.
     pub fn shared_memory_bytes(&self) -> usize {
         self.shared_memory_bytes
     }
 }
 
-/// Stateless compiler for the admitted portable Mosaic GPU baseline.
+/// Stateless compiler for admitted portable kernels and exact Mosaic GPU extensions.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Compiler;
 
 impl Compiler {
     /// Builds typed MLIR for inspection before the source serialization pass.
-    pub fn module<'c, 't>(
+    pub fn module<'c, 't, Extension: KernelExtension + Into<GpuOperation>>(
         &self,
         context: &'c Context<'t>,
-        kernel: &VerifiedKernel<'_>,
+        kernel: &VerifiedKernel<'_, Extension>,
         target: &Target,
         options: &Options,
         schedule: &KernelSchedule,
@@ -234,7 +328,7 @@ impl Compiler {
     }
 }
 
-impl KernelCompiler for Compiler {
+impl<Extension: KernelExtension + Into<GpuOperation>> KernelCompiler<Extension> for Compiler {
     type Target = Target;
     type Options = Options;
     type Output = CompiledKernel;
@@ -242,7 +336,7 @@ impl KernelCompiler for Compiler {
 
     fn admit(
         &self,
-        kernel: &VerifiedKernel<'_>,
+        kernel: &VerifiedKernel<'_, Extension>,
         target: &Target,
         options: &Options,
         schedule: &KernelSchedule,
@@ -259,7 +353,7 @@ impl KernelCompiler for Compiler {
         schedule: &KernelSchedule,
     ) -> Result<Vec<u8>, KernelCompilationError<Error>> {
         Ok(format!(
-            "mosaic gpu 1; xla {}; jax {}; serde {}; resource {}; {target:?}; {options:?}; {schedule:?}",
+            "mosaic gpu 2; xla {}; jax {}; serde {}; resource {}; {target:?}; {options:?}; {schedule:?}",
             ryft_xla_sys::XLA_COMMIT,
             ryft_xla_sys::JAX_COMMIT,
             ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_SERDE_VERSION,
@@ -270,7 +364,7 @@ impl KernelCompiler for Compiler {
 
     fn compile(
         &self,
-        kernel: &VerifiedKernel<'_>,
+        kernel: &VerifiedKernel<'_, Extension>,
         target: &Target,
         options: &Options,
         schedule: &KernelSchedule,
@@ -329,6 +423,7 @@ mod tests {
         let target = Target::new(9, 0).unwrap();
         assert_eq!(target.compute_capability(), (9, 0));
         assert_eq!(target.threads_per_block(), 32);
+        assert_eq!(target.blocks_per_cluster(), 1);
         assert_eq!(target.maximum_shared_memory_bytes(), 48 * 1024);
         assert_eq!(HashMap::from([(target.clone(), "hopper")]).get(&target), Some(&"hopper"));
         assert_ne!(target, Target::new(12, 1).unwrap());
@@ -343,6 +438,18 @@ mod tests {
             if message == "threads per block must be between 1 and 1024"));
         assert!(matches!(Target::new(9, 0).unwrap().with_threads_per_block(1025), Err(Error::Invalid { message })
             if message == "threads per block must be between 1 and 1024"));
+    }
+
+    #[test]
+    fn test_target_with_blocks_per_cluster() {
+        let target = Target::new(12, 1).unwrap();
+        let clustered = target.clone().with_blocks_per_cluster(2).unwrap();
+        assert_eq!(clustered.blocks_per_cluster(), 2);
+        assert_eq!(clustered.with_blocks_per_cluster(1).unwrap(), target);
+        for blocks in [0, 3] {
+            assert!(matches!(target.clone().with_blocks_per_cluster(blocks), Err(Error::Invalid { message })
+                if message == "blocks per cluster must be 1 or 2"));
+        }
     }
 
     #[test]
@@ -365,9 +472,33 @@ mod tests {
     }
 
     #[test]
+    fn test_options_tma() {
+        assert_eq!(Options::default().tma(), false);
+    }
+
+    #[test]
+    fn test_options_mma() {
+        assert_eq!(Options::default().mma(), None);
+    }
+
+    #[test]
     fn test_options_with_maximum_instructions() {
         assert_eq!(Options::default().with_maximum_instructions(0).maximum_instructions(), 0);
         assert_ne!(Options::default(), Options::default().with_maximum_instructions(1));
+    }
+
+    #[test]
+    fn test_options_with_tma() {
+        let options = Options::default().with_tma(true);
+        assert_eq!(options.tma(), true);
+        assert_eq!(options.with_tma(false), Options::default());
+    }
+
+    #[test]
+    fn test_options_with_mma() {
+        let options = Options::default().with_mma(Mma::Wgmma);
+        assert_eq!(options.mma(), Some(Mma::Wgmma));
+        assert_ne!(options, Options::default());
     }
 
     #[test]
@@ -412,7 +543,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadOnly).unwrap()],
         )
         .unwrap();
-        let unsupported = KernelDefinition::trace(operation, |(references, _)| {
+        let unsupported: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let value = references[0].read()?;
             value.context().bind(
                 ArrayIrOperation::from(ArrayOperation::Sqrt(SqrtOperation::new())),
@@ -433,10 +564,61 @@ mod tests {
         let target = Target::new(9, 0).unwrap();
         let options = Options::default();
         let schedule = KernelSchedule::default();
-        let key = Compiler.configuration_key(&target, &options, &schedule).unwrap();
-        assert_eq!(key, Compiler.configuration_key(&target, &options, &schedule).unwrap());
-        assert_ne!(key, Compiler.configuration_key(&Target::new(12, 1).unwrap(), &options, &schedule).unwrap());
-        assert_ne!(key, Compiler.configuration_key(&target, &options.with_maximum_instructions(1), &schedule).unwrap());
+        let key = <Compiler as KernelCompiler>::configuration_key(&Compiler, &target, &options, &schedule).unwrap();
+        assert_eq!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(&Compiler, &target, &options, &schedule).unwrap()
+        );
+        assert_ne!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(
+                &Compiler,
+                &Target::new(12, 1).unwrap(),
+                &options,
+                &schedule
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(
+                &Compiler,
+                &target.clone().with_blocks_per_cluster(2).unwrap(),
+                &options,
+                &schedule,
+            )
+            .unwrap(),
+        );
+        assert_ne!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(
+                &Compiler,
+                &target,
+                &options.clone().with_tma(true),
+                &schedule
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(
+                &Compiler,
+                &target,
+                &options.clone().with_mma(Mma::Wgmma),
+                &schedule
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            key,
+            <Compiler as KernelCompiler>::configuration_key(
+                &Compiler,
+                &target,
+                &options.with_maximum_instructions(1),
+                &schedule
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -467,7 +649,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I32), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(operation, |(references, _)| {
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let value = references[0].read()?;
             value.context().bind(
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(

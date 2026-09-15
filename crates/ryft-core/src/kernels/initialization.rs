@@ -2,7 +2,7 @@
 //!
 //! Writes establish coverage only for their canonical root-relative selections. Branch joins intersect coverage;
 //! loops preserve the zero-body path while including their mandatory first condition. This initial verifier rejects
-//! symbolic views, extension operations, dynamic launch shapes, and unsupported control flow. Padded parameter
+//! symbolic views, extensions without checked memory contracts, dynamic launch shapes, and unsupported control flow. Padded parameter
 //! windows admit ordinary reads only through views valid in every invocation; masked accesses use explicit fallbacks.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,11 +18,11 @@ use crate::kernels::calls::{KernelCallOperation, KernelError};
 use crate::kernels::grids::GridExecution;
 use crate::kernels::mappings::{BlockMappingError, BoundaryPolicy};
 use crate::kernels::memory::KernelMemoryError;
-use crate::kernels::operations::KernelOperation;
+use crate::kernels::operations::{KernelExtension, KernelExtensionMemory, KernelOperation};
 use crate::kernels::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
 use crate::programs::{
-    Atom, AtomId, InputRegionProvenance, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceRoot,
-    ReferenceType, ReferenceViewOperation, ReferenceViewOverlap, RegionRef, Typed, ValueId,
+    Atom, AtomId, InputRegionProvenance, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect,
+    ReferenceRoot, ReferenceType, ReferenceViewOverlap, RegionRef, Typed, ValueId,
 };
 
 /// A body or launch lacks a definite initialization or disjointness proof.
@@ -80,6 +80,14 @@ pub enum KernelInitializationError {
         /// Instruction needing a dedicated transfer rule.
         instruction: InstructionId,
     },
+
+    /// An extension classification disagrees with its canonical effects or types.
+    #[error("invalid kernel extension memory contract at {instruction}: {message}")]
+    InvalidExtension { instruction: InstructionId, message: String },
+
+    /// An allocation has not been established or was already released.
+    #[error("kernel reference {value:?} is not a live allocation")]
+    UnavailableReference { value: ValueId },
 
     /// A reference selection cannot be resolved statically.
     #[error("kernel initialization cannot prove the selection of reference {value:?}")]
@@ -158,7 +166,7 @@ pub fn validate_kernel_initialization<Extension>(
     maximum_programs: usize,
 ) -> Result<(), KernelInitializationError>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+    Extension: KernelExtension,
 {
     if !call.prefetch_types().is_empty() {
         return Err(KernelInitializationError::UnsupportedLaunch { boundary: "unspecialized scalar prefetch" });
@@ -357,16 +365,10 @@ where
     Ok(())
 }
 
-/// Canonical source and destination selections held until a copy token is consumed.
+/// Canonical accesses reserved until a completion token is consumed.
 struct PendingCopy {
-    /// Allocation whose selected elements remain immutable until the wait.
-    source: ReferenceRoot,
-    /// Canonical root-relative source selection.
-    source_view: ArrayReferenceView,
-    /// Allocation whose selected elements are unavailable until the wait.
-    destination: ReferenceRoot,
-    /// Canonical root-relative destination selection initialized by the wait.
-    destination_view: ArrayReferenceView,
+    /// Root, root-relative selection, and declared access mode for each outstanding access.
+    accesses: Vec<(ReferenceRoot, ArrayReferenceView, ReferenceAccessMode)>,
 }
 
 /// Ordered coverage state, keyed by canonical roots after attachment-specific input substitution.
@@ -379,13 +381,13 @@ struct Initialization<'a> {
     types: BTreeMap<ReferenceRoot, ArrayType>,
     /// Ordinary reads and read-write accesses checked against actual launch validity after body initialization.
     unmasked_accesses: Vec<(ReferenceRoot, &'static str, ArrayReferenceView)>,
-    /// Outstanding copy reservations keyed by their canonical token allocation.
+    /// Outstanding asynchronous access reservations keyed by their canonical completion allocation.
     pending_copies: BTreeMap<ReferenceRoot, PendingCopy>,
 }
 
 impl Initialization<'_> {
-    /// Visits instructions in execution order; coverage grows monotonically except at conservative branch joins.
-    fn region<Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>>(
+    /// Visits instructions in execution order; releases retire allocations and joins retain definite coverage.
+    fn region<Extension: KernelExtension>(
         &mut self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
@@ -409,10 +411,17 @@ impl Initialization<'_> {
                         return Err(KernelInitializationError::OverlappingCopy { instruction: id });
                     }
                 }
-                self.accesses(region, id, bindings, None)?;
+                self.accesses(region, id, bindings, None, true)?;
                 let token = ReferenceRoot::Allocation { instruction: id, output_index: 0 };
-                self.pending_copies
-                    .insert(token, PendingCopy { source, source_view, destination, destination_view });
+                self.pending_copies.insert(
+                    token,
+                    PendingCopy {
+                        accesses: vec![
+                            (source, source_view, ReferenceAccessMode::Read),
+                            (destination, destination_view, ReferenceAccessMode::Write),
+                        ],
+                    },
+                );
                 self.types.insert(token, ArrayType::scalar(DataType::Token));
                 self.states.insert(token, vec![0..1]);
                 continue;
@@ -429,12 +438,7 @@ impl Initialization<'_> {
                 }
                 let pending =
                     self.pending_copies.remove(&token).ok_or(KernelInitializationError::InvalidCopyToken { value })?;
-                let ArrayReferenceView::Slice { axes } = pending.destination_view else { unreachable!() };
-                let addressing = ArrayAddressing::new(self.types[&pending.destination].clone())?;
-                let state = self.states.get_mut(&pending.destination).unwrap();
-                for range in addressing.ranges(&axes)? {
-                    insert(state, range.elements());
-                }
+                self.complete(pending)?;
                 self.states.remove(&token);
                 continue;
             }
@@ -450,11 +454,15 @@ impl Initialization<'_> {
                 _ => None,
             };
             if let Some(mask_index) = mask_index {
-                self.accesses(region, id, bindings, Some(instruction.inputs()[mask_index]))?;
+                self.accesses(region, id, bindings, Some(instruction.inputs()[mask_index]), false)?;
                 continue;
             }
             if matches!(instruction.operation(), KernelOperation::TileLoad(_)) {
-                self.accesses(region, id, bindings, None)?;
+                self.accesses(region, id, bindings, None, false)?;
+                continue;
+            }
+            if let KernelOperation::Extension(operation) = instruction.operation() {
+                self.extension(region, id, operation, bindings)?;
                 continue;
             }
             let KernelOperation::Portable(operation) = instruction.operation() else {
@@ -514,7 +522,7 @@ impl Initialization<'_> {
                 self.states.insert(root, if count == 0 { vec![] } else { vec![0..count] });
                 self.types.insert(root, r#type);
             }
-            self.accesses(region, id, bindings, None)?;
+            self.accesses(region, id, bindings, None, false)?;
         }
         if let Some(&token) = self.pending_copies.keys().next() {
             return Err(KernelInitializationError::UnwaitedCopy { token });
@@ -522,14 +530,167 @@ impl Initialization<'_> {
         Ok(())
     }
 
+    /// Publishes deferred writes only after the corresponding completion operation.
+    fn complete(&mut self, pending: PendingCopy) -> Result<(), KernelInitializationError> {
+        for (root, view, mode) in pending.accesses {
+            if mode == ReferenceAccessMode::Read {
+                continue;
+            }
+            let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
+            let addressing = ArrayAddressing::new(self.types[&root].clone())?;
+            let state = self.states.get_mut(&root).unwrap();
+            for range in addressing.ranges(&axes)? {
+                insert(state, range.elements());
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies extension timing to canonical reference effects without redefining access geometry.
+    fn extension<Extension: KernelExtension>(
+        &mut self,
+        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
+        id: InstructionId,
+        operation: &Extension,
+        bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
+    ) -> Result<(), KernelInitializationError> {
+        let instruction = &region.instructions()[id.index()];
+        let invalid = |message: &str| KernelInitializationError::InvalidExtension {
+            instruction: id,
+            message: message.to_owned(),
+        };
+        if !instruction.regions().is_empty() {
+            return Err(invalid("nested extension regions are unsupported"));
+        }
+        let semantics = operation.memory_semantics().map_err(|error| invalid(&error.to_string()))?;
+        let effects = operation.effects();
+        let declarations = effects.reference_effects();
+        let allocations = declarations
+            .iter()
+            .filter_map(|effect| match effect {
+                ReferenceEffect::Allocate { output_index } => Some(*output_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let accesses = declarations
+            .iter()
+            .filter_map(|effect| match effect {
+                ReferenceEffect::Access { input_index, mode } => Some((*input_index, *mode)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match semantics {
+            KernelExtensionMemory::Synchronous => {
+                if !allocations.is_empty() || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume) {
+                    return Err(invalid("synchronous operations cannot allocate or consume references"));
+                }
+                self.accesses(region, id, bindings, None, false)?;
+            }
+            KernelExtensionMemory::Allocation { output_index }
+            | KernelExtensionMemory::Asynchronous { completion_output_index: output_index } => {
+                if allocations != [output_index] || !effects.reference_aliases().is_empty() {
+                    return Err(invalid("classification requires exactly its declared allocation and no aliases"));
+                }
+                let asynchronous = matches!(semantics, KernelExtensionMemory::Asynchronous { .. });
+                if (!asynchronous && !accesses.is_empty())
+                    || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume)
+                {
+                    return Err(invalid("allocation accesses do not match its initialization contract"));
+                }
+                let output =
+                    instruction.outputs().get(output_index).ok_or_else(|| invalid("allocation output is absent"))?;
+                let r#type = region.atoms()[output.index()].r#type();
+                let ArrayIrType::Reference(reference) = r#type.as_ref() else {
+                    return Err(invalid("allocation output is not a reference"));
+                };
+                let referent = reference.referent().clone();
+                if asynchronous && referent != ArrayType::scalar(DataType::Token) {
+                    return Err(invalid("completion allocation must reference a scalar token"));
+                }
+                if !asynchronous && referent.data_type() == DataType::Token {
+                    return Err(invalid("ordinary allocations cannot create completion tokens"));
+                }
+                ArrayAddressing::new(referent.clone())?;
+                let root = ReferenceRoot::Allocation { instruction: id, output_index };
+                if asynchronous {
+                    self.accesses(region, id, bindings, None, true)?;
+                    let reservations = accesses
+                        .iter()
+                        .map(|(input, mode)| {
+                            self.selection(ValueId::new(region.id(), instruction.inputs()[*input]), bindings)
+                                .map(|(root, view)| (root, view, *mode))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.pending_copies.insert(root, PendingCopy { accesses: reservations });
+                }
+                self.types.insert(root, referent);
+                self.states.insert(root, Vec::new());
+            }
+            KernelExtensionMemory::Commit { completion_input_index: input_index } => {
+                if !allocations.is_empty()
+                    || accesses != [(input_index, ReferenceAccessMode::Read)]
+                    || !effects.reference_aliases().is_empty()
+                {
+                    return Err(invalid("commit must read exactly its declared completion reference"));
+                }
+                let input =
+                    instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
+                let value = ValueId::new(region.id(), *input);
+                let (root, _) = self.selection(value, bindings)?;
+                if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
+                    || !self.pending_copies.contains_key(&root)
+                {
+                    return Err(KernelInitializationError::InvalidCopyToken { value });
+                }
+            }
+            KernelExtensionMemory::Wait { completion_input_index: input_index }
+            | KernelExtensionMemory::Release { input_index } => {
+                if !allocations.is_empty()
+                    || accesses != [(input_index, ReferenceAccessMode::Consume)]
+                    || !effects.reference_aliases().is_empty()
+                {
+                    return Err(invalid("wait or release must consume exactly its declared reference"));
+                }
+                let input = instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
+                let value = ValueId::new(region.id(), *input);
+                let (root, _) = self.selection(value, bindings)?;
+                if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
+                {
+                    return Err(invalid("wait or release requires an allocation from the current region"));
+                }
+                if matches!(semantics, KernelExtensionMemory::Wait { .. }) {
+                    let pending = self
+                        .pending_copies
+                        .remove(&root)
+                        .ok_or(KernelInitializationError::InvalidCopyToken { value })?;
+                    self.complete(pending)?;
+                } else {
+                    if self.pending_copies.contains_key(&root) {
+                        return Err(KernelInitializationError::InvalidCopyTokenAccess { instruction: id, token: root });
+                    }
+                    if let Some((&token, _)) = self
+                        .pending_copies
+                        .iter()
+                        .find(|(_, pending)| pending.accesses.iter().any(|(reserved, _, _)| *reserved == root))
+                    {
+                        return Err(KernelInitializationError::PendingCopyAccess { instruction: id, token });
+                    }
+                }
+                self.states.remove(&root);
+            }
+        }
+        Ok(())
+    }
+
     /// Checks selected reads and records definite writes using the operation's optional mask operand. Unknown
     /// masks require the complete selected view for reads and cannot establish any definite write coverage.
-    fn accesses<Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>>(
+    fn accesses<Extension: KernelExtension>(
         &mut self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         id: InstructionId,
         bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
         mask: Option<AtomId>,
+        deferred: bool,
     ) -> Result<(), KernelInitializationError> {
         let known_mask = mask
             .and_then(|mask| match &region.atoms()[mask.index()] {
@@ -558,9 +719,7 @@ impl Initialization<'_> {
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
             let writes_only = access.mode() == ReferenceAccessMode::Write
                 || self.references.swap_lowering(id) == Some(KernelSwapLowering::Store);
-            let establishes_write = writes_only
-                && !(mask.is_some() && known_mask.is_none())
-                && !matches!(instruction.operation(), KernelOperation::AsyncCopy(_));
+            let establishes_write = writes_only && !(mask.is_some() && known_mask.is_none()) && !deferred;
             let mut mask_offset = 0;
             for range in addressing.ranges(&axes)? {
                 let range = range.elements();
@@ -601,6 +760,9 @@ impl Initialization<'_> {
             .unwrap()
             .root_slice(&self.types[&root])
             .ok_or(KernelInitializationError::UnknownSelection { value })?;
+        if !self.states.contains_key(&root) {
+            return Err(KernelInitializationError::UnavailableReference { value });
+        }
         Ok((root, view))
     }
 
@@ -613,11 +775,9 @@ impl Initialization<'_> {
         instruction: InstructionId,
     ) -> Result<(), KernelInitializationError> {
         for (&token, copy) in &self.pending_copies {
-            for (reserved_root, view, conflicts) in [
-                (copy.destination, &copy.destination_view, true),
-                (copy.source, &copy.source_view, mode != ReferenceAccessMode::Read),
-            ] {
-                if reserved_root == root && conflicts {
+            for (reserved_root, view, reserved_mode) in &copy.accesses {
+                let conflicts = *reserved_mode != ReferenceAccessMode::Read || mode != ReferenceAccessMode::Read;
+                if *reserved_root == root && conflicts {
                     let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
                     let addressing = ArrayAddressing::new(self.types[&root].clone())?;
                     if addressing.ranges(axes)?.any(|reserved| {
@@ -633,7 +793,7 @@ impl Initialization<'_> {
     }
 
     /// Resolves only this particular region attachment, keeping shared regions' callers independent.
-    fn bindings<Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>>(
+    fn bindings<Extension: KernelExtension>(
         &self,
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         instruction: InstructionId,
@@ -756,6 +916,236 @@ mod tests {
     use crate::programs::{FlatProgram, ProgramBuilder, ReferenceAnalysisError, ReferenceViewAnalysisError};
 
     use super::*;
+
+    /// Multi-source asynchronous update fixture using canonical effects and reference types.
+    #[derive(Clone, Debug)]
+    enum MemoryExtension {
+        Allocate(ArrayType),
+        MisclassifiedAllocation,
+        Synchronous,
+        Update,
+        Commit,
+        Wait,
+        Release,
+    }
+
+    impl Operation for MemoryExtension {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Allocate(_) => "test_allocate",
+                Self::MisclassifiedAllocation => "test_misclassified_allocation",
+                Self::Synchronous => "test_synchronous",
+                Self::Update => "test_async_update",
+                Self::Commit => "test_commit",
+                Self::Wait => "test_wait",
+                Self::Release => "test_release",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            _inputs: &[ArrayIrType],
+            _regions: &[crate::programs::RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, crate::programs::TypeError> {
+            Ok(match self {
+                Self::Allocate(referent) => vec![ArrayIrType::Reference(ReferenceType::new(referent.clone()))],
+                Self::Update => vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::Token)))],
+                Self::MisclassifiedAllocation => {
+                    vec![ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::I32)))]
+                }
+                Self::Synchronous | Self::Commit | Self::Wait | Self::Release => vec![],
+            })
+        }
+
+        fn effects(&self) -> std::borrow::Cow<'_, crate::programs::Effects> {
+            use crate::programs::{EffectClasses, Effects};
+            let declarations = match self {
+                Self::Allocate(_) | Self::MisclassifiedAllocation => {
+                    vec![ReferenceEffect::Allocate { output_index: 0 }]
+                }
+                Self::Synchronous => vec![],
+                Self::Update => vec![
+                    ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
+                    ReferenceEffect::Allocate { output_index: 0 },
+                ],
+                Self::Commit => vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                Self::Wait | Self::Release => {
+                    vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
+                }
+            };
+            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, declarations, vec![]).unwrap())
+        }
+    }
+
+    impl crate::programs::ReferenceViewOperation for MemoryExtension {
+        type View = ArrayReferenceView;
+
+        fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+            None
+        }
+
+        fn validate_reference_view(
+            view: &ArrayReferenceView,
+            source: &ArrayIrType,
+            target: &ArrayIrType,
+        ) -> Result<(), crate::programs::ReferenceViewValidationError> {
+            crate::arrays::validate_array_reference_view(view, source, target)
+        }
+
+        fn reapply_reference_view<C: crate::contexts::Context<Type = ArrayIrType, Operation = Self>>(
+            _context: &C,
+            _view: &ArrayReferenceView,
+            _source: C::Value,
+            _symbols: &[C::Value],
+        ) -> Result<C::Value, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "test extension has no views".to_owned() })
+        }
+    }
+
+    impl KernelExtension for MemoryExtension {
+        fn memory_semantics(&self) -> Result<KernelExtensionMemory, crate::programs::TypeError> {
+            Ok(match self {
+                Self::Allocate(_) => KernelExtensionMemory::Allocation { output_index: 0 },
+                Self::MisclassifiedAllocation | Self::Synchronous => KernelExtensionMemory::Synchronous,
+                Self::Update => KernelExtensionMemory::Asynchronous { completion_output_index: 0 },
+                Self::Commit => KernelExtensionMemory::Commit { completion_input_index: 0 },
+                Self::Wait => KernelExtensionMemory::Wait { completion_input_index: 0 },
+                Self::Release => KernelExtensionMemory::Release { input_index: 0 },
+            })
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_extension_async_update() {
+        let call = call(1, 1, 1);
+        for conflict in [
+            None,
+            Some("read"),
+            Some("release"),
+            Some("uninitialized source"),
+            Some("commit after wait"),
+            Some("commit after release"),
+        ] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<MemoryExtension>>::new();
+            let output = builder.add_input(call.parameters()[0].body_type());
+            builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+            let r#type = ArrayType::new_static(DataType::I32, vec![1]);
+            let source = builder
+                .add_instruction(
+                    KernelOperation::Extension(MemoryExtension::Allocate(r#type.clone())),
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap()[0];
+            let destination = builder
+                .add_instruction(KernelOperation::Extension(MemoryExtension::Allocate(r#type)), vec![], vec![], None)
+                .unwrap()[0];
+            let value = builder.add_constant(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, vec![1]), &[3i32]).unwrap(),
+            ));
+            if conflict != Some("uninitialized source") {
+                builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![source, value], None).unwrap();
+            }
+            let token = builder
+                .add_instruction(
+                    KernelOperation::Extension(MemoryExtension::Update),
+                    vec![],
+                    vec![source, source, destination],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(KernelOperation::Extension(MemoryExtension::Commit), vec![], vec![token], None)
+                .unwrap();
+            if conflict == Some("read") {
+                builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap();
+            }
+            if conflict == Some("release") {
+                builder
+                    .add_instruction(KernelOperation::Extension(MemoryExtension::Release), vec![], vec![source], None)
+                    .unwrap();
+            }
+            let completion =
+                if conflict == Some("commit after release") { MemoryExtension::Release } else { MemoryExtension::Wait };
+            builder.add_instruction(KernelOperation::Extension(completion), vec![], vec![token], None).unwrap();
+            if matches!(conflict, Some("commit after wait" | "commit after release")) {
+                let consumer = if conflict == Some("commit after wait") { "test_wait" } else { "test_release" };
+                assert_eq!(
+                    builder.add_instruction(
+                        KernelOperation::Extension(MemoryExtension::Commit),
+                        vec![],
+                        vec![token],
+                        None
+                    ),
+                    Err(ProgramError::MalformedProgram(format!(
+                        "`test_commit` reads a reference whose alias family `{consumer}` already consumed",
+                    ))),
+                );
+                continue;
+            }
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap()[0];
+            builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, value], None).unwrap();
+            builder
+                .add_instruction(KernelOperation::Extension(MemoryExtension::Release), vec![], vec![destination], None)
+                .unwrap();
+            let body = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap();
+            let region = body.entry_region_ref().id();
+            let result = validate_kernel_initialization(body.entry_region_ref(), &call, 1);
+            match conflict {
+                None => assert_eq!(result, Ok(())),
+                Some("uninitialized source") => assert_eq!(
+                    result,
+                    Err(KernelInitializationError::UninitializedRead {
+                        instruction: InstructionId::new(region, 2),
+                        root: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 0), output_index: 0 },
+                    })
+                ),
+                _ => assert_eq!(
+                    result,
+                    Err(KernelInitializationError::PendingCopyAccess {
+                        instruction: InstructionId::new(region, 5),
+                        token: ReferenceRoot::Allocation {
+                            instruction: InstructionId::new(region, 3),
+                            output_index: 0
+                        },
+                    })
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_extension_classification() {
+        let call = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
+        for (operation, valid) in
+            [(MemoryExtension::Synchronous, true), (MemoryExtension::MisclassifiedAllocation, false)]
+        {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<MemoryExtension>>::new();
+            builder.add_instruction(KernelOperation::Extension(operation), vec![], vec![], None).unwrap();
+            let body =
+                builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![], vec![]).unwrap();
+            let result = validate_kernel_initialization(body.entry_region_ref(), &call, 1);
+            if valid {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(KernelInitializationError::InvalidExtension {
+                        instruction: InstructionId::new(body.entry_region_ref().id(), 0),
+                        message: "synchronous operations cannot allocate or consume references".to_owned(),
+                    })
+                );
+            }
+        }
+    }
 
     /// Builds one static write-only vector parameter whose blocks advance by their logical size.
     fn call(extent: usize, block: usize, programs: usize) -> KernelCallOperation {

@@ -17,7 +17,7 @@ use crate::arrays::{
 use crate::contexts::EagerContext;
 use crate::kernels::grids::{Grid, GridError, GridExecution};
 use crate::kernels::mappings::{BlockMapping, BlockMappingError, BoundaryPolicy};
-use crate::kernels::operations::{KernelOperation, NoKernelExtension};
+use crate::kernels::operations::{KernelExtension, KernelOperation, NoKernelExtension};
 use crate::kernels::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
@@ -817,8 +817,11 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
     /// This is a cache-identity encoding, not a round-trip executable serialization format. The closed payload schema
     /// uses its audited structural fields, with explicit encodings for lossy value formats. Arbitrary extensions and
     /// unsupported opaque descriptors return an error instead of inheriting identity from diagnostic formatting. A
-    /// future extension identity contract must specify an exact versioned payload before such kernels become eligible.
-    pub fn semantic_key(&self) -> Result<String, TypeError> {
+    /// registered extension provides its exact versioned payload through [`KernelExtension::semantic_key`].
+    pub fn semantic_key(&self) -> Result<String, TypeError>
+    where
+        Extension: KernelExtension,
+    {
         let mut identities = self.operation.identity_occurrences();
         for region in self.body.regions().iter() {
             for instruction in region.instructions() {
@@ -877,10 +880,13 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                         Self::semantic_field(&mut key, &format!("MaskedSwap({operation:?})"))
                     }
                     KernelOperation::Extension(operation) => {
-                        return Err(TypeError::invalid(format!(
-                            "kernel extension `{}` has no exact semantic identity contract",
-                            operation.name(),
-                        )));
+                        let payload = operation.semantic_key()?;
+                        let mut encoded = String::with_capacity(payload.len().saturating_mul(2));
+                        for byte in payload {
+                            write!(encoded, "{byte:02x}").unwrap();
+                        }
+                        Self::semantic_field(&mut key, "extension");
+                        Self::semantic_field(&mut key, &encoded);
                     }
                 }
             }
@@ -2171,9 +2177,9 @@ mod tests {
 
     /// Extension whose diagnostic text intentionally omits semantic payload, demonstrating conservative eligibility.
     #[derive(Clone, Debug)]
-    struct HiddenKeyExtension(u32);
+    struct HiddenKeyExtension<const EXACT: bool = false>(u32);
 
-    impl Operation for HiddenKeyExtension {
+    impl<const EXACT: bool> Operation for HiddenKeyExtension<EXACT> {
         type Type = ArrayIrType;
         fn name(&self) -> &'static str {
             "hidden_key_extension"
@@ -2187,7 +2193,17 @@ mod tests {
         }
     }
 
-    impl ReferenceViewOperation for HiddenKeyExtension {
+    impl KernelExtension for HiddenKeyExtension {}
+
+    impl KernelExtension for HiddenKeyExtension<true> {
+        fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+            let mut key = b"test.hidden_key_extension\0v1\0".to_vec();
+            key.extend_from_slice(&self.0.to_le_bytes());
+            Ok(key)
+        }
+    }
+
+    impl<const EXACT: bool> ReferenceViewOperation for HiddenKeyExtension<EXACT> {
         type View = ArrayReferenceView;
         fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
             None
@@ -2206,6 +2222,28 @@ mod tests {
             _symbols: &[C::Value],
         ) -> Result<C::Value, ProgramError> {
             Err(ProgramError::UnsupportedOperation { message: "hidden extension has no reference views".to_owned() })
+        }
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_exact_extension_payload() {
+        let keys = [0, 1, 256, u32::MAX].map(|payload| {
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<HiddenKeyExtension<true>>>::new();
+            body.add_instruction(KernelOperation::Extension(HiddenKeyExtension(payload)), vec![], vec![], None)
+                .unwrap();
+            let definition = KernelDefinition::new(
+                KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
+                body.build(vec![], vec![], vec![]).unwrap(),
+            )
+            .unwrap();
+            let key = definition.semantic_key().unwrap();
+            assert_eq!(key, definition.clone().semantic_key().unwrap());
+            key
+        });
+        for (position, key) in keys.iter().enumerate() {
+            for other in &keys[position + 1..] {
+                assert_ne!(key, other);
+            }
         }
     }
 

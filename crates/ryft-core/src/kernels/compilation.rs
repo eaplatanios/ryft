@@ -8,11 +8,11 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayIrType, ArrayReferenceView};
+use crate::arrays::ArrayIrType;
 use crate::kernels::calls::KernelDefinition;
 use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
-use crate::kernels::operations::NoKernelExtension;
-use crate::programs::{Operation, ReferenceViewOperation};
+use crate::kernels::operations::{KernelExtension, NoKernelExtension};
+use crate::programs::Operation;
 
 /// Compiler admission and invocation failures, distinct from invalid core semantics.
 #[derive(Debug, Error)]
@@ -117,7 +117,7 @@ pub struct VerifiedKernel<'k, Extension: Operation<Type = ArrayIrType> = NoKerne
 
 impl<'k, Extension> VerifiedKernel<'k, Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+    Extension: KernelExtension,
 {
     /// Verifies initialization, accesses, bounds, output coverage, and mutable-window disjointness before admission.
     /// The enumeration budget bounds verification work and is excluded from semantic and compiler identity.

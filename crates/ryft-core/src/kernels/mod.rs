@@ -46,7 +46,7 @@ pub use memory::{
     AsyncCopyOperation, KernelMemoryError, MaskedLoadOperation, MaskedStoreOperation, MaskedSwapOperation,
     ScratchOperation, WaitOperation,
 };
-pub use operations::{KernelOperation, NoKernelExtension};
+pub use operations::{KernelExtension, KernelExtensionMemory, KernelOperation, NoKernelExtension};
 pub use scheduling::{KernelInterleaving, KernelSchedulingError};
 pub use serialization::KernelSerializationError;
 

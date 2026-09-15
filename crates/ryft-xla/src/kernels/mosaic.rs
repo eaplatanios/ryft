@@ -5,8 +5,10 @@
 //! Execution admission requires a pinned CUDA platform version. The native compilation provider checks the actual
 //! PTX compiler and LLVM support before selecting their common PTX ISA; native compilation and loading remain
 //! responsible for driver compatibility because PJRT does not expose those provider or driver versions here.
+//! The `10.1` target spelling is restricted to the pinned CUDA 12.9 runtime; `11.0` requires the pinned CUDA 13.2
+//! runtime and PTX 9.0. These target names are checked against actual device facts rather than silently normalized.
 
-use ryft_core::kernels::{KernelParameterAccess, VerifiedKernel};
+use ryft_core::kernels::{KernelExtension, KernelParameterAccess, VerifiedKernel};
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{ArrayType, DataType, EffectClass, Layout, Memory, Typed};
 use ryft_mlir::dialects::stable_hlo::CustomCallMemoryLayouts;
@@ -22,7 +24,7 @@ use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, XlaKernelExecu
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MosaicGpuEmbedding;
 
-impl KernelOutputEmbedding<CompiledKernel> for MosaicGpuEmbedding {
+impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension> for MosaicGpuEmbedding {
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(format!(
             "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
@@ -32,7 +34,7 @@ impl KernelOutputEmbedding<CompiledKernel> for MosaicGpuEmbedding {
 
     fn custom_call(
         &self,
-        kernel: &VerifiedKernel<'_>,
+        kernel: &VerifiedKernel<'_, Extension>,
         output: &CompiledKernel,
     ) -> Result<CustomCallOperation, KernelEmbeddingError> {
         let logical = kernel.definition().operation();
@@ -117,6 +119,18 @@ impl XlaKernelTarget for Target {
         if !matches!(facts.platform_version.as_str(), "cuda 12090" | "cuda 13020") {
             return Err(KernelEmbeddingError::Invalid {
                 message: "mosaic GPU requires pinned CUDA platform version `cuda 12090` or `cuda 13020`".to_owned(),
+            });
+        }
+        // The `sm_110` target name requires PTX 9.0; CUDA 12.9 only accepts PTX through 8.8.
+        if self.compute_capability() == (11, 0) && facts.platform_version == "cuda 12090" {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "compute capability `11.0` requires PTX 9.0 and the pinned CUDA 13.2 runtime".to_owned(),
+            });
+        }
+        // CUDA 13 renamed `sm_101` to `sm_110`; it no longer accepts the former assembler target.
+        if self.compute_capability() == (10, 1) && facts.platform_version == "cuda 13020" {
+            return Err(KernelEmbeddingError::Invalid {
+                message: "compute capability `10.1` requires the pinned CUDA 12.9 runtime".to_owned(),
             });
         }
         if self.maximum_shared_memory_bytes() > 48 * 1024 {
@@ -205,7 +219,9 @@ mod tests {
 
     #[test]
     fn test_mosaic_gpu_embedding_configuration_key() {
-        assert_eq!(MosaicGpuEmbedding.configuration_key().unwrap(), format!(
+        let key = <MosaicGpuEmbedding as KernelOutputEmbedding<CompiledKernel>>::configuration_key(&MosaicGpuEmbedding)
+            .unwrap();
+        assert_eq!(key, format!(
             "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
              resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then optional assertion token; row-major; no collectives; no custom barrier"
         ).into_bytes());
@@ -245,7 +261,8 @@ mod tests {
     #[test]
     fn test_mosaic_gpu_embedding_custom_call_preserves_assertions() {
         use ryft_core::kernels::{
-            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
+            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, NoKernelExtension,
+            whole_array_parameter,
         };
         use ryft_core::{
             ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
@@ -256,7 +273,7 @@ mod tests {
             vec![whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadWrite).unwrap()],
         )
         .unwrap();
-        let definition = KernelDefinition::trace(call, |(references, _)| {
+        let definition = KernelDefinition::<NoKernelExtension>::trace(call, |(references, _)| {
             let value = references[0].read()?;
             references[0].context().bind(
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(DimensionVariable::new(
@@ -310,6 +327,31 @@ mod tests {
         assert!(matches!(target.with_maximum_shared_memory_bytes(49 * 1024).unwrap().admit_execution(&facts()),
             Err(KernelEmbeddingError::Invalid { message })
                 if message == "mosaic GPU execution admission currently supports at most 48 KiB shared memory"));
+    }
+
+    #[test]
+    fn test_target_admit_execution_ptx_version() {
+        let target = Target::new(11, 0).unwrap();
+        let mut execution = facts();
+        execution.devices[0]
+            .attributes
+            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("11.0".to_owned()));
+        target.admit_execution(&execution).unwrap();
+        execution.platform_version = "cuda 12090".to_owned();
+        assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
+            if message == "compute capability `11.0` requires PTX 9.0 and the pinned CUDA 13.2 runtime"));
+        execution.devices[0]
+            .attributes
+            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("12.1".to_owned()));
+        Target::new(12, 1).unwrap().admit_execution(&execution).unwrap();
+        execution.devices[0]
+            .attributes
+            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("10.1".to_owned()));
+        let legacy = Target::new(10, 1).unwrap();
+        legacy.admit_execution(&execution).unwrap();
+        execution.platform_version = "cuda 13020".to_owned();
+        assert!(matches!(legacy.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
+            if message == "compute capability `10.1` requires the pinned CUDA 12.9 runtime"));
     }
 
     #[test]

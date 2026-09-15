@@ -58,6 +58,26 @@ RYFT_PJRT_RUN_MOSAIC_GPU_ASSERTION_FAILURE=1 cargo test -p ryft-experimental \
   --features mosaic-gpu,cuda-13 kernels::gpu::test_assertion_failure_on_cuda -- --exact --ignored
 ```
 
+Advanced adapter cases in the same module cover TMA copies, dense and pair-wise sparse NVFP4, attention, and explicit
+two-CTA cluster execution. The NVFP4 cases require compute capability 12.0 or 12.1 and use packed bytes with independent
+scalar decoding; sparse metadata covers all six ordered pair selections. Sparse scales span 32 logical contraction
+elements, while dense scales span 16. The cluster case compares one and two CTAs for successive read-write increments
+and checks partial-tile vector addition. Targets come from the actual device capability and explicit test settings.
+Unsupported requested features fail rather than selecting another instruction family.
+
+The copy benchmark is separately enabled with `RYFT_PJRT_RUN_MOSAIC_GPU_BENCHMARKS=1` and the native kernel gate. It
+compares ordinary asynchronous copies with TMA over 4096 elements, using one warmup and 32 cached invocations. Reported
+times exclude compilation and upload but include dispatch and awaited host readback; they are not GPU-only timings.
+
+Sparse invalid-metadata qualification also deliberately traps the device. Run its exact test in a separate process
+after positive checks, with the existing `RYFT_PJRT_RUN_MOSAIC_GPU_ASSERTION_FAILURE=1` gate:
+
+```sh
+RYFT_PJRT_RUN_MOSAIC_GPU_ASSERTION_FAILURE=1 \
+  cargo test -p ryft-experimental --features mosaic-gpu,cuda-13 \
+  kernels::gpu::test_nvfp4_sparse_invalid_metadata_on_cuda -- --exact --ignored
+```
+
 - [ ] For JAX-level support we need to be able to load the MLIR dialects and passes that are listed
   [here](https://github.com/jax-ml/jax/blob/d13a4754e3a8e265008ac3ab23c27d4cb244b8b9/jax/_src/interpreters/mlir.py#L601).
 - [ ] We want to be able to instantiate a model (potentially with a sharding config) doing all necessary allocations.

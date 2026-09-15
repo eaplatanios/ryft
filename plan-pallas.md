@@ -1,11 +1,12 @@
 # Ryft Pallas-Style Kernels: Architecture and Implementation Plan
 
-Status (2026-09-14): Phases 6–14 are implemented for the documented experimental subset. The Phase 14 Mosaic GPU
-adapter and macro-authored experiments pass local compiler tests and native DGX Spark qualification. Phase 5 has
-local Mac/DGX Spark qualification; the remaining platform matrix is deferred with user approval. The cuTile and
-Triton compiler adapters remain assigned to their later phases. This file is the current implementation record;
-detailed command logs and review notes are retained in `.tasks/plan_kernel_phases_5_13.md` and
-`.tasks/plan_kernel_phase_14.md`.
+Status (2026-09-14): Phases 6–15 are implemented for the documented experimental subset. Mosaic GPU kernels pass
+compiler tests and native DGX Spark qualification. Hopper WGMMA and datacenter Blackwell TMEM/tcgen05 additionally
+pass serialized target-code and assembler checks; their numerical device qualification requires hardware unavailable
+on the Spark. Phase 5 has local Mac/DGX Spark qualification; the remaining platform matrix is deferred with user
+approval. The cuTile and Triton compiler adapters remain assigned to their later phases. This file is the current
+implementation record; detailed logs and reviews are retained in `.tasks/plan_kernel_phases_5_13.md`,
+`.tasks/plan_kernel_phase_14.md`, and `.tasks/plan_kernel_phase_15.md`.
 
 This is a source-sensitive plan. Mosaic, cuTile, Triton, and their runtime integrations are evolving systems, so
 Phase 0 refreshes the first-release non-TPU inventory against the selected OpenXLA, JAX, CUDA, and cuTile revisions;
@@ -535,16 +536,21 @@ NVFP4 is modeled as a compound contract, not as a single scalar data type:
 - sparse or dense form and collective CTA mode;
 - exact target instruction capability.
 
-The portable `block_scaled_dot` path can select a compatible backend implementation. The explicit Mosaic GPU
+The portable `ScaledDotOperation` path can select a compatible backend implementation. The explicit Mosaic GPU
 `tcgen05` path exposes TMEM, scale transfer, ordering barriers, and collective MMA and fails on non-Blackwell targets.
 Cache identity includes the complete format and architecture contract, so a kernel compiled for `sm_100` or a
 particular feature extension cannot be reused on an incompatible device.
 
-Native Blackwell NVFP4 eligibility is narrower than portable block scaling: it requires packed E2M1 values, E4M3
+Dense native Blackwell NVFP4 eligibility is narrower than portable block scaling: it requires packed E2M1 values, E4M3
 scales for each consecutive block of 16 values, the defined tensor-level FP32 scale, supported accumulator/output
 types, exact scale encoding, and compatible operand layouts. When the semantic scale is omitted, native lowering must
-materialize or encode the hardware-required exact `1.0` identity representation. Other scale geometries are valid
-portable operations but cannot be labeled or tested as native NVFP4.
+materialize or encode the hardware-required exact `1.0` identity representation. Other dense scale geometries cannot
+be relabeled as this native instruction contract.
+
+The native pair-wise sparse form has a separate exact contract: every eight logical A values retain two ordered
+adjacent pairs, and each E4M3 scale spans 32 logical contraction values (16 retained A values). Explicit pair metadata
+is validated before issuing the sparse instruction. This sparse instruction geometry does not change the dense
+block-16 contract or authorize treating arbitrary portable block scaling as native NVFP4.
 
 ### 5.6 Synchronization and race freedom
 
@@ -1492,23 +1498,52 @@ commands and source snapshots are recorded in `.tasks/plan_kernel_phase_14.md` a
 
 ### Phase 15: Add advanced Hopper and Blackwell Mosaic GPU support
 
+**Implementation status (2026-09-14):** implemented, with available-device and offline compiler qualification complete.
+Scope, source/artifact hashes, command logs, and remaining hardware distinctions are recorded in
+`.tasks/plan_kernel_phase_15.md` and `.tasks/kernel-phase-15-evidence/`. Hopper/datacenter Blackwell numerical execution
+remains part of the deferred hardware matrix; a Blackwell family name alone does not establish instruction support.
+
+Core extension initialization/identity contracts and the XLA attached-region carrier are implemented. Final isolated
+verification passes 3,297 core tests (two ignored), 136 Mosaic tests, and 715 XLA tests (six ignored), plus core
+doctests and macro suites. Mosaic rustdoc builds cleanly. The source snapshot excludes only an unrelated concurrent
+broadcasting change that prevents fresh compilation; all Phase 15 code is retained and source/artifact hashes are
+recorded. TMA, dense and pair-wise sparse NVFP4, attention, and cluster cases pass native Spark execution with the final
+embedding cache identity. TMA, NVFP4, and cluster cases also pass memcheck, racecheck, and synccheck. NVFP4 covers
+signed block scales, an FP32 tensor scale, omitted tensor scale, NaN block scales, and a nonzero addend; tile-dependent
+fixtures distinguish row and contraction tiles. Stable softmax attention matches an independent FP64 oracle. A bounded
+32-invocation copy benchmark passed both paths; its dispatch-and-readback measurements did not show a TMA speedup for
+this workload.
+
+Hopper WGMMA has verified F16/BF16 lowering and consumed warpgroup simulation. Compatible BF16 portable
+`ScaledDotOperation` lowering preserves its BF16 scaling semantics. One- and two-CTA TMEM/tcgen05 support allocation,
+dense and block-scaled MMA, scale copies, commit, wait, loads, release, and final allocation-permit relinquishment, with
+consumed lifetime/order simulation. Signed NVFP4 uses packed E2M1 operands and allocation-owned scale signs; FP32 tensor
+scaling and addends follow the native product through ordinary array operations. Production serialization roundtrips
+emit native WGMMA and tcgen05 PTX through the pinned LLVM target machine. WGMMA, dense TMEM, MXFP8, and signed NVFP4
+artifacts assemble successfully; signed K128 one-/two-CTA fixtures cover `sm100a`, with two-CTA coverage also assembled
+for `sm110a`. The post-scale fixture retains separate `mul.rn.f32` and `add.rn.f32` instructions. The larger MXFP8
+cluster fixture uses an explicit 64-KiB offline target and correctly fails the 48-KiB execution limit. The Spark cannot
+execute datacenter Blackwell `tcgen05`/TMEM or Hopper WGMMA; compiler coverage is distinct from numerical hardware
+qualification. Explicit packed NVFP4 does not reinterpret the portable scaled-dot contract.
+
 **Prerequisites:** Phase 14.
 
 **Owners:** `ryft_mosaic::kernels::gpu` target extensions, schedules, capability tables, and qualification tests;
-`ryft-xla` consumes their typed output and execution requirements.
+`ryft_core::kernels` shared extension identity and asynchronous reference lifetimes; `ryft_xla::kernels` typed
+embedding, cache identity, and execution admission; `ryft_experimental::kernels` numerical and device qualification.
 
-- [ ] Add Hopper WGMMA, TMA descriptors/transfers, warpgroup scheduling, barrier semantics, swizzles, and pipeline
+- [x] Add Hopper WGMMA, TMA descriptors/transfers, warpgroup scheduling, barrier semantics, swizzles, and pipeline
       generation.
-- [ ] Add Blackwell TMEM allocation/lifetime, `tcgen05` MMA/commit/wait, tensor-core-ordering barriers, SMEM/TMEM scale
+- [x] Add Blackwell TMEM allocation/lifetime, `tcgen05` MMA/commit/wait, tensor-core-ordering barriers, SMEM/TMEM scale
       transfers, cluster and two-CTA collective modes where supported.
-- [ ] Extend target simulation to warpgroup, cluster, TMEM, collective-MMA, and tensor-core-ordering resources.
-- [ ] Lower portable block-scaled dot to a compatible optimized path and expose an exact Mosaic GPU `tcgen05`
+- [x] Extend target simulation to warpgroup, cluster, TMEM, collective-MMA, and tensor-core-ordering resources.
+- [x] Lower portable block-scaled dot to a compatible optimized path and expose an exact Mosaic GPU `tcgen05`
       operation family for manual control.
-- [ ] Implement the complete NVFP4 contract from §5.5, including scale packing/geometry and FP32 tensor scale.
-- [ ] Add sparse block-scaled forms only after dense behavior and metadata are stable.
-- [ ] Include architecture/feature/compiler choices in cache identity and reject missing features before native
+- [x] Implement the complete NVFP4 contract from §5.5, including scale packing/geometry and FP32 tensor scale.
+- [x] Add sparse block-scaled forms only after dense behavior and metadata are stable.
+- [x] Include architecture/feature/compiler choices in cache identity and reject missing features before native
       compilation.
-- [ ] Add target-code inspection that proves WGMMA, TMA, TMEM, or `tcgen05` use; numerical parity is insufficient.
+- [x] Add target-code inspection that proves WGMMA, TMA, TMEM, or `tcgen05` use; numerical parity is insufficient.
 
 **Tests/docs:** Hopper and Blackwell MLIR/PTX snapshots, barrier-order litmus tests, TMEM lifetime failures, NVFP4
 bit-pattern and tolerance tests, at least matmul and attention kernels, architecture mismatch, and scheduled benchmarks.

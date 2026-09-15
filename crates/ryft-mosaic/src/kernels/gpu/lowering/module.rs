@@ -83,23 +83,36 @@ fn kernel_argument<'c, 't>(
 
 /// Builds a Mosaic GPU module following the pinned JAX host ABI.
 ///
-/// `body` receives the launch block, global argument memrefs, and shared attribution memrefs in declaration order.
+/// `body` receives the launch block, global argument memrefs, shared attribution memrefs, and TMA descriptor pointers
+/// in declaration order. Each `tma_sources` entry indexes `arguments`; host initialization captures its checked whole
+/// window descriptor by value through the pinned native Mosaic ABI.
 /// The first twelve block arguments are `block_id.{x,y,z}`, `thread_id.{x,y,z}`, `grid_dim.{x,y,z}`, and
-/// `block_dim.{x,y,z}`, respectively. Shared attribution arguments follow them. This function terminates the body.
+/// `block_dim.{x,y,z}`, respectively. Clustered launches append cluster IDs and the grid dimensions in clusters
+/// before shared attributions. In particular, arguments 15–17 lower to PTX `%nclusterid`, not the number of CTAs
+/// per cluster. Physical grid dimensions count CTAs and must be divisible by the target's cluster dimensions.
+/// This function terminates the body.
 /// Each global argument pairs its native pointer-array slot with its static dense row-major type. Untiled explicit
 /// row-major layouts are accepted. Global and shared memrefs are flattened to one dimension, including scalar arrays
-/// as a one-element memref.
+/// as a one-element memref. `shared_alignments` supplies one validated alignment per attribution, or an empty slice
+/// for the 16-byte baseline. Alignment is transferred to the actual outlined shared-memory globals.
 pub(super) fn build<'c, 't, B>(
     context: &'c Context<'t>,
     target: &Target,
     kernel_name: &str,
     arguments: &[(usize, ArrayType)],
     shared_storage_types: &[ArrayType],
+    shared_alignments: &[usize],
+    tma_sources: &[usize],
     grid: [usize; 3],
     body: B,
 ) -> Result<Module<'c, 't>, Error>
 where
-    B: FnOnce(&mut DetachedBlock<'c, 't>, &[KernelValue<'c, 't>], &[KernelValue<'c, 't>]) -> Result<(), Error>,
+    B: FnOnce(
+        &mut DetachedBlock<'c, 't>,
+        &[KernelValue<'c, 't>],
+        &[KernelValue<'c, 't>],
+        &[KernelValue<'c, 't>],
+    ) -> Result<(), Error>,
 {
     if arguments.len() > i32::MAX as usize
         || arguments.iter().any(|(slot, _)| *slot > i32::MAX as usize)
@@ -111,7 +124,18 @@ where
     }
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let compute_capability = target.compute_capability();
+    let clustered = target.blocks_per_cluster() != 1;
+    if grid[0] % target.blocks_per_cluster() as usize != 0 {
+        return Err(Error::Invalid { message: "physical grid must be divisible by the cluster dimensions".to_owned() });
+    }
     let block = [target.threads_per_block() as usize, 1, 1];
+    if !shared_alignments.is_empty() && shared_alignments.len() != shared_storage_types.len()
+        || shared_alignments.iter().any(|alignment| !matches!(alignment, 16 | 128 | 256))
+    {
+        return Err(Error::Invalid {
+            message: "shared attribution alignments must match storage and be 16, 128, or 256 bytes".to_owned(),
+        });
+    }
     let location = context.unknown_location();
     let module = context.module(location)?;
     let i32_type = context.signless_integer_type(32);
@@ -173,6 +197,7 @@ where
     for (index, r#type) in arguments {
         memrefs.push(kernel_argument(context, &mut function_block, buffers, *index, r#type, location)?);
     }
+    let descriptors = tma_descriptors(context, &mut function_block, buffers, arguments, tma_sources, location)?;
     let mut dimensions = Vec::with_capacity(6);
     for size in grid.into_iter().chain(block) {
         let size = context.integer_attribute(index_type, size as i64);
@@ -181,22 +206,41 @@ where
     let dynamic_shared_memory_size =
         append(&mut function_block, arith::constant(context.integer_attribute(i32_type, 0), location)?)?;
 
-    let mut launch_types = vec![(index_type.as_ref(), location); 12];
+    let cluster_dimensions = if clustered {
+        let mut dimensions = Vec::with_capacity(3);
+        for size in [target.blocks_per_cluster(), 1, 1] {
+            dimensions.push(append(
+                &mut function_block,
+                arith::constant(context.integer_attribute(index_type, size as i64), location)?,
+            )?);
+        }
+        Some(Dim3 { x: dimensions[0], y: dimensions[1], z: dimensions[2] })
+    } else {
+        None
+    };
+    let configuration_count = if clustered { 18 } else { 12 };
+    let mut launch_types = vec![(index_type.as_ref(), location); configuration_count];
     for r#type in shared_storage_types {
         launch_types.push((memref_type(context, r#type, true)?, location));
     }
     let mut launch_block = context.block(&launch_types);
-    let shared = (12..launch_types.len())
+    let shared = (configuration_count..launch_types.len())
         .map(|index| launch_block.argument(index).map(|argument| argument.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    body(&mut launch_block, &memrefs, &shared)?;
+    let descriptors = descriptors
+        .into_iter()
+        .map(|descriptor| {
+            append(&mut launch_block, builtin::unrealized_conversion_cast(&[descriptor], &[pointer_type], location)?)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    body(&mut launch_block, &memrefs, &shared, &descriptors)?;
     launch_block.append_operation(gpu::terminator(location)?)?;
-    function_block.append_operation(gpu::launch(
+    let mut launch = function_block.append_operation(gpu::launch(
         LaunchProperties {
             async_dependencies: vec![token],
             grid_size: Dim3 { x: dimensions[0], y: dimensions[1], z: dimensions[2] },
             block_size: Dim3 { x: dimensions[3], y: dimensions[4], z: dimensions[5] },
-            cluster_size: None,
+            cluster_size: cluster_dimensions,
             dynamic_shared_memory_size: Some(dynamic_shared_memory_size),
             module: None,
             function: None,
@@ -208,6 +252,18 @@ where
         launch_block.try_into()?,
         location,
     )?)?;
+    let alignments = (0..shared_storage_types.len())
+        .map(|index| {
+            context.dictionary_attribute(&[context.named_attribute(
+                context.identifier("llvm.align"),
+                context.integer_attribute(
+                    context.signless_integer_type(64),
+                    shared_alignments.get(index).copied().unwrap_or(16) as i64,
+                ),
+            )])
+        })
+        .collect::<Vec<_>>();
+    launch.set_attribute(gpu::WORKGROUP_ATTRIBUTION_ATTRIBUTES_ATTRIBUTE, context.array_attribute(&alignments));
     function_block.append_operation(func::r#return(&[] as &[KernelValue<'c, 't>], location)?)?;
     module.body()?.append_operation(func::func(
         format!("{kernel_name}_mosaic_gpu").as_str(),
@@ -222,14 +278,100 @@ where
     Ok(module)
 }
 
+/// Initializes CUDA tensor maps on the host and captures each aligned descriptor by value in the GPU launch.
+/// The pinned Mosaic outlining pass converts these LLVM array captures to native by-value pointer arguments.
+fn tma_descriptors<'c, 't>(
+    context: &'c Context<'t>,
+    block: &mut DetachedBlock<'c, 't>,
+    buffers: KernelValue<'c, 't>,
+    arguments: &[(usize, ArrayType)],
+    sources: &[usize],
+    location: UnknownLocationRef<'c, 't>,
+) -> Result<Vec<KernelValue<'c, 't>>, Error> {
+    let pointer_type = context.llvm_pointer_type(0)?.as_ref();
+    let integer_type = context.signless_integer_type(64);
+    let descriptor_type = context.llvm_array_type(context.signless_integer_type(8), 128)?.as_ref();
+    let constant = |block: &mut DetachedBlock<'c, 't>, value: usize| {
+        append(block, llvm::constant(context.integer_attribute(integer_type, value as i64), integer_type, location)?)
+    };
+    let address = |block: &mut DetachedBlock<'c, 't>, base, element_type: TypeRef<'c, 't>, index: usize| {
+        append(
+            block,
+            llvm::get_element_ptr(
+                base,
+                &[],
+                pointer_type,
+                context.dense_i32_array_attribute(&[index as i32])?.as_ref(),
+                context.type_attribute(element_type).as_ref(),
+                None,
+                location,
+            )?,
+        )
+    };
+    let mut descriptors = Vec::with_capacity(sources.len());
+    for &source in sources {
+        let (slot, r#type) = arguments.get(source).ok_or_else(|| Error::Invalid {
+            message: "TMA source parameter exceeds the native argument list".to_owned(),
+        })?;
+        super::memory::validate_tma_type(r#type)?;
+        let shape = r#type.static_shape().unwrap();
+        let shape = shape.dimensions();
+        let one = constant(block, 1)?;
+        let descriptor = append(block, llvm::alloca(one, descriptor_type, pointer_type, Some(64), false, location)?)?;
+        let source_slot = address(block, buffers, pointer_type, *slot)?;
+        let source_pointer = append(block, llvm::load(source_slot, pointer_type, None, false, location)?)?;
+        let count = constant(block, shape.len())?;
+        let sizes = append(block, llvm::alloca(count, integer_type, pointer_type, Some(8), false, location)?)?;
+        let strides = append(block, llvm::alloca(count, integer_type, pointer_type, Some(8), false, location)?)?;
+        for (axis, &extent) in shape.iter().enumerate() {
+            let size = constant(block, extent)?;
+            let size_pointer = address(block, sizes, integer_type.as_ref(), axis)?;
+            block.append_operation(llvm::store(size, size_pointer, None, false, location)?)?;
+            let stride = constant(block, shape[axis + 1..].iter().product())?;
+            let stride_pointer = address(block, strides, integer_type.as_ref(), axis)?;
+            block.append_operation(llvm::store(stride, stride_pointer, None, false, location)?)?;
+        }
+        let element = constant(
+            block,
+            match r#type.data_type() {
+                DataType::U32 => 3,
+                DataType::U64 | DataType::F64 => 4,
+                DataType::F16 => 5,
+                DataType::F32 => 6,
+                DataType::BF16 => 7,
+                DataType::I32 => 9,
+                DataType::I64 => 10,
+                _ => unreachable!(),
+            },
+        )?;
+        let swizzle = constant(block, 16)?;
+        block.append_operation(func::call(
+            "mosaic_gpu_init_tma_desc",
+            func::CallProperties {
+                arguments: [descriptor, source_pointer, element, count, sizes, strides, swizzle, sizes]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                ..Default::default()
+            },
+            location,
+        )?)?;
+        descriptors.push(append(block, llvm::load(descriptor, descriptor_type, Some(64), false, location)?)?);
+    }
+    Ok(descriptors)
+}
+
 /// Converts an admitted scalar data type to its native storage element type. Integer signedness remains an operation
 /// property; all integer memrefs use signless MLIR integers. Boolean storage uses `i1`, whose memref allocation uses
 /// one byte per element rather than packed bits.
 pub(super) fn element_type<'c, 't>(context: &'c Context<'t>, data_type: DataType) -> Result<TypeRef<'c, 't>, Error> {
     Ok(match data_type {
         DataType::Boolean => context.signless_integer_type(1).as_ref(),
+        DataType::U8 | DataType::F8E4M3FN | DataType::F8E8M0FNU => context.signless_integer_type(8).as_ref(),
         DataType::I32 | DataType::U32 => context.signless_integer_type(32).as_ref(),
         DataType::I64 | DataType::U64 => context.signless_integer_type(64).as_ref(),
+        DataType::F16 => context.float16_type().as_ref(),
+        DataType::BF16 => context.bfloat16_type().as_ref(),
         DataType::F32 => context.float32_type().as_ref(),
         DataType::F64 => context.float64_type().as_ref(),
         _ => {
@@ -269,6 +411,19 @@ pub(in crate::kernels::gpu) fn serialize(module: &Module<'_, '_>) -> Result<Vec<
     let context = module.context();
     // The native pipeline repeats outlining, which is a no-op once launches have been replaced. Explicit function
     // attribution alignment survives GPU-to-NVVM conversion as alignment on the actual shared-memory globals.
+    // GPU outlining does not forward attribution dictionaries. This builder owns exactly one launch; carry its
+    // canonical alignment attributes across that pass rather than assuming every shared allocation has one alignment.
+    let mut launch_alignments = Vec::new();
+    module.as_operation()?.walk(WalkOrder::PreOrder, |operation| {
+        if operation.name().as_str() == Ok("gpu.launch") {
+            launch_alignments.push(operation.attribute(gpu::WORKGROUP_ATTRIBUTION_ATTRIBUTES_ATTRIBUTE));
+        }
+        WalkResult::Advance
+    });
+    let launch_alignments = launch_alignments.into_iter().collect::<Result<Vec<_>, _>>()?;
+    if launch_alignments.len() > 1 {
+        return Err(ryft_mlir::Error::internal("Mosaic GPU source must contain at most one launch").into());
+    }
     let mut outlining = context.pass_manager()?;
     outlining.add_pass(gpu::create_gpu_kernel_outlining_pass()?);
     if !outlining.run(&module.as_operation()?).is_success() {
@@ -282,20 +437,9 @@ pub(in crate::kernels::gpu) fn serialize(module: &Module<'_, '_>) -> Result<Vec<
         WalkResult::Advance
     });
     for mut function in functions {
-        let alignment = context.dictionary_attribute(&[context.named_attribute(
-            context.identifier("llvm.align"),
-            context.integer_attribute(context.signless_integer_type(64), 16),
-        )]);
-        let count = if function.has_attribute(gpu::WORKGROUP_ATTRIBUTIONS_ATTRIBUTE) {
-            usize::try_from(function.integer_attribute(gpu::WORKGROUP_ATTRIBUTIONS_ATTRIBUTE)?.signless_value())
-                .map_err(|_| ryft_mlir::Error::internal("invalid outlined workgroup attribution count"))?
-        } else {
-            0
-        };
-        function.set_attribute(
-            gpu::WORKGROUP_ATTRIBUTION_ATTRIBUTES_ATTRIBUTE,
-            context.array_attribute(&vec![alignment; count]),
-        );
+        if let Some(Some(alignments)) = launch_alignments.first() {
+            function.set_attribute(gpu::WORKGROUP_ATTRIBUTION_ATTRIBUTES_ATTRIBUTE, *alignments);
+        }
     }
     // The pinned runtime loads NVGPU only after parsing bytecode, so its token types would remain opaque during
     // deserialization. Lower them to the native NVVM copy/group/wait instructions before versioned transport.
@@ -347,8 +491,10 @@ mod tests {
             "mixed_buffers",
             &[(0, ArrayType::scalar(DataType::I32)), (2, ArrayType::new_static(DataType::F32, [2, 3]))],
             &[ArrayType::new_static(DataType::F32, [2, 3])],
+            &[],
+            &[],
             [2, 1, 1],
-            |block, arguments, shared| {
+            |block, arguments, shared, _descriptors| {
                 assert_eq!(arguments.len(), 2);
                 assert_eq!(arguments[0].r#type()?.to_string(), "memref<1xi32>");
                 assert_eq!(arguments[1].r#type()?.to_string(), "memref<6xf32>");
@@ -381,20 +527,61 @@ mod tests {
     }
 
     #[test]
+    fn test_build_cluster() {
+        let context = Context::new();
+        let target = Target::new(9, 0).unwrap().with_blocks_per_cluster(2).unwrap();
+        let module = build(
+            &context,
+            &target,
+            "clustered",
+            &[],
+            &[ArrayType::scalar(DataType::F32)],
+            &[],
+            &[],
+            [4, 1, 1],
+            |block, arguments, shared, _| {
+                assert_eq!(arguments.len(), 0);
+                assert_eq!(block.arguments().count(), 19);
+                assert_eq!(block.argument(18)?.as_ref(), shared[0]);
+                assert_eq!(block.argument(12)?.r#type()?.to_string(), "index");
+                assert_eq!(block.argument(15)?.r#type()?.to_string(), "index");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(module.verify().unwrap());
+        let mut segments = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if operation.name().as_str() == Ok("gpu.launch") {
+                segments.push(operation.attribute("operandSegmentSizes").unwrap().unwrap().to_string());
+            }
+            WalkResult::Advance
+        });
+        assert_eq!(segments, vec!["array<i32: 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0>"]);
+        assert!(matches!(build(&context, &target, "invalid_cluster", &[], &[], &[], &[], [3, 1, 1],
+            |_, _, _, _| Ok(())), Err(Error::Invalid { message })
+            if message == "physical grid must be divisible by the cluster dimensions"));
+    }
+
+    #[test]
     fn test_build_rejects_invalid_grid() {
         let context = Context::new();
-        assert!(matches!(build(&context, &Target::new(9, 0).unwrap(), "empty", &[], &[], [0, 1, 1],
-            |_, _, _| panic!("invalid geometry must be rejected before body construction")),
-            Err(Error::Invalid { message }) if message == "kernel argument count or launch grid exceeds the native ABI"));
+        assert!(matches!(build(&context, &Target::new(9, 0).unwrap(), "empty", &[], &[],
+            &[], &[], [0, 1, 1],
+            |_, _, _, _| panic!("invalid geometry must be rejected before body construction")),
+            Err(Error::Invalid { message })
+                if message == "kernel argument count or launch grid exceeds the native ABI"));
     }
 
     #[test]
     fn test_build_rejects_invalid_argument_slot() {
         let context = Context::new();
         assert!(matches!(build(&context, &Target::new(9, 0).unwrap(), "invalid_slot",
-            &[(i32::MAX as usize + 1, ArrayType::scalar(DataType::I32))], &[], [1, 1, 1],
-            |_, _, _| panic!("invalid native slot must be rejected before body construction")),
-            Err(Error::Invalid { message }) if message == "kernel argument count or launch grid exceeds the native ABI"));
+            &[(i32::MAX as usize + 1, ArrayType::scalar(DataType::I32))], &[],
+            &[], &[], [1, 1, 1],
+            |_, _, _, _| panic!("invalid native slot must be rejected before body construction")),
+            Err(Error::Invalid { message })
+                if message == "kernel argument count or launch grid exceeds the native ABI"));
     }
 
     #[test]
@@ -402,10 +589,15 @@ mod tests {
         let context = Context::new();
         for (data_type, expected) in [
             (DataType::Boolean, "i1"),
+            (DataType::U8, "i8"),
+            (DataType::F8E4M3FN, "i8"),
+            (DataType::F8E8M0FNU, "i8"),
             (DataType::I32, "i32"),
             (DataType::U32, "i32"),
             (DataType::I64, "i64"),
             (DataType::U64, "i64"),
+            (DataType::F16, "f16"),
+            (DataType::BF16, "bf16"),
             (DataType::F32, "f32"),
             (DataType::F64, "f64"),
         ] {
@@ -415,7 +607,7 @@ mod tests {
             matches!(element_type(&context, DataType::Token), Err(Error::Unsupported { operation: "buffer", reason })
             if reason == "unsupported native storage data type `token`")
         );
-        for data_type in [DataType::I8, DataType::U8, DataType::I16, DataType::U16, DataType::F16, DataType::BF16] {
+        for data_type in [DataType::I8, DataType::I16, DataType::U16] {
             assert!(
                 matches!(element_type(&context, data_type), Err(Error::Unsupported { operation: "buffer", reason })
                 if reason == format!("unsupported native storage data type `{data_type}`"))
@@ -447,8 +639,10 @@ mod tests {
             "serialization",
             &[],
             &[ArrayType::new_static(DataType::F32, [4])],
+            &[],
+            &[],
             [1, 1, 1],
-            |_, _, _| Ok(()),
+            |_, _, _, _| Ok(()),
         )
         .unwrap();
         let bytes = serialize(&module).unwrap();
@@ -469,6 +663,33 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_shared_alignments() {
+        let context = Context::new();
+        let module = build(
+            &context,
+            &Target::new(9, 0).unwrap(),
+            "aligned_buffers",
+            &[],
+            &[ArrayType::new_static(DataType::F32, [32]), ArrayType::new_static(DataType::F16, [128])],
+            &[128, 256],
+            &[],
+            [1, 1, 1],
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(module.verify().unwrap());
+        serialize(&module).unwrap();
+        let mut attributes = Vec::new();
+        module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
+            if let Some(value) = operation.attribute(gpu::WORKGROUP_ATTRIBUTION_ATTRIBUTES_ATTRIBUTE).unwrap() {
+                attributes.push(value.to_string());
+            }
+            WalkResult::Advance
+        });
+        assert_eq!(attributes, vec!["[{llvm.align = 128 : i64}, {llvm.align = 256 : i64}]"]);
+    }
+
+    #[test]
     fn test_serialize_async_tokens() {
         let context = Context::new();
         let location = context.unknown_location();
@@ -479,8 +700,10 @@ mod tests {
             "async_serialization",
             &[(0, r#type.clone())],
             &[r#type],
+            &[],
+            &[],
             [1, 1, 1],
-            |block, arguments, shared| {
+            |block, arguments, shared, _descriptors| {
                 let index =
                     append(block, arith::constant(context.integer_attribute(context.index_type(), 0), location)?)?;
                 let token = append(

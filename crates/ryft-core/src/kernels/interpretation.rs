@@ -52,12 +52,12 @@ use crate::kernels::calls::{KernelCallOperation, KernelDefinition};
 use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
 use crate::kernels::mappings::BoundaryPolicy;
 use crate::kernels::memory::{KernelMemoryError, ScratchOperation};
-use crate::kernels::operations::KernelOperation;
+use crate::kernels::operations::{KernelExtension, KernelOperation};
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::Zero;
 use crate::programs::{
     BindingRegionDriver, Operation, ProgramError, Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode,
-    ReferenceId, ReferenceViewOperation, RegionDriver, RegionRef, TypeError, Typed,
+    ReferenceId, RegionDriver, RegionRef, TypeError, Typed,
 };
 
 /// Host debugging limits exceeded while replaying a kernel; these limits do not alter its device semantics.
@@ -204,8 +204,7 @@ pub const DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS: usize = 10_000;
 
 impl<Extension> KernelDefinition<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-        + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+    Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     /// Interprets this definition on host arrays after checking initialization, output coverage, and races. The
     /// inputs and results follow the functional signature: write-only parameters consume no input, and read-only
@@ -308,8 +307,7 @@ where
 impl<Extension> InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
     for KernelCallOperation
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-        + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+    Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>>(
         &self,
@@ -342,8 +340,8 @@ impl KernelCallOperation {
         order: Option<&[usize]>,
     ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError>
     where
-        Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-            + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+        Extension:
+            KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
         D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
     {
         let body = driver.region(0)?;
@@ -693,8 +691,7 @@ impl<Extension: Operation<Type = ArrayIrType>> Domain for QualifiedKernelContext
 
 impl<Extension> Context for QualifiedKernelContext<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-        + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+    Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         Ok(constant)
@@ -875,8 +872,7 @@ impl<Extension: Operation<Type = ArrayIrType>, D: RegionDriver<ArrayIrValue<Arra
 impl<Extension, D> InterpretationDriver<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>
     for QualifiedKernelDriver<'_, Extension, D>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-        + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+    Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
     D: RegionDriver<ArrayIrValue<Array>, KernelOperation<Extension>>,
 {
     fn interpret_region(

@@ -32,11 +32,72 @@ use crate::programs::{
     TypeError, TypeIdentityRenaming,
 };
 
+/// Initialization and lifetime behavior not implied by ordinary reference effects.
+///
+/// Access modes, aliases, and allocated referents come exclusively from canonical operation effects and types.
+/// This descriptor specifies when those accesses complete; it does not declare an independent memory model.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum KernelExtensionMemory {
+    /// All declared accesses complete synchronously; reference views retain their canonical alias semantics.
+    Synchronous,
+
+    /// Creates one uninitialized local reference allocation with no accesses.
+    Allocation { output_index: usize },
+
+    /// Reserves all declared accesses until the newly allocated completion reference is waited.
+    Asynchronous { completion_output_index: usize },
+
+    /// Observes a pending completion reference without completing its accesses or publishing writes.
+    /// Hardware group counts and commit ordering remain the adapter's responsibility.
+    Commit { completion_input_index: usize },
+
+    /// Consumes a pending completion reference and publishes its deferred writes.
+    Wait { completion_input_index: usize },
+
+    /// Consumes a local allocation after all outstanding accesses complete.
+    Release { input_index: usize },
+}
+
+/// Adapter-owned kernel semantics over the canonical array and reference universe.
+///
+/// Implementations are trusted semantic contracts, not target admission. A compiler must still validate the exact
+/// architecture, instruction capabilities, and resource requirements before compiling an extension.
+pub trait KernelExtension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
+    /// Returns the checked initialization timing and lifetime contract for this operation.
+    ///
+    /// The verifier checks consistency with canonical effects, output referents, and completion-token types. Nested
+    /// extension regions are not admitted by this contract. Unimplemented classifications fail conservatively.
+    fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+        Err(TypeError::invalid(format!("kernel extension `{}` has no initialization contract", self.name())))
+    }
+
+    /// Returns an exact, versioned encoding of this operation's semantic payload.
+    ///
+    /// The encoding must include an unambiguous owner namespace and schema version, every instruction mode and
+    /// semantic option, and exact floating-point bits. It must not depend on diagnostic formatting or addresses.
+    /// Operands, results, regions, and their types are encoded by the enclosing kernel. Type identities in the
+    /// payload must participate in ordinary operation identity renaming before this function is called.
+    /// Unsupported payloads fail explicitly; implementing this function does not enable source deserialization.
+    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+        Err(TypeError::invalid(format!("kernel extension `{}` has no exact semantic identity contract", self.name(),)))
+    }
+}
+
 /// Empty extension family for kernels containing only portable operations.
 ///
 /// This enum has no values, so a portable kernel cannot contain an unknown or unchecked target payload.
 #[derive(Copy, Clone, Debug)]
 pub enum NoKernelExtension {}
+
+impl KernelExtension for NoKernelExtension {
+    fn memory_semantics(&self) -> Result<KernelExtensionMemory, TypeError> {
+        match *self {}
+    }
+
+    fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
+        match *self {}
+    }
+}
 
 impl Display for NoKernelExtension {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -136,6 +197,28 @@ pub enum KernelOperation<Extension: Operation<Type = ArrayIrType> = NoKernelExte
 
     /// A typed exact operation whose semantics and supported targets belong to its adapter.
     Extension(Extension),
+}
+
+impl<Extension: Operation<Type = ArrayIrType>> KernelOperation<Extension> {
+    /// Converts only the adapter-owned payload, preserving every canonical portable operation unchanged.
+    /// The conversion can reject an extension family unavailable to the destination execution integration.
+    pub fn map_extension<Other: Operation<Type = ArrayIrType>>(
+        self,
+        map: impl FnOnce(Extension) -> Result<Other, ProgramError>,
+    ) -> Result<KernelOperation<Other>, ProgramError> {
+        Ok(match self {
+            Self::Portable(operation) => KernelOperation::Portable(operation),
+            Self::Call(operation) => KernelOperation::Call(operation),
+            Self::Scratch(operation) => KernelOperation::Scratch(operation),
+            Self::TileLoad(operation) => KernelOperation::TileLoad(operation),
+            Self::AsyncCopy(operation) => KernelOperation::AsyncCopy(operation),
+            Self::Wait(operation) => KernelOperation::Wait(operation),
+            Self::MaskedLoad(operation) => KernelOperation::MaskedLoad(operation),
+            Self::MaskedStore(operation) => KernelOperation::MaskedStore(operation),
+            Self::MaskedSwap(operation) => KernelOperation::MaskedSwap(operation),
+            Self::Extension(operation) => KernelOperation::Extension(map(operation)?),
+        })
+    }
 }
 
 impl<Extension: Operation<Type = ArrayIrType>> Display for KernelOperation<Extension> {
@@ -575,6 +658,24 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_operation_map_extension() {
+        let portable = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let mapped = portable.map_extension::<ArrayIrOperation<Array>>(|extension| match extension {}).unwrap();
+        assert!(matches!(mapped, KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_)))));
+        let extension =
+            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
+        assert!(matches!(extension.clone().map_extension(Ok).unwrap(), KernelOperation::Extension(_)));
+        assert_eq!(
+            extension
+                .map_extension::<NoKernelExtension>(|_| Err(ProgramError::UnsupportedOperation {
+                    message: "destination rejects this extension family".to_owned(),
+                }))
+                .unwrap_err(),
+            ProgramError::UnsupportedOperation { message: "destination rejects this extension family".to_owned() },
+        );
+    }
+
+    #[test]
     fn test_kernel_operation_type_inference() {
         let operation = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
         let r#type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
@@ -686,6 +787,42 @@ mod tests {
                 Err(ProgramError::MalformedProgram("extension has no registered interpreter".to_owned()))
             }
         }
+
+        impl ReferenceViewOperation for UnavailableExtension {
+            type View = ArrayReferenceView;
+
+            fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+                None
+            }
+
+            fn validate_reference_view(
+                view: &ArrayReferenceView,
+                source: &ArrayIrType,
+                target: &ArrayIrType,
+            ) -> Result<(), ReferenceViewValidationError> {
+                validate_array_reference_view(view, source, target)
+            }
+
+            fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+                _context: &C,
+                _view: &ArrayReferenceView,
+                _source: C::Value,
+                _symbols: &[C::Value],
+            ) -> Result<C::Value, ProgramError> {
+                Err(ProgramError::UnsupportedOperation { message: "extension has no reference views".to_owned() })
+            }
+        }
+
+        impl KernelExtension for UnavailableExtension {}
+
+        assert_eq!(
+            UnavailableExtension.semantic_key(),
+            Err(TypeError::invalid("kernel extension `unavailable_extension` has no exact semantic identity contract")),
+        );
+        assert_eq!(
+            UnavailableExtension.memory_semantics(),
+            Err(TypeError::invalid("kernel extension `unavailable_extension` has no initialization contract")),
+        );
 
         let operation = KernelOperation::Extension(UnavailableExtension);
         assert_eq!(operation.to_string(), "unavailable_extension");

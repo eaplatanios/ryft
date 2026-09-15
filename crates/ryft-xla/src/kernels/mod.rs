@@ -8,13 +8,11 @@
 use std::collections::BTreeSet;
 
 use ryft_core::kernels::{
-    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelSchedule, NoKernelExtension, VerifiedKernel,
+    KERNEL_SCHEMA_VERSION, KernelCompiler, KernelDefinition, KernelExtension, KernelSchedule, NoKernelExtension,
+    VerifiedKernel,
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
-use ryft_core::{
-    ArrayIrType, ArrayReferenceView, ArrayType, Context, EffectClass, Operation, ProgramError, ReferenceViewOperation,
-    TypeError, Typed,
-};
+use ryft_core::{ArrayIrType, ArrayType, Context, EffectClass, Operation, ProgramError, TypeError, Typed};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -28,8 +26,8 @@ pub use mosaic::MosaicGpuEmbedding;
 
 pub(crate) use staging::select_kernels;
 pub use staging::{
-    XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelOperation, XlaKernelTarget,
-    stage_kernel,
+    XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelExtension, XlaKernelOperation,
+    XlaKernelTarget, stage_kernel,
 };
 
 pub(crate) use cuda::CudaKernelRuntime;
@@ -114,7 +112,7 @@ pub struct CompiledKernel<Extension: Operation<Type = ArrayIrType> = NoKernelExt
 
 impl<Extension> CompiledKernel<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+    Extension: KernelExtension,
 {
     /// Admits and compiles the verified definition with one explicitly selected adapter, then embeds its typed output.
     /// Compiler configuration is recorded even when it does not alter the emitted native bytes.
@@ -142,6 +140,7 @@ where
     /// Embeds an already available typed output, permitting runtime-only use when its native format supports it.
     /// `configuration` must be the complete key emitted by the compiler that produced `output`; an integration must
     /// validate persisted adapter/schema/plugin compatibility before invoking this constructor on reloaded output.
+    /// The embedding configuration is independently included in the resulting custom-call identity.
     pub fn from_output<Output, B: KernelOutputEmbedding<Output, Extension>>(
         kernel: &VerifiedKernel<'_, Extension>,
         configuration: &[u8],
@@ -202,13 +201,19 @@ where
                 });
             }
         }
+        let embedding_configuration = embedding.configuration_key()?;
+        let mut configuration_hash = Sha256::new();
+        for component in [configuration, embedding_configuration.as_slice()] {
+            configuration_hash.update((component.len() as u64).to_le_bytes());
+            configuration_hash.update(component);
+        }
         custom_call = custom_call
             .with_attribute("ryft.kernel.schema", i64::from(KERNEL_SCHEMA_VERSION))
             .with_attribute(
                 "ryft.kernel.semantic",
                 format!("{:x}", Sha256::digest(kernel.definition().semantic_key()?.as_bytes())),
             )
-            .with_attribute("ryft.kernel.configuration", format!("{:x}", Sha256::digest(configuration)));
+            .with_attribute("ryft.kernel.configuration", format!("{:x}", configuration_hash.finalize()));
         let input_types = logical
             .input_types()
             .iter()
@@ -385,6 +390,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_compiled_kernel_from_output() {
+        /// Changes only the embedding ABI identity, preserving the emitted payload and logical call.
+        struct Embedding(&'static [u8]);
+
+        impl KernelOutputEmbedding<DeferredCopy> for Embedding {
+            fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+                Ok(self.0.to_vec())
+            }
+
+            fn custom_call(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                output: &DeferredCopy,
+            ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+                DeferredEmbedding.custom_call(kernel, output)
+            }
+        }
+
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let output = DeferredCopy { schema: 1 };
+        let first = CompiledKernel::from_output(&verified, b"a", &output, &Embedding(b"bc")).unwrap();
+        let repeated = CompiledKernel::from_output(&verified, b"a", &output, &Embedding(b"bc")).unwrap();
+        let changed = CompiledKernel::from_output(&verified, b"a", &output, &Embedding(b"bd")).unwrap();
+        let repartitioned = CompiledKernel::from_output(&verified, b"ab", &output, &Embedding(b"c")).unwrap();
+        assert_eq!(first.custom_call().to_string(), repeated.custom_call().to_string());
+        assert_ne!(first.custom_call().to_string(), changed.custom_call().to_string());
+        assert_ne!(first.custom_call().to_string(), repartitioned.custom_call().to_string());
+        let compiled = CompiledKernel::from_compiler(
+            &verified,
+            &Compiler,
+            &true,
+            &1,
+            &KernelSchedule::default(),
+            &Embedding(b"bc"),
+        )
+        .unwrap();
+        let embedded = CompiledKernel::from_output(&verified, &1u32.to_le_bytes(), &output, &Embedding(b"bc")).unwrap();
+        assert_eq!(compiled.custom_call().to_string(), embedded.custom_call().to_string());
+    }
+
+    #[test]
     fn test_compiled_kernel_from_output_rejects_deferred_schema() {
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -490,7 +537,7 @@ pub(crate) mod tests {
         let (module, _signature, requires_assertion_handler) = lowered.into_parts();
         assert!(!requires_assertion_handler);
         let semantic = format!("{:x}", Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
-        let configuration = format!("{:x}", Sha256::digest(b"fixture configuration"));
+        let configuration = "6dea220b6278c1cf02bdf72bf1a7969892b830605f8a1a1baea5af53bfcad12e";
         assert_eq!(
             module,
             formatdoc! {r#"

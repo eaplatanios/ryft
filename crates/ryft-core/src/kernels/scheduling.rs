@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceView};
+use crate::arrays::{Array, ArrayIrType, ArrayIrValue};
 use crate::contexts::EagerContext;
 use crate::interpretation::InterpretableOperation;
 use crate::kernels::calls::KernelDefinition;
@@ -15,8 +15,8 @@ use crate::kernels::grids::{Grid, GridExecution};
 use crate::kernels::initialization::{KernelInitializationError, validate_kernel_initialization};
 use crate::kernels::interpretation::{KernelDebugOptions, KernelTraceEntry};
 use crate::kernels::mappings::BoundaryPolicy;
-use crate::kernels::operations::KernelOperation;
-use crate::programs::{Operation, ProgramError, ReferenceAccessMode, ReferenceViewOperation, Typed};
+use crate::kernels::operations::{KernelExtension, KernelOperation};
+use crate::programs::{Operation, ProgramError, ReferenceAccessMode, Typed};
 
 /// Admission and resource-limit failures before interleaving execution begins.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -61,8 +61,7 @@ pub struct KernelInterleaving {
 
 impl<Extension> KernelDefinition<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>
-        + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
+    Extension: KernelExtension + InterpretableOperation<EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>>,
 {
     /// Explores all program-order-preserving instruction interleavings within the supplied bounds. Qualification
     /// rejects races and uninitialized accesses before exploration. Ordinary floating-point atomic accumulation can
