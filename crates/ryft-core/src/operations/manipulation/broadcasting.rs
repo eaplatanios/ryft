@@ -1064,11 +1064,10 @@ where
     }
 }
 
-impl<C> DifferentiableOperation<C> for DynamicBroadcastOperation
+impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for DynamicBroadcastOperation
 where
-    C: Context<Type = ArrayIrType>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
@@ -1263,19 +1262,18 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Direct transposition rule for mixed broadcast. Static input geometry delegates to the homogeneous array pullback,
-// while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
-// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
-impl<V, O> TransposableOperation<V, O> for DynamicBroadcastOperation
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
+    for DynamicBroadcastOperation
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <O as OperationProjection<ArrayType>>::Projected: From<BroadcastOperation>
-        + TransposableOperation<
-            <V as ValueProjection<ArrayType>>::Projected,
-            <O as OperationProjection<ArrayType>>::Projected,
+    V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: From<AddOperation<ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: From<BroadcastOperation>
+                           + TransposableOperation<
+                <V as ValueProjection<ArrayType>>::Projected,
+                <O as OperationProjection<ArrayType>>::Projected,
+            >,
         >,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1286,6 +1284,9 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // Static input geometry delegates to the homogeneous array pullback, while every explicit output
+        // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so that
+        // `DifferentiableOperation::jvp` can retain its exact extents as residuals.
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
@@ -1293,11 +1294,13 @@ where
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
+
         // A structural zero needs no reduction or runtime shape residual. Accumulators already hold zeros of their
         // input cotangent types, including the dimension inputs and arrays with no cotangent space.
         if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
             return Ok(());
         }
+
         if input_cotangent_type
             .shape()
             .dimensions()
@@ -1318,14 +1321,18 @@ where
             [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
             _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
         };
+
         let operation = <O as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
             output_type,
             self.output_axes().to_vec(),
         ));
-        // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
+
+        // Dimension inputs do not receive cotangents. Forward only the array inputs' handles.
         transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Replicates an array using dimension values to specify its output shape. Input axis `i` maps to output axis
 /// `output_axes[i]`; mapped extents must match or expand an input extent of one. Unmapped output axes replicate the
