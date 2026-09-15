@@ -738,8 +738,6 @@ impl DynamicBroadcastOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Display for DynamicBroadcastOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -787,11 +785,8 @@ impl Operation for DynamicBroadcastOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicBroadcastOperation);
 
-// Resolve dimension inputs before invoking the homogeneous capability: the operation's optional output layout
-// belongs to the complete ArrayType accepted by Broadcast, while DynamicBroadcast exposes inferred layout only.
-impl<C> InterpretableOperation<C> for DynamicBroadcastOperation
+impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DynamicBroadcastOperation
 where
-    C: Domain<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Broadcast>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
 {
@@ -801,9 +796,12 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Resolve dimension inputs before invoking the homogeneous capability (the operation's optional output layout
+        // belongs to the complete `ArrayType` accepted by `Broadcast`, while `DynamicBroadcast` exposes inferred layout
+        // only).
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(TypeError::invalid(format!(
-                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents"
+                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents",
             ))
             .into());
         };
@@ -815,8 +813,8 @@ where
                 .cloned()
                 .map(<C::Value as ValueProjection<DimensionType>>::into_projected)
                 .map(|result| {
-                    let extent = result?;
                     // Shared dimension identities denote one size across all output axes.
+                    let extent = result?;
                     refinements.bind(extent.r#type().variable(), extent.extent())?;
                     Ok(Dimension::Static(extent.extent()))
                 })
@@ -856,20 +854,14 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
     }
 }
 
-// Batching rule for [`DynamicBroadcastOperation`]. A mapped input is canonicalized to a leading batch axis, which is
-// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its
-// declared finite bound as physical packed storage and records its per-item extent vector as transform-owned ragged
-// metadata; replicated extents retain their existing first-class representation.
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicBroadcastOperation
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicBroadcastOperation
 where
-    C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -877,12 +869,17 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // A mapped input is canonicalized to a leading batch axis, which is represented in both the lifted output
+        // extents and the input-to-output axis mapping. A mapped output extent uses its declared finite bound as
+        // physical packed storage and records its per-item extent vector as transform-owned ragged metadata
+        // replicated extents retain their existing first-class representation.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let input_type = input.unbatched_type();
         let input_rank = <&ArrayType>::try_from(&input_type)?.rank();
         let output_rank = output_extents.len();
+
         // Validate the mapping before shifting its indices for the leading batch axis.
         if self.output_axes().len() != input_rank {
             return Err(TypeError::invalid(format!(
@@ -892,6 +889,7 @@ where
             ))
             .into());
         }
+
         let mut mapped_output_axes = vec![false; output_rank];
         for (input_axis, &output_axis) in self.output_axes().iter().enumerate() {
             if output_axis >= output_rank {
@@ -909,9 +907,10 @@ where
             }
             mapped_output_axes[output_axis] = true;
         }
-        // Eager replay can concretize ordinary array dimensions while their dimension inputs retain declared
-        // dynamic types. Parent binding validates that runtime geometry; only ragged identities must be checked
-        // here, before replacing their logical dimensions with physical packed extents.
+
+        // Eager replay can concretize ordinary array dimensions while their dimension inputs retain declared dynamic
+        // types. Parent binding validates that runtime geometry; only ragged identities must be checked here, before
+        // replacing their logical dimensions with physical packed extents.
         for ragged_axis in input.ragged_axes() {
             let input_axis = ragged_axis.axis()
                 - usize::from(input.batch_axis_position().is_some_and(|axis| axis < ragged_axis.axis()));
@@ -934,6 +933,7 @@ where
                 });
             }
         }
+
         let ragged_extents = output_extents
             .iter()
             .enumerate()
@@ -973,7 +973,7 @@ where
         if matches!(self.output_layout(), Some(Layout::Strided(_))) {
             return Err(BatchingError::InvalidBatchMetadata {
                 message: "mapped dynamic broadcasting with an explicit strided output layout requires a runtime batch \
-                     stride, which is not supported"
+                          stride, which is not supported"
                     .to_owned(),
             });
         }
@@ -990,6 +990,7 @@ where
             operation =
                 operation.with_output_layout(Layout::Tiled(TiledLayout::new(minor_to_major, layout.tiles().to_vec())));
         }
+
         if let Some(output_sharding) = self.output_sharding() {
             operation = operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
                 output_sharding,
@@ -1049,22 +1050,20 @@ where
             })
             .collect::<Vec<_>>();
         for (axis, extent, extents) in ragged_extents {
+            // Explicit output dimensions own the output's ragged metadata. A mapped input can already carry
+            // this same axis; replace that entry rather than recording the axis twice.
             let unbatched_type = extent.unbatched_type();
             let extent_type = <&DimensionType>::try_from(&unbatched_type)?;
             let axis = axis + 1;
-            // Explicit output dimensions own the output's ragged metadata. A mapped input can already carry
-            // this same axis; replace that entry rather than recording the axis twice.
             ragged_axes.retain(|ragged_axis| ragged_axis.axis() != axis);
             ragged_axes.push(RaggedAxis::new(axis, extents.clone(), extent_type.variable().clone(), vec![0]));
         }
+
         let output = ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(0))?;
         Ok(vec![output.with_ragged_axes(ragged_axes)?].into())
     }
 }
 
-// Forward-mode rule for mixed broadcast. The explicit output extents are ordinary non-differentiated shape values.
-// Exact input geometry replays the mixed broadcast directly; dynamic input geometry retains its exact extents so the
-// linear transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
 impl<C> DifferentiableOperation<C> for DynamicBroadcastOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -1084,6 +1083,9 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays the
+        // mixed broadcast directly while dynamic input geometry retains its exact extents so the linear transpose can
+        // reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
         let destinations = context;
         let context = destinations.primal();
         let Some(_) = inputs.split_first() else {
@@ -1098,6 +1100,7 @@ where
         let inputs = tangent_inputs.as_slice();
         let (array, output_extents) = inputs.split_first().unwrap();
         let context = destinations.tangent();
+
         // Tangent promotion can change element width, so derive the layout from the tangent type rather than
         // replaying byte strides captured for the primal.
         let tangent_type = primal.r#type().tangent()?;
@@ -1231,6 +1234,7 @@ where
                                     exact_inputs.as_slice(),
                                 )?;
                                 check_count!("output", outputs, 1, ProgramError);
+
                                 // Reshaping restores geometry but clears layout. Reapply the input cotangent's
                                 // complete storage metadata at the linear boundary.
                                 if transpose_target_type.layout().is_some() {
@@ -1248,14 +1252,18 @@ where
                             }
                         },
                     )?;
+
                     check_count!("output", tangent_outputs, 1, ProgramError);
                     MaybeZero::Value(tangent_outputs.remove(0))
                 }
             }
         };
+
         Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Direct transposition rule for mixed broadcast. Static input geometry delegates to the homogeneous array pullback,
 // while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
