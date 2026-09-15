@@ -50,9 +50,8 @@ pub struct DiskCache {
     /// Filesystem directory holding the cached entries.
     directory: PathBuf,
 
-    /// Counter used to make per-write temp file names unique inside one process, in addition to
-    /// the PID. Pairing PID and an atomic counter eliminates the chance of two threads racing on
-    /// the same temp path before rename.
+    /// Candidate temporary-file suffix. Exclusive creation resolves collisions with independently opened caches
+    /// and stale files from an earlier process with the same PID.
     write_counter: AtomicU64,
 
     /// Optional cap on the on-disk footprint of cached entries, in bytes. `None` disables
@@ -204,10 +203,8 @@ impl DiskCache {
         }
         let digest = Self::auxiliary_digest(namespace, key);
         let final_path = self.auxiliary_entry_path(&digest);
-        let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.directory.join(format!("{}.metadata.tmp.{}.{}", digest.as_hex(), process::id(), counter,));
+        let (temp_path, temporary_file) = self.temporary_entry(&digest, "metadata")?;
         let write_result = (|| -> std::io::Result<()> {
-            let temporary_file = File::create(&temp_path)?;
             let mut encoder = GzEncoder::new(temporary_file, Compression::fast());
             Self::write_envelope(&mut encoder, &digest, data)?;
             let temporary_file = encoder.finish()?;
@@ -249,13 +246,10 @@ impl DiskCache {
     /// compilation context records such failures before degrading to an in-memory-only result.
     pub(crate) fn put(&self, digest: &CacheDigest, data: &[u8]) -> std::io::Result<()> {
         let final_path = self.entry_path(digest);
-        let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
-        let temp_path =
-            self.directory.join(format!("{}.executable.tmp.{}.{}", digest.as_hex(), process::id(), counter));
+        let (temp_path, temporary_file) = self.temporary_entry(digest, "executable")?;
         let write_result = (|| -> std::io::Result<()> {
             // Fast compression bounds host-side overhead after an already-expensive compile.
-            let tmp_file = File::create(&temp_path)?;
-            let mut encoder = GzEncoder::new(tmp_file, Compression::fast());
+            let mut encoder = GzEncoder::new(temporary_file, Compression::fast());
             Self::write_envelope(&mut encoder, digest, data)?;
             let tmp_file = encoder.finish()?;
             tmp_file.sync_all()?;
@@ -271,6 +265,26 @@ impl DiskCache {
             self.evict_to_fit(&final_path, max_bytes)?;
         }
         Ok(())
+    }
+
+    /// Exclusively creates an owned temporary file without truncating another cache instance's active write.
+    /// The same-directory rename publication path remains unchanged. Existing files, including symlinks and
+    /// abandoned files from PID reuse, are skipped; all other creation errors propagate without deleting anything.
+    fn temporary_entry(&self, digest: &CacheDigest, extension: &str) -> std::io::Result<(PathBuf, File)> {
+        for _ in 0..256 {
+            let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
+            let path =
+                self.directory.join(format!("{}.{}.tmp.{}.{}", digest.as_hex(), extension, process::id(), counter,));
+            match File::options().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique cache temporary file after 256 attempts",
+        ))
     }
 
     fn remove_temporary_entry(path: &Path, error: std::io::Error) -> std::io::Result<()> {
@@ -592,6 +606,75 @@ mod tests {
         assert!(!cache.should_persist(Duration::from_secs(1), 256));
         assert!(!cache.should_persist(Duration::from_secs(3), 64));
         assert!(cache.should_persist(Duration::from_secs(2), 128));
+    }
+
+    #[test]
+    fn test_disk_cache_temporary_entry_independent_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = DiskCache::open(directory.path()).unwrap();
+        let second = DiskCache::open(directory.path()).unwrap();
+        let digest = CacheDigest::from_bytes(b"same-key");
+        let barrier = std::sync::Barrier::new(2);
+        // Both caches begin with counter zero. Hold both files open together so neither writer can reuse a name
+        // after the other publishes or cleans up; this deterministically exercises independent-instance collision.
+        let paths = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                let (path, mut file) = first.temporary_entry(&digest, "metadata").unwrap();
+                barrier.wait();
+                file.write_all(b"first writer").unwrap();
+                path
+            });
+            let right = scope.spawn(|| {
+                let (path, mut file) = second.temporary_entry(&digest, "metadata").unwrap();
+                barrier.wait();
+                file.write_all(b"second writer").unwrap();
+                path
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(paths.0, paths.1);
+        assert_eq!(fs::read(&paths.0).unwrap(), b"first writer");
+        assert_eq!(fs::read(&paths.1).unwrap(), b"second writer");
+
+        // A reopened instance must also skip abandoned files instead of truncating their content.
+        let reopened = DiskCache::open(directory.path()).unwrap();
+        let (path, file) = reopened.temporary_entry(&digest, "metadata").unwrap();
+        assert_ne!(path, paths.0);
+        assert_ne!(path, paths.1);
+        drop(file);
+        assert_eq!(fs::read(&paths.0).unwrap(), b"first writer");
+        assert_eq!(fs::read(&paths.1).unwrap(), b"second writer");
+    }
+
+    #[test]
+    fn test_disk_cache_put_independent_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = DiskCache::open(directory.path()).unwrap();
+        let second = DiskCache::open(directory.path()).unwrap();
+        let digest = CacheDigest::from_bytes(b"same-key");
+        let barrier = std::sync::Barrier::new(2);
+        let first_payload = vec![17u8; 32 * 1024];
+        let second_payload = vec![93u8; 48 * 1024];
+        std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                first.put(&digest, &first_payload).unwrap();
+                first.put_auxiliary("tuning", b"same-key", &first_payload).unwrap();
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                second.put(&digest, &second_payload).unwrap();
+                second.put_auxiliary("tuning", b"same-key", &second_payload).unwrap();
+            });
+            left.join().unwrap();
+            right.join().unwrap();
+        });
+        let executable = first.get(&digest).unwrap().unwrap();
+        let auxiliary = second.get_auxiliary("tuning", b"same-key").unwrap().unwrap();
+        assert!(executable == first_payload || executable == second_payload);
+        assert!(auxiliary == first_payload || auxiliary == second_payload);
+        // Atomic publication leaves only the two complete envelope files, with no temporary write debris.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[test]

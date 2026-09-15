@@ -63,6 +63,9 @@ struct CompilationPreflightManifest {
 struct DistributedRuntimeState {
     key_value_store: DistributedKeyValueStore,
     launch_id: [u8; 32],
+    kernel_sequence: AtomicU64,
+    process_index: u32,
+    process_count: u32,
     _service: Option<DistributedRuntimeService>,
 }
 
@@ -304,6 +307,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
 ///
 /// PJRT [`ryft_pjrt::Client`]s minted via [`Self::create_client`] borrow the handle's key-value
 /// store, so the handle must outlive every such client.
+#[derive(Clone)]
 pub struct DistributedRuntime {
     state: Arc<DistributedRuntimeState>,
 }
@@ -364,7 +368,11 @@ impl DistributedRuntime {
         service_options: DistributedRuntimeServiceOptions,
         client_options: DistributedRuntimeClientOptions,
     ) -> Result<Self, ryft_pjrt::Error> {
+        if node_id != client_options.node_id || service_options.num_nodes == 0 || node_id >= service_options.num_nodes {
+            return Err(ryft_pjrt::Error::invalid_argument("distributed runtime participant coordinates disagree"));
+        }
         // Coordinator (node 0) hosts the service so workers have something to dial into.
+        let process_count = service_options.num_nodes;
         let service = if node_id == 0 {
             Some(plugin.distributed_runtime_service(coordinator_address, service_options)?)
         } else {
@@ -387,7 +395,16 @@ impl DistributedRuntime {
                 .try_into()
                 .map_err(|_| ryft_pjrt::Error::invalid_argument("distributed launch identity has the wrong length"))?
         };
-        Ok(Self { state: Arc::new(DistributedRuntimeState { key_value_store, launch_id, _service: service }) })
+        Ok(Self {
+            state: Arc::new(DistributedRuntimeState {
+                key_value_store,
+                launch_id,
+                kernel_sequence: AtomicU64::new(0),
+                process_index: node_id,
+                process_count,
+                _service: service,
+            }),
+        })
     }
 
     /// Returns the [`DistributedKeyValueStore`] backed by this runtime. Useful for callers that
@@ -396,6 +413,16 @@ impl DistributedRuntime {
     #[inline]
     pub fn key_value_store(&self) -> &DistributedKeyValueStore {
         &self.state.key_value_store
+    }
+
+    /// Reserves one ordered kernel coordinator namespace within the existing distributed launch.
+    pub(crate) fn reserve_kernel_coordinator(&self) -> Result<([u8; 32], u64, u32, u32), ryft_pjrt::Error> {
+        let sequence = self
+            .state
+            .kernel_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .map_err(|_| ryft_pjrt::Error::invalid_argument("kernel coordinator sequence overflow"))?;
+        Ok((self.state.launch_id, sequence, self.state.process_index, self.state.process_count))
     }
 
     /// Creates a chunked, checksummed compilation-artifact exchange over this runtime's coordination store.

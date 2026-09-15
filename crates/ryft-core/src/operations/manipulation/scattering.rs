@@ -13,13 +13,12 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    MemberDifferentiableOperation, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
+    ResidualZeroProvider, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type};
+use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::compare::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::IotaOperation;
@@ -41,7 +40,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
     Value, ValueProjection,
@@ -764,200 +763,196 @@ where
     }
 }
 
-// Coefficients are constructed in the primal context and transferred through the differentiation boundary before
-// they multiply tangent values. Structural zeros avoid constructing inactive products with nonfinite coefficients.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ScatterOperation
-where
-    C::Operation: From<IotaOperation<ArrayType>>
-        + From<ScatterOperation>
-        + From<GatherOperation>
-        + From<ZeroLikeOperation<ArrayType>>
-        + From<OneLikeOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<SelectOperation<ArrayType>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<AddOperation<ArrayType>>
-        + From<MulOperation<ArrayType>>
-        + From<DivOperation<ArrayType>>
-        + From<ReshapeOperation>
-        + From<BroadcastOperation>,
-    C::Value: Scatter,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 3, ProgramError);
-        let input = &inputs[0];
-        let indices = inputs[1].primal();
-        let updates = &inputs[2];
-        let mut primal = input.primal().scatter(indices, updates.primal(), self)?;
-        let tangent = if input.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            let input_tangent = input.tangent().clone().materialize(context.tangent())?;
-            let updates_tangent = updates.tangent().clone().materialize(context.tangent())?;
-            let (linearized_primal, tangent) = self.linearize_values(
-                (context.primal(), context.tangent()),
-                [input.primal(), indices, updates.primal()],
-                primal.clone(),
-                [(&input_tangent, input.tangent().is_zero()), (&updates_tangent, updates.tangent().is_zero())],
-                |value| context.primal_to_tangent(value).map_err(ProgramError::from),
-            )?;
-            // The winner-ID rule also defines the primal overwrite choice.
-            if self.kind() == ScatterReductionKind::Overwrite && !self.unique_indices() {
-                primal = linearized_primal;
-            }
-            MaybeZero::Value(tangent)
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// Partition-aware transpose rule for the primal [`ScatterOperation`] with an [`Add`](ScatterReductionKind::Add)
-// combiner. The integer index input (input 1) has no tangent space, so in a valid pushforward it is the known
-// input while the scattered input (input 0) and the updates (input 2) are the linear ones. Scatter-add
-// accumulates into its input (`output = input + scattered(updates)`, so the input Jacobian is the identity), so
-// the input cotangent is the output cotangent unchanged; the update cotangent gathers the output cotangent at the
-// scattered windows via the dual gather built by mirroring the scatter geometry. The transpose reads the known
-// indices from the pullback boundary and stages an ordinary [`GatherOperation`], so linearization retains the
-// indices as regular SSA residuals. The indices receive a structural zero, and a zero output cotangent stays a
-// structural zero. Unique-index overwrite erases the input cotangent at the written windows; other combiners are
-// rejected.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScatterOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<GatherOperation>
-        + From<ScatterOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 3, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 3, DifferentiationError);
-        if self.kind() != ScatterReductionKind::Add
-            && !(self.kind() == ScatterReductionKind::Overwrite && self.unique_indices())
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "transposition of `{}` with the `{}` combiner requires scatter-add or unique-index overwrite",
-                    SCATTER_OPERATION_NAME,
-                    self.kind(),
-                ),
-            }
-            .into());
+impl_differentiable_operation! {
+    ScatterOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType> + Zero<C::Value>,
+        C::Operation: From<IotaOperation<ArrayType>>
+            + From<ScatterOperation>
+            + From<GatherOperation>
+            + From<ZeroLikeOperation<ArrayType>>
+            + From<OneLikeOperation<ArrayType>>
+            + From<CompareOperation<ArrayType>>
+            + From<SelectOperation<ArrayType>>
+            + From<ConvertElementTypeOperation<ArrayType>>
+            + From<AddOperation<ArrayType>>
+            + From<MulOperation<ArrayType>>
+            + From<DivOperation<ArrayType>>
+            + From<ReshapeOperation>
+            + From<BroadcastOperation>,
+        C::Value: Scatter,
+    {
+        |operation, context, _driver, inputs| {
+            // Coefficients are constructed in the primal context and transferred through the differentiation boundary
+            // before they multiply tangent values. Structural zeros avoid constructing inactive products with nonfinite
+            // coefficients.
+            check_count!("input", inputs, 3, ProgramError);
+            let input = &inputs[0];
+            let indices = inputs[1].primal();
+            let updates = &inputs[2];
+            let mut primal = input.primal().scatter(indices, updates.primal(), operation)?;
+            let tangent = if input.tangent().is_zero() && updates.tangent().is_zero() {
+                MaybeZero::Zero(primal.r#type().tangent()?)
+            } else {
+                let input_tangent = input.tangent().clone().materialize(context.tangent())?;
+                let updates_tangent = updates.tangent().clone().materialize(context.tangent())?;
+                let (linearized_primal, tangent) = operation.linearize_values(
+                    (context.primal(), context.tangent()),
+                    [input.primal(), indices, updates.primal()],
+                    primal.clone(),
+                    [(&input_tangent, input.tangent().is_zero()), (&updates_tangent, updates.tangent().is_zero())],
+                    |value| context.primal_to_tangent(value).map_err(ProgramError::from),
+                )?;
+                // The winner-ID rule also defines the primal overwrite choice.
+                if operation.kind() == ScatterReductionKind::Overwrite && !operation.unique_indices() {
+                    primal = linearized_primal;
+                }
+                MaybeZero::Value(tangent)
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(()),
-            MaybeZero::Value(cotangent) => {
-                // Empty inputs have no writable locations, including in clipping mode. The base keeps its
-                // identity edge and update cotangents remain structural zeros; no size-one gather is valid here.
-                if inputs[0].r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))? == Some(0)
-                {
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
+            + From<GatherOperation>
+            + From<ScatterOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Partition-aware transpose rule for the primal [`ScatterOperation`] with an
+            // [`Add`](ScatterReductionKind::Add) combiner. The integer index input (input 1) has no tangent space, so
+            // in a valid pushforward it is the known input while the scattered input (input 0) and the updates (input
+            // 2) are the linear ones. Scatter-add accumulates into its input (`output = input + scattered(updates)`, so
+            // the input Jacobian is the identity), so the input cotangent is the output cotangent unchanged; the update
+            // cotangent gathers the output cotangent at the scattered windows via the dual gather built by mirroring
+            // the scatter geometry. The transpose reads the known indices from the pullback boundary and stages an
+            // ordinary [`GatherOperation`], so linearization retains the indices as regular SSA residuals. The indices
+            // receive a structural zero, and a zero output cotangent stays a structural zero. Unique-index overwrite
+            // erases the input cotangent at the written windows; other combiners are rejected.
+            check_count!("input", inputs, 3, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 3, DifferentiationError);
+            if operation.kind() != ScatterReductionKind::Add
+                && !(operation.kind() == ScatterReductionKind::Overwrite && operation.unique_indices())
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "transposition of `{}` with the `{}` combiner requires scatter-add or unique-index overwrite",
+                        SCATTER_OPERATION_NAME,
+                        operation.kind(),
+                    ),
+                }
+                .into());
+            }
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(cotangent) => {
+                    // Empty inputs have no writable locations, including in clipping mode. The base keeps its
+                    // identity edge and update cotangents remain structural zeros; no size-one gather is valid here.
+                    let element_count =
+                        inputs[0].r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))?;
+                    if element_count == Some(0) {
+                        if accumulators[0].is_needed() {
+                            let contribution = cotangent.unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
+                            accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
+                        }
+                        return Ok(());
+                    }
                     if accumulators[0].is_needed() {
-                        let contribution = cotangent.unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
+                        let contribution = if operation.kind() == ScatterReductionKind::Overwrite {
+                            // Unique replacement windows erase the input tangent exactly where updates are written.
+                            let update_zeros =
+                                MaybeZero::Zero(inputs[2].r#type().cotangent()?).materialize(&**context)?;
+                            let indices = inputs[1]
+                                .as_known()
+                                .ok_or_else(|| TypeError::invalid("`scatter` transpose requires known indices"))?
+                                .clone();
+                            let mut contributions = context.stage_operation(
+                                operation
+                                    .clone()
+                                    .with_output_sharding(inputs[0].r#type().cotangent()?.sharding().cloned()),
+                                Vec::new(),
+                                &[cotangent.clone(), indices, update_zeros],
+                            )?;
+                            check_count!("output", contributions, 1, ProgramError);
+                            contributions.remove(0)
+                        } else {
+                            cotangent.clone()
+                        };
+                        let contribution = contribution.unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
                         accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
                     }
-                    return Ok(());
-                }
-                if accumulators[0].is_needed() {
-                    let contribution = if self.kind() == ScatterReductionKind::Overwrite {
-                        // Unique replacement windows erase the input tangent exactly where updates are written.
-                        let update_zeros = MaybeZero::Zero(inputs[2].r#type().cotangent()?).materialize(&**context)?;
-                        let indices = inputs[1]
-                            .as_known()
-                            .ok_or_else(|| TypeError::invalid("`scatter` transpose requires known indices"))?
-                            .clone();
-                        let mut contributions = context.stage_operation(
-                            self.clone().with_output_sharding(inputs[0].r#type().cotangent()?.sharding().cloned()),
-                            Vec::new(),
-                            &[cotangent.clone(), indices, update_zeros],
-                        )?;
-                        check_count!("output", contributions, 1, ProgramError);
-                        contributions.remove(0)
-                    } else {
-                        cotangent.clone()
-                    };
-                    let contribution = contribution.unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
-                    accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
-                }
-                // Only the update input needs a gather; the base input's cotangent is the seed itself.
-                if !accumulators[2].is_needed() {
-                    return Ok(());
-                }
-                // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
-                // value, so read the tracer directly.
-                let indices = inputs[1].as_known().unwrap().clone();
-                // Build the dual gather by mirroring the scatter geometry: the slice sizes pair each input window
-                // axis with its update window extent, with size 1 at the inserted and batching axes.
-                let dimensions = self.dimensions();
-                let updates_type = inputs[2].r#type();
-                let input_rank = inputs[0].r#type().rank();
-                let update_window_dimensions = dimensions.update_window_dimensions();
-                let inserted_window_dimensions = dimensions.inserted_window_dimensions();
-                let operand_batching_dimensions = dimensions.operand_batching_dimensions();
-                let mut slice_sizes = Vec::with_capacity(input_rank);
-                let mut window_position = 0;
-                for input_axis in 0..input_rank {
-                    if inserted_window_dimensions.contains(&input_axis)
-                        || operand_batching_dimensions.contains(&input_axis)
-                    {
-                        slice_sizes.push(1);
-                    } else {
-                        let update_axis = update_window_dimensions[window_position];
-                        let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
-                            ProgramError::from(TypeError::invalid(format!(
-                                "`{SCATTER_OPERATION_NAME}` transpose requires a static update shape but update axis \
-                                     {update_axis} has a dynamic size",
-                            )))
-                        })?;
-                        slice_sizes.push(extent);
-                        window_position += 1;
+                    // Only the update input needs a gather; the base input's cotangent is the seed itself.
+                    if !accumulators[2].is_needed() {
+                        return Ok(());
                     }
+                    // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
+                    // value, so read the tracer directly.
+                    let indices = inputs[1].as_known().unwrap().clone();
+                    // Build the dual gather by mirroring the scatter geometry: the slice sizes pair each input window
+                    // axis with its update window extent, with size 1 at the inserted and batching axes.
+                    let dimensions = operation.dimensions();
+                    let updates_type = inputs[2].r#type();
+                    let input_rank = inputs[0].r#type().rank();
+                    let update_window_dimensions = dimensions.update_window_dimensions();
+                    let inserted_window_dimensions = dimensions.inserted_window_dimensions();
+                    let operand_batching_dimensions = dimensions.operand_batching_dimensions();
+                    let mut slice_sizes = Vec::with_capacity(input_rank);
+                    let mut window_position = 0;
+                    for input_axis in 0..input_rank {
+                        if inserted_window_dimensions.contains(&input_axis)
+                            || operand_batching_dimensions.contains(&input_axis)
+                        {
+                            slice_sizes.push(1);
+                        } else {
+                            let update_axis = update_window_dimensions[window_position];
+                            let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
+                                ProgramError::from(TypeError::invalid(format!(
+                                    "`{SCATTER_OPERATION_NAME}` transpose requires a static update shape but update \
+                                     axis {update_axis} has a dynamic size",
+                                )))
+                            })?;
+                            slice_sizes.push(extent);
+                            window_position += 1;
+                        }
+                    }
+                    let gather_dimensions = GatherDimensionNumbers::new(
+                        update_window_dimensions.to_vec(),
+                        inserted_window_dimensions.to_vec(),
+                        dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
+                    )
+                    .with_batching_dimensions(
+                        operand_batching_dimensions.to_vec(),
+                        dimensions.scatter_indices_batching_dimensions().to_vec(),
+                    );
+                    let mut gather_operation = GatherOperation::new(gather_dimensions, slice_sizes)
+                        .with_mode(operation.mode())
+                        .with_indices_are_sorted(operation.indices_are_sorted())
+                        .with_unique_indices(operation.unique_indices())
+                        .with_output_sharding(updates_type.cotangent()?.sharding().cloned());
+                    // Dropped updates have zero derivative, independent of gather's default replacement value.
+                    if operation.mode() == GatherScatterMode::FillOrDrop {
+                        gather_operation = gather_operation.with_fill_value(
+                            EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?,
+                        )?;
+                    }
+                    let update_cotangents =
+                        context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
+                    check_count!("output", update_cotangents, 1, ProgramError);
+                    let update_cotangent = update_cotangents
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
+                    accumulators[2].accumulate(context, MaybeZero::Value(update_cotangent))
                 }
-                let gather_dimensions = GatherDimensionNumbers::new(
-                    update_window_dimensions.to_vec(),
-                    inserted_window_dimensions.to_vec(),
-                    dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
-                )
-                .with_batching_dimensions(
-                    operand_batching_dimensions.to_vec(),
-                    dimensions.scatter_indices_batching_dimensions().to_vec(),
-                );
-                let mut gather_operation = GatherOperation::new(gather_dimensions, slice_sizes)
-                    .with_mode(self.mode())
-                    .with_indices_are_sorted(self.indices_are_sorted())
-                    .with_unique_indices(self.unique_indices())
-                    .with_output_sharding(updates_type.cotangent()?.sharding().cloned());
-                // Dropped updates have zero derivative, independent of gather's default replacement value.
-                if self.mode() == GatherScatterMode::FillOrDrop {
-                    gather_operation = gather_operation.with_fill_value(
-                        EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?,
-                    )?;
-                }
-                let update_cotangents =
-                    context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
-                check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent = update_cotangents
-                    .into_iter()
-                    .next()
-                    .unwrap()
-                    .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
-                accumulators[2].accumulate(context, MaybeZero::Value(update_cotangent))
             }
         }
-    }
+    },
 }
 
 // Mixed input extents require missing tangents to be materialized from their primal runtime geometry. Coefficient

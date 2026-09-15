@@ -375,3 +375,26 @@ fn test_kernel_source_provenance() {
     let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
     assert_eq!(located(&input), Ok(input));
 }
+
+#[test]
+fn test_kernel_declarative_shape_group() {
+    // Forwards a literal through Rust's invisible expression group into shape metadata and tile loads.
+    macro_rules! tiled_copy {
+        ($width:literal) => {
+            /// Copies a tile with a partially populated final block.
+            #[core_alias::kernels::kernel(crate = "::core_alias")]
+            fn copy(
+                #[input(data_type = F32, rank = 1)] input: &Array,
+                #[output(data_type = F32, shape = [input.shape()[0]], tile = [$width], boundary = masked)]
+                output: &mut Array,
+            ) {
+                let [block] = output.tile_index();
+                let tiles = input.tiles([$width]).pad(0.0);
+                output.store(tiles.load([block]));
+            }
+        };
+    }
+    tiled_copy!(32);
+    let input = Array::vector((0..33).map(|index| index as f32 - 16.0).collect::<Vec<_>>()).unwrap();
+    assert_eq!(copy(&input), Ok(input));
+}

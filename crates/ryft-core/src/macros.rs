@@ -1240,8 +1240,9 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal branch starts parsing a JVP with an unbraced `where` clause. Token-by-token collection is
-    // necessary because `macro_rules!` cannot otherwise distinguish the final predicate from the rule body.
+    // This internal branch starts parsing a JVP with an unbraced `where` clause. Token-tree collection (four token
+    // trees per recursion, see the collector arms below) is necessary because `macro_rules!` cannot otherwise
+    // distinguish the final predicate from the rule body.
     (
         @start [$($generic:ident),*] [$operation:ty]
         jvp<$context:ident>
@@ -1264,7 +1265,7 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal helper ends JVP-bound collection when it reaches the rule body and forwards the normalized rule.
+    // This internal helper ends JVP bound collection when it reaches the rule body and forwards the normalized rule.
     (
         @collect_jvp_where
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
@@ -1276,15 +1277,59 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal helper consumes one token tree from a JVP `where` clause while preserving the remaining rule.
+    // This internal helper ends JVP bound collection when the rule body follows within one token tree. It appends that
+    // token to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the four-token
+    // arm below advance without ever consuming the body as a predicate token.
     (
         @collect_jvp_where
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        $next:tt $($rest:tt)+
+        $first:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_jvp_where
-            [$($generic),*] [$context] [$operation] [$($bounds)* $next] $($rest)*
+            [$($generic),*] [$context] [$operation] [$($bounds)* $first] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends JVP bound collection when the rule body follows within two token trees. It appends
+    // those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the
+    // four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_jvp_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_jvp_where
+            [$($generic),*] [$context] [$operation] [$($bounds)* $first $second] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends JVP bound collection when the rule body follows within three token trees. It appends
+    // those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the
+    // four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_jvp_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt $third:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_jvp_where
+            [$($generic),*] [$context] [$operation] [$($bounds)* $first $second $third] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper consumes four token trees from a JVP `where` clause per recursion. Consuming several tokens
+    // per step keeps the macro recursion depth well below the default limit for long predicate lists, and the
+    // look-ahead arms above guarantee that the rule body is never consumed as a predicate token.
+    (
+        @collect_jvp_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt $third:tt $fourth:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_jvp_where
+            [$($generic),*] [$context] [$operation] [$($bounds)* $first $second $third $fourth] $($rest)*
         }
     };
 
@@ -1385,7 +1430,7 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal helper ends transposition-bound collection and emits the retained JVP and transposition rules.
+    // This internal helper ends transposition bound collection and emits the retained JVP and transposition rules.
     (
         @collect_transpose_where
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
@@ -1425,19 +1470,75 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal helper consumes one token tree from a transposition `where` clause while retaining the JVP state.
+    // This internal helper ends transposition bound collection when the rule body follows within one token tree. It
+    // appends that token to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
     (
         @collect_transpose_where
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
         [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
         [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        $next:tt $($rest:tt)+
+        $first:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_transpose_where
             [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
             [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+            [$value] [$operations] [$($transpose_bounds)* $first] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends transposition bound collection when the rule body follows within two token trees. It
+    // appends those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$value] [$operations] [$($transpose_bounds)* $first $second] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends transposition bound collection when the rule body follows within three token trees. It
+    // appends those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt $third:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$value] [$operations] [$($transpose_bounds)* $first $second $third] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper consumes four token trees from a transposition `where` clause per recursion. Consuming
+    // several tokens per step keeps the macro recursion depth well below the default limit for long predicate lists,
+    // and the look-ahead arms above guarantee that the rule body is never consumed as a predicate token.
+    (
+        @collect_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt $third:tt $fourth:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$value] [$operations] [$($transpose_bounds)* $first $second $third $fourth] $($rest)*
         }
     };
 
@@ -1877,9 +1978,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch recognizes a public JVP with an unbraced `where` clause and initializes
-    // token-by-token bound collection. Collection is necessary because `macro_rules!` has no fragment that
-    // matches a complete Rust `where` clause while also identifying where the following JVP body begins.
+    // This internal helper branch recognizes a public JVP with an unbraced `where` clause and initializes token-tree
+    // bound collection (four token trees per recursion, see the collector arms below). Collection is necessary because
+    // `macro_rules!` has no fragment that matches a complete Rust `where` clause while also identifying where the
+    // following JVP body begins.
     (
         @public_jvp [$kind:ident] [$($generic:ident),*]
         $operation:ty,
@@ -1908,7 +2010,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch terminates JVP-bound collection when it reaches the brace-delimited JVP expression
+    // This internal helper branch terminates JVP bound collection when it reaches the brace-delimited JVP expression
     // and forwards the accumulated predicates to normalized rule dispatch. A terminal arm is required to distinguish
     // the body delimiter from ordinary token trees inside the preceding `where` clause.
     (
@@ -1924,17 +2026,59 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch consumes one token tree from an unbraced JVP `where` clause and recurses with that
-    // token appended to the bound accumulator. It exists because arbitrary Rust predicates cannot be captured as one
-    // macro fragment without also consuming the JVP body that follows them.
+    // This internal helper ends JVP bound collection when the rule body follows within one token tree. It appends that
+    // token to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the four-token
+    // arm below advance without ever consuming the body as a predicate token.
     (
         @collect_jvp_where
         [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        $next:tt $($rest:tt)+
+        $first:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @collect_jvp_where
-            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $next] $($rest)*
+            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $first] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends JVP bound collection when the rule body follows within two token trees. It appends
+    // those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the
+    // four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_jvp_where
+        [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_jvp_where
+            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $first $second] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends JVP bound collection when the rule body follows within three token trees. It appends
+    // those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets the
+    // four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_jvp_where
+        [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt $third:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_jvp_where
+            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $first $second $third] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper consumes four token trees from a JVP `where` clause per recursion. Consuming several tokens
+    // per step keeps the macro recursion depth well below the default limit for long predicate lists, and the
+    // look-ahead arms above guarantee that the rule body is never consumed as a predicate token.
+    (
+        @collect_jvp_where
+        [$kind:ident] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $first:tt $second:tt $third:tt $fourth:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_jvp_where
+            [$kind] [$($generic),*] [$context] [$operation] [$($bounds)* $first $second $third $fourth] $($rest)*
         }
     };
 
@@ -2024,7 +2168,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch ends binary transposition-bound collection at the brace-delimited rule body and
+    // This internal helper branch ends binary transposition bound collection at the brace-delimited rule body and
     // forwards a normalized representation to code generation. One terminal arm handles both structured cases and
     // the custom closure escape hatch because the braces already provide an unambiguous boundary after an arbitrary
     // `where`.
@@ -2047,19 +2191,67 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch consumes one token tree from a binary transposition `where` clause and recurses with
-    // it in the bound accumulator. It is the recursive counterpart to the brace-delimited terminal arm above and is
-    // needed solely because `macro_rules!` cannot parse a complete unbraced `where` clause.
+    // This internal helper ends transposition bound collection when the rule body follows within one token tree. It
+    // appends that token to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
     (
         @collect_public_transpose_where
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
         [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        $next:tt $($rest:tt)+
+        $first:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @collect_public_transpose_where
             [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
-            [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+            [$value] [$operations] [$($transpose_bounds)* $first] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends transposition bound collection when the rule body follows within two token trees. It
+    // appends those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_public_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_public_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$value] [$operations] [$($transpose_bounds)* $first $second] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends transposition bound collection when the rule body follows within three token trees. It
+    // appends those tokens to the accumulator and recurses so that the terminal arm above forwards the rule, which lets
+    // the four-token arm below advance without ever consuming the body as a predicate token.
+    (
+        @collect_public_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt $third:tt { $($body:tt)* } $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_public_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$value] [$operations] [$($transpose_bounds)* $first $second $third] { $($body)* } $($tail)*
+        }
+    };
+
+    // This internal helper consumes four token trees from a transposition `where` clause per recursion. Consuming
+    // several tokens per step keeps the macro recursion depth well below the default limit for long predicate lists,
+    // and the look-ahead arms above guarantee that the rule body is never consumed as a predicate token.
+    (
+        @collect_public_transpose_where
+        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $first:tt $second:tt $third:tt $fourth:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_public_transpose_where
+            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$value] [$operations] [$($transpose_bounds)* $first $second $third $fourth] $($rest)*
         }
     };
 

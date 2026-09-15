@@ -409,6 +409,10 @@ fn shape_metadata(expression: &Expr, inputs: &[Ident], core: &syn::Path, in_trac
             let value = shape_metadata(&value.expr, inputs, core, in_trace)?;
             Ok(quote!((#value)))
         }
+        Expr::Group(value) => {
+            let value = shape_metadata(&value.expr, inputs, core, in_trace)?;
+            Ok(quote!((#value)))
+        }
         Expr::Binary(binary) => {
             let left = shape_metadata(&binary.left, inputs, core, in_trace)?;
             let right = shape_metadata(&binary.right, inputs, core, in_trace)?;
@@ -1129,5 +1133,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "kernel reduction axes require integer literals");
+    }
+
+    #[test]
+    fn test_shape_metadata_group() {
+        let group = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(32));
+        let expression: Expr = syn::parse2(TokenStream::from(proc_macro2::TokenTree::Group(group))).unwrap();
+        assert_eq!(
+            shape_metadata(&expression, &[], &syn::parse_quote!(::ryft_core), true).unwrap().to_string(),
+            "(32)"
+        );
+        let group = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(host_callback()));
+        let expression: Expr = syn::parse2(TokenStream::from(proc_macro2::TokenTree::Group(group))).unwrap();
+        assert_eq!(
+            shape_metadata(&expression, &[], &syn::parse_quote!(::ryft_core), true).unwrap_err().to_string(),
+            "unsupported shape metadata expression"
+        );
     }
 }

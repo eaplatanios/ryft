@@ -1403,7 +1403,7 @@ impl_differentiable_operation! {
             + From<ZeroOperation<ArrayType>>
             + From<DynamicUpdateSliceOperation>,
     {
-        |operation, context, _driver, inputs, outputs, accumulators| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
             // (inputs 1 onward) have no tangent space, so in a valid pushforward they are the known inputs and the
             // sliced input (input 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)`
@@ -1941,7 +1941,7 @@ impl_differentiable_operation! {
         C::Operation: From<DynamicUpdateSliceOperation>,
         C::Value: DynamicUpdateSlice,
     {
-        |operation, context, _driver, inputs| {
+        |_operation, context, _driver, inputs| {
             // Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the
             // input and the update, while the scalar start indices are non-differentiated primal input edges, so the
             // tangent updates the input tangent with the update tangent at the same primal start indices. A zero input
@@ -1980,7 +1980,7 @@ impl_differentiable_operation! {
             + From<DynamicSliceOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
-        |operation, context, _driver, inputs, outputs, accumulators| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start
             // indices (inputs 2 onward) have no tangent space, so in a valid pushforward they are the known inputs and
             // the input and update (inputs 0 and 1) are the linear ones. The forward map `(t, u) ↦

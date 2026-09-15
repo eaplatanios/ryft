@@ -10,12 +10,14 @@ use crate::arrays::{
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{
-    CotangentDestination, CotangentDestinationKind, CotangentSeed, TranspositionContext, differentiate_at,
+    CotangentDestination, CotangentDestinationKind, CotangentSeed, TransposableOperation, TranspositionContext,
+    differentiate_at,
 };
 use crate::macros::{check_operation_transposition, check_operation_type_inference};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
 use crate::operations::manipulation::broadcasting::DynamicBroadcast;
 use crate::parameters::Placeholder;
+use crate::partial::PartialValue;
 use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, Value, ValueProjection};
 use crate::tracing::TracingContext;
 
