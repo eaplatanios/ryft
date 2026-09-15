@@ -8,11 +8,11 @@ use crate::arrays::{
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    CotangentAccumulator, DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver,
-};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_dischargeable_operation,
+};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -33,12 +33,11 @@ use crate::operations::math::sqrt::Sqrt;
 use crate::operations::math::sub::Sub;
 use crate::operations::sort::ArgMax;
 use crate::parameters::Placeholder;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
@@ -430,26 +429,7 @@ where
 impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 // Random bits are discrete and therefore never form a linear map that can be transposed.
-impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for RngBitGeneratorOperation<T>
-where
-    RngBitGeneratorOperation<T>: Operation<Type = T>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        _accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot be transposed because random bits are discrete"
-            ),
-        }
-        .into())
-    }
-}
+impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 /// Represents the ability to generate deterministic random bits from a counter-based generator state.
 /// [`RngBitGenerator`] stages or executes an [`RngBitGeneratorOperation`]; refer to its documentation for the
@@ -780,6 +760,7 @@ mod tests {
     use crate::macros::check_operation_type_inference;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed};
+    use crate::tracing::TracingContext;
 
     use super::*;
 

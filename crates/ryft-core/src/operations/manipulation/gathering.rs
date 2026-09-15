@@ -14,12 +14,11 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type};
+use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -28,13 +27,11 @@ use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicB
 use crate::operations::manipulation::reshaping::{Reshape, lift_output_sharding_for_leading_batch_axis};
 use crate::operations::manipulation::scattering::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
     Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this.
 
@@ -557,130 +554,123 @@ where
     }
 }
 
-// Forward-mode differentiation gathers the data tangent at the primal indices. The indices and out-of-bounds fill
-// are constant with respect to the input data, so the tangent uses zero fill. A zero input tangent stays typed zero.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for GatherOperation
-where
-    C::Operation: From<GatherOperation>,
-    C::Value: Gather,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let indices = inputs[1].primal();
-        let primal = inputs[0].primal().gather(indices, self)?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => {
-                // An out-of-bounds fill is constant with respect to the gathered input. Its derivative is zero,
-                // including when the primal uses NaN or a custom nonzero replacement.
-                let operation = if self.mode() == GatherScatterMode::FillOrDrop {
-                    self.clone().with_fill_value(
-                        EagerContext::<Array>::new().zero(&ArrayType::scalar(tangent.r#type().data_type()))?,
-                    )?
-                } else {
-                    self.clone()
-                };
-                MaybeZero::Value(tangent.gather(&context.primal_to_tangent(indices.clone())?, &operation)?)
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index input (input 1) has no
-// tangent space, so in a valid pushforward it is the known input and the gathered input (input 0) is the
-// linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the
-// output cotangent back into a zero input at the gathered windows: the scatter geometry mirrors the gather
-// axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an ordinary additive
-// [`ScatterOperation`], so linearization retains the indices as regular SSA residuals. The indices receive a
-// structural zero, and a zero output cotangent stays a structural zero.
-//
-// **Contract:** this homogeneous rule requires a statically shaped input. The scatter target is a zero of the
-// input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
-// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped input
-// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule below routes a
-// dynamically shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
-// transpose region rebuilds the same zero from the retained exact extents.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<ScatterOperation>
-        + From<BroadcastOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 2, DifferentiationError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(()),
-            MaybeZero::Value(cotangent) => {
-                if !accumulators[0].is_needed() {
-                    return Ok(());
+impl_differentiable_operation! {
+    GatherOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<GatherOperation>,
+        C::Value: Gather,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode differentiation gathers the data tangent at the primal indices. The indices and
+            // out-of-bounds fill are constant with respect to the input data, so the tangent uses zero fill. A zero
+            // input tangent stays typed zero.
+            check_count!("input", inputs, 2, ProgramError);
+            let indices = inputs[1].primal();
+            let primal = inputs[0].primal().gather(indices, operation)?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => {
+                    // An out-of-bounds fill is constant with respect to the gathered input. Its derivative is zero,
+                    // including when the primal uses NaN or a custom nonzero replacement.
+                    let tangent_operation = if operation.mode() == GatherScatterMode::FillOrDrop {
+                        operation.clone().with_fill_value(
+                            EagerContext::<Array>::new().zero(&ArrayType::scalar(tangent.r#type().data_type()))?,
+                        )?
+                    } else {
+                        operation.clone()
+                    };
+                    MaybeZero::Value(tangent.gather(&context.primal_to_tangent(indices.clone())?, &tangent_operation)?)
                 }
-                // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
-                // value, so read the tracer directly.
-                let indices = inputs[1].as_known().unwrap().clone();
-                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
-                // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
-                let input_cotangent_type = inputs[0].r#type().cotangent()?;
-                if input_cotangent_type.static_shape().is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped input but got \
-                         `{input_cotangent_type}`",
-                    ))
-                    .into());
-                }
-                let output_sharding = input_cotangent_type.sharding().cloned();
-                let zeros = MaybeZero::Zero(input_cotangent_type.clone()).materialize(&**context)?;
-                let scatter_dimensions = ScatterDimensionNumbers::new(
-                    self.dimensions().offset_dimensions().to_vec(),
-                    self.dimensions().collapsed_slice_dimensions().to_vec(),
-                    self.dimensions().start_index_map().to_vec(),
-                )
-                .with_batching_dimensions(
-                    self.dimensions().operand_batching_dimensions().to_vec(),
-                    self.dimensions().start_indices_batching_dimensions().to_vec(),
-                );
-                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
-                    .with_mode(self.mode())
-                    .with_indices_are_sorted(self.indices_are_sorted())
-                    .with_unique_indices(self.unique_indices())
-                    .with_output_sharding(output_sharding);
-                let outputs =
-                    context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
-                check_count!("output", outputs, 1, ProgramError);
-                let mut contribution = outputs.into_iter().next().unwrap();
-                if contribution.r#type().as_ref() != &input_cotangent_type {
-                    let mut outputs = context.stage_operation(
-                        BroadcastOperation::new(
-                            input_cotangent_type.clone(),
-                            (0..input_cotangent_type.rank()).collect(),
-                        ),
-                        Vec::new(),
-                        std::slice::from_ref(&contribution),
-                    )?;
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
+            + From<ScatterOperation>
+            + From<BroadcastOperation>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index input (input 1) has
+            // no tangent space, so in a valid pushforward it is the known input and the gathered input (input 0) is the
+            // linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that
+            // writes the output cotangent back into a zero input at the gathered windows: the scatter geometry mirrors
+            // the gather axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an
+            // ordinary additive [`ScatterOperation`], so linearization retains the indices as regular SSA residuals.
+            // The indices receive a structural zero, and a zero output cotangent stays a structural zero.
+            //
+            // **Contract:** this homogeneous rule requires a statically shaped input. The scatter target is a zero of
+            // the input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no
+            // first-class dimension operations, so it has no constructor that can supply a runtime extent for that
+            // zero. A dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed
+            // [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
+            // [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule below routes a dynamically
+            // shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
+            // transpose region rebuilds the same zero from the retained exact extents.
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(cotangent) => {
+                    if !accumulators[0].is_needed() {
+                        return Ok(());
+                    }
+                    // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
+                    // value, so read the tracer directly.
+                    let indices = inputs[1].as_known().unwrap().clone();
+                    // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                    // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
+                    let input_cotangent_type = inputs[0].r#type().cotangent()?;
+                    if input_cotangent_type.static_shape().is_none() {
+                        return Err(TypeError::invalid(format!(
+                            "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped input but got \
+                             `{input_cotangent_type}`",
+                        ))
+                        .into());
+                    }
+                    let output_sharding = input_cotangent_type.sharding().cloned();
+                    let zeros = MaybeZero::Zero(input_cotangent_type.clone()).materialize(&**context)?;
+                    let scatter_dimensions = ScatterDimensionNumbers::new(
+                        operation.dimensions().offset_dimensions().to_vec(),
+                        operation.dimensions().collapsed_slice_dimensions().to_vec(),
+                        operation.dimensions().start_index_map().to_vec(),
+                    )
+                    .with_batching_dimensions(
+                        operation.dimensions().operand_batching_dimensions().to_vec(),
+                        operation.dimensions().start_indices_batching_dimensions().to_vec(),
+                    );
+                    let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
+                        .with_mode(operation.mode())
+                        .with_indices_are_sorted(operation.indices_are_sorted())
+                        .with_unique_indices(operation.unique_indices())
+                        .with_output_sharding(output_sharding);
+                    let outputs =
+                        context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
                     check_count!("output", outputs, 1, ProgramError);
-                    contribution = outputs.remove(0);
+                    let mut contribution = outputs.into_iter().next().unwrap();
+                    if contribution.r#type().as_ref() != &input_cotangent_type {
+                        let mut outputs = context.stage_operation(
+                            BroadcastOperation::new(
+                                input_cotangent_type.clone(),
+                                (0..input_cotangent_type.rank()).collect(),
+                            ),
+                            Vec::new(),
+                            std::slice::from_ref(&contribution),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        contribution = outputs.remove(0);
+                    }
+                    accumulators[0].accumulate(context, MaybeZero::Value(contribution))
                 }
-                accumulators[0].accumulate(context, MaybeZero::Value(contribution))
             }
         }
-    }
+    },
 }
 
 // Projected array IR JVP rule for [`GatherOperation`]. A dynamically shaped input retains its exact extents
@@ -1653,7 +1643,7 @@ mod tests {
     use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder};
-    use crate::tracing::Trace;
+    use crate::tracing::{Trace, TracingContext};
 
     use super::*;
 

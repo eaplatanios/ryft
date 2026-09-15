@@ -18,16 +18,11 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::cumulative::{cumulative_abstract, lift_cumulative_axis};
-use crate::operations::math::add::AddOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
@@ -190,66 +185,58 @@ where
 // tangent. The composite array universe reaches this rule through the default projected fall-through of
 // `MemberDifferentiableOperation`, because the operation is shape-preserving and its operand never needs the
 // replication a broadcasting elementwise member does.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CumulativeSumOperation
-where
-    C::Operation: From<CumulativeSumOperation>,
-    C::Value: CumulativeSum,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        _context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let scan = |value: &C::Value| match self.reverse {
-            true => value.reverse_cumulative_sum(self.axis),
-            false => value.cumulative_sum(self.axis),
-        };
-        let primal = scan(inputs[0].primal())?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => MaybeZero::Value(scan(tangent)?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// A forward prefix sum sends input element `i` into every output element `j >= i`, so the cotangent of input `i` is
-// the sum of the output cotangents `j >= i` — a reverse prefix sum. The adjoint of a reverse prefix sum is
-// symmetrically a forward one, which is why the operation is closed under transposition and needs no companion
-// primitive.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for CumulativeSumOperation
-where
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<CumulativeSumOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+impl_differentiable_operation! {
+    CumulativeSumOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<CumulativeSumOperation>,
+        C::Value: CumulativeSum,
+    {
+        |operation, _context, _driver, inputs| {
             check_count!("input", inputs, 1, ProgramError);
-            check_count!("output", outputs, 1, ProgramError);
-            check_count!("accumulator", accumulators, 1, DifferentiationError);
-            match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
-                MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(match self.reverse {
-                    true => cotangent.cumulative_sum(self.axis)?,
-                    false => cotangent.reverse_cumulative_sum(self.axis)?,
-                })]),
-            }
-        };
-        let contributions = contributions?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(_context, contribution)?;
+            let scan = |value: &C::Value| match operation.reverse {
+                true => value.reverse_cumulative_sum(operation.axis),
+                false => value.cumulative_sum(operation.axis),
+            };
+            let primal = scan(inputs[0].primal())?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => MaybeZero::Value(scan(tangent)?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        Ok(())
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: From<CumulativeSumOperation>,
+    {
+        |operation, _context, _driver, inputs, outputs, accumulators| {
+            // A forward prefix sum sends input element `i` into every output element `j >= i`, so the cotangent of
+            // input `i` is the sum of the output cotangents `j >= i` — a reverse prefix sum. The adjoint of a reverse
+            // prefix sum is symmetrically a forward one, which is why the operation is closed under transposition and
+            // needs no companion primitive.
+            let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+                check_count!("input", inputs, 1, ProgramError);
+                check_count!("output", outputs, 1, ProgramError);
+                check_count!("accumulator", accumulators, 1, DifferentiationError);
+                match &outputs[0] {
+                    MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                    MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(match operation.reverse {
+                        true => cotangent.cumulative_sum(operation.axis)?,
+                        false => cotangent.reverse_cumulative_sum(operation.axis)?,
+                    })]),
+                }
+            };
+            let contributions = contributions?;
+            check_count!("input", contributions, accumulators.len(), ProgramError);
+            for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                accumulator.accumulate(_context, contribution)?;
+            }
+            Ok(())
+        }
+    },
 }
 
 /// Value-level cumulative summation capability.

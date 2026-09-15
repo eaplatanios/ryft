@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DimensionType, DimensionValue,
+    ArrayType, DimensionType, DimensionValue,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -486,13 +486,13 @@ where
 // mapped extent. A mapped predicate replays both pure branches and selects their array outputs per item. First-class
 // dimension outputs remain replicated, so the mapped-predicate path requires both branches to produce the same
 // dimension value.
-impl<A, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrValue<A>>
+impl<Capture, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<Capture>
 where
-    A: Value<Type = ArrayType>,
+    Capture: Value<Type = ArrayIrType>,
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<ConditionOperation<ArrayIrValue<A>>>
+                           + From<ConditionOperation<Capture>>
                            + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,

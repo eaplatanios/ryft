@@ -13,24 +13,18 @@ use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ResidualZeroProvider};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::zero::Zero;
-use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceEffect, ReferenceMemberType, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
     ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
@@ -192,77 +186,69 @@ where
     }
 }
 
-impl<T, U, C> DifferentiableOperation<C> for ReferenceNewOperation<T, U>
-where
-    T: Type,
-    U: DifferentiableType,
-    ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Context<
-            Type = U,
-            Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
-        > + Zero<C::Value>,
-{
-    // Forward mode allocates a tangent reference beside the primal one, initialized from the initial value's tangent.
-    // A symbolic zero tangent is instantiated first, because the tangent reference must exist as a concrete allocation
-    // for later stores to land in: a reference type is never zero-space, so the allocation's dual always carries a live
-    // tangent reference.
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
-        let source = context.primal_to_tangent(inputs[0].primal().clone())?;
-        let tangent = context
-            .tangent()
-            .bind(
-                *self,
-                Vec::new(),
-                &[C::Operation::materialize_zero_from_residual_sources(
-                    context.tangent(),
-                    inputs[0].tangent().clone(),
-                    std::iter::once(&source),
-                )?],
-            )?
-            .remove(0);
-        Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
-    }
-}
-
-impl<T, U, V, O> TransposableOperation<V, O> for ReferenceNewOperation<T, U>
-where
-    T: Type,
-    U: DifferentiableType,
-    ReferenceNewOperation<T, U>: Operation<Type = U>,
-    V: Value<Type = U>,
-    O: Operation<Type = U> + From<AddOperation<U>> + From<ReferenceFreezeOperation<T, U>>,
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-{
-    // The allocation is the map from the initial value to the initial state, so its transpose is the final step of the
-    // reverse sweep for its root: the cotangent accumulated into the root's cotangent reference is frozen into the
-    // cotangent of the initial value. An accumulator that nothing ever reached was never allocated, so the initial
-    // value's cotangent is a symbolic zero and neither `reference_new` nor `reference_freeze` is staged.
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let contribution = match context.take_reference_cotangent(driver, 0)? {
-            Some(accumulator) => {
-                MaybeZero::Value(context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[accumulator])?.remove(0))
-            }
-            None => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-        };
-        accumulators[0].accumulate(context, contribution)
-    }
+impl_differentiable_operation! {
+    <T, U> ReferenceNewOperation<T, U>,
+    jvp<C>
+    where
+        T: Type,
+        U: DifferentiableType,
+        C: Context<
+                Type = U,
+                Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+            > + Zero<C::Value>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward mode allocates a tangent reference beside the primal one, initialized from the initial value's
+            // tangent. A symbolic zero tangent is instantiated first, because the tangent reference must exist as a
+            // concrete allocation for later stores to land in: a reference type is never zero-space, so the
+            // allocation's dual always carries a live tangent reference.
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = context
+                .primal()
+                .bind(*operation, Vec::new(), std::slice::from_ref(inputs[0].primal()))?
+                .remove(0);
+            let source = context.primal_to_tangent(inputs[0].primal().clone())?;
+            let tangent = context
+                .tangent()
+                .bind(
+                    *operation,
+                    Vec::new(),
+                    &[C::Operation::materialize_zero_from_residual_sources(
+                        context.tangent(),
+                        inputs[0].tangent().clone(),
+                        std::iter::once(&source),
+                    )?],
+                )?
+                .remove(0);
+            Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
+        }
+    },
+    transpose<V, O>
+    where
+        T: Type,
+        U: DifferentiableType,
+        V: Value<Type = U>,
+        O: From<ReferenceFreezeOperation<T, U>>,
+        ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    {
+        |_operation, context, driver, inputs, outputs, accumulators| {
+            // The allocation is the map from the initial value to the initial state, so its transpose is the final
+            // step of the reverse sweep for its root: the cotangent accumulated into the root's cotangent reference is
+            // frozen into the cotangent of the initial value. An accumulator that nothing ever reached was never
+            // allocated, so the initial value's cotangent is a symbolic zero and neither `reference_new` nor
+            // `reference_freeze` is staged.
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            let contribution = match context.take_reference_cotangent(driver, 0)? {
+                Some(accumulator) => MaybeZero::Value(
+                    context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[accumulator])?.remove(0),
+                ),
+                None => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+            };
+            accumulators[0].accumulate(context, contribution)
+        }
+    },
 }
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
@@ -359,17 +345,22 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationTracer,
+        TransposableOperation, TranspositionContext,
+    };
     use crate::macros::check_operation_type_inference;
+    use crate::operations::math::add::AddOperation;
     use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_write::ReferenceWrite;
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue, ReferencePlacement};
     use crate::programs::{
         EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, ReferenceMemberType,
         TypeIdentityPosition,
     };
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 

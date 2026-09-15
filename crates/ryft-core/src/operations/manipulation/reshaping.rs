@@ -18,9 +18,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment, TransposableOperation,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -30,10 +29,8 @@ use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
-use crate::operations::math::add::AddOperation;
 use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
@@ -989,150 +986,133 @@ where
     }
 }
 
-// Forward-mode rule for mixed reshape. The explicit output extents are ordinary non-differentiated shape values.
-// Static input cotangent geometry replays the mixed reshape directly; dynamic geometry retains the exact input shape
-// so the linear transpose can reconstruct the inverse reshape from first-class dimension residuals.
-impl<C> DifferentiableOperation<C> for DynamicReshapeOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<DynamicReshapeOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType, Projected: From<BroadcastOperation> + From<TransposeOperation>>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let destinations = context;
-        let context = destinations.primal();
-        if inputs.is_empty() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        }
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_operation = self
-            .clone()
-            .with_input_types(&primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
-        let mut primal_outputs = context.bind(primal_operation, Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let output_primal = primal_outputs.remove(0);
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
-        let inputs = tangent_inputs.as_slice();
-        let (array, output_extents) = inputs.split_first().unwrap();
-        let context = destinations.tangent();
-        let tangent = match array.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(array_tangent) => {
-                let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
-                let input_cotangent_type = input_type.cotangent()?;
-                let permuted_input_cotangent_type = match self.dimensions() {
-                    Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
-                    None => input_cotangent_type.clone(),
-                };
-                if permuted_input_cotangent_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
-                {
-                    let mut tangent_inputs = Vec::with_capacity(inputs.len());
-                    tangent_inputs.push(array_tangent.clone());
-                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let operation = self.clone().with_input_types(
-                        &tangent_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-                    )?;
-                    let mut outputs = context.bind(operation, Vec::new(), tangent_inputs.as_slice())?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    MaybeZero::Value(outputs.remove(0))
-                } else {
-                    // Record each distinct dynamic input extent while the source array is available. Repeated type
-                    // identities reuse one residual SSA value in first-use order.
-                    let mut residuals = LinearResiduals::new();
-                    let output_extents =
-                        residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let input_shape = residuals.retain_shape(context, array.primal())?;
-                    let permuted_input_shape = match self.dimensions() {
-                        Some(dimensions) => input_shape.transposed(dimensions)?,
-                        None => input_shape,
+impl_differentiable_operation! {
+    DynamicReshapeOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayIrType>,
+        C::Operation: From<DimensionSizeOperation>
+            + From<LinearCallOperation<ArrayIrType>>
+            + From<DynamicReshapeOperation>
+            + From<ConstantOperation<DimensionValue>>
+            + OperationProjection<ArrayType, Projected: From<BroadcastOperation> + From<TransposeOperation>>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for mixed reshape. The explicit output extents are ordinary non-differentiated shape
+            // values. Static input cotangent geometry replays the mixed reshape directly; dynamic geometry retains the
+            // exact input shape so the linear transpose can reconstruct the inverse reshape from first-class dimension
+            // residuals.
+            let destinations = context;
+            let context = destinations.primal();
+            if inputs.is_empty() {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            }
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal_operation = operation
+                .clone()
+                .with_input_types(&primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
+            let mut primal_outputs = context.bind(primal_operation, Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primal_outputs, 1, ProgramError);
+            let output_primal = primal_outputs.remove(0);
+            let primal = destinations.primal_to_tangent(output_primal.clone())?;
+            let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+            let inputs = tangent_inputs.as_slice();
+            let (array, output_extents) = inputs.split_first().unwrap();
+            let context = destinations.tangent();
+            let tangent = match array.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(array_tangent) => {
+                    let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
+                    let input_cotangent_type = input_type.cotangent()?;
+                    let permuted_input_cotangent_type = match operation.dimensions() {
+                        Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
+                        None => input_cotangent_type.clone(),
                     };
+                    if permuted_input_cotangent_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    {
+                        let mut tangent_inputs = Vec::with_capacity(inputs.len());
+                        tangent_inputs.push(array_tangent.clone());
+                        tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let tangent_operation = operation.clone().with_input_types(
+                            &tangent_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+                        )?;
+                        let mut outputs = context.bind(tangent_operation, Vec::new(), tangent_inputs.as_slice())?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        MaybeZero::Value(outputs.remove(0))
+                    } else {
+                        // Record each distinct dynamic input extent while the source array is available. Repeated type
+                        // identities reuse one residual SSA value in first-use order.
+                        let mut residuals = LinearResiduals::new();
+                        let output_extents =
+                            residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let input_shape = residuals.retain_shape(context, array.primal())?;
+                        let permuted_input_shape = match operation.dimensions() {
+                            Some(dimensions) => input_shape.transposed(dimensions)?,
+                            None => input_shape,
+                        };
 
-                    // Both linear regions share one deterministic residual boundary. The forward region consumes the
-                    // retained output extents; the transpose region consumes the retained exact input geometry.
-                    let forward_operation = self.clone();
-                    let forward_output_extents = output_extents.clone();
-                    let transpose_operation = self.clone();
-                    let transpose_target_type = input_cotangent_type.clone();
-                    let transpose_permuted_type = permuted_input_cotangent_type.clone();
-                    let tangent = LinearCallOperation::stage(
-                        context,
-                        residuals.into_values(),
-                        vec![array_tangent.clone()],
-                        move |residuals, linear_inputs| {
-                            let mut reshape_inputs = Vec::with_capacity(1 + forward_output_extents.len());
-                            reshape_inputs.push(linear_inputs[0].clone());
-                            reshape_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                            linear_inputs[0].dispatch_domain().bind(
-                                forward_operation.with_input_types(
-                                    &reshape_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-                                )?,
-                                Vec::new(),
-                                reshape_inputs.as_slice(),
-                            )
-                        },
-                        move |residuals, output_cotangents| {
-                            let transpose_context = output_cotangents[0].dispatch_domain();
-                            let bridge_sharding = match (
-                                transpose_permuted_type.sharding(),
-                                <&ArrayType>::try_from(output_cotangents[0].r#type().as_ref())?.sharding(),
-                            ) {
-                                (Some(sharding), _) => Some(sharding.clone()),
-                                (None, Some(sharding)) => {
-                                    Some(Sharding::replicated(sharding.mesh().clone(), transpose_permuted_type.rank()))
-                                }
-                                (None, None) => None,
-                            };
-                            let mut inverse_operation = DynamicReshapeOperation::new();
-                            if let Some(bridge_sharding) = bridge_sharding {
-                                inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
-                            }
-                            let mut inverse_inputs = Vec::with_capacity(transpose_permuted_type.rank() + 1);
-                            inverse_inputs.push(output_cotangents[0].clone());
-                            inverse_inputs.extend(permuted_input_shape.dimensions(&transpose_context, residuals)?);
-                            let inverse_operation = inverse_operation.with_input_types(
-                                &inverse_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-                            )?;
-                            let mut outputs =
-                                transpose_context.bind(inverse_operation, Vec::new(), inverse_inputs.as_slice())?;
-                            check_count!("output", outputs, 1, ProgramError);
-                            let cotangent = outputs.remove(0);
-                            let cotangent = if let Some(dimensions) = transpose_operation.dimensions() {
-                                let mut outputs = transpose_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        TransposeOperation::new(dimensions.inverse()?),
-                                    ),
+                        // Both linear regions share one deterministic residual boundary. The forward region consumes
+                        // the retained output extents; the transpose region consumes the retained exact input geometry.
+                        let forward_operation = operation.clone();
+                        let forward_output_extents = output_extents.clone();
+                        let transpose_operation = operation.clone();
+                        let transpose_target_type = input_cotangent_type.clone();
+                        let transpose_permuted_type = permuted_input_cotangent_type.clone();
+                        let tangent = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![array_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let mut reshape_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                                reshape_inputs.push(linear_inputs[0].clone());
+                                reshape_inputs
+                                    .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                                linear_inputs[0].dispatch_domain().bind(
+                                    forward_operation.with_input_types(
+                                        &reshape_inputs
+                                            .iter()
+                                            .map(|input| input.r#type().into_owned())
+                                            .collect::<Vec<_>>(),
+                                    )?,
                                     Vec::new(),
-                                    std::slice::from_ref(&cotangent),
+                                    reshape_inputs.as_slice(),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let bridge_sharding = match (
+                                    transpose_permuted_type.sharding(),
+                                    <&ArrayType>::try_from(output_cotangents[0].r#type().as_ref())?.sharding(),
+                                ) {
+                                    (Some(sharding), _) => Some(sharding.clone()),
+                                    (None, Some(sharding)) => Some(Sharding::replicated(
+                                        sharding.mesh().clone(),
+                                        transpose_permuted_type.rank(),
+                                    )),
+                                    (None, None) => None,
+                                };
+                                let mut inverse_operation = DynamicReshapeOperation::new();
+                                if let Some(bridge_sharding) = bridge_sharding {
+                                    inverse_operation = inverse_operation.with_output_sharding(bridge_sharding);
+                                }
+                                let mut inverse_inputs = Vec::with_capacity(transpose_permuted_type.rank() + 1);
+                                inverse_inputs.push(output_cotangents[0].clone());
+                                inverse_inputs.extend(permuted_input_shape.dimensions(&transpose_context, residuals)?);
+                                let inverse_operation = inverse_operation.with_input_types(
+                                    &inverse_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                                 )?;
+                                let mut outputs =
+                                    transpose_context.bind(inverse_operation, Vec::new(), inverse_inputs.as_slice())?;
                                 check_count!("output", outputs, 1, ProgramError);
-                                outputs.remove(0)
-                            } else {
-                                cotangent
-                            };
-                            // The inverse geometry is exact, but reshape clears layouts and may need replicated
-                            // bridge sharding. Restore the original cotangent's complete storage metadata after
-                            // undoing the permutation, just as the homogeneous rule's unalignment does.
-                            let cotangent =
-                                if <&ArrayType>::try_from(cotangent.r#type().as_ref())? != &transpose_target_type {
+                                let cotangent = outputs.remove(0);
+                                let cotangent = if let Some(dimensions) = transpose_operation.dimensions() {
                                     let mut outputs = transpose_context.bind(
                                         <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                            BroadcastOperation::new(
-                                                transpose_target_type.clone(),
-                                                (0..transpose_target_type.rank()).collect(),
-                                            ),
+                                            TransposeOperation::new(dimensions.inverse()?),
                                         ),
                                         Vec::new(),
                                         std::slice::from_ref(&cotangent),
@@ -1142,87 +1122,107 @@ where
                                 } else {
                                     cotangent
                                 };
-                            Ok(vec![cotangent])
-                        },
-                    )?
-                    .remove(0);
-                    MaybeZero::Value(tangent)
+                                // The inverse geometry is exact, but reshape clears layouts and may need replicated
+                                // bridge sharding. Restore the original cotangent's complete storage metadata after
+                                // undoing the permutation, just as the homogeneous rule's unalignment does.
+                                let cotangent =
+                                    if <&ArrayType>::try_from(cotangent.r#type().as_ref())? != &transpose_target_type {
+                                        let mut outputs = transpose_context.bind(
+                                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                                BroadcastOperation::new(
+                                                    transpose_target_type.clone(),
+                                                    (0..transpose_target_type.rank()).collect(),
+                                                ),
+                                            ),
+                                            Vec::new(),
+                                            std::slice::from_ref(&cotangent),
+                                        )?;
+                                        check_count!("output", outputs, 1, ProgramError);
+                                        outputs.remove(0)
+                                    } else {
+                                        cotangent
+                                    };
+                                Ok(vec![cotangent])
+                            },
+                        )?
+                        .remove(0);
+                        MaybeZero::Value(tangent)
+                    }
                 }
+            };
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+        <O as OperationProjection<ArrayType>>::Projected: From<ReshapeOperation>
+            + From<TransposeOperation>
+            + TransposableOperation<
+                <V as ValueProjection<ArrayType>>::Projected,
+                <O as OperationProjection<ArrayType>>::Projected,
+            >,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Direct transposition rule for mixed reshape. Static input geometry delegates to the homogeneous array
+            // pullback, while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry
+            // requires linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
+            let Some((input, _output_extents)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
+            let permuted_input_cotangent_type = match operation.dimensions() {
+                Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
+                None => input_cotangent_type.clone(),
+            };
+            // No inverse geometry is needed when there is no live contribution. In particular, dynamic input extents
+            // must not force residual capture for a structural-zero cotangent or a nondifferentiable input.
+            if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
+                return Ok(());
             }
-        };
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
-    }
-}
-
-// Direct transposition rule for mixed reshape. Static input geometry delegates to the homogeneous array pullback,
-// while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry requires
-// linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
-impl<V, O> TransposableOperation<V, O> for DynamicReshapeOperation
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <O as OperationProjection<ArrayType>>::Projected: From<ReshapeOperation>
-        + From<TransposeOperation>
-        + TransposableOperation<
-            <V as ValueProjection<ArrayType>>::Projected,
-            <O as OperationProjection<ArrayType>>::Projected,
-        >,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-
-        let Some((input, _output_extents)) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
-        let permuted_input_cotangent_type = match self.dimensions() {
-            Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
-            None => input_cotangent_type.clone(),
-        };
-        // No inverse geometry is needed when there is no live contribution. In particular, dynamic input extents
-        // must not force residual capture for a structural-zero cotangent or a nondifferentiable input.
-        if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
-            return Ok(());
-        }
-        if permuted_input_cotangent_type
-            .shape()
-            .dimensions()
-            .iter()
-            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "direct transposition of a dynamic `{RESHAPE_OPERATION_NAME}` requires linearization so its input \
-                     extents are available as explicit residuals",
-                ),
+            if permuted_input_cotangent_type
+                .shape()
+                .dimensions()
+                .iter()
+                .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "direct transposition of a dynamic `{RESHAPE_OPERATION_NAME}` requires linearization so its \
+                         input extents are available as explicit residuals",
+                    ),
+                }
+                .into());
             }
-            .into());
-        }
 
-        let output_type = match outputs {
-            [MaybeZero::Zero(r#type)] => <&ArrayType>::try_from(r#type)?.clone(),
-            [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
-            _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
-        };
-        let mut parameters = ReshapeParameters::new(output_type.shape().clone());
-        if let Some(dimensions) = self.dimensions() {
-            parameters = parameters.with_dimensions(dimensions.clone());
+            let output_type = match outputs {
+                [MaybeZero::Zero(r#type)] => <&ArrayType>::try_from(r#type)?.clone(),
+                [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
+                _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
+            };
+            let mut parameters = ReshapeParameters::new(output_type.shape().clone());
+            if let Some(dimensions) = operation.dimensions() {
+                parameters = parameters.with_dimensions(dimensions.clone());
+            }
+            if let Some(output_sharding) = operation.output_sharding() {
+                parameters = parameters.with_output_sharding(output_sharding.clone());
+            }
+            let projected_operation =
+                <O as OperationProjection<ArrayType>>::Projected::from(ReshapeOperation::new(parameters));
+            // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
+            transpose_projected_operation(
+                context,
+                &projected_operation,
+                std::slice::from_ref(input),
+                outputs,
+                &accumulators[..1],
+            )
         }
-        if let Some(output_sharding) = self.output_sharding() {
-            parameters = parameters.with_output_sharding(output_sharding.clone());
-        }
-        let operation = <O as OperationProjection<ArrayType>>::Projected::from(ReshapeOperation::new(parameters));
-        // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
-        transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
-    }
+    },
 }
 
 /// Reshapes an array using one explicit first-class dimension value per output axis.
@@ -1825,6 +1825,7 @@ mod tests {
         Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::differentiation::TranspositionContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -1832,6 +1833,7 @@ mod tests {
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::Trace;
 

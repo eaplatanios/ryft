@@ -17,10 +17,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    transpose_projected_operation,
+    DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
+    ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -35,8 +33,7 @@ use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
     ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
@@ -588,371 +585,364 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
-where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-        + From<ConcatenateOperation<ArrayIrType>>
-        + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The trailing result-extent input is an ordinary non-differentiated shape value. Static input cotangent
-        // shapes replay the mixed concatenate directly; dynamic input shapes are retained as explicit residuals so
-        // the transpose can slice the output cotangent at runtime offsets.
-        let destinations = context;
-        let context = destinations.primal();
-        let Some((result_extent, array_inputs)) = inputs.split_last() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array followed by its result \
-                 extent",
-            ))
-            .into());
-        };
-
-        if array_inputs.is_empty() {
-            return match result_extent.primal().r#type().as_ref() {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
-                ))
-                .into()),
-                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array before its result \
+impl_differentiable_operation! {
+    ConcatenateOperation<ArrayIrType>,
+    jvp<C>
+    where
+        C: Context<Type = ArrayIrType> + Zero<C::Value>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+            + From<ConcatenateOperation<ArrayIrType>>
+            + From<DimensionSizeOperation>
+            + From<DynamicShapeSliceOperation>
+            + From<LinearCallOperation<ArrayIrType>>
+            + From<ConstantOperation<DimensionValue>>
+            + OperationProjection<
+                ArrayType,
+                Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>,
+            > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs| {
+            // The trailing result-extent input is an ordinary non-differentiated shape value. Static input cotangent
+            // shapes replay the mixed concatenate directly; dynamic input shapes are retained as explicit residuals so
+            // the transpose can slice the output cotangent at runtime offsets.
+            let destinations = context;
+            let context = destinations.primal();
+            let Some((result_extent, array_inputs)) = inputs.split_last() else {
+                return Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array followed by its result \
                      extent",
                 ))
-                .into()),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
-                ))
-                .into()),
+                .into());
             };
-        }
 
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primal_outputs = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let primal = primal_outputs.remove(0);
-        let output_primal = primal;
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
-        let inputs = tangent_inputs.as_slice();
-        let (result_extent, array_inputs) = inputs.split_last().unwrap();
-        let context = destinations.tangent();
-        let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            // Concatenation needs one concrete array tangent per array input. Materialize only structural zeros;
-            // the trailing result extent remains the unchanged primal shape input.
-            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
-            let mut tangent_inputs = array_inputs
-                .iter()
-                .map(|input| -> Result<C::Value, DifferentiationError> {
-                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
-                        &projected_context,
-                        input,
-                    )?))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let input_cotangent_types = array_inputs
-                .iter()
-                .map(|input| <&ArrayType>::try_from(input.primal().r#type().as_ref())?.cotangent())
-                .collect::<Result<Vec<_>, DifferentiationError>>()?;
-            if input_cotangent_types
-                .iter()
-                .flat_map(|r#type| r#type.shape().dimensions())
-                .all(|dimension| matches!(dimension, Dimension::Static(_)))
-            {
-                tangent_inputs.push(result_extent.primal().clone());
-                let mut tangent_outputs = context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
-                check_count!("output", tangent_outputs, 1, ProgramError);
-                MaybeZero::Value(tangent_outputs.remove(0))
+            if array_inputs.is_empty() {
+                return match result_extent.primal().r#type().as_ref() {
+                    ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
+                    ))
+                    .into()),
+                    ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array before its result \
+                         extent",
+                    ))
+                    .into()),
+                    ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
+                    ))
+                    .into()),
+                };
+            }
+
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut primal_outputs = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primal_outputs, 1, ProgramError);
+            let primal = primal_outputs.remove(0);
+            let output_primal = primal;
+            let primal = destinations.primal_to_tangent(output_primal.clone())?;
+            let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+            let inputs = tangent_inputs.as_slice();
+            let (result_extent, array_inputs) = inputs.split_last().unwrap();
+            let context = destinations.tangent();
+            let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
+                MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
-                let mut residuals = LinearResiduals::new();
-                let result_extent_index = residuals.retain(result_extent.primal().clone());
-                let mut input_shapes = Vec::with_capacity(array_inputs.len());
-                for input in array_inputs {
-                    input_shapes.push(residuals.retain_shape(context, input.primal())?);
-                }
-                let forward_operation = self.clone();
-                let transpose_axis = self.axis();
-                let mut tangent_outputs = LinearCallOperation::stage(
-                    context,
-                    residuals.into_values(),
-                    tangent_inputs,
-                    move |residuals, linear_inputs| {
-                        let mut concatenate_inputs = linear_inputs.to_vec();
-                        concatenate_inputs.push(residuals[result_extent_index].clone());
-                        let outputs = linear_inputs[0].dispatch_domain().bind(
-                            forward_operation,
-                            Vec::new(),
-                            concatenate_inputs.as_slice(),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs)
-                    },
-                    move |residuals, output_cotangents| {
-                        let transpose_context = output_cotangents[0].dispatch_domain();
-                        let mut outputs = transpose_context.bind(
-                            DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
-                            Vec::new(),
-                            &[],
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        let zero = outputs.remove(0);
-                        let mut offset = zero.clone();
-                        let mut cotangents = Vec::with_capacity(input_shapes.len());
-                        for (input_index, input_shape) in input_shapes.iter().enumerate() {
-                            let sizes = input_shape.dimensions(&transpose_context, residuals)?;
-                            let mut starts = vec![zero.clone(); sizes.len()];
-                            starts[transpose_axis] = offset.clone();
-                            let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
-                            slice_inputs.push(output_cotangents[0].clone());
-                            slice_inputs.extend(starts);
-                            slice_inputs.extend(sizes.iter().cloned());
-                            let mut outputs = transpose_context.bind(
-                                DynamicShapeSliceOperation::new(sizes.len()),
+                // Concatenation needs one concrete array tangent per array input. Materialize only structural zeros;
+                // the trailing result extent remains the unchanged primal shape input.
+                let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+                let mut tangent_inputs = array_inputs
+                    .iter()
+                    .map(|input| -> Result<C::Value, DifferentiationError> {
+                        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                            &projected_context,
+                            input,
+                        )?))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let input_cotangent_types = array_inputs
+                    .iter()
+                    .map(|input| <&ArrayType>::try_from(input.primal().r#type().as_ref())?.cotangent())
+                    .collect::<Result<Vec<_>, DifferentiationError>>()?;
+                if input_cotangent_types
+                    .iter()
+                    .flat_map(|r#type| r#type.shape().dimensions())
+                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                {
+                    tangent_inputs.push(result_extent.primal().clone());
+                    let mut tangent_outputs = context.bind(operation.clone(), Vec::new(), tangent_inputs.as_slice())?;
+                    check_count!("output", tangent_outputs, 1, ProgramError);
+                    MaybeZero::Value(tangent_outputs.remove(0))
+                } else {
+                    let mut residuals = LinearResiduals::new();
+                    let result_extent_index = residuals.retain(result_extent.primal().clone());
+                    let mut input_shapes = Vec::with_capacity(array_inputs.len());
+                    for input in array_inputs {
+                        input_shapes.push(residuals.retain_shape(context, input.primal())?);
+                    }
+                    let forward_operation = operation.clone();
+                    let transpose_axis = operation.axis();
+                    let mut tangent_outputs = LinearCallOperation::stage(
+                        context,
+                        residuals.into_values(),
+                        tangent_inputs,
+                        move |residuals, linear_inputs| {
+                            let mut concatenate_inputs = linear_inputs.to_vec();
+                            concatenate_inputs.push(residuals[result_extent_index].clone());
+                            let outputs = linear_inputs[0].dispatch_domain().bind(
+                                forward_operation,
                                 Vec::new(),
-                                slice_inputs.as_slice(),
+                                concatenate_inputs.as_slice(),
                             )?;
                             check_count!("output", outputs, 1, ProgramError);
-                            let cotangent = ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?
-                                .unalign_cotangent(&input_cotangent_types[input_index])?;
-                            cotangents.push(cotangent.into_value());
-                            if input_index + 1 < input_shapes.len() {
-                                let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
-                                let size_type =
-                                    <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
+                            Ok(outputs)
+                        },
+                        move |residuals, output_cotangents| {
+                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let mut outputs = transpose_context.bind(
+                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
+                                Vec::new(),
+                                &[],
+                            )?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            let zero = outputs.remove(0);
+                            let mut offset = zero.clone();
+                            let mut cotangents = Vec::with_capacity(input_shapes.len());
+                            for (input_index, input_shape) in input_shapes.iter().enumerate() {
+                                let sizes = input_shape.dimensions(&transpose_context, residuals)?;
+                                let mut starts = vec![zero.clone(); sizes.len()];
+                                starts[transpose_axis] = offset.clone();
+                                let mut slice_inputs = Vec::with_capacity(1 + 2 * sizes.len());
+                                slice_inputs.push(output_cotangents[0].clone());
+                                slice_inputs.extend(starts);
+                                slice_inputs.extend(sizes.iter().cloned());
                                 let mut outputs = transpose_context.bind(
-                                    DimensionOperation::Add(DimensionAddOperation::new(&offset_type, &size_type)?),
+                                    DynamicShapeSliceOperation::new(sizes.len()),
                                     Vec::new(),
-                                    &[offset, sizes[transpose_axis].clone()],
+                                    slice_inputs.as_slice(),
                                 )?;
                                 check_count!("output", outputs, 1, ProgramError);
-                                offset = outputs.remove(0);
+                                let cotangent = ValueProjection::<ArrayType>::into_projected(outputs.remove(0))?
+                                    .unalign_cotangent(&input_cotangent_types[input_index])?;
+                                cotangents.push(cotangent.into_value());
+                                if input_index + 1 < input_shapes.len() {
+                                    let offset_type = <&DimensionType>::try_from(offset.r#type().as_ref())?.clone();
+                                    let size_type =
+                                        <&DimensionType>::try_from(sizes[transpose_axis].r#type().as_ref())?.clone();
+                                    let mut outputs = transpose_context.bind(
+                                        DimensionOperation::Add(DimensionAddOperation::new(&offset_type, &size_type)?),
+                                        Vec::new(),
+                                        &[offset, sizes[transpose_axis].clone()],
+                                    )?;
+                                    check_count!("output", outputs, 1, ProgramError);
+                                    offset = outputs.remove(0);
+                                }
                             }
-                        }
-                        Ok(cotangents)
-                    },
-                )?;
-                check_count!("output", tangent_outputs, 1, ProgramError);
-                MaybeZero::Value(tangent_outputs.remove(0))
-            }
-        };
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-// Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
-// cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
-// concatenated axis. Fully static inputs delegate that slicing to the homogeneous array pullback. Inputs with a
-// dynamic extent on a *non-concatenated* axis are sliced directly in the composite universe instead, reading each
-// such extent off the live output cotangent, which repeats the input's dimension identity on every preserved axis.
-// A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold, because the
-// per-input offsets are then runtime sums, so that case requires linearization instead, which retains those input
-// extents as explicit residuals through [`DifferentiableOperation::jvp`].
-impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType>
-        + From<AddOperation<ArrayIrType>>
-        + OperationProjection<ArrayType>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<DynamicBroadcastOperation>,
-    ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>: ElementwiseDerivativeAlignment<ArrayType>,
-    <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
-        + TransposableOperation<
-            <V as ValueProjection<ArrayType>>::Projected,
-            <O as OperationProjection<ArrayType>>::Projected,
-        >,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-
-        let Some((result_extent, array_inputs)) = inputs.split_last() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array followed by its result extent",
-            ))
-            .into());
-        };
-        if array_inputs.is_empty() {
-            return match result_extent.r#type().as_ref() {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
-                ))
-                .into()),
-                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array before its result extent",
-                ))
-                .into()),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
-                ))
-                .into()),
-            };
-        }
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(&input_types, &[])?;
-        if outputs[0].is_zero() {
-            for (input, accumulator) in inputs.iter().zip(accumulators) {
-                accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
-            }
-            return Ok(());
-        }
-        let axis = self.axis();
-        let mut array_types = Vec::with_capacity(array_inputs.len());
-        for input in array_inputs {
-            let input_type = input.r#type();
-            let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-            if matches!(input_type.dimension(axis), Dimension::Dynamic(_)) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "direct transposition of a dynamic `{CONCATENATE_OPERATION_NAME}` requires linearization so \
-                         its input extents can be retained as residuals",
-                    ),
+                            Ok(cotangents)
+                        },
+                    )?;
+                    check_count!("output", tangent_outputs, 1, ProgramError);
+                    MaybeZero::Value(tangent_outputs.remove(0))
                 }
+            };
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+        }
+    },
+    // TODO(eaplatanios): Review from here onwards.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        O: Operation<Type = ArrayIrType>
+            + OperationProjection<ArrayType>
+            + From<ConstantOperation<DimensionValue>>
+            + From<DimensionSizeOperation>
+            + From<DynamicShapeSliceOperation>
+            + From<DynamicBroadcastOperation>,
+        ProjectedValue<ArrayType, Tracer<TracingContext<V, O>>>: ElementwiseDerivativeAlignment<ArrayType>,
+        <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
+            + TransposableOperation<
+                <V as ValueProjection<ArrayType>>::Projected,
+                <O as OperationProjection<ArrayType>>::Projected,
+            >,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a
+            // structural-zero cotangent and each array cotangent is sliced out of the output cotangent at its
+            // cumulative offset along the concatenated axis. Fully static inputs delegate that slicing to the
+            // homogeneous array pullback. Inputs with a dynamic extent on a *non-concatenated* axis are sliced directly
+            // in the composite universe instead, reading each such extent off the live output cotangent, which repeats
+            // the input's dimension identity on every preserved axis. A dynamic extent on the *concatenated* axis is
+            // the one geometry this boundary does not already hold, because the per-input offsets are then runtime
+            // sums, so that case requires linearization instead, which retains those input extents as explicit
+            // residuals through [`DifferentiableOperation::jvp`].
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
+            let Some((result_extent, array_inputs)) = inputs.split_last() else {
+                return Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array followed by its result extent",
+                ))
                 .into());
+            };
+            if array_inputs.is_empty() {
+                return match result_extent.r#type().as_ref() {
+                    ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
+                    ))
+                    .into()),
+                    ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array before its result extent",
+                    ))
+                    .into()),
+                    ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                        "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
+                    ))
+                    .into()),
+                };
             }
-            array_types.push(input_type.clone());
-        }
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            operation.infer_output_types(&input_types, &[])?;
+            if outputs[0].is_zero() {
+                for (input, accumulator) in inputs.iter().zip(accumulators) {
+                    accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
+                }
+                return Ok(());
+            }
+            let axis = operation.axis();
+            let mut array_types = Vec::with_capacity(array_inputs.len());
+            for input in array_inputs {
+                let input_type = input.r#type();
+                let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+                if matches!(input_type.dimension(axis), Dimension::Dynamic(_)) {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "direct transposition of a dynamic `{CONCATENATE_OPERATION_NAME}` requires linearization \
+                             so its input extents can be retained as residuals",
+                        ),
+                    }
+                    .into());
+                }
+                array_types.push(input_type.clone());
+            }
 
-        if array_types.iter().all(|input_type| input_type.static_shape().is_some()) {
-            let operation = <O as OperationProjection<ArrayType>>::Projected::from(
-                ConcatenateOperation::<ArrayType>::from(self.clone()),
-            );
-            return transpose_projected_operation(
-                context,
-                &operation,
-                array_inputs,
-                outputs,
-                &accumulators[..array_inputs.len()],
-            );
-        }
-
-        // A dynamic extent on a non-concatenated axis needs no residual, because the exact geometry the pullback
-        // requires is already live at this boundary. Concatenation preserves every non-concatenated axis, so the
-        // output cotangent repeats each input's dimension identity there, and a repeated identity denotes one
-        // runtime quantity. Reading those extents off the cotangent therefore recovers the input geometry exactly
-        // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
-        // express this because its [`SliceOperation`] bounds are static payload values, so the composite slice is
-        // staged here directly.
-
-        let mut cotangents = Vec::with_capacity(inputs.len());
-        match &outputs[0] {
-            MaybeZero::Zero(_) => {
-                cotangents.extend(
-                    array_inputs
-                        .iter()
-                        .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
+            if array_types.iter().all(|input_type| input_type.static_shape().is_some()) {
+                let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
+                    ConcatenateOperation::<ArrayType>::from(operation.clone()),
+                );
+                return transpose_projected_operation(
+                    context,
+                    &projected_operation,
+                    array_inputs,
+                    outputs,
+                    &accumulators[..array_inputs.len()],
                 );
             }
-            MaybeZero::Value(cotangent) => {
-                let cotangent_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
-                let rank = cotangent_type.rank();
 
-                // Stage the geometry shared by every input slice once: a zero start, and one extent per
-                // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
-                // read of the live cotangent for a dynamic one. The concatenated axis is filled in per input below.
-                let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
-                    DimensionValue::constant(0).map_err(ProgramError::from)?,
-                ))?;
-                check_count!("output", outputs, 1, ProgramError);
-                let zero = outputs.remove(0);
-                let mut extents = Vec::with_capacity(rank);
-                for (other_axis, dimension) in cotangent_type.shape().dimensions().iter().enumerate() {
-                    extents.push(match dimension {
-                        _ if other_axis == axis => None,
-                        Dimension::Static(extent) => {
-                            let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
-                                DimensionValue::constant(*extent).map_err(ProgramError::from)?,
-                            ))?;
-                            check_count!("output", outputs, 1, ProgramError);
-                            Some(outputs.remove(0))
-                        }
-                        Dimension::Dynamic(_) => {
-                            let mut outputs = context.stage_operation(
-                                DimensionSizeOperation::new(&cotangent_type, other_axis)?,
-                                Vec::new(),
-                                std::slice::from_ref(cotangent),
-                            )?;
-                            check_count!("output", outputs, 1, ProgramError);
-                            Some(outputs.remove(0))
-                        }
-                    });
+            // A dynamic extent on a non-concatenated axis needs no residual, because the exact geometry the pullback
+            // requires is already live at this boundary. Concatenation preserves every non-concatenated axis, so the
+            // output cotangent repeats each input's dimension identity there, and a repeated identity denotes one
+            // runtime quantity. Reading those extents off the cotangent therefore recovers the input geometry exactly
+            // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
+            // express this because its [`SliceOperation`] bounds are static payload values, so the composite slice is
+            // staged here directly.
+
+            let mut cotangents = Vec::with_capacity(inputs.len());
+            match &outputs[0] {
+                MaybeZero::Zero(_) => {
+                    cotangents.extend(
+                        array_inputs
+                            .iter()
+                            .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                            .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                    );
                 }
+                MaybeZero::Value(cotangent) => {
+                    let cotangent_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
+                    let rank = cotangent_type.rank();
 
-                // Slice the output cotangent back into per-input pieces at cumulative offsets along the
-                // concatenated axis. Those offsets and the input extents along it are static by the guard above,
-                // so they stage as exact dimension constants.
-                let mut offset = 0usize;
-                for input_type in &array_types {
-                    let Dimension::Static(input_axis_size) = input_type.dimension(axis) else {
-                        unreachable!("the guard above rejects a dynamic concatenated axis");
-                    };
-                    let start = if offset == 0 {
-                        zero.clone()
-                    } else {
-                        let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
-                            DimensionValue::constant(offset).map_err(ProgramError::from)?,
-                        ))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        outputs.remove(0)
-                    };
+                    // Stage the geometry shared by every input slice once: a zero start, and one extent per
+                    // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
+                    // read of the live cotangent for a dynamic one. The concatenated axis is filled in per input below.
                     let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
-                        DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
+                        DimensionValue::constant(0).map_err(ProgramError::from)?,
                     ))?;
                     check_count!("output", outputs, 1, ProgramError);
-                    let size = outputs.remove(0);
-                    let mut slice_inputs = Vec::with_capacity(1 + 2 * rank);
-                    slice_inputs.push(cotangent.clone());
-                    for other_axis in 0..rank {
-                        slice_inputs.push(if other_axis == axis { start.clone() } else { zero.clone() });
+                    let zero = outputs.remove(0);
+                    let mut extents = Vec::with_capacity(rank);
+                    for (other_axis, dimension) in cotangent_type.shape().dimensions().iter().enumerate() {
+                        extents.push(match dimension {
+                            _ if other_axis == axis => None,
+                            Dimension::Static(extent) => {
+                                let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                                    DimensionValue::constant(*extent).map_err(ProgramError::from)?,
+                                ))?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                Some(outputs.remove(0))
+                            }
+                            Dimension::Dynamic(_) => {
+                                let mut outputs = context.stage_operation(
+                                    DimensionSizeOperation::new(&cotangent_type, other_axis)?,
+                                    Vec::new(),
+                                    std::slice::from_ref(cotangent),
+                                )?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                Some(outputs.remove(0))
+                            }
+                        });
                     }
-                    for extent in &extents {
-                        slice_inputs.push(extent.clone().unwrap_or_else(|| size.clone()));
+
+                    // Slice the output cotangent back into per-input pieces at cumulative offsets along the
+                    // concatenated axis. Those offsets and the input extents along it are static by the guard above,
+                    // so they stage as exact dimension constants.
+                    let mut offset = 0usize;
+                    for input_type in &array_types {
+                        let Dimension::Static(input_axis_size) = input_type.dimension(axis) else {
+                            unreachable!("the guard above rejects a dynamic concatenated axis");
+                        };
+                        let start = if offset == 0 {
+                            zero.clone()
+                        } else {
+                            let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                                DimensionValue::constant(offset).map_err(ProgramError::from)?,
+                            ))?;
+                            check_count!("output", outputs, 1, ProgramError);
+                            outputs.remove(0)
+                        };
+                        let mut outputs = context.stage_nullary_operation(ConstantOperation::new(
+                            DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
+                        ))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        let size = outputs.remove(0);
+                        let mut slice_inputs = Vec::with_capacity(1 + 2 * rank);
+                        slice_inputs.push(cotangent.clone());
+                        for other_axis in 0..rank {
+                            slice_inputs.push(if other_axis == axis { start.clone() } else { zero.clone() });
+                        }
+                        for extent in &extents {
+                            slice_inputs.push(extent.clone().unwrap_or_else(|| size.clone()));
+                        }
+                        let slice = context.stage_operation(
+                            DynamicShapeSliceOperation::new(rank),
+                            Vec::new(),
+                            slice_inputs.as_slice(),
+                        )?;
+                        check_count!("output", slice, 1, ProgramError);
+                        let cotangent =
+                            ValueProjection::<ArrayType>::into_projected(slice.into_iter().next().unwrap())?
+                                .unalign_cotangent(&input_type.cotangent()?)?;
+                        cotangents.push(MaybeZero::Value(cotangent.into_value()));
+                        offset += input_axis_size;
                     }
-                    let slice = context.stage_operation(
-                        DynamicShapeSliceOperation::new(rank),
-                        Vec::new(),
-                        slice_inputs.as_slice(),
-                    )?;
-                    check_count!("output", slice, 1, ProgramError);
-                    let cotangent = ValueProjection::<ArrayType>::into_projected(slice.into_iter().next().unwrap())?
-                        .unalign_cotangent(&input_type.cotangent()?)?;
-                    cotangents.push(MaybeZero::Value(cotangent.into_value()));
-                    offset += input_axis_size;
                 }
             }
+            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
+            for (accumulator, contribution) in accumulators.iter().zip(cotangents) {
+                accumulator.accumulate(context, contribution)?;
+            }
+            Ok(())
         }
-        cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
-        for (accumulator, contribution) in accumulators.iter().zip(cotangents) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
+    },
 }
 
 /// Represents the ability to join arrays end to end along one axis. [`Self::concatenate`] preserves input order and
@@ -1480,12 +1470,14 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiableOperation, DifferentiationContext, TranspositionContext};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::constants::iota::IotaOperation;
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{
         EffectClass, EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed,
     };

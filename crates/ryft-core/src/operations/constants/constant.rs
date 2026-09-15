@@ -1,17 +1,17 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
-use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DimensionValue};
-use crate::batching::{
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-    RecursiveBatchingPolicy,
-};
+use crate::arrays::DimensionValue;
+use crate::batching::{BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
+};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
@@ -122,30 +122,7 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 {
 }
 
-impl<
-    Stored: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>,
-    P: ArrayExtentBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatchingPolicy<P>> for ConstantOperation<Stored>
-{
-    #[inline]
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        check_count!("input", inputs, 0, ProgramError);
-        Ok(context
-            .parent()
-            .bind(self.clone(), Vec::new(), &[])?
-            .into_iter()
-            .map(ArrayBatch::replicated)
-            .collect::<Vec<_>>()
-            .into())
-    }
-}
-
+impl_nullary_batchable_operation!(@replicated <V> ConstantOperation<V> where V: Value);
 impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
 impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 
@@ -255,8 +232,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayType, DataType, DimensionOperation,
+        Array, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayType, DataType, DimensionOperation,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;

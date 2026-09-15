@@ -17,13 +17,12 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
     jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type};
+use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
@@ -33,15 +32,13 @@ use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
-use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
     Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
@@ -289,163 +286,155 @@ where
 // captured. [`Any`](ReductionKind::Any) / [`All`](ReductionKind::All) are Boolean reductions with no tangent and are
 // rejected with [`UnsupportedOperation`](ProgramError::UnsupportedOperation). The shared all-zero fast path handles a
 // zero operand tangent before this rule is consulted, so the operand tangent reaching every supported case is live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperation
-where
-    C::Operation: From<ReduceOperation>
-        + From<BroadcastOperation>
-        + From<CompareOperation<ArrayType>>
-        + From<DivOperation<ArrayType>>
-        + From<MulOperation<ArrayType>>,
-    C::Value: Reduce
-        + Broadcast
-        + Compare<C::Value>
-        + Div<Output = C::Value>
-        + ElementwiseDerivativeAlignment<ArrayType>
-        + Mul<Output = C::Value>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        match self.kind() {
-            ReductionKind::Sum | ReductionKind::Mean => {
-                let reduce = |value: &C::Value| match self.output_sharding() {
-                    Some(output_sharding) => {
-                        value.reduce_with_output_sharding(self.axes(), self.kind(), output_sharding)
-                    }
-                    None => value.reduce(self.axes(), self.kind()),
-                };
-                let primal = reduce(inputs[0].primal());
-                let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                    MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
-                };
-                Ok(vec![DifferentiationDual::new(primal, tangent)?])
-            }
-            kind @ (ReductionKind::Max | ReductionKind::Min) => {
-                // Stage the argmax mask from the operand primal capture-free: `compare` the operand primal against the
-                // broadcast-back reduced value (an ordinary `compare`/`broadcast`), convert it to the tangent type,
-                // normalize it by the number of ties, and route the operand tangent through that normalized mask.
-                let primal_input = inputs[0].primal();
-                let primal = primal_input.reduce(self.axes(), kind);
-                let input_type = primal_input.r#type().into_owned();
-                let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
-                let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
-                let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
-                let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                    MaybeZero::Value(input_tangent) => {
-                        let numeric_mask = context
-                            .primal_to_tangent(mask.clone())?
-                            .align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
-                        let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
-                        let masked_tangent = numeric_mask * input_tangent.clone();
-                        MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)
-                    }
-                };
-                Ok(vec![DifferentiationDual::new(primal, tangent)?])
-            }
-            kind => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "array operation `reduce with kind {kind:?}` is not supported by the forward-mode \
-                     linearization slice; any and all are not differentiable",
-                ),
-            }
-            .into()),
-        }
-    }
-}
-
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<BroadcastOperation>
-        + From<ConstantOperation<crate::arrays::Array>>
-        + From<MulOperation<ArrayType>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let input_type = inputs[0].r#type();
-        let input_shape = input_type.shape();
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(()),
-            MaybeZero::Value(cotangent) => match self.kind {
+impl_differentiable_operation! {
+    ReduceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<ReduceOperation>
+            + From<BroadcastOperation>
+            + From<CompareOperation<ArrayType>>
+            + From<DivOperation<ArrayType>>
+            + From<MulOperation<ArrayType>>,
+        C::Value: Reduce
+            + Broadcast
+            + Compare<C::Value>
+            + Div<Output = C::Value>
+            + ElementwiseDerivativeAlignment<ArrayType>
+            + Mul<Output = C::Value>,
+    {
+        |operation, context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            match operation.kind() {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
-                    // directly transposed program cannot observe as it holds no primal value that carries it.
-                    if let Some(axis) =
-                        self.axes.iter().find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
-                    {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
-                                 linearization so that the runtime extent can be retained as a residual",
-                                self.name(),
-                            ),
+                    let reduce = |value: &C::Value| match operation.output_sharding() {
+                        Some(output_sharding) => {
+                            value.reduce_with_output_sharding(operation.axes(), operation.kind(), output_sharding)
                         }
-                        .into());
-                    }
-
-                    if !accumulators[0].is_needed() {
-                        return Ok(());
-                    }
-                    let output_type = input_type.cotangent()?;
-                    let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
-                    let cotangent_input = match self.kind {
-                        ReductionKind::Sum => broadcasted,
-                        ReductionKind::Mean => {
-                            // The check above rejected every runtime-sized reduced axis, so each reduced extent is
-                            // statically known here.
-                            let reduced_extents = self
-                                .axes
-                                .iter()
-                                .map(|axis| input_shape.dimension(*axis).value().unwrap())
-                                .collect::<Vec<_>>();
-                            let element_count = if reduced_extents.contains(&0) {
-                                0
-                            } else {
-                                reduced_extents.iter().try_fold(1usize, |count, extent| {
-                                    count.checked_mul(*extent).ok_or_else(|| {
-                                        TypeError::invalid(format!(
-                                            "mean transpose reduced element count overflows usize for input shape \
-                                             {input_shape}",
-                                        ))
-                                    })
-                                })?
-                            };
-                            let inverse_count = 1.0 / element_count as f64;
-                            // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in
-                            // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
-                            let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
-                            let factor = context.fill(&factor_type, inverse_count)?;
-                            factor * broadcasted
-                        }
-                        _ => unreachable!("outer match handled the only two supported kinds"),
+                        None => value.reduce(operation.axes(), operation.kind()),
                     };
-                    accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
+                    let primal = reduce(inputs[0].primal());
+                    let tangent = match inputs[0].tangent() {
+                        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                        MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
+                    };
+                    Ok(vec![DifferentiationDual::new(primal, tangent)?])
                 }
-                other => Err(TypeError::invalid(format!(
-                    "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
-                        (Max/Min need argmax-style gather; Any/All are not differentiable)"
-                ))
+                kind @ (ReductionKind::Max | ReductionKind::Min) => {
+                    // Stage the argmax mask from the operand primal capture-free: `compare` the operand primal against
+                    // the broadcast-back reduced value (an ordinary `compare`/`broadcast`), convert it to the tangent
+                    // type, normalize it by the number of ties, and route the operand tangent through that normalized
+                    // mask.
+                    let primal_input = inputs[0].primal();
+                    let primal = primal_input.reduce(operation.axes(), kind);
+                    let input_type = primal_input.r#type().into_owned();
+                    let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes());
+                    let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
+                    let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
+                    let tangent = match inputs[0].tangent() {
+                        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                        MaybeZero::Value(input_tangent) => {
+                            let numeric_mask = context
+                                .primal_to_tangent(mask.clone())?
+                                .align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
+                            let tie_count = numeric_mask.clone().reduce(operation.axes(), ReductionKind::Sum);
+                            let masked_tangent = numeric_mask * input_tangent.clone();
+                            MaybeZero::Value(masked_tangent.reduce(operation.axes(), ReductionKind::Sum) / tie_count)
+                        }
+                    };
+                    Ok(vec![DifferentiationDual::new(primal, tangent)?])
+                }
+                kind => Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "array operation `reduce with kind {kind:?}` is not supported by the forward-mode \
+                         linearization slice; any and all are not differentiable",
+                    ),
+                }
                 .into()),
-            },
+            }
         }
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: From<BroadcastOperation> + From<ConstantOperation<Array>> + From<MulOperation<ArrayType>>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            let input_type = inputs[0].r#type();
+            let input_shape = input_type.shape();
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(cotangent) => match operation.kind {
+                    ReductionKind::Sum | ReductionKind::Mean => {
+                        // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
+                        // directly transposed program cannot observe as it holds no primal value that carries it.
+                        if let Some(axis) = operation
+                            .axes
+                            .iter()
+                            .find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
+                        {
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
+                                     linearization so that the runtime extent can be retained as a residual",
+                                    operation.name(),
+                                ),
+                            }
+                            .into());
+                        }
+
+                        if !accumulators[0].is_needed() {
+                            return Ok(());
+                        }
+                        let output_type = input_type.cotangent()?;
+                        let output_axes = output_to_input_axis_map(input_shape.rank(), &operation.axes);
+                        let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
+                        let cotangent_input = match operation.kind {
+                            ReductionKind::Sum => broadcasted,
+                            ReductionKind::Mean => {
+                                // The check above rejected every runtime-sized reduced axis, so each reduced extent is
+                                // statically known here.
+                                let reduced_extents = operation
+                                    .axes
+                                    .iter()
+                                    .map(|axis| input_shape.dimension(*axis).value().unwrap())
+                                    .collect::<Vec<_>>();
+                                let element_count = if reduced_extents.contains(&0) {
+                                    0
+                                } else {
+                                    reduced_extents.iter().try_fold(1usize, |count, extent| {
+                                        count.checked_mul(*extent).ok_or_else(|| {
+                                            TypeError::invalid(format!(
+                                                "mean transpose reduced element count overflows usize for input shape \
+                                                 {input_shape}",
+                                            ))
+                                        })
+                                    })?
+                                };
+                                let inverse_count = 1.0 / element_count as f64;
+                                // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting
+                                // in the subsequent multiplication to scale the broadcast-back cotangent to the input
+                                // shape.
+                                let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
+                                let factor = context.fill(&factor_type, inverse_count)?;
+                                factor * broadcasted
+                            }
+                            _ => unreachable!("outer match handled the only two supported kinds"),
+                        };
+                        accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
+                    }
+                    other => Err(TypeError::invalid(format!(
+                        "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
+                            (Max/Min need argmax-style gather; Any/All are not differentiable)"
+                    ))
+                    .into()),
+                },
+            }
+        }
+    },
 }
 
 // Parent-context JVP rule for [`ReduceOperation`]. Fully static reductions delegate to the homogeneous projected
@@ -1442,7 +1431,7 @@ mod tests {
         DimensionVariable, Layout, Shape, StridedLayout,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationError, differentiate_at};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::check_operation_batching;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

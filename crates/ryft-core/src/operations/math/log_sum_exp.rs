@@ -9,12 +9,9 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::math::exp::Exp;
 use crate::operations::math::log_add_exp::{is_log_add_exp_identity_data_type, log_add_exp_identity_data_type_error};
@@ -176,46 +173,44 @@ where
 // several operands into one result (so no operand ever needs replication) nor observes a reduced extent as a value. A
 // runtime-sized reduced axis is rejected by the `broadcast` staged above, which carries its complete output geometry
 // as payload metadata.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for LogSumExpOperation
-where
-    C::Value: LogSumExp
-        + Broadcast
-        + Exp
-        + Reduce
-        + StandardSub<Output = C::Value>
-        + StandardMul<Output = C::Value>
-        + ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal_input = inputs[0].primal();
-        let primal = primal_input.log_sum_exp(self.axes.as_slice())?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(input_tangent) => {
-                let primal_input = context.primal_to_tangent(primal_input.clone())?;
-                let tangent_primal = context.primal_to_tangent(primal.clone())?;
-                let input_type = primal_input.r#type().into_owned();
-                let output_axes = output_to_input_axis_map(input_type.rank(), self.axes.as_slice());
-                let broadcast_primal = tangent_primal.broadcast(input_type, output_axes.as_slice())?;
-                let weights = (primal_input.clone() - broadcast_primal).exp()?;
-                let weights = weights.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
-                let weighted = weights * input_tangent.clone();
-                MaybeZero::Value(weighted.reduce(self.axes.as_slice(), ReductionKind::Sum))
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
+impl_differentiable_operation! {
+    LogSumExpOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Value: LogSumExp
+            + Broadcast
+            + Exp
+            + Reduce
+            + StandardSub<Output = C::Value>
+            + StandardMul<Output = C::Value>
+            + ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal_input = inputs[0].primal();
+            let primal = primal_input.log_sum_exp(operation.axes.as_slice())?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(input_tangent) => {
+                    let primal_input = context.primal_to_tangent(primal_input.clone())?;
+                    let tangent_primal = context.primal_to_tangent(primal.clone())?;
+                    let input_type = primal_input.r#type().into_owned();
+                    let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes.as_slice());
+                    let broadcast_primal = tangent_primal.broadcast(input_type, output_axes.as_slice())?;
+                    let weights = (primal_input.clone() - broadcast_primal).exp()?;
+                    let weights = weights.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
+                    let weighted = weights * input_tangent.clone();
+                    MaybeZero::Value(weighted.reduce(operation.axes.as_slice(), ReductionKind::Sum))
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    // `log_sum_exp` is not linear in its operand, so it has no primitive transposition rule. Reverse-mode
+    // differentiation remains available by transposing the linear operations that the forward-mode rule above stages.
+    transpose = @nonlinear,
 }
-
-// `log_sum_exp` is not linear in its operand, so it has no primitive transposition rule. Reverse-mode differentiation
-// remains available by transposing the linear operations that the forward-mode rule above stages.
-impl_non_transposable_operation!(LogSumExpOperation);
 
 /// Value-level `log(sum(exp(x)))` capability.
 ///

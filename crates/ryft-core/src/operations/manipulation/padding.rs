@@ -21,13 +21,11 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    transpose_projected_operation,
+    DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
+    ResidualZeroProvider, TransposableOperation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_reference_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::{One, OneOperation};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -41,9 +39,8 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation, resized_output_sharding};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
     ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
@@ -711,163 +708,501 @@ where
     }
 }
 
-// Forward-mode rule for [`PadOperation`]: `pad` is linear in both the input and the padding value, so the tangent pads
-// the input tangent with the padding-value tangent using the same padding amounts.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for PadOperation<ArrayType>
-where
-    C::Operation: From<PadOperation<ArrayType>>,
-    C::Value: Pad,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let primal = inputs[0].primal().pad(
-            inputs[1].primal(),
-            self.edge_padding_low(),
-            self.edge_padding_high(),
-            self.interior_padding(),
-        )?;
-        // The pad needs both the input and padding-value tangents as real values, so materialize the structurally zero
-        // side (the shared all-zero fast path already handled the case where both are zero).
-        let operand_tangent = inputs[0].tangent().clone().materialize(context.tangent())?;
-        let padding_tangent = inputs[1].tangent().clone().materialize(context.tangent())?;
-        let tangent = operand_tangent.pad(
-            &padding_tangent,
-            self.edge_padding_low(),
-            self.edge_padding_high(),
-            self.interior_padding(),
-        )?;
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
+impl_differentiable_operation! {
+    PadOperation<ArrayType>,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType> + Zero<C::Value>,
+        C::Operation: From<PadOperation<ArrayType>>,
+        C::Value: Pad,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`PadOperation`]: `pad` is linear in both the input and the padding value, so the
+            // tangent pads the input tangent with the padding-value tangent using the same padding amounts.
+            check_count!("input", inputs, 2, ProgramError);
+            let primal = inputs[0].primal().pad(
+                inputs[1].primal(),
+                operation.edge_padding_low(),
+                operation.edge_padding_high(),
+                operation.interior_padding(),
+            )?;
+            // The pad needs both the input and padding-value tangents as real values, so materialize the structurally
+            // zero side (the shared all-zero fast path already handled the case where both are zero).
+            let operand_tangent = inputs[0].tangent().clone().materialize(context.tangent())?;
+            let padding_tangent = inputs[1].tangent().clone().materialize(context.tangent())?;
+            let tangent = operand_tangent.pad(
+                &padding_tangent,
+                operation.edge_padding_low(),
+                operation.edge_padding_high(),
+                operation.interior_padding(),
+            )?;
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<OneOperation<ArrayType>>
+            + From<PadOperation<ArrayType>>
+            + From<SelectOperation<ArrayType>>
+            + From<SliceOperation>
+            + From<ReduceOperation>
+            + From<ZeroOperation<ArrayType>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Transpose (vector-Jacobian product) for a [`PadOperation`].
+            //
+            // The forward map `(t, p) ↦ pad(t, p, low, high, interior)` writes input element `i` to output position
+            // `low + i * (interior + 1)` along each axis and the padding value everywhere else, so its pullback splits
+            // the output cotangent into two contributions:
+            //
+            //   - **Input cotangent**: slice the surviving input positions with stride `interior + 1`, then insert
+            //     zeros at the cropped input positions.
+            //   - **Padding-value cotangent**: pad an all-false input-shaped mask with `true`, select the output
+            //     cotangent only at those padding positions, and sum the selected tensor. Selection rather than
+            //     subtraction keeps non-finite cotangents at input positions from contaminating this contribution.
+            //
+            // Symbolic-zero cotangents propagate unchanged.
+            let contributions = {
+                // The rule stages into the tracing context only, so the transposition context is narrowed once up
+                // front.
+                let context: &mut TracingContext<V, O> = context;
+                check_count!("input", inputs, 2, ProgramError);
+                check_count!("output", outputs, 1, ProgramError);
+                check_count!("accumulator", accumulators, 2, DifferentiationError);
+                operation.infer_output_types(
+                    &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
+                    &[],
+                )?;
+                match &outputs[0] {
+                    MaybeZero::Zero(_) => vec![
+                        MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                        MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+                    ],
+                    MaybeZero::Value(cotangent) => {
+                        let input_cotangent = if inputs[0].is_unknown() {
+                            let target_type = inputs[0].r#type().cotangent()?;
+                            let mut starts = Vec::with_capacity(target_type.rank());
+                            let mut limits = Vec::with_capacity(target_type.rank());
+                            let mut strides = Vec::with_capacity(target_type.rank());
+                            let mut low = Vec::with_capacity(target_type.rank());
+                            let mut high = Vec::with_capacity(target_type.rank());
+                            let mut empty = false;
+                            for axis in 0..target_type.rank() {
+                                let input_extent = target_type.dimension(axis).value().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose requires a static input extent on axis {axis}"
+                                    ))
+                                })? as i128;
+                                let output_extent = cotangent.r#type().dimension(axis).value().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose requires a static output extent on axis \
+                                         {axis}"
+                                    ))
+                                })? as i128;
+                                let edge = operation.edge_padding_low[axis] as i128;
+                                let stride = operation.interior_padding[axis] as i128 + 1;
+                                // Keep only input indices whose padded coordinates survive cropping. Working in i128
+                                // avoids negating i64::MIN and constructing an enormous intermediate dilated array.
+                                let first = (-edge).div_euclid(stride) + i128::from((-edge).rem_euclid(stride) != 0);
+                                let end = (output_extent - edge).div_euclid(stride)
+                                    + i128::from((output_extent - edge).rem_euclid(stride) != 0);
+                                let first = first.clamp(0, input_extent);
+                                let end = end.clamp(first, input_extent);
+                                if first == end {
+                                    empty = true;
+                                    break;
+                                }
+                                starts.push((edge + first * stride) as usize);
+                                limits.push((edge + (end - 1) * stride + 1) as usize);
+                                // With one surviving element, the stride is irrelevant and need not fit usize.
+                                strides.push(if end - first == 1 { 1 } else { usize::try_from(stride).unwrap() });
+                                low.push(i64::try_from(first).map_err(|_| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose low padding exceeds `i64` on axis {axis}"
+                                    ))
+                                })?);
+                                high.push(i64::try_from(input_extent - end).map_err(|_| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose high padding exceeds `i64` on axis {axis}"
+                                    ))
+                                })?);
+                            }
+                            if empty {
+                                MaybeZero::Zero(target_type)
+                            } else {
+                                let slice = SliceOperation::new(starts, limits).with_strides(strides)?;
+                                let mut sliced =
+                                    context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
+                                check_count!("output", sliced, 1, ProgramError);
+                                let zero = MaybeZero::Zero(dependency_scalar_type(cotangent.r#type().as_ref())?)
+                                    .materialize(context)?;
+                                let mut padded = context.stage_operation(
+                                    PadOperation::new(low, high, vec![0; target_type.rank()])?,
+                                    Vec::new(),
+                                    &[sliced.remove(0), zero],
+                                )?;
+                                check_count!("output", padded, 1, ProgramError);
+                                MaybeZero::Value(padded.remove(0).unalign_cotangent(&target_type)?)
+                            }
+                        } else {
+                            MaybeZero::Zero(inputs[0].r#type().cotangent()?)
+                        };
+                        let padding_value_cotangent = if inputs[1].is_unknown() {
+                            let mask_input_type =
+                                inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
+                            let mask_padding_type =
+                                inputs[1].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
+                            let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
+                            let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
+                            let mut mask_padding = context.stage_operation(
+                                OneOperation::new(mask_padding_type),
+                                Vec::new(),
+                                &no_inputs,
+                            )?;
+                            check_count!("output", mask_padding, 1, ProgramError);
+                            let mut mask = context.stage_operation(
+                                operation.clone(),
+                                Vec::new(),
+                                &[mask_input, mask_padding.remove(0)],
+                            )?;
+                            check_count!("output", mask, 1, ProgramError);
+                            let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
+                            let mut selected = context.stage_operation(
+                                SelectOperation::<ArrayType>::new(),
+                                Vec::new(),
+                                &[mask.remove(0), cotangent.clone(), zero],
+                            )?;
+                            check_count!("output", selected, 1, ProgramError);
+                            let all_axes = (0..cotangent.r#type().rank()).collect::<Vec<_>>();
+                            let mut reduced = context.stage_operation(
+                                ReduceOperation::new(all_axes, ReductionKind::Sum),
+                                Vec::new(),
+                                &[selected.remove(0)],
+                            )?;
+                            check_count!("output", reduced, 1, ProgramError);
+                            MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent()?)?)
+                        } else {
+                            MaybeZero::Zero(inputs[1].r#type().cotangent()?)
+                        };
+                        vec![input_cotangent, padding_value_cotangent]
+                    }
+                }
+            };
+            check_count!("input", contributions, accumulators.len(), ProgramError);
+            for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                accumulator.accumulate(context, contribution)?;
+            }
+            Ok(())
+        }
+    },
 }
 
-// Forward-mode rule for mixed pad. The explicit output extents are ordinary non-differentiated shape values. Exact
-// input geometry replays the mixed pad directly; dynamic geometry retains the exact input shape and output
-// extents so the linear transpose can reconstruct both the input and padding-value cotangents.
-impl<C> DifferentiableOperation<C> for PadOperation<ArrayIrType>
-where
-    C: Context<Type = ArrayIrType> + Zero<C::Value>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
-        + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<PadOperation<ArrayIrType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<
-            ArrayType,
-            Projected: From<OneOperation<ArrayType>>
-                           + From<ReduceOperation>
-                           + From<SelectOperation<ArrayType>>
-                           + From<ZeroLikeOperation<ArrayType>>
-                           + From<ZeroOperation<ArrayType>>,
-        > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let destinations = context;
-        let context = destinations.primal();
-        if inputs.len() < 2 {
-            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-        }
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal, 1, ProgramError);
-        let primal = primal.remove(0);
-        let output_primal = primal;
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
-        let inputs = tangent_inputs.as_slice();
-        let (array_inputs, output_extents) = inputs.split_at(2);
-        let context = destinations.tangent();
-        let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
-            let mut tangent_inputs = array_inputs
-                .iter()
-                .map(|input| -> Result<C::Value, DifferentiationError> {
-                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
-                        &projected_context,
-                        input,
-                    )?))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let operand_cotangent_type =
-                <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent()?;
-            if operand_cotangent_type
-                .shape()
-                .dimensions()
-                .iter()
-                .all(|dimension| matches!(dimension, Dimension::Static(_)))
-            {
-                tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                {
-                    let mut outputs = context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    MaybeZero::Value(outputs.remove(0))
-                }
+impl_differentiable_operation! {
+    PadOperation<ArrayIrType>,
+    jvp<C>
+    where
+        C: Context<Type = ArrayIrType> + Zero<C::Value>,
+        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+            + From<DimensionSizeOperation>
+            + From<DynamicShapeSliceOperation>
+            + From<LinearCallOperation<ArrayIrType>>
+            + From<PadOperation<ArrayIrType>>
+            + From<ZeroOperation<ArrayType>>
+            + From<ConstantOperation<DimensionValue>>
+            + OperationProjection<
+                ArrayType,
+                Projected: From<OneOperation<ArrayType>>
+                               + From<ReduceOperation>
+                               + From<SelectOperation<ArrayType>>
+                               + From<ZeroLikeOperation<ArrayType>>
+                               + From<ZeroOperation<ArrayType>>,
+            > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for mixed pad. The explicit output extents are ordinary non-differentiated shape
+            // values. Exact input geometry replays the mixed pad directly; dynamic geometry retains the exact input
+            // shape and output extents so the linear transpose can reconstruct both the input and padding-value
+            // cotangents.
+            let destinations = context;
+            let context = destinations.primal();
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            }
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primal, 1, ProgramError);
+            let primal = primal.remove(0);
+            let output_primal = primal;
+            let primal = destinations.primal_to_tangent(output_primal.clone())?;
+            let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+            let inputs = tangent_inputs.as_slice();
+            let (array_inputs, output_extents) = inputs.split_at(2);
+            let context = destinations.tangent();
+            let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
+                MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
-                let mut residuals = LinearResiduals::new();
-                let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                let operand_shape = residuals.retain_shape(context, array_inputs[0].primal())?;
-                let forward_operation = self.clone();
-                let forward_output_extents = output_extents.clone();
-                let transpose_operation = self.clone();
-                let transpose_operand_type = operand_cotangent_type.clone();
-                let transpose_padding_type =
-                    <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent()?;
-                let transpose_output_type = <&ArrayType>::try_from(primal.r#type().as_ref())?.cotangent()?;
-                let mut tangent = LinearCallOperation::stage(
-                    context,
-                    residuals.into_values(),
-                    tangent_inputs,
-                    move |residuals, linear_inputs| {
-                        check_count!("input", linear_inputs, 2, ProgramError);
-                        let mut pad_inputs = linear_inputs.to_vec();
-                        pad_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                        linear_inputs[0].dispatch_domain().bind(forward_operation, Vec::new(), pad_inputs.as_slice())
-                    },
-                    move |residuals, output_cotangents| {
-                        check_count!("output", output_cotangents, 1, ProgramError);
-                        let transpose_context = output_cotangents[0].dispatch_domain();
-                        let output_cotangent = output_cotangents[0].clone();
-                        let input_extents = operand_shape.dimensions(&transpose_context, residuals)?;
+                let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+                let mut tangent_inputs = array_inputs
+                    .iter()
+                    .map(|input| -> Result<C::Value, DifferentiationError> {
+                        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                            &projected_context,
+                            input,
+                        )?))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let operand_cotangent_type =
+                    <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent()?;
+                if operand_cotangent_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                {
+                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                    {
+                        let mut outputs = context.bind(operation.clone(), Vec::new(), tangent_inputs.as_slice())?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        MaybeZero::Value(outputs.remove(0))
+                    }
+                } else {
+                    let mut residuals = LinearResiduals::new();
+                    let output_extents =
+                        residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                    let operand_shape = residuals.retain_shape(context, array_inputs[0].primal())?;
+                    let forward_operation = operation.clone();
+                    let forward_output_extents = output_extents.clone();
+                    let transpose_operation = operation.clone();
+                    let transpose_operand_type = operand_cotangent_type.clone();
+                    let transpose_padding_type =
+                        <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent()?;
+                    let transpose_output_type = <&ArrayType>::try_from(primal.r#type().as_ref())?.cotangent()?;
+                    let mut tangent = LinearCallOperation::stage(
+                        context,
+                        residuals.into_values(),
+                        tangent_inputs,
+                        move |residuals, linear_inputs| {
+                            check_count!("input", linear_inputs, 2, ProgramError);
+                            let mut pad_inputs = linear_inputs.to_vec();
+                            pad_inputs.extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                            linear_inputs[0].dispatch_domain().bind(
+                                forward_operation,
+                                Vec::new(),
+                                pad_inputs.as_slice(),
+                            )
+                        },
+                        move |residuals, output_cotangents| {
+                            check_count!("output", output_cotangents, 1, ProgramError);
+                            let transpose_context = output_cotangents[0].dispatch_domain();
+                            let output_cotangent = output_cotangents[0].clone();
+                            let input_extents = operand_shape.dimensions(&transpose_context, residuals)?;
 
-                        let all_cropped =
-                            transpose_operand_type.shape().dimensions().iter().enumerate().any(|(axis, dimension)| {
-                                dimension.bounds().upper().is_some_and(|upper| {
-                                    if upper <= 1 {
-                                        return true;
-                                    }
-                                    let last = ((upper - 2) as i128)
-                                        .checked_mul(transpose_operation.interior_padding()[axis] as i128 + 1);
-                                    last.and_then(|position| {
-                                        position.checked_add(transpose_operation.edge_padding_low()[axis] as i128)
+                            let all_cropped = transpose_operand_type.shape().dimensions().iter().enumerate().any(
+                                |(axis, dimension)| {
+                                    dimension.bounds().upper().is_some_and(|upper| {
+                                        if upper <= 1 {
+                                            return true;
+                                        }
+                                        let last = ((upper - 2) as i128)
+                                            .checked_mul(transpose_operation.interior_padding()[axis] as i128 + 1);
+                                        last.and_then(|position| {
+                                            position.checked_add(transpose_operation.edge_padding_low()[axis] as i128)
+                                        })
+                                        .is_some_and(|position| position < 0)
+                                            || last
+                                                .and_then(|position| {
+                                                    position.checked_add(
+                                                        1 + transpose_operation.edge_padding_high()[axis] as i128,
+                                                    )
+                                                })
+                                                .is_some_and(|extent_after_high_crop| extent_after_high_crop <= 0)
                                     })
-                                    .is_some_and(|position| position < 0)
-                                        || last
-                                            .and_then(|position| {
-                                                position.checked_add(
-                                                    1 + transpose_operation.edge_padding_high()[axis] as i128,
-                                                )
-                                            })
-                                            .is_some_and(|extent_after_high_crop| extent_after_high_crop <= 0)
-                                })
-                            });
-                        let input_cotangent = if all_cropped {
-                            let dimensions = transpose_operand_type
+                                },
+                            );
+                            let input_cotangent = if all_cropped {
+                                let dimensions = transpose_operand_type
+                                    .shape()
+                                    .dimensions()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
+                                    .map(|(axis, _)| input_extents[axis].clone())
+                                    .collect::<Vec<_>>();
+                                let mut zeros = transpose_context.bind(
+                                    ZeroOperation::new(transpose_operand_type.clone()),
+                                    Vec::new(),
+                                    &dimensions,
+                                )?;
+                                check_count!("output", zeros, 1, ProgramError);
+                                zeros.remove(0)
+                            } else {
+                                // Inverse edge padding first recovers the dilated input. Its exact result extents are
+                                // `n + max(n - 1, 0) * interior`, derived from the retained input geometry.
+                                let mut dilated_extents = Vec::with_capacity(transpose_operand_type.rank());
+                                for (axis, input_extent) in input_extents.iter().enumerate() {
+                                    let interior = transpose_operation.interior_padding()[axis];
+                                    if interior == 0
+                                        || transpose_operand_type
+                                            .dimension(axis)
+                                            .bounds()
+                                            .upper()
+                                            .is_some_and(|upper| upper <= 2)
+                                    {
+                                        dilated_extents.push(input_extent.clone());
+                                        continue;
+                                    }
+                                    let mut one = transpose_context.bind(
+                                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
+                                        Vec::new(),
+                                        &[],
+                                    )?;
+                                    check_count!("output", one, 1, ProgramError);
+                                    let one = one.remove(0);
+                                    let input_type =
+                                        <&DimensionType>::try_from(input_extent.r#type().as_ref())?.clone();
+                                    let one_type = <&DimensionType>::try_from(one.r#type().as_ref())?.clone();
+                                    let mut less_one = transpose_context.bind(
+                                        DimensionOperation::SaturatingSub(DimensionSaturatingSubOperation::new(
+                                            &input_type,
+                                            &one_type,
+                                        )?),
+                                        Vec::new(),
+                                        &[input_extent.clone(), one],
+                                    )?;
+                                    check_count!("output", less_one, 1, ProgramError);
+                                    let less_one = less_one.remove(0);
+                                    let mut interior = transpose_context.bind(
+                                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(
+                                            interior,
+                                        )?)),
+                                        Vec::new(),
+                                        &[],
+                                    )?;
+                                    check_count!("output", interior, 1, ProgramError);
+                                    let interior = interior.remove(0);
+                                    let less_one_type = <&DimensionType>::try_from(less_one.r#type().as_ref())?.clone();
+                                    let interior_type = <&DimensionType>::try_from(interior.r#type().as_ref())?.clone();
+                                    let mut gaps = transpose_context.bind(
+                                        DimensionOperation::Mul(DimensionMulOperation::new(
+                                            &less_one_type,
+                                            &interior_type,
+                                        )?),
+                                        Vec::new(),
+                                        &[less_one, interior],
+                                    )?;
+                                    check_count!("output", gaps, 1, ProgramError);
+                                    let gaps = gaps.remove(0);
+                                    let gaps_type = <&DimensionType>::try_from(gaps.r#type().as_ref())?.clone();
+                                    let mut dilated_extent = transpose_context.bind(
+                                        DimensionOperation::Add(DimensionAddOperation::new(&input_type, &gaps_type)?),
+                                        Vec::new(),
+                                        &[input_extent.clone(), gaps],
+                                    )?;
+                                    check_count!("output", dilated_extent, 1, ProgramError);
+                                    dilated_extents.push(dilated_extent.remove(0));
+                                }
+
+                                let inverse_low = transpose_operation
+                                    .edge_padding_low()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(axis, padding)| {
+                                        padding.checked_neg().ok_or_else(|| {
+                                            TypeError::invalid(format!(
+                                                "`{PAD_OPERATION_NAME}` transpose cannot negate `edge_padding_low` at \
+                                                 axis {axis} with value {padding}",
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let inverse_high = transpose_operation
+                                    .edge_padding_high()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(axis, padding)| {
+                                        padding.checked_neg().ok_or_else(|| {
+                                            TypeError::invalid(format!(
+                                                "`{PAD_OPERATION_NAME}` transpose cannot negate `edge_padding_high` at \
+                                                 axis {axis} with value {padding}",
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let mut zero = transpose_context.bind(
+                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                        ZeroOperation::new(transpose_padding_type.clone()),
+                                    ),
+                                    Vec::new(),
+                                    &[],
+                                )?;
+                                check_count!("output", zero, 1, ProgramError);
+                                let zero = zero.remove(0);
+                                let mut inverse_inputs = vec![output_cotangent.clone(), zero];
+                                inverse_inputs.extend(dilated_extents);
+                                let inverse_operation =
+                                    PadOperation::<ArrayIrType>::from(PadOperation::<ArrayType>::new(
+                                        inverse_low,
+                                        inverse_high,
+                                        vec![0; transpose_operand_type.rank()],
+                                    )?);
+                                let mut unpadded =
+                                    transpose_context.bind(inverse_operation, Vec::new(), inverse_inputs.as_slice())?;
+                                check_count!("output", unpadded, 1, ProgramError);
+                                let unpadded = unpadded.remove(0);
+                                let mut start_zero = transpose_context.bind(
+                                    DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
+                                    Vec::new(),
+                                    &[],
+                                )?;
+                                check_count!("output", start_zero, 1, ProgramError);
+                                let start_zero = start_zero.remove(0);
+                                let starts = vec![start_zero; transpose_operand_type.rank()];
+                                let mut slice_inputs = Vec::with_capacity(1 + 2 * transpose_operand_type.rank());
+                                slice_inputs.push(unpadded);
+                                slice_inputs.extend(starts);
+                                slice_inputs.extend(input_extents.iter().cloned());
+                                let strides = transpose_operation
+                                    .interior_padding()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(axis, padding)| {
+                                        if transpose_operand_type
+                                            .dimension(axis)
+                                            .bounds()
+                                            .upper()
+                                            .is_some_and(|upper| upper <= 2)
+                                        {
+                                            return Ok(1);
+                                        }
+                                        padding.checked_add(1).ok_or_else(|| {
+                                            TypeError::invalid(format!(
+                                                "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis \
+                                                 {axis}",
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let mut input_cotangent = transpose_context.bind(
+                                    DynamicShapeSliceOperation::new(transpose_operand_type.rank())
+                                        .with_strides(strides)?,
+                                    Vec::new(),
+                                    slice_inputs.as_slice(),
+                                )?;
+                                check_count!("output", input_cotangent, 1, ProgramError);
+                                input_cotangent.remove(0)
+                            };
+
+                            // Select padding positions before summing so non-finite cotangents at input positions
+                            // cannot contaminate the padding-value contribution.
+                            let mask_input_type =
+                                transpose_operand_type.clone().with_data_type(DataType::Boolean).with_layout(None);
+                            let mask_input_extents = mask_input_type
                                 .shape()
                                 .dimensions()
                                 .iter()
@@ -875,466 +1210,138 @@ where
                                 .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
                                 .map(|(axis, _)| input_extents[axis].clone())
                                 .collect::<Vec<_>>();
-                            let mut zeros = transpose_context.bind(
-                                ZeroOperation::new(transpose_operand_type.clone()),
+                            let mut mask_input = transpose_context.bind(
+                                ZeroOperation::new(mask_input_type),
                                 Vec::new(),
-                                &dimensions,
+                                mask_input_extents.as_slice(),
                             )?;
-                            check_count!("output", zeros, 1, ProgramError);
-                            zeros.remove(0)
-                        } else {
-                            // Inverse edge padding first recovers the dilated input. Its exact result extents are `n +
-                            // max(n - 1, 0) * interior`, derived from the retained input geometry.
-                            let mut dilated_extents = Vec::with_capacity(transpose_operand_type.rank());
-                            for (axis, input_extent) in input_extents.iter().enumerate() {
-                                let interior = transpose_operation.interior_padding()[axis];
-                                if interior == 0
-                                    || transpose_operand_type
-                                        .dimension(axis)
-                                        .bounds()
-                                        .upper()
-                                        .is_some_and(|upper| upper <= 2)
-                                {
-                                    dilated_extents.push(input_extent.clone());
-                                    continue;
-                                }
-                                let mut one = transpose_context.bind(
-                                    DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
-                                    Vec::new(),
-                                    &[],
-                                )?;
-                                check_count!("output", one, 1, ProgramError);
-                                let one = one.remove(0);
-                                let input_type = <&DimensionType>::try_from(input_extent.r#type().as_ref())?.clone();
-                                let one_type = <&DimensionType>::try_from(one.r#type().as_ref())?.clone();
-                                let mut less_one = transpose_context.bind(
-                                    DimensionOperation::SaturatingSub(DimensionSaturatingSubOperation::new(
-                                        &input_type,
-                                        &one_type,
-                                    )?),
-                                    Vec::new(),
-                                    &[input_extent.clone(), one],
-                                )?;
-                                check_count!("output", less_one, 1, ProgramError);
-                                let less_one = less_one.remove(0);
-                                let mut interior = transpose_context.bind(
-                                    DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(
-                                        interior,
-                                    )?)),
-                                    Vec::new(),
-                                    &[],
-                                )?;
-                                check_count!("output", interior, 1, ProgramError);
-                                let interior = interior.remove(0);
-                                let less_one_type = <&DimensionType>::try_from(less_one.r#type().as_ref())?.clone();
-                                let interior_type = <&DimensionType>::try_from(interior.r#type().as_ref())?.clone();
-                                let mut gaps = transpose_context.bind(
-                                    DimensionOperation::Mul(DimensionMulOperation::new(
-                                        &less_one_type,
-                                        &interior_type,
-                                    )?),
-                                    Vec::new(),
-                                    &[less_one, interior],
-                                )?;
-                                check_count!("output", gaps, 1, ProgramError);
-                                let gaps = gaps.remove(0);
-                                let gaps_type = <&DimensionType>::try_from(gaps.r#type().as_ref())?.clone();
-                                let mut dilated_extent = transpose_context.bind(
-                                    DimensionOperation::Add(DimensionAddOperation::new(&input_type, &gaps_type)?),
-                                    Vec::new(),
-                                    &[input_extent.clone(), gaps],
-                                )?;
-                                check_count!("output", dilated_extent, 1, ProgramError);
-                                dilated_extents.push(dilated_extent.remove(0));
-                            }
-
-                            let inverse_low = transpose_operation
-                                .edge_padding_low()
-                                .iter()
-                                .enumerate()
-                                .map(|(axis, padding)| {
-                                    padding.checked_neg().ok_or_else(|| {
-                                        TypeError::invalid(format!(
-                                            "`{PAD_OPERATION_NAME}` transpose cannot negate `edge_padding_low` at axis \
-                                         {axis} with value {padding}",
-                                        ))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let inverse_high = transpose_operation
-                                .edge_padding_high()
-                                .iter()
-                                .enumerate()
-                                .map(|(axis, padding)| {
-                                    padding.checked_neg().ok_or_else(|| {
-                                    TypeError::invalid(format!(
-                                        "`{PAD_OPERATION_NAME}` transpose cannot negate `edge_padding_high` at axis \
-                                         {axis} with value {padding}",
-                                    ))
-                                })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let mut zero = transpose_context.bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                    transpose_padding_type.clone(),
+                            check_count!("output", mask_input, 1, ProgramError);
+                            let mask_input = mask_input.remove(0);
+                            let mut mask_padding = transpose_context.bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(OneOperation::new(
+                                    transpose_padding_type.clone().with_data_type(DataType::Boolean).with_layout(None),
                                 )),
                                 Vec::new(),
                                 &[],
                             )?;
-                            check_count!("output", zero, 1, ProgramError);
-                            let zero = zero.remove(0);
-                            let mut inverse_inputs = vec![output_cotangent.clone(), zero];
-                            inverse_inputs.extend(dilated_extents);
-                            let inverse_operation = PadOperation::<ArrayIrType>::from(PadOperation::<ArrayType>::new(
-                                inverse_low,
-                                inverse_high,
-                                vec![0; transpose_operand_type.rank()],
-                            )?);
-                            let mut unpadded =
-                                transpose_context.bind(inverse_operation, Vec::new(), inverse_inputs.as_slice())?;
-                            check_count!("output", unpadded, 1, ProgramError);
-                            let unpadded = unpadded.remove(0);
-                            let mut start_zero = transpose_context.bind(
-                                DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(0)?)),
-                                Vec::new(),
-                                &[],
-                            )?;
-                            check_count!("output", start_zero, 1, ProgramError);
-                            let start_zero = start_zero.remove(0);
-                            let starts = vec![start_zero; transpose_operand_type.rank()];
-                            let mut slice_inputs = Vec::with_capacity(1 + 2 * transpose_operand_type.rank());
-                            slice_inputs.push(unpadded);
-                            slice_inputs.extend(starts);
-                            slice_inputs.extend(input_extents.iter().cloned());
-                            let strides = transpose_operation
-                                .interior_padding()
+                            check_count!("output", mask_padding, 1, ProgramError);
+                            let mask_padding = mask_padding.remove(0);
+                            let mut mask_inputs = vec![mask_input, mask_padding];
+                            mask_inputs.extend(output_extents.iter().map(|index| residuals[*index].clone()));
+                            let mut mask =
+                                transpose_context.bind(transpose_operation, Vec::new(), mask_inputs.as_slice())?;
+                            check_count!("output", mask, 1, ProgramError);
+                            let mask = mask.remove(0);
+                            let output_zero_extents = transpose_output_type
+                                .shape()
+                                .dimensions()
                                 .iter()
                                 .enumerate()
-                                .map(|(axis, padding)| {
-                                    if transpose_operand_type
-                                        .dimension(axis)
-                                        .bounds()
-                                        .upper()
-                                        .is_some_and(|upper| upper <= 2)
-                                    {
-                                        return Ok(1);
-                                    }
-                                    padding.checked_add(1).ok_or_else(|| {
-                                        TypeError::invalid(format!(
-                                            "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis {axis}",
-                                        ))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let mut input_cotangent = transpose_context.bind(
-                                DynamicShapeSliceOperation::new(transpose_operand_type.rank()).with_strides(strides)?,
+                                .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
+                                .map(|(axis, _)| residuals[output_extents[axis]].clone())
+                                .collect::<Vec<_>>();
+                            let mut output_zero = transpose_context.bind(
+                                ZeroOperation::new(transpose_output_type.clone()),
                                 Vec::new(),
-                                slice_inputs.as_slice(),
+                                output_zero_extents.as_slice(),
                             )?;
-                            check_count!("output", input_cotangent, 1, ProgramError);
-                            input_cotangent.remove(0)
-                        };
-
-                        // Select padding positions before summing so non-finite cotangents at input positions cannot
-                        // contaminate the padding-value contribution.
-                        let mask_input_type =
-                            transpose_operand_type.clone().with_data_type(DataType::Boolean).with_layout(None);
-                        let mask_input_extents = mask_input_type
-                            .shape()
-                            .dimensions()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
-                            .map(|(axis, _)| input_extents[axis].clone())
-                            .collect::<Vec<_>>();
-                        let mut mask_input = transpose_context.bind(
-                            ZeroOperation::new(mask_input_type),
-                            Vec::new(),
-                            mask_input_extents.as_slice(),
-                        )?;
-                        check_count!("output", mask_input, 1, ProgramError);
-                        let mask_input = mask_input.remove(0);
-                        let mut mask_padding = transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(OneOperation::new(
-                                transpose_padding_type.clone().with_data_type(DataType::Boolean).with_layout(None),
-                            )),
-                            Vec::new(),
-                            &[],
-                        )?;
-                        check_count!("output", mask_padding, 1, ProgramError);
-                        let mask_padding = mask_padding.remove(0);
-                        let mut mask_inputs = vec![mask_input, mask_padding];
-                        mask_inputs.extend(output_extents.iter().map(|index| residuals[*index].clone()));
-                        let mut mask =
-                            transpose_context.bind(transpose_operation, Vec::new(), mask_inputs.as_slice())?;
-                        check_count!("output", mask, 1, ProgramError);
-                        let mask = mask.remove(0);
-                        let output_zero_extents = transpose_output_type
-                            .shape()
-                            .dimensions()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
-                            .map(|(axis, _)| residuals[output_extents[axis]].clone())
-                            .collect::<Vec<_>>();
-                        let mut output_zero = transpose_context.bind(
-                            ZeroOperation::new(transpose_output_type.clone()),
-                            Vec::new(),
-                            output_zero_extents.as_slice(),
-                        )?;
-                        check_count!("output", output_zero, 1, ProgramError);
-                        let output_zero = output_zero.remove(0);
-                        let mut selected = transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(SelectOperation::new()),
-                            Vec::new(),
-                            &[mask, output_cotangent, output_zero],
-                        )?;
-                        check_count!("output", selected, 1, ProgramError);
-                        let selected = selected.remove(0);
-                        let mut padding_cotangent = transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ReduceOperation::new(
-                                (0..transpose_output_type.rank()).collect(),
-                                ReductionKind::Sum,
-                            )),
-                            Vec::new(),
-                            &[selected],
-                        )?;
-                        check_count!("output", padding_cotangent, 1, ProgramError);
-                        let padding_cotangent = padding_cotangent.remove(0);
-                        Ok(vec![
-                            ValueProjection::<ArrayType>::into_projected(input_cotangent)?
-                                .unalign_cotangent(&transpose_operand_type)?
-                                .into_value(),
-                            ValueProjection::<ArrayType>::into_projected(padding_cotangent)?
-                                .unalign_cotangent(&transpose_padding_type)?
-                                .into_value(),
-                        ])
-                    },
-                )?;
-                check_count!("output", tangent, 1, ProgramError);
-                MaybeZero::Value(tangent.remove(0))
-            }
-        };
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
-    }
-}
-
-// Transpose (vector-Jacobian product) for a [`PadOperation`].
-//
-// The forward map `(t, p) ↦ pad(t, p, low, high, interior)` writes input element `i` to output position `low + i *
-// (interior + 1)` along each axis and the padding value everywhere else, so its pullback splits the output cotangent
-// into two contributions:
-//
-//   - **Input cotangent**: slice the surviving input positions with stride `interior + 1`, then insert zeros
-//     at the cropped input positions.
-//   - **Padding-value cotangent**: pad an all-false input-shaped mask with `true`, select the output cotangent only
-//     at those padding positions, and sum the selected tensor. Selection rather than subtraction keeps non-finite
-//     cotangents at input positions from contaminating this contribution.
-//
-// Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation<ArrayType>
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<PadOperation<ArrayType>>
-        + From<SelectOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<ReduceOperation>
-        + From<ZeroOperation<ArrayType>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        let contributions = {
-            // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-            let context: &mut TracingContext<V, O> = context;
-            check_count!("input", inputs, 2, ProgramError);
-            check_count!("output", outputs, 1, ProgramError);
-            check_count!("accumulator", accumulators, 2, DifferentiationError);
-            self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-            match &outputs[0] {
-                MaybeZero::Zero(_) => vec![
-                    MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                ],
-                MaybeZero::Value(cotangent) => {
-                    let input_cotangent = if inputs[0].is_unknown() {
-                        let target_type = inputs[0].r#type().cotangent()?;
-                        let mut starts = Vec::with_capacity(target_type.rank());
-                        let mut limits = Vec::with_capacity(target_type.rank());
-                        let mut strides = Vec::with_capacity(target_type.rank());
-                        let mut low = Vec::with_capacity(target_type.rank());
-                        let mut high = Vec::with_capacity(target_type.rank());
-                        let mut empty = false;
-                        for axis in 0..target_type.rank() {
-                            let input_extent = target_type.dimension(axis).value().ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose requires a static input extent on axis {axis}"
-                                ))
-                            })? as i128;
-                            let output_extent = cotangent.r#type().dimension(axis).value().ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose requires a static output extent on axis {axis}"
-                                ))
-                            })? as i128;
-                            let edge = self.edge_padding_low[axis] as i128;
-                            let stride = self.interior_padding[axis] as i128 + 1;
-                            // Keep only input indices whose padded coordinates survive cropping. Working in i128 avoids
-                            // negating i64::MIN and constructing an enormous intermediate dilated array.
-                            let first = (-edge).div_euclid(stride) + i128::from((-edge).rem_euclid(stride) != 0);
-                            let end = (output_extent - edge).div_euclid(stride)
-                                + i128::from((output_extent - edge).rem_euclid(stride) != 0);
-                            let first = first.clamp(0, input_extent);
-                            let end = end.clamp(first, input_extent);
-                            if first == end {
-                                empty = true;
-                                break;
-                            }
-                            starts.push((edge + first * stride) as usize);
-                            limits.push((edge + (end - 1) * stride + 1) as usize);
-                            // With one surviving element, the stride is irrelevant and need not fit usize.
-                            strides.push(if end - first == 1 { 1 } else { usize::try_from(stride).unwrap() });
-                            low.push(i64::try_from(first).map_err(|_| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose low padding exceeds `i64` on axis {axis}"
-                                ))
-                            })?);
-                            high.push(i64::try_from(input_extent - end).map_err(|_| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose high padding exceeds `i64` on axis {axis}"
-                                ))
-                            })?);
-                        }
-                        if empty {
-                            MaybeZero::Zero(target_type)
-                        } else {
-                            let slice = SliceOperation::new(starts, limits).with_strides(strides)?;
-                            let mut sliced =
-                                context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
-                            check_count!("output", sliced, 1, ProgramError);
-                            let zero = MaybeZero::Zero(dependency_scalar_type(cotangent.r#type().as_ref())?)
-                                .materialize(context)?;
-                            let mut padded = context.stage_operation(
-                                PadOperation::new(low, high, vec![0; target_type.rank()])?,
+                            check_count!("output", output_zero, 1, ProgramError);
+                            let output_zero = output_zero.remove(0);
+                            let mut selected = transpose_context.bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                    SelectOperation::new(),
+                                ),
                                 Vec::new(),
-                                &[sliced.remove(0), zero],
+                                &[mask, output_cotangent, output_zero],
                             )?;
-                            check_count!("output", padded, 1, ProgramError);
-                            MaybeZero::Value(padded.remove(0).unalign_cotangent(&target_type)?)
-                        }
-                    } else {
-                        MaybeZero::Zero(inputs[0].r#type().cotangent()?)
-                    };
-                    let padding_value_cotangent = if inputs[1].is_unknown() {
-                        let mask_input_type =
-                            inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
-                        let mask_padding_type =
-                            inputs[1].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
-                        let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
-                        let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
-                        let mut mask_padding =
-                            context.stage_operation(OneOperation::new(mask_padding_type), Vec::new(), &no_inputs)?;
-                        check_count!("output", mask_padding, 1, ProgramError);
-                        let mut mask =
-                            context.stage_operation(self.clone(), Vec::new(), &[mask_input, mask_padding.remove(0)])?;
-                        check_count!("output", mask, 1, ProgramError);
-                        let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
-                        let mut selected = context.stage_operation(
-                            SelectOperation::<ArrayType>::new(),
-                            Vec::new(),
-                            &[mask.remove(0), cotangent.clone(), zero],
-                        )?;
-                        check_count!("output", selected, 1, ProgramError);
-                        let all_axes = (0..cotangent.r#type().rank()).collect::<Vec<_>>();
-                        let mut reduced = context.stage_operation(
-                            ReduceOperation::new(all_axes, ReductionKind::Sum),
-                            Vec::new(),
-                            &[selected.remove(0)],
-                        )?;
-                        check_count!("output", reduced, 1, ProgramError);
-                        MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent()?)?)
-                    } else {
-                        MaybeZero::Zero(inputs[1].r#type().cotangent()?)
-                    };
-                    vec![input_cotangent, padding_value_cotangent]
+                            check_count!("output", selected, 1, ProgramError);
+                            let selected = selected.remove(0);
+                            let mut padding_cotangent = transpose_context.bind(
+                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                                    ReduceOperation::new(
+                                        (0..transpose_output_type.rank()).collect(),
+                                        ReductionKind::Sum,
+                                    ),
+                                ),
+                                Vec::new(),
+                                &[selected],
+                            )?;
+                            check_count!("output", padding_cotangent, 1, ProgramError);
+                            let padding_cotangent = padding_cotangent.remove(0);
+                            Ok(vec![
+                                ValueProjection::<ArrayType>::into_projected(input_cotangent)?
+                                    .unalign_cotangent(&transpose_operand_type)?
+                                    .into_value(),
+                                ValueProjection::<ArrayType>::into_projected(padding_cotangent)?
+                                    .unalign_cotangent(&transpose_padding_type)?
+                                    .into_value(),
+                            ])
+                        },
+                    )?;
+                    check_count!("output", tangent, 1, ProgramError);
+                    MaybeZero::Value(tangent.remove(0))
                 }
-            }
-        };
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
+            };
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
-        Ok(())
-    }
-}
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+        <O as OperationProjection<ArrayType>>::Projected: From<PadOperation<ArrayType>>
+            + TransposableOperation<
+                <V as ValueProjection<ArrayType>>::Projected,
+                <O as OperationProjection<ArrayType>>::Projected,
+            >,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Direct transposition rule for mixed pad. Static input and output geometry delegate to the homogeneous
+            // array pullback, while every explicit output extent receives a structural-zero cotangent. Dynamic geometry
+            // requires linearization so [`DifferentiableOperation::jvp`] can retain the exact primal extents as
+            // residuals.
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
-// Direct transposition rule for mixed pad. Static input and output geometry delegate to the homogeneous array pullback,
-// while every explicit output extent receives a structural-zero cotangent. Dynamic geometry requires linearization so
-// [`DifferentiableOperation::jvp`] can retain the exact primal extents as residuals.
-impl<V, O> TransposableOperation<V, O> for PadOperation<ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <O as OperationProjection<ArrayType>>::Projected: From<PadOperation<ArrayType>>
-        + TransposableOperation<
-            <V as ValueProjection<ArrayType>>::Projected,
-            <O as OperationProjection<ArrayType>>::Projected,
-        >,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-
-        if inputs.len() < 2 {
-            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-        }
-        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        if outputs[0].is_zero() {
-            for (input, accumulator) in inputs.iter().zip(accumulators) {
-                accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
             }
-            return Ok(());
-        }
-        let (array_inputs, output_extents) = inputs.split_at(2);
-        if array_inputs.iter().any(|input| {
-            <&ArrayType>::try_from(input.r#type().as_ref()).is_ok_and(|r#type| {
-                r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-            })
-        }) || output_extents.iter().any(|extent| {
-            <&DimensionType>::try_from(extent.r#type().as_ref())
-                .is_ok_and(|r#type| matches!(r#type.to_dimension(), Dimension::Dynamic(_)))
-        }) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "direct `{PAD_OPERATION_NAME}` transposition with dynamic extents requires linearization so that \
-                     the primal geometry can be retained as residuals",
-                ),
+            operation
+                .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+            if outputs[0].is_zero() {
+                for (input, accumulator) in inputs.iter().zip(accumulators) {
+                    accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
+                }
+                return Ok(());
             }
-            .into());
-        }
+            let (array_inputs, output_extents) = inputs.split_at(2);
+            if array_inputs.iter().any(|input| {
+                <&ArrayType>::try_from(input.r#type().as_ref()).is_ok_and(|r#type| {
+                    r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                })
+            }) || output_extents.iter().any(|extent| {
+                <&DimensionType>::try_from(extent.r#type().as_ref())
+                    .is_ok_and(|r#type| matches!(r#type.to_dimension(), Dimension::Dynamic(_)))
+            }) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "direct `{PAD_OPERATION_NAME}` transposition with dynamic extents requires linearization so \
+                         that the primal geometry can be retained as residuals",
+                    ),
+                }
+                .into());
+            }
 
-        let operation =
-            <O as OperationProjection<ArrayType>>::Projected::from(PadOperation::<ArrayType>::from(self.clone()));
-        transpose_projected_operation(context, &operation, array_inputs, outputs, &accumulators[..2])?;
-        for (extent, accumulator) in output_extents.iter().zip(&accumulators[2..]) {
-            accumulator.accumulate(context, MaybeZero::Zero(extent.r#type().cotangent()?))?;
+            let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
+                PadOperation::<ArrayType>::from(operation.clone()),
+            );
+            transpose_projected_operation(context, &projected_operation, array_inputs, outputs, &accumulators[..2])?;
+            for (extent, accumulator) in output_extents.iter().zip(&accumulators[2..]) {
+                accumulator.accumulate(context, MaybeZero::Zero(extent.r#type().cotangent()?))?;
+            }
+            Ok(())
         }
-        Ok(())
-    }
+    },
 }
 
 /// Represents the ability to add edge and interior padding filled with a scalar value. Negative edge padding crops the
@@ -1964,12 +1971,14 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
+    use crate::differentiation::TranspositionContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::constants::iota::IotaOperation;
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;

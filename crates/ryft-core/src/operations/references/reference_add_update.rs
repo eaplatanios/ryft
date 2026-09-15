@@ -12,25 +12,20 @@ use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
-};
+use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
     RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
-use crate::tracing::{Tracer, TracingContext};
 
 use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
@@ -193,67 +188,56 @@ where
     }
 }
 
-impl<T, U, C> DifferentiableOperation<C> for ReferenceAddUpdateOperation<T, U>
-where
-    T: Type,
-    U: DifferentiableType,
-    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
-{
-    // Addition is linear, so the update's tangent is accumulated into the tangent reference exactly as the primal
-    // update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op and stages
-    // nothing. The tangent pairing is resolved before either accumulation so that a rejected plumbing store leaves both
-    // references untouched.
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let stored = stored_tangents(REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
-        context
-            .primal()
-            .bind(*self, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
-        if let Some((tangent_reference, MaybeZero::Value(tangent))) = stored {
-            context.tangent().bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?;
+impl_differentiable_operation! {
+    <T, U> ReferenceAddUpdateOperation<T, U>,
+    jvp<C>
+    where
+        T: Type,
+        U: DifferentiableType,
+        C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
+    {
+        |operation, context, _driver, inputs| {
+            // Addition is linear, so the update's tangent is accumulated into the tangent reference exactly as the
+            // primal update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op
+            // and stages nothing. The tangent pairing is resolved before either accumulation so that a rejected
+            // plumbing store leaves both references untouched.
+            check_count!("input", inputs, 2, ProgramError);
+            let stored = stored_tangents(REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
+            context
+                .primal()
+                .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
+            if let Some((tangent_reference, MaybeZero::Value(tangent))) = stored {
+                context.tangent().bind(*operation, Vec::new(), &[tangent_reference.clone(), tangent])?;
+            }
+            Ok(Vec::new())
         }
-        Ok(Vec::new())
-    }
-}
-
-impl<T, U, V, O> TransposableOperation<V, O> for ReferenceAddUpdateOperation<T, U>
-where
-    T: Type,
-    U: DifferentiableType,
-    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
-    V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U> + From<AddOperation<U>> + From<ReferenceReadOperation<T, U>>,
-    ReferenceReadOperation<T, U>: Operation<Type = U>,
-{
-    // An accumulation maps `(state, x) ↦ state + x`, so its transpose reads the cotangent reference as the cotangent of
-    // the update and leaves the reference's contents unchanged for the earlier accesses. An accumulator that nothing
-    // has reached yet holds zero, so nothing is staged and the update's cotangent stays symbolic.
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 0, ProgramError);
-        check_count!("accumulator", accumulators, 2, DifferentiationError);
-        let Some(accumulator) = context.cotangent_reference_if_allocated(driver, 0)? else {
-            return Ok(());
-        };
-        if accumulators[1].is_needed() {
-            let contribution = context.bind(ReferenceReadOperation::new(), Vec::new(), &[accumulator])?.remove(0);
-            accumulators[1].accumulate(context, MaybeZero::Value(contribution))?;
+    },
+    transpose<V, O>
+    where
+        T: Type,
+        U: DifferentiableType,
+        V: Value<Type = U>,
+        O: ReferenceViewOperation<Type = U> + From<ReferenceReadOperation<T, U>>,
+        ReferenceReadOperation<T, U>: Operation<Type = U>,
+    {
+        |_operation, context, driver, inputs, outputs, accumulators| {
+            // An accumulation maps `(state, x) ↦ state + x`, so its transpose reads the cotangent reference as the
+            // cotangent of the update and leaves the reference's contents unchanged for the earlier accesses. An
+            // accumulator that nothing has reached yet holds zero, so nothing is staged and the update's cotangent
+            // stays symbolic.
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 0, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            let Some(accumulator) = context.cotangent_reference_if_allocated(driver, 0)? else {
+                return Ok(());
+            };
+            if accumulators[1].is_needed() {
+                let contribution = context.bind(ReferenceReadOperation::new(), Vec::new(), &[accumulator])?.remove(0);
+                accumulators[1].accumulate(context, MaybeZero::Value(contribution))?;
+            }
+            Ok(())
         }
-        Ok(())
-    }
+    },
 }
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
@@ -364,15 +348,19 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationTracer,
+        TransposableOperation, TranspositionContext,
+    };
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::references::reference_freeze::{ReferenceFreeze, ReferenceFreezeOperation};
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;
     use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue, ReferencePlacement};
     use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder};
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 

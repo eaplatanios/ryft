@@ -25,7 +25,7 @@ use crate::differentiation::{
     TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_reference_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -230,156 +230,154 @@ where
     }
 }
 
-// Forward-mode rule for [`SliceOperation`]: slicing is a linear map, so the primal output is the slice of the input
-// primal and the tangent is the same slice of the input tangent. A zero input tangent yields a typed zero output
-// tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for SliceOperation
-where
-    C::Operation: From<SliceOperation>,
-    C::Value: Slice,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        _context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let apply = |value: &C::Value| value.slice(self.start_indices(), self.limit_indices(), self.strides());
-        let primal = apply(inputs[0].primal())?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => MaybeZero::Value(apply(tangent)?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// **Contract:** this homogeneous rule requires a statically shaped input on both strategies. Each writes into a zero
-// of the input's cotangent type (or reconstructs its extents), and the homogeneous [`ArrayType`] operation family owns
-// no first-class dimension operations, so it has no constructor that can supply a runtime extent. A dynamically shaped
-// input is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a dynamically
-// shaped slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same zero from the
-// retained exact extents.
-//
-// Transpose (vector-Jacobian product) for a [`SliceOperation`].
-//
-// The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back into the
-// positions the forward map read, with the strategy split on the strides:
-//
-//   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of the input
-//     type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent, start_indices)`.
-//   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a zero
-//     scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
-//     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input extent
-//     (everything after the last element the forward slice covered). For example, slicing `[0..6)` with `start = 1`
-//     and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the cotangent of length `3` with
-//     `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back to positions `1`, `3`, and `5` of a
-//     zero-filled length-`6` array.
-//
-// Symbolic-zero cotangents propagate unchanged.
-//
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<UpdateSliceOperation>
-        + From<PadOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, 1, DifferentiationError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(()),
-            MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
-                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
-                // contract explicitly, matching the strided strategy's own check below.
-                let input_cotangent_type = inputs[0].r#type().cotangent()?;
-                if input_cotangent_type.static_shape().is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but got \
-                         `{input_cotangent_type}`",
-                    ))
-                    .into());
-                }
-                if !accumulators[0].is_needed() {
-                    return Ok(());
-                }
-                let zeros = MaybeZero::Zero(input_cotangent_type).materialize(&**context)?;
-                let outputs = context.stage_operation(
-                    UpdateSliceOperation::new(self.start_indices().to_vec()),
-                    Vec::new(),
-                    &[zeros, cotangent.clone()],
-                )?;
-                check_count!("output", outputs, 1, ProgramError);
-                let cotangent =
-                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
-                accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
-            }
-            MaybeZero::Value(cotangent) => {
-                let input_type = inputs[0].r#type();
-                let mut edge_padding_low = Vec::with_capacity(input_type.rank());
-                let mut edge_padding_high = Vec::with_capacity(input_type.rank());
-                let mut interior_padding = Vec::with_capacity(input_type.rank());
-                for (axis, ((&start, &limit), &stride)) in
-                    self.start_indices().iter().zip(self.limit_indices()).zip(self.strides()).enumerate()
-                {
-                    let dimension = input_type.dimension(axis);
-                    let Some(input_size) = dimension.value() else {
+impl_differentiable_operation! {
+    SliceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<SliceOperation>,
+        C::Value: Slice,
+    {
+        |operation, _context, _driver, inputs| {
+            // Forward-mode rule for [`SliceOperation`]: slicing is a linear map, so the primal output is the slice of
+            // the input primal and the tangent is the same slice of the input tangent. A zero input tangent yields a
+            // typed zero output tangent.
+            check_count!("input", inputs, 1, ProgramError);
+            let apply = |value: &C::Value| {
+                value.slice(operation.start_indices(), operation.limit_indices(), operation.strides())
+            };
+            let primal = apply(inputs[0].primal())?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => MaybeZero::Value(apply(tangent)?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<UpdateSliceOperation>
+            + From<PadOperation<ArrayType>>
+            + From<ZeroOperation<ArrayType>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // **Contract:** this homogeneous rule requires a statically shaped input on both strategies. Each writes
+            // into a zero of the input's cotangent type (or reconstructs its extents), and the homogeneous
+            // [`ArrayType`] operation family owns no first-class dimension operations, so it has no constructor that
+            // can supply a runtime extent. A dynamically shaped input is therefore rejected here with an exact
+            // diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
+            // [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a dynamically shaped
+            // slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same zero from
+            // the retained exact extents.
+            //
+            // Transpose (vector-Jacobian product) for a [`SliceOperation`].
+            //
+            // The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back
+            // into the positions the forward map read, with the strategy split on the strides:
+            //
+            //   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of
+            //     the input type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent,
+            //     start_indices)`.
+            //   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a
+            //     zero scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
+            //     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input
+            //     extent (everything after the last element the forward slice covered). For example, slicing `[0..6)`
+            //     with `start = 1` and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the
+            //     cotangent of length `3` with `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back
+            //     to positions `1`, `3`, and `5` of a zero-filled length-`6` array.
+            //
+            // Symbolic-zero cotangents propagate unchanged.
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(cotangent) if operation.strides().iter().all(|stride| *stride == 1) => {
+                    // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                    // contract explicitly, matching the strided strategy's own check below.
+                    let input_cotangent_type = inputs[0].r#type().cotangent()?;
+                    if input_cotangent_type.static_shape().is_none() {
                         return Err(TypeError::invalid(format!(
-                            "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but axis {axis} has \
-                            size {dimension}",
+                            "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but got \
+                             `{input_cotangent_type}`",
                         ))
                         .into());
-                    };
-                    let output_size = (limit - start).div_ceil(stride);
-                    // The forward slice covered positions `start + i * stride` for `i < output_size`; everything
-                    // after the last covered position becomes high edge padding. An empty slice covered nothing, so the
-                    // pullback is pure edge padding around zero interior elements.
-                    let high = match output_size {
-                        0 => input_size - start,
-                        size => input_size - (start + (size - 1) * stride) - 1,
-                    };
-                    edge_padding_low.push(i64::try_from(start).map_err(|_| {
-                        TypeError::invalid(format!(
-                            "`{SLICE_OPERATION_NAME}` transpose start index is too large on axis {axis}"
-                        ))
-                    })?);
-                    edge_padding_high.push(i64::try_from(high).map_err(|_| {
-                        TypeError::invalid(format!(
-                            "`{SLICE_OPERATION_NAME}` transpose high padding is too large on axis {axis}"
-                        ))
-                    })?);
-                    interior_padding.push(stride - 1);
+                    }
+                    if !accumulators[0].is_needed() {
+                        return Ok(());
+                    }
+                    let zeros = MaybeZero::Zero(input_cotangent_type).materialize(&**context)?;
+                    let outputs = context.stage_operation(
+                        UpdateSliceOperation::new(operation.start_indices().to_vec()),
+                        Vec::new(),
+                        &[zeros, cotangent.clone()],
+                    )?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    let cotangent =
+                        outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
+                    accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
                 }
-                if !accumulators[0].is_needed() {
-                    return Ok(());
+                MaybeZero::Value(cotangent) => {
+                    let input_type = inputs[0].r#type();
+                    let mut edge_padding_low = Vec::with_capacity(input_type.rank());
+                    let mut edge_padding_high = Vec::with_capacity(input_type.rank());
+                    let mut interior_padding = Vec::with_capacity(input_type.rank());
+                    for (axis, ((&start, &limit), &stride)) in operation
+                        .start_indices()
+                        .iter()
+                        .zip(operation.limit_indices())
+                        .zip(operation.strides())
+                        .enumerate()
+                    {
+                        let dimension = input_type.dimension(axis);
+                        let Some(input_size) = dimension.value() else {
+                            return Err(TypeError::invalid(format!(
+                                "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but axis {axis} has \
+                                size {dimension}",
+                            ))
+                            .into());
+                        };
+                        let output_size = (limit - start).div_ceil(stride);
+                        // The forward slice covered positions `start + i * stride` for `i < output_size`; everything
+                        // after the last covered position becomes high edge padding. An empty slice covered nothing, so
+                        // the pullback is pure edge padding around zero interior elements.
+                        let high = match output_size {
+                            0 => input_size - start,
+                            size => input_size - (start + (size - 1) * stride) - 1,
+                        };
+                        edge_padding_low.push(i64::try_from(start).map_err(|_| {
+                            TypeError::invalid(format!(
+                                "`{SLICE_OPERATION_NAME}` transpose start index is too large on axis {axis}"
+                            ))
+                        })?);
+                        edge_padding_high.push(i64::try_from(high).map_err(|_| {
+                            TypeError::invalid(format!(
+                                "`{SLICE_OPERATION_NAME}` transpose high padding is too large on axis {axis}"
+                            ))
+                        })?);
+                        interior_padding.push(stride - 1);
+                    }
+                    if !accumulators[0].is_needed() {
+                        return Ok(());
+                    }
+                    let zero =
+                        MaybeZero::Zero(dependency_scalar_type(cotangent.r#type().as_ref())?).materialize(&**context)?;
+                    let outputs = context.stage_operation(
+                        PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
+                        Vec::new(),
+                        &[cotangent.clone(), zero],
+                    )?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    let cotangent =
+                        outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
+                    accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
                 }
-                let zero =
-                    MaybeZero::Zero(dependency_scalar_type(cotangent.r#type().as_ref())?).materialize(&**context)?;
-                let outputs = context.stage_operation(
-                    PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
-                    Vec::new(),
-                    &[cotangent.clone(), zero],
-                )?;
-                check_count!("output", outputs, 1, ProgramError);
-                let cotangent =
-                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
-                accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
             }
         }
-    }
+    },
 }
 
 // Projected array IR JVP rule for [`SliceOperation`]. A dynamically shaped input retains its exact extents as
@@ -897,112 +895,104 @@ where
     }
 }
 
-// Forward-mode rule for [`UpdateSliceOperation`]: the operation is jointly linear in its input and update, so the
-// tangent updates the input tangent with the update tangent at the same static start indices. A zero input and update
-// tangent yields a typed zero output tangent.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for UpdateSliceOperation
-where
-    C::Operation: From<UpdateSliceOperation>,
-    C::Value: UpdateSlice,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let input = &inputs[0];
-        let update = &inputs[1];
-        let primal = input.primal().update_slice(update.primal(), self.start_indices())?;
-        let tangent = if input.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            let operand_tangent = input.tangent().clone().materialize(context.tangent())?;
-            let update_tangent = update.tangent().clone().materialize(context.tangent())?;
-            MaybeZero::Value(operand_tangent.update_slice(&update_tangent, self.start_indices())?)
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// Transpose (vector-Jacobian product) for an [`UpdateSliceOperation`].
-//
-// The forward map overwrites a block of the input with the update, so its pullback splits the output cotangent into two
-// contributions: the input cotangent is the cotangent with the update window zeroed (`update_slice(cotangent,
-// zeros(update_type), start_indices)`) and the update cotangent is the static slice of the cotangent at the update
-// window (`slice(cotangent, start_indices, start_indices + update_shape)`). Symbolic-zero cotangents propagate
-// unchanged.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<UpdateSliceOperation>
-        + From<ZeroOperation<ArrayType>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-            let context: &mut TracingContext<V, O> = context;
+impl_differentiable_operation! {
+    UpdateSliceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType> + Zero<C::Value>,
+        C::Operation: From<UpdateSliceOperation>,
+        C::Value: UpdateSlice,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`UpdateSliceOperation`]: the operation is jointly linear in its input and update,
+            // so the tangent updates the input tangent with the update tangent at the same static start indices. A zero
+            // input and update tangent yields a typed zero output tangent.
             check_count!("input", inputs, 2, ProgramError);
-            check_count!("output", outputs, 1, ProgramError);
-            check_count!("accumulator", accumulators, 2, DifferentiationError);
-            match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(vec![
-                    MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                ]),
-                MaybeZero::Value(cotangent) => {
-                    let update_type = inputs[1].r#type();
-                    let update_sizes = static_update_sizes(UPDATE_SLICE_OPERATION_NAME, &update_type)?;
-                    let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(context)?;
-                    let input_cotangents = context.stage_operation(
-                        UpdateSliceOperation::new(self.start_indices().to_vec()),
-                        Vec::new(),
-                        &[cotangent.clone(), zeros],
-                    )?;
-                    check_count!("output", input_cotangents, 1, ProgramError);
-                    let limit_indices: Vec<usize> = self
-                        .start_indices()
-                        .iter()
-                        .zip(update_sizes.iter())
-                        .map(|(start, size)| start + size)
-                        .collect();
-                    let update_cotangents = context.stage_operation(
-                        SliceOperation::new(self.start_indices().to_vec(), limit_indices)
-                            .with_strides(vec![1; self.start_indices().len()])?,
-                        Vec::new(),
-                        std::slice::from_ref(cotangent),
-                    )?;
-                    check_count!("output", update_cotangents, 1, ProgramError);
-                    let update_cotangent = update_cotangents
-                        .into_iter()
-                        .next()
-                        .unwrap()
-                        .unalign_cotangent(&inputs[1].r#type().cotangent()?)?;
-                    Ok(vec![
-                        MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
-                        MaybeZero::Value(update_cotangent),
-                    ])
-                }
-            }
-        };
-        let contributions = contributions?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
+            let input = &inputs[0];
+            let update = &inputs[1];
+            let primal = input.primal().update_slice(update.primal(), operation.start_indices())?;
+            let tangent = if input.tangent().is_zero() && update.tangent().is_zero() {
+                MaybeZero::Zero(primal.r#type().tangent()?)
+            } else {
+                let operand_tangent = input.tangent().clone().materialize(context.tangent())?;
+                let update_tangent = update.tangent().clone().materialize(context.tangent())?;
+                MaybeZero::Value(operand_tangent.update_slice(&update_tangent, operation.start_indices())?)
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        Ok(())
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<SliceOperation>
+            + From<UpdateSliceOperation>
+            + From<ZeroOperation<ArrayType>>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Transpose (vector-Jacobian product) for an [`UpdateSliceOperation`].
+            //
+            // The forward map overwrites a block of the input with the update, so its pullback splits the output
+            // cotangent into two contributions: the input cotangent is the cotangent with the update window zeroed
+            // (`update_slice(cotangent, zeros(update_type), start_indices)`) and the update cotangent is the static
+            // slice of the cotangent at the update window (`slice(cotangent, start_indices, start_indices +
+            // update_shape)`). Symbolic-zero cotangents propagate unchanged.
+            let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+                // The rule stages into the tracing context only, so the transposition context is narrowed once up
+                // front.
+                let context: &mut TracingContext<V, O> = context;
+                check_count!("input", inputs, 2, ProgramError);
+                check_count!("output", outputs, 1, ProgramError);
+                check_count!("accumulator", accumulators, 2, DifferentiationError);
+                match &outputs[0] {
+                    MaybeZero::Zero(_) => Ok(vec![
+                        MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                        MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+                    ]),
+                    MaybeZero::Value(cotangent) => {
+                        let update_type = inputs[1].r#type();
+                        let update_sizes = static_update_sizes(UPDATE_SLICE_OPERATION_NAME, &update_type)?;
+                        let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(context)?;
+                        let input_cotangents = context.stage_operation(
+                            UpdateSliceOperation::new(operation.start_indices().to_vec()),
+                            Vec::new(),
+                            &[cotangent.clone(), zeros],
+                        )?;
+                        check_count!("output", input_cotangents, 1, ProgramError);
+                        let limit_indices: Vec<usize> = operation
+                            .start_indices()
+                            .iter()
+                            .zip(update_sizes.iter())
+                            .map(|(start, size)| start + size)
+                            .collect();
+                        let update_cotangents = context.stage_operation(
+                            SliceOperation::new(operation.start_indices().to_vec(), limit_indices)
+                                .with_strides(vec![1; operation.start_indices().len()])?,
+                            Vec::new(),
+                            std::slice::from_ref(cotangent),
+                        )?;
+                        check_count!("output", update_cotangents, 1, ProgramError);
+                        let update_cotangent = update_cotangents
+                            .into_iter()
+                            .next()
+                            .unwrap()
+                            .unalign_cotangent(&inputs[1].r#type().cotangent()?)?;
+                        Ok(vec![
+                            MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
+                            MaybeZero::Value(update_cotangent),
+                        ])
+                    }
+                }
+            };
+            let contributions = contributions?;
+            check_count!("input", contributions, accumulators.len(), ProgramError);
+            for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                accumulator.accumulate(context, contribution)?;
+            }
+            Ok(())
+        }
+    },
 }
 
 /// Represents the ability to overwrite a contiguous sub-array with an update value at static start indices. This is the
@@ -1377,99 +1367,92 @@ where
     }
 }
 
-// Forward-mode rule for [`DynamicSliceOperation`]: `dynamic_slice` is linear in the input, and the scalar start indices
-// are non-differentiated primal input edges, so the tangent slices the input tangent at the same primal start indices.
-// A zero input tangent yields a typed zero output tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DynamicSliceOperation
-where
-    C::Operation: From<DynamicSliceOperation>,
-    C::Value: DynamicSlice,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let (input, start_indices) =
-            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        let primal = input.primal().dynamic_slice(&primal_starts, self.sizes())?;
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => {
-                let tangent_starts = primal_starts
-                    .into_iter()
-                    .map(|value| context.primal_to_tangent(value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                MaybeZero::Value(tangent.dynamic_slice(&tangent_starts, self.sizes())?)
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices (inputs 1
-// onward) have no tangent space, so in a valid pushforward they are the known inputs and the sliced input (input 0) is
-// the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output
-// cotangent back into a zero array of the input type at the same start indices, i.e. a dynamic update-slice at those
-// indices. The transpose reads the known start indices from the pullback boundary and stages an ordinary
-// [`DynamicUpdateSliceOperation`], so linearization retains the indices as regular SSA residuals. The start indices
-// receive structural zeros, and a zero output cotangent stays a structural zero.
-//
-// **Contract:** this homogeneous rule requires a statically shaped input. The update target is a zero of the
-// input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension operations,
-// so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped input is therefore
-// rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
-// [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a dynamically shaped dynamic
-// slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same zero from the
-// retained exact extents.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<DynamicUpdateSliceOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        if inputs.is_empty() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+impl_differentiable_operation! {
+    DynamicSliceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<DynamicSliceOperation>,
+        C::Value: DynamicSlice,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`DynamicSliceOperation`]: `dynamic_slice` is linear in the input, and the scalar
+            // start indices are non-differentiated primal input edges, so the tangent slices the input tangent at the
+            // same primal start indices. A zero input tangent yields a typed zero output tangent.
+            let (input, start_indices) =
+                inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+            let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+            let primal = input.primal().dynamic_slice(&primal_starts, operation.sizes())?;
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => {
+                    let tangent_starts = primal_starts
+                        .into_iter()
+                        .map(|value| context.primal_to_tangent(value))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    MaybeZero::Value(tangent.dynamic_slice(&tangent_starts, operation.sizes())?)
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        if let MaybeZero::Value(cotangent) = &outputs[0] {
-            let start_indices = read_known_start_indices(&inputs[1..]);
-            // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
-            // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
-            let operand_cotangent_type = inputs[0].r#type().cotangent()?;
-            if operand_cotangent_type.static_shape().is_none() {
-                return Err(TypeError::invalid(format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` transpose requires a statically shaped input but got \
-                     `{operand_cotangent_type}`",
-                ))
-                .into());
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
+            + From<DynamicUpdateSliceOperation>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
+            // (inputs 1 onward) have no tangent space, so in a valid pushforward they are the known inputs and the
+            // sliced input (input 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)`
+            // transposes by scattering the output cotangent back into a zero array of the input type at the same start
+            // indices, i.e. a dynamic update-slice at those indices. The transpose reads the known start indices from
+            // the pullback boundary and stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains
+            // the indices as regular SSA residuals. The start indices receive structural zeros, and a zero output
+            // cotangent stays a structural zero.
+            //
+            // **Contract:** this homogeneous rule requires a statically shaped input. The update target is a zero of
+            // the input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class
+            // dimension operations, so it has no constructor that can supply a runtime extent for that zero. A
+            // dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed
+            // [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
+            // [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a dynamically shaped
+            // dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
+            // zero from the retained exact extents.
+            if inputs.is_empty() {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             }
-            if !accumulators[0].is_needed() {
-                return Ok(());
-            }
-            let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(&**context)?;
-            let mut inputs = Vec::with_capacity(2 + start_indices.len());
-            inputs.push(zeros);
-            inputs.push(cotangent.clone());
-            inputs.extend(start_indices);
-            let outputs = context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), inputs.as_slice())?;
             check_count!("output", outputs, 1, ProgramError);
-            accumulators[0].accumulate(context, MaybeZero::Value(outputs.into_iter().next().unwrap()))?;
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            if let MaybeZero::Value(cotangent) = &outputs[0] {
+                let start_indices = read_known_start_indices(&inputs[1..]);
+                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
+                let operand_cotangent_type = inputs[0].r#type().cotangent()?;
+                if operand_cotangent_type.static_shape().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` transpose requires a statically shaped input but got \
+                         `{operand_cotangent_type}`",
+                    ))
+                    .into());
+                }
+                if !accumulators[0].is_needed() {
+                    return Ok(());
+                }
+                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(&**context)?;
+                let mut inputs = Vec::with_capacity(2 + start_indices.len());
+                inputs.push(zeros);
+                inputs.push(cotangent.clone());
+                inputs.extend(start_indices);
+                let outputs = context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), inputs.as_slice())?;
+                check_count!("output", outputs, 1, ProgramError);
+                accumulators[0].accumulate(context, MaybeZero::Value(outputs.into_iter().next().unwrap()))?;
+            }
+            Ok(())
         }
-        Ok(())
-    }
+    },
 }
 
 // Projected array IR JVP rule for [`DynamicSliceOperation`]. A dynamically shaped input retains its exact
@@ -1950,117 +1933,110 @@ where
     }
 }
 
-// Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the input and the
-// update, while the scalar start indices are non-differentiated primal input edges, so the tangent updates the input
-// tangent with the update tangent at the same primal start indices. A zero input and update tangent yields a typed zero
-// output tangent.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for DynamicUpdateSliceOperation
-where
-    C::Operation: From<DynamicUpdateSliceOperation>,
-    C::Value: DynamicUpdateSlice,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if inputs.len() < 2 {
-            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-        }
-        let input = &inputs[0];
-        let update = &inputs[1];
-        let primal_starts = inputs[2..].iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        let primal = input.primal().dynamic_update_slice(update.primal(), &primal_starts)?;
-        let tangent = if input.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            let operand_tangent = input.tangent().clone().materialize(context.tangent())?;
-            let update_tangent = update.tangent().clone().materialize(context.tangent())?;
-            MaybeZero::Value(
-                operand_tangent.dynamic_update_slice(
-                    &update_tangent,
-                    &primal_starts
-                        .into_iter()
-                        .map(|value| context.primal_to_tangent(value))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )?,
-            )
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start indices
-// (inputs 2 onward) have no tangent space, so in a valid pushforward they are the known inputs and the input and update
-// (inputs 0 and 1) are the linear ones. The forward map `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the
-// output cotangent into two contributions at the same start indices: the input cotangent is the cotangent with the
-// update window zeroed (a dynamic update-slice writing zeros at the indices) and the update cotangent is the dynamic
-// slice of the cotangent at the update window. The transpose reads the known start indices from the pullback boundary
-// and stages ordinary dynamic slicing operations, so linearization retains the indices as regular SSA residuals. The
-// start indices receive structural zeros, and a zero output cotangent stays a structural zero.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicUpdateSliceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<DynamicUpdateSliceOperation>
-        + From<DynamicSliceOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        if inputs.len() < 2 {
-            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
-        }
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        if let MaybeZero::Value(cotangent) = &outputs[0] {
-            let update_sizes = static_update_sizes(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &inputs[1].r#type())?;
-            let start_indices = read_known_start_indices(&inputs[2..]);
-            if accumulators[0].is_needed() {
-                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()?).materialize(&**context)?;
-                // Input cotangent: the output cotangent with the update window overwritten by zeros.
-                let mut input_operands = Vec::with_capacity(2 + start_indices.len());
-                input_operands.push(cotangent.clone());
-                input_operands.push(zeros);
-                input_operands.extend(start_indices.iter().cloned());
-                let input_cotangents =
-                    context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), input_operands.as_slice())?;
-                check_count!("output", input_cotangents, 1, ProgramError);
-                accumulators[0].accumulate(context, MaybeZero::Value(input_cotangents.into_iter().next().unwrap()))?;
+impl_differentiable_operation! {
+    DynamicUpdateSliceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType> + Zero<C::Value>,
+        C::Operation: From<DynamicUpdateSliceOperation>,
+        C::Value: DynamicUpdateSlice,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the
+            // input and the update, while the scalar start indices are non-differentiated primal input edges, so the
+            // tangent updates the input tangent with the update tangent at the same primal start indices. A zero input
+            // and update tangent yields a typed zero output tangent.
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
             }
-            if accumulators[1].is_needed() {
-                // Update cotangent: the dynamic slice of the output cotangent at the update window.
-                let mut update_operands = Vec::with_capacity(1 + start_indices.len());
-                update_operands.push(cotangent.clone());
-                update_operands.extend(start_indices);
-                let update_cotangents = context.stage_operation(
-                    DynamicSliceOperation::new(update_sizes),
-                    Vec::new(),
-                    update_operands.as_slice(),
-                )?;
-                check_count!("output", update_cotangents, 1, ProgramError);
-                accumulators[1].accumulate(
-                    context,
-                    MaybeZero::Value(
-                        update_cotangents
+            let input = &inputs[0];
+            let update = &inputs[1];
+            let primal_starts = inputs[2..].iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+            let primal = input.primal().dynamic_update_slice(update.primal(), &primal_starts)?;
+            let tangent = if input.tangent().is_zero() && update.tangent().is_zero() {
+                MaybeZero::Zero(primal.r#type().tangent()?)
+            } else {
+                let operand_tangent = input.tangent().clone().materialize(context.tangent())?;
+                let update_tangent = update.tangent().clone().materialize(context.tangent())?;
+                MaybeZero::Value(
+                    operand_tangent.dynamic_update_slice(
+                        &update_tangent,
+                        &primal_starts
                             .into_iter()
-                            .next()
-                            .unwrap()
-                            .unalign_cotangent(&inputs[1].r#type().cotangent()?)?,
-                    ),
-                )?;
-            }
+                            .map(|value| context.primal_to_tangent(value))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )?,
+                )
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        Ok(())
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
+            + From<DynamicUpdateSliceOperation>
+            + From<DynamicSliceOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start
+            // indices (inputs 2 onward) have no tangent space, so in a valid pushforward they are the known inputs and
+            // the input and update (inputs 0 and 1) are the linear ones. The forward map `(t, u) ↦
+            // dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the same
+            // start indices: the input cotangent is the cotangent with the update window zeroed (a dynamic update-slice
+            // writing zeros at the indices) and the update cotangent is the dynamic slice of the cotangent at the
+            // update window. The transpose reads the known start indices from the pullback boundary and stages ordinary
+            // dynamic slicing operations, so linearization retains the indices as regular SSA residuals. The start
+            // indices receive structural zeros, and a zero output cotangent stays a structural zero.
+            if inputs.len() < 2 {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            }
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            if let MaybeZero::Value(cotangent) = &outputs[0] {
+                let update_sizes = static_update_sizes(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &inputs[1].r#type())?;
+                let start_indices = read_known_start_indices(&inputs[2..]);
+                if accumulators[0].is_needed() {
+                    let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()?).materialize(&**context)?;
+                    // Input cotangent: the output cotangent with the update window overwritten by zeros.
+                    let mut input_operands = Vec::with_capacity(2 + start_indices.len());
+                    input_operands.push(cotangent.clone());
+                    input_operands.push(zeros);
+                    input_operands.extend(start_indices.iter().cloned());
+                    let input_cotangents =
+                        context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), input_operands.as_slice())?;
+                    check_count!("output", input_cotangents, 1, ProgramError);
+                    accumulators[0]
+                        .accumulate(context, MaybeZero::Value(input_cotangents.into_iter().next().unwrap()))?;
+                }
+                if accumulators[1].is_needed() {
+                    // Update cotangent: the dynamic slice of the output cotangent at the update window.
+                    let mut update_operands = Vec::with_capacity(1 + start_indices.len());
+                    update_operands.push(cotangent.clone());
+                    update_operands.extend(start_indices);
+                    let update_cotangents = context.stage_operation(
+                        DynamicSliceOperation::new(update_sizes),
+                        Vec::new(),
+                        update_operands.as_slice(),
+                    )?;
+                    check_count!("output", update_cotangents, 1, ProgramError);
+                    accumulators[1].accumulate(
+                        context,
+                        MaybeZero::Value(
+                            update_cotangents
+                                .into_iter()
+                                .next()
+                                .unwrap()
+                                .unalign_cotangent(&inputs[1].r#type().cotangent()?)?,
+                        ),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+    },
 }
 
 // Projected array IR JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped inputs retain their
@@ -2670,72 +2646,51 @@ where
     }
 }
 
-// Forward-mode rule for [`DynamicShapeSliceOperation`]. The array input is linear while the first-class starts and
-// sizes are discrete shape metadata. A live array tangent uses the primal's slice geometry; a structural-zero tangent
-// stays symbolic and takes the result's tangent type.
-impl<C> DifferentiableOperation<C> for DynamicShapeSliceOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<DynamicShapeSliceOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1 + 2 * self.strides.len(), ProgramError);
-        let Some((input, bounds)) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let primal_bounds = bounds.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primal_inputs = Vec::with_capacity(inputs.len());
-        primal_inputs.push(input.primal().clone());
-        primal_inputs.extend(primal_bounds.iter().cloned());
-        let mut primals = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primals, 1, ProgramError);
+impl_differentiable_operation! {
+    DynamicShapeSliceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayIrType>,
+        C::Operation: From<DynamicShapeSliceOperation>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`DynamicShapeSliceOperation`]. The array input is linear while the first-class
+            // starts and sizes are discrete shape metadata. A live array tangent uses the primal's slice geometry; a
+            // structural-zero tangent stays symbolic and takes the result's tangent type.
+            check_count!("input", inputs, 1 + 2 * operation.strides.len(), ProgramError);
+            let Some((input, bounds)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let primal_bounds = bounds.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut primal_inputs = Vec::with_capacity(inputs.len());
+            primal_inputs.push(input.primal().clone());
+            primal_inputs.extend(primal_bounds.iter().cloned());
+            let mut primals = context.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primals, 1, ProgramError);
 
-        let mut tangent_inputs = Vec::with_capacity(inputs.len());
-        let MaybeZero::Value(tangent) = input.tangent() else {
-            let primal = primals.remove(0);
-            let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
-            return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
-        };
-        tangent_inputs.push(tangent.clone());
-        tangent_inputs.extend(
-            primal_bounds
-                .into_iter()
-                .map(|value| context.primal_to_tangent(value))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let mut tangents = context.tangent().bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
-        check_count!("output", tangents, 1, ProgramError);
-        Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
-    }
-}
-
-// Reverse-mode differentiation of [`DynamicShapeSliceOperation`] is not yet supported. Its transpose must scatter a
-// possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
-// residuals; returning an explicit error preserves that requirement instead of silently producing an incorrect
-// cotangent.
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
-    for DynamicShapeSliceOperation
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        _accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "operation `{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` does not yet support reverse-mode differentiation",
-            ),
+            let mut tangent_inputs = Vec::with_capacity(inputs.len());
+            let MaybeZero::Value(tangent) = input.tangent() else {
+                let primal = primals.remove(0);
+                let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
+                return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
+            };
+            tangent_inputs.push(tangent.clone());
+            tangent_inputs.extend(
+                primal_bounds
+                    .into_iter()
+                    .map(|value| context.primal_to_tangent(value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut tangents = context.tangent().bind(operation.clone(), Vec::new(), tangent_inputs.as_slice())?;
+            check_count!("output", tangents, 1, ProgramError);
+            Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
         }
-        .into())
-    }
+    },
+    // Reverse-mode differentiation of [`DynamicShapeSliceOperation`] is not yet supported. Its transpose must scatter a
+    // possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
+    // residuals; the standard rejecting rule preserves that requirement instead of silently producing an incorrect
+    // cotangent.
+    transpose = @nonlinear,
 }
 
 /// Represents slicing with first-class dimension inputs for both the origin and result shape.
@@ -6639,7 +6594,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `dynamic_shape_slice` does not yet support reverse-mode differentiation",
+                if message == "operation `dynamic_shape_slice` is not transposable",
         ));
     }
 

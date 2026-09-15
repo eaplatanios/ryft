@@ -11,9 +11,8 @@ use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingCon
 use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::reduce_broadcast_cotangent;
 use crate::differentiation::{
-    BroadcastDerivativeAlignment, CotangentAccumulator, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    BroadcastDerivativeAlignment, DifferentiableType, DifferentiationDual, TransposableOperation,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -31,14 +30,13 @@ use crate::operations::math::add::AddOperation;
 use crate::operations::math::reduce::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
+use crate::tracing::{NestedTracingContext, Tracer};
 
 /// Canonical operation name shared by [`BroadcastOperation`] and [`DynamicBroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -1064,234 +1062,237 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType>> DifferentiableOperation<C> for DynamicBroadcastOperation
-where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<DynamicBroadcastOperation>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<DynamicReshapeOperation>
-        + From<ZeroOperation<ArrayType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<
-            ArrayType,
-            Projected: From<BroadcastOperation> + From<ReduceOperation> + From<TransposeOperation>,
-        >,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays the
-        // mixed broadcast directly while dynamic input geometry retains its exact extents so the linear transpose can
-        // reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
-        let destinations = context;
-        let context = destinations.primal();
-        let Some(_) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primal_outputs = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let output_primal = primal_outputs.remove(0);
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
-        let inputs = tangent_inputs.as_slice();
-        let (array, output_extents) = inputs.split_first().unwrap();
-        let context = destinations.tangent();
+impl_differentiable_operation! {
+    DynamicBroadcastOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayIrType>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C::Operation: From<DynamicBroadcastOperation>
+            + From<DimensionSizeOperation>
+            + From<LinearCallOperation<ArrayIrType>>
+            + From<DynamicReshapeOperation>
+            + From<ZeroOperation<ArrayType>>
+            + From<ConstantOperation<DimensionValue>>
+            + OperationProjection<
+                ArrayType,
+                Projected: From<BroadcastOperation> + From<ReduceOperation> + From<TransposeOperation>,
+            >,
+    {
+        |operation, context, _driver, inputs| {
+            // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays
+            // the mixed broadcast directly while dynamic input geometry retains its exact extents so the linear
+            // transpose can reduce, reorder, and rebind the input cotangent using first-class dimension residuals.
+            let destinations = context;
+            let context = destinations.primal();
+            let Some(_) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut primal_outputs = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?;
+            check_count!("output", primal_outputs, 1, ProgramError);
+            let output_primal = primal_outputs.remove(0);
+            let primal = destinations.primal_to_tangent(output_primal.clone())?;
+            let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+            let inputs = tangent_inputs.as_slice();
+            let (array, output_extents) = inputs.split_first().unwrap();
+            let context = destinations.tangent();
 
-        // Tangent promotion can change element width, so derive the layout from the tangent type rather than
-        // replaying byte strides captured for the primal.
-        let tangent_type = primal.r#type().tangent()?;
-        let tangent_operation =
-            self.clone().with_output_layout(<&ArrayType>::try_from(&tangent_type)?.layout().cloned());
-        let tangent = match array.tangent() {
-            MaybeZero::Zero(_) => {
-                if tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
-                    let array_tangent_type = <&ArrayType>::try_from(&tangent_type)?.clone();
-                    let dynamic_extents = array_tangent_type
+            // Tangent promotion can change element width, so derive the layout from the tangent type rather than
+            // replaying byte strides captured for the primal.
+            let tangent_type = primal.r#type().tangent()?;
+            let tangent_operation =
+                operation.clone().with_output_layout(<&ArrayType>::try_from(&tangent_type)?.layout().cloned());
+            let tangent = match array.tangent() {
+                MaybeZero::Zero(_) => {
+                    if tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
+                        let array_tangent_type = <&ArrayType>::try_from(&tangent_type)?.clone();
+                        let dynamic_extents = array_tangent_type
+                            .shape()
+                            .dimensions()
+                            .iter()
+                            .zip(output_extents)
+                            .filter(|(dimension, _)| matches!(dimension, Dimension::Dynamic(_)))
+                            .map(|(_, extent)| extent.primal().clone())
+                            .collect::<Vec<_>>();
+                        let mut outputs = context.bind(
+                            ZeroOperation::new(array_tangent_type),
+                            Vec::new(),
+                            dynamic_extents.as_slice(),
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        MaybeZero::Value(outputs.remove(0))
+                    } else {
+                        MaybeZero::Zero(tangent_type)
+                    }
+                }
+                MaybeZero::Value(array_tangent) => {
+                    let input_cotangent_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
+                    if input_cotangent_type
                         .shape()
                         .dimensions()
                         .iter()
-                        .zip(output_extents)
-                        .filter(|(dimension, _)| matches!(dimension, Dimension::Dynamic(_)))
-                        .map(|(_, extent)| extent.primal().clone())
-                        .collect::<Vec<_>>();
-                    let mut outputs =
-                        context.bind(ZeroOperation::new(array_tangent_type), Vec::new(), dynamic_extents.as_slice())?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    MaybeZero::Value(outputs.remove(0))
-                } else {
-                    MaybeZero::Zero(tangent_type)
-                }
-            }
-            MaybeZero::Value(array_tangent) => {
-                let input_cotangent_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
-                if input_cotangent_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .all(|dimension| matches!(dimension, Dimension::Static(_)))
-                {
-                    let mut tangent_inputs = Vec::with_capacity(inputs.len());
-                    tangent_inputs.push(array_tangent.clone());
-                    tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let mut outputs = context.bind(tangent_operation, Vec::new(), tangent_inputs.as_slice())?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    MaybeZero::Value(outputs.remove(0))
-                } else {
-                    let mut residuals = LinearResiduals::new();
-                    let output_extents =
-                        residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let input_shape = residuals.retain_shape(context, array.primal())?;
-                    let forward_operation = tangent_operation;
-                    let forward_output_extents = output_extents.clone();
-                    let transpose_output_axes = self.output_axes().to_vec();
-                    let transpose_target_type = input_cotangent_type.clone();
-                    let mut tangent_outputs = LinearCallOperation::stage(
-                        context,
-                        residuals.into_values(),
-                        vec![array_tangent.clone()],
-                        move |residuals, linear_inputs| {
-                            let mut broadcast_inputs = Vec::with_capacity(1 + forward_output_extents.len());
-                            broadcast_inputs.push(linear_inputs[0].clone());
-                            broadcast_inputs
-                                .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
-                            linear_inputs[0].dispatch_domain().bind(
-                                forward_operation,
-                                Vec::new(),
-                                broadcast_inputs.as_slice(),
-                            )
-                        },
-                        move |residuals, output_cotangents| {
-                            let transpose_context = output_cotangents[0].dispatch_domain();
-                            let cotangent =
-                                <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
-                                    output_cotangents[0].clone(),
-                                )?;
-                            let contribution =
-                                reduce_broadcast_cotangent(&cotangent, &transpose_target_type, &transpose_output_axes)?
-                                    .into_value();
-                            let contribution_type = contribution.r#type().into_owned();
-                            let contribution_type = <&ArrayType>::try_from(&contribution_type)?;
-                            let mut exact_inputs = Vec::with_capacity(transpose_target_type.rank() + 1);
-                            exact_inputs.push(contribution);
-                            exact_inputs.extend(input_shape.dimensions(&transpose_context, residuals)?);
-
-                            // Keep runtime geometry on explicit input edges, including when the shape is unchanged.
-                            let mut outputs = if contribution_type.shape() == transpose_target_type.shape() {
-                                transpose_context.bind(
-                                    DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
-                                        .with_output_sharding(transpose_target_type.sharding().cloned())
-                                        .with_output_layout(transpose_target_type.layout().cloned()),
+                        .all(|dimension| matches!(dimension, Dimension::Static(_)))
+                    {
+                        let mut tangent_inputs = Vec::with_capacity(inputs.len());
+                        tangent_inputs.push(array_tangent.clone());
+                        tangent_inputs.extend(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let mut outputs = context.bind(tangent_operation, Vec::new(), tangent_inputs.as_slice())?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        MaybeZero::Value(outputs.remove(0))
+                    } else {
+                        let mut residuals = LinearResiduals::new();
+                        let output_extents =
+                            residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
+                        let input_shape = residuals.retain_shape(context, array.primal())?;
+                        let forward_operation = tangent_operation;
+                        let forward_output_extents = output_extents.clone();
+                        let transpose_output_axes = operation.output_axes().to_vec();
+                        let transpose_target_type = input_cotangent_type.clone();
+                        let mut tangent_outputs = LinearCallOperation::stage(
+                            context,
+                            residuals.into_values(),
+                            vec![array_tangent.clone()],
+                            move |residuals, linear_inputs| {
+                                let mut broadcast_inputs = Vec::with_capacity(1 + forward_output_extents.len());
+                                broadcast_inputs.push(linear_inputs[0].clone());
+                                broadcast_inputs
+                                    .extend(forward_output_extents.iter().map(|index| residuals[*index].clone()));
+                                linear_inputs[0].dispatch_domain().bind(
+                                    forward_operation,
                                     Vec::new(),
-                                    exact_inputs.as_slice(),
+                                    broadcast_inputs.as_slice(),
+                                )
+                            },
+                            move |residuals, output_cotangents| {
+                                let transpose_context = output_cotangents[0].dispatch_domain();
+                                let cotangent =
+                                    <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
+                                        output_cotangents[0].clone(),
+                                    )?;
+                                let contribution = reduce_broadcast_cotangent(
+                                    &cotangent,
+                                    &transpose_target_type,
+                                    &transpose_output_axes,
                                 )?
-                            } else {
-                                transpose_context.bind(
-                                    DynamicReshapeOperation::new()
-                                        .with_output_sharding(transpose_target_type.sharding().cloned()),
-                                    Vec::new(),
-                                    exact_inputs.as_slice(),
-                                )?
-                            };
-                            check_count!("output", outputs, 1, ProgramError);
-                            let mut contribution =
-                                <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
-                                    outputs.remove(0),
-                                )?;
+                                .into_value();
+                                let contribution_type = contribution.r#type().into_owned();
+                                let contribution_type = <&ArrayType>::try_from(&contribution_type)?;
+                                let mut exact_inputs = Vec::with_capacity(transpose_target_type.rank() + 1);
+                                exact_inputs.push(contribution);
+                                exact_inputs.extend(input_shape.dimensions(&transpose_context, residuals)?);
 
-                            // Optional dynamic-operation metadata means inference, so it cannot clear a layout or
-                            // sharding. Once geometry is explicit, pin the complete target type with a broadcast.
-                            if contribution.r#type().as_ref() != &transpose_target_type {
-                                let output_axes = (0..transpose_target_type.rank()).collect::<Vec<_>>();
-                                contribution = contribution.broadcast(transpose_target_type.clone(), &output_axes)?;
-                            }
-                            Ok(vec![contribution.into_value()])
-                        },
-                    )?;
+                                // Keep runtime geometry on explicit input edges, including when the shape is unchanged.
+                                let mut outputs = if contribution_type.shape() == transpose_target_type.shape() {
+                                    transpose_context.bind(
+                                        DynamicBroadcastOperation::new((0..transpose_target_type.rank()).collect())
+                                            .with_output_sharding(transpose_target_type.sharding().cloned())
+                                            .with_output_layout(transpose_target_type.layout().cloned()),
+                                        Vec::new(),
+                                        exact_inputs.as_slice(),
+                                    )?
+                                } else {
+                                    transpose_context.bind(
+                                        DynamicReshapeOperation::new()
+                                            .with_output_sharding(transpose_target_type.sharding().cloned()),
+                                        Vec::new(),
+                                        exact_inputs.as_slice(),
+                                    )?
+                                };
+                                check_count!("output", outputs, 1, ProgramError);
+                                let mut contribution =
+                                    <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::into_projected(
+                                        outputs.remove(0),
+                                    )?;
 
-                    check_count!("output", tangent_outputs, 1, ProgramError);
-                    MaybeZero::Value(tangent_outputs.remove(0))
+                                // Optional dynamic-operation metadata means inference, so it cannot clear a layout or
+                                // sharding. Once geometry is explicit, pin the complete target type with a broadcast.
+                                if contribution.r#type().as_ref() != &transpose_target_type {
+                                    let output_axes = (0..transpose_target_type.rank()).collect::<Vec<_>>();
+                                    contribution =
+                                        contribution.broadcast(transpose_target_type.clone(), &output_axes)?;
+                                }
+                                Ok(vec![contribution.into_value()])
+                            },
+                        )?;
+
+                        check_count!("output", tangent_outputs, 1, ProgramError);
+                        MaybeZero::Value(tangent_outputs.remove(0))
+                    }
                 }
-            }
-        };
+            };
 
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
-    for DynamicBroadcastOperation
-where
-    V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: From<AddOperation<ArrayIrType>>
-        + OperationProjection<
-            ArrayType,
-            Projected: From<BroadcastOperation>
-                           + TransposableOperation<
-                <V as ValueProjection<ArrayType>>::Projected,
-                <O as OperationProjection<ArrayType>>::Projected,
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        O: Operation<Type = ArrayIrType>
+            + OperationProjection<
+                ArrayType,
+                Projected: From<BroadcastOperation>
+                    + TransposableOperation<
+                        <V as ValueProjection<ArrayType>>::Projected,
+                        <O as OperationProjection<ArrayType>>::Projected,
+                    >,
             >,
-        >,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        // Static input geometry delegates to the homogeneous array pullback, while every explicit output
-        // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so that
-        // `DifferentiableOperation::jvp` can retain its exact extents as residuals.
-        check_count!("output", outputs, 1, ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Static input geometry delegates to the homogeneous array pullback, while every explicit output
+            // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so that
+            // `DifferentiableOperation::jvp` can retain its exact extents as residuals.
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
-        let Some((input, _output_extents)) = inputs.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
+            let Some((input, _output_extents)) = inputs.split_first() else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+            };
+            let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
 
-        // A structural zero needs no reduction or runtime shape residual. Accumulators already hold zeros of their
-        // input cotangent types, including the dimension inputs and arrays with no cotangent space.
-        if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
-            return Ok(());
-        }
-
-        if input_cotangent_type
-            .shape()
-            .dimensions()
-            .iter()
-            .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "direct transposition of a dynamic `{BROADCAST_OPERATION_NAME}` requires linearization so its \
-                     input extents can be retained as residuals",
-                ),
+            // A structural zero needs no reduction or runtime shape residual. Accumulators already hold zeros of their
+            // input cotangent types, including the dimension inputs and arrays with no cotangent space.
+            if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
+                return Ok(());
             }
-            .into());
+
+            if input_cotangent_type
+                .shape()
+                .dimensions()
+                .iter()
+                .any(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "direct transposition of a dynamic `{BROADCAST_OPERATION_NAME}` requires linearization so its \
+                         input extents can be retained as residuals",
+                    ),
+                }
+                .into());
+            }
+
+            let output_type = match outputs {
+                [MaybeZero::Zero(r#type)] => <&ArrayType>::try_from(r#type)?.clone(),
+                [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
+                _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
+            };
+
+            let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
+                output_type,
+                operation.output_axes().to_vec(),
+            ));
+
+            // Dimension inputs do not receive cotangents. Forward only the array inputs' handles.
+            transpose_projected_operation(
+                context,
+                &projected_operation,
+                std::slice::from_ref(input),
+                outputs,
+                &accumulators[..1],
+            )
         }
-
-        let output_type = match outputs {
-            [MaybeZero::Zero(r#type)] => <&ArrayType>::try_from(r#type)?.clone(),
-            [MaybeZero::Value(value)] => <&ArrayType>::try_from(value.r#type().as_ref())?.clone(),
-            _ => return Err(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into()),
-        };
-
-        let operation = <O as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
-            output_type,
-            self.output_axes().to_vec(),
-        ));
-
-        // Dimension inputs do not receive cotangents. Forward only the array inputs' handles.
-        transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
-    }
+    },
 }
 
 /// Replicates an array using dimension values to specify its output shape. Input axis `i` maps to output axis
@@ -1773,7 +1774,7 @@ mod tests {
         ShardingDimension, StridedLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{TransposableOperation, differentiate_at};
+    use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,

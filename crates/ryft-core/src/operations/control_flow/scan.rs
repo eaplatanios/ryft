@@ -12,9 +12,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType,
-    DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, ReferenceSliceOperation,
-    Shape,
+    ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType,
+    Dimension, DimensionBounds, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, ReferenceSliceOperation, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -784,15 +783,15 @@ where
 // stack keeps the batch axis fixed by its referent (which must lie behind the leading scan axis). The body receives
 // the whole packed root, and its explicit view instruction adjusts the selected axis through
 // `BatchableReferenceView::batch`.
-impl<A, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<ArrayIrValue<A>>
+impl<Capture, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<Capture>
 where
-    A: Value<Type = ArrayType>,
+    Capture: Value<Type = ArrayIrType>,
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + From<ScanOperation<ArrayIrValue<A>>>
+                           + From<ScanOperation<Capture>>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -946,7 +945,7 @@ where
         let output_order = (0..batched_body.output_ids().len()).collect::<Vec<_>>();
         let batched_body = reorder_program_boundary(&batched_body, &input_order, &output_order)?;
 
-        let batched_scan = ScanOperation::<ArrayIrValue<A>>::new(carry_count + 1, self.length())
+        let batched_scan = ScanOperation::<Capture>::new(carry_count + 1, self.length())
             .with_reverse(self.reverse())
             .with_unroll(self.unroll())?
             .with_captures(self.captures().to_vec());
