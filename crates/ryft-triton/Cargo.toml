@@ -1,0 +1,25 @@
+[package]
+name = "ryft-triton"
+version = "0.0.3"
+description = "Direct Triton compiler adapters for Ryft kernels."
+readme = "README.md"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ryft-core.workspace = true
+ryft-cuda.workspace = true
+ryft-mlir.workspace = true
+ryft-rocm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+pretty_assertions.workspace = true

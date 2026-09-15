@@ -1,0 +1,19 @@
+[package]
+name = "ryft-rocm"
+version = "0.0.3"
+readme = "README.md"
+description = "ROCm kernel loading and execution support for Ryft."
+keywords = ["ryft", "rocm", "gpu", "kernel", "hip"]
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
