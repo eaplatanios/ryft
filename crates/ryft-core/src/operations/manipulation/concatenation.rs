@@ -188,8 +188,6 @@ impl ConcatenateOperation<ArrayIrType> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> ConcatenateOperation<T> {
     /// Returns the axis along which this [`ConcatenateOperation`] joins its inputs.
     #[inline]
@@ -197,12 +195,17 @@ impl<T: Type> ConcatenateOperation<T> {
         self.axis
     }
 
-    // TODO(eaplatanios): Why is this a separate function instead of being inlined in `ConcatenateOperation::render`?
-    /// Renders this payload independently of its homogeneous or composite operation contract. The runtime-assertion
-    /// classification is rendered only when it is set, because it decides this operation's effects and is not
-    /// recoverable from the rendered input types: a signature that proves the result extent may still carry the
-    /// assertion (which is what the conversion from the homogeneous payload produces).
-    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+    /// Renders this payload independently of its homogeneous or composite operation contract. This is a separate
+    /// function rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads
+    /// have separate [`Operation`] implementations that must render identically, and both must forward their
+    /// `indentation` so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence
+    /// over trait functions during method resolution, so the `self.render(...)` calls in those implementations and in
+    /// the [`Display`] implementation, which exists only for those two payloads, resolve to this function rather than
+    /// recursing into [`Operation::render`]. The runtime-assertion classification is rendered only when it is set,
+    /// because it decides this operation's effects and is not recoverable from the rendered input types: a signature
+    /// that proves the result extent may still carry the assertion (which is what the conversion from the homogeneous
+    /// payload produces).
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis", self.axis)?;
             if self.requires_runtime_assertion {
@@ -213,10 +216,20 @@ impl<T: Type> ConcatenateOperation<T> {
     }
 }
 
-impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayIrType> {
+impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
-        Self { axis: operation.axis, requires_runtime_assertion: true, marker: PhantomData }
+        Self::Concatenate(operation.into())
+    }
+}
+
+impl<T: Type> Display for ConcatenateOperation<T>
+where
+    Self: Operation,
+{
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
     }
 }
 
@@ -227,17 +240,10 @@ impl From<ConcatenateOperation<ArrayIrType>> for ConcatenateOperation<ArrayType>
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<ConcatenateOperation<ArrayType>> for ArrayIrOperation<A> {
+impl From<ConcatenateOperation<ArrayType>> for ConcatenateOperation<ArrayIrType> {
     #[inline]
     fn from(operation: ConcatenateOperation<ArrayType>) -> Self {
-        Self::Concatenate(operation.into())
-    }
-}
-
-impl<T: Type> Display for ConcatenateOperation<T> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render_operation(formatter, 0)
+        Self { axis: operation.axis, requires_runtime_assertion: true, marker: PhantomData }
     }
 }
 
@@ -256,16 +262,19 @@ impl Operation for ConcatenateOperation<ArrayType> {
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
+
         // The operation stores a normalized axis, which remains subject to validation for the actual input rank.
         if let Some(input_type) = input_types.first() {
             Axis::from(self.axis).normalize(input_type.rank()).map_err(|_| {
                 TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` axis {} is out of bounds for inputs of rank {}",
+                    "`{}` axis {} is out of bounds for inputs of rank {}",
+                    CONCATENATE_OPERATION_NAME,
                     self.axis,
                     input_type.rank(),
                 ))
             })?;
         }
+
         match ArrayType::concatenate(input_types, self.axis) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
@@ -275,7 +284,7 @@ impl Operation for ConcatenateOperation<ArrayType> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
+        self.render(formatter, indentation)
     }
 }
 
@@ -296,9 +305,8 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
         let (_, output_type, requires_runtime_assertion) = Self::infer_signature(input_types, Axis::from(self.axis))?;
         if !self.requires_runtime_assertion && requires_runtime_assertion {
             return Err(TypeError::invalid(format!(
-                "`{}` was constructed for an input signature that proves its result extent, but the provided input \
-                 types require a runtime extent check",
-                CONCATENATE_OPERATION_NAME,
+                "`{CONCATENATE_OPERATION_NAME}` was constructed for an input signature that proves its result extent, \
+                 but the provided input types require a runtime extent check",
             )));
         }
         Ok(vec![output_type.into()])
@@ -315,7 +323,7 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        self.render_operation(formatter, indentation)
+        self.render(formatter, indentation)
     }
 }
 
@@ -336,6 +344,7 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
 impl<C: Domain<Type = ArrayIrType, Value: DynamicConcatenate>> InterpretableOperation<C>
     for ConcatenateOperation<ArrayIrType>
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -403,12 +412,10 @@ where
     }
 }
 
-// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
-// replicated, while array inputs are aligned on one physical mapped axis before concatenation.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for ConcatenateOperation<ArrayIrType>
 where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
@@ -421,12 +428,15 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // Batching rule for mixed `ConcatenateOperation<ArrayIrType>` instructions. The trailing result extent
+        // stays replicated, while array inputs are aligned on one physical mapped axis before concatenation.
         let Some((result_extent, inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",
             ))
             .into());
         };
+
         if inputs.is_empty() {
             return match result_extent.unbatched_type() {
                 ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
@@ -443,6 +453,7 @@ where
                 .into()),
             };
         }
+
         // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
         // representation. Concatenate therefore accepts only one replicated result extent.
         result_extent.validate_replicated_dimension()?;
@@ -499,9 +510,9 @@ impl_differentiable_operation! {
             + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for `ConcatenateOperation`. Concatenation is linear in every input, so its tangent
-            // concatenates the input tangents along the same axis. Materialize structural zeros because concatenation
-            // needs one concrete tangent per input; the shared all-zero fast path has already handled that case.
+            // Concatenation is linear in every input, so its tangent concatenates the input tangents along the same
+            // axis. Materialize structural zeros because concatenation needs one concrete tangent per input; the shared
+            // all-zero fast path has already handled that case.
             let tangents = inputs
                 .iter()
                 .map(|dual| dual.tangent().clone().materialize(context.tangent()))
@@ -518,15 +529,14 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Transposition rule for `ConcatenateOperation`. The forward map lays its inputs end to end, so its
-            // pullback slices the output cotangent at cumulative input offsets. The concatenated input dimensions must
-            // be static so those offsets are known. Symbolic-zero cotangents remain symbolic for every input.
+            // The forward map lays its inputs end to end, so its pullback slices the output cotangent at cumulative
+            // input offsets. The concatenated input dimensions must be static so those offsets are known. Symbolic-zero
+            // cotangents remain symbolic for every input.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             if inputs.is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "`{}` transpose expects at least one input but got none",
-                    CONCATENATE_OPERATION_NAME,
+                    "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one input but got none",
                 ))
                 .into());
             }
@@ -542,7 +552,7 @@ impl_differentiable_operation! {
                         let Dimension::Static(input_axis_size) = dimension else {
                             return Err(TypeError::invalid(format!(
                                 "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size along the \
-                                            concatenated axis {axis} but input {index} has size {dimension}",
+                                 concatenated axis {axis} but input {index} has size {dimension}",
                             ))
                             .into());
                         };
@@ -556,7 +566,7 @@ impl_differentiable_operation! {
                                 dimension.value().ok_or_else(|| {
                                     TypeError::invalid(format!(
                                         "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis \
-                                                 {other_axis} but input {index} has size {dimension}",
+                                         {other_axis} but input {index} has size {dimension}",
                                     ))
                                 })
                             })
@@ -578,15 +588,10 @@ impl_differentiable_operation! {
     },
 }
 
-// Forward-mode rule for mixed array IR concatenation. The trailing result-extent input is an ordinary
-// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
-// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
-impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayIrType> + Zero<C::Value>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + From<ConcatenateOperation<ArrayIrType>>
         + From<DimensionSizeOperation>
@@ -595,6 +600,7 @@ where
         + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -602,6 +608,9 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The trailing result-extent input is an ordinary non-differentiated shape value. Static input cotangent
+        // shapes replay the mixed concatenate directly; dynamic input shapes are retained as explicit residuals so
+        // the transpose can slice the output cotangent at runtime offsets.
         let destinations = context;
         let context = destinations.primal();
         let Some((result_extent, array_inputs)) = inputs.split_last() else {
@@ -611,6 +620,7 @@ where
             ))
             .into());
         };
+
         if array_inputs.is_empty() {
             return match result_extent.primal().r#type().as_ref() {
                 ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
@@ -742,6 +752,8 @@ where
         Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
 // cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
