@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   adapters, behind the `cuda-12` and `cuda-13` features.
 - Added Mosaic GPU type ID and serde-pass bindings, versioned bytecode/resource constants, CUDA-only `mosaic_gpu_v2`
   runtime registration, upstream Complex attribute bindings, and a source-owned UB poison attribute C API bridge.
+- Added a native C ABI and Rust bindings for direct verified Triton module compilation in GPU-configured archives,
+  with typed resource metadata, owned outputs, and explicit compiler availability on CPU archives.
 
 ### Changed
 

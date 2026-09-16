@@ -8,16 +8,16 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::{arith, scf, triton::tt};
 use ryft_mlir::{
-    Block, Context, DetachedBlock, DetachedOp, DialectHandle, Operation, Size, Type, TypeRef, UnknownLocationRef,
-    Value, ValueRef,
+    Block, Context, DetachedBlock, DetachedOp, DialectHandle, Module, Operation, Size, Type, TypeRef,
+    UnknownLocationRef, Value, ValueRef,
 };
 
 use crate::kernels::{Error, Options};
 
-/// Verified module text and the exact pointer-only logical argument mapping.
-pub(super) struct Lowered {
-    /// Deterministic typed module serialization.
-    pub ttir: String,
+/// Verified native module and the exact pointer-only logical argument mapping.
+pub(super) struct Lowered<'c, 't> {
+    /// Typed module owned for the duration of native compilation.
+    pub module: Module<'c, 't>,
 
     /// Physical parallel launch dimensions.
     pub grid: [u32; 3],
@@ -26,7 +26,7 @@ pub(super) struct Lowered {
     pub parameter_types: Vec<ArrayType>,
 }
 
-/// Native values remain owned by the lowering context until serialization finishes.
+/// Native values remain owned by the caller-provided lowering context.
 type Native<'c, 't> = ValueRef<'c, 'c, 't>;
 
 /// Global window preserving physical coordinates when logical axes are indexed away.
@@ -98,11 +98,12 @@ struct Lowering<'c, 't> {
 }
 
 /// Admits and constructs a complete native module without invoking a target compiler.
-pub(super) fn lower(
+pub(super) fn lower<'c, 't>(
+    context: &'c Context<'t>,
     kernel: &VerifiedKernel<'_>,
     options: &Options,
     _schedule: &KernelSchedule,
-) -> Result<Lowered, Error> {
+) -> Result<Lowered<'c, 't>, Error> {
     let call = kernel.definition().operation();
     if !call.aliases().is_empty() {
         return Err(unsupported("kernel_call", "read-write alias parameters are not yet supported"));
@@ -110,14 +111,13 @@ pub(super) fn lower(
     if !call.prefetch_types().is_empty() {
         return Err(unsupported("kernel_call", "scalar prefetch must be specialized before Triton compilation"));
     }
-    let context = Context::new();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     context.load_dialect(DialectHandle::arith()?)?;
     context.load_dialect(DialectHandle::scf()?)?;
     let location = context.unknown_location();
     let module = context.module(location)?;
     let mut lowering = Lowering {
-        context: &context,
+        context,
         location,
         remaining: options.maximum_instructions(),
         maximum_tile_elements: options.maximum_tile_elements(),
@@ -206,7 +206,7 @@ pub(super) fn lower(
     if !module.verify()? {
         return Err(unsupported("kernel_call", "constructed Triton module failed native verification"));
     }
-    Ok(Lowered { ttir: module.to_string(), grid: [count.max(1) as u32, 1, 1], parameter_types })
+    Ok(Lowered { module, grid: [count.max(1) as u32, 1, 1], parameter_types })
 }
 
 impl<'c, 't> Lowering<'c, 't> {
@@ -1175,78 +1175,102 @@ mod tests {
 
     #[test]
     fn test_lower() {
+        let context = Context::new();
         let r#type = ArrayType::new_static(DataType::F32, [1003]);
         let definition = vector::definition(&r#type, &r#type).unwrap();
         let verified = VerifiedKernel::new(&definition, 1024).unwrap();
-        let first = lower(&verified, &Options::default(), &KernelSchedule::default()).unwrap();
-        let second = lower(&verified, &Options::default(), &KernelSchedule::default()).unwrap();
+        let first = lower(&context, &verified, &Options::default(), &KernelSchedule::default()).unwrap();
+        let second = lower(&context, &verified, &Options::default(), &KernelSchedule::default()).unwrap();
         assert_eq!(first.grid, [4, 1, 1]);
         assert_eq!(first.parameter_types, vec![r#type; 3]);
-        assert_eq!(first.ttir, second.ttir);
+        assert_eq!(first.module.to_string(), second.module.to_string());
     }
 
     #[test]
     fn test_lower_empty_and_batched_windows() {
+        let context = Context::new();
         let r#type = ArrayType::new_static(DataType::F32, [0]);
         let definition = vector::definition(&r#type, &r#type).unwrap();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1024).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1024).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
         assert_eq!(lowered.grid, [1, 1, 1]);
         let r#type = ArrayType::new_static(DataType::F32, [1003]);
         let definition = vector::definition(&r#type, &r#type)
             .unwrap()
             .batched(2, &[Some(0), Some(0), Some(0)], 1024)
             .unwrap();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1024).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1024).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
         assert_eq!(lowered.grid, [8, 1, 1]);
         assert_eq!(lowered.parameter_types, vec![ArrayType::new_static(DataType::F32, [2, 1003]); 3]);
     }
 
     #[test]
     fn test_lower_large_global_window() {
+        let context = Context::new();
         let r#type = ArrayType::new_static(DataType::F32, [70_000]);
         let definition = vector::definition(&r#type, &r#type).unwrap();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1024).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1024).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
         assert_eq!(lowered.grid, [274, 1, 1]);
         assert_eq!(lowered.parameter_types, vec![r#type; 3]);
     }
 
     #[test]
     fn test_lower_reduction_and_matrix() {
+        let context = Context::new();
         let definition = sum::definition(&ArrayType::new_static(DataType::F32, [257])).unwrap();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1024).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1024).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
         assert_eq!(lowered.grid, [1, 1, 1]);
         let definition = matrix::definition(
             &ArrayType::new_static(DataType::F32, [33, 35]),
             &ArrayType::new_static(DataType::F32, [35, 34]),
         )
         .unwrap();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1024).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1024).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
         assert_eq!(lowered.grid, [4, 1, 1]);
     }
 
     #[test]
     fn test_lower_condition_write_bound() {
-        let definition = condition_write_definition();
-        let lowered =
-            lower(&VerifiedKernel::new(&definition, 1).unwrap(), &Options::default(), &KernelSchedule::default())
-                .unwrap();
-        assert_eq!(lowered.parameter_types, vec![ArrayType::scalar(DataType::F32)]);
         let context = Context::new();
-        context.load_dialect(DialectHandle::triton_tt().unwrap()).unwrap();
-        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
-        context.load_dialect(DialectHandle::scf().unwrap()).unwrap();
-        let module = context.parse_module(&lowered.ttir).unwrap();
-        let function = module.body().unwrap().operations().unwrap().next().unwrap().unwrap();
+        let definition = condition_write_definition();
+        let lowered = lower(
+            &context,
+            &VerifiedKernel::new(&definition, 1).unwrap(),
+            &Options::default(),
+            &KernelSchedule::default(),
+        )
+        .unwrap();
+        assert_eq!(lowered.parameter_types, vec![ArrayType::scalar(DataType::F32)]);
+        let function = lowered.module.body().unwrap().operations().unwrap().next().unwrap().unwrap();
         let body = function.region(0).unwrap().blocks().unwrap().next().unwrap().unwrap();
         let loop_operation = body
             .operations()

@@ -186,9 +186,25 @@ where
     fn unalign_cotangent_along(&self, target: &ArrayType, output_axes: &[usize]) -> Result<Self, DifferentiationError> {
         let mut contribution = reduce_broadcast_cotangent(self, target, output_axes)?;
 
-        // Reinstate the stretched axes (reduced away entirely above) as unit axes so the shape matches `target`.
+        // Reinstate stretched unit axes and any statically proven extent refinements. A homogeneous reshape
+        // cannot change a dynamic shape, but a broadcast can reinsert unit axes without reading runtime extents.
         if contribution.r#type().shape() != target.shape() {
-            contribution = contribution.reshape(target.shape().clone())?;
+            if contribution.r#type().static_shape().is_some() && target.static_shape().is_some() {
+                contribution = contribution.reshape(target.shape().clone())?;
+            } else {
+                let value_type = self.r#type();
+                let surviving_axes = output_axes
+                    .iter()
+                    .enumerate()
+                    .filter(|(axis, output_axis)| {
+                        target.dimension(*axis) != Dimension::Static(1)
+                            || value_type.dimension(**output_axis).bounds() == Dimension::Static(1).bounds()
+                    })
+                    .map(|(axis, _)| axis)
+                    .collect::<Vec<_>>();
+                let output_type = target.clone().with_data_type(contribution.r#type().data_type()).with_layout(None);
+                contribution = contribution.broadcast(output_type, &surviving_axes)?;
+            }
         }
 
         // Convert back to the operand's cotangent element type (the adjoint of the element-type promotion the
@@ -229,8 +245,8 @@ where
 
 /// Reduces broadcast copies and restores surviving axes to input order. Stretched singleton axes remain omitted;
 /// callers restore those axes and exact type metadata using their static or retained runtime geometry. The mapping
-/// must name one distinct output axis per target axis. A mapped dimension must either match its target dimension or
-/// be an expansion of a statically singleton target dimension.
+/// must name one distinct output axis per target axis. A mapped dimension must either match its target dimension
+/// (including equivalent static and exact-bound representations) or expand a statically singleton target dimension.
 pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + Transpose>(
     cotangent: &V,
     target: &ArrayType,
@@ -260,7 +276,14 @@ pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + T
     for (target_axis, &output_axis) in output_axes.iter().enumerate() {
         let target_dimension = target.dimension(target_axis);
         let value_dimension = value_type.dimension(output_axis);
-        if target_dimension != value_dimension {
+        let same_extent = target_dimension == value_dimension
+            || match (&target_dimension, &value_dimension) {
+                (Dimension::Static(size), dimension) | (dimension, Dimension::Static(size)) => {
+                    dimension.bounds() == Dimension::Static(*size).bounds()
+                }
+                _ => false,
+            };
+        if !same_extent {
             if target_dimension != Dimension::Static(1) {
                 return Err(TypeError::invalid(format!(
                     "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
@@ -530,14 +553,15 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation, NegOperation,
-        ReduceOperation, TanhOperation,
+        AddOperation, BroadcastOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation,
+        NegOperation, ReduceOperation, TanhOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{MaybeZero, ProgramBuilder};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -695,6 +719,77 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_derivative_alignment_dynamic_shape() {
+        // Exact singleton bounds permit a mapped axis to retain its extent under a different representation. The
+        // first axis consumes the symbolic identity so the forward and transposed programs both have it in scope.
+        let size = DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(2)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Dynamic(size)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let values = Array::matrix(2, 2, vec![2_f32, 5., 7., 9.]).unwrap();
+        assert_eq!(program.interpret(vec![values.clone()]), Ok(vec![values.clone()]));
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(pullback.output_types(), vec![input_type]);
+        assert_eq!(pullback.interpret(vec![values.clone()]), Ok(vec![values]));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[size, size] .
+                let %1:f32[size, 2] = broadcast [output_type=f32[size, 2], output_axes=[0, 1]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Reinstating a stretched singleton beside a genuinely dynamic axis needs no runtime extent read: an
+        // identity-axis broadcast restores that unit axis, while an ordinary reshape cannot change dynamic shapes.
+        let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(1)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size), Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::matrix(2, 1, vec![2_f32, 5.]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![2_f32, 2., 2., 5., 5., 5.]).unwrap()]),
+        );
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(pullback.output_types(), vec![input_type]);
+        assert_eq!(
+            pullback.interpret(vec![Array::matrix(2, 3, vec![1_f32, 2., 3., 4., 5., 6.]).unwrap()]),
+            Ok(vec![Array::matrix(2, 1, vec![6_f32, 15.]).unwrap()]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![Array::matrix::<f32>(0, 3, Vec::new()).unwrap()]),
+            Ok(vec![Array::matrix::<f32>(0, 1, Vec::new()).unwrap()]),
+        );
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[size, 3] .
+                let %1:f32[size] = reduce_sum [axes=[1]] %0
+                    %2:f32[size, 1] = broadcast [output_type=f32[size, 1], output_axes=[0]] %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_reduce_broadcast_cotangent() {
         // Introduced and stretched axes are summed away; restoring the stretched unit axis and element type belongs
         // to the caller, so this result deliberately has a compact shape and the cotangent's original element type.
@@ -728,6 +823,14 @@ mod tests {
             reduce_broadcast_cotangent(&cotangent, &target, &[1]),
             Ok(Array::from_elements(target, &[0_f64, 0.]).unwrap()),
         );
+
+        // A symbolic exact bound equal to a static target extent keeps the axis without staging a reduction.
+        let size = DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent = context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)])));
+        let target = ArrayType::new_static(DataType::F32, [2]);
+        assert_eq!(reduce_broadcast_cotangent(&cotangent, &target, &[0]).unwrap().atom_id(), cotangent.atom_id(),);
+        assert!(context.builder().borrow().instructions().is_empty());
 
         let cotangent =
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 2]), &[1_f64, 2., 3., 4.]).unwrap();

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Validates pinned non-TPU source contracts and the symbols in a built `ryft-xla-sys` archive.
 
-The static archive is always the CPU archive: CUDA and cuTile runtimes ship only in the Linux CUDA PJRT plugins, so
-the archive must define every source-derived symbol and none of the CUDA-only runtime symbols below.
+The static archive keeps CPU PJRT and may include GPU compilers. CUDA and cuTile execution runtimes ship only in the
+Linux CUDA PJRT plugins, so the archive defines all source-derived bridges and none of the runtime symbols below.
 """
 
 from __future__ import annotations
@@ -195,6 +195,7 @@ def discover_required_symbols(
 
     rust_paths = [
         Path("src/bindings.rs"),
+        Path("src/triton.rs"),
         Path("src/mlir/dialects/complex.rs"),
         Path("src/mlir/dialects/mosaic/gpu.rs"),
     ]
@@ -218,6 +219,14 @@ def discover_required_symbols(
     }
     require_equal_sets("Mosaic GPU C API bindings", mosaic_symbols | source_owned_mosaic_symbols, mosaic_rust_symbols)
     require_equal_sets("Complex C API bindings", complex_symbols, relevant_complex_rust_symbols)
+    triton_header_symbols = set(
+        extract_c_functions(read(ryft_xla_sys_root, "src/c++/triton_compiler.h"), "RYFT_XLA_SYS_EXPORT")
+    )
+    triton_rust_symbols = {
+        symbol for symbol in local_rust_symbols[Path("src/triton.rs")] if symbol.startswith("RYFT_XLA_Triton_")
+    }
+    require_equal_sets("Triton compiler C API bindings", triton_header_symbols, triton_rust_symbols)
+
 
     missing_pass_symbols = pass_symbols - local_rust_symbols[Path("src/bindings.rs")]
     if missing_pass_symbols:
@@ -866,6 +875,23 @@ pub const MOSAIC_GPU_FFI_TARGET: &str = "mosaic_gpu_v2";
             "src/c++/profiler.h",
             "RYFT_XLA_SYS_EXPORT void ryftProfilerStart(void);\n",
         )
+        triton_symbols = [
+            "RYFT_XLA_Triton_Compile",
+            "RYFT_XLA_Triton_Compile_Args_Destroy",
+            "RYFT_XLA_Triton_Get_Versions",
+            "RYFT_XLA_Triton_Versions_Destroy",
+        ]
+        self.write(
+            self.ryft_xla_sys,
+            "src/c++/triton_compiler.h",
+            "\n".join(f"RYFT_XLA_SYS_EXPORT void {symbol}(void);" for symbol in triton_symbols),
+        )
+        self.write(
+            self.ryft_xla_sys,
+            "src/triton.rs",
+            "\n".join(f"pub fn {symbol}();" for symbol in triton_symbols),
+        )
+
 
         self.write(
             self.ryft_mlir,
@@ -927,7 +953,18 @@ class ContractTests(unittest.TestCase):
         self.assertIn("mlirRegisterExpandStridedMetadataPass", symbols)
         self.assertIn("mlirRegisterLowerVectorMaskPass", symbols)
         self.assertIn("ryftProfilerStart", symbols)
+        self.assertIn("RYFT_XLA_Triton_Compile", symbols)
+        self.assertIn("RYFT_XLA_Triton_Compile_Args_Destroy", symbols)
+        self.assertIn("RYFT_XLA_Triton_Get_Versions", symbols)
+        self.assertIn("RYFT_XLA_Triton_Versions_Destroy", symbols)
         self.assertFalse(any("tpu" in symbol.lower() for symbol in symbols))
+
+    def test_check_rejects_missing_triton_compiler_binding(self) -> None:
+        """Requires the Rust declarations to cover every native Triton compiler export."""
+        bindings = self.fixture.ryft_xla_sys / "src/triton.rs"
+        bindings.write_text(bindings.read_text().replace("pub fn RYFT_XLA_Triton_Compile();", ""))
+        with self.assertRaisesRegex(ContractError, "Triton compiler C API bindings differs"):
+            check_sources(self.fixture.args())
 
     def test_mosaic_runtime_symbols_rejects_missing_registration(self) -> None:
         """Rejects a runtime function that the JIT cannot resolve inside a local plugin."""

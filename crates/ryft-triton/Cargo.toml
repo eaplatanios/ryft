@@ -14,10 +14,9 @@ ryft-core.workspace = true
 ryft-cuda.workspace = true
 ryft-mlir.workspace = true
 ryft-rocm.workspace = true
+ryft-xla-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

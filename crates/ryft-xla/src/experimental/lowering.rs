@@ -213,6 +213,9 @@ pub(crate) struct XlaExecutableSignature {
 
     /// Whether native CUDA artifact calls require the session launcher and execution-context user data.
     requires_cuda_kernel_runtime: bool,
+
+    /// Whether native ROCm artifact calls require the separate HIP session owner.
+    requires_rocm_kernel_runtime: bool,
 }
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
@@ -331,6 +334,7 @@ impl XlaExecutableSignature {
             unordered_io: false,
             requires_assertion_handler: false,
             requires_cuda_kernel_runtime: false,
+            requires_rocm_kernel_runtime: false,
         }
     }
 
@@ -379,6 +383,17 @@ impl XlaExecutableSignature {
     /// Restores the persisted CUDA runtime requirement without changing the program's effect classes.
     pub(crate) fn with_cuda_kernel_runtime(mut self, required: bool) -> Self {
         self.requires_cuda_kernel_runtime = required;
+        self
+    }
+
+    /// Returns whether execution needs session-owned HIP artifact resources.
+    pub(crate) fn requires_rocm_kernel_runtime(&self) -> bool {
+        self.requires_rocm_kernel_runtime
+    }
+
+    /// Restores the persisted HIP owner requirement without changing the effect classification.
+    pub(crate) fn with_rocm_kernel_runtime(mut self, required: bool) -> Self {
+        self.requires_rocm_kernel_runtime = required;
         self
     }
 
@@ -3338,8 +3353,19 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         } else {
             block.append_operation(tensor::cast(result, expected_type, location)?)?.result(0).unwrap().as_ref()
         }
-    } else if output_type.layout().is_some() && output_type.static_shape().is_none() {
-        // Layout constraints describe the physical allocation; restore logical sizes after constraining it.
+    } else if output_type.static_shape().is_none()
+        && (output_type.layout().is_some()
+            || output_type
+                .shape()
+                .dimensions()
+                .iter()
+                .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                .count()
+                > 1)
+    {
+        // `stablehlo.broadcast_in_dim` results admit at most one bounded dynamic axis. Broadcast the physical
+        // allocation for multiple dynamic axes or an explicit layout, then restore every logical size from its
+        // mapped input axis.
         let physical_type = physical_bound_type(output_type)?;
         let physical_input = lower_physical_bound_value(input, &input_types[0], 0.0, block, context, location)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
@@ -4714,12 +4740,11 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
         memory_layouts
     };
     // Compiler-provided static strides require fixed layouts even when the logical array type leaves them implicit.
-    let memory_layouts = if operation
-        .attributes()
-        .iter()
-        .any(|(name, value)| name == "ryft.cuda.row_major" && *value == CustomCallAttribute::Boolean(true))
-    {
-        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "cuda kernel")
+    let memory_layouts = if operation.attributes().iter().any(|(name, value)| {
+        matches!(name.as_str(), "ryft.cuda.row_major" | "ryft.rocm.row_major")
+            && *value == CustomCallAttribute::Boolean(true)
+    }) {
+        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")
             .map_err(|error| LoweringError::UnsupportedOp { op: error.to_string() })?;
         if operation.has_side_effect() {
             layouts.operands.push(Vec::new());
@@ -6915,6 +6940,13 @@ where
             matches!(instruction.operation(),
             XlaOperation::CustomCall(operation) | XlaOperation::Array(ArrayOperation::CustomCall(operation))
                 if operation.target_name() == crate::kernels::CUDA_KERNEL_CUSTOM_CALL_TARGET)
+        })
+    });
+    signature.requires_rocm_kernel_runtime = program.entry_region_ref().computation_regions().any(|region| {
+        region.instructions().iter().any(|instruction| {
+            matches!(instruction.operation(),
+            XlaOperation::CustomCall(operation) | XlaOperation::Array(ArrayOperation::CustomCall(operation))
+                if operation.target_name() == crate::kernels::ROCM_KERNEL_CUSTOM_CALL_TARGET)
         })
     });
     signature.requires_assertion_handler |= collective_state.has_assertions.get();
@@ -12079,6 +12111,129 @@ mod tests {
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(module.matches("stablehlo.dynamic_broadcast_in_dim").count(), 1, "{module}");
         assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 1, "{module}");
+    }
+
+    #[test]
+    fn test_plain_broadcast_dynamic_pullbacks_execute_on_cpu() {
+        /// Executes one homogeneous broadcast or its adjoint through the mixed executable ABI.
+        fn execute(program: PlainXlaProgram, values: &[f32], extent: i32) -> (Vec<f32>, Vec<u64>) {
+            let input_type = program.input_types().remove(0);
+            let output_type = program.output_types().remove(0);
+            let dimensions = physical_bound_type(&input_type)
+                .unwrap()
+                .static_shape()
+                .unwrap()
+                .dimensions()
+                .iter()
+                .map(|dimension| *dimension as u64)
+                .collect::<Vec<_>>();
+            let program = program.into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone()],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let client = execution_client();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let mut inputs = vec![ExecutionInput {
+                buffer: Arc::new(
+                    client
+                        .buffer(
+                            values_to_bytes(values).as_slice(),
+                            BufferType::F32,
+                            &dimensions,
+                            None,
+                            device.clone(),
+                            None,
+                        )
+                        .unwrap(),
+                ),
+                donatable: false,
+            }];
+            for dimension in input_type.shape().dimensions() {
+                if matches!(dimension, Dimension::Dynamic(_)) {
+                    inputs.push(ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(
+                                    values_to_bytes(&[extent]).as_slice(),
+                                    BufferType::I32,
+                                    &[],
+                                    None,
+                                    device.clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    });
+                }
+            }
+            let output = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+                .remove(0)
+                .outputs
+                .remove(0);
+            let dimensions = output.unpadded_dimensions().unwrap();
+            let bytes = output.copy_to_host(None).unwrap().r#await().unwrap();
+            (values_from_bytes::<f32>(&bytes), dimensions.to_vec())
+        }
+
+        // The first axis keeps the identity in scope while the second changes between its exact dynamic and static
+        // representations. The pullback must preserve both the values and the statically refined second axis.
+        let size = DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), 2.into()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.into()]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(execute(program, &[2., 5., 7., 9.], 2), (vec![2., 5., 7., 9.], vec![2, 2]));
+        assert_eq!(execute(pullback, &[1., 2., 3., 4.], 2), (vec![1., 2., 3., 4.], vec![2, 2]));
+
+        // Reduction removes the stretched singleton, and the pullback reinserts it beside a genuinely dynamic axis.
+        // Execute below the allocation bound to ensure the restored axis does not specialize the runtime extent.
+        let size = dynamic_dimension("size", Some(5));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone(), 1.into()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size, 3.into()]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![0, 1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(execute(program, &[2., 5., 0., 0.], 2), (vec![2., 2., 2., 5., 5., 5.], vec![2, 3]));
+        assert_eq!(
+            execute(pullback, &[1., 2., 3., 4., 5., 6., 0., 0., 0., 0., 0., 0.], 2),
+            (vec![6., 15.], vec![2, 1]),
+        );
     }
 
     #[test]

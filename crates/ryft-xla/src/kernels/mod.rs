@@ -24,6 +24,12 @@
 //! recompilation after incompatibility is an explicit caller decision. [`DistributedKernel`] coordinates functional
 //! calls over an existing distributed runtime using explicit host staging and the canonical pending completion.
 //! See [`distributed`] for ordering, cancellation, topology admission and publication semantics.
+//!
+//! The optional `triton` feature adds direct typed-TTIR compilation with `TritonEmbedding`. CUDA artifacts reuse
+//! [`CudaKernelEmbedding`]; ROCm artifacts use a separate HIP session owner enabled by `rocm`. Both retain the same
+//! staging, persistence and whole-execution completion path. Compiler-free Triton AOT loading reconstructs the
+//! binding with recorded compiler configuration; it still requires a compatible runtime and device. AMD hardware
+//! execution remains unqualified, and unsupported portable operations fail before native compilation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +48,8 @@ use thiserror::Error;
 
 mod aot;
 mod cuda;
+#[cfg(feature = "rocm")]
+mod rocm;
 #[cfg(feature = "cutile")]
 mod cutile;
 pub mod distributed;
@@ -49,11 +57,16 @@ pub mod distributed;
 pub(crate) mod mosaic;
 mod staging;
 mod tuning;
+#[cfg(feature = "triton")]
+mod triton;
 
 #[cfg(feature = "cutile")]
 pub use cutile::CuTileEmbedding;
 #[cfg(feature = "mosaic-gpu")]
 pub use mosaic::MosaicGpuEmbedding;
+
+#[cfg(feature = "triton")]
+pub use triton::TritonEmbedding;
 
 pub use aot::{KernelAotBundle, KernelAotError, KernelCompilationReport, LoadedKernel};
 pub use distributed::{DistributedKernel, DistributedKernelError, DistributedKernelOptions};
@@ -66,6 +79,14 @@ pub use staging::{
     XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelExtension, XlaKernelOperation,
     XlaKernelTarget, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_vjp,
 };
+
+#[cfg(feature = "rocm")]
+pub(crate) use rocm::RocmKernelRuntime;
+#[cfg(feature = "rocm")]
+pub use rocm::RocmKernelEmbedding;
+
+/// Typed FFI target used by persisted ROCm kernel calls.
+pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
 
 pub(crate) use cuda::CudaKernelRuntime;
 pub use cuda::{
@@ -82,6 +103,11 @@ pub enum KernelEmbeddingError {
     /// Canonical CUDA artifact validation failed.
     #[error(transparent)]
     Cuda(#[from] ryft_cuda::Error),
+
+    /// Concrete HIP artifact validation or runtime initialization failed.
+    #[cfg(feature = "rocm")]
+    #[error(transparent)]
+    Rocm(#[from] ryft_rocm::Error),
 
     /// Versioned payload serialization or parsing failed.
     #[error(transparent)]

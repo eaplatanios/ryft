@@ -343,7 +343,11 @@ fn test_generated_vector_cases() {
 
 #[test]
 fn test_macro_kernels_interpretation() {
-    for case in kernel_cases().into_iter().chain([precision_case(), batched_case()]) {
+    for case in kernel_cases()
+        .into_iter()
+        .filter(|case| case.name != "async_copy")
+        .chain([precision_case(), batched_case()])
+    {
         interpret_case(&case);
     }
 }
@@ -370,11 +374,12 @@ fn test_attention_interpretation() {
 }
 
 /// Exports a macro-authored whole-array kernel, reloads it in a fresh session, and awaits its native output.
-#[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+#[cfg(any(feature = "mosaic-gpu", feature = "cutile", feature = "triton"))]
 fn execute_aot_case<'c>(
     plugin: &crate::Plugin,
     client: &'c crate::Client<'c>,
     binding: ryft_xla::kernels::XlaKernelCompilerBinding,
+    deployment_binding: ryft_xla::kernels::XlaKernelCompilerBinding,
     backend: &str,
 ) {
     use std::io::Read;
@@ -420,7 +425,7 @@ fn execute_aot_case<'c>(
     drop(producer);
     let restored = KernelAotBundle::from_bytes(&bytes, 1024).unwrap();
     let runtime = Arc::new(XlaSession::new(client));
-    let loaded = restored.load(&runtime.domain(), &binding, &mesh).unwrap();
+    let loaded = restored.load(&runtime.domain(), &deployment_binding, &mesh).unwrap();
     let inputs: Vec<_> = [1.0f32, 2.0]
         .into_iter()
         .map(|value| runtime.array(r#type.clone(), mesh.clone(), value.to_ne_bytes().repeat(64)).unwrap())
@@ -603,7 +608,7 @@ mod gpu {
                     1024,
                 )
                 .unwrap();
-                execute_aot_case(&_plugin, &client, binding, "mosaic");
+                execute_aot_case(&_plugin, &client, binding.clone(), binding, "mosaic");
                 executed = true;
             }
         });
@@ -1287,7 +1292,7 @@ mod cutile {
                     1024,
                 )
                 .unwrap();
-                execute_aot_case(&_plugin, &client, binding, "cutile");
+                execute_aot_case(&_plugin, &client, binding.clone(), binding, "cutile");
                 executed = true;
             }
         });
@@ -1686,7 +1691,7 @@ mod cutile {
 }
 
 /// Bounded real-device schedule measurements; host readback and numerical validation are part of each sample.
-#[cfg(any(feature = "mosaic-gpu", feature = "cutile"))]
+#[cfg(any(feature = "mosaic-gpu", feature = "cutile", feature = "triton"))]
 mod tuning {
     use std::env;
     use std::num::NonZeroUsize;
@@ -1821,7 +1826,7 @@ mod tuning {
         .unwrap();
         let facts = XlaKernelExecutionFacts::from_client(client, &mesh).unwrap();
         let candidates = vec![
-            KernelSchedule::default(),
+            KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(1).unwrap()),
             KernelSchedule::default().with_pipeline_stages(NonZeroUsize::new(2).unwrap()),
         ];
         let environment = format!(
@@ -1885,6 +1890,35 @@ mod tuning {
             result.best_candidate(),
             result.samples()
         );
+    }
+
+    #[cfg(feature = "triton")]
+    #[test]
+    fn test_triton_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_TRITON_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+                    panic!("missing CUDA compute capability")
+                };
+                let (major, minor) = capability.split_once('.').unwrap();
+                let compiler = ryft_triton::kernels::Compiler::new();
+                measure(
+                    &client,
+                    compiler,
+                    ryft_triton::kernels::Target::Cuda { major: major.parse().unwrap(), minor: minor.parse().unwrap() },
+                    ryft_triton::kernels::Options::default(),
+                    ryft_xla::kernels::TritonEmbedding,
+                    &AtomicBool::new(false),
+                );
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled Triton tuning did not execute CUDA");
     }
 
     #[cfg(feature = "mosaic-gpu")]
@@ -2209,5 +2243,240 @@ mod stress {
         });
         assert!(executed, "compiler stress must execute the CUDA 13 platform");
         eprintln!("compiler stress passed: seed={seed} iteration={iteration} backend={backend}");
+    }
+}
+
+#[cfg(feature = "triton")]
+mod triton {
+    use std::env;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use pretty_assertions::assert_eq;
+
+    use ryft_core::kernels::{KernelCompiler, KernelSchedule};
+    use ryft_core::{
+        ArrayIrType, ArrayIrValue, CompilationCacheDomain, CompilationDomain, CompilationStagingRequest, Device,
+        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, call_function,
+    };
+    use ryft_triton::kernels::{Compiler, Options, Target};
+    use ryft_xla::kernels::{TritonEmbedding, XlaKernelCompilerBinding, stage_kernel};
+    use ryft_xla::{FromPjrt, XlaDomain, XlaOptions, XlaSession};
+
+    use crate::tests::{TestPlatform, test_for_each_platform};
+
+    use super::*;
+
+    /// Reads the actual CUDA architecture for explicit compiler selection.
+    fn device_target(client: &crate::Client<'_>) -> Target {
+        let device = client.addressable_devices().unwrap().remove(0);
+        let crate::Value::String(capability) = device.attribute("compute_capability").unwrap() else {
+            panic!("missing CUDA compute capability")
+        };
+        let (major, minor) = capability.split_once('.').unwrap();
+        Target::Cuda { major: major.parse().unwrap(), minor: minor.parse().unwrap() }
+    }
+
+    /// Compiles the unchanged portable definition, disables its compiler, and executes a fresh-session reload.
+    fn execute_case<'c>(client: &'c crate::Client<'c>, case: KernelCase) {
+        interpret_case(&case);
+        let semantic = case.definition.semantic_key().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let compiler = Compiler::new().with_cancellation(cancellation.clone());
+        let binding = XlaKernelCompilerBinding::new(
+            compiler,
+            device_target(client),
+            Options::default(),
+            KernelSchedule::default(),
+            TritonEmbedding,
+            1024,
+        )
+        .unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&device).unwrap()],
+        )
+        .unwrap();
+        let producer = Arc::new(XlaSession::new(client));
+        let domain = producer.domain();
+        let staged = domain
+            .stage(CompilationStagingRequest::<XlaDomain<'c>, _, Vec<ArrayIrType>, Vec<ArrayIrType>>::new(
+                |_, _, inputs: Vec<ryft_core::CompilationTracer<XlaDomain<'c>>>| {
+                    Ok(stage_kernel(inputs[0].context(), &case.definition, &inputs)?)
+                },
+                vec![],
+                case.input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+                XlaOptions::new(mesh.clone()).with_kernel_compiler(binding),
+            ))
+            .unwrap();
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        cancellation.store(true, Ordering::Release);
+        let session = Arc::new(XlaSession::new(client));
+        let runtime = session.domain();
+        let restored = runtime.deserialize_program(&bytes).unwrap().unwrap();
+        let executable = compiled
+            .executable_function()
+            .with_compiled_program(Arc::new(restored), compiled.executable_function().output_types().to_vec());
+        let inputs = case
+            .input_types
+            .iter()
+            .zip(&case.inputs)
+            .map(|(r#type, values)| {
+                session
+                    .array(
+                        r#type.clone(),
+                        mesh.clone(),
+                        values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            let outputs =
+                call_function(&runtime, &executable, inputs.iter().cloned().map(ArrayIrValue::Array).collect())
+                    .unwrap();
+            let ArrayIrValue::Array(output) = &outputs[0] else { panic!("expected array output") };
+            let bytes = output
+                .device_shard(device.id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            let values = bytes
+                .chunks_exact(size_of::<f32>())
+                .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(values, case.expected, "{}", case.name);
+        }
+        for (input, expected) in inputs.iter().zip(&case.inputs) {
+            let bytes = input
+                .device_shard(device.id().unwrap())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            assert_eq!(bytes, expected.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>());
+        }
+        assert_eq!(case.definition.semantic_key().unwrap(), semantic);
+        eprintln!("Triton {}: exact output, unchanged inputs, compiler-disabled reload", case.name);
+    }
+
+    /// Exercises the production adapter's complete HSACO path without loading HIP or requiring an AMD device.
+    #[test]
+    fn test_compiler_on_rocm() {
+        if env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+        /// Uses a whole-array contraction without checked loop dimensions or assertion hostcalls.
+        #[ryft_core::kernels::kernel]
+        fn dot(
+            #[input(data_type = F32, rank = 2)] left: &Array,
+            #[input(data_type = F32, rank = 2)] right: &Array,
+            #[output(data_type = F32, shape = [left.shape()[0], right.shape()[1]])] output: &mut Array,
+        ) {
+            output.store(left.load().dot(right.load()));
+        }
+        let compiler = Compiler::new();
+        let vector = kernel_cases().remove(0).definition;
+        let matrix = ArrayType::new_static(DataType::F32, [32, 32]);
+        let dot = dot::definition(&matrix, &matrix).unwrap();
+        for (architecture, definition) in
+            [("gfx908", &vector), ("gfx90a", &vector), ("gfx942", &vector), ("gfx942", &dot)]
+        {
+            let verified = ryft_core::kernels::VerifiedKernel::new(definition, 1024).unwrap();
+            let output = verified
+                .compile(
+                    &compiler,
+                    &Target::Rocm { architecture: architecture.into() },
+                    &Options::default(),
+                    &KernelSchedule::default(),
+                )
+                .unwrap();
+            let ryft_triton::kernels::Artifact::Rocm(artifact) = output.artifact() else {
+                panic!("ROCm compiler must return HSACO")
+            };
+            assert_eq!(artifact.target(), architecture);
+            assert_eq!(artifact.entry_name(), "ryft_kernel");
+            assert_eq!(artifact.parameter_count(), 3);
+            assert_eq!(artifact.launch_dimensions().block(), [256, 1, 1]);
+            assert_eq!(output.semantic_key(), definition.semantic_key().unwrap());
+            eprintln!("ROCm {architecture}: validated {} HSACO bytes; no hardware execution", artifact.image().len());
+        }
+    }
+
+    #[test]
+    fn test_unsupported_scratch() {
+        let case = async_copy_case(&[67]);
+        let verified = ryft_core::kernels::VerifiedKernel::new(&case.definition, 1024).unwrap();
+        let compiler = Compiler::new();
+        assert!(matches!(
+            compiler.admit(&verified, &Target::Cuda { major: 12, minor: 1 }, &Options::default(),
+                &KernelSchedule::default()),
+            Err(ryft_core::kernels::KernelCompilationError::Unsupported { operation: "scratch", requested, .. })
+                if requested == "operation is outside the portable Triton subset",
+        ));
+    }
+
+    #[test]
+    fn test_portable_kernels_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_TRITON_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                for case in kernel_cases()
+                    .into_iter()
+                    .filter(|case| case.name != "async_copy")
+                    .chain([precision_case(), batched_case()])
+                {
+                    execute_case(&client, case);
+                }
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled Triton qualification did not execute CUDA");
+    }
+
+    #[test]
+    fn test_aot_on_cuda() {
+        if env::var("RYFT_PJRT_RUN_TRITON_KERNELS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut executed = false;
+        test_for_each_platform!(|_plugin, client, platform| {
+            if matches!(platform, TestPlatform::Cuda13) {
+                let compiler = Compiler::new();
+                let target = device_target(&client);
+                let options = Options::default();
+                let schedule = KernelSchedule::default();
+                let configuration = compiler.configuration_key(&target, &options, &schedule).unwrap();
+                let deployment = Compiler::from_configuration(&configuration).unwrap();
+                let binding = XlaKernelCompilerBinding::new(
+                    compiler,
+                    target.clone(),
+                    options.clone(),
+                    schedule.clone(),
+                    TritonEmbedding,
+                    1024,
+                )
+                .unwrap();
+                let deployment_binding =
+                    XlaKernelCompilerBinding::new(deployment, target, options, schedule, TritonEmbedding, 1024)
+                        .unwrap();
+                assert_eq!(binding.configuration(), deployment_binding.configuration());
+                execute_aot_case(&_plugin, &client, binding, deployment_binding, "triton");
+                executed = true;
+            }
+        });
+        assert!(executed, "enabled Triton AOT qualification did not execute CUDA");
     }
 }

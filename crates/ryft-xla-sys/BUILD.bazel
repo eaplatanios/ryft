@@ -1,6 +1,7 @@
 load("@buildifier_prebuilt//:rules.bzl", "buildifier")
 load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library")
+load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda_is_configured")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
@@ -44,10 +45,31 @@ platform(
 # XLA
 # ----------------------------------------------------
 
+# GPU archives expose the Triton compiler through the same native C ABI as the other bridges. CPU archives retain
+# the core TT dialect and report compilation unavailable, avoiding unsupported GPU compiler dependencies on Windows.
+TRITON_COMPILER_DEPENDENCIES = [
+    "@llvm-project//llvm:Core",
+    "@llvm-project//mlir:BuiltinToLLVMIRTranslation",
+    "@llvm-project//mlir:FuncExtensions",
+    "@llvm-project//mlir:LLVMIRTransforms",
+    "@llvm-project//mlir:LLVMToLLVMIRTranslation",
+    "@llvm-project//mlir:NVVMToLLVMIRTranslation",
+    "@llvm-project//mlir:Pass",
+    "@llvm-project//mlir:ROCDLToLLVMIRTranslation",
+    "@llvm-project//mlir:SCFDialect",
+    "@llvm-project//mlir:ToLLVMIRTranslation",
+    "@triton//:TritonDialects",
+    "@xla//xla:debug_options_flags",
+    "@xla//xla/backends/gpu/codegen/triton:compilation_pipeline",
+    "@xla//xla/service/gpu/llvm_gpu_backend:amdgpu_backend",
+    "@xla//xla/service/gpu:target_constants",
+    "@xla//xla/stream_executor/cuda:cuda_compute_capability",
+    "@xla//xla/stream_executor/rocm:rocm_compute_capability",
+]
+
 XLA_DEPENDENCIES = [
     ":mlir_complex_capi",
     ":mlir_math_vector_pass_capi",
-    ":triton_tt_dialect",
     "@com_google_absl//absl/status",
     "@com_google_absl//absl/status:statusor",
     "@jax//jaxlib/mosaic/dialect/gpu:gpu_dialect_capi",
@@ -120,23 +142,19 @@ XLA_DEPENDENCIES = [
     "@xla//xla/python:aggregate_profile",
     "@xla//xla/python:xplane_to_profile_instructions",
     "@xla//xla/service/spmd/shardy/integrations/c:xla_sdy_capi",
-]
+] + select({
+    "@local_config_cuda//:is_cuda_enabled": TRITON_COMPILER_DEPENDENCIES,
+    "@local_config_rocm//rocm:using_hipcc": TRITON_COMPILER_DEPENDENCIES,
+    "//conditions:default": [":triton_tt_dialect"],
+}) + if_cuda_is_configured([
+    "@local_config_cuda//cuda:cuda_headers",
+    "@xla//xla/service/gpu/llvm_gpu_backend:nvptx_backend",
+    "@xla//xla/stream_executor/cuda:subprocess_compilation",
+])
 
-RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + select({
-    "@local_config_cuda//:is_cuda_enabled": [
-        "@xla//xla/pjrt/c:pjrt_c_api_gpu",
-        "@xla//xla/service:gpu_plugin",
-        "@xla//xla/stream_executor:cuda_platform",
-    ],
-    "@local_config_rocm//rocm:using_hipcc": [
-        "@xla//xla/pjrt/c:pjrt_c_api_gpu",
-        "@xla//xla/service:gpu_plugin",
-        "@xla//xla/stream_executor:rocm_platform",
-    ],
-    "//conditions:default": [
-        "@xla//xla/pjrt/c:pjrt_c_api_cpu",
-    ],
-})
+# The builtin PJRT API remains CPU-backed even when this archive includes GPU kernel compilers. GPU execution uses
+# the separately linked PJRT plugin target below, preventing its platform registration from entering this archive.
+RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + ["@xla//xla/pjrt/c:pjrt_c_api_cpu"]
 
 # The XLA LLVM Bazel overlay exposes Math and Vector pass C API declarations but omits their generated implementations.
 # Generate those implementations from the same pinned TableGen sources so Rust bindings resolve from the native archive.
@@ -316,6 +334,7 @@ cc_library(
         "src/c++/mlir/dialects/triton.cc",
         "src/c++/mlir/dialects/ub.cc",
         "src/c++/profiler.cc",
+        "src/c++/triton_compiler.cc",
     ],
     hdrs = [
         "src/c++/common.h",
@@ -335,11 +354,17 @@ cc_library(
         "src/c++/mlir/dialects/triton.h",
         "src/c++/mlir/dialects/ub.h",
         "src/c++/profiler.h",
+        "src/c++/triton_compiler.h",
     ],
     copts = tsl_copts() + [
         "-Iexternal/triton/include",
         "-I$(BINDIR)/external/triton/include",
     ],
+    local_defines = select({
+        "@local_config_cuda//:is_cuda_enabled": ["RYFT_TRITON_COMPILER=1", "RYFT_TRITON_CUDA=1"],
+        "@local_config_rocm//rocm:using_hipcc": ["RYFT_TRITON_COMPILER=1"],
+        "//conditions:default": [],
+    }),
     deps = RYFT_PJRT_SYS_DEPENDENCIES,
     alwayslink = True,
 )

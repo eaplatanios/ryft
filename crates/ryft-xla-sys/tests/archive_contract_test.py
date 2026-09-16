@@ -31,6 +31,7 @@ REQUIRED_PATHS = {
     "include/src/c++/mlir/dialects/sparse_tensor.h",
     "include/src/c++/mlir/dialects/transform.h",
     "include/src/c++/mlir/dialects/triton.h",
+    "include/src/c++/triton_compiler.h",
     "include/src/c++/mlir/dialects/ub.h",
     "include/src/c++/profiler.h",
     "include/xla/pjrt/c/pjrt_c_api_abi_version_extension.h",

@@ -12,6 +12,7 @@ license.workspace = true
 
 [dependencies]
 ryft-cuda = { workspace = true, optional = true }
+ryft-triton = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 
 [dev-dependencies]
@@ -27,6 +28,7 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [features]
+triton = ["dep:ryft-triton", "ryft-xla/triton"]
 cutile = ["dep:ryft-cuda", "ryft-cuda/cutile-compiler", "ryft-xla/cutile-compiler"]
 default = []
 cuda-12 = ["dep:ryft-cuda", "ryft-pjrt/cuda-12", "ryft-xla/cuda-12"]

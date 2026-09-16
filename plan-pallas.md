@@ -104,7 +104,7 @@ upstream stability promise.
 - **cuTile:** NVIDIA's tile programming system. Its tile execution space exposes block-level parallelism without
   per-thread control or explicit intra-block synchronization.
 - **Direct Triton backend:** Ryft lowering from verified portable kernel IR to a pinned TTIR contract, followed by
-  compilation through the existing PJRT Triton extension. It does not reuse JAX's Pallas lowering or require Python.
+  compilation through the `ryft-xla-sys` C ABI using the pinned Triton compiler pipeline. It does not reuse JAX's Pallas lowering or require Python.
 - **ROCm:** the AMD GPU target stack used in Phase 22, including the selected PJRT plugin, HIP runtime, HSACO artifact,
   architecture identifier, and launch ABI.
 - **Capability:** a compiler-and-device fact used for legality, selection, caching, and diagnostics—not a semantic
@@ -159,7 +159,7 @@ The allowed dependency direction is:
 ryft-xla      -> ryft-core, ryft-mlir, ryft-pjrt, ryft-xla-sys
               -> optional ryft-mosaic / ryft-cuda cuTile features / ryft-triton
 ryft-mosaic   -> ryft-core, ryft-mlir, required ryft-xla-sys compiler bridges
-ryft-triton   -> ryft-core, ryft-pjrt's existing Triton compiler extension
+ryft-triton   -> ryft-core, ryft-mlir, optional ryft-xla-sys Triton compiler executable
               -> ryft-mlir only for required typed TTIR; ryft-cuda for NVIDIA artifacts
 ryft-pjrt     -> ryft-xla-sys, optional ryft-cuda
 ryft-mlir     -> ryft-xla-sys
@@ -426,8 +426,9 @@ same restrictions as explicit builder construction.
   model where it fits, but must not depend on JAX or Python at deployment time.
 - The production kernel language, verifier, interpreter, scheduling contract, backend lowerings, transformations,
   debugging, profiling, autotuning, examples, and release qualification.
-- A pinned, typed direct-Triton compiler contract and one production ROCm execution route. The existing PJRT Triton
-  extension is useful groundwork, but it does not itself prove TTIR ownership, HSACO execution, or AMD qualification.
+- A pinned, typed direct-Triton compiler contract and one production ROCm execution route. The former PJRT Triton
+  compiler extension was removed upstream; the replacement native pipeline must prove PTX and HSACO production
+  independently of the deprecated Pallas runtime.
 
 Phase 0 produces machine-checkable non-TPU source contracts that compare the pinned and local surfaces directly.
 Phase 21 produces the separate TPU source contract, and Phase 22 produces the direct Triton and ROCm source contracts.
@@ -676,13 +677,14 @@ internal completion tokens live in compiler configuration and artifact metadata,
 ### 6.5 Direct Triton and ROCm integration boundary
 
 Phase 22 is a direct compiler backend, not compatibility with the deprecated JAX Pallas Triton backend. It lowers the
-verified portable subset to a pinned TTIR contract and compiles through the existing PJRT Triton extension. If the
+verified portable subset to a pinned TTIR contract and compiles through the linked `ryft-xla-sys` C ABI. The pinned
+PJRT ABI no longer exposes the deprecated Triton compiler extension; do not restore it. If the
 pinned native surface lacks typed TTIR construction, Ryft owns a minimal typed schema and deterministic serializer for
 the admitted subset; arbitrary user-supplied TTIR strings are not a production API.
 
 The resulting artifact uses exactly one production execution route per platform. NVIDIA reuses the established CUDA
-artifact path. ROCm selects either an official XLA/PJRT custom-call route or one hardened HIP launcher for HSACO, based
-on the Phase 22 source contract; it does not implement and maintain both. CUDA and ROCm launchers remain concrete and
+artifact path. ROCm uses one hardened HIP launcher for HSACO: the pinned plugin exposes no official artifact handler. The separate
+JAX Triton runtime is not imported. CUDA and ROCm launchers remain concrete and
 separate until repeated implementation proves a smaller shared contract. `ryft-triton` owns compiler output and target
 metadata, core owns semantic aliases/effects and logical signatures, platform runtimes own physical artifacts, and
 `ryft-xla` owns the embedding and executable persistence envelope. No adapter imports an XLA-owned artifact schema.
@@ -1952,58 +1954,110 @@ without any TPU dependency.
 **Prerequisites:** Phase 20. This post-v1 phase may proceed independently of Phase 21 and must not change the portable
 semantics stabilized by the first production release.
 
-**Owners:** new `ryft_triton::kernels` lowering, compiler invocation, typed options, and artifact mapping; existing
-Triton compiler extension and selected ROCm execution seam in `ryft-pjrt`; `ryft-cuda` NVIDIA artifacts/launching;
+**Owners:** new `ryft_triton::kernels` lowering, compiler invocation, typed options, and artifact mapping; optional
+native Triton compiler bridge in `ryft-xla-sys`; concrete HIP artifacts/launching in new `ryft-rocm`;
+existing FFI stream and completion support in `ryft-pjrt`; `ryft-cuda` NVIDIA artifacts/launching;
 `ryft-xla` selection/embedding/execution; only proven native or typed-IR gaps in `ryft-xla-sys` and `ryft-mlir`;
-Linux CUDA and ROCm CI/tooling.
+Linux CUDA and ROCm local qualification/tooling.
 
-- [ ] Freeze compatible Triton, TTIR, PJRT Triton extension, ROCm plugin, HIP, HSACO, driver, operating-system, and
+- [ ] Freeze compatible Triton, TTIR, native compiler bridge, ROCm plugin, HIP, HSACO, driver, operating-system, and
       hardware revisions. Add direct source contracts for every native symbol, artifact field, supported NVIDIA
       compute capability, supported AMD `gfx` architecture, and known restriction.
-- [ ] Create `ryft-triton` following §3.2. Use the existing PJRT Triton compiler extension directly without depending
-      on `ryft-xla`; do not copy its C API or move compiler ownership into `ryft-cuda` or `ryft-pjrt`.
-- [ ] Record explicitly that deprecated JAX Pallas-to-Triton lowering is unsupported. Do not import its Python
+- [x] Create `ryft-triton` following §3.2. Use the linked native compiler bridge without depending on `ryft-xla`;
+      do not restore the removed PJRT extension or move compiler policy into `ryft-cuda` or `ryft-pjrt`.
+- [x] Record explicitly that deprecated JAX Pallas-to-Triton lowering is unsupported. Do not import its Python
       lowering, compatibility surface, or runtime behavior into Ryft.
-- [ ] Prove one structured TTIR module through the existing PJRT Triton extension to executable PTX on NVIDIA and
+- [x] Prove one structured TTIR module through the pinned native compiler pipeline to executable PTX on NVIDIA and
       HSACO on AMD. Inspect entry symbols, layouts, resource metadata, diagnostics, and target code before designing
       the production lowering.
-- [ ] Select exactly one ROCm execution route for the resulting HSACO: an official XLA/PJRT custom-call route when the
-      pinned plugin exposes one, or a hardened HIP artifact launcher otherwise. Do not maintain both routes.
-- [ ] Keep CUDA and ROCm low-level launchers concrete and separate. Reuse the four ownership contracts in §6.7,
+- [x] Select exactly one ROCm execution route: a concrete HIP artifact launcher. Source inspection confirms that the
+      pinned plugin exposes no HSACO handler; do not import the separate JAX runtime or maintain two routes.
+- [x] Keep CUDA and ROCm low-level launchers concrete and separate. Reuse the four ownership contracts in §6.7,
       composed capability/cache identity, and core alias/effect diagnostics without a universal artifact schema or
       vendor-neutral launcher layer.
-- [ ] Define the portable subset admitted by direct Triton, including scalar/tile operations, layouts, reductions,
+- [x] Define the portable subset admitted by direct Triton, including scalar/tile operations, layouts, reductions,
       masked memory, atomics, barriers, dot and block-scaled operations, and bounded grids. Reject unsupported
       synchronization, memory-space, alias, resource, and target-operation contracts before TTIR construction.
-- [ ] Implement structured lowering to the pinned TTIR surface. Prefer typed native construction where supported;
+- [x] Implement structured lowering to the pinned TTIR surface. Prefer typed native construction where supported;
       otherwise own a minimal typed Ryft schema and deterministic TTIR serializer for the admitted subset. Do not
       expose arbitrary TTIR text as a verified kernel body.
-- [ ] Validate artifact entry points, argument ordering, buffer layouts, dynamic extents, aliases, side effects,
+- [x] Validate artifact entry points, argument ordering, buffer layouts, dynamic extents, aliases, side effects,
       scratch, launch geometry, architecture, PTX/HSACO format, and required resources before cache insertion or
       execution.
-- [ ] Include Triton, TTIR schema, PJRT extension, CUDA or ROCm/HIP, architecture, compiler options, launch ABI, and
-      artifact format versions in capabilities, cache identity, persistence manifests, and AOT compatibility checks.
-- [ ] Integrate batching, custom AD policy, specialization, rematerialization, profiling, tuning, persistence,
+- [x] Include Triton, TTIR schema, native compiler bridge, CUDA or ROCm/HIP, architecture, compiler options,
+      launch ABI and artifact format versions in capabilities, cache identity, persistence manifests, and AOT
+      compatibility checks.
+- [x] Integrate batching, custom AD policy, specialization, rematerialization, profiling, tuning, persistence,
       sharding, asynchronous completion, and distributed execution only where the portable contract already defines
       them. Reject every unsupported path before compilation.
-- [ ] Add CUDA and ROCm compiler-only CI, supported NVIDIA and AMD hardware qualification, clean-room AOT deployment,
-      concurrency and leak tests, malformed TTIR/artifact tests, and target-code inspection for PTX and HSACO.
+- [ ] Add CUDA and ROCm compiler-only checks, supported NVIDIA and AMD hardware qualification, clean-room AOT
+      deployment, concurrency and leak tests, malformed TTIR/artifact tests, and target-code inspection for PTX and HSACO.
 - [ ] Run the unchanged portable-definition suite through direct Triton on each supported platform. Prove NVIDIA
       artifacts reuse the one CUDA launcher, adapter-only tests exclude `ryft-xla`, and core gains no Triton/AMD enum.
-- [ ] Publish exact support matrices, installation requirements, backend-selection behavior, cache compatibility,
+- [x] Publish exact support matrices, installation requirements, backend-selection behavior, cache compatibility,
       failure diagnostics, and examples that compare portable semantics across the interpreter and supported backends.
 
-**Tests/docs:** typed TTIR construction and snapshot tests; invalid portable-to-Triton lowering cases; existing PJRT
-extension compile/error coverage; PTX and HSACO metadata inspection; CUDA and ROCm compile/launch/AOT reload tests;
-cross-backend numerical, alias, effect, synchronization, transform, cache, failure, and performance qualification;
+**Tests/docs:** typed TTIR construction and snapshot tests; invalid portable-to-Triton lowering cases;
+native compiler bridge compile/error coverage; PTX and HSACO metadata inspection; CUDA and ROCm compile/launch/AOT
+reload tests; cross-backend numerical, alias, effect, synchronization, transform, cache, failure and performance
+qualification;
 version and hardware matrices; direct-backend guide; and a complete verification record.
 
 **Excludes:** the deprecated JAX Pallas Triton backend, a JAX or Python runtime dependency, arbitrary TTIR ingestion,
 the full Triton language surface, treating TTIR as stable across unpinned revisions, Mosaic-specific target operations,
 maintaining two ROCm launch paths, and a speculative common CUDA/ROCm launcher hierarchy.
 
-**Estimate:** production 3,200-5,400; tests 3,000-5,000; docs 700-1,200. Re-estimate after the pinned compiler and
-ROCm execution probes select exact native, serialization, and launch seams.
+**Source investigation (2026-09-15):** XLA `eb6b90ed013f511eca088c52f541f3c0819f919e` pins Triton
+`a77e7c793abc0d0c923a9afb275058e2fe57a198` plus XLA patches. Its native `CreateTritonPipeline`, LLVM translation,
+`CompileToPtx`, and `CompileToHsaco` provide the selected native compiler seam; none is exposed by the PJRT
+plugin. Existing typed TTIR wrappers passed native construction, verification and serialization probes for vector
+addition and IEEE FP32 dot. HIP 7.13 header layout checks pass on Linux/aarch64 and Linux/x86_64; these do not establish
+HSACO execution. The former executable compiler passed eight contract tests for both `sm_80` and `sm_121`,
+including vector/dot HSACO generation and descriptor inspection for `gfx908`, `gfx90a`, and `gfx942`. Production
+typed lowering executed vector addition, reduction, batched indexed references, partial-tile matrix multiplication,
+and IEEE precision cases exactly on DGX Spark through the existing CUDA launcher. A deliberately false CUDA
+assertion reported device error 710 in an isolated process. AMD assertion hostcalls are explicitly unsupported.
+The prior Rust adapter and NVIDIA XLA/AOT integration passed their qualification tests. The user has no AMD machine, so AMD
+hardware execution remains unverified and cannot be claimed complete from compiler-only checks. No CI runs were used.
+
+**Implementation status:** the typed adapter, separate HIP launcher and XLA embedding are implemented. The native
+compiler now follows the existing `ryft-xla-sys` C header, C++ implementation and Rust FFI conventions. It borrows the
+typed MLIR module under an exclusive context guard and lowers a clone. `Compiler::new()` takes no executable path.
+Schema 2 records source/toolchain versions and linked capabilities without an executable hash or subprocess protocol.
+CPU-only archives report compilation unavailable; GPU-enabled compiler archives preserve ordinary CPU PJRT support.
+Cancellation is checked before and after synchronous native compilation; there is no hard timeout or containment of
+native aborts. Returned artifacts and diagnostics remain bounded, and native output ownership covers every exit.
+The linked implementation passes six native bridge tests, 37 Triton owner tests, and the full XLA suite with
+778 passing tests and five existing ignored tests. The 41 ROCm owner tests also pass. Spark passes the four
+experimental Triton tests, including all five numerical cases, 16 awaited AOT executions and compiler-only AMD
+products, plus two-schedule tuning. The admitted subset and exact deployment procedure are documented in
+[`crates/ryft-triton/README.md`](crates/ryft-triton/README.md); unsupported operations and zero-element physical
+parameters fail admission. AMD assertions and hardware execution remain outside the qualified matrix.
+
+**Prior qualification (before the native bridge refactor):** 40 Triton owner tests and 41 ROCm owner tests passed.
+The full XLA suite with Triton enabled passed 777 tests with five existing ignored tests; the subsequently added primary Triton embedding test also passes for
+both concrete artifact branches. Eight native compiler contract tests pass for each NVIDIA compiler target and
+inspect actual AMD vector/dot products. Spark passes five admitted portable numerical cases, repeated awaited
+execution, unchanged live inputs, compiler-disabled executable reload, compiler-free AOT loading with 16 executions,
+and two-schedule tuning with independent numerical checks. The production Rust compiler path validates vector HSACO
+for `gfx908`, `gfx90a`, and `gfx942` and whole-array IEEE dot HSACO for `gfx942`. Rustdoc builds for all three affected
+crates. Independent review fixed Boolean ordering and bounded-loop condition effects and resolved the empty-buffer
+admission gap. Full details are in `.tasks/plan_kernel_phase_22.md` and `.tasks/kernel-phase-22-evidence/`.
+
+**Native bridge qualification:** the standard GPU-enabled archive builds successfully and preserves built-in CPU
+PJRT. Archive contents and all 324 required exports pass verification; the C header compiles as C, and the exact
+CPU-only fallback passes availability, ownership and bounded-diagnostic checks. Fourteen native symbol-contract
+unit tests and affected Rustdoc builds pass. The broader existing source-contract check still references the removed
+JAX Mosaic `runtime.h`; this unrelated check was not changed. Refactor evidence is recorded in
+`.tasks/plan_triton_native_bridge.md` and `.tasks/triton-native-bridge-evidence/`.
+
+**Remaining qualification:** AMD launch/AOT/numerical hardware tests and SM80 device execution require unavailable
+hardware. A full native build with CUDA configuration disabled has not been tested; the cold local build stopped at
+its 300-second bound. These limits keep the combined
+hardware-qualification checklist items open; they do not imply that the compiler-only checks exercised AMD devices.
+
+**Original estimate:** production 3,200-5,400; tests 3,000-5,000; docs 700-1,200. The implemented route uses the existing
+typed MLIR and CUDA surfaces; no new dialect wrappers or common launcher hierarchy were required.
 
 **Exit criterion:** supported portable kernels compile directly through Triton and execute through versioned NVIDIA
 and ROCm artifact paths with deterministic caching, AOT reload, exact prelaunch diagnostics, target-code evidence, and
@@ -2031,7 +2085,7 @@ independent correctness, conventions, security, and simplicity audits reporting 
 - Existing program, execution, stream, FFI, GPU custom-call, metadata, topology, profiling, and distributed modules.
 - Thin CUDA client and XLA FFI stream/buffer adapters over `ryft-cuda`; no duplicate CUDA driver or cache policy.
 - No Mosaic-specific executable hierarchy and no cuTile-specific PJRT extension absent an upstream standard.
-- The existing Triton extension plus exactly one selected ROCm artifact execution path; CUDA and ROCm launchers stay
+- Existing FFI stream/completion adapters for the selected HIP artifact execution path; CUDA and ROCm launchers stay
   concrete until implementation evidence supports a smaller common contract.
 
 ### `ryft-cuda`
@@ -2078,7 +2132,7 @@ independent correctness, conventions, security, and simplicity audits reporting 
 
 ### `ryft-triton` (new in Phase 22)
 
-- Direct portable lowering, pinned typed TTIR, compiler invocation through the existing PJRT extension, target
+- Direct portable lowering, pinned typed TTIR, compiler invocation through the linked native compiler bridge, target
   legality, typed configuration, diagnostics, compatibility metadata, and NVIDIA/AMD artifact mapping.
 - Reuse canonical CUDA artifacts and the selected ROCm contract. Add native/typed wrappers only at their existing
   low-level owners and only where the pinned compiler contract proves a gap.
@@ -2294,7 +2348,7 @@ Expected production ownership:
 | `ryft-xla-sys` | 4% | missing registration/serde/runtime bridges and builds |
 | `ryft-mlir` | 25% | typed compiler dialects, Mosaic parity, verification, and pipelines |
 | `ryft-cuda` | 8% | producer-neutral artifact/launch runtime and optional cuTile compiler/manifest module |
-| `ryft-pjrt` | 5% | demonstrated generic gaps, adapters, Triton extension, selected ROCm execution path |
+| `ryft-pjrt` | 5% | demonstrated generic gaps, stream/completion adapters, selected ROCm execution path |
 | `ryft-core` / `ryft-macros` | 22% | macro DSL/tracing, IR, verifier, interpreter, transforms, adapter contracts |
 | `ryft-mosaic` | 20% | GPU/TPU compiler adapters, exact extensions, simulation, target policy |
 | `ryft-triton` | 6% | direct Triton compiler adapter, target policy and artifact mapping |
@@ -2391,8 +2445,10 @@ and performance gates only after variance is controlled.
 
 **Risk:** untrusted compiler tools, cubins, or cached metadata compromise builds or execution.
 
-**Mitigation:** optional sandboxed compiler subprocess, time/memory limits, content-hashed bundles, strict schema
-validation, trusted-source policy, and no implicit execution of foreign artifacts. Artifact signing is deferred unless
+**Mitigation:** explicit compiler selection, content-hashed bundles, strict schema validation, trusted-source policy,
+and no implicit execution of foreign artifacts. External compiler tools may use bounded subprocesses. The linked
+Triton bridge has ordinary in-process XLA failure semantics, cooperative cancellation and bounded returned outputs;
+it does not promise process isolation or a hard compilation deadline. Artifact signing is deferred unless
 an untrusted distribution model defines trust roots, key rotation, and verification policy.
 
 ### Scope explosion
@@ -2496,6 +2552,9 @@ begins, and revalidate the direct Triton and ROCm sources only when Phase 22 beg
   supported platforms, and version constraints that Phase 22 must revalidate.
 - [Triton project support matrix](https://github.com/triton-lang/triton/blob/main/README.md): current NVIDIA and AMD
   hardware, operating-system, and ROCm requirements that Phase 22 must pin rather than assume.
+- [PJRT Triton extension removal](https://github.com/openxla/xla/commit/6f094faf0fadcd1677e474c06b740876525c99fc):
+  the extension served deprecated Pallas Triton and is absent from the current pinned ABI. Phase 22 uses the
+  pinned native compiler pipeline instead of restoring this interface.
 - [cuTile execution model](https://docs.nvidia.com/cuda/cutile-python/execution.html): block/tile model, execution
   spaces, synchronization restrictions, launch, and compiler hints.
 - [cuTile compilation and export](https://docs.nvidia.com/cuda/cutile-python/compilation.html): cubin/TileIR export,

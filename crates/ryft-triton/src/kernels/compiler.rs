@@ -1,12 +1,7 @@
-//! Bounded native compiler invocation and concrete device artifact validation.
+//! In-process native compilation and concrete device artifact validation.
 
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use ryft_core::kernels::{
     KERNEL_CALL_OPERATION_NAME, KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel,
@@ -15,85 +10,70 @@ use ryft_core::{EffectClass, Typed};
 use ryft_cuda::{
     CudaArtifactFormat, CudaKernelAbi, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaKernelParameterType,
 };
+use ryft_mlir::{Context, StringRef};
 use ryft_rocm::{RocmKernelArtifact, RocmKernelLaunchDimensions};
-use serde::Deserialize;
+use ryft_xla_sys::triton::{
+    RYFT_XLA_Triton_Compile, RYFT_XLA_Triton_Compile_Args, RYFT_XLA_Triton_Compile_Args_Destroy,
+    RYFT_XLA_Triton_Get_Versions, RYFT_XLA_Triton_Versions, RYFT_XLA_Triton_Versions_Destroy,
+};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::kernels::lowering;
 use crate::kernels::{
     Artifact, COMPILER_SCHEMA_VERSION, CompiledKernel, Error, Options, TRITON_VERSION, Target, XLA_VERSION,
 };
 
-/// Explicit native compiler installation and optional caller-owned cancellation signal.
-#[derive(Clone, Debug)]
+/// Linked native compiler and optional caller-owned cancellation signal.
+///
+/// Compilation has the same in-process failure model as ordinary XLA compilation. Recoverable native failures
+/// return diagnostics. Cancellation is observed before and after the native call; it cannot interrupt that call
+/// or contain native aborts. Recorded configuration supports AOT compatibility checks without compiling.
+#[derive(Clone, Debug, Default)]
 pub struct Compiler {
-    /// Absolute executable path; no implicit compiler selection occurs.
-    executable: Option<PathBuf>,
-
-    /// Recorded configuration permits AOT compatibility checks without a compiler installation.
+    /// Recorded configuration disables compilation while retaining exact AOT compatibility checks.
     configuration: Option<Value>,
 
-    /// Cancellation affects control flow, not semantic identity.
+    /// Cancellation controls submission and publication, not semantic identity.
     cancellation: Arc<AtomicBool>,
 }
 
-/// Native products are decoded strictly before constructing a launchable artifact.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Checked entry metadata used to validate concrete PTX declarations.
 struct Metadata {
-    /// Native protocol schema.
-    schema: u32,
-
-    /// Concrete platform.
-    platform: String,
-
-    /// Requested compiler architecture.
-    requested_architecture: String,
-
-    /// Actual exported function.
-    entry_name: String,
-
-    /// Verified physical pointer count after scratch argument removal.
+    /// Number of ordinary global pointer arguments.
     argument_count: usize,
 
-    /// Actual warp count after native specialization.
-    warp_count: u32,
-
-    /// Requested warp count.
-    requested_warp_count: u32,
-
-    /// Requested pipeline stage count.
-    stage_count: usize,
-
-    /// Native threads in each warp or wavefront.
-    threads_per_warp: u32,
-
-    /// Actual thread block width.
+    /// Actual thread block width after native specialization.
     block_dimension_x: u32,
+}
 
-    /// Dynamic shared-memory allocation required at launch.
-    shared_memory_bytes: u32,
+/// Owns native compilation outputs through every error and cancellation path.
+struct NativeCompilation(RYFT_XLA_Triton_Compile_Args);
 
-    /// Unsupported external global scratch requirement.
-    global_scratch_bytes: u64,
+impl Drop for NativeCompilation {
+    fn drop(&mut self) {
+        // The bridge releases only its owned outputs; the input module remains owned by the caller.
+        unsafe { RYFT_XLA_Triton_Compile_Args_Destroy(&mut self.0) };
+    }
+}
 
-    /// Concrete image representation.
-    artifact_format: String,
+/// Owns the assembler version returned alongside process-lifetime source revision strings.
+struct NativeVersions(RYFT_XLA_Triton_Versions);
+
+impl Drop for NativeVersions {
+    fn drop(&mut self) {
+        unsafe { RYFT_XLA_Triton_Versions_Destroy(&mut self.0) };
+    }
 }
 
 impl Compiler {
-    /// Selects an absolute native executable path without starting a process or opening a GPU context.
-    pub fn new(executable: PathBuf) -> Result<Self, Error> {
-        if !executable.is_absolute() {
-            return Err(Error::Invalid { message: "compiler executable must be an absolute path".into() });
-        }
-        Ok(Self { executable: Some(executable), configuration: None, cancellation: Arc::new(AtomicBool::new(false)) })
+    /// Selects the native bridge linked into `ryft-xla-sys` without opening a GPU context.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Restores validated compiler configuration for AOT loading without opening an executable or runtime.
-    /// This compiler can check configuration compatibility but cannot compile new kernels. Configuration records
-    /// are compatibility metadata, not authentication of native code or its producer.
+    /// Restores validated compiler configuration for AOT loading without invoking the compiler or a GPU runtime.
+    /// This compiler can check compatibility but cannot compile new kernels. Configuration records describe
+    /// compatibility; they do not authenticate native code or its producer.
     pub fn from_configuration(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > 1024 * 1024 {
             return Err(Error::Invalid { message: "compiler configuration exceeds 1 MiB".into() });
@@ -102,21 +82,10 @@ impl Compiler {
         let fields = configuration
             .as_object()
             .ok_or_else(|| Error::Invalid { message: "compiler configuration must be an object".into() })?;
-        let expected = [
-            "schema",
-            "versions",
-            "executable_sha256",
-            "target",
-            "warp_count",
-            "pipeline_stages",
-            "maximum_scratch_bytes",
-        ];
+        let expected = ["schema", "versions", "target", "warp_count", "pipeline_stages", "maximum_scratch_bytes"];
         if fields.len() != expected.len()
             || expected.iter().any(|name| !fields.contains_key(*name))
             || configuration["schema"] != json!(COMPILER_SCHEMA_VERSION)
-            || configuration["executable_sha256"].as_str().is_none_or(|hash| {
-                hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
         {
             return Err(Error::Invalid { message: "invalid recorded compiler configuration".into() });
         }
@@ -132,25 +101,17 @@ impl Compiler {
         {
             return Err(Error::Invalid { message: "invalid recorded compiler options".into() });
         }
-        Ok(Self {
-            executable: None,
-            configuration: Some(configuration),
-            cancellation: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self { configuration: Some(configuration), ..Self::new() })
     }
 
-    /// Returns the native executable, absent for recorded AOT configuration.
-    pub fn executable(&self) -> Option<&Path> {
-        self.executable.as_deref()
-    }
-
-    /// Uses a caller-owned signal to terminate the isolated native process group during compilation.
+    /// Uses a caller-owned signal checked before native compilation and before publishing its result.
+    /// An in-progress native call runs to completion even when cancellation is requested.
     pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = cancellation;
         self
     }
 
-    /// Computes actual executable and toolchain identity under the same bounds as compilation.
+    /// Computes linked compiler and effective toolchain identity, or checks the recorded AOT configuration.
     fn key(&self, target: &Target, options: &Options, schedule: &KernelSchedule) -> Result<Vec<u8>, Error> {
         target.validate()?;
         let stages = schedule.pipeline_stages().map_or(2, |stages| stages.get());
@@ -171,56 +132,55 @@ impl Compiler {
             }
             return Ok(serde_json::to_vec(configuration)?);
         }
-        let executable = self.executable.as_ref().unwrap();
-        let mut file = File::open(executable).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Error::Unavailable { message: format!("compiler executable `{}` does not exist", executable.display()) }
-            } else {
-                Error::Io(error)
-            }
-        })?;
-        if !file.metadata()?.is_file() {
-            return Err(Error::Invalid { message: "compiler executable must be a regular file".into() });
+        let native = NativeVersions(unsafe { RYFT_XLA_Triton_Get_Versions() });
+        let available = match target {
+            Target::Cuda { .. } => native.0.cuda_available,
+            Target::Rocm { .. } => native.0.rocm_available,
+        };
+        if !available {
+            return Err(Error::Unavailable {
+                message: "linked native archive does not include the requested Triton compiler target".into(),
+            });
         }
-        let mut digest = Sha256::new();
-        let mut buffer = [0u8; 65_536];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        let directory = tempfile::tempdir()?;
-        let (stdout, _) = self.run(directory.path(), &["--version"], options)?;
-        let versions: Value = serde_json::from_str(&stdout)?;
+        let versions = json!({
+            "schema": COMPILER_SCHEMA_VERSION,
+            "xla": unsafe { StringRef::from_c_api(native.0.xla) }.to_string(),
+            "jax": unsafe { StringRef::from_c_api(native.0.jax) }.to_string(),
+            "triton": unsafe { StringRef::from_c_api(native.0.triton) }.to_string(),
+            "rocm_device_libs": unsafe { StringRef::from_c_api(native.0.rocm_device_libs) }.to_string(),
+            "cuda_available": native.0.cuda_available,
+            "rocm_available": native.0.rocm_available,
+            "cuda_toolkit_version": native.0.cuda_toolkit_version,
+            "assembler_version": String::from_utf8(unsafe {
+                copy_native_bytes(native.0.assembler_version, native.0.assembler_version_size, 1024)?
+            }).map_err(|_| Error::Invalid { message: "native assembler version is not UTF-8".into() })?,
+        });
         Self::validate_versions(&versions, target)?;
         Ok(serde_json::to_vec(&json!({
-            "schema": COMPILER_SCHEMA_VERSION,
-            "versions": versions,
-            "executable_sha256": format!("{:x}", digest.finalize()),
-            "target": target,
-            "warp_count": options.warp_count(),
-            "pipeline_stages": stages,
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions, "target": target,
+            "warp_count": options.warp_count(), "pipeline_stages": stages,
             "maximum_scratch_bytes": schedule.maximum_scratch_bytes(),
         }))?)
     }
 
-    /// Uses the same exact source and target-specific toolchain contract for live and recorded installations.
+    /// Checks the same linked-source and target toolchain contract for live and recorded configurations.
     fn validate_versions(versions: &Value, target: &Target) -> Result<(), Error> {
         let fixed = json!({
-            "schema": 1, "protocol": 1, "xla": XLA_VERSION,
+            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION,
             "jax": "a7606f995e1a92707cbeb257e487fa53e7abe84b", "triton": TRITON_VERSION,
             "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
         });
         let valid_toolchain = match target {
             Target::Cuda { .. } => {
-                versions["cuda_toolkit_version"] == json!(13020) && versions["assembler_version"] == json!("13.0.88")
+                versions["cuda_available"] == json!(true)
+                    && versions["cuda_toolkit_version"] == json!(13020)
+                    && versions["assembler_version"] == json!("13.0.88")
             }
             Target::Rocm { .. } => {
-                versions["cuda_toolkit_version"]
-                    .as_u64()
-                    .is_some_and(|version| version == 0 || (version >= 12000 && version % 10 == 0))
+                versions["rocm_available"] == json!(true)
+                    && versions["cuda_toolkit_version"]
+                        .as_u64()
+                        .is_some_and(|version| version == 0 || (version >= 12000 && version % 10 == 0))
                     && versions["assembler_version"].as_str().is_some_and(|version| {
                         version == "unavailable"
                             || (version.split('.').count() == 3
@@ -230,8 +190,10 @@ impl Compiler {
                     })
             }
         };
-        if !versions.as_object().is_some_and(|fields| fields.len() == 8)
+        if !versions.as_object().is_some_and(|fields| fields.len() == 9)
             || fixed.as_object().unwrap().iter().any(|(name, value)| versions[name] != *value)
+            || versions["cuda_available"].as_bool().is_none()
+            || versions["rocm_available"].as_bool().is_none()
             || !valid_toolchain
         {
             return Err(Error::Invalid {
@@ -241,7 +203,7 @@ impl Compiler {
         Ok(())
     }
 
-    /// Rejects unsupported physical buffers and target-specific effects before starting a native process.
+    /// Rejects unsupported physical buffers and target-specific effects before native compilation.
     fn validate_boundary(kernel: &VerifiedKernel<'_>, target: &Target) -> Result<(), Error> {
         if matches!(target, Target::Rocm { .. })
             && !(1..=64).contains(&kernel.definition().operation().parameters().len())
@@ -273,126 +235,6 @@ impl Compiler {
         }
         Ok(())
     }
-
-    /// Executes one native process group with bounded files, deadline and cancellation; always reaps the child.
-    #[cfg(unix)]
-    fn run(&self, directory: &Path, arguments: &[&str], options: &Options) -> Result<(String, String), Error> {
-        use std::os::unix::process::CommandExt;
-
-        if self.cancellation.load(Ordering::Acquire) {
-            return Err(Error::Tool {
-                reason: "cancelled before launch".into(),
-                stdout: String::new(),
-                stderr: String::new(),
-            });
-        }
-        let stdout_path = directory.join("stdout.log");
-        let stderr_path = directory.join("stderr.log");
-        let executable = self.executable.as_ref().ok_or_else(|| Error::Unavailable {
-            message: "recorded compiler configuration cannot compile new kernels".into(),
-        })?;
-        let mut child = Command::new(executable)
-            .args(arguments)
-            .current_dir(directory)
-            .env_clear()
-            .env("PATH", "/usr/local/cuda/bin:/usr/bin:/bin")
-            .env("TMPDIR", directory)
-            .stdin(Stdio::null())
-            .stdout(File::create(&stdout_path)?)
-            .stderr(File::create(&stderr_path)?)
-            .process_group(0)
-            .spawn()?;
-        let start = Instant::now();
-        let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Err(error) => break Err(format!("failed while observing child: {error}")),
-                Ok(None) => {}
-            }
-            if self.cancellation.load(Ordering::Acquire) {
-                break Err("cancelled".into());
-            }
-            if start.elapsed() >= options.process_timeout() {
-                break Err("timed out".into());
-            }
-            let bounds = [
-                (&stdout_path, options.maximum_diagnostic_bytes()),
-                (&stderr_path, options.maximum_diagnostic_bytes()),
-            ];
-            if let Some(reason) = bounds.iter().find_map(|(path, limit)| match fs::metadata(path) {
-                Ok(metadata) if metadata.len() > *limit as u64 => Some("exceeded diagnostic capture limit".to_owned()),
-                Err(error) => Some(format!("failed to inspect diagnostic output: {error}")),
-                _ => None,
-            }) {
-                break Err(reason);
-            }
-            if let Some(reason) =
-                [("artifact", options.maximum_artifact_bytes()), ("metadata.json", options.maximum_diagnostic_bytes())]
-                    .iter()
-                    .find_map(|(name, limit)| match fs::metadata(directory.join(name)) {
-                        Ok(metadata) if metadata.len() > *limit as u64 => {
-                            Some("exceeded compiler product size limit".to_owned())
-                        }
-                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                            Some(format!("failed to inspect compiler product: {error}"))
-                        }
-                        _ => None,
-                    })
-            {
-                break Err(reason);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        unsafe extern "C" {
-            fn kill(process: i32, signal: i32) -> i32;
-        }
-        // The negative child PID addresses only the fresh process group. Descendants must not survive completion,
-        // failure or cancellation. Retain a cleanup error while still reaping the owned child below.
-        let result = unsafe { kill(-(child.id() as i32), 9) };
-        let cleanup = if result == 0 {
-            None
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(3) { None } else { Some(error) }
-        };
-        child.wait()?;
-        if let Some(error) = cleanup {
-            return Err(error.into());
-        }
-        let read_diagnostic = |path: &Path| -> Result<String, Error> {
-            let mut bytes = Vec::new();
-            File::open(path)?.take(options.maximum_diagnostic_bytes() as u64).read_to_end(&mut bytes)?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        };
-        let stdout = read_diagnostic(&stdout_path)?;
-        let stderr = read_diagnostic(&stderr_path)?;
-        if fs::metadata(&stdout_path)?.len().max(fs::metadata(&stderr_path)?.len())
-            > options.maximum_diagnostic_bytes() as u64
-        {
-            return Err(Error::Tool { reason: "exceeded diagnostic capture limit".into(), stdout, stderr });
-        }
-        match outcome {
-            Ok(status) if status.success() => Ok((stdout, stderr)),
-            Ok(status) => Err(Error::Tool { reason: format!("exited with `{status}`"), stdout, stderr }),
-            Err(reason) => Err(Error::Tool { reason, stdout, stderr }),
-        }
-    }
-
-    /// Native compiler process isolation currently requires Unix process groups.
-    #[cfg(not(unix))]
-    fn run(&self, _directory: &Path, _arguments: &[&str], _options: &Options) -> Result<(String, String), Error> {
-        Err(Error::Invalid { message: "native compiler process isolation requires Unix".into() })
-    }
-
-    /// Reads at most one byte beyond a validated limit, detecting files that grow after metadata inspection.
-    fn read(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
-        let mut bytes = Vec::new();
-        File::open(path)?.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            return Err(Error::Artifact { message: "compiler output exceeds its size limit".into() });
-        }
-        Ok(bytes)
-    }
 }
 
 impl KernelCompiler for Compiler {
@@ -410,7 +252,11 @@ impl KernelCompiler for Compiler {
     ) -> Result<(), KernelCompilationError<Error>> {
         target.validate().map_err(classify)?;
         Self::validate_boundary(kernel, target).map_err(classify)?;
-        lowering::lower(kernel, options, schedule).map_err(classify)?;
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(classify(Error::Cancelled));
+        }
+        let context = Context::new();
+        lowering::lower(&context, kernel, options, schedule).map_err(classify)?;
         self.key(target, options, schedule).map_err(classify)?;
         Ok(())
     }
@@ -434,70 +280,83 @@ impl KernelCompiler for Compiler {
         let compile = || -> Result<CompiledKernel, Error> {
             target.validate()?;
             Self::validate_boundary(kernel, target)?;
-            let lowered = lowering::lower(kernel, options, schedule)?;
-            if lowered.ttir.len() > 8 * 1024 * 1024 {
-                return Err(Error::Invalid { message: "generated TTIR exceeds the native 8 MiB limit".into() });
+            if self.configuration.is_some() {
+                return Err(Error::Invalid {
+                    message: "recorded compiler configuration cannot compile new kernels".into(),
+                });
             }
+            if self.cancellation.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            let context = Context::new();
+            let lowered = lowering::lower(&context, kernel, options, schedule)?;
             let configuration_key = self.key(target, options, schedule)?;
-            let (platform, architecture, threads_per_warp, format) = match target {
-                Target::Cuda { major, minor } => ("cuda", format!("{major}.{minor}"), 32, "ptx"),
-                Target::Rocm { architecture } => ("rocm", architecture.clone(), 64, "hsaco"),
+            let (platform, architecture, threads_per_warp) = match target {
+                Target::Cuda { major, minor } => ("cuda", format!("{major}.{minor}"), 32),
+                Target::Rocm { architecture } => ("rocm", architecture.clone(), 64),
             };
-            let stages = schedule.pipeline_stages().map_or(2, |stages| stages.get());
-            let directory = tempfile::tempdir()?;
-            fs::write(directory.path().join("input.ttir"), &lowered.ttir)?;
-            let (stdout, stderr) = self.run(
-                directory.path(),
-                &[
-                    platform,
-                    &architecture,
-                    &options.warp_count().to_string(),
-                    &stages.to_string(),
-                    "input.ttir",
-                    "artifact",
-                    "metadata.json",
-                ],
-                options,
-            )?;
-            let metadata: Metadata = serde_json::from_slice(&Self::read(
-                &directory.path().join("metadata.json"),
+            let mut native = NativeCompilation(RYFT_XLA_Triton_Compile_Args::new(
+                unsafe { lowered.module.to_c_api() },
+                unsafe { StringRef::from(platform).to_c_api() },
+                unsafe { StringRef::from(architecture.as_str()).to_c_api() },
+                options.warp_count() as i32,
+                schedule.pipeline_stages().map_or(2, |stages| stages.get()) as i32,
+                options.maximum_artifact_bytes(),
                 options.maximum_diagnostic_bytes(),
-            )?)?;
-            if metadata.schema != 1
-                || metadata.platform != platform
-                || metadata.requested_architecture != architecture
-                || metadata.entry_name != "ryft_kernel"
-                || metadata.argument_count != lowered.parameter_types.len()
-                || metadata.requested_warp_count != options.warp_count()
-                || metadata.stage_count != stages
-                || metadata.threads_per_warp != threads_per_warp
-                || metadata.warp_count == 0
-                || metadata.warp_count > 1024 / threads_per_warp
-                || metadata.block_dimension_x != metadata.warp_count * threads_per_warp
-                || metadata.global_scratch_bytes != 0
-                || metadata.artifact_format != format
-                || metadata.shared_memory_bytes > 1024 * 1024
-                || schedule.maximum_scratch_bytes().is_some_and(|limit| metadata.shared_memory_bytes as usize > limit)
+            ));
+            if self.cancellation.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            let success = {
+                // Native passes mutate a clone in this context. Keep the exclusive guard through the entire call.
+                let _guard = context.borrow_mut();
+                unsafe { RYFT_XLA_Triton_Compile(&mut native.0).value != 0 }
+            };
+            if self.cancellation.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            let diagnostics = String::from_utf8_lossy(&unsafe {
+                copy_native_bytes(native.0.diagnostics, native.0.diagnostics_size, options.maximum_diagnostic_bytes())?
+            })
+            .into_owned();
+            if !success {
+                return Err(Error::Compilation { message: diagnostics });
+            }
+            let entry = unsafe { copy_native_bytes(native.0.entry_name, native.0.entry_name_size, 1024)? };
+            if entry != b"ryft_kernel"
+                || native.0.argument_count != lowered.parameter_types.len() as i64
+                || native.0.threads_per_warp != threads_per_warp
+                || native.0.actual_warp_count <= 0
+                || native.0.actual_warp_count > 1024 / threads_per_warp
+                || !(0..=1024 * 1024).contains(&native.0.shared_memory_bytes)
+                || schedule.maximum_scratch_bytes().is_some_and(|limit| native.0.shared_memory_bytes as usize > limit)
             {
                 return Err(Error::Artifact {
                     message: "native metadata differs from the requested entry, target or resource contract".into(),
                 });
             }
-            let bytes = Self::read(&directory.path().join("artifact"), options.maximum_artifact_bytes())?;
+            let metadata = Metadata {
+                argument_count: lowered.parameter_types.len(),
+                block_dimension_x: (native.0.actual_warp_count * threads_per_warp) as u32,
+            };
+            let shared_memory_bytes = native.0.shared_memory_bytes as u32;
+            let bytes = unsafe {
+                copy_native_bytes(native.0.artifact, native.0.artifact_size, options.maximum_artifact_bytes())?
+            };
             let artifact = match target {
                 Target::Cuda { .. } => {
                     let ptx = std::str::from_utf8(&bytes)
                         .map_err(|_| Error::Artifact { message: "PTX is not UTF-8".into() })?;
-                    let target_architecture = validate_ptx(ptx, target, &metadata)?;
+                    let architecture = validate_ptx(ptx, target, &metadata)?;
                     Artifact::Cuda(CudaKernelArtifact::new(
                         CudaArtifactFormat::Ptx,
                         bytes,
                         "ryft_kernel",
-                        target_architecture,
+                        architecture,
                         CudaKernelLaunchDimensions::new(
                             lowered.grid,
                             [metadata.block_dimension_x, 1, 1],
-                            metadata.shared_memory_bytes,
+                            shared_memory_bytes,
                         )?,
                         CudaKernelAbi::new(
                             "triton global pointers",
@@ -514,23 +373,41 @@ impl KernelCompiler for Compiler {
                     RocmKernelLaunchDimensions::new(
                         lowered.grid,
                         [metadata.block_dimension_x, 1, 1],
-                        metadata.shared_memory_bytes,
+                        shared_memory_bytes,
                     )?,
                 )?),
             };
             if self.key(target, options, schedule)? != configuration_key {
-                return Err(Error::Invalid { message: "compiler installation changed during compilation".into() });
+                return Err(Error::Invalid { message: "compiler toolchain changed during compilation".into() });
+            }
+            if self.cancellation.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
             }
             Ok(CompiledKernel {
                 artifact,
                 parameter_types: lowered.parameter_types,
                 semantic_key: kernel.definition().semantic_key()?,
                 configuration_key,
-                diagnostics: format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+                diagnostics,
             })
         };
         compile().map_err(classify)
     }
+}
+
+/// Copies a bounded native output while its owning result remains alive.
+///
+/// # Safety
+/// A nonempty buffer must be readable for its declared size until the copy completes. The native bridge guarantees
+/// this for its owned result buffers. Empty results may use a null pointer.
+unsafe fn copy_native_bytes(pointer: *const u8, size: usize, maximum: usize) -> Result<Vec<u8>, Error> {
+    if size > maximum || (size != 0 && pointer.is_null()) {
+        return Err(Error::Artifact { message: "native output is null or exceeds its size limit".into() });
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(unsafe { std::slice::from_raw_parts(pointer, size) }.to_vec())
 }
 
 /// Preserves canonical admission categories and concrete native diagnostics.
@@ -683,24 +560,10 @@ mod tests {
 
     /// Metadata for a single-pointer, zero-scratch native program.
     fn metadata() -> Metadata {
-        Metadata {
-            schema: 1,
-            platform: "cuda".into(),
-            requested_architecture: "12.1".into(),
-            entry_name: "ryft_kernel".into(),
-            argument_count: 1,
-            warp_count: 4,
-            requested_warp_count: 4,
-            stage_count: 2,
-            threads_per_warp: 32,
-            block_dimension_x: 128,
-            shared_memory_bytes: 0,
-            global_scratch_bytes: 0,
-            artifact_format: "ptx".into(),
-        }
+        Metadata { argument_count: 1, block_dimension_x: 128 }
     }
 
-    /// A portable definition used to exercise the complete compile protocol with controlled native products.
+    /// A portable definition used to exercise the native compilation without changing its portable semantics.
     #[ryft_core::kernels::kernel]
     fn vector(
         #[input(data_type = F32, rank = 1)] left: &Array,
@@ -729,58 +592,31 @@ mod tests {
     /// Produces the fixed source contract used by both the native and recorded paths.
     fn versions() -> Value {
         json!({
-            "schema": 1, "protocol": 1, "xla": XLA_VERSION,
+            "schema": COMPILER_SCHEMA_VERSION, "xla": XLA_VERSION,
             "jax": "a7606f995e1a92707cbeb257e487fa53e7abe84b", "triton": TRITON_VERSION,
             "rocm_device_libs": "53996464fa8d94b182ac4aaa7dc3a109ab524f45",
+            "cuda_available": true, "rocm_available": true,
             "cuda_toolkit_version": 13020, "assembler_version": "13.0.88",
         })
     }
 
-    /// Creates a controlled native installation whose products are ordinary sibling files.
-    #[cfg(unix)]
-    fn installation(directory: &Path, artifact: &[u8], metadata: &Value, changed: bool) -> Compiler {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::write(directory.join("versions.json"), serde_json::to_vec(&versions()).unwrap()).unwrap();
-        fs::write(directory.join("product"), artifact).unwrap();
-        fs::write(directory.join("product.json"), serde_json::to_vec(metadata).unwrap()).unwrap();
-        let executable = directory.join("compiler");
-        let script = indoc! {r#"
-            #!/bin/sh
-            directory=$(dirname "$0")
-            if [ "$1" = "--version" ]; then
-                cat "$directory/versions.json"
-            else
-                cp "$directory/product" "$6"
-                cp "$directory/product.json" "$7"
-            fi
-        "#};
-        fs::write(
-            &executable,
-            if changed { format!("{script}printf '# changed\\n' >> \"$0\"\n") } else { script.into() },
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        Compiler::new(executable).unwrap()
-    }
-
     #[test]
     fn test_compiler_new() {
-        assert!(Compiler::new(PathBuf::from("/compiler")).is_ok());
-        assert!(matches!(Compiler::new(PathBuf::from("compiler")), Err(Error::Invalid { message })
-            if message == "compiler executable must be an absolute path"));
+        let compiler = Compiler::new();
+        assert!(compiler.configuration.is_none());
+        assert!(!compiler.cancellation.load(Ordering::Acquire));
     }
 
     #[test]
     fn test_compiler_from_configuration() {
         let configuration = json!({
-            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "executable_sha256": "a".repeat(64),
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(),
             "target": Target::Cuda { major: 12, minor: 1 }, "warp_count": 4,
             "pipeline_stages": 2, "maximum_scratch_bytes": null,
         });
         let bytes = serde_json::to_vec(&configuration).unwrap();
         let restored = Compiler::from_configuration(&bytes).unwrap();
-        assert_eq!(restored.executable(), None);
+        assert!(restored.configuration.is_some());
         assert_eq!(
             restored
                 .key(&Target::Cuda { major: 12, minor: 1 }, &Options::default(), &KernelSchedule::default())
@@ -816,123 +652,66 @@ mod tests {
     }
 
     #[test]
-    fn test_compiler_executable() {
-        assert_eq!(Compiler::new("/compiler".into()).unwrap().executable(), Some(Path::new("/compiler")));
-    }
-
-    #[test]
     fn test_compiler_with_cancellation() {
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let compiler = Compiler::new("/compiler".into()).unwrap().with_cancellation(cancellation.clone());
-        cancellation.store(true, Ordering::Release);
-        assert!(compiler.cancellation.load(Ordering::Acquire));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_compiler_key() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("compiler");
-        let versions = versions();
-        let script = format!("#!/bin/sh\nprintf '%s\\n' '{versions}'\n");
-        fs::write(&path, &script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        let compiler = Compiler::new(path.clone()).unwrap();
-        let target = Target::Cuda { major: 12, minor: 1 };
-        let schedule = KernelSchedule::default();
-        let key = compiler.key(&target, &Options::default(), &schedule).unwrap();
-        assert_eq!(
-            compiler
-                .key(&target, &Options::default().with_process_timeout(Duration::from_secs(1)).unwrap(), &schedule)
-                .unwrap(),
-            key
-        );
-        assert_ne!(compiler.key(&target, &Options::default().with_warp_count(8).unwrap(), &schedule).unwrap(), key);
-        let recorded = Compiler::from_configuration(&key).unwrap();
-        assert_eq!(recorded.executable(), None);
-        assert_eq!(recorded.key(&target, &Options::default(), &schedule).unwrap(), key);
-        assert!(matches!(
-            recorded.key(&target, &Options::default().with_warp_count(8).unwrap(), &schedule),
-            Err(Error::Invalid { message })
-                if message == "requested options differ from recorded compiler configuration"
-        ));
-        fs::write(&path, format!("{script}# changed executable\n")).unwrap();
-        assert_ne!(compiler.key(&target, &Options::default(), &schedule).unwrap(), key);
-        fs::write(&path, script.replace("13.0.88", "13.1.0")).unwrap();
-        assert!(matches!(compiler.key(&target, &Options::default(), &schedule), Err(Error::Invalid { message })
-            if message == "compiler installation differs from the qualified source and toolchain contract"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_compiler_run() {
-        let compiler = Compiler::new("/bin/sh".into()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        assert_eq!(
-            compiler
-                .run(directory.path(), &["-c", "printf output; printf diagnostic >&2"], &Options::default())
-                .unwrap(),
-            ("output".into(), "diagnostic".into())
-        );
-        assert!(matches!(compiler.run(directory.path(), &["-c", "printf partial; exit 7"], &Options::default()),
-            Err(Error::Tool { stdout, stderr, .. }) if stdout == "partial" && stderr.is_empty()));
-        let options = Options::default().with_output_limits(32, 4).unwrap();
-        assert!(matches!(compiler.run(directory.path(), &["-c", "printf 123456"], &options),
-            Err(Error::Tool { reason, stdout, stderr }) if reason == "exceeded diagnostic capture limit"
-                && stdout == "1234" && stderr.is_empty()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_compiler_run_cancellation_and_timeout() {
-        let directory = tempfile::tempdir().unwrap();
         let cancellation = Arc::new(AtomicBool::new(true));
-        let compiler = Compiler::new("/bin/sh".into()).unwrap().with_cancellation(cancellation.clone());
-        assert!(matches!(compiler.run(directory.path(), &["-c", "exit 0"], &Options::default()),
-            Err(Error::Tool { reason, stdout, stderr })
-                if reason == "cancelled before launch" && stdout.is_empty() && stderr.is_empty()));
-        cancellation.store(false, Ordering::Release);
-        let options = Options::default().with_process_timeout(Duration::from_millis(20)).unwrap();
-        assert!(matches!(compiler.run(directory.path(), &["-c", "sleep 2"], &options),
-            Err(Error::Tool { reason, .. }) if reason == "timed out"));
+        let compiler = Compiler::new().with_cancellation(cancellation);
+        let r#type = ArrayType::new_static(DataType::F32, [256]);
+        let definition = vector::definition(&r#type, &r#type).unwrap();
+        let kernel = VerifiedKernel::new(&definition, 1024).unwrap();
+        let target = Target::Cuda { major: 12, minor: 1 };
+        assert!(matches!(
+            compiler.admit(&kernel, &target, &Options::default(), &KernelSchedule::default()),
+            Err(KernelCompilationError::Compiler(Error::Cancelled))
+        ));
+        assert!(matches!(
+            compiler.compile(&kernel, &target, &Options::default(), &KernelSchedule::default()),
+            Err(KernelCompilationError::Compiler(Error::Cancelled))
+        ));
     }
 
     #[test]
-    fn test_compiler_read() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("output");
-        fs::write(&path, [1, 2, 3]).unwrap();
-        assert_eq!(Compiler::read(&path, 3).unwrap(), [1, 2, 3]);
-        assert!(matches!(Compiler::read(&path, 2), Err(Error::Artifact { message })
-            if message == "compiler output exceeds its size limit"));
+    fn test_compiler_configuration_key() {
+        let configuration = json!({
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": Target::Cuda { major: 12, minor: 1 },
+            "warp_count": 4, "pipeline_stages": 2, "maximum_scratch_bytes": null,
+        });
+        let bytes = serde_json::to_vec(&configuration).unwrap();
+        let compiler = Compiler::from_configuration(&bytes).unwrap();
+        let target = Target::Cuda { major: 12, minor: 1 };
+        assert_eq!(
+            compiler.configuration_key(&target, &Options::default(), &KernelSchedule::default()).unwrap(),
+            bytes
+        );
+        assert!(
+            matches!(compiler.key(&target, &Options::default().with_warp_count(8).unwrap(), &KernelSchedule::default()),
+            Err(Error::Invalid { message }) if message == "requested options differ from recorded compiler configuration")
+        );
+        let mut old = configuration.clone();
+        old["schema"] = json!(1);
+        assert!(matches!(Compiler::from_configuration(&serde_json::to_vec(&old).unwrap()),
+            Err(Error::Invalid { message }) if message == "invalid recorded compiler configuration"));
     }
 
     #[test]
     fn test_compiler_admit() {
-        let directory = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new(directory.path().join("missing")).unwrap();
+        let compiler = Compiler::new();
         let r#type = ArrayType::new_static(DataType::F32, [32, 32]);
         let definition = matrix::definition(&r#type, &r#type).unwrap();
         let verified = VerifiedKernel::new(&definition, 1024).unwrap();
-        let options = Options::default();
-        let schedule = KernelSchedule::default();
         assert!(matches!(
-            compiler.admit(&verified, &Target::Rocm { architecture: "gfx942".into() }, &options, &schedule),
+            compiler.admit(
+                &verified,
+                &Target::Rocm { architecture: "gfx942".into() },
+                &Options::default(),
+                &KernelSchedule::default()
+            ),
             Err(KernelCompilationError::Unsupported { operation: "ordered_assertion", .. })
         ));
-        let r#type = ArrayType::new_static(DataType::F32, [256]);
-        let definition = vector::definition(&r#type, &r#type).unwrap();
-        let verified = VerifiedKernel::new(&definition, 1024).unwrap();
-        assert!(matches!(compiler.admit(&verified, &Target::Cuda { major: 12, minor: 1 }, &options, &schedule),
-            Err(KernelCompilationError::Unavailable { message }) if message.contains("does not exist")));
     }
 
     #[test]
     fn test_compiler_admit_and_compile_empty_parameters() {
-        let directory = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new(directory.path().join("missing")).unwrap();
+        let compiler = Compiler::new();
         let r#type = ArrayType::new_static(DataType::F32, [0]);
         let definition = vector::definition(&r#type, &r#type).unwrap();
         let verified = VerifiedKernel::new(&definition, 1024).unwrap();
@@ -957,8 +736,7 @@ mod tests {
 
     #[test]
     fn test_compiler_admit_and_compile_rocm_parameter_count() {
-        let directory = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new(directory.path().join("missing")).unwrap();
+        let compiler = Compiler::new();
         let r#type = ArrayType::new_static(DataType::F32, [1]);
         let prototype = vector::definition(&r#type, &r#type).unwrap();
         let options = Options::default();
@@ -974,10 +752,7 @@ mod tests {
             let verified = VerifiedKernel::new(&definition, 1024).unwrap();
             assert!(Compiler::validate_boundary(&verified, &Target::Cuda { major: 12, minor: 1 }).is_ok());
             if count == 64 {
-                assert!(matches!(
-                    compiler.admit(&verified, &target, &options, &schedule),
-                    Err(KernelCompilationError::Unavailable { .. })
-                ));
+                assert!(Compiler::validate_boundary(&verified, &target).is_ok());
                 continue;
             }
             for result in [
@@ -995,73 +770,106 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_compiler_compile() {
+        let configuration = json!({
+            "schema": COMPILER_SCHEMA_VERSION, "versions": versions(), "target": Target::Cuda { major: 12, minor: 1 },
+            "warp_count": 4, "pipeline_stages": 2, "maximum_scratch_bytes": null,
+        });
+        let compiler = Compiler::from_configuration(&serde_json::to_vec(&configuration).unwrap()).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [256]);
         let definition = vector::definition(&r#type, &r#type).unwrap();
-        let verified = VerifiedKernel::new(&definition, 1024).unwrap();
-        let target = Target::Cuda { major: 12, minor: 1 };
+        let kernel = VerifiedKernel::new(&definition, 1024).unwrap();
+        assert!(matches!(compiler.compile(&kernel, &Target::Cuda { major: 12, minor: 1 },
+            &Options::default(), &KernelSchedule::default()),
+            Err(KernelCompilationError::Compiler(Error::Invalid { message }))
+                if message == "recorded compiler configuration cannot compile new kernels"));
+    }
+
+    #[test]
+    fn test_compiler_compile_native() {
+        if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let compiler = Compiler::new();
+        let r#type = ArrayType::new_static(DataType::F32, [256]);
+        let definition = vector::definition(&r#type, &r#type).unwrap();
+        let original = definition.body().to_string();
+        let kernel = VerifiedKernel::new(&definition, 1024).unwrap();
         let options = Options::default();
         let schedule = KernelSchedule::default();
-        let metadata = json!({
-            "schema": 1, "platform": "cuda", "requested_architecture": "12.1", "entry_name": "ryft_kernel",
-            "argument_count": 3, "warp_count": 4, "requested_warp_count": 4, "stage_count": 2,
-            "threads_per_warp": 32, "block_dimension_x": 128, "shared_memory_bytes": 0,
-            "global_scratch_bytes": 0, "artifact_format": "ptx",
-        });
-        let ptx = PTX.replace(
-            ".param .u64 .ptr .global .align 1 pointer",
-            ".param .u64 .ptr .global .align 1 first, \
-             .param .u64 .ptr .global .align 1 second, \
-             .param .u64 .ptr .global .align 1 output",
-        );
-        let directory = tempfile::tempdir().unwrap();
-        let compiler = installation(directory.path(), ptx.as_bytes(), &metadata, false);
-        compiler.admit(&verified, &target, &options, &schedule).unwrap();
-        let compiled = compiler.compile(&verified, &target, &options, &schedule).unwrap();
-        assert_eq!(compiled.parameter_types(), &[r#type.clone(), r#type.clone(), r#type]);
-        assert_eq!(compiled.semantic_key(), definition.semantic_key().unwrap());
-        assert!(matches!(compiled.artifact(), Artifact::Cuda(_)));
-        for (field, value) in [
-            ("argument_count", json!(4)),
-            ("platform", json!("rocm")),
-            ("block_dimension_x", json!(256)),
-            ("global_scratch_bytes", json!(1)),
-            ("unexpected", json!(0)),
+        for target in [
+            Target::Cuda { major: 8, minor: 0 },
+            Target::Cuda { major: 12, minor: 1 },
+            Target::Rocm { architecture: "gfx942".into() },
         ] {
-            let mut changed = metadata.clone();
-            changed[field] = value;
-            fs::write(directory.path().join("product.json"), serde_json::to_vec(&changed).unwrap()).unwrap();
-            assert!(matches!(
-                compiler.compile(&verified, &target, &options, &schedule),
-                Err(KernelCompilationError::Compiler(Error::Artifact { .. } | Error::Json(_)))
-            ));
+            compiler.admit(&kernel, &target, &options, &schedule).unwrap();
+            let configuration = compiler.configuration_key(&target, &options, &schedule).unwrap();
+            let output = compiler.compile(&kernel, &target, &options, &schedule).unwrap();
+            assert_eq!(output.semantic_key(), definition.semantic_key().unwrap());
+            assert_eq!(output.parameter_types(), vec![r#type.clone(); 3]);
+            assert_eq!(output.configuration_key(), configuration);
+            assert_eq!(definition.body().to_string(), original);
+            assert!(output.diagnostics().len() <= options.maximum_diagnostic_bytes());
+            match (target.clone(), output.artifact()) {
+                (Target::Cuda { major, minor }, Artifact::Cuda(artifact)) => {
+                    assert_eq!(artifact.symbol(), "ryft_kernel");
+                    assert_eq!(artifact.target_architecture(), format!("sm_{major}{minor}"));
+                    assert_eq!(artifact.launch_dimensions().grid(), [1, 1, 1]);
+                    assert_eq!(artifact.launch_dimensions().block(), [128, 1, 1]);
+                    assert!(!artifact.bytes().is_empty());
+                    assert!(artifact.bytes().len() <= options.maximum_artifact_bytes());
+                }
+                (Target::Rocm { .. }, Artifact::Rocm(artifact)) => {
+                    assert_eq!(artifact.entry_name(), "ryft_kernel");
+                    assert_eq!(artifact.target(), "gfx942");
+                    assert_eq!(artifact.parameter_count(), 3);
+                    assert_eq!(artifact.launch_dimensions().grid(), [1, 1, 1]);
+                    assert_eq!(artifact.launch_dimensions().block(), [256, 1, 1]);
+                    assert!(!artifact.image().is_empty());
+                    assert!(artifact.image().len() <= options.maximum_artifact_bytes());
+                }
+                _ => panic!("native compiler returned an artifact for a different platform"),
+            }
+            let deployment = Compiler::from_configuration(&configuration).unwrap();
+            assert_eq!(deployment.configuration_key(&target, &options, &schedule).unwrap(), configuration);
+            assert!(matches!(deployment.compile(&kernel, &target, &options, &schedule),
+                Err(KernelCompilationError::Compiler(Error::Invalid { message }))
+                    if message == "recorded compiler configuration cannot compile new kernels"));
         }
-        fs::write(directory.path().join("product.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
-        fs::write(directory.path().join("product"), ptx.replace("sm_121", "sm_80")).unwrap();
-        assert!(matches!(
-            compiler.compile(&verified, &target, &options, &schedule),
-            Err(KernelCompilationError::Compiler(Error::Artifact { .. }))
-        ));
-        fs::write(directory.path().join("product"), [0xff]).unwrap();
-        assert!(matches!(compiler.compile(&verified, &target, &options, &schedule),
-            Err(KernelCompilationError::Compiler(Error::Artifact { message })) if message == "PTX is not UTF-8"));
-        let mut rocm_metadata = metadata.clone();
-        rocm_metadata["platform"] = json!("rocm");
-        rocm_metadata["requested_architecture"] = json!("gfx942");
-        rocm_metadata["threads_per_warp"] = json!(64);
-        rocm_metadata["block_dimension_x"] = json!(256);
-        rocm_metadata["artifact_format"] = json!("hsaco");
-        fs::write(directory.path().join("product.json"), serde_json::to_vec(&rocm_metadata).unwrap()).unwrap();
-        assert!(matches!(
-            compiler.compile(&verified, &Target::Rocm { architecture: "gfx942".into() }, &options, &schedule),
-            Err(KernelCompilationError::Compiler(Error::Rocm(_)))
-        ));
-        let changed = installation(directory.path(), ptx.as_bytes(), &metadata, true);
-        assert!(matches!(changed.compile(&verified, &target, &options, &schedule),
-            Err(KernelCompilationError::Compiler(Error::Invalid { message }))
-                if message == "compiler installation changed during compilation"));
+    }
+
+    #[test]
+    fn test_compiler_compile_native_output_limits() {
+        if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let compiler = Compiler::new();
+        let r#type = ArrayType::new_static(DataType::F32, [256]);
+        let definition = vector::definition(&r#type, &r#type).unwrap();
+        let kernel = VerifiedKernel::new(&definition, 1024).unwrap();
+        let target = Target::Cuda { major: 12, minor: 1 };
+        let schedule = KernelSchedule::default();
+        // One element per thread keeps this fixture's diagnostics focused on output validation.
+        for (limit, expected) in [(1024, "compiler artifact exceeds its byte limit"), (8, "compiler")] {
+            let options = Options::default().with_warp_count(8).unwrap().with_output_limits(1, limit).unwrap();
+            let error = compiler.compile(&kernel, &target, &options, &schedule).unwrap_err();
+            let KernelCompilationError::Compiler(Error::Compilation { message }) = error else {
+                panic!("expected a native compilation error, got {error:?}");
+            };
+            assert_eq!(message, expected);
+        }
+    }
+
+    #[test]
+    fn test_copy_native_bytes() {
+        let bytes = [1, 2, 3];
+        assert_eq!(unsafe { copy_native_bytes(bytes.as_ptr(), bytes.len(), 3) }.unwrap(), bytes);
+        assert_eq!(unsafe { copy_native_bytes(std::ptr::null(), 0, 3) }.unwrap(), Vec::<u8>::new());
+        for (pointer, size, maximum) in [(std::ptr::null(), 1, 3), (bytes.as_ptr(), 3, 2)] {
+            assert!(matches!(unsafe { copy_native_bytes(pointer, size, maximum) },
+                Err(Error::Artifact { message }) if message == "native output is null or exceeds its size limit"));
+        }
     }
 
     #[test]

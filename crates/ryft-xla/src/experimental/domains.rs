@@ -47,6 +47,8 @@ use crate::arrays_v0::{
     BoundedMaterializationWaiter, ExecuteArguments,
 };
 use crate::experimental::operations::ShardMapOperation;
+#[cfg(feature = "rocm")]
+use crate::kernels::RocmKernelRuntime;
 use crate::kernels::{CudaKernelRuntime, KernelEmbeddingError};
 use crate::{Array, ArrayError, Error, FromPjrt, ShardDescriptor, ShardLayout, ToPjrt};
 
@@ -223,6 +225,14 @@ pub struct XlaSession<'c> {
 
     /// Existing whole-execution fences protecting borrowed CUDA contexts even after outputs are dropped.
     cuda_kernel_completions: Mutex<Vec<ExecutionFence>>,
+
+    /// Separate HIP resources borrowed by ROCm execution contexts.
+    #[cfg(feature = "rocm")]
+    rocm_kernel_runtime: Mutex<Option<Box<RocmKernelRuntime>>>,
+
+    /// Whole-program completions retaining HIP user data and loaded modules after dropped outputs.
+    #[cfg(feature = "rocm")]
+    rocm_kernel_completions: Mutex<Vec<ExecutionFence>>,
 }
 
 impl Drop for XlaSession<'_> {
@@ -237,6 +247,17 @@ impl Drop for XlaSession<'_> {
         }
         // Drop uses the CUDA owner's existing cleanup/error retention policy while our client borrow is alive.
         drop(self.cuda_kernel_runtime.get_mut().expect("cuda runtime owner mutex poisoned").take());
+        #[cfg(feature = "rocm")]
+        {
+            let completions = self.rocm_kernel_completions.get_mut().expect("rocm completion owner mutex poisoned");
+            for completion in completions.drain(..) {
+                match completion.block_until_ready() {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            // Keep the borrowed PJRT client alive while HIP releases its synchronized module cache.
+            drop(self.rocm_kernel_runtime.get_mut().expect("rocm runtime owner mutex poisoned").take());
+        }
     }
 }
 
@@ -254,6 +275,10 @@ impl<'c> XlaSession<'c> {
             default_effect_scope: Arc::new(EffectScope::default()),
             cuda_kernel_runtime: Mutex::new(None),
             cuda_kernel_completions: Mutex::new(Vec::new()),
+            #[cfg(feature = "rocm")]
+            rocm_kernel_runtime: Mutex::new(None),
+            #[cfg(feature = "rocm")]
+            rocm_kernel_completions: Mutex::new(Vec::new()),
         }
     }
 
@@ -2136,6 +2161,10 @@ struct XlaPersistentKeyV8<'a> {
     /// Native CUDA launcher requirement derived from selected calls.
     requires_cuda_kernel_runtime: bool,
 
+    /// Native HIP launcher requirement; omitted when false to preserve existing V8 cache bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    requires_rocm_kernel_runtime: bool,
+
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
     /// Whether completion includes unordered I/O without a boundary slot.
@@ -2174,6 +2203,10 @@ struct XlaPersistentExecutableMetadataV8 {
     /// Native CUDA launcher requirement derived from selected calls.
     #[serde(default)]
     requires_cuda_kernel_runtime: bool,
+
+    /// Native HIP launcher requirement; omitted when false to preserve existing V8 cache bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    requires_rocm_kernel_runtime: bool,
 
     /// Whether a native ordered-I/O slot is present after the array and extent slots.
     ordered_io: bool,
@@ -3020,6 +3053,27 @@ impl<'c> XlaDomain<'c> {
                 *runtime = Some(Box::new(CudaKernelRuntime::new(self.client()?)?));
             }
         }
+        if signature.requires_rocm_kernel_runtime() {
+            if !platform_name.eq_ignore_ascii_case("rocm") {
+                return Err(XlaDomainError::InvalidCompilationOptions {
+                    reason: "rocm artifact calls require a rocm platform".into(),
+                });
+            }
+            #[cfg(not(feature = "rocm"))]
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "rocm artifact execution requires the `rocm` feature".into(),
+            });
+            #[cfg(feature = "rocm")]
+            {
+                let session = self.session.as_ref().ok_or_else(|| XlaDomainError::InvalidCompilationOptions {
+                    reason: "rocm artifact calls require an owning XlaSession".into(),
+                })?;
+                let mut runtime = session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
+                if runtime.is_none() {
+                    *runtime = Some(Box::new(RocmKernelRuntime::new(self.client()?)?));
+                }
+            }
+        }
         // I/O uses the shared registered-handler surface. Register the built-in print target at compilation and
         // reload on the platforms whose handler exists (CPU, and CUDA with a `cuda-*` feature), so ordinary eager
         // printing needs no separate process-global initialization by the caller.
@@ -3099,7 +3153,10 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<PreparedXlaExecution<'c>, XlaDomainError> {
         ensure_effect_dispatch_allowed()?;
         self.validate_xla_program_owner(program)?;
-        if program.kernel_execution_facts.is_some() || program.signature.requires_cuda_kernel_runtime() {
+        if program.kernel_execution_facts.is_some()
+            || program.signature.requires_cuda_kernel_runtime()
+            || program.signature.requires_rocm_kernel_runtime()
+        {
             crate::kernels::distributed::validate_kernel_participants(self.client()?, &program.mesh)?;
         }
         self.ensure_runtime_requirements(&program.signature, &program.platform_name)?;
@@ -4199,6 +4256,7 @@ impl<'c> XlaDomain<'c> {
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
+            requires_rocm_kernel_runtime: program.signature.requires_rocm_kernel_runtime(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -4314,6 +4372,7 @@ impl<'c> XlaDomain<'c> {
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             requires_cuda_kernel_runtime: program.signature.requires_cuda_kernel_runtime(),
+            requires_rocm_kernel_runtime: program.signature.requires_rocm_kernel_runtime(),
             ordered_io: program.signature.has_ordered_io(),
             unordered_io: program.signature.has_unordered_io(),
             device_ordered_io: program.signature.has_device_ordered_io(),
@@ -4388,6 +4447,9 @@ impl<'c> XlaDomain<'c> {
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
         if metadata.requires_cuda_kernel_runtime && metadata.kernel_execution_facts.is_none() {
             return Err(persistent_error("cuda kernel executable is missing execution facts"));
+        }
+        if metadata.requires_rocm_kernel_runtime && metadata.kernel_execution_facts.is_none() {
+            return Err(persistent_error("rocm kernel executable is missing execution facts"));
         }
         if let Some(expected) = &metadata.kernel_execution_facts {
             let actual =
@@ -4479,7 +4541,8 @@ impl<'c> XlaDomain<'c> {
                 metadata.requires_assertion_handler,
                 metadata.device_ordered_io,
             )
-            .with_cuda_kernel_runtime(metadata.requires_cuda_kernel_runtime);
+            .with_cuda_kernel_runtime(metadata.requires_cuda_kernel_runtime)
+            .with_rocm_kernel_runtime(metadata.requires_rocm_kernel_runtime);
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
             || persistent_input_dimensions(&signature) != metadata.input_dimensions
@@ -6050,6 +6113,18 @@ impl<'c> XlaDomain<'c> {
             // ensure_runtime_requirements initialized the stable boxed owner. This session cannot drop during this
             // borrow; immediately after successful submission its existing fence is retained before output work.
             Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()?) }?)
+        } else if program.signature.requires_rocm_kernel_runtime() {
+            #[cfg(feature = "rocm")]
+            {
+                let session = self.session.as_ref().unwrap();
+                let runtime = session.rocm_kernel_runtime.lock().expect("rocm runtime owner mutex poisoned");
+                // Preparation established the stable boxed allocation; the fence below retains it through completion.
+                Some(unsafe { runtime.as_ref().unwrap().execution_context(self.client()?) }?)
+            }
+            #[cfg(not(feature = "rocm"))]
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "rocm artifact execution requires the `rocm` feature".into(),
+            });
         } else {
             None
         };
@@ -6061,6 +6136,13 @@ impl<'c> XlaDomain<'c> {
             let session = self.session.as_ref().unwrap();
             let mut completions = session.cuda_kernel_completions.lock().expect("cuda completion owner mutex poisoned");
             // Failed fences are terminal and retain their diagnostics in the caller's existing execution object.
+            completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
+            completions.push(fence.clone());
+        }
+        #[cfg(feature = "rocm")]
+        if program.signature.requires_rocm_kernel_runtime() {
+            let session = self.session.as_ref().unwrap();
+            let mut completions = session.rocm_kernel_completions.lock().expect("rocm completion owner mutex poisoned");
             completions.retain(|completion| matches!(completion.is_ready(), Ok(false)));
             completions.push(fence.clone());
         }
@@ -6732,6 +6814,11 @@ mod tests {
                 if reason == "replacement executable has incompatible kernel execution facts"));
         let cuda_signature = signature.clone().with_cuda_kernel_runtime(true);
         let replacement = XlaInvocationMetadata { signature: &cuda_signature, ..current };
+        assert!(matches!(validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible executable signature"));
+        let rocm_signature = signature.clone().with_rocm_kernel_runtime(true);
+        let replacement = XlaInvocationMetadata { signature: &rocm_signature, ..current };
         assert!(matches!(validate_xla_replacement_metadata(current, replacement),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible executable signature"));
@@ -10285,6 +10372,7 @@ mod tests {
         assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
         let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
         assert_eq!(decoded["schema_version"], XLA_PERSISTENT_KEY_SCHEMA_VERSION);
+        assert!(decoded.get("requires_rocm_kernel_runtime").is_none());
         assert_eq!(decoded["compiler_identity"], XLA_COMPILER_IDENTITY.as_str());
         assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::XLA_COMMIT));
         assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::JAX_COMMIT));
@@ -10381,6 +10469,17 @@ mod tests {
         assert!(matches!(domain.deserialize_program(&encode(missing)),
             Err(XlaDomainError::InvalidPersistentExecutable { reason })
                 if reason == "cuda kernel executable is missing execution facts"));
+
+        let legacy: serde_json::Value = serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert!(legacy.get("requires_rocm_kernel_runtime").is_none());
+        let mut rocm: XlaPersistentExecutableMetadataV8 = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!rocm.requires_rocm_kernel_runtime);
+        assert_eq!(serde_json::to_value(&rocm).unwrap(), legacy);
+        rocm.requires_rocm_kernel_runtime = true;
+        assert_eq!(serde_json::to_value(&rocm).unwrap()["requires_rocm_kernel_runtime"], true);
+        assert!(matches!(domain.deserialize_program(&encode(rocm)),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "rocm kernel executable is missing execution facts"));
 
         let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV8 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
@@ -10593,6 +10692,7 @@ mod tests {
             reference_states: Vec::new(),
             requires_assertion_handler: false,
             requires_cuda_kernel_runtime: false,
+            requires_rocm_kernel_runtime: false,
             ordered_io: false,
             unordered_io: false,
             device_ordered_io: false,
@@ -13958,6 +14058,40 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_xla_session_drop_retains_rocm_completion_after_dropped_outputs() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let session = XlaSession::new(&client);
+        let (first, first_promise) = client.event(()).unwrap();
+        let (second, second_promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![first, second]);
+        session.rocm_kernel_completions.lock().unwrap().push(fence.clone());
+        drop(fence);
+        std::thread::scope(|threads| {
+            let (started, waiting) = std::sync::mpsc::channel();
+            let (released, completed) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                started.send(()).unwrap();
+                drop(session);
+                released.send(()).unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                completed.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            first_promise.set(Some(ryft_pjrt::Error::aborted("terminal test failure"))).unwrap();
+            assert!(matches!(
+                completed.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            second_promise.set(None).unwrap();
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+    }
+
     #[test]
     fn test_xla_domain_cuda_runtime_rejects_cpu() {
         let plugin = load_cpu_plugin().unwrap();
@@ -13968,6 +14102,22 @@ mod tests {
         assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
             Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "cuda artifact calls require a cuda platform"));
         assert!(session.cuda_kernel_runtime.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_xla_domain_rocm_runtime_rejects_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let session = Arc::new(XlaSession::new(&client));
+        let signature = XlaExecutableSignature::new(&[], &[]).with_rocm_kernel_runtime(true);
+        assert!(!signature.has_effects());
+        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "cpu"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "rocm artifact calls require a rocm platform"));
+        #[cfg(not(feature = "rocm"))]
+        assert!(matches!(session.domain().ensure_runtime_requirements(&signature, "rocm"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason == "rocm artifact execution requires the `rocm` feature"));
+        #[cfg(feature = "rocm")]
+        assert!(session.rocm_kernel_runtime.lock().unwrap().is_none());
     }
 
     #[test]

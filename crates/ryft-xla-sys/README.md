@@ -201,6 +201,21 @@ builds remain free of that CUDA-only dependency; `tests/symbol_contract_test.py`
 private `MosaicGpu*` runtime ABI, CUDA Driver API entry points such as `cuLaunchKernel`, or cuTile symbols. The native
 linkage does not impose a closed list of SM architectures; runtime and compiler capability checks remain authoritative.
 
+### Native Triton Compiler
+
+The native archive exposes XLA's pinned Triton pipeline through [C bindings](src/c++/triton_compiler.h) and the Rust
+`triton` module. CUDA-configured archives support PTX and HSACO compilation; ROCm-configured archives support HSACO.
+CPU-only archives expose the same interface but report compilation unavailable. Compilation runs in process without
+creating a GPU context and retains ordinary XLA failure semantics. AMD compilation uses embedded device bitcode and
+does not require an AMD device or ROCm installation.
+
+The compiler borrows an MLIR module under an exclusive context guard and lowers a clone, preserving the original.
+Results contain owned artifact buffers, resource metadata and bounded diagnostics; callers release owned buffers
+through the matching destroy function. Version queries expose source revisions, compiler availability and CUDA toolchain
+versions for cache compatibility. [`ryft-triton`](../ryft-triton/README.md) owns portable lowering, target admission and
+artifact validation; its guide documents supported kernels, configuration, cancellation and hardware qualification.
+Native ABI and ownership details are documented in the C header and Rust bindings.
+
 ## Contribution
 
 When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate change and follow this checklist:

@@ -10,6 +10,8 @@ members = [
     "crates/ryft-mlir",
     "crates/ryft-mosaic",
     "crates/ryft-pjrt",
+    "crates/ryft-rocm",
+    "crates/ryft-triton",
     "crates/ryft-xla",
     "crates/ryft-xla-sys",
 ]
@@ -36,6 +38,8 @@ ryft-macros = { path = "crates/ryft-macros", version = "0.0.3", default-features
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.3", default-features = false }
 ryft-mosaic = { path = "crates/ryft-mosaic", version = "0.0.3", default-features = false }
 ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.3", default-features = false }
+ryft-rocm = { path = "crates/ryft-rocm", version = "0.0.3", default-features = false }
+ryft-triton = { path = "crates/ryft-triton", version = "0.0.3", default-features = false }
 ryft-xla = { path = "crates/ryft-xla", version = "0.0.3", default-features = false }
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.3", default-features = false }
 anyhow = "1.0.102"

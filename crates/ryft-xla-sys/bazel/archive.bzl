@@ -135,6 +135,7 @@ HEADERS = [
     "src/c++/mlir/dialects/triton.h",
     "src/c++/mlir/dialects/ub.h",
     "src/c++/profiler.h",
+    "src/c++/triton_compiler.h",
 ]
 
 def _build_archive_impl(ctx):

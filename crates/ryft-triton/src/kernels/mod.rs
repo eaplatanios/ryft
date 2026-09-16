@@ -2,9 +2,8 @@
 //!
 //! The adapter admits static dense F32 arrays, masked global windows, arithmetic, reductions and bounded control
 //! flow. Floating-point dot uses IEEE input precision. Unsupported effects and memory contracts fail before native
-//! compilation. The selected compiler executable is optional at build time and absent from artifact deployment.
-
-use std::time::Duration;
+//! compilation. The linked native bridge compiles without creating a GPU context. Artifact deployment uses the
+//! corresponding runtime adapter.
 
 use ryft_core::{ArrayType, ProgramError, TypeError};
 use serde::{Deserialize, Serialize};
@@ -20,10 +19,10 @@ pub enum Error {
         message: String,
     },
 
-    /// The explicit executable is absent or recorded configuration cannot produce new artifacts.
+    /// The linked native archive does not provide the requested compiler target.
     #[error("triton compiler is unavailable: {message}")]
     Unavailable {
-        /// Required installation detail.
+        /// Required compiler capability.
         message: String,
     },
 
@@ -37,18 +36,16 @@ pub enum Error {
         reason: String,
     },
 
-    /// Native compilation failed or exceeded its resource policy.
-    #[error("triton compiler {reason}\nstdout:\n{stdout}\nstderr:\n{stderr}")]
-    Tool {
-        /// Failure or termination cause.
-        reason: String,
-
-        /// Bounded standard output.
-        stdout: String,
-
-        /// Bounded diagnostics, including partial output on failure.
-        stderr: String,
+    /// Native compilation returned an error.
+    #[error("triton compilation failed: {message}")]
+    Compilation {
+        /// Bounded native diagnostics.
+        message: String,
     },
+
+    /// Cancellation was requested before compilation or before accepting its result.
+    #[error("triton compilation cancelled")]
+    Cancelled,
 
     /// Compiler products disagree with the requested signature, target or resource contract.
     #[error("invalid Triton artifact: {message}")]
@@ -56,10 +53,6 @@ pub enum Error {
         /// Failed artifact invariant.
         message: String,
     },
-
-    /// File or process management failed.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
 
     /// Native metadata could not be decoded.
     #[error(transparent)]
@@ -91,8 +84,8 @@ mod lowering;
 
 pub use compiler::Compiler;
 
-/// Version of the typed lowering, native protocol and physical argument contract.
-pub const COMPILER_SCHEMA_VERSION: u32 = 1;
+/// Version of the typed lowering, native bridge and physical argument contract.
+pub const COMPILER_SCHEMA_VERSION: u32 = 2;
 
 /// Source revision that owns the native pipeline and its Triton patches.
 pub const XLA_VERSION: &str = "eb6b90ed013f511eca088c52f541f3c0819f919e";
@@ -136,10 +129,10 @@ impl Target {
     }
 }
 
-/// Compiler choices and bounded construction/process resources.
+/// Compiler choices and bounded construction and output resources.
 ///
-/// Warp count affects generated code and compiler identity. Deadlines and size limits affect admission and failure
-/// behavior only. Pipeline stages come from the canonical kernel schedule, defaulting to two.
+/// Warp count affects generated code and compiler identity. Size limits affect admission and failure behavior only.
+/// Pipeline stages come from the canonical kernel schedule, defaulting to two.
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Requested warps per program; final native metadata may require additional warps.
@@ -154,11 +147,8 @@ pub struct Options {
     /// Maximum native artifact size.
     maximum_artifact_bytes: usize,
 
-    /// Maximum bytes retained from either diagnostic stream or metadata.
+    /// Maximum bytes retained from native diagnostics.
     maximum_diagnostic_bytes: usize,
-
-    /// Deadline for each version probe or compilation, including native subprocesses.
-    process_timeout: Duration,
 }
 
 impl Options {
@@ -182,14 +172,9 @@ impl Options {
         self.maximum_artifact_bytes
     }
 
-    /// Returns the per-stream diagnostic and metadata limit in bytes.
+    /// Returns the diagnostic capture limit in bytes.
     pub fn maximum_diagnostic_bytes(&self) -> usize {
         self.maximum_diagnostic_bytes
-    }
-
-    /// Returns the per-invocation process deadline.
-    pub fn process_timeout(&self) -> Duration {
-        self.process_timeout
     }
 
     /// Selects one, two, four or eight warps per program.
@@ -231,15 +216,6 @@ impl Options {
         self.maximum_diagnostic_bytes = diagnostic_bytes;
         Ok(self)
     }
-
-    /// Sets a nonzero deadline for each native process invocation.
-    pub fn with_process_timeout(mut self, timeout: Duration) -> Result<Self, Error> {
-        if timeout.is_zero() {
-            return Err(Error::Invalid { message: "process timeout must be positive".into() });
-        }
-        self.process_timeout = timeout;
-        Ok(self)
-    }
 }
 
 impl Default for Options {
@@ -250,7 +226,6 @@ impl Default for Options {
             maximum_tile_elements: 65_536,
             maximum_artifact_bytes: 64 * 1024 * 1024,
             maximum_diagnostic_bytes: 1024 * 1024,
-            process_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -382,11 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn test_options_process_timeout() {
-        assert_eq!(Options::default().process_timeout(), Duration::from_secs(300));
-    }
-
-    #[test]
     fn test_options_with_warp_count() {
         assert_eq!(Options::default().with_warp_count(8).unwrap().warp_count(), 8);
         assert!(matches!(Options::default().with_warp_count(3), Err(Error::Invalid { message })
@@ -421,16 +391,6 @@ mod tests {
                                and 8 MiB for diagnostics")
             );
         }
-    }
-
-    #[test]
-    fn test_options_with_process_timeout() {
-        assert_eq!(
-            Options::default().with_process_timeout(Duration::from_millis(5)).unwrap().process_timeout(),
-            Duration::from_millis(5)
-        );
-        assert!(matches!(Options::default().with_process_timeout(Duration::ZERO), Err(Error::Invalid { message })
-            if message == "process timeout must be positive"));
     }
 
     #[test]
