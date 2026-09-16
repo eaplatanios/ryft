@@ -275,8 +275,6 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review this.
-
 /// Reshapes an array without changing its element count, reading and writing elements in logical row-major order.
 ///
 /// A [`Shape`] specifies the result dimensions, and [`Self::reshape_with_output_sharding`] can request explicit
@@ -287,17 +285,18 @@ impl_differentiable_operation! {
 /// before reshaping.
 ///
 /// The input and output element counts must be equal. An unchanged shape and the insertion or removal of static
-/// singleton axes (as performed by [`Self::expand_dims`], [`Self::squeeze`], and [`Self::squeeze_all`]) preserve
+/// singleton axes (as performed by [`Self::expand_dimensions`], [`Self::squeeze`], and [`Self::squeeze_all`]) preserve
 /// existing dynamic identities through this capability, because the non-singleton dimensions keep their order. Other
 /// dynamic result shapes, and shape changes whose input element count is unknown, require [`DynamicReshape`], which
 /// takes one explicit dimension input per output axis. A statically zero axis proves a zero element count even when
 /// another input axis is dynamic.
 ///
-/// When the input carries sharding, contiguous split/merge groups redistribute compatible mesh axes over their output
-/// factors. Replicated singleton dimensions may be inserted or removed; sharded singletons retain placement when its
-/// destination is unambiguous. Ambiguous dynamic, zero-sized, singleton, unconstrained, or non-contiguous placement
-/// changes require explicit output sharding. A non-identity reshape preserves the input memory space and clears
-/// explicit physical layout metadata because the logical shape change does not determine a unique storage layout.
+/// When the input carries sharding information, contiguous split/merge groups redistribute compatible mesh axes
+/// over their output factors. Replicated singleton dimensions may be inserted or removed; sharded singletons retain
+/// placement when its destination is unambiguous. Ambiguous dynamic, zero-sized, singleton, unconstrained, or
+/// non-contiguous placement changes require explicit output sharding. A non-identity reshape preserves the input
+/// memory space and clears explicit physical layout metadata because the logical shape change does not determine
+/// a unique storage layout.
 ///
 /// [`Reshape`] fills the same role for [`ReshapeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
 /// their corresponding arithmetic [`Operation`]s.
@@ -315,13 +314,6 @@ impl_differentiable_operation! {
 /// # }
 /// ```
 pub trait Reshape: Sized {
-    /// Reshapes `self` to `shape`, inferring compatible output sharding from the input placement.
-    /// The output shape must preserve the element count.
-    #[inline]
-    fn reshape<S: Into<Shape>>(&self, shape: S) -> Result<Self, ProgramError> {
-        self.reshape_with_output_sharding(shape, None)
-    }
-
     /// Reshapes `self` to `shape` with optional explicit output placement. Supplying `None` is equivalent to
     /// [`Self::reshape`]. An explicit placement is needed when a split, merge, or singleton change cannot infer an
     /// unambiguous placement from the input. The placement is attached to the reshape itself so backends can lower
@@ -337,25 +329,84 @@ pub trait Reshape: Sized {
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>;
 
-    /// Reshapes with signed sizes, accepting one inferred `-1` dimension. Values are visited in row-major order;
-    /// the final axis varies fastest. A zero input count infers a zero axis if the other sizes have a nonzero product.
+    /// Reshapes `self` to `shape`, inferring compatible output sharding from the input placement.
+    /// The output shape must preserve the element count.
+    #[inline]
+    fn reshape<S: Into<Shape>>(&self, shape: S) -> Result<Self, ProgramError> {
+        self.reshape_with_output_sharding(shape, None)
+    }
+
+    /// Reshapes with signed sizes, accepting one inferred `-1` dimension. Values are visited in row-major order where
+    /// the final axis varies fastest. A zero input count infers a zero axis if the other sizes have a non-zero product.
     /// Combining `-1` with an explicit zero is ambiguous and is rejected. The input element count must be known;
     /// first-class runtime dimensions use [`DynamicReshape`] instead.
     ///
     /// # Parameters
     ///
-    ///   - `output_sizes`: Nonnegative target sizes with at most one `-1` entry inferred from the input count.
+    ///   - `output_sizes`: Non-negative target sizes with at most one `-1` entry inferred from the input count.
+    #[inline]
     fn reshape_to_sizes(&self, output_sizes: &[isize]) -> Result<Self, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
     {
-        self.reshape(reshape_shape_from_sizes(self.r#type().shape(), output_sizes)?)
+        let input_count = self.r#type().shape().element_count()?.ok_or_else(|| {
+            TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count",
+            ))
+        })?;
+        let mut inferred_axis = None;
+        let mut sizes = Vec::with_capacity(output_sizes.len());
+        for (axis, size) in output_sizes.iter().copied().enumerate() {
+            if size == -1 {
+                if inferred_axis.replace(axis).is_some() {
+                    return Err(ProgramError::from(TypeError::invalid(format!(
+                        "`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension",
+                    ))));
+                }
+                sizes.push(1);
+            } else {
+                sizes.push(usize::try_from(size).map_err(|_| {
+                    TypeError::invalid(format!(
+                        "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`",
+                    ))
+                })?);
+            }
+        }
+        let known_count = if sizes.contains(&0) {
+            0
+        } else {
+            sizes.iter().try_fold(1usize, |count, size| count.checked_mul(*size)).ok_or_else(|| {
+                TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`"))
+            })?
+        };
+        if let Some(axis) = inferred_axis {
+            if known_count == 0 {
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero",
+                ))));
+            }
+            if !input_count.is_multiple_of(known_count) {
+                return Err(ProgramError::from(TypeError::invalid(format!(
+                    "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count",
+                ))));
+            }
+            sizes[axis] = input_count / known_count;
+        } else if known_count != input_count {
+            return Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` output element count {known_count} differs from input element count \
+                 {input_count}",
+            ))));
+        }
+        self.reshape(Shape::new(sizes.into_iter().map(Dimension::Static).collect()))
     }
+
+    // TODO(eaplatanios): Review this.
 
     /// Returns the input as a one-dimensional array in logical row-major order. An input that is already a vector
     /// retains its shape, including a dynamic extent. Other ranks require a known element count; an empty input
     /// produces shape `[0]`. Storage sharing or copying is determined by the backend.
-    fn ravel(&self) -> Result<Self, ProgramError>
+    #[inline]
+    fn flatten(&self) -> Result<Self, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
     {
@@ -368,15 +419,6 @@ pub trait Reshape: Sized {
         }
     }
 
-    /// Returns a one-dimensional array in logical row-major order, with the same contract as [`Self::ravel`].
-    /// This function does not require an independent storage allocation.
-    fn flatten(&self) -> Result<Self, ProgramError>
-    where
-        Self: Typed<Type = ArrayType>,
-    {
-        self.ravel()
-    }
-
     /// Inserts one size-one axis without changing element order. `axis` addresses the result rank, so `0` inserts
     /// a leading axis and `-1` appends a trailing axis. Existing dynamic dimensions retain their identities and
     /// bounds; inserting a static singleton does not require explicit runtime extent inputs.
@@ -384,7 +426,7 @@ pub trait Reshape: Sized {
     /// # Parameters
     ///
     ///   - `axis`: Position of the inserted axis, normalized against the result rank.
-    fn expand_dims<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
+    fn expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
     {
@@ -1100,7 +1142,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     /// Returns the input as a vector in logical row-major order. Runtime extents are read from the input and
     /// multiplied using checked first-class dimension arithmetic. A vector retains its existing dimension identity;
     /// a scalar becomes a vector of size one and an empty array becomes a vector of size zero.
-    fn dynamic_ravel(&self) -> Result<Self, ProgramError>
+    fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
         Self: DimensionSize + DimensionArithmetic,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
@@ -1128,16 +1170,6 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
         self.dynamic_reshape(&[size])
     }
 
-    /// Returns a vector in logical row-major order, with the same contract as [`Self::dynamic_ravel`]. This function
-    /// does not require an independent storage allocation.
-    fn dynamic_flatten(&self) -> Result<Self, ProgramError>
-    where
-        Self: DimensionSize + DimensionArithmetic,
-        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
-    {
-        self.dynamic_ravel()
-    }
-
     /// Inserts a size-one axis while preserving all existing extents, including runtime dimensions. The output
     /// dimensions are explicit inputs to [`Self::dynamic_reshape`], so retained programs can specialize them when
     /// concrete input shapes become available.
@@ -1145,7 +1177,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     /// # Parameters
     ///
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
-    fn dynamic_expand_dims<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
+    fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
         Self: DimensionSize,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
@@ -1229,71 +1261,6 @@ impl<
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
-}
-
-/// Resolves signed output sizes against the input's known element count. One size may be `-1`, which is replaced
-/// by the quotient of the input count and the product of the other sizes. All other sizes must be nonnegative.
-///
-/// A zero input count infers a zero axis when the other sizes have a nonzero product. Combining `-1` with an
-/// explicit zero is ambiguous and is rejected. Unknown input counts require [`DynamicReshape`] instead.
-///
-/// # Parameters
-///
-///   - `input_shape`: Shape supplying the element count used for validation and inference.
-///   - `output_sizes`: Requested output sizes, with at most one inferred `-1` entry.
-///
-/// # Errors
-///
-/// Returns an error for invalid negative sizes, repeated inferred axes, ambiguous zero products, overflow, an
-/// unknown input count, or a target count that differs from the input count.
-fn reshape_shape_from_sizes(input_shape: &Shape, output_sizes: &[isize]) -> Result<Shape, TypeError> {
-    let input_count = input_shape.element_count()?.ok_or_else(|| {
-        TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count"))
-    })?;
-    let mut inferred_axis = None;
-    let mut sizes = Vec::with_capacity(output_sizes.len());
-    for (axis, size) in output_sizes.iter().copied().enumerate() {
-        if size == -1 {
-            if inferred_axis.replace(axis).is_some() {
-                return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension"
-                )));
-            }
-            sizes.push(1);
-        } else {
-            sizes.push(usize::try_from(size).map_err(|_| {
-                TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`"
-                ))
-            })?);
-        }
-    }
-    let known_count = if sizes.contains(&0) {
-        0
-    } else {
-        sizes.iter().try_fold(1usize, |count, size| count.checked_mul(*size)).ok_or_else(|| {
-            TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`"))
-        })?
-    };
-    if let Some(axis) = inferred_axis {
-        if known_count == 0 {
-            return Err(TypeError::invalid(format!(
-                "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero"
-            )));
-        }
-        if !input_count.is_multiple_of(known_count) {
-            return Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count"
-            )));
-        }
-        sizes[axis] = input_count / known_count;
-    } else if known_count != input_count {
-        return Err(TypeError::invalid(format!(
-            "`{RESHAPE_OPERATION_NAME}` output element count {known_count} differs from input element count \
-             {input_count}"
-        )));
-    }
-    Ok(Shape::new(sizes.into_iter().map(Dimension::Static).collect()))
 }
 
 /// Inserts batching's physical leading dimension into a logical per-item output sharding.
@@ -2265,8 +2232,8 @@ mod tests {
                 .unwrap_err(),
             BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{RESHAPE_OPERATION_NAME}` with a dynamic mapped extent requires `DynamicReshape` and explicit \
-                     result-dimension inputs"
+                    "`{RESHAPE_OPERATION_NAME}` with a dynamic mapped extent requires using a dynamic reshape \
+                     operation and explicit result-dimension inputs"
                 ),
             },
         );
@@ -2532,7 +2499,7 @@ mod tests {
         let (output_types, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| {
                 let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
-                let expanded = input.expand_dims(0)?.expand_dims(-1)?;
+                let expanded = input.expand_dimensions(0)?.expand_dimensions(-1)?;
                 let squeezed = expanded.squeeze(0)?;
                 Ok(squeezed.squeeze_all()?.into_value())
             },
@@ -2572,14 +2539,71 @@ mod tests {
         let input = Array::vector(vec![1i32, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(input.reshape_to_sizes(&[3, -1]), Array::matrix(3, 2, vec![1i32, 2, 3, 4, 5, 6]));
         assert_eq!(Array::scalar(7i32).unwrap().reshape_to_sizes(&[-1]), Array::vector(vec![7i32]));
+        assert_eq!(input.reshape_to_sizes(&[6]), Ok(input.clone()));
+        assert_eq!(
+            Array::vector(Vec::<i32>::new()).unwrap().reshape_to_sizes(&[2, -1]),
+            Array::matrix(2, 0, Vec::<i32>::new()),
+        );
+        assert_eq!(Array::scalar(7i32).unwrap().reshape_to_sizes(&[]), Array::scalar(7i32));
     }
 
     #[test]
-    fn test_reshape_ravel() {
+    fn test_reshape_reshape_to_sizes_invalid_dimensions() {
+        let input = Array::vector(vec![1i32, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(
+            input.reshape_to_sizes(&[-1, -1]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension"
+            )))),
+        );
+        assert_eq!(
+            input.reshape_to_sizes(&[-2]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`"
+            )))),
+        );
+        assert_eq!(
+            input.reshape_to_sizes(&[4, -1]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count"
+            )))),
+        );
+        assert_eq!(
+            input.reshape_to_sizes(&[5]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` output element count 5 differs from input element count 6"
+            )))),
+        );
+        assert_eq!(
+            input.reshape_to_sizes(&[isize::MAX; 3]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`"
+            )))),
+        );
+        assert_eq!(
+            Array::vector(Vec::<i32>::new()).unwrap().reshape_to_sizes(&[0, -1]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero"
+            )))),
+        );
+        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+            "size",
+            DimensionBounds::new(0, Some(9)).unwrap(),
+        ))]);
+        assert_eq!(
+            ArrayType::new(DataType::F32, dynamic).reshape_to_sizes(&[-1]),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count"
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_reshape_flatten() {
         let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
-        assert_eq!(input.ravel(), Array::vector(vec![1i32, 2, 3, 4]));
-        assert_eq!(Array::scalar(7i32).unwrap().ravel(), Array::vector(vec![7i32]));
-        assert_eq!(Array::matrix(0, 2, Vec::<i32>::new()).unwrap().ravel(), Array::vector(Vec::<i32>::new()));
+        assert_eq!(input.flatten(), Array::vector(vec![1i32, 2, 3, 4]));
+        assert_eq!(Array::scalar(7i32).unwrap().flatten(), Array::vector(vec![7i32]));
+        assert_eq!(Array::matrix(0, 2, Vec::<i32>::new()).unwrap().flatten(), Array::vector(Vec::<i32>::new()));
 
         // An existing dynamic vector needs no new dimension identity or element-count proof.
         let vector = ArrayType::new(
@@ -2587,23 +2611,17 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         )
         .with_memory(Memory::Host { pinned: true });
-        assert_eq!(vector.ravel(), Ok(vector.clone()));
+        assert_eq!(vector.flatten(), Ok(vector.clone()));
     }
 
     #[test]
-    fn test_reshape_flatten() {
-        let input = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
-        assert_eq!(input.flatten(), input.ravel());
-    }
-
-    #[test]
-    fn test_reshape_expand_dims() {
+    fn test_reshape_expand_dimensions() {
         let input = Array::vector(vec![1i32, 2]).unwrap();
-        assert_eq!(input.expand_dims(0), Array::matrix(1, 2, vec![1i32, 2]));
-        assert_eq!(input.expand_dims(-1), Array::matrix(2, 1, vec![1i32, 2]));
-        assert_eq!(Array::scalar(7i32).unwrap().expand_dims(-1), Array::vector(vec![7i32]));
+        assert_eq!(input.expand_dimensions(0), Array::matrix(1, 2, vec![1i32, 2]));
+        assert_eq!(input.expand_dimensions(-1), Array::matrix(2, 1, vec![1i32, 2]));
+        assert_eq!(Array::scalar(7i32).unwrap().expand_dimensions(-1), Array::vector(vec![7i32]));
         assert!(matches!(
-            input.expand_dims(2),
+            input.expand_dimensions(2),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "axis 2 is out of bounds for rank 2",
         ));
@@ -2615,7 +2633,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]))
                 .with_memory(Memory::Host { pinned: true });
         assert_eq!(
-            dynamic_type.expand_dims(1),
+            dynamic_type.expand_dimensions(1),
             Ok(ArrayType::new(
                 DataType::F32,
                 Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1), Dimension::Static(3)]),
@@ -5102,13 +5120,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_reshape_dynamic_ravel() {
+    fn test_dynamic_reshape_dynamic_flatten() {
         let input = ArrayIrValue::Array(
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap(),
         );
         assert_eq!(
-            input.dynamic_ravel().unwrap(),
+            input.dynamic_flatten().unwrap(),
             ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::F64, [6]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],)
                     .unwrap()
@@ -5119,7 +5137,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            empty.dynamic_ravel().unwrap(),
+            empty.dynamic_flatten().unwrap(),
             ArrayIrValue::Array(
                 Array::from_elements(ArrayType::new_static(DataType::F64, [0]), &[] as &[f64],).unwrap()
             )
@@ -5127,7 +5145,7 @@ mod tests {
 
         // A static input needs no runtime size arithmetic: it stages exactly what `dynamic_reshape_to_sizes` stages.
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_ravel(),
+            |input| input.dynamic_flatten(),
             ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])),
         )
         .unwrap();
@@ -5151,7 +5169,7 @@ mod tests {
         // A vector is returned as is, and a scalar becomes a vector of size one.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_ravel(),
+            |input| input.dynamic_flatten(),
             ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows.clone())]))),
         )
         .unwrap();
@@ -5161,7 +5179,7 @@ mod tests {
         );
         assert!(program.instructions().is_empty());
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_ravel(),
+            |input| input.dynamic_flatten(),
             ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
         )
         .unwrap();
@@ -5179,7 +5197,7 @@ mod tests {
         // A dynamic input seeds the product with its leading extent instead of a constant one, so that no
         // multiplication by one is staged, and folds the remaining extents with checked dimension arithmetic.
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_ravel(),
+            |input| input.dynamic_flatten(),
             ArrayIrType::Array(ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(4)]),
@@ -5202,19 +5220,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_reshape_dynamic_flatten() {
-        let input = ArrayIrValue::Array(Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap());
-        assert_eq!(input.dynamic_flatten(), input.dynamic_ravel());
-    }
-
-    #[test]
-    fn test_dynamic_reshape_dynamic_expand_dims() {
+    fn test_dynamic_reshape_dynamic_expand_dimensions() {
         // On a partly dynamic input, the static extents are lifted as constants and only the dynamic axis is read
         // back from the array. Replaying the traced program at two sizes shows that the inserted axis is a genuine
         // size-one axis rather than a baked-in physical bound.
         let dimension = DimensionVariable::new("rows", DimensionBounds::new(4, Some(6)).unwrap());
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_expand_dims(0),
+            |input| input.dynamic_expand_dimensions(0),
             ArrayIrType::Array(ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Dimension::Dynamic(dimension), Dimension::Static(4)]),
@@ -5248,9 +5260,9 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F64, [2, 3]), &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap(),
         );
-        assert_eq!(input.dynamic_expand_dims(-1).unwrap().r#type().to_string(), "f64[2, 3, 1]");
+        assert_eq!(input.dynamic_expand_dimensions(-1).unwrap().r#type().to_string(), "f64[2, 3, 1]");
         assert!(matches!(
-            input.dynamic_expand_dims(4),
+            input.dynamic_expand_dimensions(4),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "axis 4 is out of bounds for rank 3",
         ));
@@ -5303,68 +5315,6 @@ mod tests {
         assert_eq!(
             input.dynamic_reshape_with_output_sharding(&[three, input.clone()], None),
             Err(ProgramError::Type(TypeError::invalid("expected dimension type but got array type"))),
-        );
-    }
-
-    #[test]
-    fn test_reshape_shape_from_sizes() {
-        let input = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[3, -1]),
-            Ok(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
-        );
-        assert_eq!(reshape_shape_from_sizes(&input, &[6]), Ok(Shape::new(vec![Dimension::Static(6)])),);
-        assert_eq!(
-            reshape_shape_from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[2, -1]),
-            Ok(Shape::new(vec![Dimension::Static(2), Dimension::Static(0)])),
-        );
-        assert_eq!(reshape_shape_from_sizes(&Shape::new(Vec::new()), &[]), Ok(Shape::new(Vec::new())),);
-    }
-
-    #[test]
-    fn test_reshape_shape_from_sizes_invalid_dimensions() {
-        let input = Shape::new(vec![Dimension::Static(6)]);
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[-1, -1]),
-            Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension")))
-        );
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[-2]),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`"
-            )))
-        );
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[4, -1]),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count"
-            )))
-        );
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[5]),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` output element count 5 differs from input element count 6"
-            )))
-        );
-        assert_eq!(
-            reshape_shape_from_sizes(&input, &[isize::MAX; 3]),
-            Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`")))
-        );
-        assert_eq!(
-            reshape_shape_from_sizes(&Shape::new(vec![Dimension::Static(0)]), &[0, -1]),
-            Err(TypeError::invalid(format!(
-                "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero"
-            )))
-        );
-        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
-            "size",
-            DimensionBounds::new(0, Some(9)).unwrap(),
-        ))]);
-        assert_eq!(
-            reshape_shape_from_sizes(&dynamic, &[-1]),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count"
-            )))
         );
     }
 

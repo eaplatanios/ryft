@@ -7268,7 +7268,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 3], %2:f32[3, batch], %3:f32[3] .
                 let %4:dimension<3> = const 3
-                    %5:f32[batch, 3] = reshape %1 %0 %4
+                    %5:f32[batch, 3] = reshape [element_count_proven=true] %1 %0 %4
                     %6:dimension<3> = constant [value=3]
                     %7:f32[batch, 3] = broadcast [output_axes=[1]] %3 %0 %6
                     %8:f32[batch, 3] = add %1 %7

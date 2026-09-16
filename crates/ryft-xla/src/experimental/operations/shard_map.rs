@@ -16,7 +16,7 @@ use ryft_core::{
     ProgramError, ProjectedValue, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation,
     ReferenceNewOperation, ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    ReshapeOperation, ReshapeParameters, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
+    ReshapeOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
     ValueProjection, Zero, ZeroOperation, discharge_reference_free_operation,
 };
@@ -1034,9 +1034,8 @@ where
                 return Ok(value);
             }
             let target = <&ArrayType>::try_from(target)?;
-            let operation = ReshapeOperation::new(
-                ReshapeParameters::new(target.shape().clone()).with_output_sharding(target.sharding().cloned()),
-            );
+            let operation =
+                ReshapeOperation::new(target.shape().clone()).with_output_sharding(target.sharding().cloned());
             Ok::<_, ProgramError>(
                 builder.add_instruction(
                     XlaOperation::Array(ArrayOperation::Reshape(operation)),

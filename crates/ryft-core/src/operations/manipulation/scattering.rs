@@ -1762,7 +1762,7 @@ where
         }
         // Only the index-vector axis is new. Reading the other extents from the query supplies the dimension
         // definitions needed to specialize a retained `[queries] -> [queries, 1]` reshape.
-        let indices = indices.dynamic_expand_dims(-1)?;
+        let indices = indices.dynamic_expand_dimensions(-1)?;
         let window_dimensions = (0..input_type.rank())
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })

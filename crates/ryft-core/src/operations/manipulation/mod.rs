@@ -23,10 +23,7 @@ pub use gathering::{
 };
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use padding::{DynamicPad, PAD_OPERATION_NAME, Pad, PadOperation};
-pub use reshaping::{
-    DynamicReshape, DynamicReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, ReshapeOrder,
-    ReshapeParameters,
-};
+pub use reshaping::{DynamicReshape, DynamicReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation};
 pub use scattering::{
     DynamicScatter, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
 };

@@ -35,7 +35,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
-use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape, ReshapeParameters};
+use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::div::Div;
@@ -478,7 +478,7 @@ where
         if value.r#type().shape() == &output_shape && value.r#type().sharding() == output_sharding.as_ref() {
             return Ok(value);
         }
-        Ok(value.reshape(ReshapeParameters::new(output_shape).with_output_sharding(output_sharding))?)
+        Ok(value.reshape_with_output_sharding(output_shape, output_sharding)?)
     }
 }
 

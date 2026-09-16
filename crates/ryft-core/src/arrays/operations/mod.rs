@@ -1417,10 +1417,10 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                 .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
                 .with_memory(Memory::Host { pinned: true });
-        let permuted = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new().with_dimensions([1, 0]));
-        assert_eq!(permuted.to_string(), "reshape [dimensions=[1, 0]]");
+        let placed_reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
+        assert_eq!(placed_reshape.to_string(), "reshape");
         assert_eq!(
-            permuted.infer_output_types(
+            placed_reshape.infer_output_types(
                 &[placed_input_type.into(), DimensionValue::constant(6).unwrap().r#type().into_owned().into(),],
                 &[],
             ),

@@ -7,8 +7,8 @@ use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPoli
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::operations::{
-    Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, One, Reshape, ReshapeParameters, Select,
-    Slice, Transpose, TransposeOperation, Zero,
+    Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, One, Reshape, Select, Slice, Transpose,
+    TransposeOperation, Zero,
 };
 use crate::parameters::ParameterPath;
 use crate::programs::{ProgramError, ProvenanceScope, ReferenceType, RegionRef, Type, TypeError, Typed, Value};
@@ -495,20 +495,19 @@ where
                                 None
                             };
                             let rectangular_plan = rectangular_type.and_then(|rectangular_type| {
-                                let output_reshape_parameters =
-                                    if expected_type.sharding().is_some_and(|sharding| sharding.references_auto_axis())
-                                    {
-                                        ReshapeParameters::new(expected_type.shape().clone())
-                                    } else {
-                                        ReshapeParameters::new(expected_type.shape().clone())
-                                            .with_output_sharding(expected_type.sharding().cloned())
-                                    };
+                                let output_sharding = expected_type
+                                    .sharding()
+                                    .filter(|sharding| !sharding.references_auto_axis())
+                                    .cloned();
                                 rectangular_type
-                                    .reshape(output_reshape_parameters.clone())
+                                    .reshape_with_output_sharding(
+                                        expected_type.shape().clone(),
+                                        output_sharding.clone(),
+                                    )
                                     .is_ok_and(|restored_type| restored_type == expected_type)
-                                    .then_some((rectangular_type, output_reshape_parameters))
+                                    .then_some((rectangular_type, output_sharding))
                             });
-                            if let Some((rectangular_type, output_reshape)) = rectangular_plan {
+                            if let Some((rectangular_type, output_sharding)) = rectangular_plan {
                                 let index_type = rectangular_type.clone().with_data_type(DataType::U64);
                                 let direction_index = context.iota(&index_type, 0)?;
                                 let mut value_coordinate_index = context.iota(&index_type, 1)?;
@@ -527,7 +526,8 @@ where
                                     direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
                                 let zero = context.zero(&rectangular_type)?;
                                 let one = context.one(&rectangular_type)?;
-                                Ok(C::Value::select(&selected, &one, &zero)?.reshape(output_reshape)?)
+                                Ok(C::Value::select(&selected, &one, &zero)?
+                                    .reshape_with_output_sharding(expected_type.shape().clone(), output_sharding)?)
                             } else {
                                 // Flattening is not a placement-preserving reshape for every explicit layout or
                                 // non-contiguous and unconstrained sharding. Construct the same row-major coordinates

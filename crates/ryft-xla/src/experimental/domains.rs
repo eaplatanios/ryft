@@ -7575,7 +7575,7 @@ mod tests {
             "scatter_axis",
             "batched_slice",
             "mapped_source_slice",
-            "expand_dims",
+            "expand_dimensions",
             "flatten",
             "column_take",
             "dynamic_gather_query",
@@ -7585,7 +7585,7 @@ mod tests {
             "index_axis",
         ] {
             let allows_empty_rows =
-                matches!(name, "expand_dims" | "flatten" | "column_take" | "slice_axis" | "index_axis");
+                matches!(name, "expand_dimensions" | "flatten" | "column_take" | "slice_axis" | "index_axis");
             let input_type = ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![
@@ -7687,7 +7687,7 @@ mod tests {
                 | "scatter_axis"
                 | "batched_slice"
                 | "mapped_source_slice"
-                | "expand_dims"
+                | "expand_dimensions"
                 | "flatten"
                 | "column_take"
                 | "dynamic_gather_query"
@@ -7755,7 +7755,7 @@ mod tests {
             };
             let program = if matches!(
                 name,
-                "expand_dims"
+                "expand_dimensions"
                     | "flatten"
                     | "column_take"
                     | "dynamic_gather_query"
@@ -7766,8 +7766,8 @@ mod tests {
             ) {
                 TracingContext::<XlaConstant, XlaOperation>::trace(
                     |inputs| {
-                        Ok(vec![if name == "expand_dims" {
-                            inputs[0].dynamic_expand_dims(0)?
+                        Ok(vec![if name == "expand_dimensions" {
+                            inputs[0].dynamic_expand_dimensions(0)?
                         } else if name == "slice_axis" {
                             inputs[0].dynamic_slice_axis(1, 1, 3, 1)?
                         } else if name == "index_axis" {
@@ -7809,7 +7809,7 @@ mod tests {
                 let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
                 let (shape, expected) = match name {
                     "reshape" => (vec![2, 2 * size], values.clone()),
-                    "expand_dims" => (vec![1, size, 4], values.clone()),
+                    "expand_dimensions" => (vec![1, size, 4], values.clone()),
                     "flatten" => (vec![size * 4], values.clone()),
                     "slice_axis" => (vec![size, 2], values.chunks_exact(4).flat_map(|row| [row[1], row[2]]).collect()),
                     "index_axis" => (vec![size], values.chunks_exact(4).map(|row| row[1]).collect()),

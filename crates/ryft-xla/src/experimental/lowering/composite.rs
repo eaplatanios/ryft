@@ -191,7 +191,7 @@ pub(super) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
 
 /// Packs scalar first-class dimension operands into the rank-one `i32` shape tensor required by
 /// `stablehlo.dynamic_reshape`.
-fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
+pub(super) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -702,16 +702,7 @@ where
                     location,
                 )?;
             }
-            let input = if let Some(dimensions) = operation.dimensions() {
-                let transpose = block.append_operation(stable_hlo::transpose(
-                    *input,
-                    dimensions.normalize(dimensions.len()).map_err(ProgramError::from)?.as_slice(),
-                    location,
-                )?)?;
-                transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
-            } else {
-                *input
-            };
+            let input = *input;
             let result = if output_type.static_shape().is_some() {
                 let output_shape = static_dimensions(output_type)?;
                 for dimension in &output_shape {

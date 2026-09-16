@@ -582,9 +582,8 @@ impl Lowering {
                     format!("ct.astype({}, ct.{data_type})", inputs[0])
                 }
             }
-            ArrayOperation::Reshape(operation)
-                if operation.parameters().dimensions().is_none()
-                    && checked_shape(&types[0])?.iter().all(|extent| extent.is_power_of_two())
+            ArrayOperation::Reshape(_)
+                if checked_shape(&types[0])?.iter().all(|extent| extent.is_power_of_two())
                     && shape.iter().all(|extent| extent.is_power_of_two()) =>
             {
                 format!("ct.reshape({}, {})", inputs[0], physical_shape(&shape))
@@ -904,23 +903,22 @@ mod tests {
     }
 
     #[test]
-    fn test_lowering_array_reshape_permutation() {
+    fn test_lowering_array_transpose_then_reshape() {
         let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 2]);
         let output = ArrayType::new_static(DataType::F32, [4]);
-        let operation = ArrayOperation::Reshape(ryft_core::ReshapeOperation::new(
-            ryft_core::ReshapeParameters::new(output.shape().clone()).with_dimensions(vec![1, 0]),
-        ));
-        assert!(matches!(
-            lowering.array(
-                &operation,
-                &["input".to_owned()],
-                &[ArrayType::new_static(DataType::F32, [2, 2])],
-                &output,
-            ),
-            Err(Error::Unsupported { operation: "reshape", reason })
-                if reason == "array operation or geometry is outside the cuTile subset"
-        ));
-        assert_eq!(lowering.code, "");
+        let transpose = ArrayOperation::Transpose(ryft_core::TransposeOperation::new(vec![1, 0]));
+        let transposed =
+            lowering.array(&transpose, &["input".to_owned()], &[matrix_type.clone()], &matrix_type).unwrap();
+        let reshape = ArrayOperation::Reshape(ryft_core::ReshapeOperation::new(output.shape().clone()));
+        assert_eq!(lowering.array(&reshape, &[transposed], &[matrix_type], &output).unwrap(), "v1");
+        assert_eq!(
+            lowering.code,
+            indoc! {"
+            v0 = ct.permute(input, (1, 0))
+            v1 = ct.reshape(v0, (4,))
+        "}
+        );
     }
 
     #[test]

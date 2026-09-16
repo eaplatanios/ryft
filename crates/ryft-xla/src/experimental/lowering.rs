@@ -39,7 +39,7 @@ use ryft_core::{
     Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
-use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers, ReshapeParameters};
+use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -2771,42 +2771,97 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", lowerer.input_types, 1, ProgramError);
         lower_reshape_to_mlir(
             self,
+            &lowerer.input_types[0],
             input_values,
             output_types,
             &lowerer.collective_state.bound_manual_axes,
             &mut lowerer.block,
+            lowerer.context,
             lowerer.location,
         )
     }
 }
 
-/// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract.
+/// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract. A static output lowers
+/// to `stablehlo.reshape`. A dynamic output is either the input's own shape, which needs no operation, or that shape
+/// with static singleton axes inserted or removed, which lowers to `stablehlo.dynamic_reshape` with a runtime shape
+/// that reads each dynamic extent back from the input.
+#[allow(clippy::too_many_arguments)]
 fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ReshapeOperation,
+    input_type: &ArrayType,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    let input = if let Some(dimensions) = operation.parameters().dimensions() {
-        let transpose = block.append_operation(stable_hlo::transpose(
-            input_values[0],
-            dimensions.normalize(dimensions.len()).map_err(ProgramError::from)?.as_slice(),
-            location,
-        )?)?;
-        transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
-    } else {
-        input_values[0]
-    };
+    let input = input_values[0];
     let result = if output_types[0].static_shape().is_none() {
-        // Core type inference only admits a fixed dynamic target when it is exactly the input shape after applying
-        // `dimensions`, so the identity or transpose above already has the required result type.
-        input
+        if input_type.shape() == output_types[0].shape() {
+            // The dynamic target is exactly the input shape, so the input already has the required result type.
+            input
+        } else {
+            // Core type inference admits a dynamic target only when it inserts or removes static singleton axes
+            // around the input's non-singleton dimensions, so every dynamic output axis corresponds in order
+            // to a dynamic input axis whose runtime size is read back, and every static output axis is a constant.
+            let mut input_axes = input_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .filter(|(_, dimension)| **dimension != Dimension::Static(1))
+                .map(|(axis, _)| axis);
+            let mut extents = Vec::with_capacity(output_types[0].rank());
+            for dimension in output_types[0].shape().dimensions() {
+                extents.push(match dimension {
+                    Dimension::Static(1) => lower_static_index_constants(&[1], block, context, location)?[0],
+                    Dimension::Static(extent) => {
+                        input_axes.next();
+                        lower_static_index_constants(&[*extent], block, context, location)?[0]
+                    }
+                    Dimension::Dynamic(_) => {
+                        let axis = input_axes.next().ok_or_else(|| LoweringError::UnsupportedOp {
+                            op: format!(
+                                "reshape from {} to {} does not preserve the non-singleton dimensions in order",
+                                input_type.shape(),
+                                output_types[0].shape(),
+                            ),
+                        })?;
+                        lower_runtime_dimension_size_i64(input, axis, block, context, location)?
+                    }
+                });
+            }
+            let shape = composite::lower_explicit_reshape_shape(&extents, block, context, location)?;
+            let output_bounds = output_types[0]
+                .shape()
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    Dimension::Static(extent) => Some(*extent),
+                    Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                })
+                .collect::<Vec<_>>();
+            for bound in output_bounds.iter().flatten() {
+                reshape_dimension_i32(*bound)?;
+            }
+            let reshape =
+                block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
+            let result = reshape.result(0).expect("stablehlo.dynamic_reshape should return one result").as_ref();
+            let expected_type = lower_tensor_type(&output_types[0], context, location)?;
+            if result.r#type()? == expected_type.as_ref() {
+                result
+            } else {
+                let cast = block.append_operation(tensor::cast(result, expected_type, location)?)?;
+                cast.result(0).expect("tensor.cast should return one result").as_ref()
+            }
+        }
     } else {
         let output_shape = static_dimensions(&output_types[0])?;
         for dimension in &output_shape {
@@ -2815,7 +2870,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
         let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
         reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
     };
-    if operation.parameters().output_sharding().is_some() {
+    if operation.output_sharding().is_some() {
         let output_sharding = output_types[0]
             .sharding()
             .expect("reshape type inference should preserve a requested output sharding");
@@ -11790,20 +11845,21 @@ mod tests {
     };
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
-        AndOperation, Array as CpuArray, ArrayBatch, ArrayIrOperation, ArrayOperation, Atan2Operation, BatchAxis,
-        BatchableOperation, BatchingContext, BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation,
-        ConditionOperation, ConstantOperation, Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation,
-        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate,
-        Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
+        AndOperation, Array as CpuArray, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
+        ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
+        BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
+        CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
         DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
         LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
-        PadOperation, Placeholder, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation,
-        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape,
-        Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
-        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
-        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope,
+        RaggedDot, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
+        SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile,
+        TileDimension, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation,
+        XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -11854,6 +11910,132 @@ mod tests {
 
     fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> Dimension {
         DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
+    }
+
+    /// One physical value of the mixed executable ABI used by the reshape execution tests: `f64` array storage with
+    /// its physical dimensions on input and the row-major elements inside its logical dimensions on output, or one
+    /// `i64` dimension, which on output also carries the hidden runtime extents that follow the logical outputs.
+    #[derive(Clone, Debug, PartialEq)]
+    enum MixedValue {
+        /// `f64` storage of one array together with its dimensions.
+        Array(Vec<f64>, Vec<u64>),
+
+        /// One `i64` first-class dimension or hidden runtime extent.
+        Dimension(i64),
+    }
+
+    /// Compiles one composite program for the mixed executable ABI and executes it once on `client`. Each logical
+    /// input receives the matching entry of `inputs` (array storage sized to the allocation bound, or one dimension),
+    /// and every bounded dynamic input axis then receives its runtime extent from `extents` in boundary order.
+    fn execute_mixed_program(
+        client: &ryft_pjrt::Client<'_>,
+        program: &FlatXlaProgram,
+        inputs: &[MixedValue],
+        extents: &[i32],
+    ) -> Result<Vec<MixedValue>, ryft_pjrt::Error> {
+        // First-class dimensions cross the executable boundary as `i64` scalars.
+        let boundary_type = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(r#type) => r#type.clone(),
+            ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
+            ArrayIrType::Reference(_) => panic!("reshape execution fixtures have no reference values"),
+        };
+        let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
+        let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
+        let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())?;
+        let device = executable.addressable_devices()?.remove(0);
+        let mut buffers = Vec::with_capacity(inputs.len() + extents.len());
+        for input in inputs {
+            buffers.push(match input {
+                MixedValue::Array(values, dimensions) => client.buffer(
+                    values_to_bytes(values).as_slice(),
+                    BufferType::F64,
+                    dimensions.as_slice(),
+                    None,
+                    device.clone(),
+                    None,
+                )?,
+                MixedValue::Dimension(value) => client.buffer(
+                    values_to_bytes(&[*value]).as_slice(),
+                    BufferType::I64,
+                    &[],
+                    None,
+                    device.clone(),
+                    None,
+                )?,
+            });
+        }
+        for extent in extents {
+            buffers.push(client.buffer(
+                values_to_bytes(&[*extent]).as_slice(),
+                BufferType::I32,
+                &[],
+                None,
+                device.clone(),
+                None,
+            )?);
+        }
+        let inputs = buffers
+            .into_iter()
+            .map(|buffer| ExecutionInput { buffer: Arc::new(buffer), donatable: false })
+            .collect::<Vec<_>>();
+        let outputs = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+            )?
+            .block_until_ready()?
+            .remove(0)
+            .outputs;
+        outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let bytes = output.copy_to_host(None)?.r#await()?;
+                if output_types.get(index).is_none_or(|output_type| output_type.data_type() != DataType::F64) {
+                    // Dimension outputs and the trailing hidden runtime extents are `i64` scalars.
+                    return Ok(MixedValue::Dimension(values_from_bytes::<i64>(bytes.as_slice())[0]));
+                }
+                // A populated dynamic result is copied back as its compact logical elements, while an empty logical
+                // result may still carry its backing allocation and trailing size metadata, which are ignored.
+                let logical = output.unpadded_dimensions()?.to_vec();
+                let element_count = logical.iter().product::<u64>() as usize;
+                let elements = values_from_bytes::<f64>(&bytes[..element_count * size_of::<f64>()]);
+                Ok(MixedValue::Array(elements, logical))
+            })
+            .collect()
+    }
+
+    /// Builds one homogeneous reshape program over an `f64` input for the dynamic singleton lowering tests.
+    fn plain_reshape_program(input_shape: Shape, output_shape: Shape) -> PlainXlaProgram {
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, input_shape));
+        let output =
+            builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
+        builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds the mixed reshape of a static `f64[6]` input to a dynamic `f64[rows]` output whose bound keeps the
+    /// physical capacity at six elements, so only a runtime extent of six passes the element-count assertion.
+    fn static_input_dynamic_output_reshape_program() -> FlatXlaProgram {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7)).unwrap());
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
+        let extent = builder.add_input(DimensionType::new(rows).into());
+        let output = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
+            .unwrap()[0];
+        builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
     }
 
     fn xla_identity_branch(input_type: ArrayType) -> PlainXlaProgram {
@@ -12761,15 +12943,15 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_reshape_dimensions_lower_transpose_before_reshape() {
+    fn test_plain_transpose_then_reshape_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
         let input = builder.add_input(input_type);
+        let input =
+            builder.add_instruction(TransposeOperation::new([-1, -2]), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
-                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([-1, -2]),
-                ),
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])),
                 Vec::new(),
                 vec![input],
                 None,
@@ -12820,21 +13002,17 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_fixed_dynamic_permuted_reshape_lowers_to_transpose() {
+    fn test_plain_fixed_dynamic_transpose_then_identity_reshape_lowers_to_transpose() {
         let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
         let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
         let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
         let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
-        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
-        let output = builder
-            .add_instruction(
-                ReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
+        let input =
+            builder.add_instruction(TransposeOperation::new([2, 0, 1]), Vec::new(), vec![input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(ReshapeOperation::new(output_shape), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -12852,6 +13030,602 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_plain_dynamic_singleton_insertion_reshape_lowers_to_dynamic_reshape() {
+        // Inserting a static singleton axis changes the rank, so neither the identity nor the transpose shortcut
+        // applies. The runtime shape reads the dynamic extent back from the corresponding input axis, static axes
+        // become `i64` constants, and `tensor.cast` restores the refined result type after `dynamic_reshape`.
+        let rows = dynamic_dimension("rows", Some(5));
+        let program = plain_reshape_program(Shape::new(vec![rows.clone()]), Shape::new(vec![1.into(), rows.clone()]));
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<1x?xf64, #stablehlo.bounds<?, 4>> {
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.reshape %2 : (tensor<i32>) -> tensor<1xi32>
+                    %4 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
+                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
+                    %6 = stablehlo.concatenate %3, %5, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+                    %7 = stablehlo.dynamic_reshape %arg0, %6 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<1, 4>>
+                    %cast = tensor.cast %7 : tensor<?x?xf64, #stablehlo.bounds<1, 4>> to tensor<1x?xf64, #stablehlo.bounds<?, 4>>
+                    return %cast : tensor<1x?xf64, #stablehlo.bounds<?, 4>>
+                  }
+                }
+            "#},
+        );
+        // Execute below the allocation bound and with an empty runtime extent; the logical shape follows the input.
+        let client = execution_client();
+        let program = unproject_plain_program(program);
+        let storage = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![1, 2]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![1, 0]), MixedValue::Dimension(0)]),
+        );
+
+        // A trailing static axis is preserved as a constant behind the inserted singleton.
+        let program =
+            plain_reshape_program(Shape::new(vec![rows.clone(), 3.into()]), Shape::new(vec![rows, 1.into(), 3.into()]));
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %c_0 = stablehlo.constant dense<3> : tensor<i64>
+                    %2 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.reshape %2 : (tensor<i32>) -> tensor<1xi32>
+                    %4 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
+                    %6 = stablehlo.convert %c_0 : (tensor<i64>) -> tensor<i32>
+                    %7 = stablehlo.reshape %6 : (tensor<i32>) -> tensor<1xi32>
+                    %8 = stablehlo.concatenate %3, %5, %7, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
+                    %9 = stablehlo.dynamic_reshape %arg0, %8 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>>
+                    %cast = tensor.cast %9 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>> to tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>
+                    return %cast : tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>
+                  }
+                }
+            "#},
+        );
+        let program = unproject_plain_program(program);
+        let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 1, 3]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 1, 3]), MixedValue::Dimension(0)]),
+        );
+    }
+
+    #[test]
+    fn test_plain_dynamic_singleton_removal_reshape_lowers_to_dynamic_reshape() {
+        // Removing the only static axis leaves a rank-one dynamic target whose `dynamic_reshape` result type already
+        // carries the refined bound, so no `tensor.cast` is needed.
+        let rows = dynamic_dimension("rows", Some(5));
+        let program = plain_reshape_program(Shape::new(vec![1.into(), rows.clone()]), Shape::new(vec![rows.clone()]));
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<?xf64, #stablehlo.bounds<4>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.reshape %2 : (tensor<i32>) -> tensor<1xi32>
+                    %4 = stablehlo.dynamic_reshape %arg0, %3 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>, tensor<1xi32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    return %4 : tensor<?xf64, #stablehlo.bounds<4>>
+                  }
+                }
+            "#},
+        );
+        let client = execution_client();
+        let program = unproject_plain_program(program);
+        let storage = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0]), MixedValue::Dimension(0)]),
+        );
+
+        // Removing an interior singleton keeps the surrounding dynamic and static axes in order.
+        let program =
+            plain_reshape_program(Shape::new(vec![rows.clone(), 1.into(), 3.into()]), Shape::new(vec![rows, 3.into()]));
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<?x3xf64, #stablehlo.bounds<4, ?>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %2 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
+                    %3 = stablehlo.reshape %2 : (tensor<i32>) -> tensor<1xi32>
+                    %4 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
+                    %6 = stablehlo.concatenate %3, %5, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+                    %7 = stablehlo.dynamic_reshape %arg0, %6 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 3>>
+                    %cast = tensor.cast %7 : tensor<?x?xf64, #stablehlo.bounds<4, 3>> to tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    return %cast : tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "#},
+        );
+        let program = unproject_plain_program(program);
+        let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 1, 3])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 1, 3])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 3]), MixedValue::Dimension(0)]),
+        );
+    }
+
+    #[test]
+    fn test_plain_dynamic_transpose_then_singleton_reshape_lowers_to_transpose_and_dynamic_reshape() {
+        // An explicit transpose moves the dynamic extent to its permuted axis and reorders the elements
+        // before the singleton is inserted.
+        let rows = dynamic_dimension("rows", Some(5));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![rows.clone(), 3.into()])));
+        let transposed =
+            builder.add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ReshapeOperation::new(Shape::new(vec![3.into(), 1.into(), rows.clone()])),
+                Vec::new(),
+                vec![transposed],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>> {
+                    %0 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<3x?xf64, #stablehlo.bounds<?, 4>>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                    %1 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
+                    %5 = stablehlo.convert %c_0 : (tensor<i64>) -> tensor<i32>
+                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
+                    %7 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                    %8 = stablehlo.reshape %7 : (tensor<i32>) -> tensor<1xi32>
+                    %9 = stablehlo.concatenate %4, %6, %8, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
+                    %10 = stablehlo.dynamic_reshape %0, %9 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>>
+                    %cast = tensor.cast %10 : tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>> to tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>
+                    return %cast : tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>
+                  }
+                }
+            "#},
+        );
+        let client = execution_client();
+        let program = unproject_plain_program(program);
+        let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 3])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 1, 2]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 3])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![3, 1, 0]), MixedValue::Dimension(0)]),
+        );
+
+        // The permutation may also move a singleton that the reshape then removes.
+        let mut builder = XlaProgramBuilder::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![1.into(), rows.clone(), 3.into()])));
+        let transposed =
+            builder.add_instruction(TransposeOperation::new([2, 1, 0]), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ReshapeOperation::new(Shape::new(vec![3.into(), rows])),
+                Vec::new(),
+                vec![transposed],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x?x3xf64, #stablehlo.bounds<?, 4, ?>>) -> tensor<3x?xf64, #stablehlo.bounds<?, 4>> {
+                    %0 = stablehlo.transpose %arg0, dims = [2, 1, 0] : (tensor<1x?x3xf64, #stablehlo.bounds<?, 4, ?>>) -> tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>
+                    %c = stablehlo.constant dense<3> : tensor<i64>
+                    %1 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
+                    %5 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
+                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
+                    %7 = stablehlo.concatenate %4, %6, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+                    %8 = stablehlo.dynamic_reshape %0, %7 : (tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<3, 4>>
+                    %cast = tensor.cast %8 : tensor<?x?xf64, #stablehlo.bounds<3, 4>> to tensor<3x?xf64, #stablehlo.bounds<?, 4>>
+                    return %cast : tensor<3x?xf64, #stablehlo.bounds<?, 4>>
+                  }
+                }
+            "#},
+        );
+        let program = unproject_plain_program(program);
+        let storage = (1..=12).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![1, 4, 3])], &[2]),
+            Ok(vec![MixedValue::Array(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 2]), MixedValue::Dimension(2)]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![1, 4, 3])], &[0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![3, 0]), MixedValue::Dimension(0)]),
+        );
+    }
+
+    #[test]
+    fn test_plain_dynamic_repeated_identity_singleton_reshape_lowers_to_dynamic_reshape() {
+        // Two axes sharing one dimension identity are each read back from their own input axis, in order, so the
+        // repeated identity never collapses into a single runtime read.
+        let rows = dynamic_dimension("rows", Some(5));
+        let program = plain_reshape_program(
+            Shape::new(vec![rows.clone(), rows.clone()]),
+            Shape::new(vec![rows.clone(), 1.into(), rows]),
+        );
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %2 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    %4 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
+                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
+                    %6 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
+                    %7 = stablehlo.reshape %6 : (tensor<i32>) -> tensor<1xi32>
+                    %8 = stablehlo.convert %3 : (tensor<i64>) -> tensor<i32>
+                    %9 = stablehlo.reshape %8 : (tensor<i32>) -> tensor<1xi32>
+                    %10 = stablehlo.concatenate %5, %7, %9, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
+                    %11 = stablehlo.dynamic_reshape %arg0, %10 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>>
+                    %cast = tensor.cast %11 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>> to tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>
+                    return %cast : tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>
+                  }
+                }
+            "#},
+        );
+        // Both input axes receive the shared runtime extent, and both dynamic output axes report it back.
+        let client = execution_client();
+        let program = unproject_plain_program(program);
+        let storage = (1..=16).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage.clone(), vec![4, 4])], &[2, 2]),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 1, 2]),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(2),
+            ]),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &program, &[MixedValue::Array(storage, vec![4, 4])], &[0, 0]),
+            Ok(vec![MixedValue::Array(Vec::new(), vec![0, 1, 0]), MixedValue::Dimension(0), MixedValue::Dimension(0),]),
+        );
+    }
+
+    #[test]
+    fn test_lower_static_input_dynamic_output_reshape_pullback_executes() {
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let program = static_input_dynamic_output_reshape_program();
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tangents = vec![6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+
+        // The primal keeps the elements and reports the requested dynamic extent; a mismatching extent fails the
+        // runtime element-count assertion because the output geometry is unproven.
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)],
+                &[],
+            ),
+            Ok(vec![MixedValue::Array(values.clone(), vec![6]), MixedValue::Dimension(6)]),
+        );
+        let error = execute_mixed_program(
+            &client,
+            &program,
+            &[MixedValue::Array(values, vec![6]), MixedValue::Dimension(3)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("`reshape`"), "{error}");
+
+        // Linearization retains the dynamic extent as the residual, and the pullback reshapes the dynamic cotangent
+        // back to the static input through `stablehlo.reshape` after asserting its runtime element count.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        let cotangent_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+        assert_eq!(
+            to_mlir_module_for_program(
+                &pullback,
+                &[],
+                &vec![cotangent_type, ArrayType::scalar(DataType::I64)],
+                &vec![ArrayType::new_static(DataType::F64, [6])],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<6xf64>, %arg1: tensor<i64>, %arg2: tensor<i32>) -> tensor<6xf64> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<6xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<6>>
+                    %c = stablehlo.constant dense<6> : tensor<i64>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<6>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
+                    %3 = stablehlo.compare LT, %2, %c_0, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %4 = stablehlo.after_all  : !stablehlo.token
+                    %5 = stablehlo.custom_call @ryft.assert(%3, %2, %c, %4) {api_version = 4 : i32, backend_config = {actor = "reshape", detail = "1", kind = "reshape"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %6 = stablehlo.reshape %0 : (tensor<?xf64, #stablehlo.bounds<6>>) -> tensor<6xf64>
+                    return %6 : tensor<6xf64>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &pullback,
+                &[MixedValue::Array(tangents.clone(), vec![6]), MixedValue::Dimension(6)],
+                &[6],
+            ),
+            Ok(vec![MixedValue::Array(tangents.clone(), vec![6])]),
+        );
+        let error = execute_mixed_program(
+            &client,
+            &pullback,
+            &[MixedValue::Array(tangents, vec![6]), MixedValue::Dimension(3)],
+            &[3],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("`reshape`"), "{error}");
+    }
+
+    #[test]
+    fn test_lower_static_input_dynamic_output_reshape_batched_jvp_executes() {
+        // Batching threads the batch extent as a leading dimension input, and the forward derivative of the batched
+        // program reshapes the tangent alongside the primal. Both outputs report the batch and row extents.
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let batch =
+            DimensionType::new(DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap()));
+        let (batched, output_axes) = static_input_dynamic_output_reshape_program()
+            .batched_with_threaded_extent(
+                batch,
+                ShardingDimension::replicated(),
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        let jvp = batched.jvp().unwrap();
+        let values = (1..=18).map(f64::from).collect::<Vec<_>>();
+        let tangents = (101..=118).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &jvp,
+                &[
+                    MixedValue::Dimension(2),
+                    MixedValue::Array(values.clone(), vec![3, 6]),
+                    MixedValue::Dimension(6),
+                    MixedValue::Array(tangents.clone(), vec![3, 6]),
+                ],
+                &[2, 2],
+            ),
+            Ok(vec![
+                MixedValue::Dimension(2),
+                MixedValue::Array(values[..12].to_vec(), vec![2, 6]),
+                MixedValue::Array(tangents[..12].to_vec(), vec![2, 6]),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(6),
+                MixedValue::Dimension(2),
+                MixedValue::Dimension(6),
+            ]),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &jvp,
+                &[
+                    MixedValue::Dimension(0),
+                    MixedValue::Array(values, vec![3, 6]),
+                    MixedValue::Dimension(6),
+                    MixedValue::Array(tangents, vec![3, 6]),
+                ],
+                &[0, 0],
+            ),
+            Ok(vec![
+                MixedValue::Dimension(0),
+                MixedValue::Array(Vec::new(), vec![0, 6]),
+                MixedValue::Array(Vec::new(), vec![0, 6]),
+                MixedValue::Dimension(0),
+                MixedValue::Dimension(6),
+                MixedValue::Dimension(0),
+                MixedValue::Dimension(6),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_lower_batched_proven_reshape_omits_element_count_assertion() {
+        // A proven, effect-free mixed reshape batched over a mapped input recomputes its proof on the lifted
+        // signature, so the batched instruction lowers to a plain `stablehlo.reshape` without an assertion.
+        let parent = TracingContext::<XlaConstant, XlaOperation>::new();
+        let input = parent.input(ArrayType::new_static(DataType::F64, [2, 6]).into());
+        let two = parent.lift(XlaConstant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
+        let three = parent.lift(XlaConstant::Dimension(DimensionValue::constant(3).unwrap())).unwrap();
+        let operation = DynamicReshapeOperation::new()
+            .with_input_types(&[
+                ArrayType::new_static(DataType::F64, [6]).into(),
+                two.r#type().into_owned(),
+                three.r#type().into_owned(),
+            ])
+            .unwrap();
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two.clone());
+        let (outputs, _) = operation
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap(),
+                    ArrayIrBatch::replicated(two),
+                    ArrayIrBatch::replicated(three),
+                ],
+            )
+            .unwrap()
+            .into_parts();
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![outputs[0].value().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![ArrayType::new_static(DataType::F64, [2, 6])],
+                &vec![ArrayType::new_static(DataType::F64, [2, 2, 3])],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x6xf64>) -> tensor<2x2x3xf64> {
+                    %c = stablehlo.constant dense<2> : tensor<i64>
+                    %c_0 = stablehlo.constant dense<3> : tensor<i64>
+                    %0 = stablehlo.reshape %arg0 : (tensor<2x6xf64>) -> tensor<2x2x3xf64>
+                    return %0 : tensor<2x2x3xf64>
+                  }
+                }
+            "#},
+        );
+        let values = (1..=12).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(&execution_client(), &program, &[MixedValue::Array(values.clone(), vec![2, 6])], &[]),
+            Ok(vec![MixedValue::Array(values, vec![2, 2, 3])]),
+        );
+    }
+
+    #[test]
+    fn test_lower_batched_unproven_reshape_keeps_element_count_assertion_for_unused_output() {
+        // An unproven mixed reshape stays effectful after batching, so its assertion survives even though the program
+        // never uses the reshaped value and the executable still rejects mismatching runtime element counts.
+        let client = execution_client();
+        crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let parent = TracingContext::<XlaConstant, XlaOperation>::new();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), dynamic_dimension("input", Some(5))]));
+        let input = parent.input(input_type.clone().into());
+        let size = parent.input(ArrayType::scalar(DataType::I64).into());
+        let output_type =
+            DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(0, Some(5)).unwrap()));
+        let dimension = parent
+            .bind(DimensionFromScalarOperation::new(output_type.variable().clone()), Vec::new(), &[size])
+            .unwrap()
+            .remove(0);
+        let two = parent.lift(XlaConstant::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
+        let operation = DynamicReshapeOperation::new()
+            .with_input_types(&[input_type.unbatched(BatchAxis::new(0)).unwrap().into(), output_type.into()])
+            .unwrap();
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two);
+        let (outputs, _) = operation
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayIrBatch::new(input.clone(), BatchAxis::new(0)).unwrap(), ArrayIrBatch::replicated(dimension)],
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs[0].value().r#type().to_string(), "f64[2, output]");
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![input.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type.clone(), ArrayType::scalar(DataType::I64)],
+            &vec![input_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(module.matches("stablehlo.dynamic_reshape").count(), 1, "{module}");
+        assert_eq!(
+            module.matches(r#"backend_config = {actor = "reshape", detail = "2", kind = "reshape"}"#).count(),
+            1,
+            "{module}",
+        );
+        let values = (1..=8).map(f64::from).collect::<Vec<_>>();
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[MixedValue::Array(values.clone(), vec![2, 4]), MixedValue::Dimension(2)],
+                &[2],
+            ),
+            Ok(vec![MixedValue::Array(vec![1.0, 2.0, 5.0, 6.0], vec![2, 2]), MixedValue::Dimension(2)]),
+        );
+        let error = execute_mixed_program(
+            &client,
+            &program,
+            &[MixedValue::Array(values, vec![2, 4]), MixedValue::Dimension(3)],
+            &[2],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("`reshape`"), "{error}");
     }
 
     #[test]
@@ -13264,10 +14038,12 @@ mod tests {
         let mut block = module.body().unwrap();
         let error = lower_reshape_to_mlir(
             &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
+            &test_vector_type(4),
             &[],
             &[test_vector_type(4)],
             &[],
             &mut block,
+            &context,
             location.as_ref(),
         )
         .unwrap_err();
@@ -13276,15 +14052,14 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_operation_reshape_dimensions_use_shared_lowering() {
+    fn test_xla_operation_transpose_then_reshape_use_shared_lowering() {
         let input_type = test_matrix_type(2, 3);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
+        let input = builder.add_instruction(TransposeOperation::new([1, 0]), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
-                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
-                ),
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])),
                 Vec::new(),
                 vec![input],
                 None,
@@ -13319,10 +14094,8 @@ mod tests {
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(
-                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
-                        .with_output_sharding(output_sharding),
-                ),
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                    .with_output_sharding(output_sharding),
                 Vec::new(),
                 vec![input],
                 None,

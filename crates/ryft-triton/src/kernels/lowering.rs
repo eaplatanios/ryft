@@ -873,9 +873,8 @@ impl<'c, 't> Lowering<'c, 't> {
                 }
             }
             ArrayOperation::Select(_) => append(block, arith::select(inputs[0], inputs[1], inputs[2], location)?)?,
-            ArrayOperation::Reshape(operation)
-                if operation.parameters().dimensions().is_none()
-                    && shape(&types[0])?.iter().chain(output_shape.iter()).all(|extent| extent.is_power_of_two()) =>
+            ArrayOperation::Reshape(_)
+                if shape(&types[0])?.iter().chain(output_shape.iter()).all(|extent| extent.is_power_of_two()) =>
             {
                 if types[0].rank() == 0 {
                     self.splat(block, inputs[0], output.data_type(), &output_shape)?

@@ -134,11 +134,7 @@ pub(super) fn validate(
             )?;
             Ok(())
         }
-        ArrayOperation::Reshape(reshape)
-            if reshape.parameters().dimensions().is_none() && reshape.parameters().output_sharding().is_none() =>
-        {
-            Ok(())
-        }
+        ArrayOperation::Reshape(reshape) if reshape.output_sharding().is_none() => Ok(()),
         _ => Err(unsupported(operation, "operation or its metadata has no baseline scalar implementation")),
     }
 }
