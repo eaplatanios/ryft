@@ -976,6 +976,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ArrayType, Concatenate, DataType, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: left [2, 1], right [2, 2] -> output [2, 3].
 /// let left = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1i32, 2])?;
 /// let right = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2]), &[3i32, 4, 5, 6])?;
 /// let output = left.concatenate_with([&right], -1)?;
@@ -1155,6 +1156,7 @@ where
 /// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DimensionValue, DynamicConcatenate, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: left [2], right [1] -> output [3] for both concatenation calls below.
 /// let left = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 2])?);
 /// let right = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [1]), &[3i32])?);
 /// let expected = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[1i32, 2, 3])?);

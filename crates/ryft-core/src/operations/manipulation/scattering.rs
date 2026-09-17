@@ -1257,6 +1257,7 @@ where
 /// ```rust
 /// use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind};
 ///
+/// // Shapes: input [3, 2], indices [2, 1], updates [2, 2] -> output [3, 2].
 /// let input = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1313,6 +1314,7 @@ pub trait Scatter: Sized {
     /// ```rust
     /// use ryft_core::{Array, ScatterMode, Scatter, ScatterReductionKind};
     ///
+    /// // Shapes: input [3], indices [2], updates [2] -> output [3].
     /// let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
     /// let indices = Array::vector(vec![2_i32, 0]).unwrap();
     /// let updates = Array::vector(vec![1_i32, 2]).unwrap();
@@ -1975,6 +1977,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArrayIrValue, DynamicScatter, ScatterMode, ScatterReductionKind};
+/// // Shapes: input [3], indices [2], updates [2] -> output [3].
 /// let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
 /// let indices = ArrayIrValue::Array(Array::vector(vec![1_i32, 1]).unwrap());
 /// let updates = ArrayIrValue::Array(Array::vector(vec![2_i32, 3]).unwrap());

@@ -351,6 +351,7 @@ impl_differentiable_operation! {
 /// ```rust
 /// # use ryft_core::{Array, Broadcast, ProgramError, StaticShape};
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [3] -> output [2, 3] for both broadcast calls below.
 /// let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
 /// let output = input.broadcast_to(StaticShape::new(vec![2, 3]))?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
@@ -482,6 +483,7 @@ pub trait Broadcast: Sized {
     ///
     /// ```rust
     /// # use ryft_core::{Array, ArrayType, Broadcast, DataType, ProgramError};
+    /// // Shapes: inputs [2, 1] and [3] -> outputs [2, 3] and [2, 3].
     /// let inputs = [
     ///     Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1_i32, 2])?,
     ///     Array::from_elements(ArrayType::new_static(DataType::F32, [3]), &[3_f32, 4.0, 5.0])?,
@@ -1339,6 +1341,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ArrayIrValue, DynamicBroadcast, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [3] -> output [2, 3].
 /// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
 /// let output = input.dynamic_broadcast_to_sizes(&[2, 3])?;
 /// assert_eq!(
@@ -1359,6 +1362,7 @@ impl_differentiable_operation! {
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+/// // Shapes: input [] (scalar) -> output [extent], where extent is a symbolic dimension.
 /// let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
 /// let extent = context.input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
 ///     "extent",
@@ -1578,6 +1582,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     ///
     /// ```rust
     /// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DynamicBroadcast, ProgramError};
+    /// // Shapes: inputs [] (scalar) and [2] -> outputs [2] and [2].
     /// let inputs = [
     ///     ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::I32), &[7i32])?),
     ///     ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.0])?),

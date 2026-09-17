@@ -307,6 +307,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ProgramError, Reshape, Shape};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [6] -> output [2, 3].
 /// let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
 /// let output = input.reshape(Shape::new(vec![2.into(), 3.into()]))?;
 /// assert_eq!(output, Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?);
@@ -1056,6 +1057,7 @@ impl_differentiable_operation! {
 /// ```rust
 /// # use ryft_core::{Array, ArrayIrValue, DynamicReshape, ProgramError};
 ///
+/// // Shapes: input [6] -> output [2, 3].
 /// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?);
 /// let output = input.dynamic_reshape_to_sizes(&[2, 3])?;
 /// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?));
@@ -1079,6 +1081,7 @@ impl_differentiable_operation! {
 /// let input_type =
 ///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(6)]));
 /// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+/// // Shapes: input [batch, 6] -> output [batch, 2, 3], retaining the symbolic batch extent.
 /// let input = context.input(ArrayIrType::Array(input_type));
 /// let rows = input.dimension_size(0).unwrap();
 /// let columns = context.lift(DimensionValue::constant(2).unwrap().into()).unwrap();

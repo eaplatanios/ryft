@@ -366,6 +366,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ProgramError, Transpose};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [2, 3] -> output [3, 2].
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let output = input.transpose([1, 0])?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
@@ -385,6 +386,7 @@ pub trait Transpose: Sized {
     ///
     /// ```rust
     /// # use ryft_core::{ArrayType, DataType, ProgramError, Transpose};
+    /// // Shapes: input [2, 3, 4] -> output [4, 3, 2].
     /// let input = ArrayType::new_static(DataType::F32, [2, 3, 4]);
     /// assert_eq!(input.transpose_reversed()?, ArrayType::new_static(DataType::F32, [4, 3, 2]));
     /// # Ok::<(), ProgramError>(())
@@ -404,6 +406,7 @@ pub trait Transpose: Sized {
     ///
     /// ```rust
     /// # use ryft_core::{ArrayType, DataType, ProgramError, Transpose};
+    /// // Shapes: input [2, 3, 4] -> output [2, 4, 3].
     /// let input = ArrayType::new_static(DataType::F32, [2, 3, 4]);
     /// assert_eq!(input.matrix_transpose()?, ArrayType::new_static(DataType::F32, [2, 4, 3]));
     /// # Ok::<(), ProgramError>(())
@@ -434,7 +437,11 @@ pub trait Transpose: Sized {
     /// ```rust
     /// # use ryft_core::{ArrayType, DataType, ProgramError, Transpose};
     /// let input = ArrayType::new_static(DataType::F32, [2, 3, 4]);
+    ///
+    /// // Shapes: input [2, 3, 4] -> output [3, 4, 2].
     /// assert_eq!(input.move_axis(0, -1)?, ArrayType::new_static(DataType::F32, [3, 4, 2]));
+    ///
+    /// // Shapes: input [2, 3, 4] -> output [4, 3, 2].
     /// assert_eq!(input.move_axis([0, 2], [2, 0])?, ArrayType::new_static(DataType::F32, [4, 3, 2]));
     /// # Ok::<(), ProgramError>(())
     /// ```
@@ -484,6 +491,7 @@ pub trait Transpose: Sized {
     ///
     /// ```rust
     /// # use ryft_core::{Array, ProgramError, Transpose};
+    /// // Shapes: input [2, 3] -> output [3, 2].
     /// let input = Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap();
     /// assert_eq!(input.swap_axes(-2, -1)?, Array::matrix(3, 2, vec![1_i32, 4, 2, 5, 3, 6]).unwrap());
     /// # Ok::<(), ProgramError>(())

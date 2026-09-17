@@ -979,8 +979,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Reads "windows" from an array at positions supplied by an integer index array. The receiver is the data source.
 /// The `indices` input describes where each window starts, [`GatherDimensionNumbers`] maps the axes, `slice_sizes`
 /// gives the window sizes, and [`GatherOptions`] selects out-of-bounds behavior. Gathering can select individual
@@ -1040,6 +1038,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOptions};
+/// // Shapes: input [5], indices [1, 1], fill [] (scalar) -> output [1, 2].
 /// let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
 /// let indices = Array::matrix(1, 1, vec![4_i32]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![], vec![0]);
@@ -1084,7 +1083,8 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
-/// #
+///
+/// // Shapes: input [3, 2], indices [2, 1] -> output [2, 2] for either axis order below.
 /// let input = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
@@ -1103,14 +1103,15 @@ where
 ///
 /// ## Rectangular Windows
 ///
-/// Collapsing is optional. With two-component indices, `start_index_map = [0, 1]`, and `slice_sizes = [2, 2]`, each
-/// query selects a two-row, two-column block. Keeping both window axes at output positions `[1, 2]` gives shape
-/// `[queries, 2, 2]`. The starts `[0, 1]` and `[1, 2]` below produce blocks `[[1, 2], [5, 6]]` and
+/// Collapsing is optional. With two-component indices, `start_index_map = [0, 1]`, and `slice_sizes = [2, 2]`,
+/// each query selects a two-row, two-column block. Keeping both window axes at output positions `[1, 2]` gives
+/// shape `[queries, 2, 2]`. The starts `[0, 1]` and `[1, 2]` below produce blocks `[[1, 2], [5, 6]]` and
 /// `[[6, 7], [10, 11]]`, respectively. Overlapping windows are allowed.
 ///
 /// ```rust
-/// use ryft_core::{Array, ArrayType, DataType, Gather, GatherDimensionNumbers, GatherOptions};
+/// # use ryft_core::{Array, ArrayType, DataType, Gather, GatherDimensionNumbers, GatherOptions};
 ///
+/// // Shapes: input [3, 4], indices [2, 2] -> output [2, 2, 2] (i.e., two [2, 2] windows).
 /// let input = Array::matrix(3, 4, vec![0_i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).unwrap();
 /// let indices = Array::matrix(2, 2, vec![0_i32, 1, 1, 2]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1, 2], vec![], vec![0, 1]);
@@ -1125,17 +1126,18 @@ where
 ///
 /// Ordinary query axes all read from the same input. Paired batching instead ties a query coordinate to an input
 /// coordinate: each `(input_axis, indices_axis)` entry of `batching_dimensions` takes the input coordinate from
-/// that indices axis. These paired axes must have equal extents. Input batching axes cannot
-/// also be indexed by `start_index_map` or collapsed. Their window sizes are at most one; they do not contribute
-/// window axes to the output. Their matching query axes still appear once in the output.
+/// that indices axis. These paired axes must have equal extents. Input batching axes cannot also be indexed by
+/// `start_index_map` or collapsed. Their window sizes are at most one; they do not contribute window axes to the
+/// output. Their matching query axes still appear once in the output.
 ///
 /// For an input of shape `[batch, columns]` and indices of shape `[batch, 1]`, pair input axis `0` with indices axis
 /// `0`. Each vector then supplies only a column index (`start_index_map = [1]`). This selects one column per row,
 /// rather than applying every query to every row:
 ///
 /// ```rust
-/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
+/// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
 ///
+/// // Shapes: input [2, 3], indices [2, 1] -> output [2] (i.e., one element per batch item).
 /// let input = Array::matrix(2, 3, vec![10_i32, 20, 30, 40, 50, 60]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![2_i32, 0]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![], vec![1], vec![1])
@@ -1145,13 +1147,12 @@ where
 ///     Ok(Array::vector(vec![30_i32, 40]).unwrap()),
 /// );
 /// ```
-#[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
     /// Reads windows of `slice_sizes` from the input at the starts given by `indices`, using `dimensions` to arrange
-    /// their axes and `options` to select bounds behavior, index promises, and output placement.
-    /// See the [`Gather`] guide for how index vectors, window sizes, and output-axis positions interact.
-    /// Negative starts are out of bounds; they do not count backward from an axis end. Bounds handling applies to
-    /// whole windows, so one invalid start fills the entire window in fill mode.
+    /// their axes and `options` to select bounds behavior, index promises, and output placement. Refer to the
+    /// documentation of [`Gather`] for how index vectors, window sizes, and output-axis positions interact. Negative
+    /// starts are out of bounds; they do not count backward from an axis end. Bounds handling applies to whole windows,
+    /// so one invalid start fills the entire window in fill mode.
     ///
     /// # Parameters
     ///
@@ -1167,10 +1168,10 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
         options: &GatherOptions<Stored>,
     ) -> Result<Self, ProgramError>;
 
-    /// Gathers complete slices along one axis using raw integer indices. The index array's shape replaces that
-    /// input axis in the result, and all other input axes retain their order and full size. Unlike indexing APIs that
-    /// count negative indices backward from the end, this function treats every negative index as out of bounds and
-    /// applies `mode` directly. It does not change or wrap index values.
+    /// Gathers complete slices along one axis using raw integer indices. The index array's shape replaces that input
+    /// axis in the result, and all other input axes retain their order and full size. Unlike indexing APIs that count
+    /// negative indices backward from the end, this function treats every negative index as out of bounds and applies
+    /// `mode` directly. It does not change or wrap index values.
     ///
     /// The selected axis may have a dynamic extent. All other input extents must be statically known because the
     /// underlying [`GatherOperation`] stores their complete window sizes as host integers. The index shape must also
@@ -1181,14 +1182,15 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
     ///
     ///   - `indices`: Integer indices of any rank. A scalar selects one slice and removes the selected axis.
     ///   - `axis`: Input axis to select. Negative axes count backward from the input rank.
-    ///   - `mode`: Out-of-bounds policy. [`GatherMode::Clip`] clamps indices; [`GatherMode::Fill`]
-    ///     fills invalid slices using the input data type's default fill; the promise mode requires valid indices.
+    ///   - `mode`: Out-of-bounds policy. [`GatherMode::Clip`] clamps indices; [`GatherMode::Fill`] fills invalid slices
+    ///     using the input data type's default fill; the promise mode requires valid indices.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use ryft_core::{Array, Gather, GatherMode};
+    /// # use ryft_core::{Array, Gather, GatherMode};
     ///
+    /// // Shapes: input [2, 3], indices [2] -> output [2, 2].
     /// let input = Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap();
     /// let indices = Array::vector(vec![2_i32, 0]).unwrap();
     /// let output = input.gather_axis(&indices, 1, GatherMode::Clip).unwrap();
@@ -1233,8 +1235,6 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
 }
 
 impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
-    // Type-level gather: validates the dimension numbers and slice sizes against the input and indices types and
-    // computes the output shape and placement.
     fn gather(
         &self,
         indices: &Self,
@@ -1250,29 +1250,34 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 
         if indices_rank == 0 {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` indices must have rank at least 1 (the trailing index vector)"
+                "`{GATHER_OPERATION_NAME}` indices must have rank at least 1 (the trailing index vector)",
             ))
             .into());
         }
+
         if !indices.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` indices must be integer-typed but have type `{indices}`"
+                "`{GATHER_OPERATION_NAME}` indices must be integer-typed but have type `{indices}`",
             ))
             .into());
         }
+
         options.validate_fill_value(input.data_type())?;
+
         if input.memory() != indices.memory() {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` input and indices must share one memory space but reside in `{}` and `{}`",
+                "`{}` input and indices must share one memory space but reside in `{}` and `{}`",
+                GATHER_OPERATION_NAME,
                 input.memory(),
                 indices.memory(),
             ))
             .into());
         }
+
         let index_vector_dimension = indices_rank - 1;
         let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` indices index vector dimension must have a static extent"
+                "`{GATHER_OPERATION_NAME}` indices index vector dimension must have a static extent",
             ))
             .into());
         };
@@ -1285,12 +1290,14 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             dimensions.offset_dimensions(),
             output_rank,
         )?;
+
         validate_sorted_unique_in_range(
             GATHER_OPERATION_NAME,
             "collapsed_slice_dimensions",
             dimensions.collapsed_slice_dimensions(),
             input_rank,
         )?;
+
         validate_sorted_unique_in_range(
             GATHER_OPERATION_NAME,
             "batching_dimensions input axes",
@@ -1300,12 +1307,14 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 
         if dimensions.start_index_map().len() != index_vector_extent {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` `start_index_map` has length {} but the index vector extent is \
-                     {index_vector_extent}",
+                "`{}` `start_index_map` has length {} but the index vector extent is {}",
+                GATHER_OPERATION_NAME,
                 dimensions.start_index_map().len(),
+                index_vector_extent,
             ))
             .into());
         }
+
         validate_unique_in_range(GATHER_OPERATION_NAME, "start_index_map", dimensions.start_index_map(), input_rank)?;
 
         validate_unique_in_range(
@@ -1314,12 +1323,14 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             &indices_batching_dimensions,
             indices_rank,
         )?;
+
         if dimensions.start_index_map().iter().any(|axis| input_batching_dimensions.contains(axis)) {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` `start_index_map` and `batching_dimensions input axes` must be disjoint"
             ))
             .into());
         }
+
         if indices_batching_dimensions.contains(&index_vector_dimension) {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` `batching_dimensions indices axes` cannot name the index vector dimension \
@@ -1334,49 +1345,55 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         if collapsed.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` `collapsed_slice_dimensions` and `batching_dimensions input axes` must be \
-                     disjoint"
+                 disjoint"
             ))
             .into());
         }
 
-        // Slice sizes: one per input axis; size 1 on collapsed axes; size at most 1 on batching axes; within the
-        // input extent when that extent is static.
+        // Slice sizes must have one per input axis, size 1 on collapsed axes, size at most 1 on batching axes,
+        // and within the input extent when that extent is static.
         if slice_sizes.len() != input_rank {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` `slice_sizes` has length {} but the input has rank {input_rank}",
+                "`{}` `slice_sizes` has length {} but the input has rank {}",
+                GATHER_OPERATION_NAME,
                 slice_sizes.len(),
+                input_rank,
             ))
             .into());
         }
+
         for (axis, &size) in slice_sizes.iter().enumerate() {
             match input.dimension(axis) {
                 Dimension::Static(extent) if size > extent => {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` slice size {size} at axis {axis} exceeds the input extent \
-                         {extent}"
+                        "`{GATHER_OPERATION_NAME}` slice size {size} at axis {axis} exceeds the input extent {extent}",
                     ))
                     .into());
                 }
                 Dimension::Dynamic(variable) if size > variable.bounds().lower() => {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` slice size {size} exceeds the guaranteed minimum extent {} of \
-                         dynamic input axis {axis}",
+                        "`{}` slice size {} exceeds the guaranteed minimum extent {} of dynamic input axis {}",
+                        GATHER_OPERATION_NAME,
+                        size,
                         variable.bounds().lower(),
+                        axis,
                     ))
                     .into());
                 }
                 _ => {}
             }
+
             if collapsed.contains(&axis) && size != 1 {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` collapsed slice dimension {axis} must have slice size 1 but has {size}"
+                    "`{GATHER_OPERATION_NAME}` collapsed slice dimension {axis} must have slice size 1 but has {size}",
                 ))
                 .into());
             }
+
             if operand_batching.contains(&axis) && size > 1 {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` input batching dimension {axis} must have slice size at most 1 but \
-                         has {size}"
+                     has {size}",
                 ))
                 .into());
             }
@@ -1397,14 +1414,15 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             if !dimensions_have_equal_extents(&input.dimension(input_axis), &indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
-                         {input_axis} and indices axis {indices_axis} differ"
+                     {input_axis} and indices axis {indices_axis} differ"
                 ))
                 .into());
             }
         }
 
-        // Output shape: offset positions take the (non-collapsed, non-batching) input window sizes in input-axis
-        // order; the remaining positions take the indices' batch axes (every axis but the index vector) in order.
+        // In the output shape, offset positions take the (non-collapsed, non-batching) input window sizes in input-axis
+        // order and the remaining positions take the indices' batch axes (i.e., every axis but the index vector)
+        // in order.
         let input_offset_axes: Vec<usize> = (0..input_rank)
             .filter(|axis| !collapsed.contains(axis) && !operand_batching.contains(axis))
             .collect();
@@ -1425,29 +1443,31 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             })
             .collect();
 
-        // Retained full-window axes preserve input placement, and query axes inherit index placement. Partial
-        // windows on explicitly sharded axes need an explicit output placement. Reduction and manual-axis state
-        // remain part of the contract even when a placement is supplied explicitly.
+        // Retained full-window axes preserve input placement, and query axes inherit index placement. Partial windows
+        // on explicitly sharded axes need an explicit output placement. Reduction and manual-axis state remain part of
+        // the contract even when a placement is supplied explicitly.
         let input_sharding = input.sharding();
         let indices_sharding = indices.sharding();
         let mesh = match (input_sharding, indices_sharding) {
             (Some(input), Some(indices)) if input.mesh() != indices.mesh() => {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` input and indices shardings must use the same mesh"
+                    "`{GATHER_OPERATION_NAME}` input and indices shardings must use the same mesh",
                 ))
                 .into());
             }
             (Some(sharding), _) | (_, Some(sharding)) => Some(sharding.mesh().clone()),
             (None, None) => None,
         };
+
         if indices_sharding
             .is_some_and(|sharding| !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty())
         {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes"
+                "`{GATHER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes",
             ))
             .into());
         }
+
         let unreduced_axes = input_sharding.map(Sharding::unreduced_axes).cloned().unwrap_or_default();
         let reduced_axes = input_sharding.map(Sharding::reduced_axes).cloned().unwrap_or_default();
         let mut varying_manual_axes = input_sharding.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
@@ -1458,48 +1478,52 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                     || !sharding.varying_manual_axes().is_empty())
             {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
+                    "`{GATHER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices",
                 ))
                 .into());
             }
         }
-        // An unreduced input holds per-device partial sums, so a fill constant written on every device would be
-        // counted once per device by the pending reduction. Reduced inputs are complete on each device and may be
-        // filled.
+
+        // An unreduced input holds per-device partial sums, so a fill constant written on every device would be counted
+        // once per device by the pending reduction. Reduced inputs are complete on each device and may be filled.
         if !unreduced_axes.is_empty() && matches!(options.mode(), GatherMode::Fill { .. }) {
             return Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` fill mode does not support unreduced inputs"
+                "`{GATHER_OPERATION_NAME}` fill mode does not support unreduced inputs",
             ))
             .into());
         }
+
         let sharding = if let Some(requested) = options.output_sharding() {
             if mesh.as_ref().is_some_and(|mesh| mesh != requested.mesh()) {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` requested output sharding uses a different mesh"
+                    "`{GATHER_OPERATION_NAME}` requested output sharding uses a different mesh",
                 ))
                 .into());
             }
+
             if requested.unreduced_axes() != &unreduced_axes
                 || requested.reduced_axes() != &reduced_axes
                 || requested.varying_manual_axes() != &varying_manual_axes
             {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state"
+                    "`{GATHER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state",
                 ))
                 .into());
             }
 
             if requested.rank() != output_rank {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` output sharding rank ({}) does not match the output rank \
-                         ({output_rank})",
+                    "`{}` output sharding rank ({}) does not match the output rank ({})",
+                    GATHER_OPERATION_NAME,
                     requested.rank(),
+                    output_rank,
                 ))
                 .into());
             }
+
             if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
-                    "`{GATHER_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
+                    "`{GATHER_OPERATION_NAME}` output sharding cannot reference auto mesh axes",
                 ))
                 .into());
             }
@@ -1520,19 +1544,20 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                     {
                         return Err(TypeError::invalid(format!(
                             "`{GATHER_OPERATION_NAME}` input axis {axis} is indexed by the start indices and must \
-                                 be replicated over explicit mesh axes; request an explicit output sharding to resolve \
-                                 placement"
+                             be replicated over explicit mesh axes; request an explicit output sharding to resolve \
+                             placement"
                         ))
                         .into());
                     }
                 }
             }
+
             if let Some(sharding) = indices_sharding
                 && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension])
             {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit \
-                         mesh axes"
+                     mesh axes"
                 ))
                 .into());
             }
@@ -1545,11 +1570,12 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                         .is_some_and(|sharding| dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis]))
                 {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` partial sharded windows require explicit output sharding"
+                        "`{GATHER_OPERATION_NAME}` partial sharded windows require explicit output sharding",
                     ))
                     .into());
                 }
             }
+
             let mut indices_placement = indices_sharding
                 .map(|sharding| sharding.dimensions().to_vec())
                 .unwrap_or_else(|| vec![ShardingDimension::Replicated; indices_rank]);
@@ -1562,14 +1588,15 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                     *indices_dimension = input_placement;
                 } else if input_placement != ShardingDimension::Replicated && input_placement != *indices_dimension {
                     return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` conflicting batching-axis shardings require explicit output sharding"
+                        "`{GATHER_OPERATION_NAME}` conflicting batching-axis shardings require explicit \
+                         output sharding",
                     ))
                     .into());
                 }
             }
 
-            // Propagate placement: offset positions inherit the input window axes; the remaining positions inherit
-            // the indices' batch axes (every axis but the index vector), in order.
+            // On sharding/placement, offset positions inherit the input window axes and the remaining positions inherit
+            // the indices' batch axes (i.e., every axis but the index vector), in order.
             let mut offset_iterator = input_offset_axes.iter();
             let mut batch_iterator = indices_batch_axes.iter();
             let placement: Vec<ShardingDimension> = (0..output_rank)
@@ -1602,6 +1629,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         } else {
             None
         };
+
         ArrayType::new(input.data_type(), Shape::new(output_dimensions))
             .with_memory(input.memory())
             .with_sharding(sharding)
@@ -1610,6 +1638,8 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Gather for Array {
     fn gather(
@@ -1771,6 +1801,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArrayIrValue, DynamicGather, GatherMode};
+/// // Shapes: input [2, 3], indices [2] -> output [2, 2].
 /// let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap());
 /// let indices = ArrayIrValue::Array(Array::vector(vec![2_i32, 0]).unwrap());
 /// let output = input.dynamic_gather_axis(&indices, 1, GatherMode::Clip).unwrap();

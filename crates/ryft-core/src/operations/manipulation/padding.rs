@@ -1432,12 +1432,14 @@ impl_differentiable_operation! {
 /// # use ryft_core::{Array, ArrayType, DataType, Pad, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [3], padding value [] (scalar) -> output [8].
 /// let input = Array::from_elements(ArrayType::new_static(DataType::I32, [3]), &[1i32, 2, 3])?;
 /// let value = Array::from_elements(ArrayType::scalar(DataType::I32), &[0i32])?;
 /// let output = input.pad(&value, &[1], &[2], &[1])?;
 /// assert_eq!(output.elements::<i32>()?, vec![0, 1, 0, 2, 0, 3, 0, 0]);
 ///
 /// // Cropping is applied after inserting the interior zeros.
+/// // Shapes: input [3], padding value [] (scalar) -> cropped [4].
 /// let cropped = input.pad(&value, &[-1], &[0], &[1])?;
 /// assert_eq!(cropped.elements::<i32>()?, vec![0, 2, 0, 3]);
 /// # Ok(())
@@ -1661,6 +1663,7 @@ where
 /// # use ryft_core::{Array, ArrayIrValue, ArrayType, DataType, DimensionValue, DynamicPad, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [2], padding value [] (scalar) -> output [5].
 /// let input = ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 2])?);
 /// let value = ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::I32), &[9i32])?);
 /// let dimension = ArrayIrValue::Dimension(DimensionValue::constant(5)?);

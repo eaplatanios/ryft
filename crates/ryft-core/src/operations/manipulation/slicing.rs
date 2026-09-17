@@ -560,12 +560,14 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Slice the last two elements of the second row of a 2x3 matrix.
+/// // Shapes: input [2, 3] -> output [1, 2].
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let output = input.slice(&[1, 1], &[2, 3], &[1, 1])?;
 /// // `output` has shape [1, 2] with values [[5.0, 6.0]].
 /// assert_eq!(output.to_f64s(), vec![5.0, 6.0]);
 ///
 /// // A non-unit stride keeps every other element, selecting positions 1, 3, and 5.
+/// // Shapes: input [6] -> output [3].
 /// let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 /// let output = input.slice(&[1], &[6], &[2])?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 3.0, 5.0]);
@@ -999,6 +1001,7 @@ impl_differentiable_operation! {
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
+/// // Shapes: input [2, 3], update [1, 2] -> output [2, 3].
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
 /// let output = input.update_slice(&update, &[0, 1])?;
@@ -1609,6 +1612,7 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
+/// // Shapes: input [2, 3], row and column [] (scalars) -> output [1, 2].
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let row = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
 /// let column = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
@@ -2214,6 +2218,7 @@ where
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
+/// // Shapes: input [2, 3], update [1, 2], row and column [] (scalars) -> output [2, 3].
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
 /// let row = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[0]).unwrap();
@@ -2647,6 +2652,7 @@ impl_differentiable_operation! {
 /// ```
 /// # use ryft_core::{Array, ArrayIrValue, DimensionValue, DynamicShapeSlice, ProgramError};
 /// # fn example() -> Result<(), ProgramError> {
+/// // Shapes: input [4] -> result [2]; start and size are dimension values, not tensors.
 /// let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30, 40])?);
 /// let start = ArrayIrValue::Dimension(DimensionValue::constant(1)?);
 /// let size = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
