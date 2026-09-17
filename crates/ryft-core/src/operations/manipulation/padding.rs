@@ -1533,8 +1533,6 @@ impl Pad for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Pad for Array {
     fn pad(
         &self,
@@ -1579,8 +1577,8 @@ impl Pad for Array {
 
         let mut input_index = vec![0usize; rank];
         let mut output_index = vec![0usize; rank];
-        let mut written = 0usize;
-        'elements: while written < input_addressing.element_count() {
+        for _ in 0..input_addressing.element_count() {
+            let mut is_cropped = false;
             for axis in 0..rank {
                 let input_coordinate = i128::try_from(input_index[axis]).map_err(|_| {
                     TypeError::invalid(format!("`{PAD_OPERATION_NAME}` input index is too large on axis {axis}"))
@@ -1600,17 +1598,17 @@ impl Pad for Array {
                     TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output extent is too large on axis {axis}"))
                 })?;
                 if output_coordinate < 0 || output_coordinate >= output_extent {
-                    written += 1;
-                    input_addressing.advance_index(&mut input_index);
-                    continue 'elements;
+                    is_cropped = true;
+                    break;
                 }
                 output_index[axis] = usize::try_from(output_coordinate).map_err(|_| {
                     TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index is too large on axis {axis}"))
                 })?;
             }
-            bytes[output_addressing.byte_range_unchecked(&output_index)]
-                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            written += 1;
+            if !is_cropped {
+                bytes[output_addressing.byte_range_unchecked(&output_index)]
+                    .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            }
             input_addressing.advance_index(&mut input_index);
         }
 
@@ -1682,13 +1680,11 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
     /// # Parameters
     ///
     ///   - `padding_value`: Scalar array with the input's element data type and memory space.
-    ///   - `output_dimensions`: One dimension value per output axis. Each value must equal
-    ///     `d + max(d - 1, 0) * interior + low + high` for that axis's input extent `d`. Repeated dimension identities
-    ///     must denote equal runtime sizes.
-    ///   - `edge_padding_low`: Signed edge padding before each input axis; negative amounts crop after interior
-    ///     padding.
-    ///   - `edge_padding_high`: Signed edge padding after each input axis; negative amounts crop after interior
-    ///     padding.
+    ///   - `output_dimensions`: One dimension value per output axis. Each value must equal `d + max(d - 1, 0) *
+    ///     interior + low + high` for that axis's input extent `d`. Repeated dimension identities must denote equal
+    ///     runtime sizes.
+    ///   - `edge_padding_low`: Signed edge padding before each input axis. Negative values crop after interior padding.
+    ///   - `edge_padding_high`: Signed edge padding after each input axis. Negative values crop after interior padding.
     ///   - `interior_padding`: Number of padding values between adjacent input elements on each axis. An empty input
     ///     axis has no adjacent pairs and contributes no interior padding.
     fn dynamic_pad(
@@ -1720,6 +1716,7 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for Arr
             interior_padding,
         )?;
         check_count!("input", output_dimensions, input.r#type().rank(), ProgramError);
+
         // Binding every explicit extent to its dimension identity rejects repeated identities that denote different
         // runtime sizes.
         let mut refinements = ArrayTypeRefinements::default();
@@ -1736,13 +1733,16 @@ impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for Arr
             if actual_extent != dimension.extent() {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "`{PAD_OPERATION_NAME}` output axis {axis} has extent {actual_extent}, but its explicit \
-                         extent input is {}",
+                        "`{}` output axis {} has extent {}, but its explicit extent input is {}",
+                        PAD_OPERATION_NAME,
+                        axis,
+                        actual_extent,
                         dimension.extent(),
                     ),
                 });
             }
         }
+
         Ok(Self::Array(input.pad(padding_value, edge_padding_low, edge_padding_high, interior_padding)?))
     }
 }
