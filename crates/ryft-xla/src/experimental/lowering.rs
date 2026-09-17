@@ -11100,7 +11100,7 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         .unwrap()
         .as_ref();
 
-    let fill = operation.resolved_fill_value(output_types[0].data_type())?;
+    let fill = operation.options().resolved_fill_value(output_types[0].data_type())?;
     let scalar_type = lower_tensor_type(&ArrayType::scalar(output_types[0].data_type()), context, location)?;
     let fill = block
         .append_operation(stable_hlo::constant(fill.to_dense_elements_attribute(scalar_type, context)?, location)?)?
@@ -18002,7 +18002,9 @@ mod tests {
             (
                 input.clone(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
-                windows.clone().with_mode(GatherMode::Fill { value: Some(CpuArray::scalar(fill).unwrap()) }),
+                windows
+                    .clone()
+                    .with_mode(GatherMode::Fill { value: Some(Box::new(CpuArray::scalar(fill).unwrap())) }),
                 values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
             ),
             (
@@ -18025,7 +18027,9 @@ mod tests {
                 .unwrap(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
-                    GatherMode::Fill { value: Some(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap()) },
+                    GatherMode::Fill {
+                        value: Some(Box::new(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
+                    },
                 ),
                 values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
             ),

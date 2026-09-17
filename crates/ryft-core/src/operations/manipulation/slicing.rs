@@ -32,7 +32,7 @@ use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::gathering::{
-    DynamicGather, Gather, GatherDimensionNumbers, GatherMode, GatherOperation,
+    DynamicGather, Gather, GatherDimensionNumbers, GatherMode, GatherOptions,
 };
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::manipulation::padding::PadOperation;
@@ -1277,10 +1277,10 @@ where
                         (0..self.sizes.len()).collect(),
                     )
                 };
-                let operation = GatherOperation::new(dimensions, sizes)
+                let options = GatherOptions::new()
                     .with_mode(GatherMode::Clip)
                     .with_output_sharding(output_type.sharding().cloned());
-                let output = source.gather(&indices, &operation)?;
+                let output = source.gather(&indices, &dimensions, &sizes, &options)?;
                 return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?].into());
             }
             return Ok(batch_by_item_expansion(

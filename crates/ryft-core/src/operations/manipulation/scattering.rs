@@ -88,7 +88,7 @@ impl Display for ScatterMode {
 
 /// Combiner applied when a [`scatter`](Scatter) writes an update into the input. Each kind selects the binary
 /// reduction used where an update meets the existing input value and lowers to the corresponding
-/// `stablehlo.scatter` combiner region. [`Add`](Self::Add) supports differentiation through both the input and
+/// `stablehlo.scatter` combiner region. [`Self::Add`] supports differentiation through both the input and
 /// updates and participates in the gather/scatter-add transpose duality (see [`ScatterOperation::is_linear`]).
 /// Extremal derivatives divide ties equally
 /// among matching inputs and updates. Multiplication derivatives with respect to updates require unique indices;
@@ -139,9 +139,9 @@ impl Display for ScatterReductionKind {
 /// Specification of how the index input and the update windows map onto the input axes of a [`scatter`](Scatter),
 /// following StableHLO's [`scatter`](https://openxla.org/stablehlo/spec#scatter) dimension numbers. It is the
 /// structural dual of [`GatherDimensionNumbers`]:
-/// [`update_window_dimensions`](Self::update_window_dimensions) mirrors `offset_dimensions`,
-/// [`inserted_window_dimensions`](Self::inserted_window_dimensions) mirrors `collapsed_slice_dimensions`, and
-/// [`scatter_dimensions_to_operand_dimensions`](Self::scatter_dimensions_to_operand_dimensions) mirrors
+/// [`Self::update_window_dimensions`] mirrors `offset_dimensions`,
+/// [`Self::inserted_window_dimensions`] mirrors `collapsed_slice_dimensions`, and
+/// [`Self::scatter_dimensions_to_operand_dimensions`] mirrors
 /// `start_index_map`.
 ///
 /// The index vector dimension is implicit and always the last axis of the indices input. The output has the same
@@ -166,7 +166,7 @@ pub struct ScatterDimensionNumbers {
 
 impl ScatterDimensionNumbers {
     /// Creates scatter dimension numbers from explicit axis lists. The batching axis lists default to empty; use
-    /// [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
+    /// [`Self::with_batching_dimensions`] to set them.
     ///
     /// # Parameters
     ///
@@ -244,63 +244,35 @@ impl ScatterDimensionNumbers {
     }
 }
 
-/// Canonical operation name for [`ScatterOperation`].
-pub const SCATTER_OPERATION_NAME: &str = "scatter";
-
-/// [`Operation`] that writes update windows into a copy of an input at positions named by an integer index input,
-/// combining overlaps with a [`ScatterReductionKind`]. Refer to the documentation of [`Scatter`] for the semantics.
+/// Optional bounds handling, index promises, and output placement for [`Scatter::scatter`].
+///
+/// The default promises in-bounds indices, makes no sortedness or uniqueness promise, and infers output sharding.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ScatterOperation {
-    /// Refer to the documentation of [`Self::dimensions`] for more information.
-    dimensions: ScatterDimensionNumbers,
-
-    /// Refer to the documentation of [`Self::kind`] for more information.
-    kind: ScatterReductionKind,
-
-    /// Refer to the documentation of [`Self::mode`] for more information.
+pub struct ScatterOptions {
+    /// Refer to the documentation of [`mode`](Self::mode) for more information.
     mode: ScatterMode,
 
-    /// Refer to the documentation of [`Self::indices_are_sorted`] for more information.
+    /// Refer to the documentation of [`indices_are_sorted`](Self::indices_are_sorted) for more information.
     indices_are_sorted: bool,
 
-    /// Refer to the documentation of [`Self::unique_indices`] for more information.
+    /// Refer to the documentation of [`unique_indices`](Self::unique_indices) for more information.
     unique_indices: bool,
 
-    /// Refer to the documentation of [`Self::output_sharding`] for more information.
+    /// Refer to the documentation of [`output_sharding`](Self::output_sharding) for more information.
     output_sharding: Option<Sharding>,
 }
 
-impl ScatterOperation {
-    /// Creates a new [`ScatterOperation`] with the provided dimension numbers and combiner kind. The mode defaults to
-    /// [`ScatterMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
-    /// builders to override them.
-    ///
-    /// # Parameters
-    ///
-    ///   - `dimensions`: Mapping from index components and update window axes to input axes.
-    ///   - `kind`: Combiner applied to the existing input value and every update targeting that value.
+impl ScatterOptions {
+    /// Creates new [`ScatterOptions`] with promise-in-bounds handling, no sortedness or uniqueness promises, and
+    /// inferred output placement.
     #[inline]
-    pub fn new(dimensions: ScatterDimensionNumbers, kind: ScatterReductionKind) -> Self {
+    pub fn new() -> Self {
         Self {
-            dimensions,
-            kind,
             mode: ScatterMode::PromiseInBounds,
             indices_are_sorted: false,
             unique_indices: false,
             output_sharding: None,
         }
-    }
-
-    /// Returns the dimension numbers mapping the index input and update windows onto the input axes.
-    #[inline]
-    pub fn dimensions(&self) -> &ScatterDimensionNumbers {
-        &self.dimensions
-    }
-
-    /// Returns the combiner applied where an update meets the existing input value.
-    #[inline]
-    pub fn kind(&self) -> ScatterReductionKind {
-        self.kind
     }
 
     /// Returns the out-of-bounds index handling mode.
@@ -326,10 +298,134 @@ impl ScatterOperation {
     }
 
     /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
-    /// documentation of [`Self::with_output_sharding`] for more information.
+    /// documentation of [`with_output_sharding`](Self::with_output_sharding) for more information.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its out-of-bounds handling mode set to `mode`.
+    #[inline]
+    pub fn with_mode(mut self, mode: ScatterMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not sort or validate the indices.
+    #[inline]
+    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
+        self.indices_are_sorted = indices_are_sorted;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When
+    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
+    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
+    #[inline]
+    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
+        self.unique_indices = unique_indices;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its requested output sharding set to `output_sharding`.
+    /// Without an explicit request, indexed axes with partial update windows must be replicated; complete windows
+    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
+    /// reduction state, and manual-axis variation.
+    ///
+    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
+    /// inferred placement. Validation takes place when inferring the result type.
+    #[inline]
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
+        self.output_sharding = output_sharding.into();
+        self
+    }
+}
+
+impl Default for ScatterOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Canonical operation name for [`ScatterOperation`].
+pub const SCATTER_OPERATION_NAME: &str = "scatter";
+
+/// [`Operation`] that writes update windows into a copy of an input at positions named by an integer index input,
+/// combining overlaps with a [`ScatterReductionKind`]. Refer to the documentation of [`Scatter`] for the semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScatterOperation {
+    /// Refer to the documentation of [`dimensions`](Self::dimensions) for more information.
+    dimensions: ScatterDimensionNumbers,
+
+    /// Refer to the documentation of [`kind`](Self::kind) for more information.
+    kind: ScatterReductionKind,
+
+    /// Refer to the documentation of [`options`](Self::options) for more information.
+    options: ScatterOptions,
+}
+
+impl ScatterOperation {
+    /// Creates a new [`ScatterOperation`] with the provided dimension numbers and combiner kind. The mode defaults to
+    /// [`ScatterMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
+    /// builders to override them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `dimensions`: Mapping from index components and update window axes to input axes.
+    ///   - `kind`: Combiner applied to the existing input value and every update targeting that value.
+    #[inline]
+    pub fn new(dimensions: ScatterDimensionNumbers, kind: ScatterReductionKind) -> Self {
+        Self { dimensions, kind, options: ScatterOptions::new() }
+    }
+
+    /// Returns the dimension numbers mapping the index input and update windows onto the input axes.
+    #[inline]
+    pub fn dimensions(&self) -> &ScatterDimensionNumbers {
+        &self.dimensions
+    }
+
+    /// Returns the combiner applied where an update meets the existing input value.
+    #[inline]
+    pub fn kind(&self) -> ScatterReductionKind {
+        self.kind
+    }
+
+    /// Returns the bounds handling, index promises, and output placement for this operation.
+    #[inline]
+    pub fn options(&self) -> &ScatterOptions {
+        &self.options
+    }
+
+    /// Returns the out-of-bounds index handling mode.
+    #[inline]
+    pub fn mode(&self) -> ScatterMode {
+        self.options.mode()
+    }
+
+    /// Returns whether the caller promises that the index vectors are sorted. This property is not checked.
+    /// Implementations and transformations may rely on it; `false` makes no such promise.
+    #[inline]
+    pub fn indices_are_sorted(&self) -> bool {
+        self.options.indices_are_sorted()
+    }
+
+    /// Returns whether the caller promises that the scattered windows do not overlap. This property is not checked.
+    /// Implementations and transformations may rely on it; `false` makes no such promise. In particular, uniqueness
+    /// permits direct linear rules for overwrite scatter and is required for multiplication derivatives with respect
+    /// to updates.
+    #[inline]
+    pub fn unique_indices(&self) -> bool {
+        self.options.unique_indices()
+    }
+
+    /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
+    /// documentation of [`with_output_sharding`](Self::with_output_sharding) for more information.
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.options.output_sharding()
     }
 
     /// Returns `true` when this scatter is a linear map in its input and updates with the indices held fixed, which is
@@ -340,13 +436,21 @@ impl ScatterOperation {
     /// of the input cotangent). The other combiners use coefficients computed from the primals and have no transpose.
     #[inline]
     pub fn is_linear(&self) -> bool {
-        self.kind == ScatterReductionKind::Add || (self.kind == ScatterReductionKind::Overwrite && self.unique_indices)
+        self.kind == ScatterReductionKind::Add
+            || (self.kind == ScatterReductionKind::Overwrite && self.options.unique_indices)
     }
 
-    /// Sets the out-of-bounds index handling mode.
+    /// Returns a copy of this [`ScatterOperation`] with its options replaced by `options`.
+    #[inline]
+    pub fn with_options(mut self, options: ScatterOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds handling mode set to `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: ScatterMode) -> Self {
-        self.mode = mode;
+        self.options = self.options.with_mode(mode);
         self
     }
 
@@ -355,7 +459,7 @@ impl ScatterOperation {
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
-        self.indices_are_sorted = indices_are_sorted;
+        self.options = self.options.with_indices_are_sorted(indices_are_sorted);
         self
     }
 
@@ -365,19 +469,20 @@ impl ScatterOperation {
     /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
-        self.unique_indices = unique_indices;
+        self.options = self.options.with_unique_indices(unique_indices);
         self
     }
 
-    /// Requests `output_sharding` for the result. Without an explicit request, indexed axes with partial update
-    /// windows must be replicated; complete windows preserve their input placement. An explicit request selects the
-    /// result placement while preserving its mesh, reduction state, and manual-axis variation.
+    /// Returns a copy of this [`ScatterOperation`] with its requested output sharding set to `output_sharding`.
+    /// Without an explicit request, indexed axes with partial update windows must be replicated; complete windows
+    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
+    /// reduction state, and manual-axis variation.
     ///
     /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
     /// inferred placement. Validation takes place when inferring the result type.
     #[inline]
-    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
-        self.output_sharding = output_sharding.into();
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
+        self.options = self.options.with_output_sharding(output_sharding);
         self
     }
 
@@ -448,13 +553,13 @@ impl ScatterOperation {
                 .collect(),
         );
         Ok(GatherOperation::new(gather_dimensions, slice_sizes)
-            .with_mode(match self.mode {
+            .with_mode(match self.options.mode {
                 ScatterMode::PromiseInBounds => GatherMode::PromiseInBounds,
                 ScatterMode::Clip => GatherMode::Clip,
                 ScatterMode::Drop => GatherMode::Fill { value: None },
             })
-            .with_indices_are_sorted(self.indices_are_sorted)
-            .with_unique_indices(self.unique_indices)
+            .with_indices_are_sorted(self.options.indices_are_sorted)
+            .with_unique_indices(self.options.unique_indices)
             .with_output_sharding(output_sharding))
     }
 
@@ -721,7 +826,7 @@ impl Operation for ScatterOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        match input_types[0].scatter(&input_types[1], &input_types[2], self) {
+        match input_types[0].scatter(&input_types[1], &input_types[2], self.dimensions(), self.kind(), self.options()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError::invalid(error.to_string())),
@@ -743,16 +848,16 @@ impl Operation for ScatterOperation {
                     self.dimensions.scatter_indices_batching_dimensions,
                 ),
             )?;
-            if self.mode != ScatterMode::PromiseInBounds {
-                operation.field("mode", self.mode)?;
+            if self.options.mode != ScatterMode::PromiseInBounds {
+                operation.field("mode", self.options.mode)?;
             }
-            if self.indices_are_sorted {
-                operation.field("indices_are_sorted", self.indices_are_sorted)?;
+            if self.options.indices_are_sorted {
+                operation.field("indices_are_sorted", self.options.indices_are_sorted)?;
             }
-            if self.unique_indices {
-                operation.field("unique_indices", self.unique_indices)?;
+            if self.options.unique_indices {
+                operation.field("unique_indices", self.options.unique_indices)?;
             }
-            if let Some(output_sharding) = &self.output_sharding {
+            if let Some(output_sharding) = &self.options.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
             }
             Ok(())
@@ -770,7 +875,7 @@ impl<C: Domain<Type = ArrayType, Value: Scatter>> InterpretableOperation<C> for 
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![inputs[0].scatter(&inputs[1], &inputs[2], self)?])
+        Ok(vec![inputs[0].scatter(&inputs[1], &inputs[2], self.dimensions(), self.kind(), self.options())?])
     }
 }
 
@@ -907,7 +1012,13 @@ impl_differentiable_operation! {
             let input = &inputs[0];
             let indices = inputs[1].primal();
             let updates = &inputs[2];
-            let mut primal = input.primal().scatter(indices, updates.primal(), operation)?;
+            let mut primal = input.primal().scatter(
+                indices,
+                updates.primal(),
+                operation.dimensions(),
+                operation.kind(),
+                operation.options(),
+            )?;
             let tangent = if input.tangent().is_zero() && updates.tangent().is_zero() {
                 MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
@@ -1144,29 +1255,41 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
+/// use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind};
 ///
 /// let input = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 /// // Update axis 1 holds each full row; input axis 0 is supplied by the row index.
 /// let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
-/// let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
-/// let output = input.scatter(&indices, &updates, &operation).unwrap();
+/// let output = input.scatter(
+///     &indices, &updates, &dimensions, ScatterReductionKind::Add, &ScatterOptions::new(),
+/// ).unwrap();
 /// assert_eq!(output, Array::matrix(3, 2, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]).unwrap());
 /// ```
 pub trait Scatter: Sized {
-    /// Scatters `updates` into `self` (the input) at the positions named by `indices`, according to `operation`.
+    /// Scatters `updates` into `self` at the positions named by `indices`, combining each update with the existing
+    /// input value according to `kind`. The dimension numbers describe the windows, and `options` controls bounds
+    /// handling, index promises, and output placement.
     ///
     /// # Parameters
     ///
-    ///   - `indices`: Integer start-index vectors. The trailing axis contains the coordinates selected by the
-    ///     operation's dimension numbers; preceding axes enumerate update windows.
-    ///   - `updates`: Values to combine with the input. Window and indexing axes are identified by the operation's
-    ///     dimension numbers, and the element type must equal the input element type.
-    ///   - `operation`: The axis mapping, reduction kind, bounds mode, optional output sharding, and index promises
-    ///     governing the update. Sortedness and uniqueness flags are caller promises rather than runtime checks.
-    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError>;
+    ///   - `indices`: Integer start-index vectors. The trailing axis contains the coordinates selected by
+    ///     `dimensions`; preceding axes enumerate update windows.
+    ///   - `updates`: Values to combine with the input. Window and indexing axes are identified by `dimensions`, and
+    ///     the element type must equal the input element type.
+    ///   - `dimensions`: Mapping from index components and update window axes to input axes.
+    ///   - `kind`: How each update combines with the input value at its target.
+    ///   - `options`: Bounds mode, index promises, and optional output sharding. Sortedness and uniqueness are
+    ///     unchecked caller promises; they do not request sorting or deduplication.
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError>;
 
     /// Scatters complete slices along one axis using raw integer indices. The index shape replaces the selected
     /// input axis in the required updates shape; all other input axes retain their full size and order. Negative
@@ -1174,7 +1297,7 @@ pub trait Scatter: Sized {
     ///
     /// The selected input axis may have a dynamic extent. The index shape must support the homogeneous [`Reshape`]
     /// used to append an index-vector axis; remaining input and update dimensions must satisfy [`ScatterOperation`]'s
-    /// window constraints. Use an explicit operation for dynamic queries or partial windows.
+    /// window constraints. Use [`Scatter::scatter`] for partial windows or [`DynamicScatter`] for dynamic queries.
     ///
     /// # Parameters
     ///
@@ -1230,19 +1353,28 @@ pub trait Scatter: Sized {
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
             .collect();
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(window_dimensions, vec![axis], vec![axis]), kind)
-                .with_mode(mode);
-        self.scatter(&indices, updates, &operation)
+        self.scatter(
+            &indices,
+            updates,
+            &ScatterDimensionNumbers::new(window_dimensions, vec![axis], vec![axis]),
+            kind,
+            &ScatterOptions::new().with_mode(mode),
+        )
     }
 }
 
 impl Scatter for ArrayType {
     // Type-level scatter: validates the dimension numbers, the updates shape, and the data types, and computes the
     // output type (which equals the input type) and placement.
-    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
         let input = self;
-        let dimensions = operation.dimensions();
         let input_rank = input.rank();
         let indices_rank = indices.rank();
         let updates_rank = updates.rank();
@@ -1278,7 +1410,7 @@ impl Scatter for ArrayType {
             .into());
         }
         let data_type = input.data_type();
-        match operation.kind() {
+        match kind {
             ScatterReductionKind::Overwrite => {}
             ScatterReductionKind::Add | ScatterReductionKind::Mul
                 if !data_type.is_numeric() && data_type != DataType::Zero =>
@@ -1286,7 +1418,7 @@ impl Scatter for ArrayType {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` kind `{}` requires numeric input and update elements but got \
                      `{data_type}`",
-                    operation.kind(),
+                    kind,
                 ))
                 .into());
             }
@@ -1296,7 +1428,7 @@ impl Scatter for ArrayType {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` kind `{}` requires Boolean or numeric input and update elements \
                      but got `{data_type}`",
-                    operation.kind(),
+                    kind,
                 ))
                 .into());
             }
@@ -1474,9 +1606,7 @@ impl Scatter for ArrayType {
             ))
             .into());
         }
-        if !unreduced_axes.is_empty()
-            && !matches!(operation.kind(), ScatterReductionKind::Add | ScatterReductionKind::Overwrite)
-        {
+        if !unreduced_axes.is_empty() && !matches!(kind, ScatterReductionKind::Add | ScatterReductionKind::Overwrite) {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` nonlinear reductions do not support unreduced inputs"
             ))
@@ -1509,7 +1639,7 @@ impl Scatter for ArrayType {
         for sharding in [indices.sharding(), updates.sharding()].into_iter().flatten() {
             varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
         }
-        let sharding = if let Some(requested) = operation.output_sharding() {
+        let sharding = if let Some(requested) = options.output_sharding() {
             if common_mesh.as_ref().is_some_and(|mesh| requested.mesh() != mesh) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` requested output sharding uses a different mesh"
@@ -1606,10 +1736,10 @@ impl Array {
         indices: &Self,
         updates: &Self,
         output_type: ArrayType,
-        operation: &ScatterOperation,
+        dimensions: &ScatterDimensionNumbers,
+        mode: ScatterMode,
         combine: impl Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
     ) -> Result<Self, ProgramError> {
-        let dimensions = operation.dimensions();
         let input_shape = self.r#type().static_shape().unwrap();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         // No update can address an element of an empty input, even in clipping mode.
@@ -1687,7 +1817,7 @@ impl Array {
                 // The window fits the axis: the type rule bounds update windows by the input extents, inserted and
                 // batching windows are one, and an empty input returned above.
                 let maximum = (input_shape[input_axis] - input_window_size[input_axis]) as i128;
-                match operation.mode() {
+                match mode {
                     ScatterMode::Drop => {
                         if raw < 0 || raw > maximum {
                             dropped = true;
@@ -1717,44 +1847,74 @@ impl Array {
 }
 
 impl Scatter for Array {
-    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let output_type = self.r#type().scatter(indices.r#type().as_ref(), updates.r#type().as_ref(), operation)?;
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
+        let output_type =
+            self.r#type()
+                .scatter(indices.r#type().as_ref(), updates.r#type().as_ref(), dimensions, kind, options)?;
         let data_type = output_type.data_type();
-        if operation.kind() == ScatterReductionKind::Overwrite || data_type == DataType::Zero {
-            return self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
-                current.copy_from_slice(update);
-                Ok(())
-            });
+        if kind == ScatterReductionKind::Overwrite || data_type == DataType::Zero {
+            return self.scatter_with_combiner(
+                indices,
+                updates,
+                output_type,
+                dimensions,
+                options.mode(),
+                |current, update| {
+                    current.copy_from_slice(update);
+                    Ok(())
+                },
+            );
         }
-        match operation.kind() {
+        match kind {
             ScatterReductionKind::Add | ScatterReductionKind::Mul => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
-                        let current_value = Element::decode(current);
-                        let update_value = Element::decode(update);
-                        let result = if operation.kind() == ScatterReductionKind::Add {
-                            <Element as NumericArrayElement>::add(current_value, update_value)?
-                        } else {
-                            <Element as NumericArrayElement>::mul(current_value, update_value)?
-                        };
-                        result.encode(current);
-                        Ok(())
-                    })
+                    self.scatter_with_combiner(
+                        indices,
+                        updates,
+                        output_type,
+                        dimensions,
+                        options.mode(),
+                        |current, update| {
+                            let current_value = Element::decode(current);
+                            let update_value = Element::decode(update);
+                            let result = if kind == ScatterReductionKind::Add {
+                                <Element as NumericArrayElement>::add(current_value, update_value)?
+                            } else {
+                                <Element as NumericArrayElement>::mul(current_value, update_value)?
+                            };
+                            result.encode(current);
+                            Ok(())
+                        },
+                    )
                 })
             }
             ScatterReductionKind::Min | ScatterReductionKind::Max => {
                 dispatch_on_array_element_type!(data_type, |Element| {
-                    self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
-                        let current_value = Element::decode(current);
-                        let update_value = Element::decode(update);
-                        let result = if operation.kind() == ScatterReductionKind::Min {
-                            ArrayElement::min(&current_value, &update_value)
-                        } else {
-                            ArrayElement::max(&current_value, &update_value)
-                        };
-                        result.encode(current);
-                        Ok(())
-                    })
+                    self.scatter_with_combiner(
+                        indices,
+                        updates,
+                        output_type,
+                        dimensions,
+                        options.mode(),
+                        |current, update| {
+                            let current_value = Element::decode(current);
+                            let update_value = Element::decode(update);
+                            let result = if kind == ScatterReductionKind::Min {
+                                ArrayElement::min(&current_value, &update_value)
+                            } else {
+                                ArrayElement::max(&current_value, &update_value)
+                            };
+                            result.encode(current);
+                            Ok(())
+                        },
+                    )
                 })
             }
             ScatterReductionKind::Overwrite => unreachable!("overwrite scatter returns before typed dispatch"),
@@ -1763,11 +1923,18 @@ impl Scatter for Array {
 }
 
 impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
-    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
         let updates = <Self as ValueProjection<ArrayType>>::projected(updates)?;
-        Ok(Self::Array(input.scatter(indices, updates, operation)?))
+        Ok(Self::Array(input.scatter(indices, updates, dimensions, kind, options)?))
     }
 }
 
@@ -1779,9 +1946,16 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<ScatterOperation>,
 {
-    fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
-            operation.clone(),
+            ScatterOperation::new(dimensions.clone(), kind).with_options(options.clone()),
             Vec::new(),
             &[self.clone(), indices.clone(), updates.clone()],
         )?;
@@ -1869,13 +2043,12 @@ where
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
             .collect();
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(window_dimensions, vec![axis], vec![axis]), kind)
-                .with_mode(mode);
         Ok(V::from_projected(self.clone().into_projected()?.scatter(
             &indices.into_projected()?,
             &updates.clone().into_projected()?,
-            &operation,
+            &ScatterDimensionNumbers::new(window_dimensions, vec![axis], vec![axis]),
+            kind,
+            &ScatterOptions::new().with_mode(mode),
         )?))
     }
 }
@@ -2086,6 +2259,61 @@ mod tests {
     }
 
     #[test]
+    fn test_scatter_options_new() {
+        let options = ScatterOptions::new();
+        assert_eq!(options, ScatterOptions::default());
+        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
+        assert!(!options.indices_are_sorted());
+        assert!(!options.unique_indices());
+        assert_eq!(options.output_sharding(), None);
+        let lookup = HashMap::from([(options.clone(), 7)]);
+        assert_eq!(lookup.get(&options), Some(&7));
+        assert_eq!(lookup.get(&options.with_mode(ScatterMode::Clip)), None);
+    }
+
+    #[test]
+    fn test_scatter_options_with_mode() {
+        let options = ScatterOptions::new().with_mode(ScatterMode::Drop);
+        assert_eq!(options.mode(), ScatterMode::Drop);
+        assert!(!options.indices_are_sorted());
+        assert!(!options.unique_indices());
+        assert_eq!(options.output_sharding(), None);
+        assert_eq!(options.with_mode(ScatterMode::PromiseInBounds), ScatterOptions::new());
+    }
+
+    #[test]
+    fn test_scatter_options_with_indices_are_sorted() {
+        let options = ScatterOptions::new().with_indices_are_sorted(true);
+        assert!(options.indices_are_sorted());
+        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
+        assert!(!options.unique_indices());
+        assert_eq!(options.output_sharding(), None);
+        assert_eq!(options.with_indices_are_sorted(false), ScatterOptions::new());
+    }
+
+    #[test]
+    fn test_scatter_options_with_unique_indices() {
+        let options = ScatterOptions::new().with_unique_indices(true);
+        assert!(options.unique_indices());
+        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
+        assert!(!options.indices_are_sorted());
+        assert_eq!(options.output_sharding(), None);
+        assert_eq!(options.with_unique_indices(false), ScatterOptions::new());
+    }
+
+    #[test]
+    fn test_scatter_options_with_output_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2);
+        let options = ScatterOptions::new().with_output_sharding(sharding.clone());
+        assert_eq!(options.output_sharding(), Some(&sharding));
+        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
+        assert!(!options.indices_are_sorted());
+        assert!(!options.unique_indices());
+        assert_eq!(options.with_output_sharding(None), ScatterOptions::new());
+    }
+
+    #[test]
     fn test_scatter() {
         // Scatter-add row updates into a [3, 2] input indexed by a [2, 1] index array: update window axis 1 carries
         // the row, input axis 0 is inserted (start-index driven).
@@ -2173,6 +2401,28 @@ mod tests {
         let maximum = ScatterOperation::new(dimensions, ScatterReductionKind::Max);
         assert!(!maximum.is_linear());
         assert!(!maximum.with_unique_indices(true).with_indices_are_sorted(true).is_linear());
+    }
+
+    #[test]
+    fn test_scatter_with_options() {
+        let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let operation = ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Add);
+        assert_eq!(operation.options(), &ScatterOptions::new());
+        let options = ScatterOptions::new()
+            .with_mode(ScatterMode::Drop)
+            .with_indices_are_sorted(true)
+            .with_unique_indices(true);
+        let operation = operation.with_options(options.clone());
+        assert_eq!(operation.options(), &options);
+        assert_eq!(operation.dimensions(), &dimensions);
+        assert_eq!(operation.kind(), ScatterReductionKind::Add);
+        assert_eq!(operation.mode(), ScatterMode::Drop);
+        assert!(operation.indices_are_sorted());
+        assert!(operation.unique_indices());
+        assert_eq!(
+            operation.with_options(ScatterOptions::new()),
+            ScatterOperation::new(dimensions, ScatterReductionKind::Add),
+        );
     }
 
     #[test]
@@ -2298,7 +2548,16 @@ mod tests {
                         Shape::new(vec![query_batch.clone(), Dimension::Static(2), Dimension::Static(1)]),
                     );
                     let updates = ArrayType::new(DataType::F64, Shape::new(vec![update_batch, Dimension::Static(2)]));
-                    assert_eq!(input.scatter(&indices, &updates, &operation), Ok(input));
+                    assert_eq!(
+                        input.scatter(
+                            &indices,
+                            &updates,
+                            operation.dimensions(),
+                            operation.kind(),
+                            operation.options()
+                        ),
+                        Ok(input)
+                    );
                 }
             }
         }
@@ -2314,7 +2573,13 @@ mod tests {
             ArrayType::new(DataType::I32, Shape::new(vec![second.clone(), Dimension::Static(2), Dimension::Static(1)]));
         let second_updates = ArrayType::new(DataType::F64, Shape::new(vec![second, Dimension::Static(2)]));
         assert_eq!(
-            input.scatter(&second_indices, &second_updates, &operation),
+            input.scatter(
+                &second_indices,
+                &second_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis 0 and indices \
                  axis 0 differ",
@@ -2322,7 +2587,13 @@ mod tests {
             .into()),
         );
         assert_eq!(
-            input.scatter(&first_indices, &second_updates, &operation),
+            input.scatter(
+                &first_indices,
+                &second_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` updates scatter axis 0 must match indices batch axis 0 in extent",
             ))
@@ -2625,10 +2896,19 @@ mod tests {
 
         // The result follows the input placement. Unsharded inputs take a replicated placement on the common mesh,
         // and manual-axis variation contributed by the indices or updates joins the result.
-        assert_eq!(input.scatter(&indices, &updates, &operation), Ok(input.clone()));
+        assert_eq!(
+            input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
+            Ok(input.clone())
+        );
         let replicated_updates = updates.clone().with_sharding(replicated.clone()).unwrap();
         assert_eq!(
-            ArrayType::new_static(DataType::F32, [4]).scatter(&indices, &replicated_updates, &operation),
+            ArrayType::new_static(DataType::F32, [4]).scatter(
+                &indices,
+                &replicated_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Ok(input.clone()),
         );
         let manual_mesh = LogicalMesh::new(vec![
@@ -2640,18 +2920,33 @@ mod tests {
         let varying_updates = updates.clone().with_sharding(varying.clone()).unwrap();
         let expected = ArrayType::new_static(DataType::F32, [4]).with_sharding(varying).unwrap();
         assert_eq!(
-            ArrayType::new_static(DataType::F32, [4]).scatter(&indices, &varying_updates, &operation),
+            ArrayType::new_static(DataType::F32, [4]).scatter(
+                &indices,
+                &varying_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Ok(expected.clone()),
         );
         let manual_input = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(manual_mesh.clone(), 1))
             .unwrap();
-        assert_eq!(manual_input.scatter(&indices, &varying_updates, &operation), Ok(expected));
+        assert_eq!(
+            manual_input.scatter(
+                &indices,
+                &varying_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
+            Ok(expected)
+        );
 
         // All sharded operands must use one mesh, whichever operand establishes it.
         let other_mesh_indices = indices.clone().with_sharding(Sharding::replicated(other_mesh.clone(), 2)).unwrap();
         assert_eq!(
-            input.scatter(&other_mesh_indices, &updates, &operation),
+            input.scatter(&other_mesh_indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
             ))
@@ -2660,7 +2955,13 @@ mod tests {
         let mesh_indices = indices.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
         let other_mesh_updates = updates.clone().with_sharding(Sharding::replicated(other_mesh.clone(), 1)).unwrap();
         assert_eq!(
-            ArrayType::new_static(DataType::F32, [4]).scatter(&mesh_indices, &other_mesh_updates, &operation),
+            ArrayType::new_static(DataType::F32, [4]).scatter(
+                &mesh_indices,
+                &other_mesh_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
             ))
@@ -2676,7 +2977,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            input.scatter(&sharded_vector_indices, &updates, &operation),
+            input.scatter(
+                &sharded_vector_indices,
+                &updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit mesh axes"
             ))
@@ -2687,7 +2994,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 2).with_reduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            input.scatter(&reduced_indices, &updates, &operation),
+            input.scatter(&reduced_indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes"
             ))
@@ -2700,9 +3007,18 @@ mod tests {
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
         let unreduced_input = input.clone().with_sharding(unreduced.clone()).unwrap();
         let unreduced_updates = updates.clone().with_sharding(unreduced.clone()).unwrap();
-        assert_eq!(unreduced_input.scatter(&indices, &unreduced_updates, &operation), Ok(unreduced_input.clone()),);
         assert_eq!(
-            unreduced_input.scatter(&indices, &updates, &operation),
+            unreduced_input.scatter(
+                &indices,
+                &unreduced_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
+            Ok(unreduced_input.clone()),
+        );
+        assert_eq!(
+            unreduced_input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input and updates must have matching reduction state"
             ))
@@ -2712,7 +3028,9 @@ mod tests {
             unreduced_input.scatter(
                 &indices,
                 &unreduced_updates,
-                &ScatterOperation::new(operation.dimensions().clone(), ScatterReductionKind::Mul),
+                &operation.dimensions().clone(),
+                ScatterReductionKind::Mul,
+                &ScatterOptions::new()
             ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` nonlinear reductions do not support unreduced inputs"
@@ -2727,7 +3045,13 @@ mod tests {
             .unwrap();
         let unreduced_pair = ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced).unwrap();
         assert_eq!(
-            unreduced_input.scatter(&distributed_indices, &unreduced_pair, &operation),
+            unreduced_input.scatter(
+                &distributed_indices,
+                &unreduced_pair,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
             ))
@@ -2740,7 +3064,9 @@ mod tests {
             input.scatter(
                 &indices,
                 &updates,
-                &operation.clone().with_output_sharding(Sharding::replicated(other_mesh, 1)),
+                operation.dimensions(),
+                operation.kind(),
+                &operation.options().clone().with_output_sharding(Sharding::replicated(other_mesh, 1))
             ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` requested output sharding uses a different mesh"
@@ -2751,7 +3077,9 @@ mod tests {
             unreduced_input.scatter(
                 &indices,
                 &unreduced_updates,
-                &operation.clone().with_output_sharding(replicated.clone()),
+                operation.dimensions(),
+                operation.kind(),
+                &operation.options().clone().with_output_sharding(replicated.clone())
             ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state"
@@ -2762,7 +3090,9 @@ mod tests {
             input.scatter(
                 &indices,
                 &updates,
-                &operation.clone().with_output_sharding(Sharding::replicated(mesh.clone(), 2)),
+                operation.dimensions(),
+                operation.kind(),
+                &operation.options().clone().with_output_sharding(Sharding::replicated(mesh.clone(), 2))
             ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` output sharding rank (2) does not match the input rank (1)"
@@ -2775,7 +3105,9 @@ mod tests {
             ArrayType::new_static(DataType::F32, [4]).scatter(
                 &indices,
                 &updates,
-                &operation.clone().with_output_sharding(requested),
+                operation.dimensions(),
+                operation.kind(),
+                &operation.options().clone().with_output_sharding(requested)
             ),
             Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
@@ -2786,7 +3118,16 @@ mod tests {
         // An explicit request resolves a targeted axis that is sharded over an explicit mesh axis.
         let sharded = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let sharded_input = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded).unwrap();
-        assert_eq!(sharded_input.scatter(&indices, &updates, &operation.with_output_sharding(replicated)), Ok(input),);
+        assert_eq!(
+            sharded_input.scatter(
+                &indices,
+                &updates,
+                operation.dimensions(),
+                operation.kind(),
+                &operation.options().clone().with_output_sharding(replicated)
+            ),
+            Ok(input),
+        );
     }
 
     #[test]
@@ -2897,24 +3238,32 @@ mod tests {
             input.scatter(
                 &indices,
                 &updates,
-                &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Overwrite),
+                &dimensions.clone(),
+                ScatterReductionKind::Overwrite,
+                &ScatterOptions::new()
             ),
             Array::vector(vec![1.0, 100.0, 3.0, 200.0]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Mul)),
+            input.scatter(&indices, &updates, &dimensions.clone(), ScatterReductionKind::Mul, &ScatterOptions::new()),
             Array::vector(vec![1.0, 200.0, 3.0, 800.0]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Min)),
+            input.scatter(&indices, &updates, &dimensions.clone(), ScatterReductionKind::Min, &ScatterOptions::new()),
             Ok(input.clone()),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &ScatterOperation::new(dimensions, ScatterReductionKind::Max)),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Max, &ScatterOptions::new()),
             Array::vector(vec![1.0, 100.0, 3.0, 200.0]),
         );
         assert_eq!(
-            input.scatter(&Array::matrix(2, 1, vec![1_i32, 1]).unwrap(), &updates, &operation),
+            input.scatter(
+                &Array::matrix(2, 1, vec![1_i32, 1]).unwrap(),
+                &updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options()
+            ),
             Array::vector(vec![1.0, 302.0, 3.0, 4.0]),
         );
     }
@@ -2927,16 +3276,16 @@ mod tests {
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
         assert_eq!(
-            input.scatter(&indices, &updates, &operation),
+            input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Ok(ArrayIrValue::Array(Array::vector(vec![12_i32, 20, 31]).unwrap())),
         );
         let dimension = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
         assert_eq!(
-            input.scatter(&indices, &dimension, &operation),
+            input.scatter(&indices, &dimension, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
         assert_eq!(
-            dimension.scatter(&indices, &updates, &operation),
+            dimension.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
 
@@ -2948,7 +3297,15 @@ mod tests {
         let projected_input = ValueProjection::<ArrayType>::into_projected(staged_input).unwrap();
         let projected_indices = ValueProjection::<ArrayType>::into_projected(staged_indices).unwrap();
         let projected_updates = ValueProjection::<ArrayType>::into_projected(staged_updates).unwrap();
-        let output = projected_input.scatter(&projected_indices, &projected_updates, &operation).unwrap();
+        let output = projected_input
+            .scatter(
+                &projected_indices,
+                &projected_updates,
+                operation.dimensions(),
+                operation.kind(),
+                operation.options(),
+            )
+            .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::I32, [3]));
     }
 
@@ -2961,7 +3318,10 @@ mod tests {
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         for mode in [ScatterMode::Clip, ScatterMode::Drop, ScatterMode::PromiseInBounds] {
             let operation = ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Overwrite).with_mode(mode);
-            assert_eq!(input.scatter(&indices, &updates, &operation), Ok(input.clone()));
+            assert_eq!(
+                input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
+                Ok(input.clone())
+            );
         }
 
         // Fill-or-drop discards a whole invalid window under every combiner, including the integer extrema, while
@@ -2969,24 +3329,27 @@ mod tests {
         let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
         let indices = Array::matrix(3, 1, vec![-1_i32, 1, 4]).unwrap();
         let updates = Array::vector(vec![1_i32, 2, 3]).unwrap();
-        let dropping = |kind| ScatterOperation::new(dimensions.clone(), kind).with_mode(ScatterMode::Drop);
+        let dropping = ScatterOptions::new().with_mode(ScatterMode::Drop);
         assert_eq!(
-            input.scatter(&indices, &updates, &dropping(ScatterReductionKind::Overwrite)),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Overwrite, &dropping),
             Array::vector(vec![10_i32, 2, 30, 40]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &dropping(ScatterReductionKind::Add)),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Add, &dropping),
             Array::vector(vec![10_i32, 22, 30, 40]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &dropping(ScatterReductionKind::Mul)),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Mul, &dropping),
             Array::vector(vec![10_i32, 40, 30, 40]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &dropping(ScatterReductionKind::Min)),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Min, &dropping),
             Array::vector(vec![10_i32, 2, 30, 40]),
         );
-        assert_eq!(input.scatter(&indices, &updates, &dropping(ScatterReductionKind::Max)), Ok(input.clone()),);
+        assert_eq!(
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Max, &dropping),
+            Ok(input.clone()),
+        );
 
         // Adding a window offset to a maximal start must not overflow: clipping moves the window to the last valid
         // start and fill-or-drop discards it, for signed and unsigned index types alike.
@@ -2996,16 +3359,34 @@ mod tests {
         let signed = Array::matrix(1, 1, vec![i64::MAX]).unwrap();
         let unsigned = Array::matrix(1, 1, vec![u64::MAX]).unwrap();
         let clipping = operation.clone().with_mode(ScatterMode::Clip);
-        assert_eq!(input.scatter(&signed, &updates, &clipping), Array::vector(vec![10_i32, 20, 31, 42]));
-        assert_eq!(input.scatter(&unsigned, &updates, &clipping), Array::vector(vec![10_i32, 20, 31, 42]));
+        assert_eq!(
+            input.scatter(&signed, &updates, clipping.dimensions(), clipping.kind(), clipping.options()),
+            Array::vector(vec![10_i32, 20, 31, 42])
+        );
+        assert_eq!(
+            input.scatter(&unsigned, &updates, clipping.dimensions(), clipping.kind(), clipping.options()),
+            Array::vector(vec![10_i32, 20, 31, 42])
+        );
         let dropping = operation.with_mode(ScatterMode::Drop);
-        assert_eq!(input.scatter(&signed, &updates, &dropping), Ok(input.clone()));
-        assert_eq!(input.scatter(&unsigned, &updates, &dropping), Ok(input.clone()));
+        assert_eq!(
+            input.scatter(&signed, &updates, dropping.dimensions(), dropping.kind(), dropping.options()),
+            Ok(input.clone())
+        );
+        assert_eq!(
+            input.scatter(&unsigned, &updates, dropping.dimensions(), dropping.kind(), dropping.options()),
+            Ok(input.clone())
+        );
         let maximum =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![], vec![0]), ScatterReductionKind::Max)
                 .with_mode(ScatterMode::Clip);
         assert_eq!(
-            input.scatter(&unsigned, &Array::matrix(1, 2, vec![35_i32, 5]).unwrap(), &maximum),
+            input.scatter(
+                &unsigned,
+                &Array::matrix(1, 2, vec![35_i32, 5]).unwrap(),
+                maximum.dimensions(),
+                maximum.kind(),
+                maximum.options()
+            ),
             Array::vector(vec![10_i32, 20, 35, 40]),
         );
     }
@@ -3018,13 +3399,19 @@ mod tests {
         let updates = Array::vector(vec![10.0, 20.0]).unwrap();
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
-        assert_eq!(input.scatter(&indices, &updates, &operation), Array::vector(vec![21.0, 2.0, 3.0, 14.0]));
+        assert_eq!(
+            input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
+            Array::vector(vec![21.0, 2.0, 3.0, 14.0])
+        );
 
         // Scatter decodes sub-byte indices through their physical layout without materializing a scalar index vector.
         let indices_type =
             ArrayType::new_static(DataType::I4, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
         let indices = Array::from_elements(indices_type, &[i4::new(3).unwrap(), i4::new(0).unwrap()]).unwrap();
-        assert_eq!(input.scatter(&indices, &updates, &operation), Array::vector(vec![21.0, 2.0, 3.0, 14.0]));
+        assert_eq!(
+            input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
+            Array::vector(vec![21.0, 2.0, 3.0, 14.0])
+        );
 
         // Input and update payloads are decoded and written through their independent physical layouts.
         let input_type =
@@ -3034,14 +3421,20 @@ mod tests {
             ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let updates = Array::from_elements(updates_type, &[10u16, 20]).unwrap();
         let expected = Array::from_elements(input_type, &[21u16, 2, 3, 14]);
-        assert_eq!(input.scatter(&indices, &updates, &operation), expected);
+        assert_eq!(
+            input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
+            expected
+        );
 
         // Sub-byte arithmetic wraps in the declared bit width, including repeated modular addition.
         let input = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
         let indices = Array::matrix(2, 1, vec![0i32, 1]).unwrap();
         let updates = Array::vector(vec![i4::new(2).unwrap(), i4::new(-3).unwrap()]).unwrap();
         assert_eq!(
-            input.scatter(&indices, &updates, &operation).unwrap().elements::<i4>(),
+            input
+                .scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options())
+                .unwrap()
+                .elements::<i4>(),
             Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
         );
 
@@ -3054,7 +3447,7 @@ mod tests {
             ScatterReductionKind::Overwrite,
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &overwrite),
+            input.scatter(&indices, &updates, overwrite.dimensions(), overwrite.kind(), overwrite.options()),
             Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x81, 0x80]),
         );
 
@@ -3063,13 +3456,19 @@ mod tests {
         let input = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, 4.0)]).unwrap();
         let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 1.0), ComplexNumber::new(2.0, -1.0)]).unwrap();
         assert_eq!(
-            input.scatter(&indices, &updates, &operation).unwrap().elements::<ComplexNumber<f32>>(),
+            input
+                .scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options())
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(2.0, 3.0), ComplexNumber::new(5.0, 3.0)]),
         );
         let multiply =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Mul);
         assert_eq!(
-            input.scatter(&indices, &updates, &multiply).unwrap().elements::<ComplexNumber<f32>>(),
+            input
+                .scatter(&indices, &updates, multiply.dimensions(), multiply.kind(), multiply.options())
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(-1.0, 3.0), ComplexNumber::new(10.0, 5.0)]),
         );
 
@@ -3080,21 +3479,35 @@ mod tests {
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
         let minimum =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Min);
-        let maximum_values = input.scatter(&indices, &updates, &maximum).unwrap().elements::<f32>().unwrap();
+        let maximum_values = input
+            .scatter(&indices, &updates, maximum.dimensions(), maximum.kind(), maximum.options())
+            .unwrap()
+            .elements::<f32>()
+            .unwrap();
         assert!(maximum_values[0].is_nan());
         assert_eq!(maximum_values[1].to_bits(), 0.0f32.to_bits());
-        let minimum_values = input.scatter(&indices, &updates, &minimum).unwrap().elements::<f32>().unwrap();
+        let minimum_values = input
+            .scatter(&indices, &updates, minimum.dimensions(), minimum.kind(), minimum.options())
+            .unwrap()
+            .elements::<f32>()
+            .unwrap();
         assert!(minimum_values[0].is_nan());
         assert_eq!(minimum_values[1].to_bits(), (-0.0f32).to_bits());
 
         let input = Array::vector(vec![ComplexNumber::new(1.0f32, 9.0), ComplexNumber::new(2.0, -1.0)]).unwrap();
         let updates = Array::vector(vec![ComplexNumber::new(1.0f32, 10.0), ComplexNumber::new(1.0, 100.0)]).unwrap();
         assert_eq!(
-            input.scatter(&indices, &updates, &maximum).unwrap().elements::<ComplexNumber<f32>>(),
+            input
+                .scatter(&indices, &updates, maximum.dimensions(), maximum.kind(), maximum.options())
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(1.0, 10.0), ComplexNumber::new(2.0, -1.0)]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &minimum).unwrap().elements::<ComplexNumber<f32>>(),
+            input
+                .scatter(&indices, &updates, minimum.dimensions(), minimum.kind(), minimum.options())
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(1.0, 9.0), ComplexNumber::new(1.0, 100.0)]),
         );
     }
@@ -3260,7 +3673,9 @@ mod tests {
         let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |(input, indices, updates)| {
                 batch(
-                    |(input, indices, updates)| input.scatter(&indices, &updates, &placed),
+                    |(input, indices, updates)| {
+                        input.scatter(&indices, &updates, placed.dimensions(), placed.kind(), placed.options())
+                    },
                     (input, indices, updates),
                     (BatchAxis::new(1), BatchAxis::new(1), BatchAxis::new(1)),
                     BatchAxis::new(0),
@@ -3320,8 +3735,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind)
-                                .with_unique_indices(true),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            kind,
+                            &ScatterOptions::new().with_unique_indices(true),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3338,8 +3754,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind)
-                                .with_unique_indices(true),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            kind,
+                            &ScatterOptions::new().with_unique_indices(true),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3396,7 +3813,9 @@ mod tests {
                     .scatter(
                         &indices,
                         &updates,
-                        &ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        kind,
+                        &ScatterOptions::new(),
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
@@ -3416,10 +3835,9 @@ mod tests {
                     .scatter(
                         &indices,
                         &updates,
-                        &ScatterOperation::new(
-                            ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                            ScatterReductionKind::Mul,
-                        ),
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Mul,
+                        &ScatterOptions::new(),
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
@@ -3438,10 +3856,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(
-                                ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                                ScatterReductionKind::Min,
-                            ),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            ScatterReductionKind::Min,
+                            &ScatterOptions::new(),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3459,10 +3876,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(
-                                ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                                ScatterReductionKind::Max,
-                            ),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            ScatterReductionKind::Max,
+                            &ScatterOptions::new(),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3480,10 +3896,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(
-                                ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                                ScatterReductionKind::Overwrite,
-                            ),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            ScatterReductionKind::Overwrite,
+                            &ScatterOptions::new(),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3503,11 +3918,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(
-                                ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                                ScatterReductionKind::Mul,
-                            )
-                            .with_unique_indices(true),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            ScatterReductionKind::Mul,
+                            &ScatterOptions::new().with_unique_indices(true),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3528,7 +3941,7 @@ mod tests {
                     ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                     ScatterReductionKind::Add,
                 );
-                x.scatter(&indices, &updates, &operation)
+                x.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options())
             })
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -3560,8 +3973,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Min)
-                                .with_mode(ScatterMode::Drop),
+                            &dimensions.clone(),
+                            ScatterReductionKind::Min,
+                            &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3579,8 +3993,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Max)
-                                .with_mode(ScatterMode::Drop),
+                            &dimensions.clone(),
+                            ScatterReductionKind::Max,
+                            &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3597,8 +4012,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Min)
-                                .with_mode(ScatterMode::Drop),
+                            &dimensions.clone(),
+                            ScatterReductionKind::Min,
+                            &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3617,8 +4033,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Overwrite)
-                                .with_mode(ScatterMode::Drop),
+                            &dimensions.clone(),
+                            ScatterReductionKind::Overwrite,
+                            &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3637,9 +4054,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Mul)
-                                .with_unique_indices(true)
-                                .with_mode(ScatterMode::Drop),
+                            &dimensions.clone(),
+                            ScatterReductionKind::Mul,
+                            &ScatterOptions::new().with_unique_indices(true).with_mode(ScatterMode::Drop),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -3701,7 +4118,13 @@ mod tests {
             .jvp(Array::new(ArrayType::new_static(DataType::Zero, [4]), Vec::new()).unwrap(), |input| {
                 let indices = index_array(&input, vec![2, 1], vec![1, 3]);
                 let updates = input.context().lift(integer_updates.clone())?;
-                input.scatter(&indices, &updates, &ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Min))
+                input.scatter(
+                    &indices,
+                    &updates,
+                    &dimensions.clone(),
+                    ScatterReductionKind::Min,
+                    &ScatterOptions::new(),
+                )
             })
             .unwrap();
         assert_eq!(output, Array::vector(vec![1_i32, 2, 3, 4]).unwrap());
@@ -4959,10 +5382,34 @@ mod tests {
             "`{SCATTER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
         ))
         .into());
-        assert_eq!(input_type.scatter(&sharded_indices_type, &updates_type, &add), expected);
-        assert_eq!(input_type.scatter(&sharded_indices_type, &updates_type, &minimum), expected);
-        assert_eq!(input_type.scatter(&varying_indices_type, &updates_type, &add), expected);
-        assert_eq!(input_type.scatter(&varying_indices_type, &updates_type, &minimum), expected);
+        assert_eq!(
+            input_type.scatter(&sharded_indices_type, &updates_type, add.dimensions(), add.kind(), add.options()),
+            expected
+        );
+        assert_eq!(
+            input_type.scatter(
+                &sharded_indices_type,
+                &updates_type,
+                minimum.dimensions(),
+                minimum.kind(),
+                minimum.options()
+            ),
+            expected
+        );
+        assert_eq!(
+            input_type.scatter(&varying_indices_type, &updates_type, add.dimensions(), add.kind(), add.options()),
+            expected
+        );
+        assert_eq!(
+            input_type.scatter(
+                &varying_indices_type,
+                &updates_type,
+                minimum.dimensions(),
+                minimum.kind(),
+                minimum.options()
+            ),
+            expected
+        );
 
         // Replicated, invariant indices keep reduced state differentiable end to end: the primal, the tangent, and
         // the pullback all run, with cotangents taking the dual (unreduced) state.

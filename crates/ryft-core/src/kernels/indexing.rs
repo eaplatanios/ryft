@@ -282,7 +282,7 @@ mod tests {
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Gather(
                     GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0, 1], vec![0, 1]), vec![1, 1])
-                        .with_mode(GatherMode::Fill { value: Some(Array::scalar(-7i32).unwrap()) }),
+                        .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-7i32).unwrap())) }),
                 )),
                 vec![],
                 vec![values[0], indices],

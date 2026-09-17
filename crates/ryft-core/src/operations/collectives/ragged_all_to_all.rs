@@ -39,7 +39,7 @@ use crate::operations::manipulation::conversions::{ConvertElementType, ConvertEl
 use crate::operations::manipulation::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
-    Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+    Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
@@ -1078,8 +1078,10 @@ where
     };
     // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the same position, while
     // adjacent regions combine deterministically at their shared boundary.
-    let scatter = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add);
-    let markers = marker.scatter(&start_indices, &ones, &scatter)?.scatter(&end_indices, &negative_ones, &scatter)?;
+    let options = ScatterOptions::new();
+    let markers = marker
+        .scatter(&start_indices, &ones, &scatter_dimensions, ScatterReductionKind::Add, &options)?
+        .scatter(&end_indices, &negative_ones, &scatter_dimensions, ScatterReductionKind::Add, &options)?;
     let markers = markers.cumulative_sum(leading_axis)?;
     let start_indices = vec![0; markers.r#type().rank()];
     let mut limit_indices = markers

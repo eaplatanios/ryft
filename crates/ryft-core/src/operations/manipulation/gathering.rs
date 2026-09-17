@@ -94,16 +94,17 @@ impl<V: Value<Type = ArrayType>> Display for GatherMode<V> {
 /// for diagrams and examples of axis mapping, window sizes, and paired batching.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GatherDimensionNumbers {
-    /// Refer to the documentation of [`Self::offset_dimensions`] for more information.
+    /// Refer to the documentation of [`offset_dimensions`](Self::offset_dimensions) for more information.
     offset_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::collapsed_slice_dimensions`] for more information.
+    /// Refer to the documentation of [`collapsed_slice_dimensions`](Self::collapsed_slice_dimensions)
+    /// for more information.
     collapsed_slice_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::start_index_map`] for more information.
+    /// Refer to the documentation of [`start_index_map`](Self::start_index_map) for more information.
     start_index_map: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::batching_dimensions`] for more information.
+    /// Refer to the documentation of [`batching_dimensions`](Self::batching_dimensions) for more information.
     batching_dimensions: Vec<(usize, usize)>,
 }
 
@@ -167,53 +168,30 @@ impl GatherDimensionNumbers {
     }
 }
 
-/// Canonical operation name for [`GatherOperation`].
-pub const GATHER_OPERATION_NAME: &str = "gather";
-
-/// [`Operation`] that reads slices (i.e., "windows") out of an input at positions named by an integer index input,
-/// assembling them into a new array. Refer to the documentation [`Gather`] for more information on the operation.
-///
-/// [`GatherDimensionNumbers`] describes the axis mapping independently of window sizes. This operation combines that
-/// mapping with [`slice_sizes`](Self::slice_sizes), bounds handling, an optional fill value, index promises, and output
-/// placement. Construction stores these settings and type inference validates them against the input and indices.
-/// The `V` parameter describes the stored fill constant, not the gathered input. See [`GatherMode`] for the
-/// distinction between a stored literal and a flowing value.
+/// Optional behavior and output placement for [`Gather`]. Geometry is supplied separately as [`GatherDimensionNumbers`]
+/// and slice sizes. The default promises in-bounds indices, makes no sortedness or non-overlap promise, and infers
+/// output [`Sharding`]. Explicit fill values remain constant attributes and do not receive gradients.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GatherOperation<V: Value<Type = ArrayType> = Array> {
-    /// Refer to the documentation of [`Self::dimensions`] for more information.
-    dimensions: GatherDimensionNumbers,
-
-    /// Refer to the documentation of [`Self::slice_sizes`] for more information.
-    slice_sizes: Vec<usize>,
-
-    /// Refer to the documentation of [`Self::mode`] for more information.
+pub struct GatherOptions<V: Value<Type = ArrayType> = Array> {
+    /// Refer to the documentation of [`mode`](Self::mode) for more information.
     mode: GatherMode<V>,
 
-    /// Refer to the documentation of [`Self::indices_are_sorted`] for more information.
+    /// Refer to the documentation of [`indices_are_sorted`](Self::indices_are_sorted) for more information.
     indices_are_sorted: bool,
 
-    /// Refer to the documentation of [`Self::unique_indices`] for more information.
+    /// Refer to the documentation of [`unique_indices`](Self::unique_indices) for more information.
     unique_indices: bool,
 
-    /// Refer to the documentation of [`Self::output_sharding`] for more information.
+    /// Refer to the documentation of [`output_sharding`](Self::output_sharding) for more information.
     output_sharding: Option<Sharding>,
 }
 
-impl<V: Value<Type = ArrayType>> GatherOperation<V> {
-    /// Creates a new [`GatherOperation`] with the provided dimension numbers and per-input-axis slice sizes. The mode
-    /// defaults to [`GatherMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
-    /// builders to override them.
-    ///
-    /// # Parameters
-    ///
-    ///   - `dimensions`: Mapping from index components and window axes to input and output axes.
-    ///   - `slice_sizes`: Non-negative window size for each input axis. Collapsed axes have size one and batching axes
-    ///     have size at most one. Each size must fit its input extent.
+impl<V: Value<Type = ArrayType>> GatherOptions<V> {
+    /// Creates options with [`GatherMode::PromiseInBounds`], no sortedness or non-overlap promises, and inferred output
+    /// [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
     #[inline]
-    pub fn new(dimensions: GatherDimensionNumbers, slice_sizes: Vec<usize>) -> Self {
+    pub fn new() -> Self {
         Self {
-            dimensions,
-            slice_sizes,
             mode: GatherMode::PromiseInBounds,
             indices_are_sorted: false,
             unique_indices: false,
@@ -221,7 +199,7 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         }
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its out-of-bounds index handling [`GatherMode`] replaced by
+    /// Returns a copy of this [`GatherOptions`] with its out-of-bounds index handling [`GatherMode`] replaced by
     /// `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: GatherMode<V>) -> Self {
@@ -229,7 +207,7 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// Returns a copy of this [`GatherOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
     /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
@@ -238,16 +216,16 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that gathered windows do not overlap; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not test the windows for overlap.
+    /// Returns a copy of this [`GatherOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
+    /// the caller promises that gathered windows do not overlap; `false` makes no such promise. Implementations and
+    /// transformations may rely on this property. This function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
         self.unique_indices = unique_indices;
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its requested output [`Sharding`] replaced by `output_sharding`.
+    /// Returns a copy of this [`GatherOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
     /// Passing `None` restores inferred placement. A request specifies result placement when the window geometry does
     /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
@@ -257,32 +235,18 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     /// variation. It must have the output rank and cannot reference automatic mesh axes. Validation takes place when
     /// inferring the result type.
     #[inline]
-    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
         self
     }
 
-    /// Returns the [`GatherDimensionNumbers`] of this [`GatherOperation`] mapping the index input and sliced windows
-    /// onto the input and output axes.
-    #[inline]
-    pub fn dimensions(&self) -> &GatherDimensionNumbers {
-        &self.dimensions
-    }
-
-    /// Returns the size of the sliced window along each input axis of this [`GatherOperation`]. The number of sizes
-    /// equals the input rank.
-    #[inline]
-    pub fn slice_sizes(&self) -> &[usize] {
-        &self.slice_sizes
-    }
-
-    /// Returns the out-of-bounds index handling [`GatherMode`] of this [`GatherOperation`].
+    /// Returns the out-of-bounds index handling [`GatherMode`] of this [`GatherOptions`].
     #[inline]
     pub fn mode(&self) -> &GatherMode<V> {
         &self.mode
     }
 
-    /// Returns whether the caller promises that the index vectors are sorted for this [`GatherOperation`]. This
+    /// Returns whether the caller promises that the index vectors are sorted for this [`GatherOptions`]. This
     /// property is not checked. Implementations and transformations may rely on it; `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
@@ -327,6 +291,178 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         }
         Ok(())
     }
+}
+
+impl GatherOptions<Array> {
+    /// Returns the constant scalar used to fill out-of-bounds windows for the input `data_type`. An explicit
+    /// [`GatherMode::Fill`] value must be a numeric or Boolean scalar of that exact data type; it is cloned without
+    /// converting its element encoding, preserving signed zeros and NaN payloads.
+    ///
+    /// Without an explicit fill, this returns the minimum signed integer, maximum unsigned integer, `true` for
+    /// Booleans, or NaN for floating-point and complex values. Floating-point formats without NaN use their normal
+    /// NaN conversion result; complex NaN values have a zero imaginary part. Non-fill modes also resolve this default,
+    /// but do not use it to replace out-of-bounds windows.
+    pub fn resolved_fill_value(&self, data_type: DataType) -> Result<Array, ProgramError> {
+        self.validate_fill_value(data_type)?;
+        if let GatherMode::Fill { value: Some(value) } = &self.mode {
+            return Ok(value.as_ref().clone());
+        }
+        dispatch_on_array_element_type!(data_type, |Element| {
+            // The reduction identities give the extreme values. That is, the identity of a maximum reduction is the
+            // smallest signed integer or `false`, and the identity of a minimum reduction is the largest unsigned
+            // integer or `true`.
+            let element = if data_type.is_signed() {
+                Element::max_identity()
+            } else if data_type.is_unsigned() || data_type.is_boolean() {
+                Element::min_identity()
+            } else {
+                Element::from_real(f64::NAN)?
+            };
+            Array::scalar(element)
+        })
+    }
+}
+
+impl<V: Value<Type = ArrayType>> Default for GatherOptions<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Canonical operation name for [`GatherOperation`].
+pub const GATHER_OPERATION_NAME: &str = "gather";
+
+/// [`Operation`] that reads slices (i.e., "windows") out of an input at positions named by an integer index input,
+/// assembling them into a new array. Refer to the documentation [`Gather`] for more information on the operation.
+///
+/// [`GatherDimensionNumbers`] describes the axis mapping independently of window sizes. This operation combines that
+/// mapping with [`slice_sizes`](Self::slice_sizes), bounds handling, an optional fill value, index promises, and output
+/// placement. Construction stores these settings and type inference validates them against the input and indices.
+/// The `V` parameter describes the stored fill constant, not the gathered input. See [`GatherMode`] for the
+/// distinction between a stored literal and a flowing value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GatherOperation<V: Value<Type = ArrayType> = Array> {
+    /// Refer to the documentation of [`dimensions`](Self::dimensions) for more information.
+    dimensions: GatherDimensionNumbers,
+
+    /// Refer to the documentation of [`slice_sizes`](Self::slice_sizes) for more information.
+    slice_sizes: Vec<usize>,
+
+    /// Refer to the documentation of [`options`](Self::options) for more information.
+    options: GatherOptions<V>,
+}
+
+impl<V: Value<Type = ArrayType>> GatherOperation<V> {
+    /// Creates a new [`GatherOperation`] with the provided dimension numbers and per-input-axis slice sizes. The mode
+    /// defaults to [`GatherMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
+    /// builders to override them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `dimensions`: Mapping from index components and window axes to input and output axes.
+    ///   - `slice_sizes`: Non-negative window size for each input axis. Collapsed axes have size one and batching axes
+    ///     have size at most one. Each size must fit its input extent.
+    #[inline]
+    pub fn new(dimensions: GatherDimensionNumbers, slice_sizes: Vec<usize>) -> Self {
+        Self { dimensions, slice_sizes, options: GatherOptions::new() }
+    }
+
+    /// Returns a copy of this [`GatherOperation`] with its optional behavior and output placement
+    /// replaced by `options`.
+    #[inline]
+    pub fn with_options(mut self, options: GatherOptions<V>) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Returns a copy of this [`GatherOperation`] with its out-of-bounds index handling [`GatherMode`]
+    /// replaced by `mode`.
+    #[inline]
+    pub fn with_mode(mut self, mode: GatherMode<V>) -> Self {
+        self.options = self.options.with_mode(mode);
+        self
+    }
+
+    /// Returns a copy of this [`GatherOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not sort or validate the indices.
+    #[inline]
+    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
+        self.options = self.options.with_indices_are_sorted(indices_are_sorted);
+        self
+    }
+
+    /// Returns a copy of this [`GatherOperation`] with its unique-indices promise set to `unique_indices`. When
+    /// `true`, the caller promises that gathered windows do not overlap; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
+    #[inline]
+    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
+        self.options = self.options.with_unique_indices(unique_indices);
+        self
+    }
+
+    /// Returns a copy of this [`GatherOperation`] with its requested output [`Sharding`] replaced by `output_sharding`.
+    /// Passing `None` restores inferred placement. A request specifies result placement when the window geometry does
+    /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
+    /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
+    /// on paired batching axes.
+    ///
+    /// A request selects per-axis placement while preserving the common mesh, reduction state, and manual-axis
+    /// variation. It must have the output rank and cannot reference automatic mesh axes. Validation takes place when
+    /// inferring the result type.
+    #[inline]
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
+        self.options = self.options.with_output_sharding(output_sharding);
+        self
+    }
+
+    /// Returns the [`GatherDimensionNumbers`] of this [`GatherOperation`] mapping the index input and sliced windows
+    /// onto the input and output axes.
+    #[inline]
+    pub fn dimensions(&self) -> &GatherDimensionNumbers {
+        &self.dimensions
+    }
+
+    /// Returns the size of the sliced window along each input axis of this [`GatherOperation`]. The number of sizes
+    /// equals the input rank.
+    #[inline]
+    pub fn slice_sizes(&self) -> &[usize] {
+        &self.slice_sizes
+    }
+
+    /// Returns the optional bounds behavior, index promises, and output placement of this [`GatherOperation`].
+    pub fn options(&self) -> &GatherOptions<V> {
+        &self.options
+    }
+
+    /// Returns the out-of-bounds index handling [`GatherMode`] of this [`GatherOperation`].
+    #[inline]
+    pub fn mode(&self) -> &GatherMode<V> {
+        &self.options.mode
+    }
+
+    /// Returns whether the caller promises that the index vectors are sorted for this [`GatherOperation`]. This
+    /// property is not checked. Implementations and transformations may rely on it; `false` makes no such promise.
+    #[inline]
+    pub fn indices_are_sorted(&self) -> bool {
+        self.options.indices_are_sorted
+    }
+
+    /// Returns whether the caller promises that the gathered windows do not overlap. This property is not checked.
+    /// Implementations and transformations may rely on it, including when constructing the adjoint scatter;
+    /// `false` makes no such promise.
+    #[inline]
+    pub fn unique_indices(&self) -> bool {
+        self.options.unique_indices
+    }
+
+    /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
+    /// documentation of [`Self::with_output_sharding`] for more information.
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.options.output_sharding.as_ref()
+    }
 
     /// Builds the [`ScatterOperation`] used to propagate this [`GatherOperation`]'s output cotangents back to its
     /// input array. The caller applies the scatter to a zero array with the original input shape, using the original
@@ -358,38 +494,14 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
             self.dimensions.batching_dimensions().iter().map(|&(_, indices_axis)| indices_axis).collect(),
         );
         ScatterOperation::new(dimensions, ScatterReductionKind::Add)
-            .with_mode(match &self.mode {
+            .with_mode(match &self.options.mode {
                 GatherMode::PromiseInBounds => ScatterMode::PromiseInBounds,
                 GatherMode::Clip => ScatterMode::Clip,
                 GatherMode::Fill { .. } => ScatterMode::Drop,
             })
-            .with_indices_are_sorted(self.indices_are_sorted)
-            .with_unique_indices(self.unique_indices)
+            .with_indices_are_sorted(self.options.indices_are_sorted)
+            .with_unique_indices(self.options.unique_indices)
             .with_output_sharding(output_sharding)
-    }
-}
-
-impl GatherOperation<Array> {
-    /// Resolves the scalar value used for out-of-bounds windows in the requested input [`DataType`]. Floating-point
-    /// formats without NaN use their normal NaN conversion result. Complex NaN values have a zero imaginary part.
-    pub fn resolved_fill_value(&self, data_type: DataType) -> Result<Array, ProgramError> {
-        self.validate_fill_value(data_type)?;
-        if let GatherMode::Fill { value: Some(value) } = &self.mode {
-            return Ok(value.as_ref().clone());
-        }
-        dispatch_on_array_element_type!(data_type, |Element| {
-            // The reduction identities give the extreme values. That is, the identity of a maximum reduction is the
-            // smallest signed integer or `false`, and the identity of a minimum reduction is the largest unsigned
-            // integer or `true`.
-            let element = if data_type.is_signed() {
-                Element::max_identity()
-            } else if data_type.is_unsigned() || data_type.is_boolean() {
-                Element::min_identity()
-            } else {
-                Element::from_real(f64::NAN)?
-            };
-            Array::scalar(element)
-        })
     }
 }
 
@@ -415,7 +527,7 @@ impl<V: Value<Type = ArrayType>> Operation for GatherOperation<V> {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         check_count!("input", input_types, 2, TypeError);
-        match input_types[0].gather(&input_types[1], self) {
+        match input_types[0].gather(&input_types[1], self.dimensions(), self.slice_sizes(), self.options()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError::invalid(error.to_string())),
@@ -424,7 +536,7 @@ impl<V: Value<Type = ArrayType>> Operation for GatherOperation<V> {
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         let mut operation = self.clone();
-        if let GatherMode::Fill { value: Some(value) } = &mut operation.mode {
+        if let GatherMode::Fill { value: Some(value) } = &mut operation.options.mode {
             **value = value.as_ref().rename_type_identities(renaming)?;
         }
         Ok(operation)
@@ -443,16 +555,16 @@ impl<V: Value<Type = ArrayType>> Operation for GatherOperation<V> {
                 ),
             )?;
             operation.field("slice_sizes", format_args!("{:?}", self.slice_sizes))?;
-            if !matches!(&self.mode, GatherMode::PromiseInBounds) {
-                operation.field("mode", &self.mode)?;
+            if !matches!(&self.options.mode, GatherMode::PromiseInBounds) {
+                operation.field("mode", &self.options.mode)?;
             }
-            if self.indices_are_sorted {
-                operation.field("indices_are_sorted", self.indices_are_sorted)?;
+            if self.options.indices_are_sorted {
+                operation.field("indices_are_sorted", self.options.indices_are_sorted)?;
             }
-            if self.unique_indices {
-                operation.field("unique_indices", self.unique_indices)?;
+            if self.options.unique_indices {
+                operation.field("unique_indices", self.options.unique_indices)?;
             }
-            if let Some(output_sharding) = &self.output_sharding {
+            if let Some(output_sharding) = &self.options.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
             }
             Ok(())
@@ -474,8 +586,8 @@ impl<Stored: Value<Type = ArrayType>, C: Domain<Type = ArrayType, Value: Gather<
         // Direct interpretation need not have passed through a builder's type inference. Validate literal storage
         // here too, before handing the value to a custom capability implementation.
         check_count!("input", inputs, 2, ProgramError);
-        self.validate_fill_value(inputs[0].r#type().data_type())?;
-        Ok(vec![inputs[0].gather(&inputs[1], self)?])
+        self.options.validate_fill_value(inputs[0].r#type().data_type())?;
+        Ok(vec![inputs[0].gather(&inputs[1], self.dimensions(), self.slice_sizes(), self.options())?])
     }
 }
 
@@ -575,8 +687,8 @@ where
                     .map(|&(input_axis, indices_axis)| (input_axis, indices_axis + 1))
                     .collect(),
             );
-            operation.indices_are_sorted = false;
-            operation.unique_indices = false;
+            operation.options.indices_are_sorted = false;
+            operation.options.unique_indices = false;
         } else {
             // Pair the new input and indices dimensions (every item reads only its own input, so the index promises
             // stay valid per item). The paired axes take a size-one window, or a zero window when the mapped extent
@@ -598,7 +710,7 @@ where
         }
 
         if let Some(output_sharding) = self.output_sharding() {
-            operation.output_sharding = Some(lift_output_sharding_for_leading_batch_axis(
+            operation.options.output_sharding = Some(lift_output_sharding_for_leading_batch_axis(
                 output_sharding,
                 ArrayBatch::sharding_for_inputs(inputs)?,
             )?);
@@ -626,7 +738,12 @@ impl_differentiable_operation! {
             // A zero input tangent stays a typed zero.
             check_count!("input", inputs, 2, ProgramError);
             let indices = inputs[1].primal();
-            let primal = inputs[0].primal().gather(indices, operation)?;
+            let primal = inputs[0].primal().gather(
+                indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                operation.options(),
+            )?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
@@ -641,7 +758,12 @@ impl_differentiable_operation! {
                     } else {
                         operation.clone()
                     };
-                    MaybeZero::Value(tangent.gather(&context.primal_to_tangent(indices.clone())?, &tangent_operation)?)
+                    MaybeZero::Value(tangent.gather(
+                        &context.primal_to_tangent(indices.clone())?,
+                        tangent_operation.dimensions(),
+                        tangent_operation.slice_sizes(),
+                        tangent_operation.options())?,
+                    )
                 }
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -860,11 +982,12 @@ where
 // TODO(eaplatanios): Review from here onwards.
 
 /// Reads "windows" from an array at positions supplied by an integer index array. The receiver is the data source.
-/// The `indices` input describes where each window starts, and a [`GatherOperation`] describes the window sizes, axis
-/// mapping, and out-of-bounds behavior. Gathering can select individual elements, entire rows, or multi-dimensional
-/// blocks; the output contains one window per query. Use [`Self::gather_axis`] for complete slices along one axis
-/// without constructing dimension numbers. Use [`DynamicGather::dynamic_gather_axis`] when query or untouched input
-/// extents must remain dynamic. The general [`Self::gather`] function exposes the mapping below.
+/// The `indices` input describes where each window starts, [`GatherDimensionNumbers`] maps the axes, `slice_sizes`
+/// gives the window sizes, and [`GatherOptions`] selects out-of-bounds behavior. Gathering can select individual
+/// elements, entire rows, or multi-dimensional blocks; the output contains one window per query. Use
+/// [`Self::gather_axis`] for complete slices along one axis without constructing dimension numbers. Use
+/// [`DynamicGather::dynamic_gather_axis`] when query or untouched input extents must remain dynamic.
+/// The general [`Self::gather`] function exposes the mapping below.
 ///
 /// # From Indices to Output Axes
 ///
@@ -883,7 +1006,7 @@ where
 /// | `offset_dimensions`          | Output        | Positions of retained window axes.               |
 /// | `batching_dimensions`        | Input/Indices | Pairs linking input axes to matching query axes. |
 ///
-/// [`GatherDimensionNumbers`] holds the mappings; [`GatherOperation::slice_sizes`] holds the window sizes. For each
+/// [`GatherDimensionNumbers`] holds the mappings; the `slice_sizes` argument holds the window sizes. For each
 /// query, `start_index_map[j]` says which input axis receives index-vector component `j`. For example, `[1, 0]`
 /// interprets a vector `[column, row]` as a start in a matrix. Input axes absent from this map start at zero, except
 /// paired batching axes, whose coordinates come from the query itself.
@@ -910,28 +1033,31 @@ where
 /// | `Fill { value }`  | Fills the whole window, for example `[-1, -1]` with an explicit `-1` fill. |
 ///
 /// [`GatherMode::Fill`] owns an optional boxed constant scalar of the input element data type. Wrap an explicit value
-/// in [`Box::new`] and set the mode with [`GatherOperation::with_mode`]. Without a value, fill uses NaN for
+/// in [`Box::new`] and set the mode with [`GatherOptions::with_mode`]. Without a value, fill uses NaN for
 /// floating-point and complex values, the minimum signed integer, the maximum unsigned integer, or `true` for Booleans.
 /// Other modes carry no fill value. The mode never changes the output shape. Clipping shifts a whole window, and
 /// filling replaces a whole window, rather than preserving its in-bounds portion.
 ///
 /// ```rust
-/// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOperation};
+/// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOptions};
 /// let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
 /// let indices = Array::matrix(1, 1, vec![4_i32]).unwrap();
-/// let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
-///     .with_mode(GatherMode::Fill {
-///         value: Some(Box::new(Array::scalar(-1_i32).unwrap())),
-///     });
-/// assert_eq!(input.gather(&indices, &operation), Ok(Array::matrix(1, 2, vec![-1_i32, -1]).unwrap()));
+/// let dimensions = GatherDimensionNumbers::new(vec![1], vec![], vec![0]);
+/// let options = GatherOptions::new().with_mode(GatherMode::Fill {
+///     value: Some(Box::new(Array::scalar(-1_i32).unwrap())),
+/// });
+/// assert_eq!(
+///     input.gather(&indices, &dimensions, &[2], &options),
+///     Ok(Array::matrix(1, 2, vec![-1_i32, -1]).unwrap()),
+/// );
 /// ```
 ///
-/// [`GatherOperation::with_indices_are_sorted`] and [`GatherOperation::with_unique_indices`] declare unchecked caller
+/// [`GatherOptions::with_indices_are_sorted`] and [`GatherOptions::with_unique_indices`] declare unchecked caller
 /// promises that implementations and transformations may rely on. They do not sort or deduplicate queries. Leave them
 /// false unless the index vectors are sorted or the gathered windows do not overlap, respectively. Neither setting
 /// changes the intended result for inputs satisfying the promises.
 ///
-/// [`GatherOperation::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous
+/// [`GatherOptions::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous
 /// placement when gathering partial windows on explicitly sharded axes. It does not change the axis mapping or
 /// numerical result. Input and indices must use compatible meshes; requested placement must preserve reduction and
 /// manual-axis state. Without a request, window axes and query axes infer placement from the input and indices.
@@ -949,7 +1075,7 @@ where
 /// values. Fills are validated as scalar constants of the input element data type before execution.
 ///
 /// # Examples
-/// 
+///
 /// ## Selecting Rows and Choosing Output Order
 ///
 /// For the matrix below, the query vectors `[0]` and `[2]` select its first and last rows. The window size `[1, 2]`
@@ -965,22 +1091,20 @@ where
 /// ```
 ///
 /// ```rust
-/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOperation};
+/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
 ///
 /// let input = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
-/// let operation = GatherOperation::new(dimensions, vec![1, 2]);
 /// assert_eq!(
-///     input.gather(&indices, &operation),
+///     input.gather(&indices, &dimensions, &[1, 2], &GatherOptions::new()),
 ///     Ok(Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap()),
 /// );
 ///
 /// // Moving the column axis to output position 0 makes position 1 the query axis.
 /// let dimensions = GatherDimensionNumbers::new(vec![0], vec![0], vec![0]);
-/// let operation = GatherOperation::new(dimensions, vec![1, 2]);
 /// assert_eq!(
-///     input.gather(&indices, &operation),
+///     input.gather(&indices, &dimensions, &[1, 2], &GatherOptions::new()),
 ///     Ok(Array::matrix(2, 2, vec![0.0, 4.0, 1.0, 5.0]).unwrap()),
 /// );
 /// ```
@@ -993,17 +1117,16 @@ where
 /// `[[6, 7], [10, 11]]`, respectively. Overlapping windows are allowed.
 ///
 /// ```rust
-/// use ryft_core::{Array, ArrayType, DataType, Gather, GatherDimensionNumbers, GatherOperation};
+/// use ryft_core::{Array, ArrayType, DataType, Gather, GatherDimensionNumbers, GatherOptions};
 ///
 /// let input = Array::matrix(3, 4, vec![0_i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).unwrap();
 /// let indices = Array::matrix(2, 2, vec![0_i32, 1, 1, 2]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1, 2], vec![], vec![0, 1]);
-/// let operation = GatherOperation::new(dimensions, vec![2, 2]);
 /// let expected = Array::from_elements(
 ///     ArrayType::new_static(DataType::I32, [2, 2, 2]),
 ///     &[1_i32, 2, 5, 6, 6, 7, 10, 11],
 /// ).unwrap();
-/// assert_eq!(input.gather(&indices, &operation), Ok(expected));
+/// assert_eq!(input.gather(&indices, &dimensions, &[2, 2], &GatherOptions::new()), Ok(expected));
 /// ```
 ///
 /// ## Pairing Queries with Input Batch Items
@@ -1019,18 +1142,21 @@ where
 /// rather than applying every query to every row:
 ///
 /// ```rust
-/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOperation};
+/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
 ///
 /// let input = Array::matrix(2, 3, vec![10_i32, 20, 30, 40, 50, 60]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![2_i32, 0]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![], vec![1], vec![1])
 ///     .with_batching_dimensions(vec![(0, 0)]);
-/// let operation = GatherOperation::new(dimensions, vec![1, 1]);
-/// assert_eq!(input.gather(&indices, &operation), Ok(Array::vector(vec![30_i32, 40]).unwrap()));
+/// assert_eq!(
+///     input.gather(&indices, &dimensions, &[1, 1], &GatherOptions::new()),
+///     Ok(Array::vector(vec![30_i32, 40]).unwrap()),
+/// );
 /// ```
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
-    /// Reads windows from the input at the starts given by `indices` and assembles them using `operation`.
+    /// Reads windows of `slice_sizes` from the input at the starts given by `indices`, using `dimensions` to arrange
+    /// their axes and `options` to select bounds behavior, index promises, and output placement.
     /// See the [`Gather`] guide for how index vectors, window sizes, and output-axis positions interact.
     /// Negative starts are out of bounds; they do not count backward from an axis end. Bounds handling applies to
     /// whole windows, so one invalid start fills the entire window in fill mode.
@@ -1038,8 +1164,16 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
     /// # Parameters
     ///
     ///   - `indices`: Integer array with one trailing index-vector axis. Its remaining axes enumerate queries.
-    ///   - `operation`: Dimension mapping, window sizes, bounds mode, optional fill, and placement hints.
-    fn gather(&self, indices: &Self, operation: &GatherOperation<Stored>) -> Result<Self, ProgramError>;
+    ///   - `dimensions`: Mapping from index components and window axes to input and output axes.
+    ///   - `slice_sizes`: Window size along each input axis.
+    ///   - `options`: Bounds mode, optional constant fill, unchecked index promises, and requested output placement.
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError>;
 
     /// Gathers complete slices along one axis using raw integer indices. The index array's shape replaces that
     /// input axis in the result, and all other input axes retain their order and full size. Unlike indexing APIs that
@@ -1100,22 +1234,25 @@ pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
             .collect();
-        let operation =
-            GatherOperation::new(GatherDimensionNumbers::new(offset_dimensions, vec![axis], vec![axis]), slice_sizes)
-                .with_mode(mode);
-        self.gather(&expanded_indices, &operation)
+        let dimensions = GatherDimensionNumbers::new(offset_dimensions, vec![axis], vec![axis]);
+        let options = GatherOptions::new().with_mode(mode);
+        self.gather(&expanded_indices, &dimensions, &slice_sizes, &options)
     }
 }
 
 impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
     // Type-level gather: validates the dimension numbers and slice sizes against the input and indices types and
     // computes the output shape and placement.
-    fn gather(&self, indices: &Self, operation: &GatherOperation<Stored>) -> Result<Self, ProgramError> {
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError> {
         let input = self;
-        let dimensions = operation.dimensions();
         let (input_batching_dimensions, indices_batching_dimensions): (Vec<_>, Vec<_>) =
             dimensions.batching_dimensions().iter().copied().unzip();
-        let slice_sizes = operation.slice_sizes();
         let input_rank = input.rank();
         let indices_rank = indices.rank();
 
@@ -1131,7 +1268,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             ))
             .into());
         }
-        operation.validate_fill_value(input.data_type())?;
+        options.validate_fill_value(input.data_type())?;
         if input.memory() != indices.memory() {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` input and indices must share one memory space but reside in `{}` and `{}`",
@@ -1337,13 +1474,13 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         // An unreduced input holds per-device partial sums, so a fill constant written on every device would be
         // counted once per device by the pending reduction. Reduced inputs are complete on each device and may be
         // filled.
-        if !unreduced_axes.is_empty() && matches!(operation.mode(), GatherMode::Fill { .. }) {
+        if !unreduced_axes.is_empty() && matches!(options.mode(), GatherMode::Fill { .. }) {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` fill mode does not support unreduced inputs"
             ))
             .into());
         }
-        let sharding = if let Some(requested) = operation.output_sharding() {
+        let sharding = if let Some(requested) = options.output_sharding() {
             if mesh.as_ref().is_some_and(|mesh| mesh != requested.mesh()) {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` requested output sharding uses a different mesh"
@@ -1483,10 +1620,14 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 }
 
 impl Gather for Array {
-    fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let output_type = self.r#type().gather(indices.r#type().as_ref(), operation)?;
-        let dimensions = operation.dimensions();
-        let slice_sizes = operation.slice_sizes();
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions,
+    ) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().gather(indices.r#type().as_ref(), dimensions, slice_sizes, options)?;
         let input_shape = self.r#type().static_shape().unwrap();
         let indices_shape = indices.r#type().static_shape().unwrap();
         let input_rank = input_shape.rank();
@@ -1508,8 +1649,8 @@ impl Gather for Array {
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
 
         // Resolve a fill only when the mode can use it, preserving the exact element encoding of explicit fills.
-        let dropped_fill = if matches!(operation.mode(), GatherMode::Fill { .. }) {
-            let value = operation.resolved_fill_value(output_type.data_type())?;
+        let dropped_fill = if matches!(options.mode(), GatherMode::Fill { .. }) {
+            let value = options.resolved_fill_value(output_type.data_type())?;
             let addressing = ArrayAddressing::new(value.r#type().into_owned())?;
             Some((value, addressing))
         } else {
@@ -1563,7 +1704,7 @@ impl Gather for Array {
             for (component, &input_axis) in dimensions.start_index_map().iter().enumerate() {
                 let raw = starts[component];
                 let maximum = (input_shape[input_axis] - slice_sizes[input_axis]) as i128;
-                match operation.mode() {
+                match options.mode() {
                     GatherMode::Fill { .. } => {
                         if raw < 0 || raw > maximum {
                             dropped = true;
@@ -1592,10 +1733,16 @@ impl Gather for Array {
 }
 
 impl<Stored: Value<Type = ArrayType>, A: Gather<Stored> + Value<Type = ArrayType>> Gather<Stored> for ArrayIrValue<A> {
-    fn gather(&self, indices: &Self, operation: &GatherOperation<Stored>) -> Result<Self, ProgramError> {
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
-        Ok(Self::Array(input.gather(indices, operation)?))
+        Ok(Self::Array(input.gather(indices, dimensions, slice_sizes, options)?))
     }
 }
 
@@ -1606,9 +1753,15 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<GatherOperation<Stored>>,
 {
-    fn gather(&self, indices: &Self, operation: &GatherOperation<Stored>) -> Result<Self, ProgramError> {
-        let mut outputs =
-            self.dispatch_domain().bind(operation.clone(), Vec::new(), &[self.clone(), indices.clone()])?;
+    fn gather(
+        &self,
+        indices: &Self,
+        dimensions: &GatherDimensionNumbers,
+        slice_sizes: &[usize],
+        options: &GatherOptions<Stored>,
+    ) -> Result<Self, ProgramError> {
+        let operation = GatherOperation::new(dimensions.clone(), slice_sizes.to_vec()).with_options(options.clone());
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), indices.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1715,27 +1868,28 @@ where
         // input/indices batches, so no symbolic extent is encoded as a host-sized gather window.
         let indices =
             indices.dynamic_broadcast(&dimensions, &(axis..axis + indices_type.rank()).collect::<Vec<_>>())?;
-        let operation = GatherOperation::new(
-            GatherDimensionNumbers::new(vec![], vec![axis], vec![axis]).with_batching_dimensions(batching),
-            (0..input_type.rank())
-                .map(
-                    |input_axis| {
-                        if input_axis == axis { 1 } else { batching_window_size(&input_type.dimension(input_axis)) }
-                    },
-                )
-                .collect(),
-        )
-        .with_mode(mode);
+        let gather_dimensions =
+            GatherDimensionNumbers::new(vec![], vec![axis], vec![axis]).with_batching_dimensions(batching);
+        let slice_sizes = (0..input_type.rank())
+            .map(
+                |input_axis| {
+                    if input_axis == axis { 1 } else { batching_window_size(&input_type.dimension(input_axis)) }
+                },
+            )
+            .collect::<Vec<_>>();
+        let options = GatherOptions::new().with_mode(mode);
         if indices_type.element_count().map_err(|error| TypeError::invalid(error.to_string()))? == Some(0) {
             // Empty queries read no input elements, including when the selected axis itself is empty. Use the
             // ordinary gather metadata rules with a placeholder selected extent of one, then construct its empty
             // result. This preserves placement validation without staging an invalid collapsed size-one window.
             let mut shape = input_type.shape().dimensions().to_vec();
             shape[axis] = Dimension::Static(1);
-            let output_type = input_type
-                .clone()
-                .with_shape(Shape::new(shape))
-                .gather(<&ArrayType>::try_from(indices.r#type().as_ref())?, &operation)?;
+            let output_type = input_type.clone().with_shape(Shape::new(shape)).gather(
+                <&ArrayType>::try_from(indices.r#type().as_ref())?,
+                &gather_dimensions,
+                &slice_sizes,
+                &options,
+            )?;
             let dynamic_dimensions = output_type
                 .shape()
                 .dimensions()
@@ -1745,7 +1899,12 @@ where
                 .collect::<Vec<_>>();
             return self.dispatch_domain().dynamic_zero(&output_type, &dynamic_dimensions);
         }
-        Ok(V::from_projected(self.clone().into_projected()?.gather(&indices.into_projected()?, &operation)?))
+        Ok(V::from_projected(self.clone().into_projected()?.gather(
+            &indices.into_projected()?,
+            &gather_dimensions,
+            &slice_sizes,
+            &options,
+        )?))
     }
 }
 
@@ -2010,6 +2169,89 @@ mod tests {
     }
 
     #[test]
+    fn test_gather_options_new() {
+        let options = GatherOptions::<Array>::new();
+        assert_eq!(options, GatherOptions::default());
+        assert_eq!(options.mode(), &GatherMode::PromiseInBounds);
+        assert!(!options.indices_are_sorted());
+        assert!(!options.unique_indices());
+        assert_eq!(options.output_sharding(), None);
+    }
+
+    #[test]
+    fn test_gather_options_with_mode() {
+        let options =
+            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(7_i32).unwrap())) });
+        assert_eq!(options.mode(), &GatherMode::Fill { value: Some(Box::new(Array::scalar(7_i32).unwrap())) });
+        assert!(!options.indices_are_sorted());
+        assert!(!options.unique_indices());
+        assert_eq!(options.output_sharding(), None);
+        let options = options.with_mode(GatherMode::Clip);
+        assert_eq!(options.mode(), &GatherMode::Clip);
+        assert_eq!(options.with_mode(GatherMode::Fill { value: None }).mode(), &GatherMode::Fill { value: None });
+    }
+
+    #[test]
+    fn test_gather_options_with_indices_are_sorted() {
+        let options = GatherOptions::<Array>::new().with_indices_are_sorted(true);
+        assert!(options.indices_are_sorted());
+        assert_eq!(options.with_indices_are_sorted(false), GatherOptions::new());
+    }
+
+    #[test]
+    fn test_gather_options_with_unique_indices() {
+        let options = GatherOptions::<Array>::new().with_unique_indices(true);
+        assert!(options.unique_indices());
+        assert_eq!(options.with_unique_indices(false), GatherOptions::new());
+    }
+
+    #[test]
+    fn test_gather_options_with_output_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2);
+        let options = GatherOptions::<Array>::new().with_output_sharding(sharding.clone());
+        assert_eq!(options.output_sharding(), Some(&sharding));
+        assert_eq!(options.with_output_sharding(None), GatherOptions::new());
+    }
+
+    #[test]
+    fn test_gather_options_resolved_fill_value() {
+        let options = GatherOptions::new();
+        assert_eq!(options.resolved_fill_value(DataType::I64), Array::scalar(i64::MIN));
+        assert_eq!(options.resolved_fill_value(DataType::U64), Array::scalar(u64::MAX));
+        assert_eq!(options.resolved_fill_value(DataType::Boolean), Array::scalar(true));
+        assert_eq!(options.resolved_fill_value(DataType::I1), Array::scalar(i1::new(-1).unwrap()));
+        assert_eq!(options.resolved_fill_value(DataType::U4), Array::scalar(u4::new(15).unwrap()));
+        let float_fill = options.resolved_fill_value(DataType::F32).unwrap();
+        assert!(float_fill.elements::<f32>().unwrap()[0].is_nan());
+        let complex_fill = options.resolved_fill_value(DataType::C64).unwrap();
+        let complex = complex_fill.elements::<num_complex::Complex<f32>>().unwrap()[0];
+        assert!(complex.re.is_nan());
+        assert_eq!(complex.im, 0.0);
+
+        // Resolving an explicit fill preserves its encoding and validates its shape and element data type.
+        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
+        let options = options.with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
+        assert_eq!(options.resolved_fill_value(DataType::F32).unwrap().storage_bytes(), fill.storage_bytes());
+        assert_eq!(
+            options.resolved_fill_value(DataType::I32),
+            Err(TypeError::invalid(format!(
+                "`{GATHER_OPERATION_NAME}` fill data type `f32` does not match input data type `i32`"
+            ))
+            .into()),
+        );
+        assert_eq!(
+            options
+                .with_mode(GatherMode::Fill { value: Some(Box::new(Array::vector(vec![1.0_f32]).unwrap())) })
+                .resolved_fill_value(DataType::F32),
+            Err(TypeError::invalid(format!(
+                "`{GATHER_OPERATION_NAME}` fill value must be a numeric or Boolean scalar"
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
     fn test_gather() {
         // Take whole rows of a [3, 2] matrix indexed by a [2, 1] index array: offset axis 1 carries the row (slice
         // sizes [1, 2]); axis 0 (the collapsed row axis) is driven by the start index.
@@ -2063,85 +2305,10 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(configured.clone().with_output_sharding(None).output_sharding(), None);
-    }
-
-    #[test]
-    fn test_gather_resolved_fill_value() {
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
-        assert_eq!(operation.resolved_fill_value(DataType::I64), Array::scalar(i64::MIN));
-        assert_eq!(operation.resolved_fill_value(DataType::U64), Array::scalar(u64::MAX));
-        assert_eq!(operation.resolved_fill_value(DataType::Boolean), Array::scalar(true));
-        assert_eq!(operation.resolved_fill_value(DataType::I1), Array::scalar(i1::new(-1).unwrap()));
-        assert_eq!(operation.resolved_fill_value(DataType::U4), Array::scalar(u4::new(15).unwrap()));
-        let float_fill = operation.resolved_fill_value(DataType::F32).unwrap();
-        assert!(float_fill.elements::<f32>().unwrap()[0].is_nan());
-        let complex_fill = operation.resolved_fill_value(DataType::C64).unwrap();
-        let complex = complex_fill.elements::<num_complex::Complex<f32>>().unwrap()[0];
-        assert!(complex.re.is_nan());
-        assert_eq!(complex.im, 0.0);
-
-        // Explicit NaN payloads survive operation cloning and eager filling without numeric conversion.
-        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
-        let filling = operation.with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
-        assert_eq!(filling.resolved_fill_value(DataType::F32).unwrap().storage_bytes(), fill.storage_bytes());
+        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let clipping = GatherOptions::<Array>::new().with_mode(GatherMode::Clip);
         assert_eq!(
-            filling.resolved_fill_value(DataType::I32),
-            Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` fill data type `f32` does not match input data type `i32`"
-            ))
-            .into()),
-        );
-        let input = Array::vector(vec![1.0_f32]).unwrap();
-        let out_of_bounds = Array::matrix(1, 1, vec![2_i32]).unwrap();
-        let output = input.gather(&out_of_bounds, &filling).unwrap();
-        assert_eq!(output.storage_bytes(), fill.storage_bytes());
-        assert_eq!(
-            filling
-                .clone()
-                .with_mode(GatherMode::Fill { value: Some(Box::new(Array::vector(vec![1.0_f32]).unwrap())) })
-                .resolved_fill_value(DataType::F32),
-            Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` fill value must be a numeric or Boolean scalar"
-            ))
-            .into()),
-        );
-
-        let negative_zero = filling
-            .clone()
-            .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-0.0_f32).unwrap())) });
-        assert_eq!(
-            input.gather(&out_of_bounds, &negative_zero).unwrap().elements::<f32>().unwrap()[0].to_bits(),
-            (-0.0_f32).to_bits(),
-        );
-        // A scalar fill can carry storage placement without changing its logical value.
-        let pinned_fill = Array::new(
-            ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true }),
-            7.0_f32.to_ne_bytes().to_vec(),
-        )
-        .unwrap();
-        assert_eq!(
-            input.gather(
-                &out_of_bounds,
-                &filling.clone().with_mode(GatherMode::Fill { value: Some(Box::new(pinned_fill)) })
-            ),
-            Array::vector(vec![7.0_f32]),
-        );
-        let invalid_fill = filling
-            .clone()
-            .with_mode(GatherMode::Fill { value: Some(Box::new(Array::vector(vec![1.0_f32]).unwrap())) });
-        assert_eq!(
-            input.gather(&Array::new(ArrayType::new_static(DataType::I32, [0, 1]), Vec::new()).unwrap(), &invalid_fill),
-            Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` fill value must be a numeric or Boolean scalar"
-            ))
-            .into()),
-        );
-
-        // Changing mode discards its fill payload. Returning to default fill cannot resurrect the old NaN bits.
-        let clipping = filling.clone().with_mode(GatherMode::Clip);
-        assert_eq!(clipping.mode(), &GatherMode::Clip);
-        assert_eq!(
-            format!("{clipping}"),
+            format!("{}", GatherOperation::new(dimensions.clone(), vec![1]).with_options(clipping.clone())),
             indoc! {"
                 gather [
                     dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
@@ -2151,11 +2318,19 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(input.gather(&out_of_bounds, &clipping), Ok(Array::vector(vec![1.0_f32]).unwrap()));
-        let refilling = clipping.with_mode(GatherMode::Fill { value: None });
-        assert_ne!(refilling, filling);
-        assert_eq!(refilling.mode(), &GatherMode::Fill { value: None });
-        assert!(input.gather(&out_of_bounds, &refilling).unwrap().elements::<f32>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_gather_with_options() {
+        let options = GatherOptions::<Array>::new().with_mode(GatherMode::Clip).with_unique_indices(true);
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        let operation = GatherOperation::new(dimensions.clone(), vec![1, 2]).with_options(options.clone());
+        assert_eq!(operation.dimensions(), &dimensions);
+        assert_eq!(operation.slice_sizes(), &[1, 2]);
+        assert_eq!(operation.options(), &options);
+        let operation = operation.with_options(GatherOptions::new());
+        assert_eq!(operation.mode(), &GatherMode::PromiseInBounds);
+        assert!(!operation.unique_indices());
     }
 
     #[test]
@@ -2295,10 +2470,22 @@ mod tests {
             ArrayType::new(DataType::I32, Shape::new(vec![exact.clone(), Dimension::Static(2), Dimension::Static(1)]));
         let static_output = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
         let exact_output = ArrayType::new(DataType::F64, Shape::new(vec![exact, Dimension::Static(2)]));
-        assert_eq!(static_input.gather(&static_indices, &operation), Ok(static_output.clone()));
-        assert_eq!(static_input.gather(&exact_indices, &operation), Ok(exact_output.clone()));
-        assert_eq!(exact_input.gather(&static_indices, &operation), Ok(static_output));
-        assert_eq!(exact_input.gather(&exact_indices, &operation), Ok(exact_output));
+        assert_eq!(
+            static_input.gather(&static_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(static_output.clone())
+        );
+        assert_eq!(
+            static_input.gather(&exact_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(exact_output.clone())
+        );
+        assert_eq!(
+            exact_input.gather(&static_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(static_output)
+        );
+        assert_eq!(
+            exact_input.gather(&exact_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(exact_output)
+        );
 
         // Independent dynamic dimensions with equal bounds do not prove equal extents.
         let input = ArrayType::new(
@@ -2317,7 +2504,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            input.gather(&indices, &operation),
+            input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis 0 and indices \
                  axis 0 differ",
@@ -2600,9 +2787,17 @@ mod tests {
             .unwrap();
         // Complete windows of an unreduced input keep its pending reduction; a fill written on every device would be
         // counted once per device by that reduction, so fill mode is rejected for unreduced inputs.
-        assert_eq!(input.gather(&indices, &operation), Ok(expected));
         assert_eq!(
-            input.gather(&indices, &operation.clone().with_mode(GatherMode::Fill { value: None })),
+            input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(expected)
+        );
+        assert_eq!(
+            input.gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_mode(GatherMode::Fill { value: None }),
+            ),
             Err(TypeError::invalid(format!("`{GATHER_OPERATION_NAME}` fill mode does not support unreduced inputs"))
                 .into()),
         );
@@ -2612,7 +2807,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            input.gather(&distributed_indices, &operation),
+            input.gather(&distributed_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
             ))
@@ -2635,10 +2830,18 @@ mod tests {
             )
             .unwrap();
         // Full windows retain placement even on an explicitly indexed axis.
-        assert_eq!(input.gather(&indices, &operation), Ok(expected));
+        assert_eq!(
+            input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Ok(expected)
+        );
         let partial = GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![1], vec![], vec![]), vec![2]);
         assert_eq!(
-            input.gather(&ArrayType::new_static(DataType::I32, [1, 0]), &partial),
+            input.gather(
+                &ArrayType::new_static(DataType::I32, [1, 0]),
+                partial.dimensions(),
+                partial.slice_sizes(),
+                partial.options(),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` partial sharded windows require explicit output sharding"
             ))
@@ -2660,7 +2863,10 @@ mod tests {
         let expected = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        assert_eq!(batched_input.gather(&batched_indices, &batched), Ok(expected));
+        assert_eq!(
+            batched_input.gather(&batched_indices, batched.dimensions(), batched.slice_sizes(), batched.options()),
+            Ok(expected)
+        );
 
         // Paired batching axes sharded differently are ambiguous unless the output placement is requested.
         let two_axis_mesh = LogicalMesh::new(vec![
@@ -2687,7 +2893,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            conflicting_input.gather(&conflicting_indices, &batched),
+            conflicting_input.gather(
+                &conflicting_indices,
+                batched.dimensions(),
+                batched.slice_sizes(),
+                batched.options(),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` conflicting batching-axis shardings require explicit output sharding"
             ))
@@ -2695,7 +2906,12 @@ mod tests {
         );
         let requested = Sharding::new(two_axis_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         assert_eq!(
-            conflicting_input.gather(&conflicting_indices, &batched.clone().with_output_sharding(requested.clone())),
+            conflicting_input.gather(
+                &conflicting_indices,
+                batched.dimensions(),
+                batched.slice_sizes(),
+                &batched.options().clone().with_output_sharding(requested.clone()),
+            ),
             Ok(ArrayType::new_static(DataType::F32, [2]).with_sharding(requested).unwrap()),
         );
 
@@ -2708,7 +2924,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            input.gather(&sharded_vector_indices, &operation),
+            input.gather(&sharded_vector_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit mesh axes"
             ))
@@ -2717,7 +2933,7 @@ mod tests {
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let other_mesh_indices = indices.clone().with_sharding(Sharding::replicated(other_mesh.clone(), 2)).unwrap();
         assert_eq!(
-            input.gather(&other_mesh_indices, &operation),
+            input.gather(&other_mesh_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` input and indices shardings must use the same mesh"
             ))
@@ -2728,7 +2944,12 @@ mod tests {
         // output rank, and avoid automatic mesh axes.
         let requested = Sharding::replicated(other_mesh, 2);
         assert_eq!(
-            input.gather(&indices, &operation.clone().with_output_sharding(requested)),
+            input.gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_output_sharding(requested),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` requested output sharding uses a different mesh"
             ))
@@ -2736,7 +2957,12 @@ mod tests {
         );
         let requested = Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
         assert_eq!(
-            input.gather(&indices, &operation.clone().with_output_sharding(requested)),
+            input.gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_output_sharding(requested),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state"
             ))
@@ -2744,7 +2970,12 @@ mod tests {
         );
         let requested = Sharding::replicated(mesh.clone(), 1);
         assert_eq!(
-            input.gather(&indices, &operation.clone().with_output_sharding(requested)),
+            input.gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_output_sharding(requested),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` output sharding rank (1) does not match the output rank (2)"
             ))
@@ -2754,8 +2985,12 @@ mod tests {
         let requested =
             Sharding::new(auto_mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["a"])]).unwrap();
         assert_eq!(
-            ArrayType::new_static(DataType::F32, [4])
-                .gather(&indices, &operation.clone().with_output_sharding(requested)),
+            ArrayType::new_static(DataType::F32, [4]).gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_output_sharding(requested),
+            ),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
             ))
@@ -2766,7 +3001,7 @@ mod tests {
         let reduced_indices =
             indices.with_sharding(Sharding::replicated(mesh, 2).with_reduced_axes(["x"]).unwrap()).unwrap();
         assert_eq!(
-            input.gather(&reduced_indices, &operation),
+            input.gather(&reduced_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes"
             ))
@@ -2868,10 +3103,22 @@ mod tests {
         // Clipping moves a complete window in bounds, while fill mode replaces each invalid window.
         let indices = Array::matrix(2, 1, vec![1_i32, 5]).unwrap();
         assert_eq!(
-            input.gather(&indices, &operation.clone().with_mode(GatherMode::Clip)),
+            input.gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_mode(GatherMode::Clip),
+            ),
             Array::vector(vec![20.0, 40.0]),
         );
-        let filled = input.gather(&indices, &operation.with_mode(GatherMode::Fill { value: None })).unwrap();
+        let filled = input
+            .gather(
+                &indices,
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_mode(GatherMode::Fill { value: None }),
+            )
+            .unwrap();
         assert_eq!(filled.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2]));
         let filled_elements = filled.elements::<f64>().unwrap();
         assert_eq!(filled_elements[0], 20.0);
@@ -2891,7 +3138,16 @@ mod tests {
         let staged_input = context.input(input_types[0].clone());
         let staged_indices = context.input(input_types[1].clone());
         assert_eq!(
-            staged_input.gather(&staged_indices, &abstract_operation).unwrap().r#type().as_ref(),
+            staged_input
+                .gather(
+                    &staged_indices,
+                    abstract_operation.dimensions(),
+                    abstract_operation.slice_sizes(),
+                    abstract_operation.options(),
+                )
+                .unwrap()
+                .r#type()
+                .as_ref(),
             &ArrayType::new_static(DataType::F32, [2, 2]),
         );
 
@@ -2906,8 +3162,72 @@ mod tests {
         let indices = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[2_i32, 0]).unwrap();
         let rows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         assert_eq!(
-            windows.gather(&indices, &rows),
+            windows.gather(&indices, rows.dimensions(), rows.slice_sizes(), rows.options()),
             Ok(Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[6.0_f32, 7.0, 1.0, 2.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_gather_interpretation_fill_encodings() {
+        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
+        // Explicit NaN payloads survive options cloning and eager filling without numeric conversion.
+        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
+        let filling = GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
+        let input = Array::vector(vec![1.0_f32]).unwrap();
+        let out_of_bounds = Array::matrix(1, 1, vec![2_i32]).unwrap();
+        let output = input.gather(&out_of_bounds, &dimensions, &[1], &filling).unwrap();
+        assert_eq!(output.storage_bytes(), fill.storage_bytes());
+        let negative_zero = filling
+            .clone()
+            .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-0.0_f32).unwrap())) });
+        assert_eq!(
+            input.gather(&out_of_bounds, &dimensions, &[1], &negative_zero).unwrap().elements::<f32>().unwrap()[0]
+                .to_bits(),
+            (-0.0_f32).to_bits(),
+        );
+        // A scalar fill can carry storage placement without changing its logical value.
+        let pinned_fill = Array::new(
+            ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true }),
+            7.0_f32.to_ne_bytes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            input.gather(
+                &out_of_bounds,
+                &dimensions,
+                &[1],
+                &filling.clone().with_mode(GatherMode::Fill { value: Some(Box::new(pinned_fill)) }),
+            ),
+            Array::vector(vec![7.0_f32]),
+        );
+        let invalid_fill = filling
+            .clone()
+            .with_mode(GatherMode::Fill { value: Some(Box::new(Array::vector(vec![1.0_f32]).unwrap())) });
+        assert_eq!(
+            input.gather(
+                &Array::new(ArrayType::new_static(DataType::I32, [0, 1]), Vec::new()).unwrap(),
+                &dimensions,
+                &[1],
+                &invalid_fill,
+            ),
+            Err(TypeError::invalid(format!(
+                "`{GATHER_OPERATION_NAME}` fill value must be a numeric or Boolean scalar"
+            ))
+            .into()),
+        );
+
+        // Changing mode discards its fill payload. Returning to default fill cannot resurrect the old NaN bits.
+        let clipping = filling.clone().with_mode(GatherMode::Clip);
+        assert_eq!(clipping.mode(), &GatherMode::Clip);
+        assert_eq!(
+            input.gather(&out_of_bounds, &dimensions, &[1], &clipping),
+            Ok(Array::vector(vec![1.0_f32]).unwrap())
+        );
+        let refilling = clipping.with_mode(GatherMode::Fill { value: None });
+        assert_ne!(refilling, filling);
+        assert_eq!(refilling.mode(), &GatherMode::Fill { value: None });
+        assert!(
+            input.gather(&out_of_bounds, &dimensions, &[1], &refilling).unwrap().elements::<f32>().unwrap()[0].is_nan()
         );
     }
 
@@ -2917,16 +3237,16 @@ mod tests {
         let indices = ArrayIrValue::Array(Array::matrix(2, 1, vec![2_i32, 0]).unwrap());
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
         assert_eq!(
-            input.gather(&indices, &operation),
+            input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 10]).unwrap())),
         );
         let dimension = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
         assert_eq!(
-            input.gather(&dimension, &operation),
+            input.gather(&dimension, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
         assert_eq!(
-            dimension.gather(&indices, &operation),
+            dimension.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
 
@@ -2936,7 +3256,9 @@ mod tests {
         let staged_indices = context.lift(indices).unwrap();
         let projected_input = ValueProjection::<ArrayType>::into_projected(staged_input).unwrap();
         let projected_indices = ValueProjection::<ArrayType>::into_projected(staged_indices).unwrap();
-        let output = projected_input.gather(&projected_indices, &operation).unwrap();
+        let output = projected_input
+            .gather(&projected_indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+            .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::I32, [2]));
     }
 
@@ -2946,18 +3268,42 @@ mod tests {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
             .with_mode(GatherMode::Clip);
         assert_eq!(
-            input.gather(&Array::matrix(2, 1, vec![0_u64, u64::MAX]).unwrap(), &operation),
+            input.gather(
+                &Array::matrix(2, 1, vec![0_u64, u64::MAX]).unwrap(),
+                operation.dimensions(),
+                operation.slice_sizes(),
+                operation.options(),
+            ),
             Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
         );
         assert_eq!(
-            input.gather(&Array::matrix(2, 1, vec![i64::MIN, i64::MAX]).unwrap(), &operation),
+            input.gather(
+                &Array::matrix(2, 1, vec![i64::MIN, i64::MAX]).unwrap(),
+                operation.dimensions(),
+                operation.slice_sizes(),
+                operation.options(),
+            ),
             Array::matrix(2, 2, vec![10_i32, 20, 30, 40]),
         );
 
         // Adding a window offset to an invalid maximal start must not overflow before the query is filled.
         let operation = operation.with_mode(GatherMode::Fill { value: None });
-        let signed = input.gather(&Array::matrix(1, 1, vec![i64::MAX]).unwrap(), &operation).unwrap();
-        let unsigned = input.gather(&Array::matrix(1, 1, vec![u64::MAX]).unwrap(), &operation).unwrap();
+        let signed = input
+            .gather(
+                &Array::matrix(1, 1, vec![i64::MAX]).unwrap(),
+                operation.dimensions(),
+                operation.slice_sizes(),
+                operation.options(),
+            )
+            .unwrap();
+        let unsigned = input
+            .gather(
+                &Array::matrix(1, 1, vec![u64::MAX]).unwrap(),
+                operation.dimensions(),
+                operation.slice_sizes(),
+                operation.options(),
+            )
+            .unwrap();
         assert_eq!(signed, unsigned);
         assert_eq!(signed, Array::matrix(1, 2, vec![i32::MIN, i32::MIN]).unwrap());
     }
@@ -2968,7 +3314,9 @@ mod tests {
         let input = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let indices = Array::matrix(2, 1, vec![2i64, 0]).unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let gathered = input.gather(&indices, &operation).unwrap();
+        let gathered = input
+            .gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+            .unwrap();
         assert_eq!(gathered.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
         assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
 
@@ -2978,7 +3326,7 @@ mod tests {
         let indices = Array::matrix(1, 1, vec![1i64]).unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
         assert_eq!(
-            input.gather(&indices, &operation),
+            input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80]),
         );
 
@@ -2994,7 +3342,9 @@ mod tests {
                 .unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
             .with_mode(GatherMode::Fill { value: None });
-        let gathered = input.gather(&indices, &operation).unwrap();
+        let gathered = input
+            .gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+            .unwrap();
         assert_eq!(gathered.elements::<u16>(), Ok(vec![30, u16::MAX, 20]));
         assert_eq!(gathered.storage_bytes(), [30, 0, 255, 255, 20, 0]);
     }
@@ -3305,7 +3655,9 @@ mod tests {
         let (output_type, empty_program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |(input, indices)| {
                 batch(
-                    |(input, indices)| input.gather(&indices, &operation),
+                    |(input, indices)| {
+                        input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+                    },
                     (input, indices),
                     (BatchAxis::new(0), BatchAxis::new(0)),
                     BatchAxis::new(0),
@@ -3336,7 +3688,9 @@ mod tests {
         let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |(input, indices)| {
                 batch(
-                    |(input, indices)| input.gather(&indices, &operation),
+                    |(input, indices)| {
+                        input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+                    },
                     (input, indices),
                     (BatchAxis::new(1), BatchAxis::new(1)),
                     BatchAxis::new(0),
@@ -3383,7 +3737,7 @@ mod tests {
         let jacobian = differentiate_at(Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap())
             .jacobian_forward(|input| {
                 let indices = input.dispatch_domain().lift(Array::matrix(2, 1, vec![0_i32, 2]).unwrap())?;
-                input.gather(&indices, &operation)
+                input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
             })
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -3406,7 +3760,7 @@ mod tests {
         let jacobian = differentiate_at(Array::vector(vec![10_f64, 20.]).unwrap())
             .jacobian_forward(|input| {
                 let indices = input.dispatch_domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
-                input.gather(&indices, &filling)
+                input.gather(&indices, filling.dimensions(), filling.slice_sizes(), filling.options())
             })
             .unwrap();
         assert_eq!(jacobian.iter_blocks().next().unwrap().value().elements::<f64>(), Ok(vec![0., 0., 0., 1., 0., 0.]),);
@@ -3415,7 +3769,12 @@ mod tests {
         let jacobian = differentiate_at(Array::vector(vec![10_f64, 20.]).unwrap())
             .jacobian_forward(|input| {
                 let indices = input.dispatch_domain().lift(Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap())?;
-                input.gather(&indices, &explicitly_filling)
+                input.gather(
+                    &indices,
+                    explicitly_filling.dimensions(),
+                    explicitly_filling.slice_sizes(),
+                    explicitly_filling.options(),
+                )
             })
             .unwrap();
         assert_eq!(jacobian.iter_blocks().next().unwrap().value().elements::<f64>(), Ok(vec![0., 0., 0., 1., 0., 0.]),);

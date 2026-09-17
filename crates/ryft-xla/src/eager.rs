@@ -300,9 +300,9 @@ mod tests {
         ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
         CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
         DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
+        GatherOptions, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
         OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
-        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding,
         ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
         UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
@@ -1259,10 +1259,18 @@ mod tests {
             values_to_bytes(&[num_complex::Complex::new(1.0f32, 9.0)]).as_slice(),
         )
         .unwrap();
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Max);
         assert_eq!(
-            read_c64s(&complex.scatter(&indices, &updates, &operation).unwrap()),
+            read_c64s(
+                &complex
+                    .scatter(
+                        &indices,
+                        &updates,
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Max,
+                        &ScatterOptions::default(),
+                    )
+                    .unwrap(),
+            ),
             vec![
                 num_complex::Complex::new(1.0, 9.0),
                 num_complex::Complex::new(2.0, -3.0),
@@ -2270,7 +2278,9 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
+                            &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                            kind,
+                            &ScatterOptions::default(),
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
@@ -2292,10 +2302,9 @@ mod tests {
                     .scatter(
                         &indices,
                         &updates,
-                        &ScatterOperation::new(
-                            ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                            ScatterReductionKind::Overwrite,
-                        ),
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Overwrite,
+                        &ScatterOptions::default(),
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
@@ -2319,8 +2328,8 @@ mod tests {
             &values_to_bytes(&[-1_i32, 1, 1, 3]),
         )
         .unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
-            .with_mode(GatherMode::Fill { value: Some(CpuArray::scalar(7_f32).unwrap()) });
+        let options = GatherOptions::default()
+            .with_mode(GatherMode::Fill { value: Some(Box::new(CpuArray::scalar(7_f32).unwrap())) });
 
         // Out-of-bounds fill contributes to the primal, but never to an input cotangent. Repeated valid indices
         // accumulate their cotangents through the inverse scatter on the selected execution device.
@@ -2328,7 +2337,10 @@ mod tests {
             .with_captures(indices)
             .in_context(&input.execution_domain())
             .value_and_gradient(|input, indices| {
-                input.gather(&indices, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
+                input
+                    .gather(&indices, &GatherDimensionNumbers::new(vec![], vec![0], vec![0]), &[1], &options)
+                    .unwrap()
+                    .reduce(&[0], ReductionKind::Sum)
             })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![54.0]);
