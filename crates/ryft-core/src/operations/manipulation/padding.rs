@@ -143,11 +143,24 @@ impl<T: Type> PadOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl PadOperation<ArrayIrType> {
-    /// Validates an input signature and removes the assertion effect when types alone prove every output extent.
-    /// A refined payload rejects subsequent signatures that would require a runtime assertion.
+    /// Returns this [`PadOperation`] with its runtime output-extent assertion requirement recomputed from the provided
+    /// input types. The complete mixed signature is validated before determining whether the supplied output dimensions
+    /// are guaranteed to equal the extents produced by this operation's padding configuration.
+    ///
+    /// If that equality can be proved for every axis, the returned operation is effect-free. Otherwise, it retains
+    /// [`EffectClass::OrderedAssertion`] so execution checks the supplied extents. For example, an input axis of size
+    /// `3`, edge padding `1` on both sides, and no interior padding proves an output extent of `5`. A dynamic output
+    /// dimension whose bounds merely include `5` still requires a runtime check.
+    ///
+    /// An effect-free operation rejects subsequent type inference requests that require a runtime assertion, rather
+    /// than silently changing its effects. Calling this function again explicitly recomputes the requirement for a
+    /// different signature and can restore the assertion. The padding configuration itself is unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Complete mixed input signature that contains the input array type, scalar padding value type,
+    ///     and one [`DimensionType`] wrapped in [`ArrayIrType`] per output axis, in axis order.
     pub fn with_input_types(mut self, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
         self.requires_runtime_assertion = true;
         self.infer_output_types(input_types, &[])?;
@@ -157,12 +170,35 @@ impl PadOperation<ArrayIrType> {
         Ok(self)
     }
 
-    /// Returns whether execution must validate the supplied output extents against the padded input geometry.
+    /// Returns whether execution must check that each explicit output-extent input equals the size computed from
+    /// the corresponding input axis and this operation's edge and interior padding amounts. A mismatch is an error;
+    /// the supplied extent cannot override the padding geometry or request additional cropping.
+    ///
+    /// When `true`, the operation carries [`EffectClass::OrderedAssertion`], making the check an observable effect
+    /// even when the padded output is unused. This is the conservative initial state, not a claim that the extents
+    /// are invalid. [`Self::with_input_types`] sets the flag to `false` when the input types prove every extent
+    /// equality, allowing the operation to be effect-free. Such an operation rejects input signatures that would
+    /// require a runtime check unless it is explicitly refined again with [`Self::with_input_types`].
     pub fn requires_runtime_assertion(&self) -> bool {
         self.requires_runtime_assertion
     }
 
-    /// Checks extent equality from an already validated signature without evaluating dimension inputs.
+    /// Returns whether the input type and supplied output dimensions prove the padding extent equation on every
+    /// axis, without evaluating runtime dimension inputs. An axis is proved either by computing its output extent
+    /// from known sizes or by preserving an identical input/output dimension when the low and high edge amounts sum
+    /// to zero and interior padding contributes nothing. The latter includes axes whose bounds permit only zero or
+    /// one input element. Preserving an extent does not imply preserving the elements: cropping one edge and padding
+    /// the other can leave the axis size unchanged while moving its contents.
+    ///
+    /// Returns `false` when these checks cannot prove an axis, including when bounds overlap but do not establish
+    /// equality. Errors encountered while computing a concrete padded extent are propagated. The caller must first
+    /// validate the signature, including that all padding vectors and `output_dimensions` have one entry per input
+    /// axis; this function does not repeat those checks.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input`: Validated input array type whose dimensions provide the input sizes or symbolic identities.
+    ///   - `output_dimensions`: Dimensions extracted from the explicit output-extent input types, in axis order.
     fn has_proven_output_extents(&self, input: &ArrayType, output_dimensions: &[Dimension]) -> Result<bool, TypeError> {
         for (axis, (input_dimension, output_dimension)) in
             input.shape().dimensions().iter().zip(output_dimensions).enumerate()
@@ -190,19 +226,22 @@ impl PadOperation<ArrayIrType> {
     }
 }
 
-impl From<PadOperation<ArrayType>> for PadOperation<ArrayIrType> {
+impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayIrOperation<A> {
+    #[inline]
     fn from(operation: PadOperation<ArrayType>) -> Self {
-        Self {
-            edge_padding_low: operation.edge_padding_low,
-            edge_padding_high: operation.edge_padding_high,
-            interior_padding: operation.interior_padding,
-            requires_runtime_assertion: true,
-            marker: PhantomData,
-        }
+        Self::Pad(operation.into())
+    }
+}
+
+impl<T: Type> Display for PadOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
     }
 }
 
 impl From<PadOperation<ArrayIrType>> for PadOperation<ArrayType> {
+    #[inline]
     fn from(operation: PadOperation<ArrayIrType>) -> Self {
         Self {
             edge_padding_low: operation.edge_padding_low,
@@ -214,16 +253,16 @@ impl From<PadOperation<ArrayIrType>> for PadOperation<ArrayType> {
     }
 }
 
-impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayIrOperation<A> {
+impl From<PadOperation<ArrayType>> for PadOperation<ArrayIrType> {
     #[inline]
     fn from(operation: PadOperation<ArrayType>) -> Self {
-        Self::Pad(operation.into())
-    }
-}
-
-impl<T: Type> Display for PadOperation<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        Self {
+            edge_padding_low: operation.edge_padding_low,
+            edge_padding_high: operation.edge_padding_high,
+            interior_padding: operation.interior_padding,
+            requires_runtime_assertion: true,
+            marker: PhantomData,
+        }
     }
 }
 
@@ -254,6 +293,7 @@ impl Operation for PadOperation<ArrayType> {
         }
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         self.render(formatter, indentation)
     }
@@ -276,16 +316,19 @@ impl Operation for PadOperation<ArrayIrType> {
         if input_types.len() < 2 {
             return Err(TypeError::invalid(format!("expected at least 2 inputs but got {}", input_types.len())));
         }
+
         let input = <&ArrayType>::try_from(&input_types[0])?;
         let padding_value = <&ArrayType>::try_from(&input_types[1])?;
         let expected_input_count = input.rank() + 2;
         if input_types.len() != expected_input_count {
             return Err(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` expects an input, a padding value, and one output extent per axis \
-                 ({expected_input_count} inputs total) but got {}",
+                "`{}` expects an input, a padding value, and one output extent per axis ({} inputs total) but got {}",
+                PAD_OPERATION_NAME,
+                expected_input_count,
                 input_types.len(),
             )));
         }
+
         validate_pad_inputs(
             input,
             padding_value,
@@ -297,6 +340,7 @@ impl Operation for PadOperation<ArrayIrType> {
             ProgramError::Type(error) => error,
             error => TypeError::invalid(error.to_string()),
         })?;
+
         let output_dimensions = ArrayIrType::extents(&input_types[2..])?;
         if !self.requires_runtime_assertion && !self.has_proven_output_extents(input, &output_dimensions)? {
             return Err(TypeError::invalid(format!(
@@ -343,10 +387,11 @@ impl Operation for PadOperation<ArrayIrType> {
             {
                 return Err(TypeError::invalid(format!(
                     "`{PAD_OPERATION_NAME}` output bounds {output_bounds} on axis {axis} cannot contain a padded \
-                    extent derived from input bounds {input_bounds}",
+                     extent derived from input bounds {input_bounds}",
                 )));
             }
         }
+
         pad_output_type(
             input,
             padding_value,
@@ -371,6 +416,7 @@ impl Operation for PadOperation<ArrayIrType> {
         }))
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         self.render(formatter, indentation)
     }
@@ -379,6 +425,7 @@ impl Operation for PadOperation<ArrayIrType> {
 impl_reference_dischargeable_operation!(@reference_free <T> PadOperation<T> where T: Type);
 
 impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation<ArrayType> {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -396,6 +443,7 @@ impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadO
 }
 
 impl<C: Domain<Type = ArrayIrType, Value: DynamicPad>> InterpretableOperation<C> for PadOperation<ArrayIrType> {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -420,16 +468,10 @@ where
 {
 }
 
-// Batching rule for [`PadOperation`].
-//
-// A batched input with a replicated padding value keeps its batch axis by padding it with zero amounts: the lifted
-// operation inserts `0` into all three padding vectors at the batch axis position. A batch-varying (batched) padding
-// value is vectorized with a constant-size mask construction: pad the input with a representable placeholder, pad an
-// all-true input mask with false, broadcast the per-item padding values over the padded result, and select those values
-// at padding positions.
-impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for PadOperation<ArrayType>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for PadOperation<ArrayType>
 where
-    C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
+    C: Zero<C::Value> + One<C::Value>,
     C::Value: Broadcast + Pad + Select + Transpose,
     PadOperation<ArrayType>: InterpretableOperation<C>,
 {
@@ -439,7 +481,13 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // A batched input with a replicated padding value keeps its batch axis by padding it with zero amounts (i.e.,
+        // the lifted operation inserts `0` into all three padding vectors at the batch axis position). A batch-varying
+        // (i.e., batched) padding value is vectorized with a constant-size mask construction (i.e., pad the input with
+        // a representable placeholder, pad an all-true input mask with false, broadcast the per-item padding values
+        // over the padded result, and select those values at padding positions).
         check_count!("input", inputs, 2, ProgramError);
+
         // Validate the padding contract first so that the ragged-axis check indexes the amounts with a known arity,
         // and reject unsupported ragged geometry before ordinary shape inference, which cannot express a changed
         // ragged extent. The amounts are indexed physically after inserting the mapped batch axis, and the lifted
@@ -465,6 +513,7 @@ where
             &edge_padding_high,
             &interior_padding,
         )?;
+
         self.infer_output_types(&inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
         if inputs[1].batch_axis_position().is_none() {
             let Some(batch_axis) = inputs[0].batch_axis_position() else {
@@ -476,6 +525,7 @@ where
                 lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?;
             return Ok(vec![outputs.remove(0).with_ragged_axes(ragged_axes)?].into());
         }
+
         // A replicated input is aligned to a batch axis at position zero, so its amounts are lifted there as well.
         let batch_axis = inputs[0].batch_axis_position().unwrap_or(0);
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
@@ -514,14 +564,11 @@ where
     }
 }
 
-// Batching rule for mixed [`PadOperation<ArrayIrType>`] instructions. Explicit result extents remain replicated. When
-// the scalar padding value varies across the batch, the rule pads with a representable placeholder and uses a padded
-// mask to select the broadcast per-item padding value without changing `pad`'s scalar input contract.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for PadOperation<ArrayIrType>
 where
+    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -540,23 +587,32 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // Explicit result extents remain replicated. When the scalar padding value varies across the batch, the rule
+        // pads with a representable placeholder and uses a padded mask to select the broadcast per-item padding value
+        // without changing `pad`'s scalar input contract.
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
+
         self.infer_output_types(&inputs.iter().map(ArrayIrBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
+
         let (array_inputs, output_extents) = inputs.split_at(2);
         let [input, padding_value] = array_inputs else {
             unreachable!();
         };
+
         <&ArrayType>::try_from(&input.unbatched_type())?;
         <&ArrayType>::try_from(&padding_value.unbatched_type())?;
+
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
         }
+
         let padding_value_batch = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(padding_value.value().clone())?,
             padding_value.batch_axis(),
         )?;
+
         let Some(batch_axis) = input
             .batch_axis_position()
             .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
@@ -605,6 +661,7 @@ where
             lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value()));
             lifted_inputs.push(padding_value.value().clone());
             lifted_inputs.extend(lifted_output_extents);
+
             // The lifted payload is rebuilt through the conservative homogeneous-to-mixed conversion, so recompute
             // its proof against the actual batched signature to keep a proven pad effect-free.
             let operation = operation
@@ -630,6 +687,7 @@ where
         padded_inputs.push(input.clone());
         padded_inputs.push(placeholder_padding);
         padded_inputs.extend(lifted_output_extents.iter().cloned());
+
         // Both pads of the decomposition share the lifted geometry, so one proof recomputation covers them.
         let operation = operation
             .with_input_types(&padded_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
@@ -708,8 +766,8 @@ impl_differentiable_operation! {
         C::Value: Pad,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for [`PadOperation`]: `pad` is linear in both the input and the padding value, so the
-            // tangent pads the input tangent with the padding-value tangent using the same padding amounts.
+            // `pad` is linear in both the input and the padding value, so the tangent pads the input tangent with the
+            // padding value tangent using the same padding amounts.
             check_count!("input", inputs, 2, ProgramError);
             let primal = inputs[0].primal().pad(
                 inputs[1].primal(),
@@ -717,6 +775,7 @@ impl_differentiable_operation! {
                 operation.edge_padding_high(),
                 operation.interior_padding(),
             )?;
+
             // The pad needs both the input and padding-value tangents as real values, so materialize every structurally
             // zero side. The shared all-zero fast path normally short-circuits the case where both are zero; a direct
             // rule call with two structural zeros simply pads a materialized zero with a materialized zero.
@@ -744,22 +803,20 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose (vector-Jacobian product) for a [`PadOperation`].
-            //
             // The forward map `(t, p) ↦ pad(t, p, low, high, interior)` writes input element `i` to output position
             // `low + i * (interior + 1)` along each axis and the padding value everywhere else, so its pullback splits
             // the output cotangent into two contributions:
             //
-            //   - **Input cotangent**: slice the surviving input positions with stride `interior + 1`, then insert
+            //   - **Input Cotangent:** Slice the surviving input positions with stride `interior + 1`, then insert
             //     zeros at the cropped input positions.
-            //   - **Padding-value cotangent**: pad an all-false input-shaped mask with `true`, select the output
+            //   - **Padding Value Cotangent:** Pad an all-false input-shaped mask with `true`, select the output
             //     cotangent only at those padding positions, and sum the selected tensor. Selection rather than
             //     subtraction keeps non-finite cotangents at input positions from contaminating this contribution.
             //
             // A symbolic-zero output cotangent contributes nothing and is left to the accumulator defaults.
             let contributions = {
-                // The rule stages into the tracing context only, so the transposition context is narrowed once up
-                // front.
+                // The rule stages into the tracing context only, so the transposition context is narrowed
+                // once up front.
                 let context: &mut TracingContext<V, O> = context;
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
@@ -768,6 +825,7 @@ impl_differentiable_operation! {
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                     &[],
                 )?;
+
                 // A structural-zero output cotangent contributes nothing. Untouched accumulators default to structural
                 // zeros when the transposition context collects its cotangents, so nothing is accumulated here.
                 let MaybeZero::Value(cotangent) = &outputs[0] else {
@@ -784,19 +842,19 @@ impl_differentiable_operation! {
                     for axis in 0..target_type.rank() {
                         let input_extent = target_type.dimension(axis).value().ok_or_else(|| {
                             TypeError::invalid(format!(
-                                "`{PAD_OPERATION_NAME}` transpose requires a static input extent on axis {axis}"
+                                "`{PAD_OPERATION_NAME}` transpose requires a static input extent on axis {axis}",
                             ))
                         })? as i128;
                         let output_extent = cotangent.r#type().dimension(axis).value().ok_or_else(|| {
                             TypeError::invalid(format!(
-                                "`{PAD_OPERATION_NAME}` transpose requires a static output extent on axis \
-                                 {axis}"
+                                "`{PAD_OPERATION_NAME}` transpose requires a static output extent on axis {axis}",
                             ))
                         })? as i128;
                         let edge = operation.edge_padding_low[axis] as i128;
                         let stride = operation.interior_padding[axis] as i128 + 1;
-                        // Keep only input indices whose padded coordinates survive cropping. Working in i128
-                        // avoids negating i64::MIN and constructing an enormous intermediate dilated array.
+
+                        // Keep only input indices whose padded coordinates survive cropping. Working in `i128`
+                        // avoids negating `i64::MIN` and constructing an enormous intermediate dilated array.
                         let first = (-edge).div_euclid(stride) + i128::from((-edge).rem_euclid(stride) != 0);
                         let end = (output_extent - edge).div_euclid(stride)
                             + i128::from((output_extent - edge).rem_euclid(stride) != 0);
@@ -806,31 +864,32 @@ impl_differentiable_operation! {
                             empty = true;
                             break;
                         }
+
                         // Surviving coordinates lie inside the static output extent, so they fit `usize`.
                         starts.push(usize::try_from(edge + first * stride).unwrap());
                         limits.push(usize::try_from(edge + (end - 1) * stride + 1).unwrap());
+
                         // With one surviving element, the stride is irrelevant and need not fit usize.
                         strides.push(if end - first == 1 { 1 } else { usize::try_from(stride).unwrap() });
                         low.push(i64::try_from(first).map_err(|_| {
                             TypeError::invalid(format!(
-                                "`{PAD_OPERATION_NAME}` transpose low padding exceeds `i64` on axis {axis}"
+                                "`{PAD_OPERATION_NAME}` transpose low padding exceeds `i64` on axis {axis}",
                             ))
                         })?);
                         high.push(i64::try_from(input_extent - end).map_err(|_| {
                             TypeError::invalid(format!(
-                                "`{PAD_OPERATION_NAME}` transpose high padding exceeds `i64` on axis {axis}"
+                                "`{PAD_OPERATION_NAME}` transpose high padding exceeds `i64` on axis {axis}",
                             ))
                         })?);
                     }
+
                     if empty {
                         MaybeZero::Zero(target_type)
                     } else {
                         let slice = SliceOperation::new(starts, limits).with_strides(strides)?;
-                        let mut sliced =
-                            context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
+                        let mut sliced = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
                         check_count!("output", sliced, 1, ProgramError);
-                        let zero = MaybeZero::Zero(cotangent.r#type().scalar_like()?)
-                            .materialize(context)?;
+                        let zero = MaybeZero::Zero(cotangent.r#type().scalar_like()?).materialize(context)?;
                         let mut padded = context.stage_operation(
                             PadOperation::new(low, high, vec![0; target_type.rank()])?,
                             Vec::new(),
@@ -842,6 +901,7 @@ impl_differentiable_operation! {
                 } else {
                     MaybeZero::Zero(inputs[0].r#type().cotangent()?)
                 };
+
                 let padding_value_cotangent = if inputs[1].is_unknown() {
                     let mask_input_type =
                         inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
@@ -879,8 +939,10 @@ impl_differentiable_operation! {
                 } else {
                     MaybeZero::Zero(inputs[1].r#type().cotangent()?)
                 };
+
                 vec![input_cotangent, padding_value_cotangent]
             };
+
             check_count!("input", contributions, accumulators.len(), ProgramError);
             for (accumulator, contribution) in accumulators.iter().zip(contributions) {
                 accumulator.accumulate(context, contribution)?;
@@ -915,10 +977,9 @@ impl_differentiable_operation! {
         ProjectedValue<ArrayType, Tracer<NestedTracingContext<C>>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for mixed pad. The explicit output extents are ordinary non-differentiated shape
-            // values. Exact input geometry replays the mixed pad directly; dynamic geometry retains the exact input
-            // shape and output extents so the linear transpose can reconstruct both the input and padding-value
-            // cotangents.
+            // The explicit output extents are ordinary non-differentiated shape values. Exact input geometry replays
+            // the mixed pad directly; dynamic geometry retains the exact input shape and output extents so the linear
+            // transpose can reconstruct both the input and padding value cotangents.
             let destinations = context;
             if inputs.len() < 2 {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
@@ -992,7 +1053,6 @@ impl_differentiable_operation! {
                             let transpose_context = output_cotangents[0].dispatch_domain();
                             let output_cotangent = output_cotangents[0].clone();
                             let input_extents = operand_shape.dimensions(&transpose_context, residuals)?;
-
                             let all_cropped = transpose_operand_type.shape().dimensions().iter().enumerate().any(
                                 |(axis, dimension)| {
                                     dimension.bounds().upper().is_some_and(|upper| {
@@ -1098,7 +1158,6 @@ impl_differentiable_operation! {
                                     check_count!("output", dilated_extent, 1, ProgramError);
                                     dilated_extents.push(dilated_extent.remove(0));
                                 }
-
                                 let inverse_low = transpose_operation
                                     .edge_padding_low()
                                     .iter()
@@ -1125,6 +1184,7 @@ impl_differentiable_operation! {
                                         })
                                     })
                                     .collect::<Result<Vec<_>, _>>()?;
+
                                 let mut zero = transpose_context.bind(
                                     <C::Operation as OperationProjection<ArrayType>>::Projected::from(
                                         ZeroOperation::new(transpose_padding_type.clone()),
@@ -1136,6 +1196,7 @@ impl_differentiable_operation! {
                                 let zero = zero.remove(0);
                                 let mut inverse_inputs = vec![output_cotangent.clone(), zero];
                                 inverse_inputs.extend(dilated_extents);
+
                                 // Recompute the proof against the actual inverse signature: static and unchanged
                                 // axes need no runtime assertion, while derived dilated extents keep one.
                                 let inverse_operation =
@@ -1281,6 +1342,7 @@ impl_differentiable_operation! {
                     MaybeZero::Value(tangent.remove(0))
                 }
             };
+
             Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
@@ -1295,18 +1357,17 @@ impl_differentiable_operation! {
             >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Direct transposition rule for mixed pad. Static input and output geometry delegate to the homogeneous
-            // array pullback, while every explicit output extent receives a structural-zero cotangent. Dynamic geometry
-            // requires linearization so [`DifferentiableOperation::jvp`] can retain the exact primal extents as
-            // residuals.
+            // Static input and output geometry delegate to the homogeneous array pullback, while every explicit
+            // output extent receives a structural-zero cotangent. Dynamic geometry requires linearization so
+            // `DifferentiableOperation::jvp` can retain the exact primal extents as residuals.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-
             if inputs.len() < 2 {
                 return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
             }
             operation
                 .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+
             // A structural-zero output cotangent contributes nothing. Untouched accumulators default to structural
             // zeros when the transposition context collects its cotangents, so nothing is accumulated here.
             if outputs[0].is_zero() {
@@ -1333,6 +1394,7 @@ impl_differentiable_operation! {
             let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
                 PadOperation::<ArrayType>::from(operation.clone()),
             );
+
             // The explicit output extents are shape operands with no cotangent contribution, so their accumulators
             // are left untouched and default to structural zeros.
             transpose_projected_operation(context, &projected_operation, array_inputs, outputs, &accumulators[..2])?;
@@ -1342,9 +1404,9 @@ impl_differentiable_operation! {
 }
 
 /// Represents the ability to add edge and interior padding filled with a scalar value. Negative edge padding crops the
-/// input after interior padding has been inserted. Along each axis, input coordinate `i` moves to
-/// `edge_padding_low + i * (interior_padding + 1)`; coordinates outside the output are discarded, and every remaining
-/// output position not occupied by an input element holds `padding_value`.
+/// input after interior padding has been inserted. Along each axis, input coordinate `i` moves to `edge_padding_low +
+/// i * (interior_padding + 1)`; coordinates outside the output are discarded, and every remaining output position not
+/// occupied by an input element holds `padding_value`.
 ///
 /// For an input extent `d`, the output extent is `d + max(d - 1, 0) * interior_padding + edge_padding_low +
 /// edge_padding_high`. An empty input axis therefore contributes no interior padding. Each resulting extent must be
@@ -1359,8 +1421,8 @@ impl_differentiable_operation! {
 ///
 /// These are the constant-value primitive semantics of StableHLO's [`pad`](https://openxla.org/stablehlo/spec#pad).
 /// Reflection, wrapping, statistical padding, and per-edge values are higher-level operations, not modes of this
-/// primitive. Interior padding is the transpose counterpart of strided [`SliceOperation`]: a stride of `s` corresponds
-/// to inserting `s - 1` padding elements between adjacent input elements.
+/// primitive. Note that interior padding is the transpose counterpart of a strided [`SliceOperation`] as a stride
+/// of `s` corresponds to inserting `s - 1` padding elements between adjacent input elements.
 ///
 /// # Example
 ///
@@ -1398,6 +1460,8 @@ pub trait Pad: Sized {
         edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError>;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Pads using one `(low, high, interior)` tuple per input axis. This is equivalent to [`Self::pad`], with the three
     /// configuration slices assembled from those tuples. Negative edge amounts crop after interior padding; interior
@@ -1562,8 +1626,7 @@ impl Pad for Array {
 
 impl<V: Value<Type = ArrayType>> Pad for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<PadOperation<ArrayType>>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
 {
     fn pad(
         &self,
@@ -1717,57 +1780,6 @@ where
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
-}
-
-/// Preserves ragged geometry only when padding leaves its data and extent-index axes unchanged.
-fn validate_padding_ragged_axes<V: Value>(
-    ragged_axes: &[RaggedAxis<V>],
-    edge_padding_low: &[i64],
-    edge_padding_high: &[i64],
-    interior_padding: &[usize],
-) -> Result<Vec<RaggedAxis<V>>, BatchingError> {
-    for ragged_axis in ragged_axes {
-        for axis in std::iter::once(ragged_axis.axis()).chain(ragged_axis.extent_axes().iter().copied()) {
-            let (Some(low), Some(high), Some(interior)) =
-                (edge_padding_low.get(axis), edge_padding_high.get(axis), interior_padding.get(axis))
-            else {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!(
-                        "`{PAD_OPERATION_NAME}` batching found ragged axis {axis} outside the padded rank {}",
-                        edge_padding_low.len(),
-                    ),
-                });
-            };
-            if *low != 0 || *high != 0 || *interior != 0 {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents"
-                    ),
-                }
-                .into());
-            }
-        }
-    }
-    Ok(ragged_axes.to_vec())
-}
-
-/// Returns whether this padding geometry leaves every possible element and its position unchanged.
-fn is_effective_identity(
-    input_type: &ArrayType,
-    edge_padding_low: &[i64],
-    edge_padding_high: &[i64],
-    interior_padding: &[usize],
-) -> bool {
-    edge_padding_low.iter().all(|padding| *padding == 0)
-        && edge_padding_high.iter().all(|padding| *padding == 0)
-        && input_type.shape().dimensions().iter().zip(interior_padding).all(|(dimension, padding)| {
-            *padding == 0
-                || matches!(dimension, Dimension::Static(0 | 1))
-                || matches!(
-                    dimension,
-                    Dimension::Dynamic(variable) if variable.bounds().upper().is_some_and(|upper| upper <= 2)
-                )
-        })
 }
 
 /// Validates the input types and padding-vector arity shared by both padding type contracts.
@@ -1973,6 +1985,63 @@ fn pad_output_type(
         .with_memory(input.memory())
         .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output type is invalid: {error}")).into())
+}
+
+/// Returns whether the provided padding geometry leaves every possible element and its position unchanged
+/// for the provided input [`ArrayType`].
+fn is_effective_identity(
+    input_type: &ArrayType,
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_padding: &[usize],
+) -> bool {
+    edge_padding_low.iter().all(|padding| *padding == 0)
+        && edge_padding_high.iter().all(|padding| *padding == 0)
+        && input_type.shape().dimensions().iter().zip(interior_padding).all(|(dimension, padding)| {
+            *padding == 0
+                || matches!(dimension, Dimension::Static(0 | 1))
+                || matches!(
+                    dimension,
+                    Dimension::Dynamic(variable) if variable.bounds().upper().is_some_and(|upper| upper <= 2),
+                )
+        })
+}
+
+/// Validates that padding can preserve the existing [`RaggedAxis`] metadata without updating its extent values or
+/// their indexing. Each ragged data axis and every axis indexing its extents must have zero low, high, and interior
+/// padding; other axes may be padded normally. The function rejects axes outside the padding vectors and unsupported
+/// changes to ragged geometry, otherwise returning a clone of the unchanged metadata for the batching rule to retain.
+fn validate_padding_ragged_axes<V: Value>(
+    ragged_axes: &[RaggedAxis<V>],
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_padding: &[usize],
+) -> Result<Vec<RaggedAxis<V>>, BatchingError> {
+    for ragged_axis in ragged_axes {
+        for axis in std::iter::once(ragged_axis.axis()).chain(ragged_axis.extent_axes().iter().copied()) {
+            let (Some(low), Some(high), Some(interior)) =
+                (edge_padding_low.get(axis), edge_padding_high.get(axis), interior_padding.get(axis))
+            else {
+                return Err(BatchingError::InvalidBatchMetadata {
+                    message: format!(
+                        "`{}` batching found ragged axis {} outside the padded rank {}",
+                        PAD_OPERATION_NAME,
+                        axis,
+                        edge_padding_low.len(),
+                    ),
+                });
+            };
+            if *low != 0 || *high != 0 || *interior != 0 {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents",
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(ragged_axes.to_vec())
 }
 
 #[cfg(test)]
