@@ -1006,10 +1006,10 @@ where
 /// | `offset_dimensions`          | Output        | Positions of retained window axes.               |
 /// | `batching_dimensions`        | Input/Indices | Pairs linking input axes to matching query axes. |
 ///
-/// [`GatherDimensionNumbers`] holds the mappings; the `slice_sizes` argument holds the window sizes. For each
-/// query, `start_index_map[j]` says which input axis receives index-vector component `j`. For example, `[1, 0]`
-/// interprets a vector `[column, row]` as a start in a matrix. Input axes absent from this map start at zero, except
-/// paired batching axes, whose coordinates come from the query itself.
+/// [`GatherDimensionNumbers`] holds the mappings and the `slice_sizes` argument holds the window sizes. For each query,
+/// `start_index_map[j]` says which input axis receives index-vector component `j`. For example, `[1, 0]` interprets a
+/// vector `[column, row]` as a start in a matrix. Input axes absent from this map start at zero, except paired batching
+/// axes, whose coordinates come from the query itself.
 ///
 /// After extracting a window, remove its collapsed and paired batching axes. Place the retained window axes, still
 /// in input-axis order, at `offset_dimensions`. Fill all remaining output positions with the query axes, still in
@@ -1032,11 +1032,11 @@ where
 /// | `Clip`            | Moves the start to `3`, producing `[3, 4]`.                                |
 /// | `Fill { value }`  | Fills the whole window, for example `[-1, -1]` with an explicit `-1` fill. |
 ///
-/// [`GatherMode::Fill`] owns an optional boxed constant scalar of the input element data type. Wrap an explicit value
-/// in [`Box::new`] and set the mode with [`GatherOptions::with_mode`]. Without a value, fill uses NaN for
-/// floating-point and complex values, the minimum signed integer, the maximum unsigned integer, or `true` for Booleans.
-/// Other modes carry no fill value. The mode never changes the output shape. Clipping shifts a whole window, and
-/// filling replaces a whole window, rather than preserving its in-bounds portion.
+/// [`GatherMode::Fill`] owns an optional boxed constant scalar of the input element data type. Set the mode with
+/// [`GatherOptions::with_mode`]. Without a value, the fill mode uses NaN for floating-point and complex values, the
+/// minimum signed integer, the maximum unsigned integer, or `true` for Booleans. Other modes carry no fill value. The
+/// mode never changes the output shape. Clipping shifts a whole window, and filling replaces a whole window, rather
+/// than preserving its in-bounds portion.
 ///
 /// ```rust
 /// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOptions};
@@ -1057,17 +1057,17 @@ where
 /// false unless the index vectors are sorted or the gathered windows do not overlap, respectively. Neither setting
 /// changes the intended result for inputs satisfying the promises.
 ///
-/// [`GatherOptions::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous
-/// placement when gathering partial windows on explicitly sharded axes. It does not change the axis mapping or
-/// numerical result. Input and indices must use compatible meshes; requested placement must preserve reduction and
-/// manual-axis state. Without a request, window axes and query axes infer placement from the input and indices.
-/// Indices cannot carry reduction state. Inputs with reduction state require replicated, invariant indices, and fill
-/// mode is unsupported for unreduced inputs.
+/// [`GatherOptions::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous placement
+/// when gathering partial windows on explicitly sharded axes. It does not change the axis mapping or numerical result.
+/// Input and indices must use compatible meshes; requested placement must preserve reduction and manual-axis state.
+/// Without a request, window axes and query axes infer placement from the input and indices. Indices cannot carry
+/// reduction state. Inputs with reduction state require replicated, invariant indices, and fill mode is unsupported
+/// for unreduced inputs.
 ///
-/// The input and indices must reside in the same memory space. The result keeps the input element data type and
-/// memory placement, and clears explicit physical layout metadata because gathering changes the relationship between
-/// logical axes and storage. Shape and mapping validation occurs when inferring or executing the operation, not merely
-/// when constructing its dimension numbers.
+/// The input and indices must reside in the same memory space. The result keeps the input element data type and memory
+/// placement, and clears explicit physical layout metadata because gathering changes the relationship between logical
+/// axes and storage. Shape and mapping validation occurs when inferring or executing the operation, not merely when
+/// constructing its dimension numbers.
 ///
 /// The `Stored` parameter selects the fill's constant representation independently of `Self`. For example, gathering
 /// a staged tracer still uses an [`Array`] literal for its fill in the built-in operation families; it does not embed
@@ -1082,17 +1082,9 @@ where
 /// selects one row and both columns. Collapsing input axis `0` removes the singleton row axis from each window.
 /// `offset_dimensions = [1]` places the retained column axis at output position `1`, leaving position `0` for queries.
 ///
-/// ```mermaid
-/// flowchart LR
-///   first["Query 0: start vector [0]"] --> row0["Input row 0: [0, 1]"]
-///   second["Query 1: start vector [2]"] --> row2["Input row 2: [4, 5]"]
-///   row0 --> out["Output rows: [0, 1] and [4, 5]"]
-///   row2 --> out
-/// ```
-///
 /// ```rust
-/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
-///
+/// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherOptions};
+/// #
 /// let input = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
