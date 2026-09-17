@@ -1992,9 +1992,9 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
-        ShardingDimension, StridedLayout, i1, i4, u4,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, i1, i4, u4,
     };
     use crate::batching::batch;
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
@@ -2002,12 +2002,11 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargePolicy,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType,
+        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeValue,
+        ReferenceDischargeableOperation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -2227,7 +2226,7 @@ mod tests {
         assert_eq!(complex.im, 0.0);
 
         // Resolving an explicit fill preserves its encoding and validates its shape and element data type.
-        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
+        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_le_bytes().to_vec()).unwrap();
         let options = options.with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
         assert_eq!(options.resolved_fill_value(DataType::F32).unwrap().storage_bytes(), fill.storage_bytes());
         assert_eq!(
@@ -2273,7 +2272,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Every builder sets exactly its own field, and only non-default fields render.
+        // Combining the builders preserves the gather geometry and renders each non-default option.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let configured = operation
             .clone()
@@ -2449,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_type_inference_batched_sharding() {
+    fn test_gather_type_inference_paired_extents() {
         // Specialization can retain an exact nominal dimension on one side of a paired batch while the other is
         // already static. Both descriptions prove the same extent without equating unrelated symbolic dimensions.
         let exact = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(1)).unwrap()));
@@ -2507,44 +2506,6 @@ mod tests {
                  axis 0 differ",
             ))
             .into()),
-        );
-
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-
-        // Input [4, 2] sharded only on the feature axis (axis 1); axis 0 (indexed by the start index) is replicated.
-        let input = ArrayType::new_static(DataType::F32, [4, 2])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
-                    .unwrap(),
-            )
-            .unwrap();
-        let indices = ArrayType::new_static(DataType::I32, [3, 1]);
-        let operation =
-            GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-
-        // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
-        let output = operation.infer_output_types(&[input, indices.clone()], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().unwrap().dimensions(),
-            &[ShardingDimension::Replicated, ShardingDimension::sharded(["y"])],
-        );
-
-        // Sharding the start-indexed input axis over an explicit mesh axis is ambiguous without an output sharding.
-        let input = ArrayType::new_static(DataType::F32, [4, 2])
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            operation.infer_output_types(&[input, indices], &[]),
-            Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` input axis 0 is indexed by the start indices and must be replicated over \
-                 explicit mesh axes; request an explicit output sharding to resolve placement",
-            ))),
         );
     }
 
@@ -3006,85 +2967,117 @@ mod tests {
             ))
             .into()),
         );
-    }
 
-    #[test]
-    fn test_gather_reference_discharge() {
-        // The array universe has no reference-typed spelling, which is valid here because the reference-free rule
-        // only replays ordinary operands and rejects every live reference handle before inspecting its type.
-        #[derive(Copy, Clone, Debug, PartialEq)]
-        struct WholeArray;
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
 
-        #[derive(Copy, Clone, Debug)]
-        struct WholeArrayDischarge;
+        // Input [4, 2] sharded only on the feature axis (axis 1); axis 0 (indexed by the start index) is replicated.
+        let input = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+                    .unwrap(),
+            )
+            .unwrap();
+        let indices = ArrayType::new_static(DataType::I32, [3, 1]);
+        let operation =
+            GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
 
-        impl<C: Domain<Type = ArrayType>> ReferenceDischargePolicy<C> for WholeArrayDischarge {
-            type Referent = ArrayType;
-            type Alias = WholeArray;
-
-            fn storage_alias(_referent: &ArrayType) -> WholeArray {
-                WholeArray
-            }
-
-            fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
-                Ok(current.clone())
-            }
-
-            fn write(
-                _context: &C,
-                _current: &C::Value,
-                replacement: C::Value,
-                _alias: &WholeArray,
-            ) -> Result<C::Value, ProgramError> {
-                Ok(replacement)
-            }
-        }
-
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed gather, and a staging destination records the same operation unchanged.
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let input = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
-        let eager = ReferenceDischargeContext::<EagerContext<Array, GatherOperation>, WholeArrayDischarge>::new(
-            EagerContext::new(),
-        );
-        let inputs = [ReferenceDischargeValue::Value(input.clone()), ReferenceDischargeValue::Value(indices.clone())];
+        // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
+        let output = operation.infer_output_types(&[input, indices.clone()], &[]).unwrap();
         assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap())]),
+            output[0].sharding().unwrap().dimensions(),
+            &[ShardingDimension::Replicated, ShardingDimension::sharded(["y"])],
         );
-        let trace = TracingContext::<Array, GatherOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(indices.r#type().into_owned())),
-        ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
-        assert_eq!(outputs.len(), 1);
-        let ReferenceDischargeValue::Value(output) = &outputs[0] else {
-            panic!("expected a value carrier but got {}", outputs[0]);
-        };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 2]));
-        let builder = trace.builder().borrow();
-        assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
 
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite. The
-        // handle's own rendering is spliced into the expected diagnostic because a top-level environment identity is
-        // minted process-globally and is therefore not stable across runs.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
+        // Sharding the start-indexed input axis over an explicit mesh axis is ambiguous without an output sharding.
+        let input = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
         assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &[reference.clone(), inputs[1].clone()]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{GATHER_OPERATION_NAME}` but received {reference}",
+            operation.infer_output_types(&[input, indices], &[]),
+            Err(TypeError::invalid(format!(
+                "`{GATHER_OPERATION_NAME}` input axis 0 is indexed by the start indices and must be replicated over \
+                 explicit mesh axes; request an explicit output sharding to resolve placement",
             ))),
         );
     }
 
     #[test]
+    fn test_gather_reference_discharge() {
+        // Reference-free replay preserves the complete configured gather payload. Generic replay behavior and
+        // reference rejection are covered by the reference-discharge macro tests.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let expected = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
+            .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(7_f64).unwrap())) })
+            .with_indices_are_sorted(true)
+            .with_unique_indices(true)
+            .with_output_sharding(Sharding::replicated(mesh.clone(), 2));
+        let operation = ArrayIrOperation::Array(ArrayOperation::Gather(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let staging = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
+        let inputs = [
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [3, 2]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::I32, [2, 1]).into())),
+        ];
+        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let ReferenceDischargeValue::Value(output) = &outputs[0] else {
+            panic!("expected a value carrier but got {}", outputs[0]);
+        };
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(
+                ArrayType::new_static(DataType::F64, [2, 2]).with_sharding(Sharding::replicated(mesh, 2)).unwrap(),
+            ),
+        );
+        let builder = trace.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        let ArrayIrOperation::Array(ArrayOperation::Gather(staged)) = builder.instructions()[0].operation() else {
+            panic!("expected a staged gather");
+        };
+        assert_eq!(staged, &expected);
+    }
+
+    #[test]
     fn test_gather_interpretation() {
+        // Index vectors store [column, row], reversing the input axis order. Each query selects a whole 1x2 window.
+        let input = Array::matrix(3, 4, vec![0_i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).unwrap();
+        let indices = Array::matrix(3, 2, vec![1_i32, 2, 0, 0, 2, 1]).unwrap();
+        assert_eq!(
+            input.gather(
+                &indices,
+                &GatherDimensionNumbers::new(vec![1], vec![0], vec![1, 0]),
+                &[1, 2],
+                &GatherOptions::new(),
+            ),
+            Array::matrix(3, 2, vec![9_i32, 10, 0, 1, 6, 7]),
+        );
+
+        // A start inside the input can still define an invalid window. Clip moves the complete window left;
+        // fill replaces both elements, including the one whose coordinate would otherwise be in bounds.
+        let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
+        let indices = Array::matrix(2, 1, vec![2_i32, 3]).unwrap();
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![], vec![0]);
+        assert_eq!(
+            input.gather(&indices, &dimensions, &[2], &GatherOptions::new().with_mode(GatherMode::Clip)),
+            Array::matrix(2, 2, vec![30_i32, 40, 30, 40]),
+        );
+        assert_eq!(
+            input.gather(
+                &indices,
+                &dimensions,
+                &[2],
+                &GatherOptions::new()
+                    .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-99_i32).unwrap())) }),
+            ),
+            Array::matrix(2, 2, vec![30_i32, 40, -99, -99]),
+        );
+
         // Window elements reuse a query, while interleaved output axes revisit queries. Both must reset the
         // whole-window fill decision correctly when moving between in-bounds and out-of-bounds starts.
         let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
@@ -3164,27 +3157,12 @@ mod tests {
                 .as_ref(),
             &ArrayType::new_static(DataType::F32, [2, 2]),
         );
-
-        // Slicing and reshaping change the gather window geometry without changing the element type.
-        let input = Array::from_elements(
-            ArrayType::new_static(DataType::F32, [2, 4]),
-            &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-        )
-        .unwrap();
-        let sliced = input.slice(&[0, 1], &[2, 4], &[1, 1]).unwrap();
-        let windows = sliced.reshape(Shape::new(vec![3.into(), 2.into()])).unwrap();
-        let indices = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[2_i32, 0]).unwrap();
-        let rows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert_eq!(
-            windows.gather(&indices, rows.dimensions(), rows.slice_sizes(), rows.options()),
-            Ok(Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[6.0_f32, 7.0, 1.0, 2.0]).unwrap()),
-        );
     }
 
     #[test]
     fn test_gather_interpretation_fill_encodings() {
         // Explicit NaN payloads survive options cloning and eager filling without numeric conversion.
-        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
+        let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_le_bytes().to_vec()).unwrap();
         let filling = GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
         let input = Array::vector(vec![1.0_f32]).unwrap();
         let out_of_bounds = Array::matrix(1, 1, vec![2_i32]).unwrap();
@@ -3203,7 +3181,7 @@ mod tests {
         // A scalar fill can carry storage placement without changing its logical value.
         let pinned_fill = Array::new(
             ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true }),
-            7.0_f32.to_ne_bytes().to_vec(),
+            7.0_f32.to_le_bytes().to_vec(),
         )
         .unwrap();
         assert_eq!(
@@ -3241,8 +3219,9 @@ mod tests {
         let refilling = clipping.with_mode(GatherMode::Fill { value: None });
         assert_ne!(refilling, filling);
         assert_eq!(refilling.mode(), &GatherMode::Fill { value: None });
-        assert!(
-            input.gather(&out_of_bounds, &dimensions, &[1], &refilling).unwrap().elements::<f32>().unwrap()[0].is_nan()
+        assert_eq!(
+            input.gather(&out_of_bounds, &dimensions, &[1], &refilling).unwrap().storage_bytes(),
+            GatherOptions::new().resolved_fill_value(DataType::F32).unwrap().storage_bytes(),
         );
     }
 
@@ -3342,6 +3321,16 @@ mod tests {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
         assert_eq!(
             input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80]),
+        );
+
+        assert_eq!(
+            input.gather(
+                &Array::matrix(1, 1, vec![9_i64]).unwrap(),
+                operation.dimensions(),
+                operation.slice_sizes(),
+                &operation.options().clone().with_mode(GatherMode::Clip),
+            ),
             Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80]),
         );
 
@@ -4032,9 +4021,25 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![16])))
             .with_memory(Memory::Host { pinned: true });
         let dynamic_placed_type = placed_type.clone().with_shape(Shape::new(vec![Dimension::Dynamic(extent)]));
+        let cotangent = ArrayIrValue::Array(
+            Array::from_elements(
+                ArrayType::new_static(DataType::F64, [2])
+                    .with_memory(Memory::Host { pinned: true })
+                    .with_sharding(Sharding::replicated(mesh.clone(), 1))
+                    .unwrap(),
+                &[10_f64, 20.],
+            )
+            .unwrap(),
+        );
 
         let pullback = placed_take_program(placed_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(placed_type.cotangent().unwrap())]);
+        assert_eq!(
+            pullback.interpret(vec![cotangent.clone()]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(placed_type.cotangent().unwrap(), &[0_f64, 10., 0., 20.]).unwrap(),
+            )]),
+        );
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -4057,6 +4062,12 @@ mod tests {
         let pullback = placed_take_program(sharded_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(sharded_type.cotangent().unwrap())]);
         assert_eq!(
+            pullback.interpret(vec![cotangent.clone()]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(sharded_type.cotangent().unwrap(), &[0_f64, 10., 0., 20.]).unwrap(),
+            )]),
+        );
+        assert_eq!(
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
@@ -4077,6 +4088,20 @@ mod tests {
 
         let pullback = placed_take_program(dynamic_placed_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(dynamic_placed_type.cotangent().unwrap())]);
+        let ArrayIrType::Dimension(extent_type) = &pullback.input_types()[1] else {
+            panic!("expected a retained input extent");
+        };
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![cotangent.clone(), extent]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    dynamic_placed_type.cotangent().unwrap().with_shape(Shape::new(vec![Dimension::Static(4)])),
+                    &[0_f64, 10., 0., 20.]
+                )
+                .unwrap(),
+            )]),
+        );
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -4118,6 +4143,20 @@ mod tests {
         let pullback =
             placed_take_program(dynamic_sharded_type.clone(), &mesh).linearize().unwrap().pullback().unwrap();
         assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(dynamic_sharded_type.cotangent().unwrap())]);
+        let ArrayIrType::Dimension(extent_type) = &pullback.input_types()[1] else {
+            panic!("expected a retained input extent");
+        };
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
+        assert_eq!(
+            pullback.interpret(vec![cotangent.clone(), extent]),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(
+                    dynamic_sharded_type.cotangent().unwrap().with_shape(Shape::new(vec![Dimension::Static(4)])),
+                    &[0_f64, 10., 0., 20.]
+                )
+                .unwrap(),
+            )]),
+        );
         assert_eq!(
             pullback.to_string(),
             indoc! {"
