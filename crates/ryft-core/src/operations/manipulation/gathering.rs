@@ -608,24 +608,22 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 // Differentiation must construct a literal zero in the stored family, independently of the input tracer's domain.
 // Requiring its eager zero capability avoids embedding a live tangent tracer in the operation's constant payload.
 impl_differentiable_operation! {
     <Stored> GatherOperation<Stored>,
     jvp<C>
     where
-        C: Context<Type = ArrayType>,
         Stored: Value<Type = ArrayType>,
-        EagerContext<Stored>: Zero<Stored>,
-        C::Operation: From<GatherOperation<Stored>>,
+        C: Context<Type = ArrayType>,
         C::Value: Gather<Stored>,
+        C::Operation: From<GatherOperation<Stored>>,
+        EagerContext<Stored>: Zero<Stored>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode differentiation gathers the data tangent at the primal indices. The indices and
-            // out-of-bounds fill are constant with respect to the input data, so the tangent uses zero fill. A zero
-            // input tangent stays typed zero.
+            // Forward mode differentiation gathers the data tangent at the primal indices. The indices and
+            // out-of-bounds fill are constant with respect to the input data, so the tangent uses zero fill.
+            // A zero input tangent stays a typed zero.
             check_count!("input", inputs, 2, ProgramError);
             let indices = inputs[1].primal();
             let primal = inputs[0].primal().gather(indices, operation)?;
@@ -655,26 +653,25 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
             + From<ZeroOperation<ArrayType>>
-            + From<ScatterOperation>
-            + From<BroadcastOperation>,
+            + From<BroadcastOperation>
+            + From<ScatterOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index input (input 1) has
-            // no tangent space, so in a valid pushforward it is the known input and the gathered input (input 0) is the
-            // linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that
-            // writes the output cotangent back into a zero input at the gathered windows: the scatter geometry mirrors
-            // the gather axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an
-            // ordinary additive [`ScatterOperation`], so linearization retains the indices as regular SSA residuals.
-            // The indices receive a structural zero, and a zero output cotangent stays a structural zero.
+            // The integer index input (i.e., input 1) has no tangent space, so in a valid pushforward it is the known
+            // input and the gathered input (i.e., input 0) is the linear one. The forward map `t ↦ gather(t, indices)`
+            // has, as its adjoint, the dual scatter-add that writes the output cotangent back into a zero input at the
+            // gathered windows: the scatter geometry mirrors  the gather axis-for-axis. The transpose reads the known
+            // indices from the pullback boundary and stages an ordinary additive `ScatterOperation`, so linearization
+            // retains the indices as regular Single Static Assignment (SSA) residuals. The indices receive a structural
+            // zero, and a zero output cotangent stays a structural zero.
             //
-            // **Contract:** this homogeneous rule requires a statically shaped input. The scatter target is a zero of
-            // the input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no
-            // first-class dimension operations, so it has no constructor that can supply a runtime extent for that
-            // zero. A dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed
-            // [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
-            // [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule below routes a dynamically
-            // shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
-            // transpose region rebuilds the same zero from the retained exact extents.
+            // **Contract:** This homogeneous rule requires a statically shaped input. The scatter target is a zero
+            // of the input's cotangent type, and the homogeneous `ArrayType` operation family owns no first-class
+            // dimension operations, so it has no constructor that can supply a runtime extent for that zero. A
+            // dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed `ArrayIrType`
+            // programs are unaffected: the `MemberDifferentiableOperation` rule below routes a dynamically shaped
+            // gather into a residual-carrying `LinearCallOperation` whose transpose region rebuilds the same zero
+            // from the retained exact extents.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
@@ -684,9 +681,11 @@ impl_differentiable_operation! {
                     if !accumulators[0].is_needed() {
                         return Ok(());
                     }
+
                     // The indices are the known input; the dispatch guarantees a `Known` input carries its pullback
                     // value, so read the tracer directly.
                     let indices = inputs[1].as_known().unwrap().clone();
+
                     // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                     // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
                     let input_cotangent_type = inputs[0].r#type().cotangent()?;
@@ -697,12 +696,14 @@ impl_differentiable_operation! {
                         ))
                         .into());
                     }
+
                     let zeros = MaybeZero::Zero(input_cotangent_type.clone()).materialize(&**context)?;
                     let scatter_operation =
                         operation.adjoint_scatter_operation(input_cotangent_type.sharding().cloned());
                     let outputs =
                         context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
                     check_count!("output", outputs, 1, ProgramError);
+
                     let mut contribution = outputs.into_iter().next().unwrap();
                     if contribution.r#type().as_ref() != &input_cotangent_type {
                         let mut outputs = context.stage_operation(
@@ -716,6 +717,7 @@ impl_differentiable_operation! {
                         check_count!("output", outputs, 1, ProgramError);
                         contribution = outputs.remove(0);
                     }
+
                     accumulators[0].accumulate(context, MaybeZero::Value(contribution))
                 }
             }
@@ -723,21 +725,22 @@ impl_differentiable_operation! {
     },
 }
 
-// Projected array IR JVP rule for [`GatherOperation`]. A dynamically shaped input retains its exact extents
-// and indices as ordinary residual values; a static input delegates to the homogeneous projected rule.
-impl<Stored: Value<Type = ArrayType>, C> MemberDifferentiableOperation<C> for GatherOperation<Stored>
+impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C>
+    for GatherOperation<Stored>
 where
-    C: Context<Type = ArrayIrType>,
-    EagerContext<Stored>: Zero<Stored>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<GatherOperation<Stored>>
-        + From<ScatterOperation>
-        + From<BroadcastOperation>
-        + From<ZeroOperation<ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                           + From<GatherOperation<Stored>>
+                           + From<ScatterOperation>
+                           + From<BroadcastOperation>
+                           + From<ZeroOperation<ArrayType>>,
+        >,
+    EagerContext<Stored>: Zero<Stored>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -745,10 +748,13 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // A dynamically shaped input retains its exact extents and indices as ordinary residual values,
+        // and a static input delegates to the homogeneous projected rule.
         let destinations = context;
         let [input, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
+
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
@@ -761,6 +767,7 @@ where
                 .primal()
                 .bind(operation, Vec::new(), &[input.primal().clone(), indices.primal().clone()])?;
         check_count!("output", primal_outputs, 1, ProgramError);
+
         let output_primal = primal_outputs.remove(0);
         let tangent_primal = destinations.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
@@ -773,6 +780,7 @@ where
                 let mut residuals = LinearResiduals::new();
                 let indices_index = residuals.retain(indices.primal().clone());
                 let input_shape = residuals.retain_shape(tangent_context, input.primal())?;
+
                 // The linear region differentiates input data, not the primal's constant replacement value.
                 let forward_operation = if matches!(self.mode(), GatherMode::Fill { .. }) {
                     self.clone().with_mode(GatherMode::Fill {
@@ -783,6 +791,7 @@ where
                 } else {
                     self.clone()
                 };
+
                 let transpose_operand_type = input_type.cotangent()?;
                 let transpose_operation = self.adjoint_scatter_operation(transpose_operand_type.sharding().cloned());
                 let mut tangent_outputs = LinearCallOperation::stage(
@@ -813,9 +822,10 @@ where
                             &[zeros, residuals[indices_index].clone(), output_cotangents[0].clone()],
                         )?;
                         check_count!("output", contributions, 1, ProgramError);
-                        let contribution = contributions.remove(0);
+
                         // Residual extents may refine singleton dynamic dimensions to static dimensions. Restore
                         // the original cotangent signature, including its dimension identities and storage metadata.
+                        let contribution = contributions.remove(0);
                         let contribution =
                             if <&ArrayType>::try_from(contribution.r#type().as_ref())? != &transpose_operand_type {
                                 let mut outputs = transpose_context.bind(
@@ -833,43 +843,45 @@ where
                             } else {
                                 contribution
                             };
+
                         Ok(vec![contribution])
                     },
                 )?;
+
                 check_count!("output", tangent_outputs, 1, ProgramError);
                 MaybeZero::Value(tangent_outputs.remove(0))
             }
         };
+
         Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 
-/// Reads windows from an array at positions supplied by an integer index array.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Reads "windows" from an array at positions supplied by an integer index array. The receiver is the data source.
+/// The `indices` input describes where each window starts, and a [`GatherOperation`] describes the window sizes, axis
+/// mapping, and out-of-bounds behavior. Gathering can select individual elements, entire rows, or multi-dimensional
+/// blocks; the output contains one window per query. Use [`Self::gather_axis`] for complete slices along one axis
+/// without constructing dimension numbers. Use [`DynamicGather::dynamic_gather_axis`] when query or untouched input
+/// extents must remain dynamic. The general [`Self::gather`] function exposes the mapping below.
 ///
-/// The receiver is the data source. The `indices` input describes where each window starts, and a
-/// [`GatherOperation`] describes the window sizes, axis mapping, and out-of-bounds behavior. Gathering can select
-/// individual elements, entire rows, or multidimensional blocks; the output contains one window per query.
+/// # From Indices to Output Axes
 ///
-/// Use [`Self::gather_axis`] for complete slices along one axis without constructing dimension numbers. Use
-/// [`DynamicGather::dynamic_gather_axis`] when query or untouched input extents must remain dynamic. The general
-/// [`Self::gather`] function exposes the mapping below.
+/// Suppose `indices` has shape `[Q0, Q1, ..., K]`. Every position in `[Q0, Q1, ...]` is a _query_, and its last-axis
+/// vector contains `K` start coordinates. The last axis is always the index-vector axis and it does not appear in the
+/// output. For scalar indices, include a trailing size-one axis as in `[number_of_queries, 1]`, and not
+/// `[number_of_queries]`. A shape `[K]` represents one query with no query axes.
 ///
-/// # From indices to output axes
+/// The following settings describe three distinct coordinate systems (all axis numbers are zero-based):
 ///
-/// Suppose `indices` has shape `[Q0, Q1, ..., K]`. Every position in `[Q0, Q1, ...]` is a **query**, and its last-axis
-/// vector contains `K` start coordinates. The last axis is always the index-vector axis; it does not appear in the
-/// output. For scalar indices, include a trailing size-one axis: `[number_of_queries, 1]`, not `[number_of_queries]`.
-/// A shape `[K]` represents one query with no query axes.
-///
-/// The following settings describe three distinct coordinate systems. All axis numbers are zero-based.
-///
-/// | Setting                      | Axes refer to | Meaning                                          |
+/// | Setting                      | Axes Refer To | Meaning                                          |
 /// | ---------------------------- | ------------- | ------------------------------------------------ |
 /// | `start_index_map`            | Input         | Axis addressed by each index-vector component.   |
 /// | `slice_sizes`                | Input         | Window extent on each input axis.                |
 /// | `collapsed_slice_dimensions` | Input         | Size-one window axes omitted from the output.    |
 /// | `offset_dimensions`          | Output        | Positions of retained window axes.               |
-/// | `batching_dimensions`        | Input/indices | Pairs linking input axes to matching query axes. |
+/// | `batching_dimensions`        | Input/Indices | Pairs linking input axes to matching query axes. |
 ///
 /// [`GatherDimensionNumbers`] holds the mappings; [`GatherOperation::slice_sizes`] holds the window sizes. For each
 /// query, `start_index_map[j]` says which input axis receives index-vector component `j`. For example, `[1, 0]`
@@ -878,27 +890,67 @@ where
 ///
 /// After extracting a window, remove its collapsed and paired batching axes. Place the retained window axes, still
 /// in input-axis order, at `offset_dimensions`. Fill all remaining output positions with the query axes, still in
-/// indices-axis order. Thus `offset_dimensions` interleaves window and query axes; it does not arbitrarily permute
+/// indices-axis order. Thus, `offset_dimensions` interleaves window and query axes; it does not arbitrarily permute
 /// window axes. Its entries must be sorted and distinct, as must the collapsed-axis list.
 ///
 /// The output rank is `offset_dimensions.len() + indices.rank() - 1`. Its window-axis extents come from `slice_sizes`;
 /// its query-axis extents come from `indices`. Collapsed axes must have window size one. Window sizes are static and
 /// must fit the input: for a dynamic input axis, its guaranteed minimum extent must be at least the window size.
 ///
-/// ```mermaid
-/// flowchart TD
-///   indices["Indices shape: query axes followed by index-vector axis"] --> vectors["One start vector per query"]
-///   vectors --> mapping["start_index_map: vector components to input axes"]
-///   input["Input array"] --> windows["Extract windows using slice_sizes and bounds mode"]
-///   mapping --> windows
-///   windows --> retained["Remove collapsed axes and paired input batching axes"]
-///   retained --> offsets["Place retained window axes at offset_dimensions"]
-///   indices --> queries["Place query axes at the remaining output positions"]
-///   offsets --> output["Output array"]
-///   queries --> output
+/// # Bounds Handling and Optional Settings
+///
+/// [`GatherMode`] determines what happens when a start would put any part of a window outside the input. The default
+/// is [`GatherMode::PromiseInBounds`]. Negative starts are out of bounds; they do not count backward from the end.
+/// For input `[0, 1, 2, 3, 4]`, window size `[2]`, and start `[4]`:
+///
+/// | Mode              | Result                                                                     |
+/// | ----------------- | -------------------------------------------------------------------------- |
+/// | `PromiseInBounds` | Violates the caller's promise; no result or gradient behavior is promised. |
+/// | `Clip`            | Moves the start to `3`, producing `[3, 4]`.                                |
+/// | `Fill { value }`  | Fills the whole window, for example `[-1, -1]` with an explicit `-1` fill. |
+///
+/// [`GatherMode::Fill`] owns an optional boxed constant scalar of the input element data type. Wrap an explicit value
+/// in [`Box::new`] and set the mode with [`GatherOperation::with_mode`]. Without a value, fill uses NaN for
+/// floating-point and complex values, the minimum signed integer, the maximum unsigned integer, or `true` for Booleans.
+/// Other modes carry no fill value. The mode never changes the output shape. Clipping shifts a whole window, and
+/// filling replaces a whole window, rather than preserving its in-bounds portion.
+///
+/// ```rust
+/// # use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOperation};
+/// let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
+/// let indices = Array::matrix(1, 1, vec![4_i32]).unwrap();
+/// let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
+///     .with_mode(GatherMode::Fill {
+///         value: Some(Box::new(Array::scalar(-1_i32).unwrap())),
+///     });
+/// assert_eq!(input.gather(&indices, &operation), Ok(Array::matrix(1, 2, vec![-1_i32, -1]).unwrap()));
 /// ```
 ///
-/// # Example: selecting rows and choosing output order
+/// [`GatherOperation::with_indices_are_sorted`] and [`GatherOperation::with_unique_indices`] declare unchecked caller
+/// promises that implementations and transformations may rely on. They do not sort or deduplicate queries. Leave them
+/// false unless the index vectors are sorted or the gathered windows do not overlap, respectively. Neither setting
+/// changes the intended result for inputs satisfying the promises.
+///
+/// [`GatherOperation::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous
+/// placement when gathering partial windows on explicitly sharded axes. It does not change the axis mapping or
+/// numerical result. Input and indices must use compatible meshes; requested placement must preserve reduction and
+/// manual-axis state. Without a request, window axes and query axes infer placement from the input and indices.
+/// Indices cannot carry reduction state. Inputs with reduction state require replicated, invariant indices, and fill
+/// mode is unsupported for unreduced inputs.
+///
+/// The input and indices must reside in the same memory space. The result keeps the input element data type and
+/// memory placement, and clears explicit physical layout metadata because gathering changes the relationship between
+/// logical axes and storage. Shape and mapping validation occurs when inferring or executing the operation, not merely
+/// when constructing its dimension numbers.
+///
+/// The `Stored` parameter selects the fill's constant representation independently of `Self`. For example, gathering
+/// a staged tracer still uses an [`Array`] literal for its fill in the built-in operation families; it does not embed
+/// a tracer in the operation payload. Other operation families can implement this capability for their own stored
+/// values. Fills are validated as scalar constants of the input element data type before execution.
+///
+/// # Examples
+/// 
+/// ## Selecting Rows and Choosing Output Order
 ///
 /// For the matrix below, the query vectors `[0]` and `[2]` select its first and last rows. The window size `[1, 2]`
 /// selects one row and both columns. Collapsing input axis `0` removes the singleton row axis from each window.
@@ -933,7 +985,7 @@ where
 /// );
 /// ```
 ///
-/// # Example: rectangular windows
+/// ## Rectangular Windows
 ///
 /// Collapsing is optional. With two-component indices, `start_index_map = [0, 1]`, and `slice_sizes = [2, 2]`, each
 /// query selects a two-row, two-column block. Keeping both window axes at output positions `[1, 2]` gives shape
@@ -954,7 +1006,7 @@ where
 /// assert_eq!(input.gather(&indices, &operation), Ok(expected));
 /// ```
 ///
-/// # Example: pairing queries with input batch items
+/// ## Pairing Queries with Input Batch Items
 ///
 /// Ordinary query axes all read from the same input. Paired batching instead ties a query coordinate to an input
 /// coordinate: each `(input_axis, indices_axis)` entry of `batching_dimensions` takes the input coordinate from
@@ -976,59 +1028,6 @@ where
 /// let operation = GatherOperation::new(dimensions, vec![1, 1]);
 /// assert_eq!(input.gather(&indices, &operation), Ok(Array::vector(vec![30_i32, 40]).unwrap()));
 /// ```
-///
-/// # Bounds handling and optional settings
-///
-/// [`GatherMode`] determines what happens when a start would put any part of a window outside the input.
-/// The default is [`GatherMode::PromiseInBounds`]. Negative starts are out of bounds; they do not count
-/// backward from the end. For input `[0, 1, 2, 3, 4]`, window
-/// size `[2]`, and start `[4]`:
-///
-/// | Mode              | Result for this query                                                      |
-/// | ----------------- | -------------------------------------------------------------------------- |
-/// | `PromiseInBounds` | Violates the caller's promise; no result or gradient behavior is promised. |
-/// | `Clip`            | Moves the start to `3`, producing `[3, 4]`.                                |
-/// | `Fill { value }`  | Fills the whole window, for example `[-1, -1]` with an explicit `-1` fill. |
-///
-/// [`GatherMode::Fill`] owns an optional boxed constant scalar of the input element data type. Wrap an explicit value
-/// in [`Box::new`] and set the mode with [`GatherOperation::with_mode`]. Without a value, fill uses NaN for
-/// floating-point and complex values, the minimum signed integer, the maximum unsigned integer, or `true`
-/// for Booleans. Other modes carry no fill value. The mode never changes the output shape. Clipping shifts a whole
-/// window; filling replaces a whole window, rather than preserving its in-bounds portion.
-///
-/// ```rust
-/// use ryft_core::{Array, Gather, GatherDimensionNumbers, GatherMode, GatherOperation};
-///
-/// let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
-/// let indices = Array::matrix(1, 1, vec![4_i32]).unwrap();
-/// let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![2])
-///     .with_mode(GatherMode::Fill {
-///         value: Some(Box::new(Array::scalar(-1_i32).unwrap())),
-///     });
-/// assert_eq!(input.gather(&indices, &operation), Ok(Array::matrix(1, 2, vec![-1_i32, -1]).unwrap()));
-/// ```
-///
-/// [`GatherOperation::with_indices_are_sorted`] and [`GatherOperation::with_unique_indices`] declare unchecked caller
-/// promises that implementations and transformations may rely on. They do not sort or deduplicate queries. Leave them
-/// false unless the index vectors are sorted or the gathered windows do not overlap, respectively. Neither setting
-/// changes the intended result for inputs satisfying the promises.
-///
-/// [`GatherOperation::with_output_sharding`] requests output placement, which can resolve otherwise ambiguous
-/// placement when gathering partial windows on explicitly sharded axes. It does not change the axis mapping or
-/// numerical result. Input and indices must use compatible meshes; requested placement must preserve reduction and
-/// manual-axis state. Without a request, window axes and query axes infer placement from the input and indices.
-/// Indices cannot carry reduction state. Inputs with reduction state require replicated, invariant indices, and fill
-/// mode is unsupported for unreduced inputs.
-///
-/// The input and indices must reside in the same memory space. The result keeps the input element data type and
-/// memory placement, and clears explicit physical layout metadata because gathering changes the relationship between
-/// logical axes and storage. Shape and mapping validation occurs when inferring or executing the operation, not merely
-/// when constructing its dimension numbers.
-///
-/// The `Stored` parameter selects the fill's constant representation independently of `Self`. For example, gathering
-/// a staged tracer still uses an [`Array`] literal for its fill in the built-in operation families; it does not embed
-/// a tracer in the operation payload. Other operation families can implement this capability for their own stored
-/// values. Fills are validated as scalar constants of the input element data type before execution.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait Gather<Stored: Value<Type = ArrayType> = Array>: Sized {
     /// Reads windows from the input at the starts given by `indices` and assembles them using `operation`.
