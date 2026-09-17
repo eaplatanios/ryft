@@ -694,7 +694,6 @@ impl Shape {
     /// Returns the number of elements in arrays with this [`Shape`]. A statically zero [`Dimension`] makes the result
     /// exactly zero even when another [`Dimension`] is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
     /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
-    #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         if self.dimensions.contains(&Dimension::Static(0)) {
             return Ok(Some(0));
@@ -711,6 +710,51 @@ impl Shape {
             }
         }
         Ok(Some(count))
+    }
+
+    /// Returns whether this [`Shape`] and `other` _provably_ contain the same number of elements, even when their
+    /// dimensions are dynamic. The proof compares the products of static extents and matches dynamic dimension
+    /// identities with multiplicity, independently of axis order. For example, `[n, 4]` and `[2, n, 2]` have equal
+    /// element counts, whereas `[n, 4]` and `[m, 4]` are not proven equal for independent variables `n` and `m`.
+    ///
+    /// A static zero makes a shape's product zero without multiplying its remaining extents. A scalar has product
+    /// one. Dynamic dimension bounds and relationships between distinct variables are not used to establish equality.
+    /// `Ok(false)` means equality was not proven, not necessarily that the runtime element counts differ. Returns a
+    /// [`TypeError`] if either shape's static coefficient overflows [`usize`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `other`: [`Shape`] whose element count is compared with this [`Shape`]'s element count.
+    pub fn has_equal_element_count(&self, other: &Self) -> Result<bool, TypeError> {
+        let coefficient = |shape: &Shape| {
+            if shape.dimensions().contains(&Dimension::Static(0)) {
+                return Ok(0usize);
+            }
+            shape.dimensions().iter().try_fold(1usize, |product, dimension| {
+                product.checked_mul(dimension.value().unwrap_or(1)).ok_or_else(|| {
+                    TypeError::invalid(format!(
+                        "shape `{shape}` static element-count coefficient does not fit in `usize`",
+                    ))
+                })
+            })
+        };
+        let self_coefficient = coefficient(self)?;
+        let other_coefficient = coefficient(other)?;
+        if self_coefficient != other_coefficient {
+            return Ok(false);
+        }
+        if self_coefficient == 0 {
+            return Ok(true);
+        }
+        let mut remaining =
+            other.dimensions().iter().filter(|dimension| dimension.value().is_none()).collect::<Vec<_>>();
+        for dimension in self.dimensions().iter().filter(|dimension| dimension.value().is_none()) {
+            let Some(index) = remaining.iter().position(|candidate| *candidate == dimension) else {
+                return Ok(false);
+            };
+            remaining.swap_remove(index);
+        }
+        Ok(remaining.is_empty())
     }
 
     /// Returns `true` if every [`Shape`] admitted by `other` is also admitted by this [`Shape`]. The receiver is the
@@ -736,7 +780,6 @@ impl Shape {
     /// // The ranks must match exactly.
     /// assert!(!declared.is_refined_by(&Shape::new(vec![Dimension::Static(3)])));
     /// ```
-    #[inline]
     pub fn is_refined_by(&self, other: &Shape) -> bool {
         self.rank() == other.rank()
             && self.dimensions.iter().zip(&other.dimensions).enumerate().all(|(axis, (declared, actual))| {
@@ -1232,6 +1275,68 @@ mod tests {
         assert_eq!(
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]).element_count(),
             Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
+        );
+    }
+
+    #[test]
+    fn test_shape_has_equal_element_count() {
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let m = DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap());
+
+        // Static products are compared directly, and a static zero proves a zero count without multiplying through
+        // the remaining extents, even when they would overflow.
+        assert_eq!(Shape::new(vec![2.into(), 3.into()]).has_equal_element_count(&Shape::new(vec![6.into()])), Ok(true));
+        assert_eq!(
+            Shape::new(vec![2.into(), 3.into()]).has_equal_element_count(&Shape::new(vec![5.into()])),
+            Ok(false),
+        );
+        assert_eq!(
+            Shape::new(vec![0.into(), usize::MAX.into(), 2.into()])
+                .has_equal_element_count(&Shape::new(vec![0.into()])),
+            Ok(true),
+        );
+        assert_eq!(
+            Shape::new(vec![0.into(), Dimension::Dynamic(n.clone())])
+                .has_equal_element_count(&Shape::new(vec![Dimension::Dynamic(m.clone()), 0.into()])),
+            Ok(true),
+        );
+
+        // Dynamic identities must match with multiplicity once the static coefficients agree.
+        assert_eq!(
+            Shape::new(vec![Dimension::Dynamic(n.clone()), 2.into()])
+                .has_equal_element_count(&Shape::new(vec![2.into(), Dimension::Dynamic(n.clone())])),
+            Ok(true),
+        );
+        assert_eq!(
+            Shape::new(vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone())]).has_equal_element_count(
+                &Shape::new(vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone())]),
+            ),
+            Ok(true),
+        );
+        assert_eq!(
+            Shape::new(vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone())])
+                .has_equal_element_count(&Shape::new(vec![Dimension::Dynamic(n.clone())])),
+            Ok(false),
+        );
+        assert_eq!(
+            Shape::new(vec![Dimension::Dynamic(n.clone())])
+                .has_equal_element_count(&Shape::new(vec![Dimension::Dynamic(m)])),
+            Ok(false),
+        );
+        assert_eq!(
+            Shape::new(vec![Dimension::Dynamic(n.clone()), 2.into()])
+                .has_equal_element_count(&Shape::new(vec![2.into()])),
+            Ok(false),
+        );
+
+        // Static coefficients that do not fit are reported rather than wrapped.
+        assert_eq!(
+            Shape::new(vec![usize::MAX.into(), 2.into()])
+                .has_equal_element_count(&Shape::new(vec![Dimension::Dynamic(n)])),
+            Err(TypeError::invalid(format!(
+                "shape `[{}, 2]` static element-count coefficient does not fit in `usize`",
+                usize::MAX,
+            ))),
         );
     }
 
