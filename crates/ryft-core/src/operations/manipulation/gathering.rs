@@ -83,8 +83,6 @@ impl<V: Value<Type = ArrayType>> Display for GatherMode<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Specification of how the index input and the sliced windows map onto the input and output axes of a [`Gather`]
 /// operation, following StableHLO's [`gather`](https://openxla.org/stablehlo/spec#gather) dimension numbers. The index
 /// vector dimension is implicit and always the last axis of the indices input (the indices input has shape `[batch...,
@@ -96,25 +94,22 @@ impl<V: Value<Type = ArrayType>> Display for GatherMode<V> {
 /// for diagrams and examples of axis mapping, window sizes, and paired batching.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GatherDimensionNumbers {
-    /// Output axes that hold the sliced window (i.e., the "offset" axes), in ascending order. Their count equals the
-    /// number of input axes that are neither collapsed nor batching.
+    /// Refer to the documentation of [`Self::offset_dimensions`] for more information.
     offset_dimensions: Vec<usize>,
 
-    /// Input axes whose slice size is `1` and that are removed from the output, in ascending order.
+    /// Refer to the documentation of [`Self::collapsed_slice_dimensions`] for more information.
     collapsed_slice_dimensions: Vec<usize>,
 
-    /// For each component of a start-index vector (the last axis of the indices input), the input axis it indexes
-    /// into. Its length equals the extent of the indices' index vector dimension.
+    /// Refer to the documentation of [`Self::start_index_map`] for more information.
     start_index_map: Vec<usize>,
 
-    /// Pairs of `(input_axis, indices_axis)`, ordered by ascending input axis. Each pair selects the input batch
-    /// coordinate from the matching query axis. Input batching window sizes are at most one.
+    /// Refer to the documentation of [`Self::batching_dimensions`] for more information.
     batching_dimensions: Vec<(usize, usize)>,
 }
 
 impl GatherDimensionNumbers {
-    /// Creates gather dimension numbers from explicit axis lists. The batching pairs default to empty; use
-    /// [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
+    /// Creates a new [`GatherDimensionNumbers`] instance from the provided explicit axis lists. The batching pairs
+    /// default to empty; use [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
     ///
     /// # Parameters
     ///
@@ -130,30 +125,6 @@ impl GatherDimensionNumbers {
         Self { offset_dimensions, collapsed_slice_dimensions, start_index_map, batching_dimensions: Vec::new() }
     }
 
-    /// Returns the output offset axes.
-    #[inline]
-    pub fn offset_dimensions(&self) -> &[usize] {
-        &self.offset_dimensions
-    }
-
-    /// Returns the collapsed (size-1, removed) input axes.
-    #[inline]
-    pub fn collapsed_slice_dimensions(&self) -> &[usize] {
-        &self.collapsed_slice_dimensions
-    }
-
-    /// Returns the start-index-to-input-axis map.
-    #[inline]
-    pub fn start_index_map(&self) -> &[usize] {
-        &self.start_index_map
-    }
-
-    /// Returns the `(input_axis, indices_axis)` batching pairs in input-axis order.
-    #[inline]
-    pub fn batching_dimensions(&self) -> &[(usize, usize)] {
-        &self.batching_dimensions
-    }
-
     /// Pairs input axes with query axes so that each query reads from its corresponding input batch. Paired axes
     /// must have equal extents. Input batching axes cannot also be collapsed or indexed by a start vector.
     /// These constraints are checked when inferring the gather result type.
@@ -167,9 +138,37 @@ impl GatherDimensionNumbers {
         self.batching_dimensions = batching_dimensions;
         self
     }
+
+    /// Returns the output axes that hold the sliced window (i.e., the "offset" axes), in ascending order. Their count
+    /// equals the number of input axes that are neither collapsed nor batching.
+    #[inline]
+    pub fn offset_dimensions(&self) -> &[usize] {
+        &self.offset_dimensions
+    }
+
+    /// Returns the input axes whose slice size is `1` and that are removed from the output, in ascending order.
+    #[inline]
+    pub fn collapsed_slice_dimensions(&self) -> &[usize] {
+        &self.collapsed_slice_dimensions
+    }
+
+    /// Returns the input axis indexed by each component of a start-index vector (i.e., the last axis of the indices
+    /// input). The map's length equals the extent of the indices' index vector dimension.
+    #[inline]
+    pub fn start_index_map(&self) -> &[usize] {
+        &self.start_index_map
+    }
+
+    /// Returns the `(input_axis, indices_axis)` pairs, ordered by ascending input axis. Each pair selects the input
+    /// batch coordinate from the matching query axis. Input batching window sizes are at most one.
+    #[inline]
+    pub fn batching_dimensions(&self) -> &[(usize, usize)] {
+        &self.batching_dimensions
+    }
 }
 
 impl Display for GatherDimensionNumbers {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -178,6 +177,8 @@ impl Display for GatherDimensionNumbers {
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`GatherOperation`].
 pub const GATHER_OPERATION_NAME: &str = "gather";
@@ -192,24 +193,24 @@ pub const GATHER_OPERATION_NAME: &str = "gather";
 /// distinction between a stored literal and a flowing value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GatherOperation<V: Value<Type = ArrayType> = Array> {
-    /// Dimension numbers mapping the index input and sliced windows onto the input and output axes.
+    /// Refer to the documentation of [`Self::dimensions`] for more information.
     dimensions: GatherDimensionNumbers,
 
-    /// Dimension of the sliced window along each input axis (length equals the input rank).
+    /// Refer to the documentation of [`Self::slice_sizes`] for more information.
     slice_sizes: Vec<usize>,
 
-    /// Out-of-bounds index handling. Indirection keeps a large stored value from increasing the size of every
-    /// variant in the operation enums that contain this operation, including gathers without an explicit fill.
+    /// Refer to the documentation of [`Self::mode`] for more information.
+    // Indirection keeps a large stored value from increasing the size of every variant in operation enums
+    // containing this operation, including gathers without an explicit fill.
     mode: Box<GatherMode<V>>,
 
-    /// Whether the caller guarantees the index vectors are sorted (a lowering hint only).
+    /// Refer to the documentation of [`Self::indices_are_sorted`] for more information.
     indices_are_sorted: bool,
 
-    /// Whether the caller guarantees the gathered windows do not overlap (a lowering hint only).
+    /// Refer to the documentation of [`Self::unique_indices`] for more information.
     unique_indices: bool,
 
-    /// Optional requested output [`Sharding`], used when the inferred placement is ambiguous (see
-    /// [`Self::with_output_sharding`]).
+    /// Refer to the documentation of [`Self::output_sharding`] for more information.
     output_sharding: Option<Sharding>,
 }
 
@@ -235,13 +236,13 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         }
     }
 
-    /// Returns the dimension numbers.
+    /// Returns the dimension numbers mapping the index input and sliced windows onto the input and output axes.
     #[inline]
     pub fn dimensions(&self) -> &GatherDimensionNumbers {
         &self.dimensions
     }
 
-    /// Returns the per-input-axis slice sizes.
+    /// Returns the size of the sliced window along each input axis. The number of sizes equals the input rank.
     #[inline]
     pub fn slice_sizes(&self) -> &[usize] {
         &self.slice_sizes
@@ -253,19 +254,20 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         &self.mode
     }
 
-    /// Returns the sorted-indices hint.
+    /// Returns whether the caller guarantees that the index vectors are sorted. This is a lowering hint only.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.indices_are_sorted
     }
 
-    /// Returns the unique-indices hint.
+    /// Returns whether the caller guarantees that the gathered windows do not overlap. This is a lowering hint only.
     #[inline]
     pub fn unique_indices(&self) -> bool {
         self.unique_indices
     }
 
-    /// Returns the requested output sharding, if any.
+    /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
+    /// documentation of [`Self::with_output_sharding`] for more information.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
