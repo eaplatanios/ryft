@@ -193,9 +193,9 @@ mod tests {
     use crate::kernels::operations::KernelOperation;
     use crate::kernels::validation::{KernelParameterAccess, KernelValidationError};
     use crate::operations::{
-        AddOperation, BroadcastOperation, ConcatenateOperation, DotOperation, GatherDimensionNumbers, GatherFillValue,
-        GatherMode, GatherOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation,
+        AddOperation, BroadcastOperation, ConcatenateOperation, DotOperation, GatherDimensionNumbers, GatherMode,
+        GatherOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterDimensionNumbers, ScatterMode,
+        ScatterOperation, ScatterReductionKind, SelectOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ReferenceType};
@@ -282,9 +282,7 @@ mod tests {
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Gather(
                     GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0, 1], vec![0, 1]), vec![1, 1])
-                        .with_mode(GatherMode::Fill {
-                            value: Some(GatherFillValue::from_array(Array::scalar(-7i32).unwrap()).unwrap()),
-                        }),
+                        .with_mode(GatherMode::Fill { value: Some(Array::scalar(-7i32).unwrap()) }),
                 )),
                 vec![],
                 vec![values[0], indices],

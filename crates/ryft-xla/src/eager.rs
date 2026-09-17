@@ -299,12 +299,12 @@ mod tests {
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
         ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
         CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
-        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers,
-        GatherOperation, GatherScatterMode, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis,
-        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
-        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
-        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
+        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
+        OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
+        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+        ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
+        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2320,9 +2320,7 @@ mod tests {
         )
         .unwrap();
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
-            .with_mode(GatherScatterMode::FillOrDrop)
-            .with_fill_value(CpuArray::scalar(7_f32).unwrap())
-            .unwrap();
+            .with_mode(GatherMode::Fill { value: Some(CpuArray::scalar(7_f32).unwrap()) });
 
         // Out-of-bounds fill contributes to the primal, but never to an input cotangent. Repeated valid indices
         // accumulate their cotangents through the inverse scatter on the selected execution device.

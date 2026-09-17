@@ -2099,7 +2099,6 @@ mod tests {
     #[test]
     fn test_pad() {
         let operation = PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap();
-        // Operation identity and accessors.
         assert_eq!(operation.name(), PAD_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]]");
         assert_eq!(operation.edge_padding_low(), &[1]);
@@ -2139,11 +2138,11 @@ mod tests {
 
     #[test]
     fn test_pad_type_inference() {
-        let input_type = ArrayType::new_static(DataType::F64, [3]);
-        let padding_value_type = ArrayType::scalar(DataType::F64);
         // Type inference validates the padding geometry and returns the padded type: interior padding dilates the
         // input before the edges are added, an empty axis holds only its edge padding, and dynamic axes whose extent
         // changes need the explicit result-extent input of the mixed operation.
+        let input_type = ArrayType::new_static(DataType::F64, [3]);
+        let padding_value_type = ArrayType::scalar(DataType::F64);
         check_operation_type_inference!(
             operation = PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
             cases = [
@@ -2206,6 +2205,7 @@ mod tests {
             ),
             Err(TypeError::invalid("expected 0 regions but got 1"))
         );
+
         // The padding vectors must have one entry per input axis.
         check_operation_type_inference!(
             operation = PadOperation::<ArrayType>::new(vec![1, 0], vec![2, 0], vec![1, 0]).unwrap(),
@@ -2237,6 +2237,7 @@ mod tests {
                 output_types = [ArrayType::new(DataType::F32, Shape::new(vec![size.into()]))],
             }],
         );
+
         // Negative edges still validate their abstract extent on dynamic axes. A valid derived dynamic extent
         // requires the explicit result-dimension input introduced by the mixed operation signature, while an
         // always-negative extent is rejected immediately.
@@ -2269,6 +2270,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = PadOperation::<ArrayType>::new(vec![-5], vec![0], vec![0]).unwrap(),
             cases = [{
@@ -2289,10 +2291,10 @@ mod tests {
 
     #[test]
     fn test_pad_interpretation() {
-        let context = EagerContext::<Array>::new();
-        let padding_value = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap();
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
+        let context = EagerContext::<Array>::new();
+        let padding_value = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap();
         let input = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[1.0, 2.0, 3.0]).unwrap();
         let operation = PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap();
         assert_eq!(
@@ -2302,9 +2304,10 @@ mod tests {
                     ArrayType::new_static(DataType::F64, [8]),
                     &[9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0],
                 )
-                .unwrap()
+                .unwrap(),
             ]),
         );
+
         // Negative edge padding crops after the (empty) interior padding has been inserted.
         assert_eq!(
             PadOperation::new(vec![-1], vec![1], vec![0]).unwrap().interpret(
@@ -2314,6 +2317,7 @@ mod tests {
             ),
             Ok(vec![Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[2.0, 3.0, 9.0]).unwrap()]),
         );
+
         // Empty input axes hold only the edge padding (the `d == 0` case skips interior padding entirely) and rank-0
         // inputs pass through unchanged.
         assert_eq!(
@@ -2324,6 +2328,7 @@ mod tests {
             ),
             Ok(vec![Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[9.0, 9.0, 9.0]).unwrap()]),
         );
+
         let scalar = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[42.0]).unwrap();
         assert_eq!(
             PadOperation::new(Vec::new(), Vec::new(), Vec::new()).unwrap().interpret(
@@ -2333,6 +2338,7 @@ mod tests {
             ),
             Ok(vec![scalar]),
         );
+
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -2341,7 +2347,6 @@ mod tests {
 
     #[test]
     fn test_pad_partial_evaluation() {
-        // Check standard partial evaluation with known and residual inputs.
         let input = Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [3]), &[1.0, 2.0, 3.0]).unwrap();
         let padding_value = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap();
         let expected = Array::from_elements::<f64>(
@@ -2884,6 +2889,7 @@ mod tests {
                 },
             ],
         );
+
         // Selecting padding positions before reduction avoids the `infinity - infinity` contamination that a
         // total-sum-minus-input-sum formulation would introduce.
         check_operation_transposition!(
@@ -2927,6 +2933,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_transposition!(
             @exact,
             operation = PadOperation::new(vec![-1], vec![1], vec![0]).unwrap(),
@@ -2944,6 +2951,7 @@ mod tests {
                 ],
             }],
         );
+
         check_operation_transposition!(
             @exact,
             operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
@@ -2961,6 +2969,7 @@ mod tests {
                 ],
             }],
         );
+
         check_operation_transposition!(
             @exact,
             operation = PadOperation::new(Vec::new(), Vec::new(), Vec::new()).unwrap(),
@@ -3089,6 +3098,7 @@ mod tests {
                 },
             ],
         );
+
         // Wide coordinate arithmetic identifies the sole surviving input without allocating its enormous dilation.
         check_operation_transposition!(
             @exact,
@@ -3106,6 +3116,7 @@ mod tests {
                 ],
             }],
         );
+
         // These edges crop every input position, despite their balanced finite output shape.
         check_operation_transposition!(
             @exact,
@@ -3135,6 +3146,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_transposition!(
             @exact,
             operation = PadOperation::new(vec![i64::MAX], vec![i64::MIN], vec![0]).unwrap(),
@@ -3246,13 +3258,13 @@ mod tests {
         assert_eq!(
             input.pad(&input, &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f32[3]`"
+                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f32[3]`",
             )))),
         );
         assert_eq!(
             input.pad(&padding_value, &[], &[], &[]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 0 but input has rank 1"
+                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 0 but input has rank 1",
             )))),
         );
         assert!(context.builder().borrow().instructions().is_empty());
@@ -3282,6 +3294,7 @@ mod tests {
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
+
         // [4] sharded over `x` and unreduced over the manual axis `m`.
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
             .unwrap()
@@ -3302,19 +3315,19 @@ mod tests {
         assert_eq!(
             plain_input.pad(&plain_padding, &[], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 0 but input has rank 1"
+                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 0 but input has rank 1",
             )))),
         );
         assert_eq!(
             plain_input.pad(&plain_padding, &[0], &[], &[0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_high` has length 0 but input has rank 1"
+                "`{PAD_OPERATION_NAME}` `edge_padding_high` has length 0 but input has rank 1",
             )))),
         );
         assert_eq!(
             plain_input.pad(&plain_padding, &[0], &[0], &[]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `interior_padding` has length 0 but input has rank 1"
+                "`{PAD_OPERATION_NAME}` `interior_padding` has length 0 but input has rank 1",
             )))),
         );
 
@@ -3328,7 +3341,7 @@ mod tests {
             host_input.pad(&padding_value, &[0], &[1], &[0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PAD_OPERATION_NAME}` input and padding value must share one memory space but reside in \
-                 `Host[Pinned]` and `Device`"
+                 `Host[Pinned]` and `Device`",
             )))),
         );
         let laid_out_input = host_input.with_layout(Layout::Strided(StridedLayout::new(vec![4])));
@@ -3337,6 +3350,7 @@ mod tests {
         // Padding to an evenly divisible size keeps the input sharding (including the unreduced manual axis): with low
         // = 0, interior = 0, and high = 4 the output is 0 + 4 + 4 = 8, divisible by the `x` mesh-axis size (2).
         assert_eq!(input.pad(&padding_value, &[0], &[4], &[0]).unwrap().sharding(), Some(&sharding));
+
         // Padding to a size not divisible by the explicit mesh-axis size (output 0 + 4 + 1 = 5) is rejected.
         assert_eq!(
             input.pad(&padding_value, &[0], &[1], &[0]),
@@ -3461,7 +3475,7 @@ mod tests {
                 &[0]
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` output size is negative (-1) on axis 0"
+                "`{PAD_OPERATION_NAME}` output size is negative (-1) on axis 0",
             )))),
         );
 
@@ -3491,7 +3505,7 @@ mod tests {
                 &[0]
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f64[1]`"
+                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f64[1]`",
             )))),
         );
     }
@@ -3684,6 +3698,7 @@ mod tests {
         let eight = DimensionValue::constant(8).unwrap().r#type().into_owned();
         let dynamic_variable = DimensionVariable::new("dynamic", DimensionBounds::new(7, Some(10)).unwrap());
         let operation = PadOperation::<ArrayIrType>::new(vec![1], vec![2], vec![1]).unwrap();
+
         // The conservative form accepts every well-formed signature: a static extent must equal the padded extent, a
         // supplied dynamic identity names the output axis, layouts are cleared, and the array validation shared with
         // the homogeneous form applies. Malformed operand lists report exact errors.
@@ -3898,6 +3913,7 @@ mod tests {
         );
         let padding_value =
             ArrayIrValue::Array(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[9.0]).unwrap());
+
         // A concrete mixed value validates the explicit extent against the padded input geometry before padding its
         // array member.
         assert_eq!(
@@ -3922,10 +3938,11 @@ mod tests {
             ),
             Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "`{PAD_OPERATION_NAME}` output axis 0 has extent 8, but its explicit extent input is 7"
+                    "`{PAD_OPERATION_NAME}` output axis 0 has extent 8, but its explicit extent input is 7",
                 ),
             }),
         );
+
         // The mixed arity is one extent per configured axis on top of the two array inputs.
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[]),
@@ -3948,6 +3965,7 @@ mod tests {
             )
             .unwrap(),
         );
+
         // Partial evaluation folds a fully known pad and otherwise retains exactly one operation with the explicit
         // extent edge, including when only that extent is unknown.
         check_operation_partial_evaluation!(
@@ -4437,7 +4455,7 @@ mod tests {
             ]),
             Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "`{PAD_OPERATION_NAME}` output axis 1 has extent 4, but its explicit extent input is 5"
+                    "`{PAD_OPERATION_NAME}` output axis 1 has extent 4, but its explicit extent input is 5",
                 ),
             }),
         );
@@ -4812,6 +4830,7 @@ mod tests {
         let source_extent = builder.add_input(source_type.clone().into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output_extent = builder.add_input(result_type.clone().into());
+
         // A mixed iota is a non-differentiable nullary constant, so its tangent is a structural zero of the input type
         // with symbolic extents while its primal is a non-zero exemplar and the padding-value tangent stays live. The
         // rule must still hand a concrete input tangent to the staged pad.
@@ -5283,6 +5302,7 @@ mod tests {
             "}
             .trim_end(),
         );
+
         // The inverse pad is the one with negated edge amounts; the mask pad and the replayed forward pad reuse the
         // forward operation and its conservative assertion.
         let inverse_pads = pullback
@@ -5635,6 +5655,7 @@ mod tests {
                     "`{PAD_OPERATION_NAME}` batching cannot change a ragged axis or an axis indexing its extents",
                 ),
         ));
+
         // `ArrayBatch::with_ragged_axes` validates real inputs against the carrier rank, so an axis outside the padding
         // vectors is helper-level hardening rather than a reachable operation error.
         assert!(matches!(
@@ -5649,10 +5670,12 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F32, [3, 1, 0]);
         assert!(is_effective_identity(&static_type, &[0, 0, 0], &[0, 0, 0], &[0, 0, 0]));
         assert!(is_effective_identity(&ArrayType::scalar(DataType::F32), &[], &[], &[]));
+
         // Any edge amount moves or crops elements, even when the amounts balance.
         assert!(!is_effective_identity(&static_type, &[1, 0, 0], &[0, 0, 0], &[0, 0, 0]));
         assert!(!is_effective_identity(&static_type, &[-1, 0, 0], &[1, 0, 0], &[0, 0, 0]));
         assert!(!is_effective_identity(&static_type, &[0, 0, 0], &[0, 0, -1], &[0, 0, 0]));
+
         // Interior padding only matters on axes that can hold two adjacent elements.
         assert!(is_effective_identity(&static_type, &[0, 0, 0], &[0, 0, 0], &[0, usize::MAX, usize::MAX]));
         assert!(!is_effective_identity(&static_type, &[0, 0, 0], &[0, 0, 0], &[1, 0, 0]));
@@ -5677,6 +5700,7 @@ mod tests {
         assert_eq!(padded_extent(1, 0, 0, usize::MAX, 0), Ok(1));
         assert_eq!(padded_extent(1, -2, 0, 0, 0), Ok(-1));
         assert_eq!(padded_extent(2, i64::MIN, i64::MAX, 0, 0), Ok(1));
+
         // On 64-bit targets every `usize` fits `i128`, so only the dilation arithmetic can overflow: the gap product
         // itself, or the sum of the input size and a product just below `i128::MAX`.
         assert_eq!(
@@ -5716,13 +5740,13 @@ mod tests {
         assert_eq!(
             validate_pad_inputs(&input, &ArrayType::scalar(DataType::F64), &[0, 0], &[0, 0], &[0, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` input data type `f32` does not match padding value data type `f64`"
+                "`{PAD_OPERATION_NAME}` input data type `f32` does not match padding value data type `f64`",
             )))),
         );
         assert_eq!(
             validate_pad_inputs(&input, &ArrayType::new_static(DataType::F32, [1]), &[0, 0], &[0, 0], &[0, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f32[1]`"
+                "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type `f32[1]`",
             )))),
         );
         assert_eq!(
@@ -5735,25 +5759,25 @@ mod tests {
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PAD_OPERATION_NAME}` input and padding value must share one memory space but reside in `Device` \
-                 and `Host[Unpinned]`"
+                 and `Host[Unpinned]`",
             )))),
         );
         assert_eq!(
             validate_pad_inputs(&input, &padding_value, &[0], &[0, 0], &[0, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 1 but input has rank 2"
+                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 1 but input has rank 2",
             )))),
         );
         assert_eq!(
             validate_pad_inputs(&input, &padding_value, &[0, 0], &[0, 0, 0], &[0, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_high` has length 3 but input has rank 2"
+                "`{PAD_OPERATION_NAME}` `edge_padding_high` has length 3 but input has rank 2",
             )))),
         );
         assert_eq!(
             validate_pad_inputs(&input, &padding_value, &[0, 0], &[0, 0], &[]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `interior_padding` has length 0 but input has rank 2"
+                "`{PAD_OPERATION_NAME}` `interior_padding` has length 0 but input has rank 2",
             )))),
         );
     }
@@ -5839,7 +5863,7 @@ mod tests {
                 &[0]
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh"
+                "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh",
             )))),
         );
     }

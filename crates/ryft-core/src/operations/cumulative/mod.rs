@@ -43,7 +43,7 @@ use crate::differentiation::{
 use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
-use crate::operations::manipulation::padding::{Pad, PadOperation, dependency_scalar_type};
+use crate::operations::manipulation::padding::{Pad, PadOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::math::add::{Add, AddOperation};
 use crate::programs::{MaybeZero, OperationProvider, ProgramError, ProvenanceScope, TypeError, Typed, Value};
@@ -431,7 +431,7 @@ where
         ))
         .into());
     }
-    let padding_value = left.dispatch_domain().zero(&dependency_scalar_type(left.r#type().as_ref())?)?;
+    let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
     let mut edge_padding_low = vec![0; shape.rank()];
     let mut edge_padding_high = vec![0; shape.rank()];
     let mut interior_padding = vec![0; shape.rank()];

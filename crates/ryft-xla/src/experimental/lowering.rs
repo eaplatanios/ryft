@@ -28,15 +28,15 @@ use ryft_core::{
     ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
     DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
     DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
-    ExternalReferenceBinding, FloorOperation, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout,
+    ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation, Layout,
     Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
     MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
     ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
     Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind, RegionId, RegionRef,
     RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation,
-    ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
-    SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation,
-    Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
+    TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -10955,12 +10955,13 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
     }
     let dimensions = operation.dimensions();
+    let (input_batching, indices_batching): (Vec<_>, Vec<_>) = dimensions.batching_dimensions().iter().copied().unzip();
     let index_vector_dimension = input_types[1].rank() - 1;
     let attribute = context.stable_hlo_gather_dimensions(
         dimensions.offset_dimensions(),
         dimensions.collapsed_slice_dimensions(),
-        dimensions.operand_batching_dimensions(),
-        dimensions.start_indices_batching_dimensions(),
+        &input_batching,
+        &indices_batching,
         dimensions.start_index_map(),
         index_vector_dimension,
     )?;
@@ -10971,7 +10972,7 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     // still be zero or positive, retain the original entry: changing it to one would violate the gather window bound
     // on a runtime-empty input. This does not add support for unspecialized runtime-zero batching.
     let mut slice_sizes = operation.slice_sizes().to_vec();
-    for &axis in dimensions.operand_batching_dimensions() {
+    for &(axis, _) in dimensions.batching_dimensions() {
         let bounds = input_types[0].dimension(axis).bounds();
         if bounds.upper() == Some(1) {
             slice_sizes[axis] = 0;
@@ -10988,8 +10989,8 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let result = result.result(0).unwrap().as_ref();
-    if operation.mode() == GatherScatterMode::PromiseInBounds
-        || (operation.mode() == GatherScatterMode::Clip && input_types[0].static_shape().is_some())
+    if operation.mode() == &GatherMode::PromiseInBounds
+        || (operation.mode() == &GatherMode::Clip && input_types[0].static_shape().is_some())
     {
         return Ok(vec![result]);
     }
@@ -11034,7 +11035,7 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         .unwrap()
         .as_ref();
     let zero = lower_unplaced_constant_output(&[comparison_type], 0, block, context, location)?[0];
-    if operation.mode() == GatherScatterMode::Clip {
+    if operation.mode() == &GatherMode::Clip {
         // Native gather clamps against allocation capacities, which can exceed a dynamic input's logical size.
         // Clamp explicitly before gathering, then carry query sizes from the original gather's shape computation.
         let clipped =
@@ -11281,8 +11282,8 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     if input_types[1].data_type() == DataType::I1 {
         indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
     }
-    let adjust_indices = operation.mode() == GatherScatterMode::Clip
-        || (operation.mode() == GatherScatterMode::FillOrDrop && input_types[0].static_shape().is_none());
+    let adjust_indices = operation.mode() == ScatterMode::Clip
+        || (operation.mode() == ScatterMode::Drop && input_types[0].static_shape().is_none());
     if adjust_indices && !dimensions.scatter_dimensions_to_operand_dimensions().is_empty() {
         let shape_source = indices_type.static_shape().is_none().then_some(input_values[1]);
         let mut upper_bounds = Vec::new();
@@ -11302,7 +11303,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
             upper_bounds.push(
                 block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
             );
-            if operation.mode() == GatherScatterMode::FillOrDrop {
+            if operation.mode() == ScatterMode::Drop {
                 let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
                 else {
                     unreachable!()
@@ -11333,7 +11334,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         let zero =
             lower_unplaced_constant_output(&[ArrayType::scalar(index_data_type)], 0, block, context, location)?[0];
         let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
-        if operation.mode() == GatherScatterMode::Clip {
+        if operation.mode() == ScatterMode::Clip {
             indices =
                 block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
             indices = block
@@ -13675,7 +13676,7 @@ mod tests {
         let padding = block.argument(1).unwrap().as_ref();
         assert_eq!(
             lower_pad_to_mlir(
-                &PadOperation::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
+                &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
                 &[input, padding],
                 &[input_type.clone(), padding_type.clone()],
                 &[output_type.clone()],
@@ -13689,7 +13690,7 @@ mod tests {
         );
         // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
         let results = lower_pad_to_mlir(
-            &PadOperation::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
+            &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
             &[input, padding],
             &[input_type, padding_type],
             &[output_type.clone()],
@@ -13719,7 +13720,7 @@ mod tests {
         let output_extent =
             lower_static_index_constants(&[6], &mut block.as_ref(), &context, location.as_ref()).unwrap()[0];
         let results = lower_pad_to_mlir(
-            &PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            &PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
             &[input, padding_value],
             &[input_type, padding_value_type],
             std::slice::from_ref(&requested_output_type),
@@ -13758,7 +13759,7 @@ mod tests {
             let padding = builder.add_input(padding_type);
             let result = builder
                 .add_instruction(
-                    PadOperation::new(vec![low], vec![high], vec![interior]).unwrap(),
+                    PadOperation::<ArrayType>::new(vec![low], vec![high], vec![interior]).unwrap(),
                     Vec::new(),
                     vec![input, padding],
                     None,
@@ -13870,9 +13871,7 @@ mod tests {
                             None,
                         )
                         .unwrap()[0];
-                    let operation = PadOperation::<ArrayIrType>::from(
-                        PadOperation::new(vec![low], vec![high], vec![interior]).unwrap(),
-                    );
+                    let operation = PadOperation::<ArrayIrType>::new(vec![low], vec![high], vec![interior]).unwrap();
                     let result =
                         builder.add_instruction(operation, Vec::new(), vec![array, scalar, extent], None).unwrap()[0];
                     let program = builder
@@ -17970,13 +17969,13 @@ mod tests {
                 .unwrap();
         let fill = 9_007_199_254_740_993_i64;
         let windows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![3])
-            .with_mode(GatherScatterMode::FillOrDrop);
+            .with_mode(GatherMode::Fill { value: None });
         let cases = [
             (
                 CpuArray::scalar(7_i64).unwrap(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![], vec![]), vec![])
-                    .with_mode(GatherScatterMode::FillOrDrop),
+                    .with_mode(GatherMode::Fill { value: None }),
                 values_to_bytes(&[7_i64, 7]),
             ),
             (
@@ -17984,10 +17983,10 @@ mod tests {
                     .unwrap(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
                 GatherOperation::new(
-                    GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
+                    GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![(0, 0)]),
                     vec![1, 1],
                 )
-                .with_mode(GatherScatterMode::FillOrDrop),
+                .with_mode(GatherMode::Fill { value: None }),
                 values_to_bytes(&[10_i64, 30, 50, i64::MIN]),
             ),
             (
@@ -18003,7 +18002,7 @@ mod tests {
             (
                 input.clone(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
-                windows.clone().with_fill_value(CpuArray::scalar(fill).unwrap()).unwrap(),
+                windows.clone().with_mode(GatherMode::Fill { value: Some(CpuArray::scalar(fill).unwrap()) }),
                 values_to_bytes(&[fill, fill, fill, 0, 1, 2, 127, 128, 129]),
             ),
             (
@@ -18025,10 +18024,9 @@ mod tests {
                 )
                 .unwrap(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
-                GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
-                    .with_mode(GatherScatterMode::FillOrDrop)
-                    .with_fill_value(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())
-                    .unwrap(),
+                GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
+                    GatherMode::Fill { value: Some(CpuArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap()) },
+                ),
                 values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
             ),
         ];
@@ -18089,7 +18087,7 @@ mod tests {
             assert_eq!(outputs[0].copy_to_host(None).unwrap().r#await().unwrap(), expected);
         }
         // Bounds checks use logical input extents rather than padded allocation capacity.
-        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+        for mode in [GatherMode::Clip, GatherMode::Fill { value: None }] {
             let input_type = ArrayType::new(
                 DataType::I64,
                 Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -18105,7 +18103,7 @@ mod tests {
             let output = builder
                 .add_instruction(
                     GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
-                        .with_mode(mode),
+                        .with_mode(mode.clone()),
                     Vec::new(),
                     vec![input, indices],
                     None,
@@ -18166,7 +18164,7 @@ mod tests {
                     .unwrap()
                     .remove(0)
                     .outputs;
-                let expected = if mode == GatherScatterMode::Clip { vec![20_i64, 20] } else { vec![20, i64::MIN] };
+                let expected = if mode == GatherMode::Clip { vec![20_i64, 20] } else { vec![20, i64::MIN] };
                 let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
                 let actual = values_from_bytes::<i64>(&bytes[..query_size as usize * 8]);
                 assert_eq!(actual, &expected[..query_size as usize]);
@@ -18180,14 +18178,14 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
-        use ryft_core::{Dimension, GatherDimensionNumbers, GatherOperation, GatherScatterMode, Shape};
+        use ryft_core::{Dimension, GatherDimensionNumbers, GatherMode, GatherOperation, Shape};
 
         // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
         // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
         let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
-            .with_mode(GatherScatterMode::Clip);
+            .with_mode(GatherMode::Clip);
         let mut builder = XlaProgramBuilder::new();
         let operand = builder.add_input(operand_type);
         let indices = builder.add_input(indices_type);
@@ -18210,7 +18208,7 @@ mod tests {
     #[test]
     fn test_lower_scatter_index_modes() {
         let client = execution_client();
-        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+        for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             for (unsigned, dynamic_input, dynamic_query) in
                 [(false, false, false), (true, false, false), (false, true, false), (false, false, true)]
             {
@@ -18319,11 +18317,11 @@ mod tests {
                     .remove(0)
                     .outputs;
                 let expected = match (mode, unsigned, dynamic_input, dynamic_query) {
-                    (GatherScatterMode::Clip, true, _, _) => vec![11_i64, 24, 30, 45],
-                    (GatherScatterMode::FillOrDrop, true, _, _) => vec![11, 24, 30, 40],
-                    (GatherScatterMode::Clip, _, true, _) => vec![13, 27],
-                    (GatherScatterMode::Clip, _, _, true) => vec![13, 20, 30, 40],
-                    (GatherScatterMode::Clip, _, _, _) => vec![13, 20, 30, 47],
+                    (ScatterMode::Clip, true, _, _) => vec![11_i64, 24, 30, 45],
+                    (ScatterMode::Drop, true, _, _) => vec![11, 24, 30, 40],
+                    (ScatterMode::Clip, _, true, _) => vec![13, 27],
+                    (ScatterMode::Clip, _, _, true) => vec![13, 20, 30, 40],
+                    (ScatterMode::Clip, _, _, _) => vec![13, 20, 30, 47],
                     (_, _, true, _) => vec![10, 20],
                     _ => vec![10, 20, 30, 40],
                 };
@@ -18337,7 +18335,7 @@ mod tests {
         }
         // A partially out-of-bounds update is dropped as a whole; Clip moves the complete window into range.
         let mut literal_cases = Vec::new();
-        for mode in [GatherScatterMode::Clip, GatherScatterMode::FillOrDrop] {
+        for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             literal_cases.push((
                 CpuArray::vector(vec![0_i64; 3]).unwrap(),
                 CpuArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
@@ -18347,7 +18345,7 @@ mod tests {
                     ScatterReductionKind::Add,
                 )
                 .with_mode(mode),
-                values_to_bytes(if mode == GatherScatterMode::Clip { &[0_i64, 10, 20] } else { &[0_i64, 0, 0] }),
+                values_to_bytes(if mode == ScatterMode::Clip { &[0_i64, 10, 20] } else { &[0_i64, 0, 0] }),
             ));
         }
         // One-bit integers use predicate storage but retain arithmetic modulo two and signed/unsigned extrema.
@@ -22600,7 +22598,7 @@ mod tests {
             .unwrap()[0];
         let padded = builder
             .add_instruction(
-                PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+                PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![pad_input, padding_value],
                 None,
@@ -22638,7 +22636,7 @@ mod tests {
         let padding_value = builder.add_input(padding_value_type);
         let trimmed = builder
             .add_instruction(
-                PadOperation::new(vec![-1], vec![-2], vec![0]).unwrap(),
+                PadOperation::<ArrayType>::new(vec![-1], vec![-2], vec![0]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value],
                 None,
@@ -22646,7 +22644,7 @@ mod tests {
             .unwrap()[0];
         let mixed = builder
             .add_instruction(
-                PadOperation::new(vec![-1], vec![2], vec![2]).unwrap(),
+                PadOperation::<ArrayType>::new(vec![-1], vec![2], vec![2]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value],
                 None,
@@ -22684,7 +22682,7 @@ mod tests {
         let padding_value = builder.add_input(padding_value_type);
         assert_eq!(
             builder.add_instruction(
-                PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+                PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value],
                 None

@@ -131,7 +131,7 @@ variants the original plan never asked for (this branch adds first-class runtime
 | `lax.concatenate` | RoPE half re-join, cache concat | ✅ | `ConcatenateOperation` |
 | `lax.slice` (static) | RoPE half split, KV-cache prefix slicing | ✅ | `SliceOperation` (+ `DynamicShapeSliceOperation`) |
 | `lax.dynamic_slice` / `dynamic_update_slice` | KV-cache reads/writes at runtime offsets | ✅ | `DynamicSliceOperation`, `DynamicUpdateSliceOperation` (+ static `UpdateSliceOperation`) |
-| `lax.gather` | token embedding lookup `table[input_ids]` | ✅ | `GatherOperation` with `GatherDimensionNumbers` and `GatherScatterMode::{PromiseInBounds, Clip, FillOrDrop}` |
+| `lax.gather` | token embedding lookup `table[input_ids]` | ✅ | `GatherOperation` with `GatherDimensionNumbers` and `GatherMode::{PromiseInBounds, Clip, Fill { value }}` |
 | `lax.scatter` / scatter-add | gradient of `gather` (embedding bwd), MoE dispatch | ✅ | `ScatterOperation` with `ScatterReductionKind::{Overwrite, Add, Mul, Min, Max}` |
 | `lax.pad` | RoPE timescale padding, sequence padding | ✅ | `PadOperation` |
 | `lax.iota` | position indices, RoPE arange | ✅ | `IotaOperation` (context-side constructor; + `DynamicIota` for dynamic shapes) |
