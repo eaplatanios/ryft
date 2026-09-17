@@ -18,7 +18,7 @@ use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
-    TypeError, TypeIdentityRenaming, Typed, Value,
+    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -66,7 +66,10 @@ enum LinearCallInterface<T: DifferentiableType> {
 /// which has no rendered documentation page and is therefore linked at its source. The swap re-derives each side's
 /// expected interface with the cotangent type mapping, which requires `cotangent(cotangent(u)) = u` for the linear
 /// types. Tangent types (the only types linearization rules stage as linear operands) satisfy this even where primal
-/// storage types do not (e.g., `f8e8m0fnu`, whose tangent and cotangent representations are both `f32`).
+/// storage types do not (e.g., `f8e8m0fnu`, whose tangent and cotangent representations are both `f32`). A transpose
+/// result must describe the same cotangent space as its corresponding linear input. Besides identical types, this
+/// admits representations that refine one another under [`TypeRefinements`], such as a static extent of 2 and a
+/// retained dimension constrained to exactly 2. A merely compatible or less precise shape is not sufficient.
 ///
 /// Every residual is an ordinary typed Single Static Assignment (SSA) edge rather than differentiation-only payload
 /// metadata. Partial evaluation can lift those values into the enclosing [`Linearization`](crate::Linearization)
@@ -480,10 +483,22 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
             &transpose_input_types,
             transpose.input_types(),
         ]);
-        check_types!(@same, format!("{descriptor} transpose output"), [
-            &transpose_output_types,
-            transpose.output_types(),
-        ]);
+
+        // Explicit dimension inputs retain their nominal identities even when their bounds prove an exact extent.
+        // Consequently, specializing `linear: f32[n]` to `f32[2]` can leave its transpose's `zero[n](extent)` output
+        // typed as `f32[n]`, with `n` now constrained to exactly 2. Require refinement in both directions to accept
+        // these equivalent representations without accepting a merely broader transpose result. In particular,
+        // `f32[n]` with non-singleton bounds, a different extent, or unrelated non-exact identities still fail.
+        if transpose_output_types != transpose.output_types()
+            && (T::Refinements::establish(transpose_output_types.iter(), transpose.output_types().iter()).is_err()
+                || T::Refinements::establish(transpose.output_types().iter(), transpose_output_types.iter()).is_err())
+        {
+            check_types!(@same, format!("{descriptor} transpose output"), [
+                &transpose_output_types,
+                transpose.output_types(),
+            ]);
+        }
+
         Ok(output_types.to_vec())
     }
 
@@ -926,6 +941,105 @@ mod tests {
             LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
                 .infer_output_types(&[residual_type, tangent_type.clone()], std::slice::from_ref(&transpose_interface)),
             Ok(vec![tangent_type]),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_type_inference_exact_transpose_outputs() {
+        let scalar = ArrayType::scalar(DataType::F32);
+        let vector = ArrayType::new_static(DataType::F32, [2]);
+        let exact = DimensionVariable::new("exact", DimensionBounds::new(2, Some(3)).unwrap());
+        let broad = DimensionVariable::new("broad", DimensionBounds::new(0, Some(4)).unwrap());
+        let other = DimensionVariable::new("other", DimensionBounds::new(0, Some(4)).unwrap());
+        let operation = LinearCallOperation::transpose_only(0, vec![vector.clone()], vec![scalar.clone()]);
+
+        // An exact named extent and its static representation describe precisely the same cotangent space.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&vector),
+                &[RegionInterface::new(
+                    vec![scalar.clone()],
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![exact.into()]))],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Ok(vec![scalar.clone()]),
+        );
+
+        // A possible extent is not proof of equality, and neither shape nor element type may change.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&vector),
+                &[RegionInterface::new(
+                    vec![scalar.clone()],
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![broad.clone().into()]))],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Err(TypeError::invalid(
+                "transpose-only linear call transpose output type signature mismatch: \
+                 expected [f32[2]] but got [f32[broad]]",
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&vector),
+                &[RegionInterface::new(
+                    vec![scalar.clone()],
+                    vec![ArrayType::new_static(DataType::F32, [3])],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Err(TypeError::invalid(
+                "transpose-only linear call transpose output type signature mismatch: \
+                 expected [f32[2]] but got [f32[3]]",
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&vector),
+                &[RegionInterface::new(
+                    vec![scalar.clone()],
+                    vec![ArrayType::new_static(DataType::F64, [2])],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Err(TypeError::invalid(
+                "transpose-only linear call transpose output type signature mismatch: \
+                 expected [f32[2]] but got [f64[2]]",
+            )),
+        );
+
+        // Equal bounds do not equate unrelated identities or erase a repeated-axis relationship.
+        let square = ArrayType::new(DataType::F32, Shape::new(vec![broad.clone().into(), broad.clone().into()]));
+        let operation = LinearCallOperation::transpose_only(0, vec![square.clone()], vec![scalar.clone()]);
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&square),
+                &[RegionInterface::new(
+                    vec![scalar.clone()],
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![other.clone().into(), other.clone().into()]))],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Err(TypeError::invalid(
+                "transpose-only linear call transpose output type signature mismatch: \
+                 expected [f32[broad, broad]] but got [f32[other, other]]",
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&square),
+                &[RegionInterface::new(
+                    vec![scalar],
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![broad.into(), other.into()]))],
+                    EffectClasses::NONE,
+                )],
+            ),
+            Err(TypeError::invalid(
+                "transpose-only linear call transpose output type signature mismatch: \
+                 expected [f32[broad, broad]] but got [f32[broad, other]]",
+            )),
         );
     }
 
@@ -1938,6 +2052,22 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
+        // Specializing the linear input makes it static while the transpose's explicit zero constructor keeps its
+        // exact named extent. Both describe the same cotangent space, so this call remains valid and executable.
+        let exact_dimension =
+            DimensionType::new(DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap()));
+        let specialized = program
+            .clone()
+            .specialize(&[exact_dimension.clone().into(), ArrayType::new_static(DataType::F32, [2]).into()])
+            .unwrap();
+        assert_eq!(specialized.output_types(), vec![ArrayIrType::Array(scalar_type.clone())]);
+        assert_eq!(
+            specialized.interpret(vec![
+                DimensionValue::new(exact_dimension, 2).unwrap().into(),
+                Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[3_f32, 5.]).unwrap().into(),
+            ]),
+            Ok(vec![Array::scalar(0_f32).unwrap().into()]),
+        );
         let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
         for extent in [0, 2] {
             assert_eq!(
