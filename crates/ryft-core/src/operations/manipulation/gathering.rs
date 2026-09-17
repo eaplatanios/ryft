@@ -1639,8 +1639,6 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Gather for Array {
     fn gather(
         &self,
@@ -1658,8 +1656,8 @@ impl Gather for Array {
         let index_vector_dimension = indices_rank - 1;
         let index_vector_extent = indices_shape[index_vector_dimension];
 
-        // Classify input axes (window axes carry the slice; collapsed/batching do not) and output axes (offset
-        // positions carry the window, the rest carry the indices' batch coordinates).
+        // Classify input axes (window axes carry the slice while collapsed/batching do not) and output axes (offset
+        // positions carry the window and the rest carry the indices' batch coordinates).
         let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
         let batching: BTreeSet<usize> =
             dimensions.batching_dimensions().iter().map(|&(input_axis, _)| input_axis).collect();
@@ -1678,6 +1676,7 @@ impl Gather for Array {
         } else {
             None
         };
+
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let indices_addressing = ArrayAddressing::new(indices.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
@@ -1693,6 +1692,7 @@ impl Gather for Array {
             for (position, &output_position) in batch_output_positions.iter().enumerate() {
                 indices_index[indices_batch_axes[position]] = output_index[output_position];
             }
+
             for (component, start) in starts.iter_mut().enumerate() {
                 indices_index[index_vector_dimension] = component;
                 let index_bytes = &indices.storage_bytes()[indices_addressing.byte_range_unchecked(&indices_index)];
@@ -1714,7 +1714,8 @@ impl Gather for Array {
                     _ => unreachable!(),
                 };
             }
-            // Assemble the input multi-index: window offsets, then batching coordinates, then start offsets.
+
+            // Assemble the input multi-index (i.e., window offsets, then batching coordinates, then start offsets).
             input_index.fill(0);
             for (window, &input_axis) in input_window_axes.iter().enumerate() {
                 input_index[input_axis] = output_index[dimensions.offset_dimensions()[window]] as i128;
@@ -1733,11 +1734,14 @@ impl Gather for Array {
                         }
                         input_index[input_axis] += raw;
                     }
-                    // The promise mode leaves out-of-bounds results unspecified. Clamping is a defensive choice that
-                    // keeps every read in bounds; it is not part of the contract.
-                    GatherMode::PromiseInBounds | GatherMode::Clip => input_index[input_axis] += raw.clamp(0, maximum),
+                    GatherMode::PromiseInBounds | GatherMode::Clip => {
+                        // The promise mode leaves out-of-bounds results unspecified. Clamping is a defensive choice
+                        // that keeps every read in bounds, but it is not part of the contract.
+                        input_index[input_axis] += raw.clamp(0, maximum)
+                    }
                 }
             }
+
             let source = if dropped {
                 let (value, addressing) = dropped_fill.as_ref().unwrap();
                 &value.storage_bytes()[addressing.byte_range_for_flat_index(0)]
@@ -1747,14 +1751,17 @@ impl Gather for Array {
                 }
                 &self.storage_bytes()[input_addressing.byte_range_unchecked(&input_storage_index)]
             };
+
             bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
             output_addressing.advance_index(&mut output_index);
         }
+
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
 impl<Stored: Value<Type = ArrayType>, A: Gather<Stored> + Value<Type = ArrayType>> Gather<Stored> for ArrayIrValue<A> {
+    #[inline]
     fn gather(
         &self,
         indices: &Self,
@@ -1768,12 +1775,9 @@ impl<Stored: Value<Type = ArrayType>, A: Gather<Stored> + Value<Type = ArrayType
     }
 }
 
-// Bind homogeneous array values through their context. Mixed tracers use the canonical array projection;
-// requiring a homogeneous type here keeps array-operation trait obligations from becoming recursive.
 impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType>> Gather<Stored> for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<GatherOperation<Stored>>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
 {
     fn gather(
         &self,
@@ -1782,12 +1786,16 @@ where
         slice_sizes: &[usize],
         options: &GatherOptions<Stored>,
     ) -> Result<Self, ProgramError> {
+        // Bind homogeneous array values through their context. Mixed tracers use the canonical array projection;
+        // requiring a homogeneous type here keeps array-operation trait obligations from becoming recursive.
         let operation = GatherOperation::new(dimensions.clone(), slice_sizes.to_vec()).with_options(options.clone());
         let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), indices.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Gathers complete slices with first-class dimensions for the untouched input axes and query shape.
 ///
