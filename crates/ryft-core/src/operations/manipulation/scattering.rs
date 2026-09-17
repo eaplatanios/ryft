@@ -272,7 +272,7 @@ pub struct ScatterOperation {
 
 impl ScatterOperation {
     /// Creates a new [`ScatterOperation`] with the provided dimension numbers and combiner kind. The mode defaults to
-    /// [`ScatterMode::PromiseInBounds`] and both index hints default to `false`; use the chained `with_*`
+    /// [`ScatterMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
     /// builders to override them.
     ///
     /// # Parameters
@@ -309,14 +309,17 @@ impl ScatterOperation {
         self.mode
     }
 
-    /// Returns whether the caller guarantees that the index vectors are sorted. This is a lowering hint only.
+    /// Returns whether the caller promises that the index vectors are sorted. This property is not checked.
+    /// Implementations and transformations may rely on it; `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.indices_are_sorted
     }
 
-    /// Returns whether the caller guarantees that the scattered windows do not overlap. This is a lowering hint and is
-    /// required for multiplication derivatives with respect to updates.
+    /// Returns whether the caller promises that the scattered windows do not overlap. This property is not checked.
+    /// Implementations and transformations may rely on it; `false` makes no such promise. In particular, uniqueness
+    /// permits direct linear rules for overwrite scatter and is required for multiplication derivatives with respect
+    /// to updates.
     #[inline]
     pub fn unique_indices(&self) -> bool {
         self.unique_indices
@@ -347,15 +350,18 @@ impl ScatterOperation {
         self
     }
 
-    /// Promises that start-index vectors are sorted. Backends may use this promise to optimize indexing; the
-    /// function does not sort or validate the indices.
+    /// Returns a copy of this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
         self.indices_are_sorted = indices_are_sorted;
         self
     }
 
-    /// Promises that update windows do not overlap. Backends may use this promise to simplify execution.
+    /// Returns a copy of this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When
+    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
     /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
@@ -635,7 +641,7 @@ impl ScatterOperation {
             dual_gather = dual_gather.with_output_sharding(update_ids_type.sharding().cloned());
             if self.mode() == ScatterMode::Drop {
                 // A dropped window must not match any positive ID, so pin a zero fill instead of gather's default.
-                dual_gather = dual_gather.with_mode(GatherMode::Fill { value: Some(Array::scalar(0u64)?) });
+                dual_gather = dual_gather.with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(0u64)?)) });
             }
             let gathered_ids = gather(context, &scattered_ids, indices, &dual_gather)?;
             let input_ids = align(context, &scattered_ids, zero_ids.r#type().as_ref())?;
@@ -850,7 +856,7 @@ where
                 .with_batching_dimensions(input_batching_dimensions, indices_batching_dimensions),
             )
         };
-        // The index hints stay valid in both cases: with replicated indices every item writes into its own slice of
+        // The index promises stay valid in both cases: with replicated indices every item writes into its own slice of
         // the new leading window axis, and with mapped indices the paired batching axes keep every item's windows
         // within its own input, so windows that were disjoint stay disjoint.
         let operation = Self::new(lifted_dimensions, self.kind())
@@ -1016,7 +1022,7 @@ impl_differentiable_operation! {
             // Dropped updates have zero derivative, independent of gather's default replacement value.
             if operation.mode() == ScatterMode::Drop {
                 gather_operation = gather_operation.with_mode(GatherMode::Fill {
-                    value: Some(EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?),
+                    value: Some(Box::new(EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?)),
                 });
             }
             let update_cotangents =
