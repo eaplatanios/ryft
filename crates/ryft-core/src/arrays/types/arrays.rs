@@ -158,11 +158,37 @@ impl ArrayType {
         self
     }
 
-    /// Constructs a new "scalar" [`ArrayType`] with the provided [`DataType`]. The resulting [`ArrayType::shape`]
+    /// Constructs a new scalar [`ArrayType`] with the provided [`DataType`]. The resulting [`ArrayType::shape`]
     /// will be a scalar (i.e., have rank 0).
     #[inline]
     pub fn scalar(data_type: DataType) -> Self {
         Self { data_type, shape: Shape::scalar(), layout: None, sharding: None, memory: Memory::default() }
+    }
+
+    /// Returns a scalar [`ArrayType`] with this array's element [`DataType`], [`Memory`] space, and mesh-level
+    /// [`Sharding`] metadata. Unlike [`Self::scalar`], this function derives those properties from an existing
+    /// [`ArrayType`]. The result has rank zero and no [`Layout`]. If this array type is sharded, the result keeps its
+    /// mesh, reduced and unreduced mesh axes, and varying manual axes, but has no per-dimension sharding because it has
+    /// no dimensions. An unsharded array produces an unsharded scalar. This is useful for constructing scalar fill
+    /// values or zeros that must share an array's distributed dependencies without retaining its shape or storage
+    /// layout.
+    pub fn scalar_like(&self) -> Result<Self, TypeError> {
+        ArrayType::scalar(self.data_type())
+            .with_memory(self.memory())
+            .with_sharding(
+                self.sharding()
+                    .map(|sharding| {
+                        Sharding::replicated(sharding.mesh().clone(), 0)
+                            .with_unreduced_axes(sharding.unreduced_axes().clone())
+                            .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                            .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                            .map_err(|error| {
+                                TypeError::invalid(format!("scalar sharding construction failed: {error}"))
+                            })
+                    })
+                    .transpose()?,
+            )
+            .map_err(|error| TypeError::invalid(format!("scalar type is invalid: {error}")))
     }
 
     /// Returns the [`DataType`] of the elements stored in the array.
@@ -847,6 +873,58 @@ mod tests {
         let dimensions = &[2, 3][..];
         assert_eq!(ArrayType::new_static(Boolean, []), ArrayType::new(Boolean, Shape::scalar()));
         assert_eq!(ArrayType::new_static(F32, dimensions), ArrayType::new(F32, StaticShape::new(vec![2, 3]).into()));
+    }
+
+    #[test]
+    fn test_array_type_scalar_like() {
+        // The scalar keeps the source's data type, memory, mesh, and distributed dependency metadata,
+        // but neither its shape nor its layout.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let plain_source = ArrayType::new_static(F64, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![1, 2])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(plain_source.scalar_like(), Ok(ArrayType::scalar(F64).with_memory(Memory::Host { pinned: true })),);
+        let unreduced_source = ArrayType::new_static(F32, [4])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_unreduced_axes(["m"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            unreduced_source.scalar_like(),
+            Ok(ArrayType::scalar(F32)
+                .with_sharding(Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["m"]).unwrap())
+                .unwrap()),
+        );
+        let reduced_source = ArrayType::new_static(F32, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["m"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            reduced_source.scalar_like(),
+            Ok(ArrayType::scalar(F32)
+                .with_sharding(Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["m"]).unwrap())
+                .unwrap()),
+        );
+        let varying_source = ArrayType::new_static(F32, [4])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["m"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            varying_source.scalar_like(),
+            Ok(ArrayType::scalar(F32)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap()),
+        );
     }
 
     #[test]

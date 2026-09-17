@@ -72,6 +72,43 @@ pub struct ConcatenateOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
+impl<T: Type> ConcatenateOperation<T> {
+    /// Returns the axis along which this [`ConcatenateOperation`] joins its inputs.
+    #[inline]
+    pub fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Normalizes `axis` against inputs of rank `rank`, reporting the shared out-of-bounds diagnostic.
+    fn normalize_axis(axis: Axis, rank: usize) -> Result<usize, TypeError> {
+        axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` axis {axis} is out of bounds for inputs of rank {rank}",
+            ))
+        })
+    }
+
+    /// Renders this payload independently of its homogeneous or composite operation contract. This is a separate
+    /// function rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads
+    /// have separate [`Operation`] implementations that must render identically, and both must forward their
+    /// `indentation` so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence
+    /// over trait functions during method resolution, so the `self.render(...)` calls in those implementations and in
+    /// the [`Display`] implementation, which exists only for those two payloads, resolve to this function rather than
+    /// recursing into [`Operation::render`]. The runtime-assertion classification is rendered only when it is set,
+    /// because it decides this operation's effects and is not recoverable from the rendered input types: a signature
+    /// that proves the result extent may still carry the assertion (which is what the conversion from the homogeneous
+    /// payload produces).
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis", self.axis)?;
+            if self.requires_runtime_assertion {
+                operation.field("requires_runtime_assertion", true)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl ConcatenateOperation<ArrayType> {
     /// Creates a new [`ConcatenateOperation`] that joins rank-`rank` inputs along `axis`.
     #[inline]
@@ -175,43 +212,6 @@ impl ConcatenateOperation<ArrayIrType> {
         let requires_runtime_assertion =
             static_sum.is_none() && !(inputs.len() == 1 && first.dimension(axis) == result_extent.to_dimension());
         Ok((axis, output_type, requires_runtime_assertion))
-    }
-}
-
-impl<T: Type> ConcatenateOperation<T> {
-    /// Returns the axis along which this [`ConcatenateOperation`] joins its inputs.
-    #[inline]
-    pub fn axis(&self) -> usize {
-        self.axis
-    }
-
-    /// Normalizes `axis` against inputs of rank `rank`, reporting the shared out-of-bounds diagnostic.
-    fn normalize_axis(axis: Axis, rank: usize) -> Result<usize, TypeError> {
-        axis.normalize(rank).map_err(|_| {
-            TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` axis {axis} is out of bounds for inputs of rank {rank}",
-            ))
-        })
-    }
-
-    /// Renders this payload independently of its homogeneous or composite operation contract. This is a separate
-    /// function rather than the body of [`Operation::render`] because the [`ArrayType`] and [`ArrayIrType`] payloads
-    /// have separate [`Operation`] implementations that must render identically, and both must forward their
-    /// `indentation` so that [`OperationFormatter`] can lay out continuation lines. Inherent functions take precedence
-    /// over trait functions during method resolution, so the `self.render(...)` calls in those implementations and in
-    /// the [`Display`] implementation, which exists only for those two payloads, resolve to this function rather than
-    /// recursing into [`Operation::render`]. The runtime-assertion classification is rendered only when it is set,
-    /// because it decides this operation's effects and is not recoverable from the rendered input types: a signature
-    /// that proves the result extent may still carry the assertion (which is what the conversion from the homogeneous
-    /// payload produces).
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis", self.axis)?;
-            if self.requires_runtime_assertion {
-                operation.field("requires_runtime_assertion", true)?;
-            }
-            Ok(())
-        })
     }
 }
 

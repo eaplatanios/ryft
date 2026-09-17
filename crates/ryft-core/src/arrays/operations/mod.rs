@@ -3100,7 +3100,7 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap().into()),
+                ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap()),
                 MemberKindSignature::GeometryMixed,
             ),
             (
