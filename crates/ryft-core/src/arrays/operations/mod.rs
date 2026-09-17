@@ -936,35 +936,18 @@ where
                     return Ok(output);
                 }
 
-                // A projected array rule can return a structural zero even when its result has runtime extents. Use
-                // the primal result as its geometry exemplar before lifting the dual into the composite family.
-                let (primal, _) = output.into_parts();
-                let tangent_array_type = <&ArrayType>::try_from(&tangent_type)?;
-                let primal_type = primal.r#type();
-                let primal_data_type = <&ArrayType>::try_from(primal_type.as_ref())?.data_type();
+                // A projected rule can return a structural zero whose shape still has runtime extents. Capture
+                // those extents from the primal in the tangent context, then let the mixed family's residual-zero
+                // protocol construct the tangent with its own element type. For example, transposing integer
+                // indices of shape [1, items, 1] produces a zero-typed tangent of shape [items, 1, 1]: converting
+                // the integer primal to `zero` is invalid, but its runtime `items` extent still defines that zero.
+                let (primal, tangent) = output.into_parts();
                 let tangent_primal = context.primal_to_tangent(primal.clone())?;
-                let exemplar = if tangent_array_type.data_type() == primal_data_type {
-                    tangent_primal.clone()
-                } else {
-                    context
-                        .tangent()
-                        .bind(
-                            ArrayIrOperation::<A>::Array(ArrayOperation::ConvertElementType(
-                                ConvertElementTypeOperation::new(tangent_array_type.data_type(), false),
-                            )),
-                            Vec::new(),
-                            std::slice::from_ref(&tangent_primal),
-                        )?
-                        .remove(0)
-                };
-                let tangent = context
-                    .tangent()
-                    .bind(
-                        ArrayIrOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
-                        Vec::new(),
-                        &[exemplar],
-                    )?
-                    .remove(0);
+                let tangent = C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
+                    tangent,
+                    std::iter::once(&tangent_primal),
+                )?;
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent))
             })
             .collect()
@@ -2419,22 +2402,9 @@ mod tests {
             )
             .unwrap();
 
-        // The projected constant derivative uses its primal result as the runtime-shape exemplar, then widens the
-        // element type to the tangent representation. No type-only dynamic zero is present in the fused JVP.
+        // The projected constant derivative reads the runtime extent from its primal result and constructs a zero
+        // in the wider tangent representation, without converting the primal's element data.
         let jvp = program.jvp().unwrap();
-        assert!(jvp.instructions().iter().any(|instruction| matches!(
-            instruction.operation(),
-            ArrayIrOperation::Array(ArrayOperation::ZeroLike(_))
-        )));
-        assert!(jvp.instructions().iter().any(|instruction| matches!(
-            instruction.operation(),
-            ArrayIrOperation::Array(ArrayOperation::ConvertElementType(_))
-        )));
-        assert!(
-            !jvp.instructions()
-                .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
-        );
 
         let primal = Array::from_elements::<f8e8m0fnu>(
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)])),
@@ -2449,6 +2419,55 @@ mod tests {
                 ArrayIrValue::Array(expected_primal),
                 ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap()),
             ]),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_dynamic_projected_jvp_preserves_zero_space_tangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![1.into(), Dimension::Dynamic(extent.clone()), 1.into()]));
+        // Invoke the member rule directly: the program-level all-zero fast path deliberately bypasses it. Integer
+        // primals have a zero differential space, and their structural tangents retain the permuted symbolic shape.
+        // Handling that shape must not attempt an invalid conversion from integers to the `zero` element type.
+        let (_, jvp) = TracingContext::<TestValue, TestOperation>::trace(
+            |input| {
+                let context = DifferentiationContext::fused(input.context().clone());
+                let output = ArrayOperation::<Array>::Transpose(TransposeOperation::new([1, 0, 2]))
+                    .jvp_in_parent(
+                        &context,
+                        &EmptyRegionDriver,
+                        &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+                    )
+                    .unwrap()
+                    .remove(0);
+                assert!(matches!(
+                    output.tangent(),
+                    MaybeZero::Zero(r#type) if r#type == &ArrayIrType::Array(ArrayType::new(
+                        DataType::Zero,
+                        Shape::new(vec![Dimension::Dynamic(extent.clone()), 1.into(), 1.into()]),
+                    )),
+                ));
+                Ok(output.primal().clone())
+            },
+            ArrayIrType::Array(input_type),
+        )
+        .unwrap();
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [3, 1, 1]), &[2_i32, 0, 1]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            jvp.interpret(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [1, 0, 1]), &[] as &[i32]).unwrap(),
+            )),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [0, 1, 1]), &[] as &[i32]).unwrap(),
+            )),
         );
     }
 

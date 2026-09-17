@@ -755,10 +755,36 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        // The severed operand's tangent is staged as `zero_like` over its own primal, which pins the runtime extent.
+        // The severed operand's tangent reads its own primal's runtime extent before constructing the dynamic zero.
         let jvp = program.jvp().unwrap();
-        let rendered = jvp.to_string();
-        assert!(rendered.contains("zero_like"), "{rendered}");
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:f64[extent], \
+                    %4:f64[extent], %5:f64[extent] .
+                let %6:f64[extent] = stop_gradient %3
+                    %7:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %6
+                    %8:f64[extent] = zero [type=f64[extent]] %7
+                    %9:dimension<extent ∈ [1, 8)>, %10:f64[extent], %11:f64[extent] = condition %0 %1 %2 %6 %4 %8 [
+                        true={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
+                                %3:f64[extent], %4:f64[extent] .
+                            let %5:f64[extent] = add %1 %2
+                                %6:f64[extent] = add %3 %4
+                            in (%0, %5, %6)
+                        },
+                        false={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
+                                %3:f64[extent], %4:f64[extent] .
+                            let %5:f64[extent] = add %1 %2
+                                %6:f64[extent] = add %3 %4
+                            in (%0, %5, %6)
+                        },
+                    ]
+                in (%10, %11)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             jvp.interpret(vec![
                 array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),

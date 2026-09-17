@@ -6,7 +6,8 @@
 //! [`ScatterOperation`](crate::operations::ScatterOperation). Broadcast signed integer query components to a common
 //! shape, append their index-vector axis, then concatenate the components. Use
 //! [`SelectOperation`](crate::operations::SelectOperation) to replace an inactive query with a negative index and
-//! [`GatherScatterMode::FillOrDrop`](crate::operations::GatherScatterMode::FillOrDrop) to fill loads or drop stores.
+//! [`GatherMode::Fill`](crate::operations::GatherMode::Fill) to fill loads or
+//! [`ScatterMode::Drop`](crate::operations::ScatterMode::Drop) to drop stores.
 //! Negative indices never wrap to the opposite array edge. Gather's explicit scalar fill preserves its exact encoding.
 //!
 //! Read the qualified reference with [`ReferenceRead`](crate::operations::ReferenceRead) before gathering or
@@ -192,9 +193,9 @@ mod tests {
     use crate::kernels::operations::KernelOperation;
     use crate::kernels::validation::{KernelParameterAccess, KernelValidationError};
     use crate::operations::{
-        AddOperation, BroadcastOperation, ConcatenateOperation, DotOperation, GatherDimensionNumbers, GatherOperation,
-        GatherScatterMode, ReferenceReadOperation, ReferenceWriteOperation, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, SelectOperation,
+        AddOperation, BroadcastOperation, ConcatenateOperation, DotOperation, GatherDimensionNumbers, GatherFillValue,
+        GatherMode, GatherOperation, ReferenceReadOperation, ReferenceWriteOperation, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ReferenceType};
@@ -258,7 +259,7 @@ mod tests {
                     .unwrap()[0],
             );
         }
-        // FillOrDrop treats the negative sentinel as invalid; it never wraps to the final source row.
+        // Fill and drop modes treat the negative sentinel as invalid; it never wraps to the final source row.
         let rows = builder
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Select(SelectOperation::new())),
@@ -281,9 +282,9 @@ mod tests {
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Gather(
                     GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0, 1], vec![0, 1]), vec![1, 1])
-                        .with_mode(GatherScatterMode::FillOrDrop)
-                        .with_fill_value(Array::scalar(-7i32).unwrap())
-                        .unwrap(),
+                        .with_mode(GatherMode::Fill {
+                            value: Some(GatherFillValue::from_array(Array::scalar(-7i32).unwrap()).unwrap()),
+                        }),
                 )),
                 vec![],
                 vec![values[0], indices],
@@ -305,7 +306,7 @@ mod tests {
                         ScatterDimensionNumbers::new(vec![], vec![0, 1], vec![0, 1]),
                         ScatterReductionKind::Overwrite,
                     )
-                    .with_mode(GatherScatterMode::FillOrDrop),
+                    .with_mode(ScatterMode::Drop),
                 )),
                 vec![],
                 vec![values[0], indices, updates],
