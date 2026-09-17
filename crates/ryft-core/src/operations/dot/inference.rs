@@ -1,22 +1,5 @@
 use super::*;
 
-/// Returns whether `dimension` is sharded over at least one [`MeshAxisType::Explicit`] mesh axis of `mesh`.
-///
-/// The explicit-mode dot sharding rules — contracting-dimension ambiguity, batch-dimension consistency, and the
-/// unreduced-operand rejection — apply only to Explicit axes. [`MeshAxisType::Manual`] axes are managed by the user
-/// inside `shard_map` (a local per-shard dot over a manual-sharded contracting dimension is ordinary, not
-/// ambiguous), and [`MeshAxisType::Auto`] axes are left to the compiler's propagation. A dimension sharded only over
-/// those axis types therefore passes through these checks, mirroring how JAX gates its trace-time sharding rules to
-/// Explicit mesh axes.
-fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &ShardingDimension) -> bool {
-    match dimension {
-        ShardingDimension::Sharded(axis_names) => {
-            axis_names.iter().any(|axis_name| mesh.axis_type(axis_name) == Some(MeshAxisType::Explicit))
-        }
-        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-    }
-}
-
 /// Merges the [`ShardingDimension`]s of one aligned batch dimension pair, preferring the more informative entry
 /// (`Sharded` over `Replicated` over `Unconstrained`). Returns [`None`] when the two entries are sharded over
 /// different mesh axes, which the caller reports as an inconsistent-sharding error. Note that preferring a one-sided
@@ -377,12 +360,11 @@ pub(crate) fn dot_abstract(
             let right = dimension_of(rhs_sharding, *rhs_axis);
             // Only Explicit-axis sharding of both contracting operands triggers the ambiguity/consistency errors;
             // Manual/Auto contracting shardings fall through (handled by `shard_map` / the compiler).
-            let both_explicitly_sharded =
-                dimension_has_explicit_axis(mesh, &left) && dimension_has_explicit_axis(mesh, &right);
+            let both_explicitly_sharded = left.has_explicit_axis(mesh) && right.has_explicit_axis(mesh);
             if both_explicitly_sharded {
                 let (ShardingDimension::Sharded(left_axes), ShardingDimension::Sharded(right_axes)) = (&left, &right)
                 else {
-                    unreachable!("dimension_has_explicit_axis only returns true for sharded dimensions")
+                    unreachable!("has_explicit_axis only returns true for sharded dimensions")
                 };
                 if left_axes != right_axes {
                     return Err(TypeError::invalid(format!(
@@ -409,7 +391,7 @@ pub(crate) fn dot_abstract(
                 Some(merged) => merged,
                 // A batch-dimension conflict is an error only when an Explicit axis is involved; a conflict purely over
                 // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
-                None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
+                None if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) => {
                     return Err(TypeError::invalid(format!(
                         "`{DOT_OPERATION_NAME}` batching dimensions must have consistent shardings, but got {left} and {right}"
                     )));

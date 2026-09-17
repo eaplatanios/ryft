@@ -32,8 +32,7 @@ use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::gathering::{
-    GatherDimensionNumbers, GatherMode, GatherOperation, dimension_has_explicit_axis, dimensions_have_equal_extents,
-    validate_sorted_unique_in_range, validate_unique_in_range,
+    GatherDimensionNumbers, GatherMode, GatherOperation, validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use crate::operations::manipulation::reshaping::{
     DynamicReshape, Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
@@ -1565,7 +1564,7 @@ impl Scatter for ArrayType {
         let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
-            if !dimensions_have_equal_extents(&updates.dimension(update_axis), &indices.dimension(indices_axis)) {
+            if !updates.dimension(update_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` updates scatter axis {update_axis} must match indices batch axis \
                          {indices_axis} in extent"
@@ -1580,7 +1579,7 @@ impl Scatter for ArrayType {
             .iter()
             .zip(dimensions.scatter_indices_batching_dimensions())
         {
-            if !dimensions_have_equal_extents(&input.dimension(input_axis), &indices.dimension(indices_axis)) {
+            if !input.dimension(input_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
                          {input_axis} and indices axis {indices_axis} differ"
@@ -1693,7 +1692,7 @@ impl Scatter for ArrayType {
                 };
                 if input.dimension(axis) != window_extent
                     && input.dimension(axis) != Dimension::Static(0)
-                    && dimension_has_explicit_axis(&mesh, &input_sharding.dimensions()[axis])
+                    && input_sharding.dimensions()[axis].has_explicit_axis(&mesh)
                 {
                     return Err(TypeError::invalid(format!(
                         "`{SCATTER_OPERATION_NAME}` input axis {axis} is targeted by the start indices and must be \
@@ -1704,7 +1703,7 @@ impl Scatter for ArrayType {
                 }
             }
             if let Some(indices_sharding) = indices.sharding()
-                && dimension_has_explicit_axis(&mesh, &indices_sharding.dimensions()[index_vector_dimension])
+                && indices_sharding.dimensions()[index_vector_dimension].has_explicit_axis(&mesh)
             {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit \

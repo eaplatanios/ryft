@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType,
-    RaggedArrayExtentBatchingPolicy, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, Dimension, MeshAxisType, RaggedArrayExtentBatchingPolicy,
+    Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{

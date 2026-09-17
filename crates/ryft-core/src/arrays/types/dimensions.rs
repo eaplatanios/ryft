@@ -541,6 +541,21 @@ impl Dimension {
         self.bounds().upper()
     }
 
+    /// Returns whether this [`Dimension`] and `other` _provably_ have the same extent. Equal dimensions have equal
+    /// extents, including occurrences of the same symbolic variable. Distinct dimensions also have equal extents when
+    /// their bounds both identify the same single integer. For example, a dynamic dimension with bounds `[3, 4)` and
+    /// a static dimension of size three. Matching non-singleton bounds do not prove equality between independent
+    /// variables. A `false` result means equality is unproven, not that the runtime extents necessarily differ.
+    /// Unlike [`Self::is_refined_by`], this comparison is symmetric and proves equality rather than checking whether
+    /// one dimension is an allowed specialization of another.
+    #[inline]
+    pub fn has_equal_extents(&self, other: &Self) -> bool {
+        let bounds = self.bounds();
+        self == other
+            || (bounds == other.bounds()
+                && bounds.upper().is_some_and(|upper| bounds.lower().checked_add(1) == Some(upper)))
+    }
+
     /// Returns `true` if `other` is a valid refinement of this dimension. Static dimensions can only be refined by
     /// static dimensions with the same value. Dynamic dimensions can be refined by static extents within their bounds
     /// or by dynamic dimensions that are represented by the same symbolic [`DimensionVariable`]. That is because a
@@ -1086,6 +1101,19 @@ mod tests {
         assert_eq!(Dimension::Static(42).upper_bound(), Some(43));
         assert_eq!(Dimension::Dynamic(unbounded).upper_bound(), None);
         assert_eq!(Dimension::Dynamic(bounded).upper_bound(), Some(42));
+    }
+
+    #[test]
+    fn test_dimension_has_equal_extents() {
+        let variable = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic = Dimension::Dynamic(variable);
+        let independent = Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap()));
+        let exact = Dimension::Dynamic(DimensionVariable::new("exact", DimensionBounds::new(3, Some(4)).unwrap()));
+        assert!(dynamic.has_equal_extents(&dynamic));
+        assert!(!dynamic.has_equal_extents(&independent));
+        assert!(exact.has_equal_extents(&Dimension::Static(3)));
+        assert!(Dimension::Static(3).has_equal_extents(&exact));
+        assert!(!exact.has_equal_extents(&Dimension::Static(4)));
     }
 
     #[test]

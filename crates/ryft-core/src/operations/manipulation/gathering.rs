@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, LogicalMesh, MeshAxisType, Shape,
-    Sharding, ShardingDimension,
+    ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape, Sharding,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1413,7 +1413,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 
         // Batch-dimension extents must match between input and indices.
         for &(input_axis, indices_axis) in dimensions.batching_dimensions() {
-            if !dimensions_have_equal_extents(&input.dimension(input_axis), &indices.dimension(indices_axis)) {
+            if !input.dimension(input_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
                      {input_axis} and indices axis {indices_axis} differ"
@@ -1542,7 +1542,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             if let Some(sharding) = input_sharding {
                 for &axis in &replicated_operand_axes {
                     if input.dimension(axis) != Dimension::Static(slice_sizes[axis])
-                        && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis])
+                        && sharding.dimensions()[axis].has_explicit_axis(&mesh)
                     {
                         return Err(TypeError::invalid(format!(
                             "`{GATHER_OPERATION_NAME}` input axis {axis} is indexed by the start indices and must \
@@ -1555,7 +1555,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             }
 
             if let Some(sharding) = indices_sharding
-                && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension])
+                && sharding.dimensions()[index_vector_dimension].has_explicit_axis(&mesh)
             {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit \
@@ -1568,8 +1568,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             // start index is implicit zero rather than supplied in the index vector.
             for &axis in &input_offset_axes {
                 if input.dimension(axis) != Dimension::Static(slice_sizes[axis])
-                    && input_sharding
-                        .is_some_and(|sharding| dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis]))
+                    && input_sharding.is_some_and(|sharding| sharding.dimensions()[axis].has_explicit_axis(&mesh))
                 {
                     return Err(TypeError::invalid(format!(
                         "`{GATHER_OPERATION_NAME}` partial sharded windows require explicit output sharding",
@@ -1926,26 +1925,6 @@ where
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns whether two indexing dimensions provably have the same extent.
-///
-/// Nominally equal dimensions are equal without additional evidence. Distinct dimensions are equal only when both
-/// bounds describe the same single integer, for example a retained `n` with bounds `[0, 1)` and a static zero. This
-/// occurs when specialization retains an index-array signature but materializes a concrete-shaped zero cotangent.
-/// Equal non-singleton bounds never establish equality between independent nominal dimensions.
-pub(crate) fn dimensions_have_equal_extents(left: &Dimension, right: &Dimension) -> bool {
-    let bounds = left.bounds();
-    left == right
-        || (bounds == right.bounds()
-            && bounds.upper().is_some_and(|upper| bounds.lower().checked_add(1) == Some(upper)))
-}
-
-/// Returns whether `dimension` is sharded over at least one explicit mesh axis of `mesh` (the explicit-axis gate of
-/// the gather and scatter sharding rules). Shared with [`super::scattering`].
-pub(crate) fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &ShardingDimension) -> bool {
-    matches!(dimension, ShardingDimension::Sharded(axis_names)
-        if axis_names.iter().any(|name| mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
-}
 
 /// Validates that `axes` is strictly ascending (sorted and unique) and that every entry is in `0..bound`. Shared with
 /// [`super::scattering`].
@@ -4477,34 +4456,6 @@ mod tests {
             program.interpret((four_rows, no_queries)),
             Ok(ArrayIrValue::Array(Array::matrix(4, 0, Vec::<f64>::new()).unwrap())),
         );
-    }
-
-    #[test]
-    fn test_dimensions_have_equal_extents() {
-        let variable = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic = Dimension::Dynamic(variable);
-        let independent = Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap()));
-        let exact = Dimension::Dynamic(DimensionVariable::new("exact", DimensionBounds::new(3, Some(4)).unwrap()));
-        assert!(dimensions_have_equal_extents(&dynamic, &dynamic));
-        assert!(!dimensions_have_equal_extents(&dynamic, &independent));
-        assert!(dimensions_have_equal_extents(&exact, &Dimension::Static(3)));
-        assert!(dimensions_have_equal_extents(&Dimension::Static(3), &exact));
-        assert!(!dimensions_have_equal_extents(&exact, &Dimension::Static(4)));
-    }
-
-    #[test]
-    fn test_dimension_has_explicit_axis() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        assert!(dimension_has_explicit_axis(&mesh, &ShardingDimension::sharded(["x"])));
-        assert!(dimension_has_explicit_axis(&mesh, &ShardingDimension::sharded(["m", "x"])));
-        assert!(!dimension_has_explicit_axis(&mesh, &ShardingDimension::sharded(["m"])));
-        assert!(!dimension_has_explicit_axis(&mesh, &ShardingDimension::sharded(["a"])));
-        assert!(!dimension_has_explicit_axis(&mesh, &ShardingDimension::Replicated));
     }
 
     #[test]

@@ -56,6 +56,17 @@ impl ShardingDimension {
             Self::Replicated | Self::Unconstrained => Vec::new(),
         }
     }
+
+    /// Returns whether this [`ShardingDimension`] partitions along at least one [`MeshAxisType::Explicit`] axis
+    /// of `mesh`. Axis types are resolved in the supplied mesh because a sharded dimension stores only axis names.
+    /// Replicated and unconstrained dimensions return `false`, as do dimensions partitioned only along manual or
+    /// automatic axes. Names absent from the mesh do not count as explicit axes; this function does not validate
+    /// that the sharding dimension is valid for the mesh.
+    #[inline]
+    pub fn has_explicit_axis(&self, mesh: &LogicalMesh) -> bool {
+        matches!(self, Self::Sharded(axis_names)
+            if axis_names.iter().any(|name| mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
+    }
 }
 
 impl Display for ShardingDimension {
@@ -593,12 +604,8 @@ impl Sharding {
         if self.dimensions.len() != other.dimensions.len() {
             return true;
         }
-        let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
-            matches!(dimension, ShardingDimension::Sharded(axis_names)
-                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
-        };
         for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
-            if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
+            if left != right && (left.has_explicit_axis(&self.mesh) || right.has_explicit_axis(&self.mesh)) {
                 return true;
             }
         }
@@ -716,6 +723,23 @@ mod tests {
         assert!(ShardingDimension::sharded(["data"]).manual_axes(&mesh).is_empty());
         assert!(ShardingDimension::replicated().manual_axes(&mesh).is_empty());
         assert!(ShardingDimension::unconstrained().manual_axes(&mesh).is_empty());
+    }
+
+    #[test]
+    fn test_sharding_dimension_has_explicit_axis() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        assert!(ShardingDimension::sharded(["x"]).has_explicit_axis(&mesh));
+        assert!(ShardingDimension::sharded(["m", "x"]).has_explicit_axis(&mesh));
+        assert!(!ShardingDimension::sharded(["m"]).has_explicit_axis(&mesh));
+        assert!(!ShardingDimension::sharded(["a"]).has_explicit_axis(&mesh));
+        assert!(!ShardingDimension::Replicated.has_explicit_axis(&mesh));
+        assert!(!ShardingDimension::Unconstrained.has_explicit_axis(&mesh));
+        assert!(!ShardingDimension::sharded(["unknown"]).has_explicit_axis(&mesh));
     }
 
     #[test]
