@@ -61,13 +61,13 @@ pub const SLICE_OPERATION_NAME: &str = "slice";
 /// accumulator. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SliceOperation {
-    /// Inclusive start index for each input axis.
+    /// Refer to the documentation of [`Self::start_indices`] for more information.
     start_indices: Vec<usize>,
 
-    /// Exclusive limit index for each input axis.
+    /// Refer to the documentation of [`Self::limit_indices`] for more information.
     limit_indices: Vec<usize>,
 
-    /// Stride for each input axis (every stride is at least `1`).
+    /// Refer to the documentation of [`Self::strides`] for more information.
     strides: Vec<usize>,
 }
 
@@ -92,7 +92,7 @@ impl SliceOperation {
         self.limit_indices.as_slice()
     }
 
-    /// Returns the strides of this [`SliceOperation`], one per input axis.
+    /// Returns the strides of this [`SliceOperation`], one per input axis. Every stride is at least `1`.
     #[inline]
     pub fn strides(&self) -> &[usize] {
         self.strides.as_slice()
@@ -780,7 +780,7 @@ pub const UPDATE_SLICE_OPERATION_NAME: &str = "update_slice";
 /// indices. Refer to the documentation of [`UpdateSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UpdateSliceOperation {
-    /// Inclusive start index for each input axis at which the update is written.
+    /// Refer to the documentation of [`Self::start_indices`] for more information.
     start_indices: Vec<usize>,
 }
 
@@ -791,7 +791,8 @@ impl UpdateSliceOperation {
         Self { start_indices }
     }
 
-    /// Returns the inclusive start indices of this [`UpdateSliceOperation`], one per input axis.
+    /// Returns the inclusive start indices at which this [`UpdateSliceOperation`] writes the update, one per input
+    /// axis.
     #[inline]
     pub fn start_indices(&self) -> &[usize] {
         self.start_indices.as_slice()
@@ -1121,7 +1122,7 @@ pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 /// eager execution. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation {
-    /// Dimension of the extracted slice along each input axis.
+    /// Refer to the documentation of [`Self::sizes`] for more information.
     sizes: Vec<usize>,
 }
 
@@ -1132,7 +1133,7 @@ impl DynamicSliceOperation {
         Self { sizes }
     }
 
-    /// Returns the slice sizes of this [`DynamicSliceOperation`], one per input axis.
+    /// Returns the size of the extracted slice along each input axis.
     #[inline]
     pub fn sizes(&self) -> &[usize] {
         self.sizes.as_slice()
@@ -2344,7 +2345,7 @@ pub const DYNAMIC_SHAPE_SLICE_OPERATION_NAME: &str = "dynamic_shape_slice";
 /// leave bounds validation to execution; an unused result does not make an invalid slice unobservable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicShapeSliceOperation {
-    /// Static stride applied along each sliced axis.
+    /// Refer to the documentation of [`Self::strides`] for more information.
     strides: Vec<usize>,
 }
 

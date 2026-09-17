@@ -148,23 +148,19 @@ impl Display for ScatterReductionKind {
 /// shape as the input.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ScatterDimensionNumbers {
-    /// Axes of the updates input that hold a scattered window, in ascending order. Their count equals the number of
-    /// input axes that are neither inserted nor batching.
+    /// Refer to the documentation of [`Self::update_window_dimensions`] for more information.
     update_window_dimensions: Vec<usize>,
 
-    /// Input axes whose window size is `1` and that have no corresponding updates axis, in ascending order.
+    /// Refer to the documentation of [`Self::inserted_window_dimensions`] for more information.
     inserted_window_dimensions: Vec<usize>,
 
-    /// For each component of a start-index vector (the last axis of the indices input), the input axis it scatters
-    /// into. Its length equals the extent of the indices' index vector dimension.
+    /// Refer to the documentation of [`Self::scatter_dimensions_to_operand_dimensions`] for more information.
     scatter_dimensions_to_operand_dimensions: Vec<usize>,
 
-    /// Input axes batched against [`scatter_indices_batching_dimensions`](Self::scatter_indices_batching_dimensions),
-    /// aligned 1:1, in ascending order.
+    /// Refer to the documentation of [`Self::operand_batching_dimensions`] for more information.
     operand_batching_dimensions: Vec<usize>,
 
-    /// Indices axes (other than the index vector dimension) that align 1:1 with
-    /// [`operand_batching_dimensions`](Self::operand_batching_dimensions).
+    /// Refer to the documentation of [`Self::scatter_indices_batching_dimensions`] for more information.
     scatter_indices_batching_dimensions: Vec<usize>,
 }
 
@@ -193,31 +189,35 @@ impl ScatterDimensionNumbers {
         }
     }
 
-    /// Returns the updates window axes.
+    /// Returns the axes of the updates input that hold a scattered window, in ascending order. Their count equals the
+    /// number of input axes that are neither inserted nor batching.
     #[inline]
     pub fn update_window_dimensions(&self) -> &[usize] {
         &self.update_window_dimensions
     }
 
-    /// Returns the inserted (size-1, input-only) axes.
+    /// Returns the input axes whose window size is `1` and that have no corresponding updates axis, in ascending order.
     #[inline]
     pub fn inserted_window_dimensions(&self) -> &[usize] {
         &self.inserted_window_dimensions
     }
 
-    /// Returns the scatter-index-to-input-axis map.
+    /// Returns the input axis targeted by each component of a start-index vector (the last axis of the indices input).
+    /// The map's length equals the extent of the indices' index vector dimension.
     #[inline]
     pub fn scatter_dimensions_to_operand_dimensions(&self) -> &[usize] {
         &self.scatter_dimensions_to_operand_dimensions
     }
 
-    /// Returns the input batching axes.
+    /// Returns the input axes batched against [`Self::scatter_indices_batching_dimensions`], aligned one-to-one, in
+    /// ascending order.
     #[inline]
     pub fn operand_batching_dimensions(&self) -> &[usize] {
         &self.operand_batching_dimensions
     }
 
-    /// Returns the indices batching axes.
+    /// Returns the indices axes, excluding the index vector dimension, that align one-to-one with
+    /// [`Self::operand_batching_dimensions`].
     #[inline]
     pub fn scatter_indices_batching_dimensions(&self) -> &[usize] {
         &self.scatter_indices_batching_dimensions
@@ -244,21 +244,6 @@ impl ScatterDimensionNumbers {
     }
 }
 
-impl Display for ScatterDimensionNumbers {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "(update_window={:?}, inserted_window={:?}, scatter_to_operand={:?}, operand_batching={:?}, \
-             scatter_indices_batching={:?})",
-            self.update_window_dimensions,
-            self.inserted_window_dimensions,
-            self.scatter_dimensions_to_operand_dimensions,
-            self.operand_batching_dimensions,
-            self.scatter_indices_batching_dimensions,
-        )
-    }
-}
-
 /// Canonical operation name for [`ScatterOperation`].
 pub const SCATTER_OPERATION_NAME: &str = "scatter";
 
@@ -266,24 +251,22 @@ pub const SCATTER_OPERATION_NAME: &str = "scatter";
 /// combining overlaps with a [`ScatterReductionKind`]. Refer to the documentation of [`Scatter`] for the semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScatterOperation {
-    /// Dimension numbers mapping the index input and update windows onto the input axes.
+    /// Refer to the documentation of [`Self::dimensions`] for more information.
     dimensions: ScatterDimensionNumbers,
 
-    /// Combiner applied where an update meets the existing input value.
+    /// Refer to the documentation of [`Self::kind`] for more information.
     kind: ScatterReductionKind,
 
-    /// Out-of-bounds index handling.
+    /// Refer to the documentation of [`Self::mode`] for more information.
     mode: ScatterMode,
 
-    /// Whether the caller guarantees the index vectors are sorted (a lowering hint only).
+    /// Refer to the documentation of [`Self::indices_are_sorted`] for more information.
     indices_are_sorted: bool,
 
-    /// Whether the caller guarantees the scattered windows do not overlap. This is a lowering hint and is required
-    /// for multiplication derivatives with respect to updates.
+    /// Refer to the documentation of [`Self::unique_indices`] for more information.
     unique_indices: bool,
 
-    /// Optional requested output [`Sharding`], used when the inferred placement is ambiguous (see
-    /// [`Self::with_output_sharding`]).
+    /// Refer to the documentation of [`Self::output_sharding`] for more information.
     output_sharding: Option<Sharding>,
 }
 
@@ -308,13 +291,13 @@ impl ScatterOperation {
         }
     }
 
-    /// Returns the dimension numbers.
+    /// Returns the dimension numbers mapping the index input and update windows onto the input axes.
     #[inline]
     pub fn dimensions(&self) -> &ScatterDimensionNumbers {
         &self.dimensions
     }
 
-    /// Returns the combiner kind.
+    /// Returns the combiner applied where an update meets the existing input value.
     #[inline]
     pub fn kind(&self) -> ScatterReductionKind {
         self.kind
@@ -326,19 +309,21 @@ impl ScatterOperation {
         self.mode
     }
 
-    /// Returns the sorted-indices hint.
+    /// Returns whether the caller guarantees that the index vectors are sorted. This is a lowering hint only.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.indices_are_sorted
     }
 
-    /// Returns the unique-indices hint.
+    /// Returns whether the caller guarantees that the scattered windows do not overlap. This is a lowering hint and is
+    /// required for multiplication derivatives with respect to updates.
     #[inline]
     pub fn unique_indices(&self) -> bool {
         self.unique_indices
     }
 
-    /// Returns the requested output sharding, if any.
+    /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
+    /// documentation of [`Self::with_output_sharding`] for more information.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
@@ -740,7 +725,18 @@ impl Operation for ScatterOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("kind", self.kind)?;
-            operation.field("dimensions", &self.dimensions)?;
+            operation.field(
+                "dimensions",
+                format_args!(
+                    "(update_window={:?}, inserted_window={:?}, scatter_to_operand={:?}, operand_batching={:?}, \
+                     scatter_indices_batching={:?})",
+                    self.dimensions.update_window_dimensions,
+                    self.dimensions.inserted_window_dimensions,
+                    self.dimensions.scatter_dimensions_to_operand_dimensions,
+                    self.dimensions.operand_batching_dimensions,
+                    self.dimensions.scatter_indices_batching_dimensions,
+                ),
+            )?;
             if self.mode != ScatterMode::PromiseInBounds {
                 operation.field("mode", self.mode)?;
             }
@@ -2061,11 +2057,6 @@ mod tests {
         assert_eq!(dimensions.scatter_dimensions_to_operand_dimensions(), &[0]);
         assert_eq!(dimensions.operand_batching_dimensions(), &[] as &[usize]);
         assert_eq!(dimensions.scatter_indices_batching_dimensions(), &[] as &[usize]);
-        assert_eq!(
-            dimensions.to_string(),
-            "(update_window=[1], inserted_window=[0], scatter_to_operand=[0], operand_batching=[], \
-             scatter_indices_batching=[])"
-        );
         assert_eq!(
             format!("{dimensions:?}"),
             "ScatterDimensionNumbers { update_window_dimensions: [1], inserted_window_dimensions: [0], \

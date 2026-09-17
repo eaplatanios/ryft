@@ -167,17 +167,6 @@ impl GatherDimensionNumbers {
     }
 }
 
-impl Display for GatherDimensionNumbers {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "(offset={:?}, collapsed_slice={:?}, start_index_map={:?}, batching={:?})",
-            self.offset_dimensions, self.collapsed_slice_dimensions, self.start_index_map, self.batching_dimensions,
-        )
-    }
-}
-
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`GatherOperation`].
@@ -421,7 +410,16 @@ impl<V: Value<Type = ArrayType>> Operation for GatherOperation<V> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("dimensions", &self.dimensions)?;
+            operation.field(
+                "dimensions",
+                format_args!(
+                    "(offset={:?}, collapsed_slice={:?}, start_index_map={:?}, batching={:?})",
+                    self.dimensions.offset_dimensions,
+                    self.dimensions.collapsed_slice_dimensions,
+                    self.dimensions.start_index_map,
+                    self.dimensions.batching_dimensions,
+                ),
+            )?;
             operation.field("slice_sizes", format_args!("{:?}", self.slice_sizes))?;
             if !matches!(self.mode.as_ref(), GatherMode::PromiseInBounds) {
                 operation.field("mode", &self.mode)?;
@@ -1966,7 +1964,6 @@ mod tests {
         assert_eq!(dimensions.collapsed_slice_dimensions(), &[0]);
         assert_eq!(dimensions.start_index_map(), &[0]);
         assert_eq!(dimensions.batching_dimensions(), &[] as &[(usize, usize)]);
-        assert_eq!(dimensions.to_string(), "(offset=[1], collapsed_slice=[0], start_index_map=[0], batching=[])",);
         assert_eq!(
             format!("{dimensions:?}"),
             "GatherDimensionNumbers { offset_dimensions: [1], collapsed_slice_dimensions: [0], start_index_map: [0], \
