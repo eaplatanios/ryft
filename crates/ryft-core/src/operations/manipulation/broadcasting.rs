@@ -23,9 +23,7 @@ use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
-use crate::operations::manipulation::reshaping::{
-    DynamicReshapeOperation, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
-};
+use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, ReshapeOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::reduce::ReduceOperation;
@@ -984,10 +982,8 @@ where
         }
 
         if let Some(output_sharding) = self.output_sharding() {
-            operation = operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
-                output_sharding,
-                context.axis_sharding().clone(),
-            )?);
+            operation = operation
+                .with_output_sharding(output_sharding.with_leading_batch_axis(context.axis_sharding().clone())?);
         }
 
         let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);

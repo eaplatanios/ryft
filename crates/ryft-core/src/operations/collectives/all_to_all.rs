@@ -29,9 +29,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
-use crate::operations::manipulation::reshaping::{
-    DynamicReshapeOperation, Reshape, lift_output_sharding_for_leading_batch_axis,
-};
+use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
@@ -752,7 +750,7 @@ where
     physical_output_extents.push(axis_extent);
     physical_output_extents.extend(output_extents);
     let physical_output_sharding = output_sharding
-        .map(|sharding| lift_output_sharding_for_leading_batch_axis(&sharding, context.axis_sharding().clone()))
+        .map(|sharding| sharding.with_leading_batch_axis(context.axis_sharding().clone()))
         .transpose()?;
     let output =
         P::reshape_collective(context, received, physical_output_extents.as_slice(), physical_output_sharding)?;

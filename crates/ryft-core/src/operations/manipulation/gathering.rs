@@ -26,7 +26,7 @@ use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcast};
-use crate::operations::manipulation::reshaping::{Reshape, lift_output_sharding_for_leading_batch_axis};
+use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::scattering::{
     ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterReductionKind,
 };
@@ -712,10 +712,8 @@ where
         }
 
         if let Some(output_sharding) = self.output_sharding() {
-            operation.options.output_sharding = Some(lift_output_sharding_for_leading_batch_axis(
-                output_sharding,
-                ArrayBatch::sharding_for_inputs(inputs)?,
-            )?);
+            operation.options.output_sharding =
+                Some(output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
 
         Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?.into())

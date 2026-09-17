@@ -34,9 +34,7 @@ use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::gathering::{
     GatherDimensionNumbers, GatherMode, GatherOperation, validate_unique_in_range,
 };
-use crate::operations::manipulation::reshaping::{
-    DynamicReshape, Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
-};
+use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape, ReshapeOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::DivOperation;
@@ -972,10 +970,7 @@ where
             .with_output_sharding(
                 self.output_sharding()
                     .map(|output_sharding| {
-                        lift_output_sharding_for_leading_batch_axis(
-                            output_sharding,
-                            ArrayBatch::sharding_for_inputs(inputs)?,
-                        )
+                        output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)
                     })
                     .transpose()?,
             );

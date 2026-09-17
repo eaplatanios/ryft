@@ -3690,15 +3690,48 @@ struct ArrayBatchingTransformArguments {
 }
 
 impl Sharding {
+    /// Returns a copy of this per-item output [`Sharding`] with `axis_sharding` inserted as its leading physical
+    /// dimension. The mesh and reduction state are preserved, and mesh axes named by the inserted dimension are
+    /// removed from the varying-manual set: those axes are now represented by the explicit batch placement.
+    ///
+    /// For example, a per-item output replicated along its array dimensions but varying over manual mesh axis `x`
+    /// becomes an output with a leading dimension sharded over `x`, without `x` remaining in its varying-manual set.
+    /// Other varying-manual axes are preserved. The resulting sharding is revalidated, so unknown or already-used
+    /// placement axes are rejected.
+    ///
+    /// This function lifts a requested output placement. Use [`Self::batched`] for body-side value shardings instead.
+    /// That function records the manual-axis variation introduced by the batch placement rather than removing it.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_sharding`: Placement of the new leading batch dimension. A replicated or unconstrained placement
+    ///     leaves the varying-manual set unchanged.
+    pub fn with_leading_batch_axis(&self, axis_sharding: ShardingDimension) -> Result<Self, BatchingError> {
+        let mut dimensions = self.dimensions().to_vec();
+        dimensions.insert(0, axis_sharding.clone());
+        let mut varying_manual_axes = self.varying_manual_axes().clone();
+        if let ShardingDimension::Sharded(axis_names) = axis_sharding {
+            for axis_name in axis_names {
+                varying_manual_axes.remove(&axis_name);
+            }
+        }
+        Sharding::new(self.mesh().clone(), dimensions)
+            .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
+            .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
+            .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
+            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+    }
+
     /// Returns this [`Sharding`] with the mapped batch axis inserted at `position` on the placement `axis_sharding`.
     /// Besides gaining that placement, the result records that the value now varies along every
     /// [`MeshAxisType`](crate::MeshAxisType::Manual) axis the placement names: a batch axis placed on a manual axis
     /// spreads the batch items across that axis's shards, so the batched value differs from device to device along it.
     /// This is the body-side rule for values produced inside a batched computation.
     ///
-    /// Batching rules must construct every batched sharding through this function, or through [`ArrayType::batched`],
+    /// Batching rules construct body-side value shardings through this function, or through [`ArrayType::batched`],
     /// which uses it, rather than inserting the batch placement with [`Self::with_inserted_dimension`] directly, so
-    /// that placement and variation cannot drift apart.
+    /// that placement and variation cannot drift apart. To lift a requested per-item output placement instead, use
+    /// [`Self::with_leading_batch_axis`], which removes the inserted axes from the varying-manual set.
     pub fn batched(&self, position: usize, axis_sharding: ShardingDimension) -> Result<Self, BatchingError> {
         let varying_manual_axes = axis_sharding.manual_axes(self.mesh());
         let mut batched = self
@@ -7268,7 +7301,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 3], %2:f32[3, batch], %3:f32[3] .
                 let %4:dimension<3> = const 3
-                    %5:f32[batch, 3] = reshape [element_count_proven=true] %1 %0 %4
+                    %5:f32[batch, 3] = reshape [requires_runtime_assertion=false] %1 %0 %4
                     %6:dimension<3> = constant [value=3]
                     %7:f32[batch, 3] = broadcast [output_axes=[1]] %3 %0 %6
                     %8:f32[batch, 3] = add %1 %7
@@ -9158,6 +9191,30 @@ mod tests {
                           cannot be aligned to axis 1; pass the reference as a batched input at that axis instead"
                     .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_sharding_with_leading_batch_axis() {
+        // Lifting an explicit per-item sharding moves a manual mapped axis out of the varying set and onto the new
+        // physical batch dimension.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let per_item_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_varying_manual_axes(["x"])
+                .unwrap();
+        assert_eq!(
+            per_item_sharding.with_leading_batch_axis(ShardingDimension::sharded(["x"])),
+            Ok(Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                ],
+            )
+            .unwrap()),
         );
     }
 

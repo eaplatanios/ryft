@@ -201,10 +201,9 @@ where
         lifted_output_dimensions.extend_from_slice(output_shape.dimensions());
         let mut lifted_operation = ReshapeOperation::new(Shape::new(lifted_output_dimensions));
         if let Some(output_sharding) = self.output_sharding() {
-            lifted_operation = lifted_operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
-                output_sharding,
-                ArrayBatch::sharding_for_inputs(inputs)?,
-            )?);
+            lifted_operation = lifted_operation.with_output_sharding(
+                output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?,
+            );
         }
         Ok(lifted_operation
             .interpret_with_batch_axes(context, &[moved_input], &[BatchAxis::from_position(0)])?
@@ -832,10 +831,8 @@ where
 
         let mut operation = Self::new();
         if let Some(output_sharding) = self.output_sharding() {
-            operation = operation.with_output_sharding(lift_output_sharding_for_leading_batch_axis(
-                output_sharding,
-                context.axis_sharding().clone(),
-            )?);
+            operation = operation
+                .with_output_sharding(output_sharding.with_leading_batch_axis(context.axis_sharding().clone())?);
         }
 
         let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
@@ -1317,26 +1314,6 @@ impl<
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Inserts batching's physical leading dimension into a logical per-item output sharding.
-pub(crate) fn lift_output_sharding_for_leading_batch_axis(
-    output_sharding: &Sharding,
-    batch_dimension: ShardingDimension,
-) -> Result<Sharding, BatchingError> {
-    let mut dimensions = output_sharding.dimensions().to_vec();
-    dimensions.insert(0, batch_dimension.clone());
-    let mut varying_manual_axes = output_sharding.varying_manual_axes().clone();
-    if let ShardingDimension::Sharded(axis_names) = batch_dimension {
-        for axis_name in axis_names {
-            varying_manual_axes.remove(&axis_name);
-        }
-    }
-    Sharding::new(output_sharding.mesh().clone(), dimensions)
-        .and_then(|sharding| sharding.with_unreduced_axes(output_sharding.unreduced_axes().clone()))
-        .and_then(|sharding| sharding.with_reduced_axes(output_sharding.reduced_axes().clone()))
-        .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
-        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-}
 
 /// Proves equal products by comparing static coefficients and matching dynamic identities with multiplicity.
 fn reshape_element_counts_equal(input: &Shape, output: &Shape) -> Result<bool, TypeError> {
@@ -5422,29 +5399,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_lift_output_sharding_for_leading_batch_axis() {
-        // Lifting an explicit per-item sharding moves a manual mapped axis out of the varying set and onto the new
-        // physical batch dimension.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let per_item_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                .unwrap()
-                .with_varying_manual_axes(["x"])
-                .unwrap();
-        assert_eq!(
-            lift_output_sharding_for_leading_batch_axis(&per_item_sharding, ShardingDimension::sharded(["x"])),
-            Ok(Sharding::new(
-                mesh,
-                vec![
-                    ShardingDimension::sharded(["x"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::replicated(),
-                ],
-            )
-            .unwrap()),
-        );
-    }
     #[test]
     fn test_reshape_element_counts_equal() {
         let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap());
