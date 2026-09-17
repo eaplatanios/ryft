@@ -392,7 +392,7 @@ impl Operation for PadOperation<ArrayIrType> {
             }
         }
 
-        pad_output_type(
+        infer_pad_output_type(
             input,
             padding_value,
             output_dimensions,
@@ -1438,7 +1438,7 @@ impl_differentiable_operation! {
 /// assert_eq!(output.elements::<i32>()?, vec![0, 1, 0, 2, 0, 3, 0, 0]);
 ///
 /// // Cropping is applied after inserting the interior zeros.
-/// let cropped = input.pad_with_config(&value, &[(-1, 0, 1)])?;
+/// let cropped = input.pad(&value, &[-1], &[0], &[1])?;
 /// assert_eq!(cropped.elements::<i32>()?, vec![0, 2, 0, 3]);
 /// # Ok(())
 /// # }
@@ -1460,28 +1460,6 @@ pub trait Pad: Sized {
         edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError>;
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Pads using one `(low, high, interior)` tuple per input axis. This is equivalent to [`Self::pad`], with the three
-    /// configuration slices assembled from those tuples. Negative edge amounts crop after interior padding; interior
-    /// amounts are nonnegative. An empty configuration applies to a scalar input.
-    ///
-    /// # Parameters
-    ///
-    ///   - `padding_value`: Scalar value with the input's element data type and memory space.
-    ///   - `padding_config`: One tuple per input axis, in axis order. Each tuple gives the number of values to add
-    ///     before the input, after the input, and between adjacent input elements, respectively.
-    fn pad_with_config(
-        &self,
-        padding_value: &Self,
-        padding_config: &[(i64, i64, usize)],
-    ) -> Result<Self, ProgramError> {
-        let edge_padding_low = padding_config.iter().map(|&(low, _, _)| low).collect::<Vec<_>>();
-        let edge_padding_high = padding_config.iter().map(|&(_, high, _)| high).collect::<Vec<_>>();
-        let interior_padding = padding_config.iter().map(|&(_, _, interior)| interior).collect::<Vec<_>>();
-        self.pad(padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)
-    }
 }
 
 impl Pad for ArrayType {
@@ -1530,8 +1508,7 @@ impl Pad for ArrayType {
                         if maximum_output_extent < 0 {
                             return Err(TypeError::invalid(format!(
                                 "`{PAD_OPERATION_NAME}` output size is negative ({maximum_output_extent}) on dynamic \
-                                axis {axis} \
-                                 even at its maximum input extent {maximum_input_extent}",
+                                 axis {axis} even at its maximum input extent {maximum_input_extent}",
                             ))
                             .into());
                         }
@@ -1544,9 +1521,19 @@ impl Pad for ArrayType {
             };
             output_dimensions.push(output_dimension);
         }
-        pad_output_type(self, padding_value, output_dimensions, edge_padding_low, edge_padding_high, interior_padding)
+
+        infer_pad_output_type(
+            self,
+            padding_value,
+            output_dimensions,
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+        )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Pad for Array {
     fn pad(
@@ -1562,9 +1549,11 @@ impl Pad for Array {
             edge_padding_high,
             interior_padding,
         )?;
+
         if is_effective_identity(self.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
             return Ok(self.clone());
         }
+
         let output_shape = output_type.static_shape().unwrap();
         let rank = self.r#type().rank();
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
@@ -1572,18 +1561,22 @@ impl Pad for Array {
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let padding_bytes = &padding_value.storage_bytes()[padding_addressing.byte_range_for_flat_index(0)];
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        // Structural-zero arrays have no element bytes, even when their logical shape is enormous. Empty outputs
-        // likewise need no coordinate traversal or fill operation.
+
+        // Structural-zero arrays have no element bytes, even when their logical shape is enormous.
+        // Empty outputs likewise need no coordinate traversal or fill operation.
         if output_addressing.element_byte_width() == 0 || output_addressing.element_count() == 0 {
             return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
         }
+
         // The padded type carries no explicit layout, so its storage is dense row-major and is filled in bulk.
         for output_bytes in bytes.chunks_exact_mut(output_addressing.element_byte_width()) {
             output_bytes.copy_from_slice(padding_bytes);
         }
+
         if input_addressing.element_count() == 0 {
             return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
         }
+
         let mut input_index = vec![0usize; rank];
         let mut output_index = vec![0usize; rank];
         let mut written = 0usize;
@@ -1620,6 +1613,7 @@ impl Pad for Array {
             written += 1;
             input_addressing.advance_index(&mut input_index);
         }
+
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
@@ -1922,7 +1916,7 @@ fn static_padded_extent(
 ///   - `edge_padding_high`: Signed padding amounts at the end of each axis, used to detect possible padding.
 ///   - `interior_padding`: Nonnegative padding counts between adjacent input elements, used together with input
 ///     dimension bounds to detect possible padding.
-fn pad_output_type(
+fn infer_pad_output_type(
     input: &ArrayType,
     padding_value: &ArrayType,
     output_dimensions: Vec<Dimension>,
@@ -3278,26 +3272,6 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_pad_pad_with_config() {
-        let input = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap();
-        let padding = Array::from_elements(ArrayType::scalar(DataType::I32), &[9_i32]).unwrap();
-        assert_eq!(
-            input.pad_with_config(&padding, &[(1, 1, 1)]),
-            Array::from_elements(ArrayType::new_static(DataType::I32, [5]), &[9_i32, 1, 9, 2, 9])
-        );
-        assert_eq!(
-            input.pad_with_config(&padding, &[(-1, 0, 0)]),
-            Array::from_elements(ArrayType::new_static(DataType::I32, [1]), &[2_i32])
-        );
-        assert_eq!(
-            input.pad_with_config(&padding, &[]),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` `edge_padding_low` has length 0 but input has rank 1"
-            ))))
         );
     }
 
@@ -5798,7 +5772,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         let padding_value = ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true });
         assert_eq!(
-            pad_output_type(&input, &padding_value, vec![Dimension::Static(6)], &[1], &[1], &[0]),
+            infer_pad_output_type(&input, &padding_value, vec![Dimension::Static(6)], &[1], &[1], &[0]),
             Ok(ArrayType::new_static(DataType::F32, [6]).with_memory(Memory::Host { pinned: true })),
         );
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
@@ -5810,7 +5784,14 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            pad_output_type(&sharded_input, &matching_padding_value, vec![Dimension::Static(8)], &[0], &[4], &[0]),
+            infer_pad_output_type(
+                &sharded_input,
+                &matching_padding_value,
+                vec![Dimension::Static(8)],
+                &[0],
+                &[4],
+                &[0]
+            ),
             Ok(ArrayType::new_static(DataType::F32, [8]).with_sharding(sharding).unwrap()),
         );
 
@@ -5819,7 +5800,7 @@ mod tests {
         let plain_padding_value =
             ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         assert!(matches!(
-            pad_output_type(&sharded_input, &plain_padding_value, vec![Dimension::Static(6)], &[0], &[2], &[0]),
+            infer_pad_output_type(&sharded_input, &plain_padding_value, vec![Dimension::Static(6)], &[0], &[2], &[0]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == format!(
                     "`{PAD_OPERATION_NAME}` input and padding value must have matching reduced and unreduced mesh axes \
@@ -5827,7 +5808,7 @@ mod tests {
                 ),
         ));
         assert_eq!(
-            pad_output_type(&sharded_input, &plain_padding_value, vec![Dimension::Static(2)], &[-1], &[-1], &[0])
+            infer_pad_output_type(&sharded_input, &plain_padding_value, vec![Dimension::Static(2)], &[-1], &[-1], &[0])
                 .map(|output| output.shape().clone()),
             Ok(Shape::new(vec![Dimension::Static(2)])),
         );
@@ -5835,7 +5816,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            pad_output_type(&singleton_input, &plain_padding_value, vec![Dimension::Static(1)], &[0], &[0], &[3]),
+            infer_pad_output_type(&singleton_input, &plain_padding_value, vec![Dimension::Static(1)], &[0], &[0], &[3]),
             Ok(singleton_input.clone().with_layout(None)),
         );
 
@@ -5849,7 +5830,14 @@ mod tests {
             .with_sharding(Sharding::replicated(other_mesh, 0).with_unreduced_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            pad_output_type(&singleton_input, &other_mesh_padding_value, vec![Dimension::Static(2)], &[1], &[0], &[0]),
+            infer_pad_output_type(
+                &singleton_input,
+                &other_mesh_padding_value,
+                vec![Dimension::Static(2)],
+                &[1],
+                &[0],
+                &[0]
+            ),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh"
             )))),
