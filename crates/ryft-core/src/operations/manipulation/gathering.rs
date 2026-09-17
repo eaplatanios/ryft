@@ -369,24 +369,18 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl GatherOperation<Array> {
-    /// Resolves the scalar used for out-of-bounds windows in the requested input data type.
-    /// Floating formats without NaN use their normal NaN conversion result. Complex NaN has a zero imaginary part.
-    /// This function is shared by eager interpretation and native lowering so both use identical element encodings.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element data type of the gathered input.
+    /// Resolves the scalar value used for out-of-bounds windows in the requested input [`DataType`]. Floating-point
+    /// formats without NaN use their normal NaN conversion result. Complex NaN values have a zero imaginary part.
     pub fn resolved_fill_value(&self, data_type: DataType) -> Result<Array, ProgramError> {
         self.validate_fill_value(data_type)?;
         if let GatherMode::Fill { value: Some(value) } = &self.mode {
             return Ok(value.as_ref().clone());
         }
         dispatch_on_array_element_type!(data_type, |Element| {
-            // The reduction identities give the extreme values: the identity of a maximum reduction is the smallest
-            // signed integer, and the identity of a minimum reduction is the largest unsigned integer or `true`.
+            // The reduction identities give the extreme values. That is, the identity of a maximum reduction is the
+            // smallest signed integer or `false`, and the identity of a minimum reduction is the largest unsigned
+            // integer or `true`.
             let element = if data_type.is_signed() {
                 Element::max_identity()
             } else if data_type.is_unsigned() || data_type.is_boolean() {
@@ -400,6 +394,7 @@ impl GatherOperation<Array> {
 }
 
 impl<V: Value<Type = ArrayType>> Display for GatherOperation<V> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -476,16 +471,14 @@ impl<Stored: Value<Type = ArrayType>, C: Domain<Type = ArrayType, Value: Gather<
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
         // Direct interpretation need not have passed through a builder's type inference. Validate literal storage
         // here too, before handing the value to a custom capability implementation.
+        check_count!("input", inputs, 2, ProgramError);
         self.validate_fill_value(inputs[0].r#type().data_type())?;
         Ok(vec![inputs[0].gather(&inputs[1], self)?])
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of
-// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
     for GatherOperation<Stored>
 where
@@ -493,12 +486,9 @@ where
 {
 }
 
-// Batching lifts the dimension numbers into one gather. A mapped input alone becomes a full-window offset axis;
-// mapped indices alone add an output batch axis; jointly mapped inputs gain a paired input/indices batching axis.
-impl<Stored: Value<Type = ArrayType>, C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for GatherOperation<Stored>
+impl<Stored: Value<Type = ArrayType>, C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for GatherOperation<Stored>
 where
-    C: Context<Type = ArrayType>,
     C::Value: Transpose,
     GatherOperation<Stored>: InterpretableOperation<C>,
 {
@@ -508,12 +498,16 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Batching lifts the dimension numbers into one gather. A mapped input alone becomes a full-window offset axis,
+        // mapped indices alone add an output batch axis, and jointly mapped inputs gain a paired input/indices batching
+        // axis.
         check_count!("input", inputs, 2, ProgramError);
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("`{GATHER_OPERATION_NAME}` does not support bounded ragged array inputs"),
             });
         }
+
         let mapped_input = inputs[0].batch_axis_position().is_some();
         let mapped_indices = inputs[1].batch_axis_position().is_some();
         if !mapped_input && !mapped_indices {
@@ -528,24 +522,26 @@ where
             if input.batch_axis_position().is_some() && input.r#type().dimension(0) != axis_dimension {
                 return Err(BatchingError::MisalignedBatchAxes {
                     message: format!(
-                        "`{GATHER_OPERATION_NAME}` mapped input extent {} does not match batching extent \
-                         {axis_dimension}",
+                        "`{}` mapped input extent {} does not match batching extent {}",
+                        GATHER_OPERATION_NAME,
                         input.r#type().dimension(0),
+                        axis_dimension,
                     ),
                 });
             }
         }
+
         let dimensions = self.dimensions();
         let mut operation = self.clone();
         if mapped_input && !mapped_indices {
-            // The same indices select a complete window along the new input axis, so that axis is an output
-            // offset dimension. Its window size must be representable in the operation's static slice sizes. The
-            // index promises stay valid: every query gains the same complete window, so disjoint windows stay disjoint.
+            // The same indices select a complete window along the new input axis, so that axis is an output offset
+            // dimension. Its window size must be representable in the operation's static slice sizes. The index
+            // promises stay valid: every query gains the same complete window, so disjoint windows stay disjoint.
             let Dimension::Static(axis_size) = axis_dimension else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "`{GATHER_OPERATION_NAME}` with only its input mapped requires a statically known mapped \
-                         extent"
+                         extent",
                     ),
                 });
             };
@@ -582,9 +578,9 @@ where
             operation.indices_are_sorted = false;
             operation.unique_indices = false;
         } else {
-            // Pair the new input and indices dimensions: every item reads only its own input, so the index promises
-            // stay valid per item. The paired axes take a size-one window, or a zero window when the mapped extent is
-            // statically empty or may be empty at runtime.
+            // Pair the new input and indices dimensions (every item reads only its own input, so the index promises
+            // stay valid per item). The paired axes take a size-one window, or a zero window when the mapped extent
+            // is statically empty or may be empty at runtime.
             operation.slice_sizes.insert(0, batching_window_size(&axis_dimension));
             let mut batching = vec![(0, 0)];
             batching.extend(
@@ -600,15 +596,19 @@ where
             )
             .with_batching_dimensions(batching);
         }
+
         if let Some(output_sharding) = self.output_sharding() {
             operation.output_sharding = Some(lift_output_sharding_for_leading_batch_axis(
                 output_sharding,
                 ArrayBatch::sharding_for_inputs(inputs)?,
             )?);
         }
+
         Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?.into())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Differentiation must construct a literal zero in the stored family, independently of the input tracer's domain.
 // Requiring its eager zero capability avoids embedding a live tangent tracer in the operation's constant payload.
