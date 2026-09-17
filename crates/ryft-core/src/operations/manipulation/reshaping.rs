@@ -401,8 +401,6 @@ pub trait Reshape: Sized {
         self.reshape(Shape::new(sizes.into_iter().map(Dimension::Static).collect()))
     }
 
-    // TODO(eaplatanios): Review this.
-
     /// Returns the input as a one-dimensional array in logical row-major order. An input that is already a vector
     /// retains its shape, including a dynamic extent. Other ranks require a known element count; an empty input
     /// produces shape `[0]`. Storage sharing or copying is determined by the backend.
@@ -502,8 +500,8 @@ impl Reshape for ArrayType {
         if self.shape() != &shape {
             if shape.dimensions().iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
                 // A dynamic output shape is accepted only when it inserts or removes static singleton axes around the
-                // input's non-singleton dimensions, which keeps those dimensions and their identities in
-                // order and therefore preserves the element count. Every other dynamic result shape needs explicit
+                // input's non-singleton dimensions, which keeps those dimensions and their identities in order and
+                // therefore preserves the element count. Every other dynamic result shape needs explicit
                 // result-dimension inputs.
                 if !reshape_preserves_non_singleton_dimensions(self.shape(), &shape) {
                     return Err(TypeError::invalid(format!(
@@ -530,7 +528,7 @@ impl Reshape for ArrayType {
                 };
                 if input_elements != output_elements {
                     return Err(TypeError::invalid(format!(
-                        "`{RESHAPE_OPERATION_NAME}` changes the number of elements"
+                        "`{RESHAPE_OPERATION_NAME}` changes the number of elements",
                     ))
                     .into());
                 }
@@ -565,13 +563,9 @@ impl Reshape for Array {
     }
 }
 
-// Any context-carrying value reshapes by binding a [`ReshapeOperation`] through its own context. The
-// `From<ReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Reshape for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReshapeOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ReshapeOperation>>,
 {
     #[inline]
     fn reshape_with_output_sharding<S: Into<Shape>>(
@@ -579,6 +573,10 @@ where
         shape: S,
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError> {
+        // Any context-carrying value reshapes by binding a `ReshapeOperation` through its own context. The
+        // `From<ReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation
+        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+        // implementations.
         let operation = ReshapeOperation::new(shape).with_output_sharding(output_sharding);
         let input_type = self.r#type().into_owned();
         let output_type = input_type
@@ -592,56 +590,89 @@ where
     }
 }
 
-/// Mixed [`Operation`] that reshapes one array using one explicit first-class dimension input per output axis.
-///
-/// Input zero is the array. Every remaining input describes the corresponding output-axis extent, in order.
-/// Exact dimension types produce static axes while non-exact dimension types retain their variables as dynamic axes.
-/// The operation therefore carries only reshape attributes; it does not duplicate its output shape or encode shape
-/// arithmetic in its payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// Mixed [`Operation`] that reshapes arrays using one explicit first-class dimension input per output axis. The first
+/// input value is the array being reshaped. Every remaining input describes the corresponding output-axis extent, in
+/// order. Exact dimension types produce static axes while non-exact dimension types retain their variables as dynamic
+/// axes. The operation therefore carries only reshape attributes; it does not duplicate its output shape or encode
+/// shape arithmetic in its payload.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicReshapeOperation {
-    /// Whether the construction signature proves equal input and output element counts.
-    element_count_proven: bool,
+    /// Refer to the documentation of [`requires_runtime_assertion`](Self::requires_runtime_assertion)
+    /// for more information.
+    requires_runtime_assertion: bool,
 
-    /// Optional requested output [`Sharding`].
+    /// Refer to the documentation of [`output_sharding`](Self::output_sharding) for more information.
     output_sharding: Option<Sharding>,
 }
 
 impl DynamicReshapeOperation {
-    /// Creates a reshape with no requested output sharding.
+    /// Creates a new [`DynamicReshapeOperation`] with no requested output [`Sharding`]. The operation initially
+    /// retains a runtime element-count assertion. Use [`with_input_types`](Self::with_input_types) to remove it
+    /// when the input types prove that the input and output shapes contain the same number of elements.
     #[inline]
     pub fn new() -> Self {
-        Self::default()
+        Self { requires_runtime_assertion: true, output_sharding: None }
     }
 
-    /// Returns the requested output sharding, if any.
-    #[inline]
-    pub fn output_sharding(&self) -> Option<&Sharding> {
-        self.output_sharding.as_ref()
-    }
-
-    /// Validates the complete input signature and records whether its shapes prove equal element counts.
+    /// Returns a copy of this [`DynamicReshapeOperation`] with its runtime element-count assertion requirement
+    /// recomputed from the provided `input_types`. The complete mixed signature is validated before determining
+    /// whether the input and output shapes are guaranteed to contain the same number of elements.
     ///
-    /// Unproven operations retain an ordered runtime assertion, even when their output is unused. The proof is
-    /// revalidated during type inference, so reusing an operation cannot silently weaken this requirement.
+    /// If that equality can be proved, the returned operation is effect-free. Otherwise, it retains
+    /// [`EffectClass::OrderedAssertion`] so execution checks the element counts. For example, reshaping `[n, 4]` to
+    /// `[n, 2, 2]` proves equality through the shared dimension identity and equal static factors. Reshaping to
+    /// `[m, 2, 2]` with an independent dynamic dimension `m` generally still requires a runtime check.
+    ///
+    /// An effect-free operation rejects subsequent type inference requests that require a runtime assertion, rather
+    /// than silently changing its effects. Calling this function again explicitly recomputes the requirement for a
+    /// different signature and can restore the assertion. The requested output sharding is unchanged.
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: The array type followed by one dimension type per output axis.
+    ///   - `input_types`: Complete mixed input signature containing the input array type followed by one
+    ///     [`DimensionType`] wrapped in [`ArrayIrType`] per output axis, in axis order.
     pub fn with_input_types(mut self, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
-        self.element_count_proven = false;
+        // Reset the requirement before validation so a previously effect-free operation can be explicitly
+        // reconfigured for a signature whose element-count equality must be checked at runtime.
+        self.requires_runtime_assertion = true;
         let output_types = self.infer_output_types(input_types, &[])?;
         let input = <&ArrayType>::try_from(&input_types[0])?;
         let output = <&ArrayType>::try_from(&output_types[0])?;
-        self.element_count_proven = reshape_element_counts_equal(input.shape(), output.shape())?;
+        self.requires_runtime_assertion = !reshape_element_counts_equal(input.shape(), output.shape())?;
         Ok(self)
     }
 
-    /// Returns this operation with the requested output `sharding`.
+    /// Returns a copy of this [`DynamicReshapeOperation`] with the requested output `sharding`. Passing [`None`]
+    /// restores inferred placement. The request is validated during type inference.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Self {
         self.output_sharding = sharding.into();
         self
+    }
+
+    /// Returns whether execution must check that the product of the explicit output-extent inputs equals the input
+    /// array's element count. A mismatch is an error; reshaping cannot add or remove elements. When `true`, the
+    /// operation carries [`EffectClass::OrderedAssertion`], making the check an observable effect even when the
+    /// reshaped output is unused. This is the conservative initial state, not a claim that the extents are invalid.
+    /// [`Self::with_input_types`] sets the flag to `false` when the input types prove equal element counts, allowing
+    /// the operation to be effect-free. Such an operation rejects input signatures that would require a runtime check
+    /// unless it is explicitly refined again with [`Self::with_input_types`].
+    #[inline]
+    pub fn requires_runtime_assertion(&self) -> bool {
+        self.requires_runtime_assertion
+    }
+
+    /// Returns the requested output [`Sharding`], or [`None`] when placement is inferred from the input.
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.output_sharding.as_ref()
+    }
+}
+
+impl Default for DynamicReshapeOperation {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -668,35 +699,36 @@ impl Operation for DynamicReshapeOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"
+                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents",
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         let output_shape = Shape::new(ArrayIrType::extents(output_extent_types)?);
         let output_type = infer_explicit_reshape_output_type(input_type, output_shape, self)?;
-        if self.element_count_proven && !reshape_element_counts_equal(input_type.shape(), output_type.shape())? {
+        if !self.requires_runtime_assertion && !reshape_element_counts_equal(input_type.shape(), output_type.shape())? {
             return Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` input types do not preserve its element-count proof",
+                "`{RESHAPE_OPERATION_NAME}` was constructed without a runtime element-count check but these input \
+                 types require one",
             )));
         }
         Ok(vec![output_type.into()])
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
-        Cow::Owned(Effects::explicit(if self.element_count_proven {
-            EffectClasses::NONE
-        } else {
+        Cow::Owned(Effects::explicit(if self.requires_runtime_assertion {
             EffectClasses::single(EffectClass::OrderedAssertion)
+        } else {
+            EffectClasses::NONE
         }))
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        if !self.element_count_proven && self.output_sharding.is_none() {
+        if self.requires_runtime_assertion && self.output_sharding.is_none() {
             return formatter.write_str(RESHAPE_OPERATION_NAME);
         }
         OperationFormatter::new(formatter, indentation, RESHAPE_OPERATION_NAME)?.bracketed(|operation| {
-            if self.element_count_proven {
-                operation.field("element_count_proven", true)?;
+            if !self.requires_runtime_assertion {
+                operation.field("requires_runtime_assertion", false)?;
             }
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
@@ -708,11 +740,7 @@ impl Operation for DynamicReshapeOperation {
 
 impl_reference_dischargeable_operation!(@reference_free DynamicReshapeOperation);
 
-impl<C> InterpretableOperation<C> for DynamicReshapeOperation
-where
-    C: Domain<Type = ArrayIrType>,
-    C::Value: DynamicReshape,
-{
+impl<C: Domain<Type = ArrayIrType, Value: DynamicReshape>> InterpretableOperation<C> for DynamicReshapeOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -721,7 +749,7 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"
+                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents",
             ))
             .into());
         };
@@ -755,13 +783,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
     }
 }
 
-// Batching rule for [`DynamicReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped
-// input is canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and the
-// output sharding before the mixed operation is replayed.
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicReshapeOperation
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicReshapeOperation
 where
-    C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<DynamicReshapeOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -769,15 +794,21 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // Explicit output extents remain replicated shape values. A mapped input is canonicalized to a leading batch
+        // axis, and that axis is inserted into both the reshape geometry and the output sharding before the mixed
+        // operation is replayed.
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
+
         <&ArrayType>::try_from(&input.unbatched_type())?;
+
         if !input.ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("dynamic `{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
             });
         }
+
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
         }
@@ -811,7 +842,8 @@ where
         lifted_inputs.push(moved_input);
         lifted_inputs.push(context.axis_extent().clone());
         lifted_inputs.extend(output_extents.iter().map(|extent| extent.value().clone()));
-        // Recompute the element-count proof for the lifted signature so that a proven reshape stays effect-free.
+
+        // Recompute the runtime assertion requirement for the lifted signature so proven equal counts stay effect-free.
         let operation = operation
             .with_input_types(&lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
         Ok(context
@@ -836,10 +868,9 @@ impl_differentiable_operation! {
             + OperationProjection<ArrayType, Projected: From<BroadcastOperation>>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for mixed reshape. The explicit output extents are ordinary non-differentiated shape
-            // values. Static input cotangent geometry replays the mixed reshape directly; dynamic geometry retains the
-            // exact input shape so the linear transpose can reconstruct the inverse reshape from first-class dimension
-            // residuals.
+            // The explicit output extents are ordinary non-differentiated shape values. Static input cotangent
+            // geometry replays the mixed reshape directly. Dynamic geometry retains the exact input shape so the
+            // linear transpose can reconstruct the inverse reshape from first-class dimension residuals.
             let destinations = context;
             if inputs.is_empty() {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -854,6 +885,7 @@ impl_differentiable_operation! {
             let output_primal = primal_outputs.remove(0);
             let tangent_primal = destinations.primal_to_tangent(output_primal.clone())?;
             let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+
             // Lifting the duals into the tangent space preserves their arity, so the array input is still present.
             let (array, output_extents) = tangent_inputs.split_first().unwrap();
             let tangent_context = destinations.tangent();
@@ -862,9 +894,10 @@ impl_differentiable_operation! {
                 MaybeZero::Value(array_tangent) => {
                     let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
                     let input_cotangent_type = input_type.cotangent()?;
-                    // Direct replay needs both the input geometry and the output geometry to be static, so
-                    // that the transpose can reshape back without runtime extents. Otherwise the exact extents are
-                    // retained as linearization residuals; static extents become constants in the inverse shape.
+
+                    // Direct replay needs both the input geometry and the output geometry to be static, so that the
+                    // transpose can reshape back without runtime extents. Otherwise, the exact extents are retained
+                    // as linearization residuals; static extents become constants in the inverse shape.
                     let output_type = <&ArrayType>::try_from(output_primal.r#type().as_ref())?.clone();
                     if input_cotangent_type
                         .shape()
@@ -885,7 +918,7 @@ impl_differentiable_operation! {
                         MaybeZero::Value(outputs.remove(0))
                     } else {
                         // Record each distinct dynamic input extent while the source array is available. Repeated type
-                        // identities reuse one residual SSA value in first-use order.
+                        // identities reuse one residual Single Static Assignment (SSA) value in first-use order.
                         let mut residuals = LinearResiduals::new();
                         let output_extent_residuals =
                             residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
@@ -943,6 +976,7 @@ impl_differentiable_operation! {
                                     transpose_context.bind(inverse_operation, Vec::new(), inverse_inputs.as_slice())?;
                                 check_count!("output", outputs, 1, ProgramError);
                                 let cotangent = outputs.remove(0);
+
                                 // The inverse geometry is exact, but reshape clears layouts and may need replicated
                                 // bridge sharding. Restore the original cotangent's complete storage metadata after
                                 // reconstructing the shape, just as the homogeneous rule's unalignment does.
@@ -971,23 +1005,27 @@ impl_differentiable_operation! {
                     }
                 }
             };
+
             Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
     transpose<V, O>
     where
         V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-        O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
-        <O as OperationProjection<ArrayType>>::Projected: From<ReshapeOperation>
-            + TransposableOperation<
-                <V as ValueProjection<ArrayType>>::Projected,
-                <O as OperationProjection<ArrayType>>::Projected,
+        O: Operation<Type = ArrayIrType>
+            + OperationProjection<
+                ArrayType,
+                Projected: From<ReshapeOperation>
+                    + TransposableOperation<
+                        <V as ValueProjection<ArrayType>>::Projected,
+                        <O as OperationProjection<ArrayType>>::Projected,
+                    >,
             >,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Direct transposition rule for mixed reshape. Static input geometry delegates to the homogeneous array
-            // pullback, while every explicit output extent receives a structural-zero cotangent. Dynamic input geometry
-            // requires linearization so [`DifferentiableOperation::jvp`] can retain its exact extents as residuals.
+            // Static input geometry delegates to the homogeneous array pullback, while every explicit output
+            // extent receives a structural-zero cotangent. Dynamic input geometry requires linearization so
+            // that `DifferentiableOperation::jvp` can retain its exact extents as residuals.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
 
@@ -995,6 +1033,7 @@ impl_differentiable_operation! {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
             let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
+
             // No inverse geometry is needed when there is no live contribution. In particular, dynamic input extents
             // must not force residual capture for a structural-zero cotangent or a nondifferentiable input.
             if input_cotangent_type.is_zero_space() || outputs[0].is_zero() {
@@ -1004,6 +1043,7 @@ impl_differentiable_operation! {
                 unreachable!("a structural-zero output cotangent returns early above");
             };
             let output_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
+
             // The homogeneous pullback reshapes the cotangent back through static geometry only. A dynamic extent on
             // either side is available exactly as a linearization residual, so direct transposition is rejected.
             if input_cotangent_type
@@ -1021,10 +1061,12 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
+
             let projected_operation = <O as OperationProjection<ArrayType>>::Projected::from(
                 ReshapeOperation::new(output_type.shape().clone())
                     .with_output_sharding(operation.output_sharding().cloned()),
             );
+
             // Dimension inputs do not receive cotangents; forward only the array inputs' handles.
             transpose_projected_operation(
                 context,
@@ -1040,16 +1082,16 @@ impl_differentiable_operation! {
 /// Reshapes an array using one explicit first-class dimension value per output axis.
 ///
 /// This is the shape-polymorphic counterpart of [`Reshape`], which receives its complete output geometry as a
-/// [`Shape`]. Exact dimension types describe static axes, including those produced by arithmetic, while
-/// non-exact dimension types describe dynamic axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime
-/// shape arithmetic stays an ordinary graph computation instead of a type-level side condition; backend lowering
-/// chooses the appropriate static, bounded, or dynamic representation from the inferred result type.
+/// [`Shape`]. Exact dimension types describe static axes, including those produced by arithmetic, while non-exact
+/// dimension types describe dynamic axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime shape
+/// arithmetic stays an ordinary graph computation instead of a type-level side condition; backend lowering chooses
+/// the appropriate static, bounded, or dynamic representation from the inferred result type.
 ///
-/// The output extents must multiply to the input element count, including when either shape contains a zero axis.
-/// When the input types cannot prove this equality, the operation retains an ordered runtime assertion even if its
-/// result is unused. Each dynamic extent also retains its declared bounds. Backends may reject unbounded geometry
-/// or a reshape whose input and output physical capacities cannot be represented by their runtime reshape support;
-/// equal logical element counts alone do not guarantee that every bounded shape can be compiled.
+/// The output extents must multiply to the input element count, including when either shape contains a zero axis. When
+/// the input types cannot prove this equality, the operation retains an ordered runtime assertion even if its result is
+/// unused. Each dynamic extent also retains its declared bounds. Backends may reject unbounded geometry or a reshape
+/// whose input and output physical capacities cannot be represented by their runtime reshape support; equal logical
+/// element counts alone do not guarantee that every bounded shape can be compiled.
 ///
 /// # Examples
 ///
@@ -1065,10 +1107,10 @@ impl_differentiable_operation! {
 /// # Ok::<(), ProgramError>(())
 /// ```
 ///
-/// Computed or input dimensions remain ordinary SSA inputs, which is what makes a runtime-derived output shape
-/// expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent is read off the input while
-/// its trailing extent is an exact lifted dimension. Extents derived by first-class dimension arithmetic work the
-/// same way, using the [`DimensionArithmetic`] capability (e.g.,
+/// Computed or input dimensions remain ordinary Single Static Assignment (SSA) inputs, which is what makes a
+/// runtime-derived output shape expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent
+/// is read off the input while its trailing extent is an exact lifted dimension. Extents derived by first-class
+/// dimension arithmetic work the same way, using the [`DimensionArithmetic`] capability (e.g.,
 /// `rows.dimension_mul(&columns)?`) directly on the composite values.
 ///
 /// ```rust
@@ -1082,6 +1124,7 @@ impl_differentiable_operation! {
 /// let input_type =
 ///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(6)]));
 /// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+///
 /// // Shapes: input [batch, 6] -> output [batch, 2, 3], retaining the symbolic batch extent.
 /// let input = context.input(ArrayIrType::Array(input_type));
 /// let rows = input.dimension_size(0).unwrap();
@@ -1091,41 +1134,42 @@ impl_differentiable_operation! {
 /// assert_eq!(output.r#type().to_string(), "f32[batch, 2, 3]");
 /// ```
 pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
-    /// Reshapes `self` to the output shape described by `output_dimensions`, one first-class value per output axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `output_dimensions`: Nonnegative first-class dimension values in output-axis order. Their product must
-    ///     equal the input element count; an empty slice requests a scalar. Exact values infer static axes, while
-    ///     non-exact values retain their dimension identities and bounds.
-    fn dynamic_reshape(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
-        self.dynamic_reshape_with_output_sharding(output_dimensions, None)
-    }
-
     /// Reshapes `self` with optional explicit output sharding. Supplying `None` is equivalent to
-    /// [`Self::dynamic_reshape`]. Explicit placement resolves ambiguous input-to-output sharding changes and is
-    /// attached to the reshape itself for backend lowering.
+    /// [`Self::dynamic_reshape`]. Explicit placement resolves ambiguous input-to-output sharding changes
+    /// and is attached to the reshape itself for backend lowering.
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: Nonnegative first-class dimension values in output-axis order. Their product must
-    ///     equal the input element count; an empty slice requests a scalar. Exact values infer static axes, while
+    ///   - `output_dimensions`: Non-negative first-class dimension values in output-axis order. Their product must
+    ///     equal the input element count. An empty slice requests a scalar. Exact values infer static axes, while
     ///     non-exact values retain their dimension identities and bounds.
     ///   - `output_sharding`: Requested placement for the output axes. When absent, compatible input placement is
-    ///     propagated; ambiguous placement changes require an explicit sharding.
+    ///     propagated. Ambiguous placement changes require an explicit sharding.
     fn dynamic_reshape_with_output_sharding(
         &self,
         output_dimensions: &[Self],
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>;
 
+    /// Reshapes `self` to the output shape described by `output_dimensions`, one first-class value per output axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_dimensions`: Non-negative first-class dimension values in output-axis order. Their product must
+    ///     equal the input element count. An empty slice requests a scalar. Exact values infer static axes, while
+    ///     non-exact values retain their dimension identities and bounds.
+    #[inline]
+    fn dynamic_reshape(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
+        self.dynamic_reshape_with_output_sharding(output_dimensions, None)
+    }
+
     /// Reshapes the input to an exact static shape by lifting every size into a dimension constant in its context.
-    /// The sizes must multiply to the input element count; runtime inputs are checked when equality is not provable.
+    /// The sizes must multiply to the input element count (runtime inputs are checked when equality is not provable).
     ///
     /// # Parameters
     ///
     ///   - `output_sizes`: Output-axis sizes, including any zero axes. An empty slice requests a scalar. These are
-    ///     exact extents rather than capacity bounds; inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
+    ///     exact extents rather than capacity bounds. Inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
@@ -1143,9 +1187,9 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
         self.dynamic_reshape(output_dimensions.as_slice())
     }
 
-    /// Returns the input as a vector in logical row-major order. Runtime extents are read from the input and
-    /// multiplied using checked first-class dimension arithmetic. A vector retains its existing dimension identity;
-    /// a scalar becomes a vector of size one and an empty array becomes a vector of size zero.
+    /// Returns the input as a vector in logical row-major order. Runtime extents are read from the input and multiplied
+    /// using checked first-class dimension arithmetic. A vector retains its existing dimension identity while a scalar
+    /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
         Self: DimensionSize + DimensionArithmetic,
@@ -1156,21 +1200,25 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
         if input_type.rank() == 1 {
             return Ok(self.clone());
         }
+
         if input_type.shape().dimensions().iter().any(|dimension| dimension.value() == Some(0)) {
             // A known zero extent makes the complete product zero, even when an earlier partial product would
             // overflow the dimension ABI. Do not emit arithmetic for dimensions that cannot affect the result.
             return self.dynamic_reshape_to_sizes(&[0]);
         }
+
         if let Some(element_count) = input_type.element_count()? {
             // Static geometry needs no runtime size arithmetic.
             return self.dynamic_reshape_to_sizes(&[element_count]);
         }
+
         // Seed the product with the leading extent instead of a constant one, so that no multiplication by one is
         // staged. At least two axes remain here because vectors returned above.
         let mut size = self.dimension_size(0)?;
         for axis in 1..input_type.rank() {
             size = size.dimension_mul(&self.dimension_size(axis)?)?;
         }
+
         self.dynamic_reshape(&[size])
     }
 
@@ -1192,6 +1240,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
             .into()
             .normalize(input_type.rank() + 1)
             .map_err(|error| TypeError::invalid(error.to_string()))?;
+
         // Static extents are lifted as constants; only dynamic axes need a runtime size read.
         let mut dimensions = input_type
             .shape()
@@ -1223,8 +1272,8 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
                 .iter()
                 .map(<Self as ValueProjection<DimensionType>>::projected)
                 .map(|result| {
-                    let dimension = result?;
                     // Repeated identities describe one extent, even when separate eager values supply them.
+                    let dimension = result?;
                     refinements.bind(dimension.r#type().variable(), dimension.extent())?;
                     Ok(Dimension::Static(dimension.extent()))
                 })
@@ -1266,6 +1315,8 @@ impl<
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Inserts batching's physical leading dimension into a logical per-item output sharding.
 pub(crate) fn lift_output_sharding_for_leading_batch_axis(
@@ -3337,11 +3388,11 @@ mod tests {
         ];
         assert_eq!(
             operation.with_input_types(&input_types).unwrap().to_string(),
-            "reshape [element_count_proven=true]"
+            "reshape [requires_runtime_assertion=false]"
         );
 
-        // The requested output sharding renders after the proof and
-        // switches an unproven operation to the bracketed form as well.
+        // The requested output sharding renders after the assertion requirement and
+        // switches an assertion-bearing operation to the bracketed form as well.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let operation = DynamicReshapeOperation::new().with_output_sharding(sharding.clone());
@@ -3354,10 +3405,46 @@ mod tests {
         assert_eq!(
             operation.with_input_types(&input_types).unwrap().to_string(),
             indoc! {"
-                reshape [element_count_proven=true, output_sharding={mesh<['x'=2:explicit]>, [{'x'}]}]
+                reshape [
+                    requires_runtime_assertion=false,
+                    output_sharding={mesh<['x'=2:explicit]>, [{'x'}]},
+                ]
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_dynamic_reshape_requires_runtime_assertion() {
+        let operation = DynamicReshapeOperation::new();
+        assert_eq!(operation, DynamicReshapeOperation::default());
+        assert!(operation.requires_runtime_assertion());
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+
+        let exact = [
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+            DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+        ];
+        let operation = operation.with_input_types(&exact).unwrap();
+        assert!(!operation.requires_runtime_assertion());
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+
+        // Reuse cannot silently drop a runtime check; explicit refinement can restore it for an independent extent.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let unproven = [exact[0].clone(), DimensionType::new(extent).into()];
+        assert_eq!(
+            operation.infer_output_types(&unproven, &[]),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` was constructed without a runtime element-count check but these input \
+                 types require one",
+            ))),
+        );
+        let operation = operation.with_input_types(&unproven).unwrap();
+        assert!(operation.requires_runtime_assertion());
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let operation = operation.with_input_types(&exact).unwrap();
+        assert!(!operation.requires_runtime_assertion());
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
     }
 
     #[test]
@@ -3406,7 +3493,10 @@ mod tests {
                 },
                 {
                     input_types = [unsharded_input.clone(), other.into(), two.clone(), two.clone()],
-                    error = format!("`{RESHAPE_OPERATION_NAME}` input types do not preserve its element-count proof"),
+                    error = format!(
+                        "`{RESHAPE_OPERATION_NAME}` was constructed without a runtime element-count check but these \
+                         input types require one",
+                    ),
                 },
                 {
                     input_types = [],
@@ -3896,7 +3986,7 @@ mod tests {
                 lambda %0:f64[2, 6] .
                 let %1:dimension<2> = const 2
                     %2:dimension<3> = const 3
-                    %3:f64[2, 2, 3] = reshape [element_count_proven=true] %0 %1 %1 %2
+                    %3:f64[2, 2, 3] = reshape [requires_runtime_assertion=false] %0 %1 %1 %2
                 in (%0)
             "}
             .trim_end(),
@@ -3989,8 +4079,8 @@ mod tests {
                 lambda %0:f64[6], %1:f64[6] .
                 let %2:dimension<2> = const 2
                     %3:dimension<3> = const 3
-                    %4:f64[2, 3] = reshape [element_count_proven=true] %0 %2 %3
-                    %5:f64[2, 3] = reshape [element_count_proven=true] %1 %2 %3
+                    %4:f64[2, 3] = reshape [requires_runtime_assertion=false] %0 %2 %3
+                    %5:f64[2, 3] = reshape [requires_runtime_assertion=false] %1 %2 %3
                 in (%4, %5)
             "}
             .trim_end(),
@@ -4577,7 +4667,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[reused_source, 4], %1:dimension<reused_source ∈ [1, 9)> .
                 let %2:dimension<4> = const 4
-                    %3:f64[reused_source, 4] = reshape [element_count_proven=true] %0 %1 %2
+                    %3:f64[reused_source, 4] = reshape [requires_runtime_assertion=false] %0 %1 %2
                 in (%3, %1)
             "}
             .trim_end(),
@@ -4590,13 +4680,13 @@ mod tests {
                     %3:f64[reused_source, 4] = linear_call [residual_count=2] %1 %2 %0 [
                         forward={
                             lambda %0:dimension<reused_source ∈ [1, 9)>, %1:dimension<4>, %2:f64[reused_source, 4] .
-                            let %3:f64[reused_source, 4] = reshape [element_count_proven=true] %2 %0 %1
+                            let %3:f64[reused_source, 4] = reshape [requires_runtime_assertion=false] %2 %0 %1
                             in (%3)
                         },
                         transpose={
                             lambda %0:dimension<reused_source ∈ [1, 9)>, %1:dimension<4>, %2:f64[reused_source, 4] .
                             let %3:dimension<4> = constant [value=4]
-                                %4:f64[reused_source, 4] = reshape [element_count_proven=true] %2 %0 %3
+                                %4:f64[reused_source, 4] = reshape [requires_runtime_assertion=false] %2 %0 %3
                             in (%4)
                         },
                     ]
@@ -4759,7 +4849,7 @@ mod tests {
                 lambda %0:f64[extent, extent] .
                 let %1:f64[extent, extent] = transpose [permutation=[1, 0]] %0
                     %2:dimension<extent ∈ [0, 5)> = dimension_size [axis=0] %0
-                    %3:f64[extent, extent] = reshape [element_count_proven=true] %1 %2 %2
+                    %3:f64[extent, extent] = reshape [requires_runtime_assertion=false] %1 %2 %2
                 in (%3, %2)
             "}
             .trim_end(),
@@ -5026,7 +5116,7 @@ mod tests {
                     %2:dimension<2> = constant [value=2]
                     %3:dimension<3> = constant [value=3]
                     %4:dimension<6> = dimension_mul %2 %3
-                    %5:f64[batch, 6] = reshape [element_count_proven=true] %0 %1 %4
+                    %5:f64[batch, 6] = reshape [requires_runtime_assertion=false] %0 %1 %4
                 in (%5)
             "}
             .trim_end(),
@@ -5080,8 +5170,10 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 3] .
                 let %1:dimension<6> = constant [value=6]
-                    %2:f64[6][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = reshape [element_count_proven=true, \
-                    output_sharding={mesh<['x'=2:explicit]>, [{'x'}]}] %0 %1
+                    %2:f64[6][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = reshape [
+                        requires_runtime_assertion=false,
+                        output_sharding={mesh<['x'=2:explicit]>, [{'x'}]},
+                    ] %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -5166,7 +5258,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2, 3] .
                 let %1:dimension<6> = constant [value=6]
-                    %2:f64[6] = reshape [element_count_proven=true] %0 %1
+                    %2:f64[6] = reshape [requires_runtime_assertion=false] %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -5200,7 +5292,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:dimension<1> = constant [value=1]
-                    %2:f64[1] = reshape [element_count_proven=true] %0 %1
+                    %2:f64[1] = reshape [requires_runtime_assertion=false] %0 %1
                 in (%2)
             "}
             .trim_end(),
@@ -5252,7 +5344,7 @@ mod tests {
                 let %1:dimension<rows ∈ [4, 6)> = dimension_size [axis=0] %0
                     %2:dimension<4> = constant [value=4]
                     %3:dimension<1> = constant [value=1]
-                    %4:f64[1, rows, 4] = reshape [element_count_proven=true] %0 %3 %1 %2
+                    %4:f64[1, rows, 4] = reshape [requires_runtime_assertion=false] %0 %3 %1 %2
                 in (%4)
             "}
             .trim_end(),
