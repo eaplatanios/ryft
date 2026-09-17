@@ -551,14 +551,15 @@ impl Reshape for Array {
         let output_type = self.r#type().reshape_with_output_sharding(shape, output_sharding)?;
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
-            bytes.copy_from_slice(self.storage_bytes());
-        } else {
-            for index in 0..input_addressing.element_count() {
-                bytes[output_addressing.byte_range_for_flat_index(index)]
-                    .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_for_flat_index(index)]);
-            }
+            // Both shapes enumerate exactly the same contiguous encodings. Retyping can share storage; later
+            // mutation detaches it through the array's existing copy-on-write boundary.
+            return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
+        }
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        for index in 0..input_addressing.element_count() {
+            bytes[output_addressing.byte_range_for_flat_index(index)]
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_for_flat_index(index)]);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
@@ -1966,6 +1967,14 @@ mod tests {
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(Arc::ptr_eq(input.shared_storage(), output[0].shared_storage()));
+
+        // Storage sharing preserves value semantics: changing a reshaped copy must detach its payload.
+        let mut changed = output[0].clone();
+        changed.storage_bytes_mut()[..8].copy_from_slice(&9.0_f64.to_ne_bytes());
+        assert_eq!(changed.to_f64s(), vec![9.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(input.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // An explicit transpose composes with the row-major reshape.

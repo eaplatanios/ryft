@@ -4,7 +4,7 @@ use std::fmt::Display;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
     ArrayIrValue, ArrayType, DataType, Dimension, LogicalMesh, NumericArrayElement, Shape, Sharding, ShardingDimension,
-    i1, i2, i4, materialize_array_tangent, u1, u2, u4,
+    materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -32,8 +32,8 @@ use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::gathering::{
-    GatherDimensionNumbers, GatherMode, GatherOperation, batching_window_size, dimension_has_explicit_axis,
-    dimensions_have_equal_extents, validate_sorted_unique_in_range, validate_unique_in_range,
+    GatherDimensionNumbers, GatherMode, GatherOperation, dimension_has_explicit_axis, dimensions_have_equal_extents,
+    validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use crate::operations::manipulation::reshaping::{
     DynamicReshape, Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
@@ -488,7 +488,7 @@ impl ScatterOperation {
 
     /// Builds the gather that reads back the windows this scatter writes: its offset, collapsed, and batching axes
     /// mirror the scatter's dimension numbers, its window sizes are the static update window extents (one on inserted
-    /// axes and one or zero on paired batching axes through [`batching_window_size`]), and the bounds mode, index
+    /// axes and one on paired batching axes, or zero when those axes may be empty), and the bounds mode, index
     /// hints, and requested placement carry over. Callers choose the fill: the transpose and the overwrite winner IDs
     /// pin a typed zero, while the extremal coefficients keep gather's default fill (NaN for floating-point inputs).
     ///
@@ -524,7 +524,9 @@ impl ScatterOperation {
                 }
                 slice_sizes.push(1);
             } else if dimensions.operand_batching_dimensions().contains(&axis) {
-                slice_sizes.push(batching_window_size(&input_type.dimension(axis)));
+                // A possibly empty paired axis needs a zero window to satisfy gather's extent bounds. Its
+                // output extent still comes from the paired indices dimension, so nonempty batches stay nonempty.
+                slice_sizes.push(input_type.dimension(axis).bounds().lower().min(1));
             } else {
                 let update_axis = dimensions.update_window_dimensions()[window_position];
                 slice_sizes.push(updates_type.dimension(update_axis).value().ok_or_else(|| {
@@ -1752,11 +1754,16 @@ impl Array {
         let indices_addressing = ArrayAddressing::new(indices.r#type().into_owned())?;
         let updates_shape = updates.r#type().static_shape().unwrap();
         let updates_addressing = ArrayAddressing::new(updates.r#type().into_owned())?;
+        // The caller has already validated all inputs and placement. With no updates, retain the input payload
+        // before requesting mutable storage, which would otherwise copy the entire shared buffer.
+        if updates_addressing.element_count() == 0 {
+            return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
+        }
         let input_rank = input_shape.rank();
         let indices_rank = indices_shape.rank();
         let updates_rank = updates_shape.rank();
         let index_vector_dimension = indices_rank - 1;
-        let index_vector_extent = indices_shape[index_vector_dimension];
+        let indices_data_type = indices.r#type().data_type();
 
         let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
         let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
@@ -1776,69 +1783,54 @@ impl Array {
         let output_bytes = output.storage_bytes_mut();
         let mut update_index = vec![0usize; updates_rank];
         let mut indices_index = vec![0usize; indices_rank];
-        let mut starts = vec![0i128; index_vector_extent];
-        let mut input_index = vec![0i128; input_rank];
-        let mut input_storage_index = vec![0usize; input_rank];
+        let mut input_origin = vec![0usize; input_rank];
+        let mut input_index = vec![0usize; input_rank];
+        let mut dropped = false;
+        let drop_out_of_bounds = mode == ScatterMode::Drop;
         for update in 0..updates_addressing.element_count() {
-            indices_index.fill(0);
-            for (position, &update_axis) in update_scatter_axes.iter().enumerate() {
-                indices_index[indices_batch_axes[position]] = update_index[update_axis];
+            // Consecutive window elements often use the same query. Cache only that query's origin and bounds
+            // decision, retaining the original element traversal order even when query/window axes interleave.
+            // The first iteration also initializes queries with an empty index vector or no query axes.
+            let mut query_changed = update == 0;
+            for (position, &axis) in update_scatter_axes.iter().enumerate() {
+                let indices_axis = indices_batch_axes[position];
+                let coordinate = update_index[axis];
+                query_changed |= indices_index[indices_axis] != coordinate;
+                indices_index[indices_axis] = coordinate;
             }
-            for (component, start) in starts.iter_mut().enumerate() {
-                indices_index[index_vector_dimension] = component;
-                let bytes = &indices.storage_bytes()[indices_addressing.byte_range_unchecked(&indices_index)];
-                *start = match indices.r#type().data_type() {
-                    DataType::I1 => i128::from(i1::decode(bytes).value()),
-                    DataType::I2 => i128::from(i2::decode(bytes).value()),
-                    DataType::I4 => i128::from(i4::decode(bytes).value()),
-                    DataType::I8 => i128::from(i8::decode(bytes)),
-                    DataType::I16 => i128::from(i16::decode(bytes)),
-                    DataType::I32 => i128::from(i32::decode(bytes)),
-                    DataType::I64 => i128::from(i64::decode(bytes)),
-                    DataType::U1 => i128::from(u1::decode(bytes).value()),
-                    DataType::U2 => i128::from(u2::decode(bytes).value()),
-                    DataType::U4 => i128::from(u4::decode(bytes).value()),
-                    DataType::U8 => i128::from(u8::decode(bytes)),
-                    DataType::U16 => i128::from(u16::decode(bytes)),
-                    DataType::U32 => i128::from(u32::decode(bytes)),
-                    DataType::U64 => i128::from(u64::decode(bytes)),
-                    data_type => unreachable!("cannot use an array of element data type `{data_type}` as indices"),
-                };
-            }
-            input_index.fill(0);
-            for (window, &input_axis) in input_window_axes.iter().enumerate() {
-                input_index[input_axis] = update_index[dimensions.update_window_dimensions()[window]] as i128;
-            }
-            for (batch, &input_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
-                input_index[input_axis] =
-                    indices_index[dimensions.scatter_indices_batching_dimensions()[batch]] as i128;
-            }
-            let mut dropped = false;
-            for (component, &input_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate() {
-                let raw = starts[component];
-                // The window fits the axis: the type rule bounds update windows by the input extents, inserted and
-                // batching windows are one, and an empty input returned above.
-                let maximum = (input_shape[input_axis] - input_window_size[input_axis]) as i128;
-                match mode {
-                    ScatterMode::Drop => {
-                        if raw < 0 || raw > maximum {
-                            dropped = true;
+            if query_changed {
+                input_origin.fill(0);
+                dropped = false;
+                for (batch, &input_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                    input_origin[input_axis] = indices_index[dimensions.scatter_indices_batching_dimensions()[batch]];
+                }
+                for (component, &input_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate()
+                {
+                    indices_index[index_vector_dimension] = component;
+                    let index_bytes = &indices.storage_bytes()[indices_addressing.byte_range_unchecked(&indices_index)];
+                    let raw = dispatch_on_array_element_type!(@integer indices_data_type, |Element| {
+                        let value = Element::decode(index_bytes);
+                        if indices_data_type.is_signed() {
+                            value.convert_to::<i64>().map(i128::from)
+                        } else {
+                            value.convert_to::<u64>().map(i128::from)
                         }
-                        input_index[input_axis] += raw;
-                    }
-                    // The promise mode leaves out-of-bounds results unspecified. Clamping is a defensive choice that
-                    // keeps every write in bounds; it is not part of the contract.
-                    ScatterMode::PromiseInBounds | ScatterMode::Clip => {
-                        input_index[input_axis] += raw.clamp(0, maximum)
-                    }
+                    })?;
+                    // Validation guarantees the window fits. Widening before clamping preserves unsigned extremes.
+                    let maximum = (input_shape[input_axis] - input_window_size[input_axis]) as i128;
+                    dropped |= drop_out_of_bounds && (raw < 0 || raw > maximum);
+                    // Invalid fill/drop origins are never accessed. Promise mode uses defensive clipping without
+                    // guaranteeing any particular out-of-bounds result to callers.
+                    input_origin[input_axis] = raw.clamp(0, maximum) as usize;
                 }
             }
             if !dropped {
-                for axis in 0..input_rank {
-                    input_storage_index[axis] = input_index[axis] as usize;
+                input_index.copy_from_slice(&input_origin);
+                for (window, &input_axis) in input_window_axes.iter().enumerate() {
+                    input_index[input_axis] += update_index[dimensions.update_window_dimensions()[window]];
                 }
                 combine(
-                    &mut output_bytes[output_addressing.byte_range_unchecked(&input_storage_index)],
+                    &mut output_bytes[output_addressing.byte_range_unchecked(&input_index)],
                     &updates.storage_bytes()[updates_addressing.byte_range_for_flat_index(update)],
                 )?;
             }
@@ -2080,7 +2072,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
-        ShardingDimension, StridedLayout,
+        ShardingDimension, StridedLayout, i4,
     };
     use crate::batching::batch;
     use crate::contexts::Context;
@@ -3221,6 +3213,42 @@ mod tests {
 
     #[test]
     fn test_scatter_interpretation() {
+        // Repeated windows combine every update, including when window axes precede query axes.
+        let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
+        let indices = Array::matrix(3, 1, vec![0_i32, 0, 2]).unwrap();
+        let options = ScatterOptions::new().with_mode(ScatterMode::Drop);
+        assert_eq!(
+            input.scatter(
+                &indices,
+                &Array::matrix(3, 2, vec![1_i32, 2, 4, 8, 16, 32]).unwrap(),
+                &ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                ScatterReductionKind::Add,
+                &options,
+            ),
+            Array::vector(vec![15_i32, 30, 46, 72]),
+        );
+        assert_eq!(
+            input.scatter(
+                &indices,
+                &Array::matrix(2, 3, vec![1_i32, 4, 16, 2, 8, 32]).unwrap(),
+                &ScatterDimensionNumbers::new(vec![0], vec![], vec![0]),
+                ScatterReductionKind::Add,
+                &options,
+            ),
+            Array::vector(vec![15_i32, 30, 46, 72]),
+        );
+        let indices = Array::matrix(3, 1, vec![-1_i32, 1, 5]).unwrap();
+        assert_eq!(
+            input.scatter(
+                &indices,
+                &Array::matrix(3, 2, vec![1_i32, 2, 4, 8, 16, 32]).unwrap(),
+                &ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                ScatterReductionKind::Add,
+                &options,
+            ),
+            Array::vector(vec![10_i32, 24, 38, 40]),
+        );
+
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let indices = Array::matrix(2, 1, vec![1_i32, 3]).unwrap();
@@ -3314,6 +3342,30 @@ mod tests {
 
     #[test]
     fn test_scatter_interpretation_empty_and_extreme_indices() {
+        // Empty updates preserve the payload, but must still pass ordinary type validation.
+        let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
+        let indices = Array::matrix(0, 1, Vec::<i32>::new()).unwrap();
+        let updates = Array::vector(Vec::<i32>::new()).unwrap();
+        let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let output = input
+            .scatter(&indices, &updates, &dimensions, ScatterReductionKind::Add, &ScatterOptions::new())
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(input.shared_storage(), output.shared_storage()));
+        assert_eq!(output, input);
+        assert_eq!(
+            input.scatter(
+                &indices,
+                &Array::vector(Vec::<f32>::new()).unwrap(),
+                &dimensions,
+                ScatterReductionKind::Add,
+                &ScatterOptions::new(),
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCATTER_OPERATION_NAME}` updates data type `f32` does not match input data type `i32`",
+            ))
+            .into()),
+        );
+
         // No update can address an element of an empty input, whichever bounds mode is selected.
         let input = Array::vector(Vec::<i32>::new()).unwrap();
         let indices = Array::matrix(1, 1, vec![u64::MAX]).unwrap();

@@ -1082,8 +1082,9 @@ impl UpdateSlice for Array {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         let output_type = self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
         let output = self.clone().replace_block(update, start_indices);
-        let output_axes = (0..output_type.rank()).collect::<Vec<_>>();
-        output.broadcast(output_type, &output_axes)
+        // Type inference preserves the input's shape, element type, memory, and physical layout; only sharding
+        // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
+        Ok(Self::new_unchecked(output_type, output.shared_storage().clone()))
     }
 }
 
@@ -2303,8 +2304,9 @@ impl DynamicUpdateSlice for Array {
         let update_shape = update.r#type().static_shape().unwrap();
         let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
         let output = self.clone().replace_block(update, starts.as_slice());
-        let output_axes = (0..output_type.rank()).collect::<Vec<_>>();
-        output.broadcast(output_type, &output_axes)
+        // Type inference preserves the input's shape, element type, memory, and physical layout; only sharding
+        // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
+        Ok(Self::new_unchecked(output_type, output.shared_storage().clone()))
     }
 }
 
@@ -4496,6 +4498,22 @@ mod tests {
 
     #[test]
     fn test_update_slice_interpretation() {
+        // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type =
+            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
+        let update_type = ArrayType::new_static(DataType::I32, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type.clone(), &[1_i32, 2, 3]).unwrap();
+        let update = Array::from_elements(update_type, &[9_i32]).unwrap();
+        let output = input.update_slice(&update, &[1]).unwrap();
+        let expected_type = input_type
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
+        assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
+
         let operation = UpdateSliceOperation::new(vec![0, 1]);
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         // Interpretation overwrites the selected block of the row-major payload.
@@ -6652,6 +6670,22 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_interpretation() {
+        // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type =
+            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
+        let update_type = ArrayType::new_static(DataType::I32, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type.clone(), &[1_i32, 2, 3]).unwrap();
+        let update = Array::from_elements(update_type, &[9_i32]).unwrap();
+        let output = input.dynamic_update_slice(&update, &[index(1)]).unwrap();
+        let expected_type = input_type
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
+        assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
+
         let operation = DynamicUpdateSliceOperation;
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         // Interpretation overwrites the block at the in-band start indices.

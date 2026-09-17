@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
     ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, LogicalMesh, MeshAxisType, Shape,
-    Sharding, ShardingDimension, i1, i2, i4, u1, u2, u4,
+    Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -692,8 +692,10 @@ where
         } else {
             // Pair the new input and indices dimensions (every item reads only its own input, so the index promises
             // stay valid per item). The paired axes take a size-one window, or a zero window when the mapped extent
-            // is statically empty or may be empty at runtime.
-            operation.slice_sizes.insert(0, batching_window_size(&axis_dimension));
+            // is statically empty or may be empty at runtime. The output batch extent comes from the indices, so a
+            // zero batching window does not empty a nonempty batch; it only keeps the window within the input axis's
+            // guaranteed minimum extent.
+            operation.slice_sizes.insert(0, axis_dimension.bounds().lower().min(1));
             let mut batching = vec![(0, 0)];
             batching.extend(
                 dimensions
@@ -1654,7 +1656,7 @@ impl Gather for Array {
         let indices_rank = indices_shape.rank();
         let output_rank = output_type.rank();
         let index_vector_dimension = indices_rank - 1;
-        let index_vector_extent = indices_shape[index_vector_dimension];
+        let indices_data_type = indices.r#type().data_type();
 
         // Classify input axes (window axes carry the slice while collapsed/batching do not) and output axes (offset
         // positions carry the window and the rest carry the indices' batch coordinates).
@@ -1683,62 +1685,49 @@ impl Gather for Array {
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         let mut output_index = vec![0usize; output_rank];
         let mut indices_index = vec![0usize; indices_rank];
-        let mut starts = vec![0i128; index_vector_extent];
-        let mut input_index = vec![0i128; input_rank];
-        let mut input_storage_index = vec![0usize; input_rank];
+        let mut input_origin = vec![0usize; input_rank];
+        let mut input_index = vec![0usize; input_rank];
+        let mut dropped = false;
+        let drop_out_of_bounds = matches!(options.mode(), GatherMode::Fill { .. });
         for output_element in 0..output_addressing.element_count() {
-            // Place the output's batch coordinates into the indices multi-index and read this query's start vector.
-            indices_index.fill(0);
-            for (position, &output_position) in batch_output_positions.iter().enumerate() {
-                indices_index[indices_batch_axes[position]] = output_index[output_position];
+            // Consecutive window elements often use the same query. Cache only that query's origin and bounds
+            // decision, retaining the original element traversal order even when query/window axes interleave.
+            // The first iteration also initializes queries with an empty index vector or no query axes.
+            let mut query_changed = output_element == 0;
+            for (position, &axis) in batch_output_positions.iter().enumerate() {
+                let indices_axis = indices_batch_axes[position];
+                let coordinate = output_index[axis];
+                query_changed |= indices_index[indices_axis] != coordinate;
+                indices_index[indices_axis] = coordinate;
             }
 
-            for (component, start) in starts.iter_mut().enumerate() {
-                indices_index[index_vector_dimension] = component;
-                let index_bytes = &indices.storage_bytes()[indices_addressing.byte_range_unchecked(&indices_index)];
-                *start = match indices.r#type().data_type() {
-                    DataType::I1 => i128::from(i1::decode(index_bytes).value()),
-                    DataType::I2 => i128::from(i2::decode(index_bytes).value()),
-                    DataType::I4 => i128::from(i4::decode(index_bytes).value()),
-                    DataType::I8 => i128::from(i8::decode(index_bytes)),
-                    DataType::I16 => i128::from(i16::decode(index_bytes)),
-                    DataType::I32 => i128::from(i32::decode(index_bytes)),
-                    DataType::I64 => i128::from(i64::decode(index_bytes)),
-                    DataType::U1 => i128::from(u1::decode(index_bytes).value()),
-                    DataType::U2 => i128::from(u2::decode(index_bytes).value()),
-                    DataType::U4 => i128::from(u4::decode(index_bytes).value()),
-                    DataType::U8 => i128::from(u8::decode(index_bytes)),
-                    DataType::U16 => i128::from(u16::decode(index_bytes)),
-                    DataType::U32 => i128::from(u32::decode(index_bytes)),
-                    DataType::U64 => i128::from(u64::decode(index_bytes)),
-                    _ => unreachable!(),
-                };
-            }
+            if query_changed {
+                input_origin.fill(0);
+                dropped = false;
 
-            // Assemble the input multi-index (i.e., window offsets, then batching coordinates, then start offsets).
-            input_index.fill(0);
-            for (window, &input_axis) in input_window_axes.iter().enumerate() {
-                input_index[input_axis] = output_index[dimensions.offset_dimensions()[window]] as i128;
-            }
-            for &(input_axis, indices_axis) in dimensions.batching_dimensions() {
-                input_index[input_axis] = indices_index[indices_axis] as i128;
-            }
-            let mut dropped = false;
-            for (component, &input_axis) in dimensions.start_index_map().iter().enumerate() {
-                let raw = starts[component];
-                let maximum = (input_shape[input_axis] - slice_sizes[input_axis]) as i128;
-                match options.mode() {
-                    GatherMode::Fill { .. } => {
-                        if raw < 0 || raw > maximum {
-                            dropped = true;
+                for &(input_axis, indices_axis) in dimensions.batching_dimensions() {
+                    input_origin[input_axis] = indices_index[indices_axis];
+                }
+
+                for (component, &input_axis) in dimensions.start_index_map().iter().enumerate() {
+                    indices_index[index_vector_dimension] = component;
+                    let index_bytes = &indices.storage_bytes()[indices_addressing.byte_range_unchecked(&indices_index)];
+                    let raw = dispatch_on_array_element_type!(@integer indices_data_type, |Element| {
+                        let value = Element::decode(index_bytes);
+                        if indices_data_type.is_signed() {
+                            value.convert_to::<i64>().map(i128::from)
+                        } else {
+                            value.convert_to::<u64>().map(i128::from)
                         }
-                        input_index[input_axis] += raw;
-                    }
-                    GatherMode::PromiseInBounds | GatherMode::Clip => {
-                        // The promise mode leaves out-of-bounds results unspecified. Clamping is a defensive choice
-                        // that keeps every read in bounds, but it is not part of the contract.
-                        input_index[input_axis] += raw.clamp(0, maximum)
-                    }
+                    })?;
+
+                    // Validation guarantees the window fits. Widening before clamping preserves unsigned extremes.
+                    let maximum = (input_shape[input_axis] - slice_sizes[input_axis]) as i128;
+                    dropped |= drop_out_of_bounds && (raw < 0 || raw > maximum);
+
+                    // Invalid fill/drop origins are never accessed. Promise mode uses defensive clipping without
+                    // guaranteeing any particular out-of-bounds result to callers.
+                    input_origin[input_axis] = raw.clamp(0, maximum) as usize;
                 }
             }
 
@@ -1746,10 +1735,11 @@ impl Gather for Array {
                 let (value, addressing) = dropped_fill.as_ref().unwrap();
                 &value.storage_bytes()[addressing.byte_range_for_flat_index(0)]
             } else {
-                for axis in 0..input_rank {
-                    input_storage_index[axis] = input_index[axis] as usize;
+                input_index.copy_from_slice(&input_origin);
+                for (window, &input_axis) in input_window_axes.iter().enumerate() {
+                    input_index[input_axis] += output_index[dimensions.offset_dimensions()[window]];
                 }
-                &self.storage_bytes()[input_addressing.byte_range_unchecked(&input_storage_index)]
+                &self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]
             };
 
             bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
@@ -1795,15 +1785,11 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Gathers complete slices with first-class dimensions for the untouched input axes and query shape.
-///
-/// This is a composition of [`DynamicBroadcast`] and [`GatherOperation`].
-/// Untouched input axes become paired gather batching axes instead of runtime-sized windows. The selected axis
-/// uses a size-one window; paired axes use size zero or one according to their bounds. The output retains the exact
-/// runtime dimensions of the input and queries. Like [`Gather::gather_axis`], negative indices are out of bounds
-/// rather than indexing backward from the end.
+/// Gathers complete slices with first-class dimensions for the untouched input axes and query shape. This is a
+/// composition of [`DynamicBroadcast`] and [`GatherOperation`]. Untouched input axes become paired gather batching axes
+/// instead of runtime-sized windows. The selected axis uses a size-one window, and paired axes use size zero or one
+/// according to their bounds. The output retains the exact runtime dimensions of the input and queries. Like
+/// [`Gather::gather_axis`], negative indices are out of bounds rather than indexing backward from the end.
 ///
 /// # Examples
 ///
@@ -1831,10 +1817,8 @@ pub trait DynamicGather<Stored: Value<Type = ArrayType> = Array>: Value<Type = A
     ) -> Result<Self, ProgramError>;
 }
 
-impl<Stored: Value<Type = ArrayType>, A: Value<Type = ArrayType> + Gather<Stored> + Reshape> DynamicGather<Stored>
-    for ArrayIrValue<A>
-where
-    A::DispatchDomain: Zero<A>,
+impl<Stored: Value<Type = ArrayType>, A: Value<Type = ArrayType, DispatchDomain: Zero<A>> + Gather<Stored> + Reshape>
+    DynamicGather<Stored> for ArrayIrValue<A>
 {
     fn dynamic_gather_axis<AxisValue: Into<Axis>>(
         &self,
@@ -1863,12 +1847,9 @@ where
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V> DynamicGather<Stored> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>> DynamicGather<Stored> for V
 where
-    V: Value<Type = ArrayIrType>
-        + DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Gather<Stored>>,
+    V: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Gather<Stored>>,
     V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicZero<V>,
 {
     fn dynamic_gather_axis<A: Into<Axis>>(
@@ -1895,16 +1876,20 @@ where
             }
         }
         dimensions.push(self.dispatch_domain().dimension_constant(1)?);
+
         // Broadcast each scalar query over the untouched input coordinates. Those coordinates select matching
         // input/indices batches, so no symbolic extent is encoded as a host-sized gather window.
         let indices =
             indices.dynamic_broadcast(&dimensions, &(axis..axis + indices_type.rank()).collect::<Vec<_>>())?;
         let gather_dimensions =
             GatherDimensionNumbers::new(vec![], vec![axis], vec![axis]).with_batching_dimensions(batching);
+
+        // Paired axes use a zero window when they may be empty. Their output extents come from the indices
+        // dimensions, independently of these window sizes.
         let slice_sizes = (0..input_type.rank())
             .map(
                 |input_axis| {
-                    if input_axis == axis { 1 } else { batching_window_size(&input_type.dimension(input_axis)) }
+                    if input_axis == axis { 1 } else { input_type.dimension(input_axis).bounds().lower().min(1) }
                 },
             )
             .collect::<Vec<_>>();
@@ -1930,6 +1915,7 @@ where
                 .collect::<Vec<_>>();
             return self.dispatch_domain().dynamic_zero(&output_type, &dynamic_dimensions);
         }
+
         Ok(V::from_projected(self.clone().into_projected()?.gather(
             &indices.into_projected()?,
             &gather_dimensions,
@@ -1939,18 +1925,7 @@ where
     }
 }
 
-/// Returns the window size for a paired gather batching axis of the given extent: one element per batch item, or zero
-/// when the extent is statically empty or a dynamic extent may be empty at runtime. Paired batching axes do not
-/// contribute window dimensions; their extents enter the output through the corresponding indices dimensions. A zero
-/// batching window therefore does not empty a nonempty batch; it keeps the window within the guaranteed minimum extent
-/// that the type rule enforces for dynamic axes. Shared with [`super::scattering`], whose dual gathers pair the same
-/// batching axes.
-pub(crate) fn batching_window_size(dimension: &Dimension) -> usize {
-    match dimension {
-        Dimension::Static(size) => usize::from(*size != 0),
-        Dimension::Dynamic(variable) => usize::from(variable.bounds().lower() != 0),
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns whether two indexing dimensions provably have the same extent.
 ///
@@ -2028,7 +2003,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
         DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
-        ShardingDimension, StridedLayout,
+        ShardingDimension, StridedLayout, i1, i4, u4,
     };
     use crate::batching::batch;
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
@@ -3117,6 +3092,21 @@ mod tests {
 
     #[test]
     fn test_gather_interpretation() {
+        // Window elements reuse a query, while interleaved output axes revisit queries. Both must reset the
+        // whole-window fill decision correctly when moving between in-bounds and out-of-bounds starts.
+        let input = Array::vector(vec![10_i32, 20, 30, 40]).unwrap();
+        let indices = Array::matrix(4, 1, vec![-1_i32, 1, 5, 0]).unwrap();
+        let options =
+            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-99_i32).unwrap())) });
+        assert_eq!(
+            input.gather(&indices, &GatherDimensionNumbers::new(vec![1], vec![], vec![0]), &[2], &options),
+            Array::matrix(4, 2, vec![-99_i32, -99, 20, 30, -99, -99, 10, 20]),
+        );
+        assert_eq!(
+            input.gather(&indices, &GatherDimensionNumbers::new(vec![0], vec![], vec![0]), &[2], &options),
+            Array::matrix(2, 4, vec![-99_i32, 20, -99, 10, -99, 30, -99, 20]),
+        );
+
         let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
         let input = Array::vector(vec![10.0, 20.0, 30.0, 40.0]).unwrap();
         let indices = Array::matrix(2, 1, vec![1_i32, 3]).unwrap();
@@ -4487,17 +4477,6 @@ mod tests {
             program.interpret((four_rows, no_queries)),
             Ok(ArrayIrValue::Array(Array::matrix(4, 0, Vec::<f64>::new()).unwrap())),
         );
-    }
-
-    #[test]
-    fn test_batching_window_size() {
-        assert_eq!(batching_window_size(&Dimension::Static(0)), 0);
-        assert_eq!(batching_window_size(&Dimension::Static(1)), 1);
-        assert_eq!(batching_window_size(&Dimension::Static(5)), 1);
-        let possibly_empty = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
-        assert_eq!(batching_window_size(&Dimension::Dynamic(possibly_empty)), 0);
-        let nonempty = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        assert_eq!(batching_window_size(&Dimension::Dynamic(nonempty)), 1);
     }
 
     #[test]
