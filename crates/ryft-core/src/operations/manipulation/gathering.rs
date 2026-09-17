@@ -1286,25 +1286,28 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 
         // Output rank, then each dimension-number list against its rank bound.
         let output_rank = dimensions.offset_dimensions().len() + indices_rank - 1;
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             GATHER_OPERATION_NAME,
             "offset_dimensions",
             dimensions.offset_dimensions(),
             output_rank,
+            true,
         )?;
 
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             GATHER_OPERATION_NAME,
             "collapsed_slice_dimensions",
             dimensions.collapsed_slice_dimensions(),
             input_rank,
+            true,
         )?;
 
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             GATHER_OPERATION_NAME,
             "batching_dimensions input axes",
             &input_batching_dimensions,
             input_rank,
+            true,
         )?;
 
         if dimensions.start_index_map().len() != index_vector_extent {
@@ -1317,13 +1320,20 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             .into());
         }
 
-        validate_unique_in_range(GATHER_OPERATION_NAME, "start_index_map", dimensions.start_index_map(), input_rank)?;
+        validate_unique_in_range(
+            GATHER_OPERATION_NAME,
+            "start_index_map",
+            dimensions.start_index_map(),
+            input_rank,
+            false,
+        )?;
 
         validate_unique_in_range(
             GATHER_OPERATION_NAME,
             "batching_dimensions indices axes",
             &indices_batching_dimensions,
             indices_rank,
+            false,
         )?;
 
         if dimensions.start_index_map().iter().any(|axis| input_batching_dimensions.contains(axis)) {
@@ -1924,50 +1934,52 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validates that `axes` is strictly ascending (sorted and unique) and that every entry is in `0..bound`. Shared with
-/// [`super::scattering`].
-pub(crate) fn validate_sorted_unique_in_range(
-    operation_name: &'static str,
-    field: &str,
-    axes: &[usize],
-    bound: usize,
-) -> Result<(), TypeError> {
-    for window in axes.windows(2) {
-        if window[0] >= window[1] {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` `{field}` must be sorted and unique but got {axes:?}"
-            )));
-        }
-    }
-    if let Some(&axis) = axes.iter().find(|&&axis| axis >= bound) {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` `{field}` entry {axis} is out of range for bound {bound}"
-        )));
-    }
-    Ok(())
-}
-
-/// Validates that every entry of `axes` is unique and in `0..bound` (order not required). Shared with
-/// [`super::scattering`].
+/// Validates that `axes` contains distinct axis indices in `0..bound`, optionally requiring strictly ascending order.
+/// Empty lists are valid, including when `bound` is zero. This function neither reorders nor deduplicates the entries;
+/// it returns a [`TypeError`] identifying the operation and field when a constraint is violated.
+///
+/// When `sorted` is `true`, ordering and uniqueness are checked before any range checks. Otherwise, entries are visited
+/// in their supplied order, checking each entry's range before checking whether it duplicates an earlier entry. This
+/// determines which diagnostic is returned when more than one constraint is violated.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the operation being validated, used to identify it in diagnostics.
+///   - `field`: Name of the operation field containing the axis indices, used to identify it in diagnostics.
+///   - `axes`: Axis indices to validate. Duplicate entries are rejected regardless of `sorted`.
+///   - `bound`: Exclusive upper bound for each index, typically the rank of the corresponding input or output.
+///   - `sorted`: Whether to require strictly ascending indices. If `false`, any ordering of distinct, in-range
+///     indices is accepted. If `true`, each index must also be greater than the preceding index.
 pub(crate) fn validate_unique_in_range(
     operation_name: &'static str,
     field: &str,
     axes: &[usize],
     bound: usize,
+    sorted: bool,
 ) -> Result<(), TypeError> {
+    // Strictly increasing entries are necessarily unique, so sorted inputs need no set of previously seen axes.
+    if sorted {
+        for window in axes.windows(2) {
+            if window[0] >= window[1] {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` `{field}` must be sorted and unique but got {axes:?}",
+                )));
+            }
+        }
+    }
+
     let mut seen = BTreeSet::new();
     for &axis in axes {
         if axis >= bound {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` `{field}` entry {axis} is out of range for bound {bound}"
+                "`{operation_name}` `{field}` entry {axis} is out of range for bound {bound}",
             )));
         }
-        if !seen.insert(axis) {
+        if !sorted && !seen.insert(axis) {
             return Err(TypeError::invalid(format!("`{operation_name}` `{field}` must be unique but got {axes:?}")));
         }
     }
+
     Ok(())
 }
 
@@ -2502,6 +2514,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
+
         // Input [4, 2] sharded only on the feature axis (axis 1); axis 0 (indexed by the start index) is replicated.
         let input = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(
@@ -2512,6 +2525,7 @@ mod tests {
         let indices = ArrayType::new_static(DataType::I32, [3, 1]);
         let operation =
             GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+
         // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
         let output = operation.infer_output_types(&[input, indices.clone()], &[]).unwrap();
         assert_eq!(
@@ -2664,8 +2678,7 @@ mod tests {
                 input_types = [input.clone(), indices.clone()],
                 error = format!(
                     "`{GATHER_OPERATION_NAME}` `collapsed_slice_dimensions` and `batching_dimensions input axes` \
-                     must be \
-                     disjoint",
+                     must be disjoint",
                 ),
             }],
         );
@@ -2770,6 +2783,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+
         // Complete windows of an unreduced input keep its pending reduction; a fill written on every device would be
         // counted once per device by that reduction, so fill mode is rejected for unreduced inputs.
         assert_eq!(
@@ -2794,7 +2808,7 @@ mod tests {
         assert_eq!(
             input.gather(&distributed_indices, operation.dimensions(), operation.slice_sizes(), operation.options()),
             Err(TypeError::invalid(format!(
-                "`{GATHER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
+                "`{GATHER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices",
             ))
             .into()),
         );
@@ -3169,12 +3183,12 @@ mod tests {
 
     #[test]
     fn test_gather_interpretation_fill_encodings() {
-        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
         // Explicit NaN payloads survive options cloning and eager filling without numeric conversion.
         let fill = Array::new(ArrayType::scalar(DataType::F32), 0x7fc12345_u32.to_ne_bytes().to_vec()).unwrap();
         let filling = GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(fill.clone())) });
         let input = Array::vector(vec![1.0_f32]).unwrap();
         let out_of_bounds = Array::matrix(1, 1, vec![2_i32]).unwrap();
+        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
         let output = input.gather(&out_of_bounds, &dimensions, &[1], &filling).unwrap();
         assert_eq!(output.storage_bytes(), fill.storage_bytes());
         let negative_zero = filling
@@ -3185,6 +3199,7 @@ mod tests {
                 .to_bits(),
             (-0.0_f32).to_bits(),
         );
+
         // A scalar fill can carry storage placement without changing its logical value.
         let pinned_fill = Array::new(
             ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true }),
@@ -3330,8 +3345,8 @@ mod tests {
             Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80]),
         );
 
-        // Gather reads both a reversed input and reversed sub-byte indices through their physical addressing. An
-        // out-of-bounds query in fill-or-drop mode writes the default unsigned maximum into the dense result.
+        // Gather reads both a reversed input and reversed sub-byte indices through their physical addressing.
+        // An out-of-bounds query in fill-or-drop mode writes the default unsigned maximum into the dense result.
         let input_type =
             ArrayType::new_static(DataType::U16, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let input = Array::from_elements(input_type, &[10u16, 20, 30]).unwrap();
@@ -3351,8 +3366,8 @@ mod tests {
 
     #[test]
     fn test_gather_partial_evaluation() {
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         // Partial evaluation folds fully known gathers and residualizes an unknown data input with known indices.
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let input_value = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         let indices_value = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
         let expected = Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap();
@@ -3381,6 +3396,7 @@ mod tests {
     fn test_gather_batching() {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let indices_value = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
+
         // Unmapped inputs take the fast path and produce a replicated output.
         check_operation_batching!(
             @exact,
@@ -3394,6 +3410,7 @@ mod tests {
                 outputs = [(@replicated, Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]).unwrap())],
             }],
         );
+
         // Dimension-number lifting preserves item boundaries without expanding one operation per item.
         check_operation_batching!(
             @exact,
@@ -3413,6 +3430,7 @@ mod tests {
                 ).unwrap())],
             }],
         );
+
         check_operation_batching!(
             @exact,
             operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]),
@@ -3720,6 +3738,7 @@ mod tests {
             "}
             .trim_end(),
         );
+
         // Item 0 is column 0 of the input read at row 2, and item 1 is column 1 read at row 0.
         assert_eq!(
             program.interpret((
@@ -4459,33 +4478,41 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_sorted_unique_in_range() {
-        assert_eq!(validate_sorted_unique_in_range("gather", "axes", &[], 0), Ok(()));
-        assert_eq!(validate_sorted_unique_in_range("gather", "axes", &[0, 2], 3), Ok(()));
+    fn test_validate_unique_in_range() {
+        // Sorted validation rejects non-increasing entries before checking their range.
+        assert_eq!(validate_unique_in_range("gather", "axes", &[], 0, true), Ok(()));
+        assert_eq!(validate_unique_in_range("gather", "axes", &[0, 2], 3, true), Ok(()));
         assert_eq!(
-            validate_sorted_unique_in_range("gather", "axes", &[2, 0], 3),
+            validate_unique_in_range("gather", "axes", &[2, 0], 3, true),
             Err(TypeError::invalid("`gather` `axes` must be sorted and unique but got [2, 0]")),
         );
         assert_eq!(
-            validate_sorted_unique_in_range("gather", "axes", &[0, 0], 3),
+            validate_unique_in_range("gather", "axes", &[0, 0], 3, true),
             Err(TypeError::invalid("`gather` `axes` must be sorted and unique but got [0, 0]")),
         );
         assert_eq!(
-            validate_sorted_unique_in_range("gather", "axes", &[3], 3),
+            validate_unique_in_range("gather", "axes", &[3], 3, true),
             Err(TypeError::invalid("`gather` `axes` entry 3 is out of range for bound 3")),
         );
-    }
 
-    #[test]
-    fn test_validate_unique_in_range() {
-        assert_eq!(validate_unique_in_range("gather", "axes", &[], 0), Ok(()));
-        assert_eq!(validate_unique_in_range("gather", "axes", &[2, 0], 3), Ok(()));
         assert_eq!(
-            validate_unique_in_range("gather", "axes", &[0, 0], 3),
+            validate_unique_in_range("gather", "axes", &[3, 0], 3, true),
+            Err(TypeError::invalid("`gather` `axes` must be sorted and unique but got [3, 0]")),
+        );
+
+        // Unrestricted ordering still requires unique entries and checks each entry's range first.
+        assert_eq!(validate_unique_in_range("gather", "axes", &[], 0, false), Ok(()));
+        assert_eq!(
+            validate_unique_in_range("gather", "axes", &[3, 0], 3, false),
+            Err(TypeError::invalid("`gather` `axes` entry 3 is out of range for bound 3")),
+        );
+        assert_eq!(validate_unique_in_range("gather", "axes", &[2, 0], 3, false), Ok(()));
+        assert_eq!(
+            validate_unique_in_range("gather", "axes", &[0, 0], 3, false),
             Err(TypeError::invalid("`gather` `axes` must be unique but got [0, 0]")),
         );
         assert_eq!(
-            validate_unique_in_range("gather", "axes", &[3], 3),
+            validate_unique_in_range("gather", "axes", &[3], 3, false),
             Err(TypeError::invalid("`gather` `axes` entry 3 is out of range for bound 3")),
         );
     }

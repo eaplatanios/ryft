@@ -32,7 +32,7 @@ use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::gathering::{
-    GatherDimensionNumbers, GatherMode, GatherOperation, validate_sorted_unique_in_range, validate_unique_in_range,
+    GatherDimensionNumbers, GatherMode, GatherOperation, validate_unique_in_range,
 };
 use crate::operations::manipulation::reshaping::{
     DynamicReshape, Reshape, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
@@ -1445,23 +1445,26 @@ impl Scatter for ArrayType {
             .into());
         };
 
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "update_window_dimensions",
             dimensions.update_window_dimensions(),
             updates_rank,
+            true,
         )?;
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "inserted_window_dimensions",
             dimensions.inserted_window_dimensions(),
             input_rank,
+            true,
         )?;
-        validate_sorted_unique_in_range(
+        validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "operand_batching_dimensions",
             dimensions.operand_batching_dimensions(),
             input_rank,
+            true,
         )?;
         if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
             return Err(TypeError::invalid(format!(
@@ -1476,6 +1479,7 @@ impl Scatter for ArrayType {
             "scatter_dimensions_to_operand_dimensions",
             dimensions.scatter_dimensions_to_operand_dimensions(),
             input_rank,
+            false,
         )?;
         if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
             return Err(TypeError::invalid(format!(
@@ -1491,6 +1495,7 @@ impl Scatter for ArrayType {
             "scatter_indices_batching_dimensions",
             dimensions.scatter_indices_batching_dimensions(),
             indices_rank,
+            false,
         )?;
         if dimensions.scatter_indices_batching_dimensions().contains(&index_vector_dimension) {
             return Err(TypeError::invalid(format!(
