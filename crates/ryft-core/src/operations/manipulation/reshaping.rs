@@ -562,7 +562,7 @@ impl Reshape for ArrayType {
                 }
             }
         }
-        Ok(reshape_output_type(self, shape, output_sharding.as_ref())?)
+        Ok(infer_reshape_output_type(self, shape, output_sharding.as_ref())?)
     }
 }
 
@@ -732,7 +732,7 @@ impl Operation for DynamicReshapeOperation {
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         let output_shape = Shape::new(ArrayIrType::extents(output_extent_types)?);
-        let output_type = infer_explicit_reshape_output_type(input_type, output_shape, self)?;
+        let output_type = infer_dynamic_reshape_output_type(input_type, output_shape, self.output_sharding())?;
         if !self.requires_runtime_assertion && !input_type.shape().has_equal_element_count(output_type.shape())? {
             return Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` was constructed without a runtime element-count check but these input \
@@ -1205,7 +1205,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let output_shape = Shape::new(output_sizes.iter().map(|extent| Dimension::Static(*extent)).collect());
-        infer_explicit_reshape_output_type(input_type, output_shape, &DynamicReshapeOperation::new())?;
+        infer_dynamic_reshape_output_type(input_type, output_shape, None)?;
         let output_dimensions = output_sizes
             .iter()
             .map(|extent| self.dispatch_domain().dimension_constant(*extent))
@@ -1323,7 +1323,7 @@ impl<
         let output_shape =
             Shape::new(ArrayIrType::extents(output_dimensions.iter().map(|dimension| dimension.r#type()))?);
         let operation = DynamicReshapeOperation::new().with_output_sharding(output_sharding);
-        let output_type = infer_explicit_reshape_output_type(input_type, output_shape, &operation)?;
+        let output_type = infer_dynamic_reshape_output_type(input_type, output_shape, operation.output_sharding())?;
 
         // A static identity reshape cannot observe its exact extent inputs, so it stages nothing. Dynamic geometry
         // keeps the instruction because its inputs assert the runtime element-count relation.
@@ -1342,37 +1342,12 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Infers the result of the canonical mixed reshape from its explicit output extent types.
-fn infer_explicit_reshape_output_type(
-    input: &ArrayType,
-    output_shape: Shape,
-    operation: &DynamicReshapeOperation,
-) -> Result<ArrayType, TypeError> {
-    // Reject statically provable element-count mismatches immediately. Dynamic relationships remain explicit graph
-    // facts; eager execution checks concrete sizes and lowering must enforce the runtime requirement explicitly.
-    let input_elements = input
-        .element_count()
-        .map_err(|error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` input {error}")))?;
-    let output_elements = output_shape
-        .element_count()
-        .map_err(|error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output {error}")))?;
-    if let (Some(input_elements), Some(output_elements)) = (input_elements, output_elements)
-        && input_elements != output_elements
-    {
-        return Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements")));
-    }
-
-    reshape_output_type(input, output_shape, operation.output_sharding())
-}
-
-/// Resolves the output sharding of a reshape from `input` to `output_shape`, validating a requested sharding
-/// or inferring one from the input, and rebuilds the output type. When the shape is unchanged, the input's own type is
+/// Resolves the output sharding of a reshape from `input` to `output_shape`, validating a requested sharding or
+/// inferring one from the input, and rebuilds the output type. When the shape is unchanged, the input's own type is
 /// returned with the resolved sharding so that its layout survives. Any other reshape clears the layout, because the
 /// logical shape change does not determine a unique storage layout. Both homogeneous validation and mixed inference
 /// resolve their outputs here so that the two paths cannot drift.
-fn reshape_output_type(
+fn infer_reshape_output_type(
     input: &ArrayType,
     output_shape: Shape,
     requested_sharding: Option<&Sharding>,
@@ -1389,38 +1364,44 @@ fn reshape_output_type(
                     output_shape.rank(),
                 )));
             }
+
             if input.sharding().is_some_and(|input| input.mesh() != requested.mesh()) {
                 return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh"
+                    "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh",
                 )));
             }
+
             if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes"
+                    "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes",
                 )));
             }
+
             let input_unreduced = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
-            let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-            let input_varying = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
             if requested.unreduced_axes() != &input_unreduced {
                 return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the unreduced mesh axes"
+                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the unreduced mesh axes",
                 )));
             }
+
+            let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
             if requested.reduced_axes() != &input_reduced {
                 return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the reduced mesh axes"
+                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the reduced mesh axes",
                 )));
             }
+
+            let input_varying = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
             if requested.varying_manual_axes() != &input_varying {
                 return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes"
+                    "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes",
                 )));
             }
             Some(requested.clone())
         }
         (None, Some(sharding)) => {
-            // Infer placement from the input: preserve singleton placements first, then align the remaining axes.
+            // Infer placement from the input by preserving singleton placements first and then aligning
+            // the remaining axes.
             let input_dimensions = input
                 .shape()
                 .dimensions()
@@ -1455,6 +1436,7 @@ fn reshape_output_type(
                     unmatched_sharded_singletons.push(axis);
                 }
             }
+
             if let [input_axis, rest @ ..] = unmatched_sharded_singletons.as_slice() {
                 let unmatched_output_singletons = (0..output_shape.rank())
                     .filter(|axis| {
@@ -1468,7 +1450,7 @@ fn reshape_output_type(
                     _ => {
                         return Err(TypeError::invalid(format!(
                             "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding to place the sharded \
-                             singleton input axis {input_axis} in the output"
+                             singleton input axis {input_axis} in the output",
                         )));
                     }
                 }
@@ -1491,19 +1473,23 @@ fn reshape_output_type(
                         &mut output_sharding_dimensions,
                     )?;
                 } else {
-                    // Grow contiguous static groups until their products match, retaining equal symbolic axes as anchors.
+                    // Grow contiguous static groups until their products match, retaining equal symbolic axes
+                    // as anchors.
                     let alignment_error = || {
                         TypeError::invalid(format!(
-                            "`{RESHAPE_OPERATION_NAME}` could not align reshape dimension groups"
+                            "`{RESHAPE_OPERATION_NAME}` could not align reshape dimension groups",
                         ))
                     };
+
                     let mut input_start = 0usize;
                     let mut output_start = 0usize;
                     while input_start < input_dimensions.len() || output_start < output_dimensions.len() {
                         if input_start == input_dimensions.len() || output_start == output_dimensions.len() {
                             return Err(alignment_error());
                         }
-                        // Equal symbolic axes retain their placement independently of adjacent static split/merge groups.
+
+                        // Equal symbolic axes retain their placement independently of adjacent static
+                        // split/merge groups.
                         if input_dimensions[input_start].1 == output_dimensions[output_start].1 {
                             output_sharding_dimensions[output_dimensions[output_start].0] =
                                 sharding.dimensions()[input_dimensions[input_start].0].clone();
@@ -1511,6 +1497,7 @@ fn reshape_output_type(
                             output_start += 1;
                             continue;
                         }
+
                         let input_group_start = input_start;
                         let output_group_start = output_start;
                         let mut input_product = static_positive_size(input_dimensions[input_start].1.clone())?;
@@ -1532,6 +1519,7 @@ fn reshape_output_type(
                                 output_start += 1;
                             }
                         }
+
                         propagate_static_reshape_group(
                             &input_dimensions[input_group_start..input_start],
                             &output_dimensions[output_group_start..output_start],
@@ -1541,20 +1529,48 @@ fn reshape_output_type(
                     }
                 }
             }
+
             Some(rebuild_reshape_sharding(sharding, output_sharding_dimensions)?)
         }
         (None, None) => None,
     };
-    let sharding_error =
-        |error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output sharding is invalid: {error}"));
+
     if input.shape() == &output_shape {
-        return input.clone().with_sharding(sharding).map_err(sharding_error);
+        return input.clone().with_sharding(sharding).map_err(|error| {
+            TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output sharding is invalid: {error}"))
+        });
     }
+
     ArrayType::new(input.data_type(), output_shape)
         .with_memory(input.memory())
         .with_sharding(sharding)
-        .map_err(sharding_error)
+        .map_err(|error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output sharding is invalid: {error}")))
 }
+
+/// Infers the output type of a dynamic reshape, rejecting known element-count mismatches before resolving its
+/// placement through [`infer_reshape_output_type`]. Unknown element counts are checked at runtime when needed.
+fn infer_dynamic_reshape_output_type(
+    input: &ArrayType,
+    output_shape: Shape,
+    requested_sharding: Option<&Sharding>,
+) -> Result<ArrayType, TypeError> {
+    // Reject statically provable element-count mismatches immediately. Dynamic relationships remain explicit graph
+    // facts; eager execution checks concrete sizes and lowering must enforce the runtime requirement explicitly.
+    let input_elements = input
+        .element_count()
+        .map_err(|error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` input {error}")))?;
+    let output_elements = output_shape
+        .element_count()
+        .map_err(|error| TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` output {error}")))?;
+    if let (Some(input_elements), Some(output_elements)) = (input_elements, output_elements)
+        && input_elements != output_elements
+    {
+        return Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements")));
+    }
+    infer_reshape_output_type(input, output_shape, requested_sharding)
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the positive static value of `size` for split/merge factorization.
 fn static_positive_size(size: Dimension) -> Result<usize, TypeError> {
@@ -5363,77 +5379,6 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_explicit_reshape_output_type() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let input = ArrayType::new_static(DataType::F32, [2, 3])
-            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
-            .with_memory(Memory::Host { pinned: true });
-
-        // A shape change keeps the memory placement and clears the layout; an identity keeps the complete type.
-        assert_eq!(
-            infer_explicit_reshape_output_type(&input, Shape::new(vec![6.into()]), &DynamicReshapeOperation::new()),
-            Ok(ArrayType::new_static(DataType::F32, [6]).with_memory(Memory::Host { pinned: true })),
-        );
-        assert_eq!(
-            infer_explicit_reshape_output_type(&input, input.shape().clone(), &DynamicReshapeOperation::new()),
-            Ok(input.clone()),
-        );
-
-        // Statically provable mismatches are rejected; dynamic relationships remain explicit graph facts.
-        assert_eq!(
-            infer_explicit_reshape_output_type(&input, Shape::new(vec![5.into()]), &DynamicReshapeOperation::new()),
-            Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements"))),
-        );
-        assert_eq!(
-            infer_explicit_reshape_output_type(
-                &input,
-                Shape::new(vec![Dimension::Dynamic(rows.clone())]),
-                &DynamicReshapeOperation::new(),
-            ),
-            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
-                .with_memory(Memory::Host { pinned: true })),
-        );
-
-        // A requested output sharding is validated and carried; otherwise the input placement is inferred.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded_input = ArrayType::new_static(DataType::F32, [2, 3])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap(),
-            )
-            .unwrap();
-        let requested = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(
-            infer_explicit_reshape_output_type(
-                &sharded_input,
-                Shape::new(vec![6.into()]),
-                &DynamicReshapeOperation::new().with_output_sharding(requested.clone()),
-            ),
-            Ok(ArrayType::new_static(DataType::F32, [6]).with_sharding(requested).unwrap()),
-        );
-        assert_eq!(
-            infer_explicit_reshape_output_type(
-                &sharded_input,
-                Shape::new(vec![2.into(), 1.into(), 3.into()]),
-                &DynamicReshapeOperation::new(),
-            ),
-            Ok(ArrayType::new_static(DataType::F32, [2, 1, 3])
-                .with_sharding(
-                    Sharding::new(
-                        mesh,
-                        vec![
-                            ShardingDimension::sharded(["x"]),
-                            ShardingDimension::replicated(),
-                            ShardingDimension::replicated(),
-                        ],
-                    )
-                    .unwrap(),
-                )
-                .unwrap()),
-        );
-    }
-
-    #[test]
     fn test_reshape_output_type() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -5447,7 +5392,7 @@ mod tests {
                 .unwrap()
         };
         let infer = |input: &ArrayType, output: Vec<Dimension>| {
-            reshape_output_type(input, Shape::new(output), None).map(|output| output.sharding().cloned().unwrap())
+            infer_reshape_output_type(input, Shape::new(output), None).map(|output| output.sharding().cloned().unwrap())
         };
         let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
 
@@ -5514,15 +5459,18 @@ mod tests {
         // Both unsharded and compatibly sharded inputs produce the requested output type and placement.
         let expected = ArrayType::new(DataType::F32, output_shape.clone()).with_sharding(requested.clone()).unwrap();
         let unsharded_input = ArrayType::new_static(DataType::F32, [8]);
-        assert_eq!(reshape_output_type(&unsharded_input, output_shape.clone(), Some(&requested)), Ok(expected.clone()));
+        assert_eq!(
+            infer_reshape_output_type(&unsharded_input, output_shape.clone(), Some(&requested)),
+            Ok(expected.clone())
+        );
         let input = ArrayType::new_static(DataType::F32, [8])
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap())
             .unwrap();
-        assert_eq!(reshape_output_type(&input, output_shape.clone(), Some(&requested)), Ok(expected));
+        assert_eq!(infer_reshape_output_type(&input, output_shape.clone(), Some(&requested)), Ok(expected));
 
         // Rank, mesh, and mesh-axis kind are checked before the reduction and manual-axis state.
         assert_eq!(
-            reshape_output_type(&input, Shape::new(vec![8.into()]), Some(&requested)),
+            infer_reshape_output_type(&input, Shape::new(vec![8.into()]), Some(&requested)),
             Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requested output sharding rank (2) does not match the output rank (1)"
             ))),
@@ -5532,7 +5480,7 @@ mod tests {
             Sharding::new(other_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
         assert_eq!(
-            reshape_output_type(&input, output_shape.clone(), Some(&other_requested)),
+            infer_reshape_output_type(&input, output_shape.clone(), Some(&other_requested)),
             Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh"
             ))),
@@ -5541,13 +5489,13 @@ mod tests {
         let auto_requested =
             Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
         assert_eq!(
-            reshape_output_type(&unsharded_input, output_shape.clone(), Some(&auto_requested)),
+            infer_reshape_output_type(&unsharded_input, output_shape.clone(), Some(&auto_requested)),
             Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes"
             ))),
         );
         assert_eq!(
-            reshape_output_type(
+            infer_reshape_output_type(
                 &input,
                 output_shape.clone(),
                 Some(&requested.clone().with_unreduced_axes(["r"]).unwrap()),
@@ -5557,7 +5505,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            reshape_output_type(
+            infer_reshape_output_type(
                 &input,
                 output_shape.clone(),
                 Some(&requested.clone().with_reduced_axes(["r"]).unwrap()),
@@ -5567,7 +5515,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            reshape_output_type(
+            infer_reshape_output_type(
                 &input,
                 output_shape.clone(),
                 Some(&requested.with_varying_manual_axes(["m"]).unwrap()),
@@ -5575,6 +5523,62 @@ mod tests {
             Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes"
             ))),
+        );
+    }
+
+    #[test]
+    fn test_infer_dynamic_reshape_output_type() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let input = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
+            .with_memory(Memory::Host { pinned: true });
+
+        // A shape change keeps the memory placement and clears the layout; an identity keeps the complete type.
+        assert_eq!(
+            infer_dynamic_reshape_output_type(&input, Shape::new(vec![6.into()]), None),
+            Ok(ArrayType::new_static(DataType::F32, [6]).with_memory(Memory::Host { pinned: true })),
+        );
+        assert_eq!(infer_dynamic_reshape_output_type(&input, input.shape().clone(), None), Ok(input.clone()));
+
+        // Statically provable mismatches are rejected; dynamic relationships remain explicit graph facts.
+        assert_eq!(
+            infer_dynamic_reshape_output_type(&input, Shape::new(vec![5.into()]), None),
+            Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements"))),
+        );
+        assert_eq!(
+            infer_dynamic_reshape_output_type(&input, Shape::new(vec![Dimension::Dynamic(rows.clone())]), None),
+            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]))
+                .with_memory(Memory::Host { pinned: true })),
+        );
+
+        // A requested output sharding is validated and carried; otherwise the input placement is inferred.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_input = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let requested = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(
+            infer_dynamic_reshape_output_type(&sharded_input, Shape::new(vec![6.into()]), Some(&requested)),
+            Ok(ArrayType::new_static(DataType::F32, [6]).with_sharding(requested).unwrap()),
+        );
+        assert_eq!(
+            infer_dynamic_reshape_output_type(&sharded_input, Shape::new(vec![2.into(), 1.into(), 3.into()]), None),
+            Ok(ArrayType::new_static(DataType::F32, [2, 1, 3])
+                .with_sharding(
+                    Sharding::new(
+                        mesh,
+                        vec![
+                            ShardingDimension::sharded(["x"]),
+                            ShardingDimension::replicated(),
+                            ShardingDimension::replicated(),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()),
         );
     }
 
