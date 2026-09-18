@@ -1445,7 +1445,7 @@ where
 /// corresponding arithmetic [`Operation`]s. Use [`DynamicScatter::dynamic_scatter_axis`] when the query shape must
 /// remain dynamic.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```rust
 /// # use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind};
@@ -1713,8 +1713,8 @@ impl Scatter for ArrayType {
             .into());
         }
 
-        let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
-        let operand_batching: BTreeSet<usize> = dimensions.input_batching_dimensions().iter().copied().collect();
+        let inserted = dimensions.inserted_window_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        let operand_batching = dimensions.input_batching_dimensions().iter().copied().collect::<BTreeSet<_>>();
         if inserted.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` \
@@ -1774,9 +1774,9 @@ impl Scatter for ArrayType {
 
         // The updates' scatter/batch axes (i.e., every updates axis but the window axes) must match the indices'
         // batch axes (i.e., every indices axis but the index vector), in order.
-        let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
-        let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
-        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
+        let update_window = dimensions.update_window_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        let update_scatter_axes = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect::<Vec<_>>();
+        let indices_batch_axes = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect::<Vec<_>>();
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
             if !updates.dimension(update_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
@@ -1913,12 +1913,12 @@ impl Scatter for ArrayType {
             Some(requested.clone())
         } else if let Some(input_sharding) = input.sharding() {
             let mesh = input_sharding.mesh().clone();
-            let replicated_input_axes: BTreeSet<usize> = dimensions
+            let replicated_input_axes = dimensions
                 .scatter_dimensions_to_operand_dimensions()
                 .iter()
                 .chain(dimensions.inserted_window_dimensions())
                 .copied()
-                .collect();
+                .collect::<BTreeSet<_>>();
 
             for &axis in &replicated_input_axes {
                 let window_extent = if inserted.contains(&axis) {
@@ -1974,53 +1974,168 @@ impl Scatter for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+impl Scatter for Array {
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
+        let output_type =
+            self.r#type()
+                .scatter(indices.r#type().as_ref(), updates.r#type().as_ref(), dimensions, kind, options)?;
+        let data_type = output_type.data_type();
+        match (kind, data_type) {
+            (ScatterReductionKind::Overwrite, _) | (_, DataType::Zero) => self.scatter_with_reduction(
+                indices,
+                updates,
+                output_type,
+                dimensions,
+                options.mode(),
+                |current, update| {
+                    current.copy_from_slice(update);
+                    Ok(())
+                },
+            ),
+            (ScatterReductionKind::Add | ScatterReductionKind::Mul, _) => {
+                dispatch_on_array_element_type!(@numeric data_type, |Element| {
+                    self.scatter_with_reduction(
+                        indices,
+                        updates,
+                        output_type,
+                        dimensions,
+                        options.mode(),
+                        |current, update| {
+                            let current_value = Element::decode(current);
+                            let update_value = Element::decode(update);
+                            let result = if kind == ScatterReductionKind::Add {
+                                <Element as NumericArrayElement>::add(current_value, update_value)?
+                            } else {
+                                <Element as NumericArrayElement>::mul(current_value, update_value)?
+                            };
+                            result.encode(current);
+                            Ok(())
+                        },
+                    )
+                })
+            }
+            (ScatterReductionKind::Min | ScatterReductionKind::Max, _) => {
+                dispatch_on_array_element_type!(data_type, |Element| {
+                    self.scatter_with_reduction(
+                        indices,
+                        updates,
+                        output_type,
+                        dimensions,
+                        options.mode(),
+                        |current, update| {
+                            let current_value = Element::decode(current);
+                            let update_value = Element::decode(update);
+                            let result = if kind == ScatterReductionKind::Min {
+                                ArrayElement::min(&current_value, &update_value)
+                            } else {
+                                ArrayElement::max(&current_value, &update_value)
+                            };
+                            result.encode(current);
+                            Ok(())
+                        },
+                    )
+                })
+            }
+        }
+    }
+}
+
+impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
+        let updates = <Self as ValueProjection<ArrayType>>::projected(updates)?;
+        Ok(Self::Array(input.scatter(indices, updates, dimensions, kind, options)?))
+    }
+}
+
+impl<V: Value<Type = ArrayType>> Scatter for V
+where
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
+{
+    fn scatter(
+        &self,
+        indices: &Self,
+        updates: &Self,
+        dimensions: &ScatterDimensionNumbers,
+        kind: ScatterReductionKind,
+        options: &ScatterOptions,
+    ) -> Result<Self, ProgramError> {
+        // Any context-carrying value scatters by binding a `ScatterOperation` through its own context. The
+        // `From<ScatterOperation>` bound makes this disjoint from the eager value types (whose context operation
+        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+        // implementations.
+        let mut outputs = self.dispatch_domain().bind(
+            ScatterOperation::new(dimensions.clone(), kind).with_options(options.clone()),
+            Vec::new(),
+            &[self.clone(), indices.clone(), updates.clone()],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
 
 impl Array {
-    /// Applies one already-validated scatter using a byte-slice combiner, keeping index traversal independent of the
-    /// selected element arithmetic. The combiner receives one mutable input encoding and one update encoding.
-    fn scatter_with_combiner<F>(
+    /// Applies one already-validated scatter using a byte-slice reduction, keeping index traversal independent of the
+    /// selected element arithmetic. The reduction function receives one mutable input encoding and one update encoding.
+    fn scatter_with_reduction<F: Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>>(
         &self,
         indices: &Self,
         updates: &Self,
         output_type: ArrayType,
         dimensions: &ScatterDimensionNumbers,
         mode: ScatterMode,
-        combine: F,
-    ) -> Result<Self, ProgramError>
-    where
-        F: Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
-    {
+        reduce_fn: F,
+    ) -> Result<Self, ProgramError> {
         let input_shape = self.r#type().static_shape().unwrap();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
+
         // No update can address an element of an empty input, even in clipping mode.
         if output_addressing.element_count() == 0 {
             return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
         }
+
         let indices_shape = indices.r#type().static_shape().unwrap();
         let indices_addressing = ArrayAddressing::new(indices.r#type().into_owned())?;
         let updates_shape = updates.r#type().static_shape().unwrap();
         let updates_addressing = ArrayAddressing::new(updates.r#type().into_owned())?;
+
         // The caller has already validated all inputs and placement. With no updates, retain the input payload
         // before requesting mutable storage, which would otherwise copy the entire shared buffer.
         if updates_addressing.element_count() == 0 {
             return Ok(Self::new_unchecked(output_type, self.shared_storage().clone()));
         }
+
         let input_rank = input_shape.rank();
         let indices_rank = indices_shape.rank();
         let updates_rank = updates_shape.rank();
         let index_vector_dimension = indices_rank - 1;
         let indices_data_type = indices.r#type().data_type();
+        let inserted = dimensions.inserted_window_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        let batching = dimensions.input_batching_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        let input_window_axes = (0..input_rank)
+            .filter(|axis| !inserted.contains(axis) && !batching.contains(axis))
+            .collect::<Vec<_>>();
+        let update_window = dimensions.update_window_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        let update_scatter_axes = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect::<Vec<_>>();
+        let indices_batch_axes = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect::<Vec<_>>();
 
-        let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
-        let batching: BTreeSet<usize> = dimensions.input_batching_dimensions().iter().copied().collect();
-        let input_window_axes: Vec<usize> =
-            (0..input_rank).filter(|axis| !inserted.contains(axis) && !batching.contains(axis)).collect();
-        let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
-        let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
-        let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
-        // Window size per input axis (the update extent on window axes, 1 elsewhere), used to clamp the start so the
-        // whole window stays in bounds.
+        // Compute the window size per input axis (i.e., the update extent on window axes and 1 elsewhere),
+        // used to clamp the start so the whole window stays in bounds.
         let mut input_window_size = vec![1usize; input_rank];
         for (window, &input_axis) in input_window_axes.iter().enumerate() {
             input_window_size[input_axis] = updates_shape[dimensions.update_window_dimensions()[window]];
@@ -2045,12 +2160,14 @@ impl Array {
                 query_changed |= indices_index[indices_axis] != coordinate;
                 indices_index[indices_axis] = coordinate;
             }
+
             if query_changed {
                 input_origin.fill(0);
                 dropped = false;
                 for (batch, &input_axis) in dimensions.input_batching_dimensions().iter().enumerate() {
                     input_origin[input_axis] = indices_index[dimensions.scatter_indices_batching_dimensions()[batch]];
                 }
+
                 for (component, &input_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate()
                 {
                     indices_index[index_vector_dimension] = component;
@@ -2063,158 +2180,47 @@ impl Array {
                             value.convert_to::<u64>().map(i128::from)
                         }
                     })?;
+
                     // Validation guarantees the window fits. Widening before clamping preserves unsigned extremes.
                     let maximum = (input_shape[input_axis] - input_window_size[input_axis]) as i128;
                     dropped |= drop_out_of_bounds && (raw < 0 || raw > maximum);
+
                     // Dropped origins are never accessed. Promise mode uses defensive clipping without
                     // guaranteeing any particular out-of-bounds result to callers.
                     input_origin[input_axis] = raw.clamp(0, maximum) as usize;
                 }
             }
+
             if !dropped {
                 input_index.copy_from_slice(&input_origin);
                 for (window, &input_axis) in input_window_axes.iter().enumerate() {
                     input_index[input_axis] += update_index[dimensions.update_window_dimensions()[window]];
                 }
-                combine(
+
+                reduce_fn(
                     &mut output_bytes[output_addressing.byte_range_unchecked(&input_index)],
                     &updates.storage_bytes()[updates_addressing.byte_range_for_flat_index(update)],
                 )?;
             }
+
             updates_addressing.advance_index(&mut update_index);
         }
+
         Ok(output)
     }
 }
 
-impl Scatter for Array {
-    fn scatter(
-        &self,
-        indices: &Self,
-        updates: &Self,
-        dimensions: &ScatterDimensionNumbers,
-        kind: ScatterReductionKind,
-        options: &ScatterOptions,
-    ) -> Result<Self, ProgramError> {
-        let output_type =
-            self.r#type()
-                .scatter(indices.r#type().as_ref(), updates.r#type().as_ref(), dimensions, kind, options)?;
-        let data_type = output_type.data_type();
-        if kind == ScatterReductionKind::Overwrite || data_type == DataType::Zero {
-            return self.scatter_with_combiner(
-                indices,
-                updates,
-                output_type,
-                dimensions,
-                options.mode(),
-                |current, update| {
-                    current.copy_from_slice(update);
-                    Ok(())
-                },
-            );
-        }
-        match kind {
-            ScatterReductionKind::Add | ScatterReductionKind::Mul => {
-                dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.scatter_with_combiner(
-                        indices,
-                        updates,
-                        output_type,
-                        dimensions,
-                        options.mode(),
-                        |current, update| {
-                            let current_value = Element::decode(current);
-                            let update_value = Element::decode(update);
-                            let result = if kind == ScatterReductionKind::Add {
-                                <Element as NumericArrayElement>::add(current_value, update_value)?
-                            } else {
-                                <Element as NumericArrayElement>::mul(current_value, update_value)?
-                            };
-                            result.encode(current);
-                            Ok(())
-                        },
-                    )
-                })
-            }
-            ScatterReductionKind::Min | ScatterReductionKind::Max => {
-                dispatch_on_array_element_type!(data_type, |Element| {
-                    self.scatter_with_combiner(
-                        indices,
-                        updates,
-                        output_type,
-                        dimensions,
-                        options.mode(),
-                        |current, update| {
-                            let current_value = Element::decode(current);
-                            let update_value = Element::decode(update);
-                            let result = if kind == ScatterReductionKind::Min {
-                                ArrayElement::min(&current_value, &update_value)
-                            } else {
-                                ArrayElement::max(&current_value, &update_value)
-                            };
-                            result.encode(current);
-                            Ok(())
-                        },
-                    )
-                })
-            }
-            ScatterReductionKind::Overwrite => unreachable!("overwrite scatter returns before typed dispatch"),
-        }
-    }
-}
-
-impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
-    fn scatter(
-        &self,
-        indices: &Self,
-        updates: &Self,
-        dimensions: &ScatterDimensionNumbers,
-        kind: ScatterReductionKind,
-        options: &ScatterOptions,
-    ) -> Result<Self, ProgramError> {
-        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        let indices = <Self as ValueProjection<ArrayType>>::projected(indices)?;
-        let updates = <Self as ValueProjection<ArrayType>>::projected(updates)?;
-        Ok(Self::Array(input.scatter(indices, updates, dimensions, kind, options)?))
-    }
-}
-
-// Any context-carrying value scatters by binding a [`ScatterOperation`] through its own context. The
-// `From<ScatterOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> Scatter for V
-where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
-{
-    fn scatter(
-        &self,
-        indices: &Self,
-        updates: &Self,
-        dimensions: &ScatterDimensionNumbers,
-        kind: ScatterReductionKind,
-        options: &ScatterOptions,
-    ) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(
-            ScatterOperation::new(dimensions.clone(), kind).with_options(options.clone()),
-            Vec::new(),
-            &[self.clone(), indices.clone(), updates.clone()],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
-/// Scatters complete slices using a first-class query shape.
+/// Scatters complete slices using a first-class query shape. The query shape replaces the selected input axis in the
+/// updates shape, just as in [`Scatter::scatter_axis`]. Unlike that homogeneous convenience, this capability carries
+/// the query extents through an explicit [`DynamicReshape`] before projecting into the existing [`ScatterOperation`].
+/// Both the query shape and the input shape can therefore retain symbolic dimensions. This introduces no separate
+/// scatter operation or bounds policy.
 ///
-/// The query shape replaces the selected input axis in the updates shape, just as in [`Scatter::scatter_axis`].
-/// Unlike that homogeneous convenience, this capability carries the query extents through an explicit
-/// [`DynamicReshape`] before projecting into the existing [`ScatterOperation`]. Both the query shape and the input
-/// shape can therefore retain symbolic dimensions. This introduces no separate scatter operation or bounds policy.
-///
-/// # Examples
+/// # Example
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArrayIrValue, DynamicScatter, ScatterMode, ScatterReductionKind};
+///
 /// // Shapes: input [3], indices [2], updates [2] -> output [3].
 /// let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap());
 /// let indices = ArrayIrValue::Array(Array::vector(vec![1_i32, 1]).unwrap());
@@ -2233,9 +2239,9 @@ pub trait DynamicScatter: Value<Type = ArrayIrType> + Sized {
     ///   - `indices`: Integer query array of any rank. A scalar selects one complete slice.
     ///   - `updates`: Array with the input element type and the shape obtained by replacing `axis` with the query
     ///     shape. Shared symbolic extents must have the same identities, rather than merely the same bounds.
-    ///   - `axis`: Input axis to update; negative axes count from the end of the input rank.
+    ///   - `axis`: Input axis to update. Negative axes count from the end of the input rank.
     ///   - `kind`: Reduction combining each update with the existing input value, including overlapping updates.
-    ///   - `mode`: Out-of-bounds handling; see [`ScatterMode`].
+    ///   - `mode`: Out-of-bounds handling mode. Refer to the documentation of [`ScatterMode`] for more information.
     fn dynamic_scatter_axis<A: Into<Axis>>(
         &self,
         indices: &Self,
@@ -2246,9 +2252,9 @@ pub trait DynamicScatter: Value<Type = ArrayIrType> + Sized {
     ) -> Result<Self, ProgramError>;
 }
 
-impl<V> DynamicScatter for V
+impl<V: Value<Type = ArrayIrType>> DynamicScatter for V
 where
-    V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType, Projected: Scatter>,
+    V: DimensionSize + DynamicReshape + ValueProjection<ArrayType, Projected: Scatter>,
     V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
 {
     fn dynamic_scatter_axis<A: Into<Axis>>(
@@ -2272,11 +2278,13 @@ where
         let expected_shape = Shape::new(expected_dimensions);
         if updates_type.shape() != &expected_shape {
             return Err(TypeError::invalid(format!(
-                "`dynamic_scatter_axis` updates shape must be `{expected_shape}` but got `{}`",
+                "`dynamic_scatter_axis` updates shape must be `{}` but got `{}`",
+                expected_shape,
                 updates_type.shape(),
             ))
             .into());
         }
+
         // Only the index-vector axis is new. Reading the other extents from the query supplies the dimension
         // definitions needed to specialize a retained `[queries] -> [queries, 1]` reshape.
         let indices = indices.dynamic_expand_dimensions(-1)?;
@@ -2284,6 +2292,7 @@ where
             .filter(|input_axis| *input_axis != axis)
             .map(|input_axis| if input_axis < axis { input_axis } else { input_axis + indices_type.rank() - 1 })
             .collect();
+
         Ok(V::from_projected(self.clone().into_projected()?.scatter(
             &indices.into_projected()?,
             &updates.clone().into_projected()?,
