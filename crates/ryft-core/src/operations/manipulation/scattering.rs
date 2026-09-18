@@ -1424,25 +1424,22 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Combines update windows with an array at positions supplied by an integer index array.
+/// Combines update "windows" with an array at positions supplied by an integer index array. The receiver is the input.
+/// `indices` is a separate integer-typed value whose last axis holds each start-index vector. `updates` holds the
+/// windows to combine into the input using the operation's [`ScatterReductionKind`]. All three values must reside in
+/// the same memory space. The output preserves the input shape, element type, layout, and memory placement. Its
+/// placement normally follows the input and includes any additional manual-axis variation introduced by indices or
+/// updates. An explicit output placement must preserve reduction and manual-axis state and use the same mesh. Input
+/// and update reduction states normally must match, with unreduced data supporting additive or overwrite updates.
+/// Multiplication also permits unreduced input contributions when the updates are reduced over those axes: applying the
+/// same factors to each contribution commutes with their pending sum. Other nonlinear updates do not support unreduced
+/// inputs. Indices must be replicated and invariant whenever the data carries reduction state.
 ///
-/// The receiver is the input; `indices` is a separate integer-typed value whose last axis holds each start-index
-/// vector; `updates` holds the windows to combine into the input using the operation's [`ScatterReductionKind`].
-/// All three values must reside in the same memory space. The output preserves the input shape, element type,
-/// layout, and memory placement. Its placement normally follows the input and includes any additional manual-axis
-/// variation introduced by indices or updates; an explicit output placement must preserve reduction and manual-axis
-/// state and use the same mesh. Input and update reduction states normally must match, with unreduced data supporting
-/// additive or overwrite updates. Multiplication also permits unreduced input contributions when the updates are
-/// reduced over those axes: applying the same factors to each contribution commutes with their pending sum. Other
-/// nonlinear updates do not support unreduced inputs. Indices must be replicated and invariant whenever the data
-/// carries reduction state.
-///
-/// Negative starts are out of bounds and do not wrap from an axis end. Clip mode moves the entire update window
-/// inside the input; fill-or-drop mode discards a whole invalid window. Empty inputs remain empty. Repeated updates
-/// all participate in reductions, but overwrite conflicts and floating-point reduction order are backend dependent.
-/// Use [`Self::scatter_axis`] for complete slices along one axis without constructing dimension numbers.
+/// Negative starts are out of bounds and do not wrap from an axis end. [`ScatterMode::Clip`] mode moves the entire
+/// update window inside the input. [`ScatterMode::Drop`] mode discards a whole invalid window. Empty inputs remain
+/// empty. Repeated updates all participate in reductions, but overwrite conflicts and floating-point reduction order
+/// are backend dependent. Use [`Self::scatter_axis`] for complete slices along one axis without constructing a
+/// [`ScatterDimensionNumbers`] instance.
 ///
 /// [`Scatter`] fills the same role for [`ScatterOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for their
 /// corresponding arithmetic [`Operation`]s. Use [`DynamicScatter::dynamic_scatter_axis`] when the query shape must
@@ -1451,13 +1448,14 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind};
+/// # use ryft_core::{Array, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind};
 ///
 /// // Shapes: input [3, 2], indices [2, 1], updates [2, 2] -> output [3, 2].
 /// let input = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
 /// let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
 /// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-/// // Update axis 1 holds each full row; input axis 0 is supplied by the row index.
+///
+/// // Update axis 1 holds each full row and input axis 0 is supplied by the row index.
 /// let dimensions = ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]);
 /// let output = input.scatter(
 ///     &indices, &updates, &dimensions, ScatterReductionKind::Add, &ScatterOptions::new(),
@@ -1473,8 +1471,8 @@ pub trait Scatter: Sized {
     ///
     ///   - `indices`: Integer start-index vectors. The trailing axis contains the coordinates selected by
     ///     `dimensions`; preceding axes enumerate update windows.
-    ///   - `updates`: Values to combine with the input. Window and indexing axes are identified by `dimensions`, and
-    ///     the element type must equal the input element type.
+    ///   - `updates`: Values to combine with the input. Window and indexing axes are identified by `dimensions`,
+    ///     and the element type must equal the input element type.
     ///   - `dimensions`: Mapping from index components and update window axes to input axes.
     ///   - `kind`: How each update combines with the input value at its target.
     ///   - `options`: Bounds mode, index promises, and optional output sharding. Sortedness and uniqueness are
@@ -1488,13 +1486,13 @@ pub trait Scatter: Sized {
         options: &ScatterOptions,
     ) -> Result<Self, ProgramError>;
 
-    /// Scatters complete slices along one axis using raw integer indices. The index shape replaces the selected
-    /// input axis in the required updates shape; all other input axes retain their full size and order. Negative
-    /// indices are out of bounds and are handled directly by `mode`, without wrapping them from the axis end.
+    /// Scatters complete slices along one axis using raw integer indices. The index shape replaces the selected input
+    /// axis in the required updates shape. All other input axes retain their full size and order. Negative indices are
+    /// out of bounds and are handled directly by `mode`, without wrapping them from the axis end.
     ///
-    /// The selected input axis may have a dynamic extent. The index shape must support the homogeneous [`Reshape`]
-    /// used to append an index-vector axis; remaining input and update dimensions must satisfy [`ScatterOperation`]'s
-    /// window constraints. Use [`Scatter::scatter`] for partial windows or [`DynamicScatter`] for dynamic queries.
+    /// The selected input axis may have a dynamic extent. The index shape must support the homogeneous [`Reshape`] used
+    /// to append an index-vector axis; remaining input and update dimensions must satisfy [`ScatterOperation`]'s window
+    /// constraints. Use [`Scatter::scatter`] for partial windows or [`DynamicScatter`] for dynamic queries.
     ///
     /// # Parameters
     ///
@@ -1508,14 +1506,18 @@ pub trait Scatter: Sized {
     /// # Example
     ///
     /// ```rust
-    /// use ryft_core::{Array, ScatterMode, Scatter, ScatterReductionKind};
+    /// # use ryft_core::{Array, ScatterMode, Scatter, ScatterReductionKind};
     ///
     /// // Shapes: input [3], indices [2], updates [2] -> output [3].
     /// let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
     /// let indices = Array::vector(vec![2_i32, 0]).unwrap();
     /// let updates = Array::vector(vec![1_i32, 2]).unwrap();
     /// let output = input.scatter_axis(
-    ///     &indices, &updates, 0, ScatterReductionKind::Add, ScatterMode::Clip,
+    ///     &indices,
+    ///     &updates,
+    ///     0,
+    ///     ScatterReductionKind::Add,
+    ///     ScatterMode::Clip,
     /// ).unwrap();
     /// assert_eq!(output, Array::vector(vec![12_i32, 20, 31]).unwrap());
     /// ```
@@ -1539,7 +1541,8 @@ pub trait Scatter: Sized {
         let expected_shape = Shape::new(expected_dimensions);
         if updates.r#type().shape() != &expected_shape {
             return Err(TypeError::invalid(format!(
-                "`scatter_axis` updates shape must be `{expected_shape}` but got `{}`",
+                "`scatter_axis` updates shape must be `{}` but got `{}`",
+                expected_shape,
                 updates.r#type().shape()
             ))
             .into());
@@ -1562,8 +1565,6 @@ pub trait Scatter: Sized {
 }
 
 impl Scatter for ArrayType {
-    // Type-level scatter: validates the dimension numbers, the updates shape, and the data types, and computes the
-    // output type (which retains the input shape, element type, and layout) and placement.
     fn scatter(
         &self,
         indices: &Self,
@@ -1579,34 +1580,39 @@ impl Scatter for ArrayType {
 
         if indices_rank == 0 {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` indices must have rank at least 1 (the trailing index vector)"
+                "`{SCATTER_OPERATION_NAME}` indices must have rank at least 1 (the trailing index vector)",
             ))
             .into());
         }
+
         if !indices.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` indices must be integer-typed but have type `{indices}`"
+                "`{SCATTER_OPERATION_NAME}` indices must be integer-typed but have type `{indices}`",
             ))
             .into());
         }
+
         if input.memory() != indices.memory() || input.memory() != updates.memory() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input, indices, and updates must share one memory space but reside \
-                     in `{}`, `{}`, and `{}`",
+                "`{}` input, indices, and updates must share one memory space but reside in `{}`, `{}`, and `{}`",
+                SCATTER_OPERATION_NAME,
                 input.memory(),
                 indices.memory(),
                 updates.memory(),
             ))
             .into());
         }
+
         if updates.data_type() != input.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` updates data type `{}` does not match input data type `{}`",
+                "`{}` updates data type `{}` does not match input data type `{}`",
+                SCATTER_OPERATION_NAME,
                 updates.data_type(),
                 input.data_type(),
             ))
             .into());
         }
+
         let data_type = input.data_type();
         match kind {
             ScatterReductionKind::Overwrite => {}
@@ -1614,9 +1620,8 @@ impl Scatter for ArrayType {
                 if !data_type.is_numeric() && data_type != DataType::Zero =>
             {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` kind `{}` requires numeric input and update elements but got \
-                     `{data_type}`",
-                    kind,
+                    "`{}` kind `{}` requires numeric input and update elements but got `{}`",
+                    SCATTER_OPERATION_NAME, kind, data_type,
                 ))
                 .into());
             }
@@ -1624,18 +1629,18 @@ impl Scatter for ArrayType {
                 if !data_type.is_boolean() && !data_type.is_numeric() && data_type != DataType::Zero =>
             {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` kind `{}` requires Boolean or numeric input and update elements \
-                     but got `{data_type}`",
-                    kind,
+                    "`{}` kind `{}` requires Boolean or numeric input and update elements but got `{}`",
+                    SCATTER_OPERATION_NAME, kind, data_type,
                 ))
                 .into());
             }
             _ => {}
         }
+
         let index_vector_dimension = indices_rank - 1;
         let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` indices index vector dimension must have a static extent"
+                "`{SCATTER_OPERATION_NAME}` indices index vector dimension must have a static extent",
             ))
             .into());
         };
@@ -1647,6 +1652,7 @@ impl Scatter for ArrayType {
             updates_rank,
             true,
         )?;
+
         validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "inserted_window_dimensions",
@@ -1654,6 +1660,7 @@ impl Scatter for ArrayType {
             input_rank,
             true,
         )?;
+
         validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "input_batching_dimensions",
@@ -1661,14 +1668,17 @@ impl Scatter for ArrayType {
             input_rank,
             true,
         )?;
+
         if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` `scatter_dimensions_to_operand_dimensions` has length {} but the index \
-                     vector extent is {index_vector_extent}",
+                "`{}` `scatter_dimensions_to_operand_dimensions` has length {} but the index vector extent is {}",
+                SCATTER_OPERATION_NAME,
                 dimensions.scatter_dimensions_to_operand_dimensions().len(),
+                index_vector_extent,
             ))
             .into());
         }
+
         validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "scatter_dimensions_to_operand_dimensions",
@@ -1676,15 +1686,17 @@ impl Scatter for ArrayType {
             input_rank,
             false,
         )?;
+
         if dimensions.scatter_indices_batching_dimensions().len() != dimensions.input_batching_dimensions().len() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input and scatter-indices batching dimensions must align 1:1, but got \
-                     {} and {}",
+                "`{}` input and scatter-indices batching dimensions must align 1:1, but got {} and {}",
+                SCATTER_OPERATION_NAME,
                 dimensions.input_batching_dimensions().len(),
                 dimensions.scatter_indices_batching_dimensions().len(),
             ))
             .into());
         }
+
         validate_unique_in_range(
             SCATTER_OPERATION_NAME,
             "scatter_indices_batching_dimensions",
@@ -1692,10 +1704,11 @@ impl Scatter for ArrayType {
             indices_rank,
             false,
         )?;
+
         if dimensions.scatter_indices_batching_dimensions().contains(&index_vector_dimension) {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` `scatter_indices_batching_dimensions` cannot name the index vector \
-                 dimension {index_vector_dimension}"
+                 dimension {index_vector_dimension}",
             ))
             .into());
         }
@@ -1704,8 +1717,8 @@ impl Scatter for ArrayType {
         let operand_batching: BTreeSet<usize> = dimensions.input_batching_dimensions().iter().copied().collect();
         if inserted.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` must be \
-                     disjoint"
+                "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` \
+                 must be disjoint",
             ))
             .into());
         }
@@ -1716,7 +1729,7 @@ impl Scatter for ArrayType {
             .any(|axis| operand_batching.contains(axis))
         {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` indexed input axes and batching input axes must be disjoint"
+                "`{SCATTER_OPERATION_NAME}` indexed input axes and batching input axes must be disjoint",
             ))
             .into());
         }
@@ -1727,24 +1740,25 @@ impl Scatter for ArrayType {
         if input_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input rank {input_rank} must equal update_window + inserted_window + \
-                     operand_batching dimension counts"
-            ))
-            .into());
-        }
-        if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
-            return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` updates rank {updates_rank} must equal (indices rank - 1) + the update \
-                     window dimension count"
+                 operand_batching dimension counts"
             ))
             .into());
         }
 
-        // Window-size checks: the input window axes (input axes that are neither inserted nor batching, in order)
-        // pair 1:1 with the sorted update window axes; each update window extent must fit within the input window
-        // extent.
-        let input_window_axes: Vec<usize> = (0..input_rank)
+        if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
+            return Err(TypeError::invalid(format!(
+                "`{SCATTER_OPERATION_NAME}` updates rank {updates_rank} must equal (indices rank - 1) + the update \
+                 window dimension count"
+            ))
+            .into());
+        }
+
+        // Perform window-size checks. The input window axes (i.e., input axes that are neither inserted nor batching,
+        // in order) pair 1:1 with the sorted update window axes and each update window extent must fit within the input
+        // window extent.
+        let input_window_axes = (0..input_rank)
             .filter(|axis| !inserted.contains(axis) && !operand_batching.contains(axis))
-            .collect();
+            .collect::<Vec<_>>();
         for (&input_axis, &update_axis) in input_window_axes.iter().zip(dimensions.update_window_dimensions()) {
             if let (Dimension::Static(update_extent), Dimension::Static(input_extent)) =
                 (updates.dimension(update_axis), input.dimension(input_axis))
@@ -1752,14 +1766,14 @@ impl Scatter for ArrayType {
             {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` update window axis {update_axis} extent {update_extent} exceeds \
-                         the input window axis {input_axis} extent {input_extent}"
+                     the input window axis {input_axis} extent {input_extent}"
                 ))
                 .into());
             }
         }
 
-        // The updates' scatter/batch axes (every updates axis but the window axes) must match the indices' batch axes
-        // (every indices axis but the index vector), in order.
+        // The updates' scatter/batch axes (i.e., every updates axis but the window axes) must match the indices'
+        // batch axes (i.e., every indices axis but the index vector), in order.
         let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
         let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
@@ -1767,7 +1781,7 @@ impl Scatter for ArrayType {
             if !updates.dimension(update_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` updates scatter axis {update_axis} must match indices batch axis \
-                         {indices_axis} in extent"
+                     {indices_axis} in extent"
                 ))
                 .into());
             }
@@ -1780,7 +1794,7 @@ impl Scatter for ArrayType {
             if !input.dimension(input_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` batching dimensions must have equal extents, but input axis \
-                         {input_axis} and indices axis {indices_axis} differ"
+                     {input_axis} and indices axis {indices_axis} differ"
                 ))
                 .into());
             }
@@ -1803,10 +1817,12 @@ impl Scatter for ArrayType {
             ))
             .into());
         }
+
         let unreduced_axes = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
         let reduced_axes = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
         let updates_unreduced = updates.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
         let updates_reduced = updates.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
+
         // Multiplication is linear in the base when its factors are invariant across each pending reduction.
         // In particular, the transpose of a reduced multiply-scatter scales unreduced cotangent contributions
         // by reduced retained updates. Summing those scaled contributions gives the same result as scaling the sum.
@@ -1815,28 +1831,31 @@ impl Scatter for ArrayType {
             && updates_reduced == reduced_axes.union(&unreduced_axes).cloned().collect();
         if !linear_multiplication && (unreduced_axes != updates_unreduced || reduced_axes != updates_reduced) {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input and updates must have matching reduction state"
+                "`{SCATTER_OPERATION_NAME}` input and updates must have matching reduction state",
             ))
             .into());
         }
+
         if !linear_multiplication
             && !unreduced_axes.is_empty()
             && !matches!(kind, ScatterReductionKind::Add | ScatterReductionKind::Overwrite)
         {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` nonlinear reductions do not support unreduced inputs"
+                "`{SCATTER_OPERATION_NAME}` nonlinear reductions do not support unreduced inputs",
             ))
             .into());
         }
+
         if indices
             .sharding()
             .is_some_and(|sharding| !sharding.unreduced_axes().is_empty() || !sharding.reduced_axes().is_empty())
         {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes"
+                "`{SCATTER_OPERATION_NAME}` indices cannot carry reduced or unreduced mesh axes",
             ))
             .into());
         }
+
         // Reduced axes carry identical values across devices, while unreduced axes carry partial contributions.
         // Both require consistent index routing: varying indices could break replication or route partial sums to
         // different destinations. The dual gather used by the derivative rules enforces the same index contract.
@@ -1847,30 +1866,34 @@ impl Scatter for ArrayType {
             })
         {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices"
+                "`{SCATTER_OPERATION_NAME}` reduction-state inputs require replicated, invariant indices",
             ))
             .into());
         }
+
         let mut varying_manual_axes = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
         for sharding in [indices.sharding(), updates.sharding()].into_iter().flatten() {
             varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
         }
+
         let sharding = if let Some(requested) = options.output_sharding() {
             if common_mesh.as_ref().is_some_and(|mesh| requested.mesh() != mesh) {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` requested output sharding uses a different mesh"
+                    "`{SCATTER_OPERATION_NAME}` requested output sharding uses a different mesh",
                 ))
                 .into());
             }
+
             if requested.unreduced_axes() != &unreduced_axes
                 || requested.reduced_axes() != &reduced_axes
                 || requested.varying_manual_axes() != &varying_manual_axes
             {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state"
+                    "`{SCATTER_OPERATION_NAME}` requested output sharding changes reduction or manual-axis state",
                 ))
                 .into());
             }
+
             if requested.rank() != input.rank() {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` output sharding rank ({}) does not match the input rank ({})",
@@ -1879,12 +1902,14 @@ impl Scatter for ArrayType {
                 ))
                 .into());
             }
+
             if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
+                    "`{SCATTER_OPERATION_NAME}` output sharding cannot reference auto mesh axes",
                 ))
                 .into());
             }
+
             Some(requested.clone())
         } else if let Some(input_sharding) = input.sharding() {
             let mesh = input_sharding.mesh().clone();
@@ -1894,6 +1919,7 @@ impl Scatter for ArrayType {
                 .chain(dimensions.inserted_window_dimensions())
                 .copied()
                 .collect();
+
             for &axis in &replicated_input_axes {
                 let window_extent = if inserted.contains(&axis) {
                     Dimension::Static(1)
@@ -1903,27 +1929,30 @@ impl Scatter for ArrayType {
                     let window = input_window_axes.iter().position(|window_axis| *window_axis == axis).unwrap();
                     updates.dimension(dimensions.update_window_dimensions()[window])
                 };
+
                 if input.dimension(axis) != window_extent
                     && input.dimension(axis) != Dimension::Static(0)
                     && input_sharding.dimensions()[axis].has_explicit_axis(&mesh)
                 {
                     return Err(TypeError::invalid(format!(
                         "`{SCATTER_OPERATION_NAME}` input axis {axis} is targeted by the start indices and must be \
-                             replicated over explicit mesh axes; request an explicit output sharding to resolve \
-                             placement"
+                         replicated over explicit mesh axes; request an explicit output sharding to resolve \
+                         placement",
                     ))
                     .into());
                 }
             }
+
             if let Some(indices_sharding) = indices.sharding()
                 && indices_sharding.dimensions()[index_vector_dimension].has_explicit_axis(&mesh)
             {
                 return Err(TypeError::invalid(format!(
                     "`{SCATTER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit \
-                         mesh axes"
+                     mesh axes"
                 ))
                 .into());
             }
+
             Some(input_sharding.clone().with_varying_manual_axes(varying_manual_axes).map_err(|error| {
                 TypeError::invalid(format!("`{SCATTER_OPERATION_NAME}` output sharding is invalid: {error}"))
             })?)
@@ -1938,11 +1967,14 @@ impl Scatter for ArrayType {
         } else {
             None
         };
+
         input.clone().with_sharding(sharding).map_err(|error| {
             TypeError::invalid(format!("`{SCATTER_OPERATION_NAME}` output type is invalid: {error}")).into()
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Applies one already-validated scatter using a byte-slice combiner, keeping index traversal independent of the
