@@ -61,13 +61,13 @@ pub const SLICE_OPERATION_NAME: &str = "slice";
 /// accumulator. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SliceOperation {
-    /// Refer to the documentation of [`Self::start_indices`] for more information.
+    /// Refer to the documentation of [`start_indices`](Self::start_indices) for more information.
     start_indices: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::limit_indices`] for more information.
+    /// Refer to the documentation of [`limit_indices`](Self::limit_indices) for more information.
     limit_indices: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::strides`] for more information.
+    /// Refer to the documentation of [`strides`](Self::strides) for more information.
     strides: Vec<usize>,
 }
 
@@ -80,26 +80,8 @@ impl SliceOperation {
         Self { start_indices, limit_indices, strides }
     }
 
-    /// Returns the inclusive start indices of this [`SliceOperation`], one per input axis.
-    #[inline]
-    pub fn start_indices(&self) -> &[usize] {
-        self.start_indices.as_slice()
-    }
-
-    /// Returns the exclusive limit indices of this [`SliceOperation`], one per input axis.
-    #[inline]
-    pub fn limit_indices(&self) -> &[usize] {
-        self.limit_indices.as_slice()
-    }
-
-    /// Returns the strides of this [`SliceOperation`], one per input axis. Every stride is at least `1`.
-    #[inline]
-    pub fn strides(&self) -> &[usize] {
-        self.strides.as_slice()
-    }
-
-    /// Replaces the strides of this [`SliceOperation`] with `strides`. There must be one stride per start index and
-    /// every stride must be at least `1`.
+    /// Returns a copy of this [`SliceOperation`] with its strides set to `strides`. There must be one stride per
+    /// start index, and every stride must be at least `1`; otherwise, this function returns a [`TypeError`].
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, ProgramError> {
         if strides.len() != self.start_indices.len() {
             return Err(TypeError::invalid(format!(
@@ -119,9 +101,28 @@ impl SliceOperation {
         self.strides = strides;
         Ok(self)
     }
+
+    /// Returns the inclusive start indices of this [`SliceOperation`], one per input axis.
+    #[inline]
+    pub fn start_indices(&self) -> &[usize] {
+        self.start_indices.as_slice()
+    }
+
+    /// Returns the exclusive limit indices of this [`SliceOperation`], one per input axis.
+    #[inline]
+    pub fn limit_indices(&self) -> &[usize] {
+        self.limit_indices.as_slice()
+    }
+
+    /// Returns the strides of this [`SliceOperation`], one per input axis. Every stride is at least `1`.
+    #[inline]
+    pub fn strides(&self) -> &[usize] {
+        self.strides.as_slice()
+    }
 }
 
 impl Display for SliceOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -759,8 +760,7 @@ impl<A: Slice + Value<Type = ArrayType>> Slice for ArrayIrValue<A> {
 // the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Slice for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<SliceOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<SliceOperation>>,
 {
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let output_type = self.r#type().slice(start_indices, limit_indices, strides)?;
@@ -782,7 +782,7 @@ pub const UPDATE_SLICE_OPERATION_NAME: &str = "update_slice";
 /// indices. Refer to the documentation of [`UpdateSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UpdateSliceOperation {
-    /// Refer to the documentation of [`Self::start_indices`] for more information.
+    /// Refer to the documentation of [`start_indices`](Self::start_indices) for more information.
     start_indices: Vec<usize>,
 }
 
@@ -802,6 +802,7 @@ impl UpdateSliceOperation {
 }
 
 impl Display for UpdateSliceOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -1101,8 +1102,7 @@ impl<A: UpdateSlice + Value<Type = ArrayType>> UpdateSlice for ArrayIrValue<A> {
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> UpdateSlice for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<UpdateSliceOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>,
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
@@ -1126,7 +1126,7 @@ pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 /// eager execution. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation {
-    /// Refer to the documentation of [`Self::sizes`] for more information.
+    /// Refer to the documentation of [`sizes`](Self::sizes) for more information.
     sizes: Vec<usize>,
 }
 
@@ -1145,6 +1145,7 @@ impl DynamicSliceOperation {
 }
 
 impl Display for DynamicSliceOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -1730,8 +1731,7 @@ impl<A: DynamicSlice + Value<Type = ArrayType>> DynamicSlice for ArrayIrValue<A>
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> DynamicSlice for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<DynamicSliceOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicSliceOperation>>,
 {
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
         let start_index_types = start_indices.iter().map(|index| index.r#type().into_owned()).collect::<Vec<_>>();
@@ -1758,6 +1758,7 @@ pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &str = "dynamic_update_slice";
 pub struct DynamicUpdateSliceOperation;
 
 impl Display for DynamicUpdateSliceOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -2329,8 +2330,7 @@ impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for Arr
 // implementations.
 impl<V: Value<Type = ArrayType>> DynamicUpdateSlice for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<DynamicUpdateSliceOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>,
 {
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = vec![self.clone(), update.clone()];
@@ -2352,25 +2352,20 @@ pub const DYNAMIC_SHAPE_SLICE_OPERATION_NAME: &str = "dynamic_shape_slice";
 /// leave bounds validation to execution; an unused result does not make an invalid slice unobservable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicShapeSliceOperation {
-    /// Refer to the documentation of [`Self::strides`] for more information.
+    /// Refer to the documentation of [`strides`](Self::strides) for more information.
     strides: Vec<usize>,
 }
 
 impl DynamicShapeSliceOperation {
-    /// Creates an operation with one unit stride per array axis.
+    /// Creates a new [`DynamicShapeSliceOperation`] with one unit stride per input axis, for the provided `rank`.
     #[inline]
     pub fn new(rank: usize) -> Self {
         Self { strides: vec![1; rank] }
     }
 
-    /// Returns the static stride applied along each sliced axis.
-    #[inline]
-    pub fn strides(&self) -> &[usize] {
-        &self.strides
-    }
-
-    /// Replaces the per-axis strides. The number of strides must match the rank supplied to [`Self::new`], and every
-    /// stride must be strictly positive. Invalid counts or zero strides return a [`TypeError`].
+    /// Returns a copy of this [`DynamicShapeSliceOperation`] with its strides set to `strides`. The number of strides
+    /// must match the rank supplied to [`new`](Self::new), and every stride must be strictly positive; otherwise,
+    /// this function returns a [`TypeError`].
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, TypeError> {
         if strides.len() != self.strides.len() {
             return Err(TypeError::invalid(format!(
@@ -2380,13 +2375,19 @@ impl DynamicShapeSliceOperation {
                 self.strides.len(),
             )));
         }
-        if let Some((axis, _)) = strides.iter().enumerate().find(|(_, stride)| **stride == 0) {
+        if let Some(axis) = strides.iter().position(|stride| *stride == 0) {
             return Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` stride must be positive on axis {axis}",
             )));
         }
         self.strides = strides;
         Ok(self)
+    }
+
+    /// Returns the static stride applied along each sliced axis.
+    #[inline]
+    pub fn strides(&self) -> &[usize] {
+        &self.strides
     }
 }
 
@@ -3401,9 +3402,9 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
-        DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
-        i4,
+        ArrayReferenceDischarge, DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
+        ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -3424,44 +3425,12 @@ mod tests {
     use crate::operations::references::{ReferenceNew, ReferenceRead};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargePolicy,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Typed,
+        EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeValue,
+        ReferenceDischargeableOperation, Typed,
     };
     use crate::tracing::Trace;
 
     use super::*;
-
-    /// Storage alias of [`WholeArrayDischarge`]: every handle aliases its complete allocation.
-    #[derive(Copy, Clone, Debug, PartialEq)]
-    struct WholeArray;
-
-    /// Whole-array [`ReferenceDischargePolicy`] for the reference-discharge tests of the homogeneous slicing
-    /// operations. The array universe has no reference-typed spelling, which is valid here because the reference-free
-    /// rules only replay ordinary operands and reject every live reference handle before inspecting its type.
-    #[derive(Copy, Clone, Debug)]
-    struct WholeArrayDischarge;
-
-    impl<C: Domain<Type = ArrayType>> ReferenceDischargePolicy<C> for WholeArrayDischarge {
-        type Referent = ArrayType;
-        type Alias = WholeArray;
-
-        fn storage_alias(_referent: &ArrayType) -> WholeArray {
-            WholeArray
-        }
-
-        fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
-            Ok(current.clone())
-        }
-
-        fn write(
-            _context: &C,
-            _current: &C::Value,
-            replacement: C::Value,
-            _alias: &WholeArray,
-        ) -> Result<C::Value, ProgramError> {
-            Ok(replacement)
-        }
-    }
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
     fn index(value: i32) -> Array {
@@ -3667,43 +3636,25 @@ mod tests {
 
     #[test]
     fn test_slice_reference_discharge() {
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed slice, and a staging destination records the same operation unchanged.
-        let operation = SliceOperation::new(vec![1, 1], vec![2, 3]);
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let eager = ReferenceDischargeContext::<EagerContext<Array, SliceOperation>, WholeArrayDischarge>::new(
-            EagerContext::new(),
-        );
-        let inputs = [ReferenceDischargeValue::Value(input.clone())];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(1, 2, vec![5.0, 6.0]).unwrap())]),
-        );
-        let trace = TracingContext::<Array, SliceOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned()))];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
+        // are covered by the reference-discharge macro tests.
+        let expected = SliceOperation::new(vec![0, 0], vec![2, 3]).with_strides(vec![1, 2]).unwrap();
+        let operation = ArrayIrOperation::Array(ArrayOperation::Slice(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
+        let inputs = [ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into()))];
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
         };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [1, 2]));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 2])));
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite. The
-        // handle's own rendering is spliced into the expected diagnostic because a top-level environment identity is
-        // minted process-globally and is therefore not stable across runs.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &[reference.clone()]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{SLICE_OPERATION_NAME}` but received {reference}",
-            ))),
-        );
+        let ArrayIrOperation::Array(ArrayOperation::Slice(staged)) = builder.instructions()[0].operation() else {
+            panic!("expected a staged slice");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]
@@ -4454,46 +4405,28 @@ mod tests {
 
     #[test]
     fn test_update_slice_reference_discharge() {
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed update, and a staging destination records the same operation unchanged.
-        let operation = UpdateSliceOperation::new(vec![0, 1]);
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
-        let eager = ReferenceDischargeContext::<EagerContext<Array, UpdateSliceOperation>, WholeArrayDischarge>::new(
-            EagerContext::new(),
-        );
-        let inputs = [ReferenceDischargeValue::Value(input.clone()), ReferenceDischargeValue::Value(update.clone())];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(2, 3, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]).unwrap())]),
-        );
-        let trace = TracingContext::<Array, UpdateSliceOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(update.r#type().into_owned())),
+        // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
+        // are covered by the reference-discharge macro tests.
+        let expected = UpdateSliceOperation::new(vec![0, 1]);
+        let operation = ArrayIrOperation::Array(ArrayOperation::UpdateSlice(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
+        let inputs = [
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [1, 2]).into())),
         ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
         };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])));
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &[reference.clone(), inputs[1].clone()]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{UPDATE_SLICE_OPERATION_NAME}` but received \
-                 {reference}",
-            ))),
-        );
+        let ArrayIrOperation::Array(ArrayOperation::UpdateSlice(staged)) = builder.instructions()[0].operation() else {
+            panic!("expected a staged update_slice");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]
@@ -5187,54 +5120,30 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_reference_discharge() {
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed slice, and a staging destination records the same operation unchanged.
-        let operation = DynamicSliceOperation::new(vec![1, 2]);
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let eager = ReferenceDischargeContext::<EagerContext<Array, DynamicSliceOperation>, WholeArrayDischarge>::new(
-            EagerContext::new(),
-        );
+        // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
+        // are covered by the reference-discharge macro tests.
+        let expected = DynamicSliceOperation::new(vec![1, 2]);
+        let operation = ArrayIrOperation::Array(ArrayOperation::DynamicSlice(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
         let inputs = [
-            ReferenceDischargeValue::Value(input.clone()),
-            ReferenceDischargeValue::Value(index(1)),
-            ReferenceDischargeValue::Value(index(1)),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32).into())),
         ];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(1, 2, vec![5.0, 6.0]).unwrap())]),
-        );
-        let trace = TracingContext::<Array, DynamicSliceOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32))),
-            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32))),
-        ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
         };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [1, 2]));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [1, 2])));
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
-        assert_eq!(
-            operation.discharge_references(
-                &eager,
-                &EmptyRegionDriver,
-                &[reference.clone(), inputs[1].clone(), inputs[2].clone()],
-            ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{DYNAMIC_SLICE_OPERATION_NAME}` but received \
-                 {reference}",
-            ))),
-        );
+        let ArrayIrOperation::Array(ArrayOperation::DynamicSlice(staged)) = builder.instructions()[0].operation()
+        else {
+            panic!("expected a staged dynamic_slice");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]
@@ -6614,58 +6523,31 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_reference_discharge() {
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed update, and a staging destination records the same operation unchanged.
-        let operation = DynamicUpdateSliceOperation;
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
-        let eager =
-            ReferenceDischargeContext::<EagerContext<Array, DynamicUpdateSliceOperation>, WholeArrayDischarge>::new(
-                EagerContext::new(),
-            );
+        // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
+        // are covered by the reference-discharge macro tests.
+        let expected = DynamicUpdateSliceOperation;
+        let operation = ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
         let inputs = [
-            ReferenceDischargeValue::Value(input.clone()),
-            ReferenceDischargeValue::Value(update.clone()),
-            ReferenceDischargeValue::Value(index(0)),
-            ReferenceDischargeValue::Value(index(1)),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [2, 3]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [1, 2]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32).into())),
         ];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(2, 3, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]).unwrap())]),
-        );
-        let trace = TracingContext::<Array, DynamicUpdateSliceOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(update.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32))),
-            ReferenceDischargeValue::Value(trace.input(ArrayType::scalar(DataType::I32))),
-        ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
         };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])));
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
-        assert_eq!(
-            operation.discharge_references(
-                &eager,
-                &EmptyRegionDriver,
-                &[reference.clone(), inputs[1].clone(), inputs[2].clone(), inputs[3].clone()],
-            ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` but \
-                 received {reference}",
-            ))),
-        );
+        let ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(staged)) = builder.instructions()[0].operation()
+        else {
+            panic!("expected a staged dynamic_update_slice");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]
@@ -7446,60 +7328,22 @@ mod tests {
 
     #[test]
     fn test_dynamic_shape_slice_reference_discharge() {
-        // The mixed universe spells references as `ArrayIrType::Reference`, but the reference-free rule only replays
-        // ordinary operands and rejects every live handle before inspecting its type, so a whole-array policy suffices.
-        #[derive(Copy, Clone, Debug)]
-        struct WholeArrayIrDischarge;
-
-        impl<C: Domain<Type = ArrayIrType>> ReferenceDischargePolicy<C> for WholeArrayIrDischarge {
-            type Referent = ArrayType;
-            type Alias = WholeArray;
-
-            fn storage_alias(_referent: &ArrayType) -> WholeArray {
-                WholeArray
-            }
-
-            fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
-                Ok(current.clone())
-            }
-
-            fn write(
-                _context: &C,
-                _current: &C::Value,
-                replacement: C::Value,
-                _alias: &WholeArray,
-            ) -> Result<C::Value, ProgramError> {
-                Ok(replacement)
-            }
-        }
-
-        // The standalone payload discharges without the array IR operation enum: an eager destination executes the
-        // replayed slice, and a staging destination records the same operation unchanged.
-        let operation = DynamicShapeSliceOperation::new(1);
-        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30, 40]).unwrap());
-        let start = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
-        let size = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
-        let eager = ReferenceDischargeContext::<
-            EagerContext<ArrayIrValue<Array>, DynamicShapeSliceOperation>,
-            WholeArrayIrDischarge,
-        >::new(EagerContext::new());
+        // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
+        // are covered by the reference-discharge macro tests.
+        let expected = DynamicShapeSliceOperation::new(1).with_strides(vec![2]).unwrap();
+        let operation = ArrayIrOperation::DynamicShapeSlice(expected.clone());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
         let inputs = [
-            ReferenceDischargeValue::Value(input.clone()),
-            ReferenceDischargeValue::Value(start.clone()),
-            ReferenceDischargeValue::Value(size.clone()),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::I32, [4]).into())),
+            ReferenceDischargeValue::Value(
+                trace.input(DimensionValue::constant(1).unwrap().r#type().into_owned().into()),
+            ),
+            ReferenceDischargeValue::Value(
+                trace.input(DimensionValue::constant(2).unwrap().r#type().into_owned().into()),
+            ),
         ];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(ArrayIrValue::Array(Array::vector(vec![20_i32, 30]).unwrap()))]),
-        );
-        let trace = TracingContext::<ArrayIrValue<Array>, DynamicShapeSliceOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayIrDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(start.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(size.r#type().into_owned())),
-        ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
@@ -7507,23 +7351,10 @@ mod tests {
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])));
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite.
-        let referent = ArrayType::new_static(DataType::I32, [4]);
-        let reference =
-            ReferenceDischargeValue::from(eager.bind_discharged(ReferenceType::new(referent), input).unwrap());
-        assert_eq!(
-            operation.discharge_references(
-                &eager,
-                &EmptyRegionDriver,
-                &[reference.clone(), inputs[1].clone(), inputs[2].clone()],
-            ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` but \
-                 received {reference}",
-            ))),
-        );
+        let ArrayIrOperation::DynamicShapeSlice(staged) = builder.instructions()[0].operation() else {
+            panic!("expected a staged dynamic_shape_slice");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]

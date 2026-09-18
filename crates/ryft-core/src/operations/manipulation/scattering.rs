@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, LogicalMesh, NumericArrayElement, Shape, Sharding, ShardingDimension,
+    ArrayIrValue, ArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
     materialize_array_tangent,
 };
 use crate::axes::Axis;
@@ -46,14 +46,12 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this.
-
 /// Determines how [`Scatter`] handles windows extending outside its input. Negative indices are out of bounds;
 /// they do not count backward from an axis end. The mode does not change the output shape.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ScatterMode {
-    /// The caller promises every update window is in bounds. Violating the promise leaves results and gradients
-    /// undefined.
+    /// The caller promises every update window is in bounds. Violating the promise leaves results and
+    /// gradients undefined.
     #[default]
     PromiseInBounds,
 
@@ -65,7 +63,7 @@ pub enum ScatterMode {
 }
 
 impl ScatterMode {
-    /// Returns the canonical lowercase name of this mode.
+    /// Returns the canonical name of this [`ScatterMode`].
     #[inline]
     pub fn name(self) -> &'static str {
         match self {
@@ -83,39 +81,40 @@ impl Display for ScatterMode {
     }
 }
 
-/// Combiner applied when a [`scatter`](Scatter) writes an update into the input. Each kind selects the binary
-/// reduction used where an update meets the existing input value and lowers to the corresponding
-/// `stablehlo.scatter` combiner region. [`Self::Add`] supports differentiation through both the input and
-/// updates and participates in the gather/scatter-add transpose duality (see [`ScatterOperation::is_linear`]).
-/// Extremal derivatives divide ties equally
-/// among matching inputs and updates. Multiplication derivatives with respect to updates require unique indices;
-/// repeated overwrite uses a consistent winning update for its primal and tangent. Nonlinear derivatives require
-/// static update window sizes, and repeated overwrite additionally requires a static update shape. Overlapping
-/// updates may execute in any order; a unique-index hint is a caller promise, not a check.
+/// Reduction used when a [`Scatter`] writes an update into its input value. Each kind selects the binary reduction used
+/// where an update meets the existing input value (and, for the XLA backend, for example, lowers to the corresponding
+/// `stablehlo.scatter` combiner region). [`Self::Add`] supports differentiation through both the input and updates and
+/// participates in the gather/scatter-add transpose duality (refer to [`ScatterOperation::is_linear`] for more
+/// information). Extremal derivatives divide ties equally among matching inputs and updates. [`Self::Mul`] derivatives
+/// with respect to updates require unique indices. Repeated [`Self::Overwrite`] uses a consistent winning update for
+/// its primal and tangent. Non-linear derivatives require static update window sizes, and repeated overwrite
+/// additionally requires a static update shape. Overlapping updates may execute in any order; a unique-index hint
+/// is a caller promise and not a check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScatterReductionKind {
-    /// The update replaces the input value (StableHLO's scatter whose combiner returns the update).
+    /// The update replaces the input value.
     Overwrite,
 
-    /// The update is added to the input value (`scatter_add`). Linear for all index configurations.
+    /// The update is added to the input value. This is linear for all index configurations.
     Add,
 
-    /// The update is multiplied with the input value (`scatter_mul`).
+    /// The update is multiplied with the input value.
     Mul,
 
-    /// The input value is replaced by the minimum of itself and the update (`scatter_min`). Booleans use
-    /// conjunction, real numeric values propagate NaNs and order negative zero below positive zero, and complex values
-    /// compare lexicographically by `(real, imaginary)`.
+    /// The input value is replaced by the minimum of itself and the update. Booleans use conjunction, real numeric
+    /// values propagate NaNs and order negative zero below positive zero, and complex values compare lexicographically
+    /// by `(real, imaginary)`.
     Min,
 
-    /// The input value is replaced by the maximum of itself and the update (`scatter_max`). Booleans use
-    /// disjunction, real numeric values propagate NaNs and order negative zero below positive zero, and complex values
-    /// compare lexicographically by `(real, imaginary)`.
+    /// The input value is replaced by the maximum of itself and the update. Booleans use disjunction, real numeric
+    /// values propagate NaNs and order negative zero below positive zero, and complex values compare lexicographically
+    /// by `(real, imaginary)`.
     Max,
 }
 
 impl ScatterReductionKind {
-    /// Returns the canonical operation name suffix for this kind.
+    /// Returns the canonical name of this [`ScatterReductionKind`].
+    #[inline]
     pub fn name(self) -> &'static str {
         match self {
             Self::Overwrite => "overwrite",
@@ -128,10 +127,13 @@ impl ScatterReductionKind {
 }
 
 impl Display for ScatterReductionKind {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.name())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Specification of how the index input and the update windows map onto the input axes of a [`scatter`](Scatter),
 /// following StableHLO's [`scatter`](https://openxla.org/stablehlo/spec#scatter) dimension numbers. It is the
@@ -145,25 +147,30 @@ impl Display for ScatterReductionKind {
 /// shape as the input.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ScatterDimensionNumbers {
-    /// Refer to the documentation of [`Self::update_window_dimensions`] for more information.
+    /// Refer to the documentation of [`update_window_dimensions`](Self::update_window_dimensions) for more information.
     update_window_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::inserted_window_dimensions`] for more information.
+    /// Refer to the documentation of [`inserted_window_dimensions`](Self::inserted_window_dimensions)
+    /// for more information.
     inserted_window_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::scatter_dimensions_to_operand_dimensions`] for more information.
+    /// Refer to the documentation of
+    /// [`scatter_dimensions_to_operand_dimensions`](Self::scatter_dimensions_to_operand_dimensions)
+    /// for more information.
     scatter_dimensions_to_operand_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::operand_batching_dimensions`] for more information.
+    /// Refer to the documentation of [`operand_batching_dimensions`](Self::operand_batching_dimensions)
+    /// for more information.
     operand_batching_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`Self::scatter_indices_batching_dimensions`] for more information.
+    /// Refer to the documentation of [`scatter_indices_batching_dimensions`](Self::scatter_indices_batching_dimensions)
+    /// for more information.
     scatter_indices_batching_dimensions: Vec<usize>,
 }
 
 impl ScatterDimensionNumbers {
-    /// Creates scatter dimension numbers from explicit axis lists. The batching axis lists default to empty; use
-    /// [`Self::with_batching_dimensions`] to set them.
+    /// Creates a new [`ScatterDimensionNumbers`] instance from the provided explicit axis lists. The batching axis
+    /// lists default to empty; use [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
     ///
     /// # Parameters
     ///
@@ -184,6 +191,27 @@ impl ScatterDimensionNumbers {
             operand_batching_dimensions: Vec::new(),
             scatter_indices_batching_dimensions: Vec::new(),
         }
+    }
+
+    /// Returns a copy of this [`ScatterDimensionNumbers`] with its input and query batching axes replaced by
+    /// `operand_batching_dimensions` and `scatter_indices_batching_dimensions`, respectively. Each update modifies
+    /// its corresponding input batch. Paired axes must have equal extents, and input batching axes cannot also be
+    /// inserted or indexed by a start vector. These constraints are checked when inferring the scatter result type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operand_batching_dimensions`: Input axes, in ascending order, that select the independent batches.
+    ///   - `scatter_indices_batching_dimensions`: Distinct query axes paired with the input axes in the same order.
+    ///     The trailing index-vector axis cannot be a batching axis.
+    #[inline]
+    pub fn with_batching_dimensions(
+        mut self,
+        operand_batching_dimensions: Vec<usize>,
+        scatter_indices_batching_dimensions: Vec<usize>,
+    ) -> Self {
+        self.operand_batching_dimensions = operand_batching_dimensions;
+        self.scatter_indices_batching_dimensions = scatter_indices_batching_dimensions;
+        self
     }
 
     /// Returns the axes of the updates input that hold a scattered window, in ascending order. Their count equals the
@@ -219,26 +247,6 @@ impl ScatterDimensionNumbers {
     pub fn scatter_indices_batching_dimensions(&self) -> &[usize] {
         &self.scatter_indices_batching_dimensions
     }
-
-    /// Pairs input axes with query axes so that each update modifies its corresponding input batch. Paired axes
-    /// must have equal extents, and input batching axes cannot also be inserted or indexed by a start vector.
-    /// These constraints are checked when inferring the scatter result type.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operand_batching_dimensions`: Input axes, in ascending order, that select the independent batches.
-    ///   - `scatter_indices_batching_dimensions`: Distinct query axes paired with the input axes in the same order.
-    ///     The trailing index-vector axis cannot be a batching axis.
-    #[inline]
-    pub fn with_batching_dimensions(
-        mut self,
-        operand_batching_dimensions: Vec<usize>,
-        scatter_indices_batching_dimensions: Vec<usize>,
-    ) -> Self {
-        self.operand_batching_dimensions = operand_batching_dimensions;
-        self.scatter_indices_batching_dimensions = scatter_indices_batching_dimensions;
-        self
-    }
 }
 
 /// Optional bounds handling, index promises, and output placement for [`Scatter::scatter`].
@@ -260,8 +268,8 @@ pub struct ScatterOptions {
 }
 
 impl ScatterOptions {
-    /// Creates new [`ScatterOptions`] with promise-in-bounds handling, no sortedness or uniqueness promises, and
-    /// inferred output placement.
+    /// Creates options with [`ScatterMode::PromiseInBounds`], no sortedness or non-overlap promises, and inferred
+    /// output [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -270,6 +278,47 @@ impl ScatterOptions {
             unique_indices: false,
             output_sharding: None,
         }
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its out-of-bounds index handling [`ScatterMode`] replaced by
+    /// `mode`.
+    #[inline]
+    pub fn with_mode(mut self, mode: ScatterMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not sort or validate the indices.
+    #[inline]
+    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
+        self.indices_are_sorted = indices_are_sorted;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When
+    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
+    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
+    #[inline]
+    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
+        self.unique_indices = unique_indices;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
+    /// Without an explicit request, indexed axes with partial update windows must be replicated over explicit mesh
+    /// axes; complete windows
+    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
+    /// reduction state, and manual-axis variation.
+    ///
+    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
+    /// inferred placement. Validation takes place when inferring the result type.
+    #[inline]
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
+        self.output_sharding = output_sharding.into();
+        self
     }
 
     /// Returns the out-of-bounds index handling mode.
@@ -300,48 +349,10 @@ impl ScatterOptions {
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
     }
-
-    /// Returns a copy of this [`ScatterOptions`] with its out-of-bounds handling mode set to `mode`.
-    #[inline]
-    pub fn with_mode(mut self, mode: ScatterMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not sort or validate the indices.
-    #[inline]
-    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
-        self.indices_are_sorted = indices_are_sorted;
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not test the windows for overlap.
-    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
-    #[inline]
-    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
-        self.unique_indices = unique_indices;
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOptions`] with its requested output sharding set to `output_sharding`.
-    /// Without an explicit request, indexed axes with partial update windows must be replicated; complete windows
-    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
-    /// reduction state, and manual-axis variation.
-    ///
-    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
-    /// inferred placement. Validation takes place when inferring the result type.
-    #[inline]
-    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
-        self.output_sharding = output_sharding.into();
-        self
-    }
 }
 
 impl Default for ScatterOptions {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -376,6 +387,56 @@ impl ScatterOperation {
     #[inline]
     pub fn new(dimensions: ScatterDimensionNumbers, kind: ScatterReductionKind) -> Self {
         Self { dimensions, kind, options: ScatterOptions::new() }
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its optional behavior and output placement replaced by
+    /// `options`.
+    #[inline]
+    pub fn with_options(mut self, options: ScatterOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds index handling [`ScatterMode`] replaced by
+    /// `mode`.
+    #[inline]
+    pub fn with_mode(mut self, mode: ScatterMode) -> Self {
+        self.options = self.options.with_mode(mode);
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
+    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not sort or validate the indices.
+    #[inline]
+    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
+        self.options = self.options.with_indices_are_sorted(indices_are_sorted);
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When
+    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
+    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
+    #[inline]
+    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
+        self.options = self.options.with_unique_indices(unique_indices);
+        self
+    }
+
+    /// Returns a copy of this [`ScatterOperation`] with its requested output [`Sharding`] replaced by
+    /// `output_sharding`.
+    /// Without an explicit request, indexed axes with partial update windows must be replicated over explicit mesh
+    /// axes; complete windows
+    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
+    /// reduction state, and manual-axis variation.
+    ///
+    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
+    /// inferred placement. Validation takes place when inferring the result type.
+    #[inline]
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
+        self.options = self.options.with_output_sharding(output_sharding);
+        self
     }
 
     /// Returns the dimension numbers mapping the index input and update windows onto the input axes.
@@ -437,60 +498,21 @@ impl ScatterOperation {
             || (self.kind == ScatterReductionKind::Overwrite && self.options.unique_indices)
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its options replaced by `options`.
-    #[inline]
-    pub fn with_options(mut self, options: ScatterOptions) -> Self {
-        self.options = options;
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds handling mode set to `mode`.
-    #[inline]
-    pub fn with_mode(mut self, mode: ScatterMode) -> Self {
-        self.options = self.options.with_mode(mode);
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not sort or validate the indices.
-    #[inline]
-    pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
-        self.options = self.options.with_indices_are_sorted(indices_are_sorted);
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not test the windows for overlap.
-    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
-    #[inline]
-    pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
-        self.options = self.options.with_unique_indices(unique_indices);
-        self
-    }
-
-    /// Returns a copy of this [`ScatterOperation`] with its requested output sharding set to `output_sharding`.
-    /// Without an explicit request, indexed axes with partial update windows must be replicated; complete windows
-    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
-    /// reduction state, and manual-axis variation.
+    /// Builds the [`GatherOperation`] that reads the windows targeted by this [`ScatterOperation`]. In the
+    /// scatter-add transpose, gathering the output cotangent gives one cotangent per update, including a separate
+    /// copy for every repeated index. For example, scalar updates at indices `[2, 0, 2]` receive cotangents
+    /// `[c, a, c]` from an output cotangent `[a, b, c]`. Nonlinear derivative rules use the same mapping to read
+    /// primal values or winner identifiers at the update locations.
     ///
-    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
-    /// inferred placement. Validation takes place when inferring the result type.
-    #[inline]
-    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
-        self.options = self.options.with_output_sharding(output_sharding);
-        self
-    }
-
-    /// Builds the gather that reads back the windows this scatter writes: its offset, collapsed, and batching axes
-    /// mirror the scatter's dimension numbers, its window sizes are the static update window extents (one on inserted
-    /// axes and one on paired batching axes, or zero when those axes may be empty), and the bounds mode, index
-    /// hints, and requested placement carry over. Callers choose the fill: the transpose and the overwrite winner IDs
-    /// pin a typed zero, while the extremal coefficients keep gather's default fill (NaN for floating-point inputs).
+    /// Update window axes become gather offset axes, inserted input axes become collapsed axes, and the index map
+    /// and paired batching axes are retained. Window sizes come from the static update extents; inserted axes use
+    /// one, while paired axes use zero if their extent may be empty and one otherwise. A dynamic inserted axis
+    /// must have a positive lower bound because the gather collapses it through a size-one window.
     ///
-    /// An inserted axis must have a nonzero minimum extent: gather collapses it through a window of exactly one
-    /// element, which an axis that may be empty at runtime cannot provide, so such scatters have no dual gather.
+    /// Clipping and in-bounds promises retain their policies. Drop mode becomes fill mode; callers choose the fill
+    /// appropriate to the derivative: the transpose and overwrite winner identifiers use a typed zero, while
+    /// extremal coefficients retain the default fill (NaN for floating-point inputs). Sortedness and non-overlap
+    /// promises also carry over. This function constructs the operation without executing the gather.
     ///
     /// # Parameters
     ///
@@ -805,6 +827,7 @@ impl ScatterOperation {
 }
 
 impl Display for ScatterOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -1363,7 +1386,7 @@ pub trait Scatter: Sized {
 
 impl Scatter for ArrayType {
     // Type-level scatter: validates the dimension numbers, the updates shape, and the data types, and computes the
-    // output type (which equals the input type) and placement.
+    // output type (which retains the input shape, element type, and layout) and placement.
     fn scatter(
         &self,
         indices: &Self,
@@ -1594,10 +1617,16 @@ impl Scatter for ArrayType {
             .flatten()
             .next()
             .map(|sharding| sharding.mesh().clone());
-        if let Some(mesh) = &common_mesh {
-            check_same_mesh(mesh, input.sharding())?;
-            check_same_mesh(mesh, indices.sharding())?;
-            check_same_mesh(mesh, updates.sharding())?;
+        if let Some(mesh) = &common_mesh
+            && [input.sharding(), indices.sharding(), updates.sharding()]
+                .into_iter()
+                .flatten()
+                .any(|sharding| sharding.mesh() != mesh)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh",
+            ))
+            .into());
         }
         let unreduced_axes = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
         let reduced_axes = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
@@ -1675,13 +1704,13 @@ impl Scatter for ArrayType {
             Some(requested.clone())
         } else if let Some(input_sharding) = input.sharding() {
             let mesh = input_sharding.mesh().clone();
-            let replicated_operand_axes: BTreeSet<usize> = dimensions
+            let replicated_input_axes: BTreeSet<usize> = dimensions
                 .scatter_dimensions_to_operand_dimensions()
                 .iter()
                 .chain(dimensions.inserted_window_dimensions())
                 .copied()
                 .collect();
-            for &axis in &replicated_operand_axes {
+            for &axis in &replicated_input_axes {
                 let window_extent = if inserted.contains(&axis) {
                     Dimension::Static(1)
                 } else {
@@ -1818,7 +1847,7 @@ impl Array {
                     // Validation guarantees the window fits. Widening before clamping preserves unsigned extremes.
                     let maximum = (input_shape[input_axis] - input_window_size[input_axis]) as i128;
                     dropped |= drop_out_of_bounds && (raw < 0 || raw > maximum);
-                    // Invalid fill/drop origins are never accessed. Promise mode uses defensive clipping without
+                    // Dropped origins are never accessed. Promise mode uses defensive clipping without
                     // guaranteeing any particular out-of-bounds result to callers.
                     input_origin[input_axis] = raw.clamp(0, maximum) as usize;
                 }
@@ -1936,8 +1965,7 @@ impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
 // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Scatter for V
 where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ScatterOperation>,
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
 {
     fn scatter(
         &self,
@@ -2047,18 +2075,6 @@ where
     }
 }
 
-/// Errors when `other` is sharded over a different mesh than `mesh`.
-fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), TypeError> {
-    if let Some(other) = other
-        && other.mesh() != mesh
-    {
-        return Err(TypeError::invalid(format!(
-            "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2069,9 +2085,9 @@ mod tests {
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding,
-        ShardingDimension, StridedLayout, i4,
+        Array, ArrayIrOperation, ArrayOperation, ArrayReferenceDischarge, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
     };
     use crate::batching::batch;
     use crate::contexts::Context;
@@ -2086,8 +2102,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargePolicy,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType,
+        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeValue,
+        ReferenceDischargeableOperation,
     };
     use crate::tracing::Trace;
 
@@ -2269,9 +2285,6 @@ mod tests {
     fn test_scatter_options_with_mode() {
         let options = ScatterOptions::new().with_mode(ScatterMode::Drop);
         assert_eq!(options.mode(), ScatterMode::Drop);
-        assert!(!options.indices_are_sorted());
-        assert!(!options.unique_indices());
-        assert_eq!(options.output_sharding(), None);
         assert_eq!(options.with_mode(ScatterMode::PromiseInBounds), ScatterOptions::new());
     }
 
@@ -2279,9 +2292,6 @@ mod tests {
     fn test_scatter_options_with_indices_are_sorted() {
         let options = ScatterOptions::new().with_indices_are_sorted(true);
         assert!(options.indices_are_sorted());
-        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
-        assert!(!options.unique_indices());
-        assert_eq!(options.output_sharding(), None);
         assert_eq!(options.with_indices_are_sorted(false), ScatterOptions::new());
     }
 
@@ -2289,9 +2299,6 @@ mod tests {
     fn test_scatter_options_with_unique_indices() {
         let options = ScatterOptions::new().with_unique_indices(true);
         assert!(options.unique_indices());
-        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
-        assert!(!options.indices_are_sorted());
-        assert_eq!(options.output_sharding(), None);
         assert_eq!(options.with_unique_indices(false), ScatterOptions::new());
     }
 
@@ -2301,9 +2308,6 @@ mod tests {
         let sharding = Sharding::replicated(mesh, 2);
         let options = ScatterOptions::new().with_output_sharding(sharding.clone());
         assert_eq!(options.output_sharding(), Some(&sharding));
-        assert_eq!(options.mode(), ScatterMode::PromiseInBounds);
-        assert!(!options.indices_are_sorted());
-        assert!(!options.unique_indices());
         assert_eq!(options.with_output_sharding(None), ScatterOptions::new());
     }
 
@@ -2374,6 +2378,28 @@ mod tests {
     }
 
     #[test]
+    fn test_scatter_with_options() {
+        let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let operation = ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Add);
+        assert_eq!(operation.options(), &ScatterOptions::new());
+        let options = ScatterOptions::new()
+            .with_mode(ScatterMode::Drop)
+            .with_indices_are_sorted(true)
+            .with_unique_indices(true);
+        let operation = operation.with_options(options.clone());
+        assert_eq!(operation.options(), &options);
+        assert_eq!(operation.dimensions(), &dimensions);
+        assert_eq!(operation.kind(), ScatterReductionKind::Add);
+        assert_eq!(operation.mode(), ScatterMode::Drop);
+        assert!(operation.indices_are_sorted());
+        assert!(operation.unique_indices());
+        assert_eq!(
+            operation.with_options(ScatterOptions::new()),
+            ScatterOperation::new(dimensions, ScatterReductionKind::Add),
+        );
+    }
+
+    #[test]
     fn test_scatter_is_linear() {
         // Linearity holds the indices fixed: scatter-add is linear for every index configuration, overwrite only when
         // its windows are promised disjoint, and the remaining combiners never are. The sortedness hint is irrelevant.
@@ -2395,28 +2421,6 @@ mod tests {
         let maximum = ScatterOperation::new(dimensions, ScatterReductionKind::Max);
         assert!(!maximum.is_linear());
         assert!(!maximum.with_unique_indices(true).with_indices_are_sorted(true).is_linear());
-    }
-
-    #[test]
-    fn test_scatter_with_options() {
-        let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let operation = ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Add);
-        assert_eq!(operation.options(), &ScatterOptions::new());
-        let options = ScatterOptions::new()
-            .with_mode(ScatterMode::Drop)
-            .with_indices_are_sorted(true)
-            .with_unique_indices(true);
-        let operation = operation.with_options(options.clone());
-        assert_eq!(operation.options(), &options);
-        assert_eq!(operation.dimensions(), &dimensions);
-        assert_eq!(operation.kind(), ScatterReductionKind::Add);
-        assert_eq!(operation.mode(), ScatterMode::Drop);
-        assert!(operation.indices_are_sorted());
-        assert!(operation.unique_indices());
-        assert_eq!(
-            operation.with_options(ScatterOptions::new()),
-            ScatterOperation::new(dimensions, ScatterReductionKind::Add),
-        );
     }
 
     #[test]
@@ -2524,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_type_inference_batched_sharding() {
+    fn test_scatter_type_inference_paired_extents() {
         // Specialization can retain an exact nominal dimension on one side of a paired batch while the other is
         // already static. Both descriptions prove the same extent without equating unrelated symbolic dimensions.
         let exact = Dimension::Dynamic(DimensionVariable::new("batch", DimensionBounds::new(0, Some(1)).unwrap()));
@@ -2532,29 +2536,49 @@ mod tests {
             ScatterDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0]),
             ScatterReductionKind::Add,
         );
-        for input_batch in [Dimension::Static(0), exact.clone()] {
-            for query_batch in [Dimension::Static(0), exact.clone()] {
-                for update_batch in [Dimension::Static(0), exact.clone()] {
-                    let input =
-                        ArrayType::new(DataType::F64, Shape::new(vec![input_batch.clone(), Dimension::Static(4)]));
-                    let indices = ArrayType::new(
-                        DataType::I32,
-                        Shape::new(vec![query_batch.clone(), Dimension::Static(2), Dimension::Static(1)]),
-                    );
-                    let updates = ArrayType::new(DataType::F64, Shape::new(vec![update_batch, Dimension::Static(2)]));
-                    assert_eq!(
-                        input.scatter(
-                            &indices,
-                            &updates,
-                            operation.dimensions(),
-                            operation.kind(),
-                            operation.options()
-                        ),
-                        Ok(input)
-                    );
-                }
-            }
-        }
+        let static_input = ArrayType::new_static(DataType::F64, [0, 4]);
+        let dynamic_input = ArrayType::new(DataType::F64, Shape::new(vec![exact.clone(), 4.into()]));
+        let static_indices = ArrayType::new_static(DataType::I32, [0, 2, 1]);
+        let dynamic_indices = ArrayType::new(DataType::I32, Shape::new(vec![exact.clone(), 2.into(), 1.into()]));
+        let static_updates = ArrayType::new_static(DataType::F64, [0, 2]);
+        let dynamic_updates = ArrayType::new(DataType::F64, Shape::new(vec![exact, 2.into()]));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [static_input.clone(), static_indices.clone(), static_updates.clone()],
+                    output_types = [static_input.clone()],
+                },
+                {
+                    input_types = [static_input.clone(), static_indices.clone(), dynamic_updates.clone()],
+                    output_types = [static_input.clone()],
+                },
+                {
+                    input_types = [static_input.clone(), dynamic_indices.clone(), static_updates.clone()],
+                    output_types = [static_input.clone()],
+                },
+                {
+                    input_types = [static_input.clone(), dynamic_indices.clone(), dynamic_updates.clone()],
+                    output_types = [static_input.clone()],
+                },
+                {
+                    input_types = [dynamic_input.clone(), static_indices.clone(), static_updates.clone()],
+                    output_types = [dynamic_input.clone()],
+                },
+                {
+                    input_types = [dynamic_input.clone(), static_indices.clone(), dynamic_updates.clone()],
+                    output_types = [dynamic_input.clone()],
+                },
+                {
+                    input_types = [dynamic_input.clone(), dynamic_indices.clone(), static_updates.clone()],
+                    output_types = [dynamic_input.clone()],
+                },
+                {
+                    input_types = [dynamic_input.clone(), dynamic_indices.clone(), dynamic_updates.clone()],
+                    output_types = [dynamic_input.clone()],
+                },
+            ],
+        );
 
         // Identically named dimensions with equal non-exact bounds remain independent and must not pass either the
         // input/indices batching pairing or the indices/updates extent equality checks.
@@ -2592,41 +2616,6 @@ mod tests {
                 "`{SCATTER_OPERATION_NAME}` updates scatter axis 0 must match indices batch axis 0 in extent",
             ))
             .into()),
-        );
-
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-
-        // Input [4, 2] sharded only on the feature axis (axis 1); the targeted axis 0 is replicated, so the output
-        // keeps the input sharding.
-        let sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
-                .unwrap();
-        let input = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding.clone()).unwrap();
-        let indices = ArrayType::new_static(DataType::I32, [2, 1]);
-        let updates = ArrayType::new_static(DataType::F32, [2, 2]);
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
-        assert_eq!(
-            operation.infer_output_types(&[input.clone(), indices.clone(), updates.clone()], &[]),
-            Ok(vec![input])
-        );
-
-        // Sharding the targeted input axis over an explicit mesh axis is ambiguous without an output sharding.
-        let input = ArrayType::new_static(DataType::F32, [4, 2])
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            operation.infer_output_types(&[input, indices, updates], &[]),
-            Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input axis 0 is targeted by the start indices and must be replicated over \
-                 explicit mesh axes; request an explicit output sharding to resolve placement",
-            ))),
         );
     }
 
@@ -2878,6 +2867,44 @@ mod tests {
     }
 
     #[test]
+    fn test_scatter_type_inference_window_sharding() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+
+        // Input [4, 2] sharded only on the feature axis (axis 1); the targeted axis 0 is replicated, so the output
+        // keeps the input sharding.
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding.clone()).unwrap();
+        let indices = ArrayType::new_static(DataType::I32, [2, 1]);
+        let updates = ArrayType::new_static(DataType::F32, [2, 2]);
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone(), updates.clone()], &[]),
+            Ok(vec![input])
+        );
+
+        // Sharding the targeted input axis over an explicit mesh axis is ambiguous without an output sharding.
+        let input = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[input, indices, updates], &[]),
+            Err(TypeError::invalid(format!(
+                "`{SCATTER_OPERATION_NAME}` input axis 0 is targeted by the start indices and must be replicated over \
+                 explicit mesh axes; request an explicit output sharding to resolve placement",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_scatter_type_inference_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2937,7 +2964,7 @@ mod tests {
             Ok(expected)
         );
 
-        // All sharded operands must use one mesh, whichever operand establishes it.
+        // All sharded inputs must use one mesh, whichever input establishes it.
         let other_mesh_indices = indices.clone().with_sharding(Sharding::replicated(other_mesh.clone(), 2)).unwrap();
         assert_eq!(
             input.scatter(&other_mesh_indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
@@ -2945,6 +2972,13 @@ mod tests {
                 "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
             ))
             .into()),
+        );
+        check_operation_type_inference!(
+            operation = operation.clone().with_output_sharding(replicated.clone()),
+            cases = [{
+                input_types = [input.clone(), other_mesh_indices.clone(), updates.clone()],
+                error = format!("`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"),
+            }],
         );
         let mesh_indices = indices.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
         let other_mesh_updates = updates.clone().with_sharding(Sharding::replicated(other_mesh.clone(), 1)).unwrap();
@@ -3126,88 +3160,40 @@ mod tests {
 
     #[test]
     fn test_scatter_reference_discharge() {
-        // The array universe has no reference-typed spelling, which is valid here because the reference-free rule
-        // only replays ordinary operands and rejects every live reference handle before inspecting its type.
-        #[derive(Copy, Clone, Debug, PartialEq)]
-        struct WholeArray;
-
-        #[derive(Copy, Clone, Debug)]
-        struct WholeArrayDischarge;
-
-        impl<C: Domain<Type = ArrayType>> ReferenceDischargePolicy<C> for WholeArrayDischarge {
-            type Referent = ArrayType;
-            type Alias = WholeArray;
-
-            fn storage_alias(_referent: &ArrayType) -> WholeArray {
-                WholeArray
-            }
-
-            fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
-                Ok(current.clone())
-            }
-
-            fn write(
-                _context: &C,
-                _current: &C::Value,
-                replacement: C::Value,
-                _alias: &WholeArray,
-            ) -> Result<C::Value, ProgramError> {
-                Ok(replacement)
-            }
-        }
-
-        // The standalone payload discharges without the array operation enum: an eager destination executes the
-        // replayed scatter, and a staging destination records the same operation unchanged.
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
-        let input = Array::matrix(3, 2, vec![0.0; 6]).unwrap();
-        let indices = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
-        let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let eager = ReferenceDischargeContext::<EagerContext<Array, ScatterOperation>, WholeArrayDischarge>::new(
-            EagerContext::new(),
-        );
+        // Reference-free replay preserves the complete scatter payload. Generic replay behavior and reference
+        // rejection are covered by the reference-discharge macro tests.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let expected =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Mul)
+                .with_mode(ScatterMode::Drop)
+                .with_indices_are_sorted(true)
+                .with_unique_indices(true)
+                .with_output_sharding(Sharding::replicated(mesh.clone(), 2));
+        let operation = ArrayIrOperation::Array(ArrayOperation::Scatter(expected.clone()));
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
         let inputs = [
-            ReferenceDischargeValue::Value(input.clone()),
-            ReferenceDischargeValue::Value(indices.clone()),
-            ReferenceDischargeValue::Value(updates.clone()),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [3, 2]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::I32, [2, 1]).into())),
+            ReferenceDischargeValue::Value(trace.input(ArrayType::new_static(DataType::F64, [2, 2]).into())),
         ];
-        assert_eq!(
-            operation.discharge_references(&eager, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Value(Array::matrix(3, 2, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]).unwrap(),)]),
-        );
-        let trace = TracingContext::<Array, ScatterOperation>::new();
-        let staging = ReferenceDischargeContext::<_, WholeArrayDischarge>::new(trace.clone());
-        let staged_inputs = [
-            ReferenceDischargeValue::Value(trace.input(input.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(indices.r#type().into_owned())),
-            ReferenceDischargeValue::Value(trace.input(updates.r#type().into_owned())),
-        ];
-        let outputs = operation.discharge_references(&staging, &EmptyRegionDriver, &staged_inputs).unwrap();
+        let outputs = operation.discharge_references(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         let ReferenceDischargeValue::Value(output) = &outputs[0] else {
             panic!("expected a value carrier but got {}", outputs[0]);
         };
-        assert_eq!(output.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [3, 2]));
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(
+                ArrayType::new_static(DataType::F64, [3, 2]).with_sharding(Sharding::replicated(mesh, 2)).unwrap(),
+            )
+        );
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(builder.instructions()[0].operation(), &operation);
-
-        // A live reference handle is rejected, because an operation that touches a reference owns its own rewrite. The
-        // handle's own rendering is spliced into the expected diagnostic because a top-level environment identity is
-        // minted process-globally and is therefore not stable across runs.
-        let reference = ReferenceDischargeValue::from(
-            eager.bind_discharged(ReferenceType::new(input.r#type().into_owned()), input).unwrap(),
-        );
-        assert_eq!(
-            operation.discharge_references(
-                &eager,
-                &EmptyRegionDriver,
-                &[reference.clone(), inputs[1].clone(), inputs[2].clone()],
-            ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `{SCATTER_OPERATION_NAME}` but received {reference}",
-            ))),
-        );
+        let ArrayIrOperation::Array(ArrayOperation::Scatter(staged)) = builder.instructions()[0].operation() else {
+            panic!("expected a staged scatter");
+        };
+        assert_eq!(staged, &expected);
     }
 
     #[test]
@@ -3248,6 +3234,32 @@ mod tests {
             Array::vector(vec![10_i32, 24, 38, 40]),
         );
 
+        // Components are [column, row], so the index map must not be treated as sorted input-axis order.
+        let reversed_updates =
+            Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1, 2]), &[1_i32, 2, 3, 4]).unwrap();
+        assert_eq!(
+            Array::matrix(3, 4, vec![0_i32; 12]).unwrap().scatter(
+                &Array::matrix(2, 2, vec![1_i32, 0, 2, 2]).unwrap(),
+                &reversed_updates,
+                &ScatterDimensionNumbers::new(vec![1, 2], vec![], vec![1, 0]),
+                ScatterReductionKind::Add,
+                &options,
+            ),
+            Array::matrix(3, 4, vec![0_i32, 1, 2, 0, 0, 0, 0, 0, 0, 0, 3, 4]),
+        );
+
+        // Empty index vectors select the implicit zero origin. Both query windows still contribute.
+        assert_eq!(
+            Array::vector(vec![10_i32, 20]).unwrap().scatter(
+                &Array::matrix(2, 0, Vec::<i32>::new()).unwrap(),
+                &Array::matrix(2, 2, vec![1_i32, 2, 3, 4]).unwrap(),
+                &ScatterDimensionNumbers::new(vec![1], vec![], vec![]),
+                ScatterReductionKind::Add,
+                &options,
+            ),
+            Array::vector(vec![14_i32, 26]),
+        );
+
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let indices = Array::matrix(2, 1, vec![1_i32, 3]).unwrap();
@@ -3265,21 +3277,15 @@ mod tests {
 
         // Each combiner combines one update with the existing element; duplicate additive updates all contribute.
         assert_eq!(
-            input.scatter(
-                &indices,
-                &updates,
-                &dimensions.clone(),
-                ScatterReductionKind::Overwrite,
-                &ScatterOptions::new()
-            ),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Overwrite, &ScatterOptions::new()),
             Array::vector(vec![1.0, 100.0, 3.0, 200.0]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &dimensions.clone(), ScatterReductionKind::Mul, &ScatterOptions::new()),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Mul, &ScatterOptions::new()),
             Array::vector(vec![1.0, 200.0, 3.0, 800.0]),
         );
         assert_eq!(
-            input.scatter(&indices, &updates, &dimensions.clone(), ScatterReductionKind::Min, &ScatterOptions::new()),
+            input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Min, &ScatterOptions::new()),
             Ok(input.clone()),
         );
         assert_eq!(
@@ -4027,7 +4033,7 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &dimensions.clone(),
+                            &dimensions,
                             ScatterReductionKind::Min,
                             &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
@@ -4047,7 +4053,7 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &dimensions.clone(),
+                            &dimensions,
                             ScatterReductionKind::Max,
                             &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
@@ -4066,7 +4072,7 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &dimensions.clone(),
+                            &dimensions,
                             ScatterReductionKind::Min,
                             &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
@@ -4087,7 +4093,7 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &dimensions.clone(),
+                            &dimensions,
                             ScatterReductionKind::Overwrite,
                             &ScatterOptions::new().with_mode(ScatterMode::Drop),
                         )
@@ -4108,7 +4114,7 @@ mod tests {
                         .scatter(
                             &indices,
                             &updates,
-                            &dimensions.clone(),
+                            &dimensions,
                             ScatterReductionKind::Mul,
                             &ScatterOptions::new().with_unique_indices(true).with_mode(ScatterMode::Drop),
                         )
@@ -4172,13 +4178,7 @@ mod tests {
             .jvp(Array::new(ArrayType::new_static(DataType::Zero, [4]), Vec::new()).unwrap(), |input| {
                 let indices = index_array(&input, vec![2, 1], vec![1, 3]);
                 let updates = input.context().lift(integer_updates.clone())?;
-                input.scatter(
-                    &indices,
-                    &updates,
-                    &dimensions.clone(),
-                    ScatterReductionKind::Min,
-                    &ScatterOptions::new(),
-                )
+                input.scatter(&indices, &updates, &dimensions, ScatterReductionKind::Min, &ScatterOptions::new())
             })
             .unwrap();
         assert_eq!(output, Array::vector(vec![1_i32, 2, 3, 4]).unwrap());
@@ -6031,20 +6031,6 @@ mod tests {
         assert_eq!(
             input.dynamic_scatter_axis(&indices, &updates, 0, ScatterReductionKind::Add, ScatterMode::Clip),
             Err(TypeError::invalid("`dynamic_scatter_axis` updates shape must be `[2]` but got `[1]`").into()),
-        );
-    }
-
-    #[test]
-    fn test_check_same_mesh() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        assert_eq!(check_same_mesh(&mesh, None), Ok(()));
-        assert_eq!(check_same_mesh(&mesh, Some(&Sharding::replicated(mesh.clone(), 1))), Ok(()));
-        assert_eq!(
-            check_same_mesh(&mesh, Some(&Sharding::replicated(other_mesh, 1))),
-            Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
-            ))),
         );
     }
 }
