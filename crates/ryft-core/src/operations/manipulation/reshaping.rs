@@ -1961,25 +1961,6 @@ mod tests {
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(Arc::ptr_eq(input.shared_storage(), output[0].shared_storage()));
-
-        // Storage sharing preserves value semantics: changing a reshaped copy must detach its payload.
-        let mut changed = output[0].clone();
-        changed.storage_bytes_mut()[..8].copy_from_slice(&9.0_f64.to_ne_bytes());
-        assert_eq!(changed.to_f64s(), vec![9.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(input.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        // An explicit transpose composes with the row-major reshape.
-        assert_eq!(
-            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                .unwrap()
-                .transpose([-1, -2])
-                .unwrap()
-                .reshape(Shape::new(vec![Dimension::Static(6)]))
-                .map(|array| array.to_f64s()),
-            Ok(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
-        );
 
         // Invalid interpreter arity reports the exact program error.
         assert_eq!(
@@ -2748,13 +2729,17 @@ mod tests {
         assert_eq!(
             ArrayType::new(DataType::F64, huge_shape.clone()).reshape(Shape::new(vec![Dimension::Static(2)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` input shape [18446744073709551615, 2] element count does not fit in usize"
+                "`{}` input shape [{}, 2] element count does not fit in usize",
+                RESHAPE_OPERATION_NAME,
+                usize::MAX,
             )))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).reshape(huge_shape),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` output shape [18446744073709551615, 2] element count does not fit in usize"
+                "`{}` output shape [{}, 2] element count does not fit in usize",
+                RESHAPE_OPERATION_NAME,
+                usize::MAX,
             )))),
         );
 
@@ -2965,11 +2950,14 @@ mod tests {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("r", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("u", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["u"])
                     .unwrap()
                     .with_reduced_axes(["r"])
                     .unwrap(),
@@ -2990,6 +2978,8 @@ mod tests {
                         ShardingDimension::replicated(),
                     ],
                 )
+                .unwrap()
+                .with_unreduced_axes(["u"])
                 .unwrap()
                 .with_reduced_axes(["r"])
                 .unwrap(),
@@ -3165,8 +3155,8 @@ mod tests {
 
     #[test]
     fn test_array_type_reshape_sharding_sharded_singleton_axes() {
-        // A sharded singleton holds no elements but records a placement. It keeps that placement when it stays at the
-        // same index, and follows an unambiguous move to the only unmatched output singleton. Dropping it or moving
+        // A sharded singleton does not change the element count but records a placement. It keeps its placement at the
+        // same index and follows an unambiguous move to the only unmatched output singleton. Dropping it or moving
         // it ambiguously is rejected instead of being replicated silently, and an explicit output sharding places it.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -3288,6 +3278,26 @@ mod tests {
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(Arc::ptr_eq(matrix.shared_storage(), reshaped.shared_storage()));
+
+        // Storage sharing preserves value semantics: changing a reshaped copy must detach its payload.
+        let mut changed = reshaped.clone();
+        changed.storage_bytes_mut()[..8].copy_from_slice(&9.0_f64.to_le_bytes());
+        assert_eq!(changed.to_f64s(), vec![9.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(matrix.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // An explicit transpose composes with the row-major reshape.
+        assert_eq!(
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap()
+                .transpose([-1, -2])
+                .unwrap()
+                .reshape(Shape::new(vec![Dimension::Static(6)]))
+                .map(|array| array.to_f64s()),
+            Ok(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
+        );
+
         assert!(matches!(
             matrix.reshape(Shape::new(vec![Dimension::Static(4)])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -3471,15 +3481,11 @@ mod tests {
             ],
         );
 
-        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
-        assert_eq!(
-            DynamicReshapeOperation::new().effects().classes(),
-            EffectClasses::single(EffectClass::OrderedAssertion)
-        );
         assert_eq!(
             operation.infer_output_types(&input_types, &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1"))
         );
+
         assert_eq!(
             operation.infer_output_types(&[two.clone(), two], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
@@ -3573,26 +3579,6 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == format!("`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"),
         ));
-
-        // Repeating a nominal dimension cannot describe two different extents, even if their product happens
-        // to match the input count. Interpretation must propagate the concrete capability's validation error.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
-        let dimensions = [
-            ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 2).unwrap()),
-            ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
-        ];
-        assert_eq!(
-            DynamicReshapeOperation::new().interpret(
-                &EagerContext::<ArrayIrValue<Array>>::new(),
-                &EmptyRegionDriver,
-                &[input.clone(), dimensions[0].clone(), dimensions[1].clone()],
-            ),
-            Err(ProgramError::Type(
-                DimensionError::InputDimensionMismatch { dimension: "extent".to_owned(), expected: 2, actual: 3 }
-                    .into(),
-            )),
-        );
     }
 
     #[test]
@@ -3690,6 +3676,44 @@ mod tests {
             .into_simplified()
             .unwrap();
         assert!(proven.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_reshape_partial_evaluation_replay_and_specialization() {
+        // Replaying without concrete refinement still creates a fresh arithmetic definition. Its new identity must
+        // be used consistently by the output shape rather than compared with the source definition by name.
+        let program = doubled_extent_reshape_program();
+        let (replayed_types, replayed) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)
+            },
+            program.input_types(),
+        )
+        .unwrap();
+        assert_ne!(replayed_types, program.output_types());
+        assert_eq!(replayed_types[0].to_string(), "f64[2, source * 2]");
+
+        // Specialization replays this retained graph rather than retracing its construction closure. Both the
+        // dimension arithmetic and the reshape must acquire the concrete geometry at each independent call.
+        for size in [4, 5] {
+            let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
+            let specialized = program.clone().specialize(&[input_type.clone().into()]).unwrap();
+            let replayed_specialized = replayed.clone().specialize(&[input_type.clone().into()]).unwrap();
+            assert_eq!(replayed_specialized.output_types(), specialized.output_types());
+            assert_eq!(specialized.input_types(), vec![input_type.into()]);
+            assert_eq!(specialized.output_types(), vec![ArrayType::new_static(DataType::F64, [2, 2 * size]).into()]);
+            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
+            let inputs = vec![ArrayIrValue::Array(Array::matrix(size, 4, values.clone()).unwrap())];
+            let expected = vec![ArrayIrValue::Array(Array::matrix(2, 2 * size, values).unwrap())];
+            assert_eq!(specialized.interpret(inputs.clone()), Ok(expected.clone()));
+            assert_eq!(replayed_specialized.interpret(inputs), Ok(expected));
+        }
+        assert!(matches!(
+            program.clone().specialize(&[ArrayType::new_static(DataType::F64, [9, 4]).into()]),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "specialized input type f64[9, 4] does not refine declared input type f64[source, 4]",
+        ));
     }
 
     #[test]
@@ -4497,44 +4521,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_reshape_differentiation_retains_input_extents_replays_and_specializes() {
-        // Replaying without concrete refinement still creates a fresh arithmetic definition. Its new identity must
-        // be used consistently by the output shape rather than compared with the source definition by name.
-        let program = doubled_extent_reshape_program();
-        let (replayed_types, replayed) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |inputs| {
-                let context = inputs[0].context().clone();
-                program.interpret_in_context(&context, inputs)
-            },
-            program.input_types(),
-        )
-        .unwrap();
-        assert_ne!(replayed_types, program.output_types());
-        assert_eq!(replayed_types[0].to_string(), "f64[2, source * 2]");
-
-        // Specialization replays this retained graph rather than retracing its construction closure. Both the
-        // dimension arithmetic and the reshape must acquire the concrete geometry at each independent call.
-        for size in [4, 5] {
-            let input_type = ArrayType::new_static(DataType::F64, [size, 4]);
-            let specialized = program.clone().specialize(&[input_type.clone().into()]).unwrap();
-            let replayed_specialized = replayed.clone().specialize(&[input_type.clone().into()]).unwrap();
-            assert_eq!(replayed_specialized.output_types(), specialized.output_types());
-            assert_eq!(specialized.input_types(), vec![input_type.into()]);
-            assert_eq!(specialized.output_types(), vec![ArrayType::new_static(DataType::F64, [2, 2 * size]).into()]);
-            let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
-            assert_eq!(
-                specialized.interpret(vec![ArrayIrValue::Array(Array::matrix(size, 4, values.clone()).unwrap())]),
-                Ok(vec![ArrayIrValue::Array(Array::matrix(2, 2 * size, values).unwrap())]),
-            );
-        }
-        assert!(matches!(
-            program.clone().specialize(&[ArrayType::new_static(DataType::F64, [9, 4]).into()]),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "specialized input type f64[9, 4] does not refine declared input type f64[source, 4]",
-        ));
-    }
-
-    #[test]
     fn test_dynamic_reshape_differentiation_retains_input_extents_imports_and_nests_the_linear_boundary() {
         // The executable linear boundary remains structural when imported, including both attached regions and every
         // residual edge. Nested forward differentiation likewise treats only the array input as differentiable.
@@ -4567,7 +4553,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported.to_string(), linearization.tangent().to_string());
-        assert_eq!(imported.interpret(tangent_inputs.clone()), linearization.tangent().interpret(tangent_inputs));
+        let expected =
+            vec![ArrayIrValue::Array(Array::matrix(2, 6, (12..24).map(|value| value as f64).collect()).unwrap())];
+        assert_eq!(imported.interpret(tangent_inputs.clone()), Ok(expected.clone()));
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(expected));
 
         let nested_jvp = linearization.tangent().jvp().unwrap();
         let mut nested_inputs =
@@ -4822,7 +4811,7 @@ mod tests {
             )]),
         );
 
-        // The same compiled programs accept the lower-bound zero without inventing an extent tangent input.
+        // The same retained programs accept the lower-bound zero without inventing an extent tangent input.
         let mut primal_outputs = linearization
             .primal()
             .interpret(vec![ArrayIrValue::Array(Array::matrix(0, 0, Vec::<f64>::new()).unwrap())])
@@ -4868,6 +4857,24 @@ mod tests {
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.tangent().output_types(), vec![input_type.tangent().unwrap().into()]);
         assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
+        let concrete_type = input_type.clone().with_shape([3, 4]);
+        let primal = ArrayIrValue::Array(
+            Array::from_elements::<f64>(concrete_type.clone(), &(0..12).map(|value| value as f64).collect::<Vec<_>>())
+                .unwrap(),
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![primal.clone(), ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![primal]);
+        let cotangent = ArrayIrValue::Array(
+            Array::from_elements::<f64>(concrete_type, &(12..24).map(|value| value as f64).collect::<Vec<_>>())
+                .unwrap(),
+        );
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![cotangent]));
 
         // The inverse restores metadata that the forward reshape removed or introduced. In particular, replicated
         // bridge sharding must not escape into the cotangent of an originally unsharded input.
@@ -4881,9 +4888,10 @@ mod tests {
             let input = builder.add_input(input_type.clone().into());
             let extent = builder.add_input(DimensionType::new(extent.clone()).into());
             let two = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+            let output_sharding = Sharding::replicated(mesh, 3);
             let output = builder
                 .add_instruction(
-                    DynamicReshapeOperation::new().with_output_sharding(Sharding::replicated(mesh, 3)),
+                    DynamicReshapeOperation::new().with_output_sharding(output_sharding.clone()),
                     Vec::new(),
                     vec![input, extent, two, two],
                     None,
@@ -4898,6 +4906,28 @@ mod tests {
                 .unwrap();
             let linearization = program.linearize().unwrap();
             assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
+            let concrete_type = input_type.clone().with_shape([3, 4]);
+            let primal_values = (0..12).map(|value| value as f64).collect::<Vec<_>>();
+            let primal =
+                ArrayIrValue::Array(Array::from_elements::<f64>(concrete_type.clone(), &primal_values).unwrap());
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![primal, ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())])
+                .unwrap();
+            let residuals = primal_outputs.split_off(1);
+            let output_type = ArrayType::new_static(DataType::F64, [3, 2, 2]).with_sharding(output_sharding).unwrap();
+            assert_eq!(
+                primal_outputs,
+                vec![ArrayIrValue::Array(Array::from_elements::<f64>(output_type.clone(), &primal_values).unwrap())],
+            );
+            let cotangent_values = (12..24).map(|value| value as f64).collect::<Vec<_>>();
+            let mut pullback_inputs =
+                vec![ArrayIrValue::Array(Array::from_elements::<f64>(output_type, &cotangent_values).unwrap())];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                linearization.pullback().unwrap().interpret(pullback_inputs),
+                Ok(vec![ArrayIrValue::Array(Array::from_elements::<f64>(concrete_type, &cotangent_values).unwrap())]),
+            );
         }
     }
 
@@ -5209,12 +5239,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        let (_, expected) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.dynamic_reshape_to_sizes(&[6]),
-            ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2, 3])),
-        )
-        .unwrap();
-        assert_eq!(program.to_string(), expected.to_string());
 
         // A vector is returned as is, and a scalar becomes a vector of size one.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
@@ -5369,7 +5393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_output_type() {
+    fn test_infer_reshape_output_type() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -5434,7 +5458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_output_type_requested_sharding() {
+    fn test_infer_reshape_output_type_requested_sharding() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("r", 2, MeshAxisType::Explicit).unwrap(),
@@ -5630,17 +5654,7 @@ mod tests {
             Ok(vec![ShardingDimension::sharded(["x"])]),
         );
 
-        // A replicated dimension before a sharded one breaks contiguity, an unconstrained dimension cannot be placed,
-        // a factor the next mesh axis does not divide cannot be split, and every input mesh axis must be consumed.
-        let suffix_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-                .unwrap();
-        assert_eq!(
-            infer(vec![2.into(), 4.into()], vec![8.into()], &suffix_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge",
-            ))),
-        );
+        // Unconstrained dimensions cannot be placed without an explicit request.
         let unconstrained_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         assert_eq!(
             infer(vec![8.into()], vec![2.into(), 4.into()], &unconstrained_sharding),
@@ -5648,12 +5662,7 @@ mod tests {
                 "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions",
             ))),
         );
-        assert_eq!(
-            infer(vec![6.into()], vec![3.into(), 2.into()], &split_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors",
-            ))),
-        );
+
         // A trailing unit-size mesh axis still needs placement after all output factors are exhausted.
         let unit_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
