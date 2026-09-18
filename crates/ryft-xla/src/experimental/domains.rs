@@ -6213,12 +6213,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
-    use ryft_core::macros::index;
     use ryft_core::operations::attention::{
         AttentionConfiguration, AttentionImplementation, AttentionOperandSignature,
         DotProductAttentionBackwardOperation, DotProductAttentionOperation,
     };
     use ryft_core::operations::custom_call::CustomCallOperation;
+    use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{

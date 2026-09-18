@@ -1005,7 +1005,8 @@ where
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::{Array, BasicIndex, IndexSelector, IndexSlice, index};
+/// # use ryft_core::{Array, BasicIndex, IndexSelector, IndexSlice};
+/// use ryft_core::operations::manipulation::indexing::index;
 /// let selection: [IndexSelector<'_, Array>; 3] = index![1..9 by 2, new_axis, ...];
 /// assert_eq!(selection[0], IndexSelector::Basic(BasicIndex::Slice(
 ///     IndexSlice::new(Some(1), Some(9), 2),
@@ -1096,6 +1097,9 @@ macro_rules! index {
         $crate::index!(@items [] [] $($selectors)*)
     };
 }
+
+pub use crate::index;
+
 /// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
 /// identities; inserted axes are recorded separately so gather/scatter continue to operate on the original rank.
 struct DynamicIndexPlan<V> {
