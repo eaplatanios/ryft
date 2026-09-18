@@ -245,6 +245,7 @@ pub(crate) mod tests {
         Neg(NegOperation<ArrayType>),
         Add(AddOperation<ArrayType>),
         Mul(MulOperation<ArrayType>),
+        Div(DivOperation<ArrayType>),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),
@@ -252,7 +253,6 @@ pub(crate) mod tests {
         Reduce(ReduceOperation),
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
-        Div(DivOperation<ArrayType>),
     }
 
     /// Eager array context with only the operations required by ordinary core protocol tests.

@@ -21,19 +21,29 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
+use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::one::{One, OneOperation};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
+use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
+use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
+use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
+use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::memory::TransferToMemory;
+use crate::operations::manipulation::reshaping::DynamicReshape;
+use crate::operations::manipulation::scattering::{
+    Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
+};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation, resized_output_sharding};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::Add;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -1698,6 +1708,130 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError>;
+
+    /// Pads `self` along `axis` to the first-class target `extent` with a runtime low padding amount, filling every
+    /// other position of that axis with `padding_value`. The input occupies positions `edge_padding_low + i` of the
+    /// result axis for `i` below its runtime extent along `axis`; the high padding is whatever remains. A zero-result
+    /// runtime requirement asserts `edge_padding_low + size <= extent` first, so the result never truncates silently
+    /// and the requirement survives even when the padded value is unused. Every other axis keeps its runtime extent
+    /// and identity. Cropping and interior padding are not expressible here; use [`Self::dynamic_pad`] for static
+    /// amounts.
+    ///
+    /// The composition broadcasts `padding_value` to the output shape and overwrites the input's positions using
+    /// strictly increasing, unique indices. No arithmetic is applied to the data, preserving signed zeros and NaN
+    /// encodings and supporting element types without a representable zero. Output placement follows the same
+    /// sharding and reduction-state rules as [`Self::dynamic_pad`].
+    ///
+    /// Reverse-mode differentiation uses scatter's dual gather. Currently, every non-padded axis must have a static
+    /// extent, and a dynamic target `extent` must have a positive lower bound. For example, padding `[2, size]` along
+    /// axis `1` supports a pullback when the target is bounded below by `1`, whereas `[rows, size]` with dynamic `rows`
+    /// or a target bounded below by `0` does not. Forward evaluation supports those geometries independently of these
+    /// reverse-mode restrictions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `padding_value`: Scalar array with the input's element data type and memory space.
+    ///   - `axis`: Input axis to pad. Negative axes count backward from the input rank.
+    ///   - `edge_padding_low`: Dimension value giving the number of padding positions before the input.
+    ///   - `extent`: Dimension value giving the result extent along `axis`.
+    fn dynamic_pad_to_extent<A: Into<Axis>>(
+        &self,
+        padding_value: &Self,
+        axis: A,
+        edge_padding_low: &Self,
+        extent: &Self,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: DimensionArithmetic
+            + DimensionSize
+            + DimensionToScalar
+            + DynamicBroadcast
+            + DynamicReshape
+            + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
+            + ValueProjection<DimensionType, Projected: DimensionRequirement>,
+        Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
+    {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let padding_type = padding_value.r#type();
+        let padding_type = <&ArrayType>::try_from(padding_type.as_ref())?;
+        let no_padding = vec![0; input_type.rank()];
+        validate_pad_inputs(input_type, padding_type, &no_padding, &no_padding, &vec![0; input_type.rank()])?;
+        let extent_dimension = <&DimensionType>::try_from(extent.r#type().as_ref())?.to_dimension();
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let mut output_shape = input_type.shape().dimensions().to_vec();
+        output_shape[axis] = extent_dimension;
+
+        // Unlike static cropping, runtime padding can expose the fill at any position. Validate its distributed
+        // dependencies and preserve the input's placement when resizing the selected axis.
+        validate_padding_value_sharding(input_type, padding_type)?;
+        let sharding = resized_output_sharding(input_type, &output_shape, PAD_OPERATION_NAME)?;
+        let output_type = ArrayType::new(input_type.data_type(), Shape::new(output_shape))
+            .with_memory(input_type.memory())
+            .with_sharding(sharding)
+            .map_err(|error| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output type is invalid: {error}")))?;
+
+        let input_dimensions = (0..input_type.rank())
+            .map(|input_axis| self.dimension_size(input_axis))
+            .collect::<Result<Vec<_>, _>>()?;
+        let size = input_dimensions[axis].clone();
+        let end = edge_padding_low.dimension_add(&size)?;
+        <Self as ValueProjection<DimensionType>>::into_projected(end)?
+            .require_less_than_or_equal(&<Self as ValueProjection<DimensionType>>::into_projected(extent.clone())?)?;
+
+        // For the output geometry, the padded axis takes the target extent and every other axis
+        // keeps its runtime extent.
+        let mut output_dimensions = input_dimensions.clone();
+        output_dimensions[axis] = extent.clone();
+
+        // The queries are `edge_padding_low + i` for every input position `i` along the padded axis. Their type reuses
+        // the input axis's dimension (i.e., `size`) rather than a fresh one with the same bounds, because the scatter
+        // type rule matches its update axis against the indices by dimension identity. The low amount is a `dimension`
+        // value, so it becomes an `i64[]` array first, moves into the input's memory space (`add` requires one memory
+        // space), and is then spread to `i64[size]` with the mixed `dynamic_broadcast`; the homogeneous `broadcast`
+        // cannot create a dynamic axis.
+        let query_type = ArrayType::new(DataType::I64, Shape::new(vec![input_type.dimension(axis)]))
+            .with_memory(input_type.memory());
+        let context = self.dispatch_domain();
+        let queries = context.dynamic_iota(
+            &query_type,
+            0,
+            if matches!(input_type.dimension(axis), Dimension::Dynamic(_)) { std::slice::from_ref(&size) } else { &[] },
+        )?;
+        let offset = <Self as ValueProjection<ArrayType>>::into_projected(edge_padding_low.to_scalar()?)?
+            .transfer_to_memory(input_type.memory())?;
+        let offset = <Self as ValueProjection<ArrayType>>::from_projected(offset).dynamic_broadcast(&[size], &[])?;
+        let queries = <Self as ValueProjection<ArrayType>>::into_projected(queries)?
+            .add(&<Self as ValueProjection<ArrayType>>::into_projected(offset)?)?;
+        let indices = <Self as ValueProjection<ArrayType>>::into_projected(
+            <Self as ValueProjection<ArrayType>>::from_projected(queries).dynamic_expand_dimensions(-1)?,
+        )?;
+
+        let dimensions = ScatterDimensionNumbers::new(
+            (0..input_type.rank()).filter(|input_axis| *input_axis != axis).collect(),
+            vec![axis],
+            vec![axis],
+        );
+        let options = ScatterOptions::new()
+            .with_mode(ScatterMode::PromiseInBounds)
+            .with_indices_are_sorted(true)
+            .with_unique_indices(true);
+        let fill = <Self as ValueProjection<ArrayType>>::into_projected(
+            padding_value.dynamic_broadcast_with_output_sharding(
+                &output_dimensions,
+                &[],
+                output_type.sharding().cloned(),
+            )?,
+        )?;
+        let padded = fill.scatter(
+            &indices,
+            &<Self as ValueProjection<ArrayType>>::into_projected(self.clone())?,
+            &dimensions,
+            ScatterReductionKind::Overwrite,
+            &options.with_output_sharding(output_type.sharding().cloned()),
+        )?;
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(padded))
+    }
 }
 
 impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad for ArrayIrValue<A> {
@@ -1942,46 +2076,53 @@ fn infer_pad_output_type(
     let sharding = resized_output_sharding(input, &output_dimensions, PAD_OPERATION_NAME)?;
 
     if padding_positions_may_exist {
-        if input.unreduced_axes() != padding_value.unreduced_axes()
-            || input.reduced_axes() != padding_value.reduced_axes()
-        {
-            return Err(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` input and padding value must have matching reduced and unreduced mesh axes \
-                 but got input type `{input}` and padding value type `{padding_value}`",
-            ))
-            .into());
-        }
-
-        let input_varying_manual_axes = input.sharding().map(|sharding| sharding.varying_manual_axes());
-        let padding_varying_manual_axes = padding_value.sharding().map(|sharding| sharding.varying_manual_axes());
-        if input_varying_manual_axes.cloned().unwrap_or_default()
-            != padding_varying_manual_axes.cloned().unwrap_or_default()
-        {
-            return Err(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` input and padding value must have matching varying manual axes but got input \
-                 type `{input}` and padding value type `{padding_value}`",
-            ))
-            .into());
-        }
-
-        let has_distributed_dependencies = !input.unreduced_axes().is_empty()
-            || !input.reduced_axes().is_empty()
-            || input_varying_manual_axes.is_some_and(|axes| !axes.is_empty());
-        if has_distributed_dependencies
-            && input.sharding().map(|sharding| sharding.mesh())
-                != padding_value.sharding().map(|sharding| sharding.mesh())
-        {
-            return Err(TypeError::invalid(format!(
-                "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh",
-            ))
-            .into());
-        }
+        validate_padding_value_sharding(input, padding_value)?;
     }
 
     ArrayType::new(input.data_type(), Shape::new(output_dimensions))
         .with_memory(input.memory())
         .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output type is invalid: {error}")).into())
+}
+
+/// Checks that the input and scalar fill carry compatible distributed dependencies whenever padding positions may
+/// exist. Reduced and unreduced axes and manual-axis variation must agree, including the owning mesh; ordinary
+/// array-axis placement is inferred separately from the input and requested output dimensions.
+fn validate_padding_value_sharding(input: &ArrayType, padding_value: &ArrayType) -> Result<(), ProgramError> {
+    if input.unreduced_axes() != padding_value.unreduced_axes() || input.reduced_axes() != padding_value.reduced_axes()
+    {
+        return Err(TypeError::invalid(format!(
+            "`{PAD_OPERATION_NAME}` input and padding value must have matching reduced and unreduced mesh axes \
+             but got input type `{input}` and padding value type `{padding_value}`",
+        ))
+        .into());
+    }
+
+    let input_varying_manual_axes = input.sharding().map(|sharding| sharding.varying_manual_axes());
+    let padding_varying_manual_axes = padding_value.sharding().map(|sharding| sharding.varying_manual_axes());
+    if input_varying_manual_axes.cloned().unwrap_or_default()
+        != padding_varying_manual_axes.cloned().unwrap_or_default()
+    {
+        return Err(TypeError::invalid(format!(
+            "`{PAD_OPERATION_NAME}` input and padding value must have matching varying manual axes but got input \
+             type `{input}` and padding value type `{padding_value}`",
+        ))
+        .into());
+    }
+
+    let has_distributed_dependencies = !input.unreduced_axes().is_empty()
+        || !input.reduced_axes().is_empty()
+        || input_varying_manual_axes.is_some_and(|axes| !axes.is_empty());
+    if has_distributed_dependencies
+        && input.sharding().map(|sharding| sharding.mesh()) != padding_value.sharding().map(|sharding| sharding.mesh())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh",
+        ))
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Returns whether the provided padding geometry leaves every possible element and its position unchanged
@@ -2060,6 +2201,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::constants::iota::IotaOperation;
+    use crate::operations::manipulation::scattering::SCATTER_OPERATION_NAME;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramError, Typed};
@@ -2097,6 +2239,28 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap()
+    }
+
+    /// Stages and interprets runtime-offset padding to check encodings and placement through the public capability.
+    fn interpret_pad_to_extent(
+        input: &ArrayIrValue<Array>,
+        fill: &ArrayIrValue<Array>,
+        axis: i32,
+        low: &ArrayIrValue<Array>,
+        extent: &ArrayIrValue<Array>,
+    ) -> Result<ArrayIrValue<Array>, ProgramError> {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input_value = context.input(input.r#type().into_owned());
+        let fill_value = context.input(fill.r#type().into_owned());
+        let low_value = context.input(low.r#type().into_owned());
+        let extent_value = context.input(extent.r#type().into_owned());
+        let output = input_value.dynamic_pad_to_extent(&fill_value, axis, &low_value, &extent_value)?;
+        let program = context.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.atom_id().unwrap()],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        Ok(program.interpret(vec![input.clone(), fill.clone(), low.clone(), extent.clone()])?.remove(0))
     }
 
     #[test]
@@ -5612,6 +5776,312 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_pad_dynamic_pad_to_extent() {
+        // Runtime padding amounts have no primitive, so padding to a first-class extent at a runtime offset composes
+        // a requirement that the input fits, an offset iota of queries, and a unique-index overwrite scatter into
+        // the broadcast padding value.
+        let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let low = DimensionVariable::new("low", DimensionBounds::new(0, Some(4)).unwrap());
+        let target = DimensionVariable::new("target", DimensionBounds::new(1, Some(8)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context
+            .input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), size.clone().into()])).into());
+        let padding_value = context.input(ArrayType::scalar(DataType::F32).into());
+        let low_value = context.input(DimensionType::new(low).into());
+        let extent = context.input(DimensionType::new(target.clone()).into());
+        let output = input.dynamic_pad_to_extent(&padding_value, 1, &low_value, &extent).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), target.into()]))),
+        );
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, size], %1:f32[], %2:dimension<low ∈ [0, 4)>, %3:dimension<target ∈ [1, 8)> .
+                let %4:dimension<2> = constant [value=2]
+                    %5:dimension<size ∈ [1, 5)> = dimension_size [axis=1] %0
+                    %6:dimension<low + size ∈ [1, 8)> = dimension_add %2 %5
+                    dimension_require_less_than_or_equal %6 %3
+                    %7:i64[size] = iota [type=i64[size], dimension=0] %5
+                    %8:i64[] = dimension_to_scalar %2
+                    %9:i64[] = transfer_to_memory [destination=Device] %8
+                    %10:i64[size] = broadcast [output_axes=[]] %9 %5
+                    %11:i64[size] = add %7 %10
+                    %12:dimension<size ∈ [1, 5)> = dimension_size [axis=0] %11
+                    %13:dimension<1> = constant [value=1]
+                    %14:i64[size, 1] = reshape [requires_runtime_assertion=false] %11 %12 %13
+                    %15:f32[2, target] = broadcast [output_axes=[]] %1 %4 %3
+                    %16:f32[2, target] = scatter [
+                        kind=overwrite,
+                        dimensions=(update_window=[0], inserted_window=[1], scatter_to_operand=[1], \
+                        operand_batching=[], scatter_indices_batching=[]),
+                        indices_are_sorted=true,
+                        unique_indices=true,
+                    ] %15 %14 %0
+                in (%16)
+            "}
+            .trim_end(),
+        );
+
+        // One staged program pads to a larger extent, passes an exact fit through unchanged, and rejects a
+        // configuration that would truncate the input.
+        let inputs = |low: usize, target: usize| {
+            vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-7.0_f32).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(low).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(target).unwrap()),
+            ]
+        };
+        assert_eq!(
+            program.interpret(inputs(1, 5)),
+            Ok(vec![ArrayIrValue::Array(
+                Array::matrix(2, 5, vec![-7.0_f32, 1.0, 2.0, 3.0, -7.0, -7.0, 4.0, 5.0, 6.0, -7.0]).unwrap(),
+            )]),
+        );
+        assert_eq!(
+            program.interpret(inputs(0, 3)),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())]),
+        );
+        assert_eq!(
+            program.interpret(inputs(1, 3)).unwrap_err().to_string(),
+            "1 + size(axis=1) <= 3; observed 1 + size(axis=1)=4, 3=3",
+        );
+
+        // The pullback gathers the input cotangent back out of the written positions and sums the padding positions
+        // into the padding value's cotangent; the indices and broadcast geometry are ordinary residuals.
+        let linearization = program.linearize_with_respect_to(&[0, 1]).unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2, target], %1:dimension<2>, %2:dimension<target ∈ [1, 8)>, %3:i64[size, 1] .
+                let %4:f32[2, size] = gather [
+                    dimensions=(offset=[0], collapsed_slice=[1], start_index_map=[1], batching=[]),
+                    slice_sizes=[2, 1],
+                    indices_are_sorted=true,
+                    unique_indices=true,
+                ] %0 %3
+                    %5:f32[2, size] = zero_like %4
+                    %6:f32[2, target] = scatter [
+                        kind=overwrite,
+                        dimensions=(update_window=[0], inserted_window=[1], scatter_to_operand=[1], \
+                        operand_batching=[], scatter_indices_batching=[]),
+                        indices_are_sorted=true,
+                        unique_indices=true,
+                    ] %0 %3 %5
+                    %7:f32[] = reduce_sum [axes=[0, 1]] %6
+                in (%4, %7)
+            "}
+            .trim_end(),
+        );
+        let mut primal_outputs = linearization.primal().interpret(inputs(1, 5)).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut cotangents = vec![ArrayIrValue::Array(Array::matrix(2, 5, vec![1.0_f32; 10]).unwrap())];
+        cotangents.extend(residuals);
+        assert_eq!(
+            pullback.interpret(cotangents),
+            Ok(vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_pad_dynamic_pad_to_extent_encodings() {
+        // Padding copies both retained and fill encodings, including signed zeros and NaN payloads.
+        let input = ArrayIrValue::Array(Array::vector(vec![-0.0_f32, f32::from_bits(0x7fc00001)]).unwrap());
+        let fill = ArrayIrValue::Array(Array::scalar(f32::from_bits(0x7fc00002)).unwrap());
+        let zero = ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap());
+        let one = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
+        let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let four = ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap());
+        let output = interpret_pad_to_extent(&input, &fill, -1, &one, &four).unwrap();
+        let expected = Array::vector(vec![
+            f32::from_bits(0x7fc00002),
+            -0.0,
+            f32::from_bits(0x7fc00001),
+            f32::from_bits(0x7fc00002),
+        ])
+        .unwrap();
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&output).unwrap().storage_bytes(),
+            expected.storage_bytes()
+        );
+        let output = interpret_pad_to_extent(&input, &fill, 0, &zero, &two).unwrap();
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&output).unwrap().storage_bytes(),
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&input).unwrap().storage_bytes()
+        );
+
+        // F8E8M0FNU has no numeric zero, but padding requires only copying its bytes.
+        let input =
+            ArrayIrValue::Array(Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![127, 128]).unwrap());
+        let fill = ArrayIrValue::Array(Array::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![255]).unwrap());
+        let output = interpret_pad_to_extent(&input, &fill, 0, &one, &four).unwrap();
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&output).unwrap().storage_bytes(),
+            &[255, 127, 128, 255]
+        );
+
+        // Empty targets and empty inputs remain valid forward geometries.
+        let input = ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
+        let fill = ArrayIrValue::Array(Array::scalar(-0.0_f32).unwrap());
+        assert_eq!(interpret_pad_to_extent(&input, &fill, 0, &zero, &zero), Ok(input.clone()));
+        let output = interpret_pad_to_extent(&input, &fill, 0, &zero, &two).unwrap();
+        assert_eq!(
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&output).unwrap().storage_bytes(),
+            Array::vector(vec![-0.0_f32; 2]).unwrap().storage_bytes()
+        );
+    }
+
+    #[test]
+    fn test_dynamic_pad_dynamic_pad_to_extent_sharding() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_unreduced_axes(["m"])
+            .unwrap();
+        let fill_sharding = Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["m"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
+        let fill_type = ArrayType::scalar(DataType::F32).with_sharding(fill_sharding).unwrap();
+        let input = ArrayIrValue::Array(Array::from_elements(input_type.clone(), &[1.0_f32, 2.0]).unwrap());
+        let fill = ArrayIrValue::Array(Array::from_elements(fill_type, &[9.0_f32]).unwrap());
+        let low = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap());
+        assert_eq!(
+            interpret_pad_to_extent(&input, &fill, 0, &low, &extent),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(
+                    ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap(),
+                    &[9.0_f32, 1.0, 2.0, 9.0]
+                )
+                .unwrap(),
+            ))
+        );
+
+        // Reduced dependencies are preserved too, while mismatched fill dependencies are rejected by padding.
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["m"]).unwrap();
+        let fill_sharding = Sharding::replicated(mesh, 0).with_reduced_axes(["m"]).unwrap();
+        let input = ArrayIrValue::Array(
+            Array::from_elements(
+                ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap(),
+                &[1.0_f32, 2.0],
+            )
+            .unwrap(),
+        );
+        let fill = ArrayIrValue::Array(
+            Array::from_elements(ArrayType::scalar(DataType::F32).with_sharding(fill_sharding).unwrap(), &[9.0_f32])
+                .unwrap(),
+        );
+        let output = interpret_pad_to_extent(&input, &fill, 0, &low, &extent).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap())
+        );
+        let plain_fill = ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap());
+        assert!(matches!(interpret_pad_to_extent(&input, &plain_fill, 0, &low, &extent),
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == format!(
+                "`{PAD_OPERATION_NAME}` input and padding value must have matching reduced and unreduced mesh axes \
+                 but got input type `{}` and padding value type `{}`",
+                input.r#type(),
+                plain_fill.r#type(),
+            )
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_pad_dynamic_pad_to_extent_differentiation_boundaries() {
+        // A dynamic non-padded window works in forward evaluation, but the gather pullback needs a static window.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input =
+            context.input(ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), Dimension::Static(2)])).into());
+        let fill = context.input(ArrayType::scalar(DataType::F32).into());
+        let low = context.input(DimensionValue::constant(1).unwrap().r#type().into_owned().into());
+        let extent = context.input(DimensionValue::constant(4).unwrap().r#type().into_owned().into());
+        let output = input.dynamic_pad_to_extent(&fill, 1, &low, &extent).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::matrix(1, 2, vec![1.0_f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(1, 4, vec![9.0_f32, 1.0, 2.0, 9.0]).unwrap())])
+        );
+        assert!(matches!(
+            program.linearize_with_respect_to(&[0, 1]).unwrap().pullback(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "`{SCATTER_OPERATION_NAME}` differentiation requires a static update window on axis 0 but its \
+                     extent is `rows`",
+                ),
+        ));
+
+        // A possibly empty target is valid for forward execution even when its bounds prevent a size-one dual window.
+        let target = DimensionVariable::new("target", DimensionBounds::new(0, Some(5)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let fill = context.input(ArrayType::scalar(DataType::F32).into());
+        let low = context.input(DimensionValue::constant(1).unwrap().r#type().into_owned().into());
+        let extent = context.input(DimensionType::new(target).into());
+        let output = input.dynamic_pad_to_extent(&fill, 0, &low, &extent).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f32, 1.0, 2.0, 9.0]).unwrap())])
+        );
+        assert!(matches!(
+            program.linearize_with_respect_to(&[0, 1]).unwrap().pullback(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "`{SCATTER_OPERATION_NAME}` differentiation requires inserted window axis 0 to have a nonzero \
+                     minimum extent, because its dual gather collapses that axis through a one-element window",
+                ),
+        ));
+    }
+
+    #[test]
     fn test_array_ir_value_dynamic_pad() {
         let input =
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 2]).unwrap());
@@ -5869,5 +6339,25 @@ mod tests {
                 "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh",
             )))),
         );
+    }
+
+    #[test]
+    fn test_validate_padding_value_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let fill = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        assert_eq!(validate_padding_value_sharding(&input, &fill), Ok(()));
+        let plain_fill = ArrayType::scalar(DataType::F32);
+        assert!(matches!(validate_padding_value_sharding(&input, &plain_fill),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "`{PAD_OPERATION_NAME}` input and padding value must have matching varying manual axes but got \
+                     input type `{input}` and padding value type `{plain_fill}`",
+                ),
+        ));
     }
 }

@@ -907,6 +907,7 @@ where
         > + Zero<C::Value>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+    ScatterOperation: MemberDifferentiableOperation<C>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,

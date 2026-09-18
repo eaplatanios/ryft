@@ -26,7 +26,7 @@ use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::{Iota, IotaOperation};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::manipulation::broadcasting::Broadcast;
@@ -1196,6 +1196,7 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
             + From<ZeroOperation<ArrayType>>
+            + From<ZeroLikeOperation<ArrayType>>
             + From<GatherOperation>
             + From<ScatterOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
@@ -1268,10 +1269,65 @@ impl_differentiable_operation! {
                 return Ok(());
             }
 
+            // The overwrite base cotangent needs zeros shaped like the updates. Static shapes can synthesize
+            // those directly. Dynamic shapes reuse the dual gather's runtime geometry. For example, overwriting
+            // `base[target]` with `updates[size]` gathers a `size`-element cotangent, whose zero_like retains `size`.
+            // Reuse that gather for the update cotangent when both contributions are requested.
+            let dynamic_update_zeros = accumulators[0].is_needed()
+                && operation.kind() == ScatterReductionKind::Overwrite
+                && inputs[2].r#type().static_shape().is_none();
+            let update_cotangent = if accumulators[2].is_needed() || dynamic_update_zeros {
+                // The indices are the known input: an integer type has no tangent space, so a valid pullback never
+                // routes them as the linear input.
+                let indices = inputs[1]
+                    .as_known()
+                    .ok_or_else(|| {
+                        TypeError::invalid(format!("`{SCATTER_OPERATION_NAME}` transpose requires known indices"))
+                    })?
+                    .clone();
+                let updates_type = inputs[2].r#type();
+                let mut gather_operation = operation.adjoint_gather_operation(
+                    inputs[0].r#type().as_ref(),
+                    updates_type.as_ref(),
+                    updates_type.cotangent()?.sharding().cloned(),
+                )?;
+
+                // Dropped updates have zero derivative, independent of gather's default replacement value.
+                if operation.mode() == ScatterMode::Drop {
+                    gather_operation = gather_operation.with_mode(GatherMode::Fill {
+                        value: Some(Box::new(
+                            EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?,
+                        )),
+                    });
+                }
+
+                let update_cotangents =
+                    context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
+                check_count!("output", update_cotangents, 1, ProgramError);
+                let update_cotangent = update_cotangents
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
+                Some(update_cotangent)
+            } else {
+                None
+            };
+
             if accumulators[0].is_needed() {
                 let contribution = if operation.kind() == ScatterReductionKind::Overwrite {
                     // Unique replacement windows erase the input tangent exactly where updates are written.
-                    let update_zeros = MaybeZero::Zero(inputs[2].r#type().cotangent()?).materialize(&**context)?;
+                    let update_zeros = if dynamic_update_zeros {
+                        let mut zeros = context.stage_operation(
+                            ZeroLikeOperation::<ArrayType>::new(),
+                            Vec::new(),
+                            std::slice::from_ref(update_cotangent.as_ref().unwrap()),
+                        )?;
+                        check_count!("output", zeros, 1, ProgramError);
+                        zeros.remove(0)
+                    } else {
+                        MaybeZero::Zero(inputs[2].r#type().cotangent()?).materialize(&**context)?
+                    };
                     let indices = inputs[1]
                         .as_known()
                         .ok_or_else(|| {
@@ -1292,43 +1348,10 @@ impl_differentiable_operation! {
                 accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
             }
 
-            // Only the update input needs a gather; the base input's cotangent is the seed itself.
-            if !accumulators[2].is_needed() {
+            let Some(update_cotangent) = update_cotangent.filter(|_| accumulators[2].is_needed()) else {
                 return Ok(());
-            }
+            };
 
-            // The indices are the known input: an integer type has no tangent space, so a valid pullback never
-            // routes them as the linear input.
-            let indices = inputs[1]
-                .as_known()
-                .ok_or_else(|| {
-                    TypeError::invalid(format!("`{SCATTER_OPERATION_NAME}` transpose requires known indices"))
-                })?
-                .clone();
-            let updates_type = inputs[2].r#type();
-            let mut gather_operation = operation.adjoint_gather_operation(
-                inputs[0].r#type().as_ref(),
-                updates_type.as_ref(),
-                updates_type.cotangent()?.sharding().cloned(),
-            )?;
-
-            // Dropped updates have zero derivative, independent of gather's default replacement value.
-            if operation.mode() == ScatterMode::Drop {
-                gather_operation = gather_operation.with_mode(GatherMode::Fill {
-                    value: Some(Box::new(
-                        EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?,
-                    )),
-                });
-            }
-
-            let update_cotangents =
-                context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
-            check_count!("output", update_cotangents, 1, ProgramError);
-            let update_cotangent = update_cotangents
-                .into_iter()
-                .next()
-                .unwrap()
-                .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
             accumulators[2].accumulate(context, MaybeZero::Value(update_cotangent))
         }
     },
@@ -4892,21 +4915,21 @@ mod tests {
             indoc! {"
                 lambda %0:f64[4] .
                 let %1:i32[2, 1] = const [[1], [3]]
-                    %2:f64[2] = zero [type=f64[2]]
-                    %3:f64[4] = scatter [
-                        kind=overwrite,
-                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
-                        indices_are_sorted=true,
-                        unique_indices=true,
-                    ] %0 %1 %2
-                    %4:f64[2] = gather [
+                    %2:f64[2] = gather [
                         dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
                         slice_sizes=[1],
                         indices_are_sorted=true,
                         unique_indices=true,
                     ] %0 %1
-                in (%3, %4)
+                    %3:f64[2] = zero [type=f64[2]]
+                    %4:f64[4] = scatter [
+                        kind=overwrite,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                        indices_are_sorted=true,
+                        unique_indices=true,
+                    ] %0 %1 %3
+                in (%4, %2)
             "}
             .trim_end(),
         );
@@ -6149,6 +6172,72 @@ mod tests {
                     Array::from_elements::<f64>(update_type, &[2.0, 4.0]).unwrap(),
                 ],
             }],
+        );
+    }
+
+    #[test]
+    fn test_scatter_transposition_dynamic_update_zeros() {
+        // A dynamic query count supplies the shape of both the gathered cotangent and the zeros that erase the
+        // overwritten base positions. Dropped queries still produce zeros in the update cotangent.
+        let size = DimensionVariable::new("queries", DimensionBounds::new(0, Some(5)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F64, [4]).into());
+        let indices =
+            context.input(ArrayType::new(DataType::I32, Shape::new(vec![size.clone().into(), 1.into()])).into());
+        let updates = context.input(ArrayType::new(DataType::F64, Shape::new(vec![size.into()])).into());
+        let output = context
+            .bind(
+                ArrayOperation::Scatter(
+                    ScatterOperation::new(
+                        ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Overwrite,
+                    )
+                    .with_unique_indices(true)
+                    .with_mode(ScatterMode::Drop),
+                ),
+                Vec::new(),
+                &[input, indices, updates],
+            )
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let inputs = vec![
+            ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]).unwrap()),
+            ArrayIrValue::Array(Array::matrix(3, 1, vec![-1_i32, 1, 4]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![50.0_f64, 60.0, 70.0]).unwrap()),
+        ];
+        let seed = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
+        let mut residuals = linearization.primal().interpret(inputs.clone()).unwrap();
+        let residuals = residuals.split_off(1);
+        let mut cotangents = vec![seed.clone()];
+        cotangents.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(cotangents),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 2.0, 0.0]).unwrap()),
+            ])
+        );
+
+        // Even when updates are retained constants, the base-only pullback still needs their runtime geometry.
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let mut residuals = linearization.primal().interpret(inputs).unwrap();
+        let residuals = residuals.split_off(1);
+        let mut cotangents = vec![seed];
+        cotangents.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(cotangents),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 3.0, 4.0]).unwrap()),])
         );
     }
 
