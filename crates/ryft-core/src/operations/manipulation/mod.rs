@@ -4,9 +4,11 @@ pub mod broadcasting;
 pub mod concatenation;
 pub mod conversions;
 pub mod gathering;
+pub mod indexing;
 pub mod memory;
 pub mod padding;
 pub mod reshaping;
+pub mod reversing;
 pub mod scattering;
 pub mod slicing;
 pub mod transposition;
@@ -21,9 +23,11 @@ pub use conversions::{
 pub use gathering::{
     DynamicGather, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,
 };
+pub use indexing::{BasicIndex, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing};
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use padding::{DynamicPad, PAD_OPERATION_NAME, Pad, PadOperation};
 pub use reshaping::{DynamicReshape, DynamicReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation};
+pub use reversing::{REVERSE_OPERATION_NAME, Reverse, ReverseOperation};
 pub use scattering::{
     DynamicScatter, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
     ScatterOptions, ScatterReductionKind,

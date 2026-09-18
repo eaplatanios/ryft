@@ -1080,6 +1080,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::AllToAll(_)
                 | ArrayOperation::RaggedAllToAll(_)
                 | ArrayOperation::AxisIndex(_)
+                | ArrayOperation::Reverse(_)
                 | ArrayOperation::Transpose(_)
                 | ArrayOperation::Reshape(_)
                 | ArrayOperation::Broadcast(_)

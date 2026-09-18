@@ -5074,6 +5074,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::ParallelPermute(_)
         | ArrayOperation::AllToAll(_)
         | ArrayOperation::AxisIndex(_)
+        | ArrayOperation::Reverse(_)
         | ArrayOperation::Transpose(_)
         | ArrayOperation::Reshape(_)
         | ArrayOperation::Broadcast(_)
@@ -6212,6 +6213,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
+    use ryft_core::macros::index;
     use ryft_core::operations::attention::{
         AttentionConfiguration, AttentionImplementation, AttentionOperandSignature,
         DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -6232,14 +6234,14 @@ mod tests {
         DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicShapeSlice,
         DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
         DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, IotaOperation, Linearization, LogSumExpOperation, MulOperation, NegOperation, OneOperation,
-        PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, LogSumExpOperation, MulOperation,
+        NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
         ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
         Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        SelectOperation, Sharding, ShardingDimension, SliceOperation, StaticShape, SubOperation, TracingContext,
-        WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation, StaticShape, SubOperation,
+        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6249,6 +6251,136 @@ mod tests {
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
 
     use super::*;
+
+    /// Checks compiled basic and broadcast advanced reads and repeated indexed updates on the provided backend.
+    fn assert_compiled_indexing(client: &Client<'_>) {
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_types = vec![
+            ArrayType::new_static(DataType::F64, [3, 4]),
+            ArrayType::new_static(DataType::I64, [2, 1]),
+            ArrayType::new_static(DataType::I64, [3]),
+            ArrayType::new_static(DataType::F64, [2, 3]),
+        ];
+        let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| {
+                let selection = index![&inputs[1], &inputs[2]];
+                vec![
+                    inputs[0].at(&index![.. by -1, 1..4 by 2]).get(&GatherOptions::new()).unwrap(),
+                    inputs[0].at(&selection).get(&GatherOptions::new()).unwrap(),
+                    inputs[0].at(&selection).add(&inputs[3], &ScatterOptions::new()).unwrap(),
+                    inputs[0].at(&index![.. by i128::MIN, ...]).get(&GatherOptions::new()).unwrap(),
+                ]
+            },
+            input_types.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let bytes = [
+            values_to_bytes(&[0_f64, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.]),
+            values_to_bytes(&[2_i64, 0]),
+            values_to_bytes(&[1_i64, 1, 3]),
+            values_to_bytes(&[1_f64; 6]),
+        ];
+        let inputs = input_types
+            .into_iter()
+            .zip(bytes)
+            .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+            .collect::<Vec<_>>();
+        let outputs = domain.interpret(&compiled.executable_function(), inputs).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[3, 2]);
+        assert_eq!(read_f64s(&client, &outputs[0]), vec![9., 11., 5., 7., 1., 3.]);
+        assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
+        assert_eq!(read_f64s(&client, &outputs[1]), vec![9., 9., 11., 1., 1., 3.]);
+        // A huge negative stride selects only the last row and must not wrap when lowered to signed attributes.
+        assert_eq!(outputs[3].shape().as_slice(), &[1, 4]);
+        assert_eq!(read_f64s(&client, &outputs[3]), vec![8., 9., 10., 11.]);
+        // Duplicate advanced coordinates contribute twice; the original input remains a value, not a mutable view.
+        assert_eq!(read_f64s(&client, &outputs[2]), vec![0., 3., 2., 4., 4., 5., 6., 7., 8., 11., 10., 12.]);
+    }
+
+    /// Replays one symbolic indexing graph at distinct concrete extents on the provided backend.
+    fn assert_compiled_indexing_symbolic_extent(client: &Client<'_>) {
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| {
+                // Runtime dimension operations live in the mixed IR family. Explicitly retain that family while
+                // indexing symbolic extents, and project the array results back to the public JIT signature.
+                let inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
+                let selection = index![&inputs[1]];
+                vec![
+                    inputs[0].at(&selection).get(&GatherOptions::new()).unwrap().into_projected().unwrap(),
+                    inputs[0].at(&selection).add(&inputs[2], &ScatterOptions::new()).unwrap().into_projected().unwrap(),
+                ]
+            },
+            vec![
+                ArrayType::new(DataType::F64, Shape::new(vec![extent])),
+                ArrayType::new_static(DataType::I64, [3]),
+                ArrayType::new_static(DataType::F64, [3]),
+            ],
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let program = staged.source_program().program().clone();
+        let linearization = program.linearize_with_respect_to(&[2]).unwrap();
+        let pullback = linearization.pullback().unwrap();
+        // Reuse one symbolic source graph at distinct concrete extents, including negative index normalization.
+        let execute = |values: &[f64]| {
+            let input_types = vec![
+                ArrayType::new_static(DataType::F64, [values.len()]),
+                ArrayType::new_static(DataType::I64, [3]),
+                ArrayType::new_static(DataType::F64, [3]),
+                ArrayType::new_static(DataType::F64, [3]),
+                ArrayType::new_static(DataType::F64, [values.len()]),
+            ];
+            let compiled = crate::jit::compile::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let mut inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
+                    let mut cotangents = inputs.split_off(3);
+                    let context = inputs[0].context().clone();
+                    let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+                    cotangents.extend(outputs.split_off(2));
+                    outputs.extend(pullback.interpret_in_context(&context, cotangents).unwrap());
+                    outputs
+                        .into_iter()
+                        .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
+                        .collect()
+                },
+                input_types.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+            let bytes = [
+                values_to_bytes(values),
+                values_to_bytes(&[1_i64, 1, -1]),
+                values_to_bytes(&[10_f64, 20., 30.]),
+                values_to_bytes(&[0_f64; 3]),
+                values_to_bytes(values),
+            ];
+            let inputs = input_types
+                .into_iter()
+                .zip(bytes)
+                .map(|(r#type, bytes)| Array::from_host_buffer(&client, r#type, mesh.clone(), bytes).unwrap())
+                .collect::<Vec<_>>();
+            domain
+                .interpret(&compiled.executable_function(), inputs)
+                .unwrap()
+                .iter()
+                .map(|output| read_f64s(&client, output))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(execute(&[1., 2., 3., 4.]), vec![vec![2., 2., 4.], vec![1., 32., 3., 34.], vec![2., 2., 4.]]);
+        assert_eq!(
+            execute(&[1., 2., 3., 4., 5.]),
+            vec![vec![2., 2., 5.], vec![1., 32., 3., 4., 35.], vec![2., 2., 5.]]
+        );
+    }
 
     fn attention_operation(
         scale: f64,
@@ -7990,6 +8122,31 @@ mod tests {
                 assert_eq!(read_f64s(&client, &outputs[1]), gradient, "{name} pullback, n={size}");
             }
         }
+    }
+
+    #[test]
+    fn test_compiled_indexing() {
+        assert_compiled_indexing(&execution_client());
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_compiled_indexing_on_cuda() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_compiled_indexing(&client);
+        assert_compiled_indexing_symbolic_extent(&client);
+    }
+
+    #[test]
+    fn test_compiled_indexing_symbolic_extent() {
+        assert_compiled_indexing_symbolic_extent(&execution_client());
     }
 
     #[test]

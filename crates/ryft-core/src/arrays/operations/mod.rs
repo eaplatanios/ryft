@@ -58,12 +58,12 @@ use crate::operations::{
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
-    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation,
-    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient,
-    StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt,
+    RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
+    ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation,
+    StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
+    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -173,6 +173,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     RaggedAllToAll(RaggedAllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
+    Reverse(ReverseOperation),
     Reshape(ReshapeOperation),
     Broadcast(BroadcastOperation),
     Pad(PadOperation<ArrayType>),
@@ -271,7 +272,7 @@ pub trait ArrayOperations:
     // Comparison and selection.
     + Compare + Select
     // Shape and layout manipulation.
-    + Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
+    + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
     + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
     + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
@@ -291,7 +292,7 @@ where
     V: Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
-    V: Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
+    V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
     V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
