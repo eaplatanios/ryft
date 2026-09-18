@@ -1466,12 +1466,53 @@ fn infer_reshape_output_type(
                 if input_dimensions.iter().any(|(_, size)| *size == Dimension::Static(0))
                     || output_dimensions.iter().any(|(_, size)| *size == Dimension::Static(0))
                 {
-                    propagate_zero_reshape_sharding(
-                        &input_dimensions,
-                        &output_dimensions,
-                        sharding,
-                        &mut output_sharding_dimensions,
-                    )?;
+                    // Keep equal prefix and suffix axes in place. The unmatched middle must be replicated and static
+                    // as its zero product cannot determine how to distribute sharding or align symbolic axes.
+                    let mut prefix = 0usize;
+                    while input_dimensions.get(prefix).map(|(_, size)| size)
+                        == output_dimensions.get(prefix).map(|(_, size)| size)
+                    {
+                        let Some(((input_axis, _), (output_axis, _))) =
+                            input_dimensions.get(prefix).zip(output_dimensions.get(prefix))
+                        else {
+                            break;
+                        };
+                        output_sharding_dimensions[*output_axis] = sharding.dimensions()[*input_axis].clone();
+                        prefix += 1;
+                    }
+
+                    let mut input_end = input_dimensions.len();
+                    let mut output_end = output_dimensions.len();
+                    while input_end > prefix
+                        && output_end > prefix
+                        && input_dimensions[input_end - 1].1 == output_dimensions[output_end - 1].1
+                    {
+                        input_end -= 1;
+                        output_end -= 1;
+                        output_sharding_dimensions[output_dimensions[output_end].0] =
+                            sharding.dimensions()[input_dimensions[input_end].0].clone();
+                    }
+
+                    if input_dimensions[prefix..input_end]
+                        .iter()
+                        .any(|(axis, _)| sharding.dimensions()[*axis] != ShardingDimension::Replicated)
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous \
+                             zero-sized reshape",
+                        )));
+                    }
+
+                    if input_dimensions[prefix..input_end].iter().any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
+                        || output_dimensions[prefix..output_end]
+                            .iter()
+                            .any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned \
+                             dynamic dimensions",
+                        )));
+                    }
                 } else {
                     // Grow contiguous static groups until their products match, retaining equal symbolic axes
                     // as anchors.
@@ -1500,37 +1541,98 @@ fn infer_reshape_output_type(
 
                         let input_group_start = input_start;
                         let output_group_start = output_start;
-                        let mut input_product = static_positive_size(input_dimensions[input_start].1.clone())?;
-                        let mut output_product = static_positive_size(output_dimensions[output_start].1.clone())?;
+                        let mut input_product = static_positive_size(&input_dimensions[input_start].1)?;
+                        let mut output_product = static_positive_size(&output_dimensions[output_start].1)?;
                         input_start += 1;
                         output_start += 1;
                         while input_product != output_product {
                             if input_product < output_product {
                                 let (_, size) = input_dimensions.get(input_start).ok_or_else(alignment_error)?;
                                 input_product = input_product
-                                    .checked_mul(static_positive_size(size.clone())?)
+                                    .checked_mul(static_positive_size(size)?)
                                     .ok_or_else(alignment_error)?;
                                 input_start += 1;
                             } else {
                                 let (_, size) = output_dimensions.get(output_start).ok_or_else(alignment_error)?;
                                 output_product = output_product
-                                    .checked_mul(static_positive_size(size.clone())?)
+                                    .checked_mul(static_positive_size(size)?)
                                     .ok_or_else(alignment_error)?;
                                 output_start += 1;
                             }
                         }
 
-                        propagate_static_reshape_group(
-                            &input_dimensions[input_group_start..input_start],
-                            &output_dimensions[output_group_start..output_start],
-                            sharding,
-                            &mut output_sharding_dimensions,
-                        )?;
+                        // Merge the contiguous sharded prefix of this group. A replicated axis followed by a
+                        // sharded one would change which elements belong to each device.
+                        let mut mesh_axes = Vec::new();
+                        let mut saw_replicated = false;
+                        for (axis, _) in &input_dimensions[input_group_start..input_start] {
+                            match &sharding.dimensions()[*axis] {
+                                ShardingDimension::Replicated => saw_replicated = true,
+                                ShardingDimension::Unconstrained => {
+                                    return Err(TypeError::invalid(format!(
+                                        "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for \
+                                         unconstrained dimensions",
+                                    )));
+                                }
+                                ShardingDimension::Sharded(axis_names) => {
+                                    if saw_replicated {
+                                        return Err(TypeError::invalid(format!(
+                                            "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding \
+                                             across a merge",
+                                        )));
+                                    }
+                                    mesh_axes.extend(axis_names.iter().cloned());
+                                }
+                            }
+                        }
+
+                        // Distribute the merged mesh axes over output factors in order.
+                        // Each axis must divide its factor.
+                        let mut mesh_axis_index = 0usize;
+                        for (output_axis, size) in &output_dimensions[output_group_start..output_start] {
+                            let mut remaining = static_positive_size(size)?;
+                            let start = mesh_axis_index;
+                            while remaining > 1 && mesh_axis_index < mesh_axes.len() {
+                                let mesh_axis = &mesh_axes[mesh_axis_index];
+                                let mesh_axis_size = sharding.mesh().axis_size(mesh_axis).unwrap();
+                                if remaining % mesh_axis_size != 0 {
+                                    return Err(TypeError::invalid(format!(
+                                        "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the \
+                                         requested split factors",
+                                    )));
+                                }
+                                remaining /= mesh_axis_size;
+                                mesh_axis_index += 1;
+                            }
+
+                            if mesh_axis_index > start {
+                                output_sharding_dimensions[*output_axis] =
+                                    ShardingDimension::sharded(mesh_axes[start..mesh_axis_index].iter().cloned());
+                            }
+                        }
+
+                        if mesh_axis_index != mesh_axes.len() {
+                            return Err(TypeError::invalid(format!(
+                                "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes \
+                                 across the output dimensions",
+                            )));
+                        }
                     }
                 }
             }
 
-            Some(rebuild_reshape_sharding(sharding, output_sharding_dimensions)?)
+            // Only dimension placement changes; retain the input mesh, reduction state, and manual-axis variation.
+            Some(
+                Sharding::new(sharding.mesh().clone(), output_sharding_dimensions)
+                    .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                    .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                    .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                    .map_err(|error| {
+                        TypeError::invalid(format!(
+                            "`{RESHAPE_OPERATION_NAME}` inferred output sharding is invalid: {error}",
+                        ))
+                    })?,
+            )
         }
         (None, None) => None,
     };
@@ -1573,128 +1675,12 @@ fn infer_dynamic_reshape_output_type(
 // TODO(eaplatanios): Review from here onwards.
 
 /// Returns the positive static value of `size` for split/merge factorization.
-fn static_positive_size(size: Dimension) -> Result<usize, TypeError> {
-    match size {
-        Dimension::Static(value) if value > 0 => Ok(value),
-        Dimension::Static(_) | Dimension::Dynamic(_) => Err(TypeError::invalid(format!(
+fn static_positive_size(size: &Dimension) -> Result<usize, TypeError> {
+    size.value().filter(|value| *value > 0).ok_or_else(|| {
+        TypeError::invalid(format!(
             "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
-        ))),
-    }
-}
-
-/// Propagates placement around a zero-product reshape without multiplying through zero.
-fn propagate_zero_reshape_sharding(
-    input_dimensions: &[(usize, Dimension)],
-    output_dimensions: &[(usize, Dimension)],
-    sharding: &Sharding,
-    output_sharding_dimensions: &mut [ShardingDimension],
-) -> Result<(), TypeError> {
-    let mut prefix = 0usize;
-    while input_dimensions.get(prefix).map(|(_, size)| size) == output_dimensions.get(prefix).map(|(_, size)| size) {
-        let Some(((input_axis, _), (output_axis, _))) = input_dimensions.get(prefix).zip(output_dimensions.get(prefix))
-        else {
-            break;
-        };
-        output_sharding_dimensions[*output_axis] = sharding.dimensions()[*input_axis].clone();
-        prefix += 1;
-    }
-
-    let mut input_end = input_dimensions.len();
-    let mut output_end = output_dimensions.len();
-    while input_end > prefix
-        && output_end > prefix
-        && input_dimensions[input_end - 1].1 == output_dimensions[output_end - 1].1
-    {
-        input_end -= 1;
-        output_end -= 1;
-        output_sharding_dimensions[output_dimensions[output_end].0] =
-            sharding.dimensions()[input_dimensions[input_end].0].clone();
-    }
-
-    if input_dimensions[prefix..input_end]
-        .iter()
-        .any(|(axis, _)| sharding.dimensions()[*axis] != ShardingDimension::Replicated)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
-        )));
-    }
-    if input_dimensions[prefix..input_end].iter().any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
-        || output_dimensions[prefix..output_end].iter().any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
-    {
-        return Err(TypeError::invalid(format!(
-            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
-        )));
-    }
-    Ok(())
-}
-
-/// Propagates one positive-static reshape group, distributing contiguous mesh axes over output factors.
-fn propagate_static_reshape_group(
-    input_group: &[(usize, Dimension)],
-    output_group: &[(usize, Dimension)],
-    sharding: &Sharding,
-    output_sharding_dimensions: &mut [ShardingDimension],
-) -> Result<(), TypeError> {
-    let mut mesh_axes = Vec::new();
-    let mut saw_replicated = false;
-    for (axis, _) in input_group {
-        match &sharding.dimensions()[*axis] {
-            ShardingDimension::Replicated => saw_replicated = true,
-            ShardingDimension::Unconstrained => {
-                return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions"
-                )));
-            }
-            ShardingDimension::Sharded(axis_names) => {
-                if saw_replicated {
-                    return Err(TypeError::invalid(format!(
-                        "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
-                    )));
-                }
-                mesh_axes.extend(axis_names.iter().cloned());
-            }
-        }
-    }
-
-    let mut mesh_axis_index = 0usize;
-    for (output_axis, size) in output_group {
-        let mut remaining = static_positive_size(size.clone())?;
-        let start = mesh_axis_index;
-        while remaining > 1 && mesh_axis_index < mesh_axes.len() {
-            let mesh_axis = &mesh_axes[mesh_axis_index];
-            // Mesh axis names come from a sharding that `Sharding::new` validated against its mesh, so they resolve.
-            let mesh_axis_size = sharding.mesh().axis_size(mesh_axis).unwrap();
-            if remaining % mesh_axis_size != 0 {
-                return Err(TypeError::invalid(format!(
-                    "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
-                )));
-            }
-            remaining /= mesh_axis_size;
-            mesh_axis_index += 1;
-        }
-        if mesh_axis_index > start {
-            output_sharding_dimensions[*output_axis] =
-                ShardingDimension::sharded(mesh_axes[start..mesh_axis_index].iter().cloned());
-        }
-    }
-    if mesh_axis_index != mesh_axes.len() {
-        return Err(TypeError::invalid(format!(
-            "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions"
-        )));
-    }
-    Ok(())
-}
-
-/// Rebuilds inferred reshape sharding while preserving reduction and manual-axis state.
-fn rebuild_reshape_sharding(input: &Sharding, dimensions: Vec<ShardingDimension>) -> Result<Sharding, TypeError> {
-    Sharding::new(input.mesh().clone(), dimensions)
-        .and_then(|output| output.with_unreduced_axes(input.unreduced_axes().clone()))
-        .and_then(|output| output.with_reduced_axes(input.reduced_axes().clone()))
-        .and_then(|output| output.with_varying_manual_axes(input.varying_manual_axes().clone()))
-        .map_err(|error| {
-            TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` inferred output sharding is invalid: {error}"))
-        })
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -5527,6 +5513,160 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_reshape_output_type_zero_extents() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let infer = |input: Vec<Dimension>, output: Vec<Dimension>, sharding: &Sharding| {
+            let input = ArrayType::new(DataType::F32, Shape::new(input)).with_sharding(sharding.clone()).unwrap();
+            infer_reshape_output_type(&input, Shape::new(output), None)
+                .map(|output| output.sharding().unwrap().dimensions().to_vec())
+        };
+
+        // Equal prefix and suffix dimensions carry their placement around the zero-product middle, which itself must
+        // be replicated and static.
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            infer(vec![3.into(), 0.into(), 2.into()], vec![3.into(), 0.into(), 5.into(), 2.into()], &sharding),
+            Ok(vec![
+                ShardingDimension::sharded(["x"]),
+                ShardingDimension::replicated(),
+                ShardingDimension::replicated(),
+                ShardingDimension::replicated(),
+            ]),
+        );
+        let suffix_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        assert_eq!(
+            infer(vec![0.into(), 4.into(), 2.into()], vec![0.into(), 2.into()], &suffix_sharding),
+            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]),
+        );
+
+        // A sharded dimension inside the zero-product middle is ambiguous, and so is a dynamic one on either side.
+        let middle_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            infer(vec![0.into(), 4.into(), 2.into()], vec![0.into(), 2.into()], &middle_sharding),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
+            ))),
+        );
+        let dynamic_sharding = Sharding::new(
+            mesh,
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            infer(
+                vec![2.into(), 0.into(), Dimension::Dynamic(rows.clone())],
+                vec![2.into(), 0.into(), 2.into()],
+                &dynamic_sharding,
+            ),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
+            ))),
+        );
+        assert_eq!(
+            infer(
+                vec![2.into(), 0.into(), 2.into()],
+                vec![2.into(), 0.into(), Dimension::Dynamic(rows)],
+                &dynamic_sharding,
+            ),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_infer_reshape_output_type_static_groups() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let infer = |input: Vec<Dimension>, output: Vec<Dimension>, sharding: &Sharding| {
+            let input = ArrayType::new(DataType::F32, Shape::new(input)).with_sharding(sharding.clone()).unwrap();
+            infer_reshape_output_type(&input, Shape::new(output), None)
+                .map(|output| output.sharding().unwrap().dimensions().to_vec())
+        };
+
+        // A split distributes the contiguous mesh axes over the leading output factors they divide; a merge
+        // concatenates the contiguous sharded prefix of the merged dimensions.
+        let split_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        assert_eq!(
+            infer(vec![8.into()], vec![2.into(), 4.into()], &split_sharding),
+            Ok(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]),
+        );
+        assert_eq!(
+            infer(vec![8.into()], vec![4.into(), 2.into()], &split_sharding),
+            Ok(vec![ShardingDimension::sharded(["x", "y"]), ShardingDimension::replicated()]),
+        );
+        let merge_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        assert_eq!(
+            infer(vec![2.into(), 4.into()], vec![8.into()], &merge_sharding),
+            Ok(vec![ShardingDimension::sharded(["x", "y"])]),
+        );
+        let prefix_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        assert_eq!(
+            infer(vec![2.into(), 4.into()], vec![8.into()], &prefix_sharding),
+            Ok(vec![ShardingDimension::sharded(["x"])]),
+        );
+
+        // A replicated dimension before a sharded one breaks contiguity, an unconstrained dimension cannot be placed,
+        // a factor the next mesh axis does not divide cannot be split, and every input mesh axis must be consumed.
+        let suffix_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        assert_eq!(
+            infer(vec![2.into(), 4.into()], vec![8.into()], &suffix_sharding),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
+            ))),
+        );
+        let unconstrained_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap();
+        assert_eq!(
+            infer(vec![8.into()], vec![2.into(), 4.into()], &unconstrained_sharding),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions"
+            ))),
+        );
+        assert_eq!(
+            infer(vec![6.into()], vec![3.into(), 2.into()], &split_sharding),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
+            ))),
+        );
+        // A trailing unit-size mesh axis still needs placement after all output factors are exhausted.
+        let unit_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let unit_sharding = Sharding::new(unit_mesh, vec![ShardingDimension::sharded(["x", "y", "z"])]).unwrap();
+        assert_eq!(
+            infer(vec![4.into()], vec![2.into(), 2.into()], &unit_sharding),
+            Err(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions"
+            ))),
+        );
+    }
+
+    #[test]
     fn test_infer_dynamic_reshape_output_type() {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let input = ArrayType::new_static(DataType::F32, [2, 3])
@@ -5579,160 +5719,6 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap()),
-        );
-    }
-
-    #[test]
-    fn test_propagate_zero_reshape_sharding() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let propagate = |input: Vec<(usize, Dimension)>, output: Vec<(usize, Dimension)>, sharding: &Sharding| {
-            let mut output_sharding_dimensions = vec![ShardingDimension::replicated(); output.len()];
-            propagate_zero_reshape_sharding(&input, &output, sharding, &mut output_sharding_dimensions)
-                .map(|()| output_sharding_dimensions)
-        };
-
-        // Equal prefix and suffix dimensions carry their placement around the zero-product middle, which itself must
-        // be replicated and static.
-        let sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        assert_eq!(
-            propagate(
-                vec![(0, 3.into()), (1, 0.into()), (2, 2.into())],
-                vec![(0, 3.into()), (1, 0.into()), (2, 5.into()), (3, 2.into())],
-                &sharding,
-            ),
-            Ok(vec![
-                ShardingDimension::sharded(["x"]),
-                ShardingDimension::replicated(),
-                ShardingDimension::replicated(),
-                ShardingDimension::replicated(),
-            ]),
-        );
-        let suffix_sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-        )
-        .unwrap();
-        assert_eq!(
-            propagate(
-                vec![(0, 0.into()), (1, 4.into()), (2, 2.into())],
-                vec![(0, 0.into()), (1, 2.into())],
-                &suffix_sharding
-            ),
-            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]),
-        );
-
-        // A sharded dimension inside the zero-product middle is ambiguous, and so is a dynamic one on either side.
-        let middle_sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        assert_eq!(
-            propagate(
-                vec![(0, 0.into()), (1, 4.into()), (2, 2.into())],
-                vec![(0, 0.into()), (1, 2.into())],
-                &middle_sharding
-            ),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
-            ))),
-        );
-        let replicated_sharding = Sharding::replicated(mesh, 2);
-        assert_eq!(
-            propagate(
-                vec![(0, 0.into()), (1, Dimension::Dynamic(rows.clone()))],
-                vec![(0, 0.into()), (1, 2.into())],
-                &replicated_sharding,
-            ),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
-            ))),
-        );
-        assert_eq!(
-            propagate(
-                vec![(0, 0.into()), (1, 2.into())],
-                vec![(0, 0.into()), (1, Dimension::Dynamic(rows))],
-                &replicated_sharding
-            ),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_propagate_static_reshape_group() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let propagate = |input: Vec<(usize, Dimension)>, output: Vec<(usize, Dimension)>, sharding: &Sharding| {
-            let mut output_sharding_dimensions = vec![ShardingDimension::replicated(); output.len()];
-            propagate_static_reshape_group(&input, &output, sharding, &mut output_sharding_dimensions)
-                .map(|()| output_sharding_dimensions)
-        };
-
-        // A split distributes the contiguous mesh axes over the leading output factors they divide; a merge
-        // concatenates the contiguous sharded prefix of the merged dimensions.
-        let split_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        assert_eq!(
-            propagate(vec![(0, 8.into())], vec![(0, 2.into()), (1, 4.into())], &split_sharding),
-            Ok(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]),
-        );
-        assert_eq!(
-            propagate(vec![(0, 8.into())], vec![(0, 4.into()), (1, 2.into())], &split_sharding),
-            Ok(vec![ShardingDimension::sharded(["x", "y"]), ShardingDimension::replicated()]),
-        );
-        let merge_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-                .unwrap();
-        assert_eq!(
-            propagate(vec![(0, 2.into()), (1, 4.into())], vec![(0, 8.into())], &merge_sharding),
-            Ok(vec![ShardingDimension::sharded(["x", "y"])]),
-        );
-        let prefix_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                .unwrap();
-        assert_eq!(
-            propagate(vec![(0, 2.into()), (1, 4.into())], vec![(0, 8.into())], &prefix_sharding),
-            Ok(vec![ShardingDimension::sharded(["x"])]),
-        );
-
-        // A replicated dimension before a sharded one breaks contiguity, an unconstrained dimension cannot be placed,
-        // a factor the next mesh axis does not divide cannot be split, and every input mesh axis must be consumed.
-        let suffix_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-                .unwrap();
-        assert_eq!(
-            propagate(vec![(0, 2.into()), (1, 4.into())], vec![(0, 8.into())], &suffix_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
-            ))),
-        );
-        let unconstrained_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap();
-        assert_eq!(
-            propagate(vec![(0, 8.into())], vec![(0, 2.into()), (1, 4.into())], &unconstrained_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions"
-            ))),
-        );
-        assert_eq!(
-            propagate(vec![(0, 6.into())], vec![(0, 3.into()), (1, 2.into())], &split_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
-            ))),
-        );
-        assert_eq!(
-            propagate(vec![(0, 2.into())], vec![(0, 2.into()), (1, 1.into())], &split_sharding),
-            Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions"
-            ))),
         );
     }
 }
