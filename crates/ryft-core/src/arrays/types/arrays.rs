@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::sharding::ShardingError;
-use crate::arrays::sharding::meshes::DeviceMesh;
+use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
@@ -462,6 +462,52 @@ impl ArrayType {
                 ))),
             },
         )
+    }
+
+    /// Returns this array type's sharding for a same-rank resize, preserving dimension placement and reduction state.
+    /// Changed static extents must remain divisible by the product of their explicit mesh-axis sizes. Dynamic extents
+    /// and manual or automatic mesh axes are left to their respective execution contracts. Callers validate the output
+    /// rank and ensure their operation preserves the carried reduction state; this function only checks divisibility.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_sizes`: New dimensions, in input-axis order, with the same rank as this array type.
+    ///   - `operation_name`: Name of the requesting operation, used to identify invalid resizes in diagnostics.
+    pub(crate) fn resized_sharding(
+        &self,
+        output_sizes: &[Dimension],
+        operation_name: &'static str,
+    ) -> Result<Option<Sharding>, TypeError> {
+        let Some(sharding) = self.sharding() else {
+            return Ok(None);
+        };
+
+        for (axis, (input_size, output_size)) in self.shape().dimensions().iter().zip(output_sizes).enumerate() {
+            let (ShardingDimension::Sharded(axis_names), Dimension::Static(output_size)) =
+                (&sharding.dimensions()[axis], output_size)
+            else {
+                continue;
+            };
+
+            if input_size == &Dimension::Static(*output_size) {
+                continue;
+            }
+
+            // Dimensions sharded only over manual or automatic axes have an explicit mesh-axis product of one.
+            let explicit_axis_product: usize = axis_names
+                .iter()
+                .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+                .filter_map(|name| sharding.mesh().axis_size(name))
+                .try_fold(1usize, |product, size| product.checked_mul(size))
+                .ok_or_else(|| TypeError::invalid(format!("`{operation_name}` mesh-axis product overflows `usize`")))?;
+            if explicit_axis_product > 1 && output_size % explicit_axis_product != 0 {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` on a dimension sharded over explicit mesh axes requires the output size \
+                     ({output_size}) at axis {axis} to be divisible by the mesh-axis product ({explicit_axis_product})",
+                )));
+            }
+        }
+        Ok(Some(sharding.clone()))
     }
 
     /// Returns whether `other` has the same element [`DataType`] and [`Memory`] placement as this [`ArrayType`] and
@@ -1433,6 +1479,69 @@ mod tests {
     fn test_array_type_as_referent() {
         assert_eq!(ArrayType::scalar(F32).as_referent(), None);
         assert_eq!(ArrayType::new_static(F64, [3]).as_referent(), None);
+    }
+
+    #[test]
+    fn test_array_type_resized_sharding() {
+        // An unsharded input has no sharding to carry.
+        let input = ArrayType::new_static(DataType::F32, [4, 4]);
+        assert_eq!(input.resized_sharding(&[Dimension::Static(2), Dimension::Static(4)], "slice"), Ok(None));
+
+        // The input sharding, including its reduction state, is carried through unchanged when every resized dimension
+        // sharded over explicit axes keeps a divisible static size.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let explicit =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["m"])
+                .unwrap();
+        let explicit_input = input.clone().with_sharding(explicit.clone()).unwrap();
+        assert_eq!(
+            explicit_input.resized_sharding(&[Dimension::Static(2), Dimension::Static(1)], "slice"),
+            Ok(Some(explicit.clone())),
+        );
+        assert_eq!(
+            explicit_input.resized_sharding(&[Dimension::Static(3), Dimension::Static(4)], "slice"),
+            Err(TypeError::invalid(
+                "`slice` on a dimension sharded over explicit mesh axes requires the output size (3) at axis 0 to be \
+                 divisible by the mesh-axis product (2)",
+            )),
+        );
+
+        // A dimension sharded only over manual axes has an explicit product of one, so any size is accepted, and a
+        // dynamic output extent is not checked.
+        let manual =
+            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["m"])]).unwrap();
+        let manual_input = input.with_sharding(manual.clone()).unwrap();
+        assert_eq!(
+            manual_input.resized_sharding(&[Dimension::Static(4), Dimension::Static(3)], "slice"),
+            Ok(Some(manual)),
+        );
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+        assert_eq!(
+            explicit_input.resized_sharding(&[Dimension::Dynamic(extent), Dimension::Static(4)], "slice"),
+            Ok(Some(explicit)),
+        );
+    }
+
+    #[test]
+    fn test_array_type_resized_sharding_overflow() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", usize::MAX, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input = ArrayType::new_static(DataType::I32, [1])
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x", "y"])]).unwrap())
+            .unwrap();
+        assert_eq!(
+            input.resized_sharding(&[Dimension::Static(0)], "slice"),
+            Err(TypeError::invalid("`slice` mesh-axis product overflows `usize`")),
+        );
     }
 
     #[test]
