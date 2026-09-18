@@ -917,6 +917,7 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_duals = match self {
             Self::Slice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::UpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::DynamicSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::DynamicUpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::Gather(operation) => operation.jvp_in_parent(context, driver, inputs)?,

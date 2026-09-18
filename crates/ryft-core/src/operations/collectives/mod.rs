@@ -36,7 +36,6 @@ use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
-use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
@@ -289,7 +288,7 @@ pub(super) fn shape_changing_collective_output_type(
     output_dimensions: Vec<usize>,
 ) -> Result<ArrayType, TypeError> {
     let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
-    let sharding = resized_output_sharding(input_type, output_sizes.as_slice(), operation_name)?;
+    let sharding = input_type.resized_sharding(output_sizes.as_slice(), operation_name)?;
     let mut output_type =
         ArrayType::new(input_type.data_type(), Shape::new(output_sizes)).with_memory(input_type.memory());
     output_type.sharding = sharding;

@@ -30,7 +30,6 @@ use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
-use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
@@ -135,7 +134,7 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
     }
     let mut dimensions = input_type.shape().dimensions().to_vec();
     dimensions[operation.scatter_axis] = Dimension::Static(0);
-    let sharding = resized_output_sharding(input_type, dimensions.as_slice(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
+    let sharding = input_type.resized_sharding(dimensions.as_slice(), PARALLEL_SUM_SCATTER_OPERATION_NAME)?;
     let mut base_output_type =
         ArrayType::new(input_type.data_type(), Shape::new(dimensions)).with_memory(input_type.memory());
     base_output_type.sharding = sharding;

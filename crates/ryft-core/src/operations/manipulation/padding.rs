@@ -41,7 +41,7 @@ use crate::operations::manipulation::reshaping::DynamicReshape;
 use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
-use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation, resized_output_sharding};
+use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::Add;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
@@ -1765,7 +1765,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         // Unlike static cropping, runtime padding can expose the fill at any position. Validate its distributed
         // dependencies and preserve the input's placement when resizing the selected axis.
         validate_padding_value_sharding(input_type, padding_type)?;
-        let sharding = resized_output_sharding(input_type, &output_shape, PAD_OPERATION_NAME)?;
+        let sharding = input_type.resized_sharding(&output_shape, PAD_OPERATION_NAME)?;
         let output_type = ArrayType::new(input_type.data_type(), Shape::new(output_shape))
             .with_memory(input_type.memory())
             .with_sharding(sharding)
@@ -2073,7 +2073,7 @@ fn infer_pad_output_type(
                 ))
     });
 
-    let sharding = resized_output_sharding(input, &output_dimensions, PAD_OPERATION_NAME)?;
+    let sharding = input.resized_sharding(&output_dimensions, PAD_OPERATION_NAME)?;
 
     if padding_positions_may_exist {
         validate_padding_value_sharding(input, padding_value)?;
