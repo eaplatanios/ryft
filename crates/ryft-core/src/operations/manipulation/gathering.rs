@@ -187,8 +187,8 @@ pub struct GatherOptions<V: Value<Type = ArrayType> = Array> {
 }
 
 impl<V: Value<Type = ArrayType>> GatherOptions<V> {
-    /// Creates options with [`GatherMode::PromiseInBounds`], no sortedness or non-overlap promises, and inferred output
-    /// [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
+    /// Creates a new [`GatherOptions`] instance with [`GatherMode::PromiseInBounds`], no sortedness or non-overlap
+    /// promises, and inferred output [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -208,7 +208,7 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
     }
 
     /// Returns a copy of this [`GatherOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -217,7 +217,7 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
     }
 
     /// Returns a copy of this [`GatherOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
-    /// the caller promises that gathered windows do not overlap; `false` makes no such promise. Implementations and
+    /// the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations and
     /// transformations may rely on this property. This function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
@@ -226,14 +226,12 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
     }
 
     /// Returns a copy of this [`GatherOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
-    /// Passing `None` restores inferred placement. A request specifies result placement when the window geometry does
+    /// Passing [`None`] restores inferred placement. A request specifies result placement when the window geometry does
     /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
-    /// on paired batching axes.
-    ///
-    /// A request selects per-axis placement while preserving the common mesh, reduction state, and manual-axis
-    /// variation. It must have the output rank and cannot reference automatic mesh axes. Validation takes place when
-    /// inferring the result type.
+    /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
+    /// and manual-axis variation. It must have the output rank and cannot reference automatic mesh axes. Validation
+    /// takes place when inferring the result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
@@ -247,15 +245,15 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
     }
 
     /// Returns whether the caller promises that the index vectors are sorted for this [`GatherOptions`]. This
-    /// property is not checked. Implementations and transformations may rely on it; `false` makes no such promise.
+    /// property is not checked. Implementations and transformations may rely on it. `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.indices_are_sorted
     }
 
     /// Returns whether the caller promises that the gathered windows do not overlap. This property is not checked.
-    /// Implementations and transformations may rely on it, including when constructing the adjoint scatter;
-    /// `false` makes no such promise.
+    /// Implementations and transformations may rely on it, including when constructing the adjoint scatter. `false`
+    /// makes no such promise.
     #[inline]
     pub fn unique_indices(&self) -> bool {
         self.unique_indices
@@ -355,7 +353,7 @@ pub struct GatherOperation<V: Value<Type = ArrayType> = Array> {
 
 impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     /// Creates a new [`GatherOperation`] with the provided dimension numbers and per-input-axis slice sizes. The mode
-    /// defaults to [`GatherMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
+    /// defaults to [`GatherMode::PromiseInBounds`] and both index promises default to `false`. Use the chained `with_*`
     /// builders to override them.
     ///
     /// # Parameters
@@ -385,7 +383,7 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     }
 
     /// Returns a copy of this [`GatherOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -394,7 +392,7 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     }
 
     /// Returns a copy of this [`GatherOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that gathered windows do not overlap; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
@@ -406,11 +404,9 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     /// Passing `None` restores inferred placement. A request specifies result placement when the window geometry does
     /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
-    /// on paired batching axes.
-    ///
-    /// A request selects per-axis placement while preserving the common mesh, reduction state, and manual-axis
-    /// variation. It must have the output rank and cannot reference automatic mesh axes. Validation takes place when
-    /// inferring the result type.
+    /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
+    /// and manual-axis variation. It must have the output rank and cannot reference automatic mesh axes. Validation
+    /// takes place when inferring the result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.options = self.options.with_output_sharding(output_sharding);
@@ -443,14 +439,14 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
     }
 
     /// Returns whether the caller promises that the index vectors are sorted for this [`GatherOperation`]. This
-    /// property is not checked. Implementations and transformations may rely on it; `false` makes no such promise.
+    /// property is not checked. Implementations and transformations may rely on it. `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.options.indices_are_sorted
     }
 
     /// Returns whether the caller promises that the gathered windows do not overlap. This property is not checked.
-    /// Implementations and transformations may rely on it, including when constructing the adjoint scatter;
+    /// Implementations and transformations may rely on it, including when constructing the adjoint scatter.
     /// `false` makes no such promise.
     #[inline]
     pub fn unique_indices(&self) -> bool {

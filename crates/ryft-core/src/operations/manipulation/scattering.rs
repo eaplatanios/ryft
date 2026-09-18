@@ -133,21 +133,16 @@ impl Display for ScatterReductionKind {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Specification of how the index input and the update windows map onto the input axes of a [`scatter`](Scatter),
+/// Specification of how the index input and the update windows map onto the input axes of a [`Scatter`] operation,
 /// following StableHLO's [`scatter`](https://openxla.org/stablehlo/spec#scatter) dimension numbers. It is the
-/// structural dual of [`GatherDimensionNumbers`]:
-/// [`Self::update_window_dimensions`] mirrors `offset_dimensions`,
+/// structural dual of [`GatherDimensionNumbers`]: [`Self::update_window_dimensions`] mirrors `offset_dimensions`,
 /// [`Self::inserted_window_dimensions`] mirrors `collapsed_slice_dimensions`, and
-/// [`Self::scatter_dimensions_to_operand_dimensions`] mirrors
-/// `start_index_map`.
-///
-/// The index vector dimension is implicit and always the last axis of the indices input. The output has the same
-/// shape as the input.
+/// [`Self::scatter_dimensions_to_operand_dimensions`] mirrors `start_index_map`. The index vector dimension
+/// is implicit and always the last axis of the indices input. The output has the same shape as the input.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ScatterDimensionNumbers {
-    /// Refer to the documentation of [`update_window_dimensions`](Self::update_window_dimensions) for more information.
+    /// Refer to the documentation of [`update_window_dimensions`](Self::update_window_dimensions)
+    /// for more information.
     update_window_dimensions: Vec<usize>,
 
     /// Refer to the documentation of [`inserted_window_dimensions`](Self::inserted_window_dimensions)
@@ -159,9 +154,9 @@ pub struct ScatterDimensionNumbers {
     /// for more information.
     scatter_dimensions_to_operand_dimensions: Vec<usize>,
 
-    /// Refer to the documentation of [`operand_batching_dimensions`](Self::operand_batching_dimensions)
+    /// Refer to the documentation of [`input_batching_dimensions`](Self::input_batching_dimensions)
     /// for more information.
-    operand_batching_dimensions: Vec<usize>,
+    input_batching_dimensions: Vec<usize>,
 
     /// Refer to the documentation of [`scatter_indices_batching_dimensions`](Self::scatter_indices_batching_dimensions)
     /// for more information.
@@ -170,7 +165,7 @@ pub struct ScatterDimensionNumbers {
 
 impl ScatterDimensionNumbers {
     /// Creates a new [`ScatterDimensionNumbers`] instance from the provided explicit axis lists. The batching axis
-    /// lists default to empty; use [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
+    /// lists default to empty. Use [`with_batching_dimensions`](Self::with_batching_dimensions) to set them.
     ///
     /// # Parameters
     ///
@@ -188,28 +183,28 @@ impl ScatterDimensionNumbers {
             update_window_dimensions,
             inserted_window_dimensions,
             scatter_dimensions_to_operand_dimensions,
-            operand_batching_dimensions: Vec::new(),
+            input_batching_dimensions: Vec::new(),
             scatter_indices_batching_dimensions: Vec::new(),
         }
     }
 
     /// Returns a copy of this [`ScatterDimensionNumbers`] with its input and query batching axes replaced by
-    /// `operand_batching_dimensions` and `scatter_indices_batching_dimensions`, respectively. Each update modifies
+    /// `input_batching_dimensions` and `scatter_indices_batching_dimensions`, respectively. Each update modifies
     /// its corresponding input batch. Paired axes must have equal extents, and input batching axes cannot also be
     /// inserted or indexed by a start vector. These constraints are checked when inferring the scatter result type.
     ///
     /// # Parameters
     ///
-    ///   - `operand_batching_dimensions`: Input axes, in ascending order, that select the independent batches.
+    ///   - `input_batching_dimensions`: Input axes, in ascending order, that select the independent batches.
     ///   - `scatter_indices_batching_dimensions`: Distinct query axes paired with the input axes in the same order.
     ///     The trailing index-vector axis cannot be a batching axis.
     #[inline]
     pub fn with_batching_dimensions(
         mut self,
-        operand_batching_dimensions: Vec<usize>,
+        input_batching_dimensions: Vec<usize>,
         scatter_indices_batching_dimensions: Vec<usize>,
     ) -> Self {
-        self.operand_batching_dimensions = operand_batching_dimensions;
+        self.input_batching_dimensions = input_batching_dimensions;
         self.scatter_indices_batching_dimensions = scatter_indices_batching_dimensions;
         self
     }
@@ -227,31 +222,30 @@ impl ScatterDimensionNumbers {
         &self.inserted_window_dimensions
     }
 
-    /// Returns the input axis targeted by each component of a start-index vector (the last axis of the indices input).
-    /// The map's length equals the extent of the indices' index vector dimension.
+    /// Returns the input axis targeted by each component of a start-index vector (i.e., the last axis of the indices
+    /// input). The map's length equals the extent of the indices' index vector dimension.
     #[inline]
     pub fn scatter_dimensions_to_operand_dimensions(&self) -> &[usize] {
         &self.scatter_dimensions_to_operand_dimensions
     }
 
-    /// Returns the input axes batched against [`Self::scatter_indices_batching_dimensions`], aligned one-to-one, in
-    /// ascending order.
+    /// Returns the input axes batched against [`Self::scatter_indices_batching_dimensions`], aligned one-to-one,
+    /// in ascending order.
     #[inline]
-    pub fn operand_batching_dimensions(&self) -> &[usize] {
-        &self.operand_batching_dimensions
+    pub fn input_batching_dimensions(&self) -> &[usize] {
+        &self.input_batching_dimensions
     }
 
     /// Returns the indices axes, excluding the index vector dimension, that align one-to-one with
-    /// [`Self::operand_batching_dimensions`].
+    /// [`Self::input_batching_dimensions`].
     #[inline]
     pub fn scatter_indices_batching_dimensions(&self) -> &[usize] {
         &self.scatter_indices_batching_dimensions
     }
 }
 
-/// Optional bounds handling, index promises, and output placement for [`Scatter::scatter`].
-///
-/// The default promises in-bounds indices, makes no sortedness or uniqueness promise, and infers output sharding.
+/// Optional bounds handling, index promises, and output placement for [`Scatter::scatter`]. The default promises
+/// in-bounds indices, makes no sortedness or uniqueness promise, and infers output [`Sharding`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScatterOptions {
     /// Refer to the documentation of [`mode`](Self::mode) for more information.
@@ -268,8 +262,8 @@ pub struct ScatterOptions {
 }
 
 impl ScatterOptions {
-    /// Creates options with [`ScatterMode::PromiseInBounds`], no sortedness or non-overlap promises, and inferred
-    /// output [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
+    /// Creates a new [`ScatterOptions`] instance with [`ScatterMode::PromiseInBounds`], no sortedness or non-overlap
+    /// promises, and inferred output [`Sharding`]. Use the consuming `with_*` functions to override these defaults.
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -289,7 +283,7 @@ impl ScatterOptions {
     }
 
     /// Returns a copy of this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -297,10 +291,10 @@ impl ScatterOptions {
         self
     }
 
-    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
-    /// and transformations may rely on this property. This function does not test the windows for overlap.
-    /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
+    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
+    /// the caller promises that update windows do not overlap. `false` makes no such promise. Implementations and
+    /// transformations may rely on this property. This function does not test the windows for overlap. Differentiating
+    /// multiplicative updates requires this promise when the updates carry nonzero tangents.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
         self.unique_indices = unique_indices;
@@ -308,34 +302,32 @@ impl ScatterOptions {
     }
 
     /// Returns a copy of this [`ScatterOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
-    /// Without an explicit request, indexed axes with partial update windows must be replicated over explicit mesh
-    /// axes; complete windows
-    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
-    /// reduction state, and manual-axis variation.
-    ///
-    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
-    /// inferred placement. Validation takes place when inferring the result type.
+    /// Passing [`None`] restores inferred placement. Without an explicit request, indexed axes with partial update
+    /// windows must be replicated over explicit mesh axes; complete windows preserve their input placement. An explicit
+    /// request selects the result placement while preserving its mesh, reduction state, and manual-axis variation. The
+    /// request must have the input rank and cannot reference automatic mesh axes. Validation takes place when inferring
+    /// the result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
         self
     }
 
-    /// Returns the out-of-bounds index handling mode.
+    /// Returns the out-of-bounds index handling [`ScatterMode`] of this [`ScatterOptions`].
     #[inline]
     pub fn mode(&self) -> ScatterMode {
         self.mode
     }
 
-    /// Returns whether the caller promises that the index vectors are sorted. This property is not checked.
-    /// Implementations and transformations may rely on it; `false` makes no such promise.
+    /// Returns whether the caller promises that the index vectors are sorted for this [`ScatterOptions`]. This property
+    /// is not checked. Implementations and transformations may rely on it. `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.indices_are_sorted
     }
 
     /// Returns whether the caller promises that the scattered windows do not overlap. This property is not checked.
-    /// Implementations and transformations may rely on it; `false` makes no such promise. In particular, uniqueness
+    /// Implementations and transformations may rely on it. `false` makes no such promise. In particular, uniqueness
     /// permits direct linear rules for overwrite scatter and is required for multiplication derivatives with respect
     /// to updates.
     #[inline]
@@ -344,7 +336,7 @@ impl ScatterOptions {
     }
 
     /// Returns the requested output [`Sharding`], if any, used when the inferred placement is ambiguous. Refer to the
-    /// documentation of [`with_output_sharding`](Self::with_output_sharding) for more information.
+    /// documentation of [`Self::with_output_sharding`] for more information.
     #[inline]
     pub fn output_sharding(&self) -> Option<&Sharding> {
         self.output_sharding.as_ref()
@@ -376,29 +368,29 @@ pub struct ScatterOperation {
 }
 
 impl ScatterOperation {
-    /// Creates a new [`ScatterOperation`] with the provided dimension numbers and combiner kind. The mode defaults to
-    /// [`ScatterMode::PromiseInBounds`] and both index promises default to `false`; use the chained `with_*`
-    /// builders to override them.
+    /// Creates a new [`ScatterOperation`] with the provided dimension numbers and reduction kind. The mode defaults to
+    /// [`ScatterMode::PromiseInBounds`] and both index promises default to `false`. Use the chained `with_*` builders
+    /// to override them.
     ///
     /// # Parameters
     ///
     ///   - `dimensions`: Mapping from index components and update window axes to input axes.
-    ///   - `kind`: Combiner applied to the existing input value and every update targeting that value.
+    ///   - `kind`: Reduction applied to the existing input value and every update targeting that value.
     #[inline]
     pub fn new(dimensions: ScatterDimensionNumbers, kind: ScatterReductionKind) -> Self {
         Self { dimensions, kind, options: ScatterOptions::new() }
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its optional behavior and output placement replaced by
-    /// `options`.
+    /// Returns a copy of this [`ScatterOperation`] with its optional behavior and output placement
+    /// replaced by `options`.
     #[inline]
     pub fn with_options(mut self, options: ScatterOptions) -> Self {
         self.options = options;
         self
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds index handling [`ScatterMode`] replaced by
-    /// `mode`.
+    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds index handling [`ScatterMode`]
+    /// replaced by `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: ScatterMode) -> Self {
         self.options = self.options.with_mode(mode);
@@ -406,7 +398,7 @@ impl ScatterOperation {
     }
 
     /// Returns a copy of this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -415,7 +407,7 @@ impl ScatterOperation {
     }
 
     /// Returns a copy of this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that update windows do not overlap; `false` makes no such promise. Implementations
+    /// `true`, the caller promises that update windows do not overlap. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not test the windows for overlap.
     /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
     #[inline]
@@ -425,53 +417,52 @@ impl ScatterOperation {
     }
 
     /// Returns a copy of this [`ScatterOperation`] with its requested output [`Sharding`] replaced by
-    /// `output_sharding`.
-    /// Without an explicit request, indexed axes with partial update windows must be replicated over explicit mesh
-    /// axes; complete windows
-    /// preserve their input placement. An explicit request selects the result placement while preserving its mesh,
-    /// reduction state, and manual-axis variation.
-    ///
-    /// The request must have the input rank and cannot reference automatic mesh axes. Passing `None` restores
-    /// inferred placement. Validation takes place when inferring the result type.
+    /// `output_sharding`. Passing `None` restores inferred placement. Without an explicit request, indexed axes
+    /// with partial update windows must be replicated over explicit mesh axes; complete windows preserve their input
+    /// placement. An explicit request selects the result placement while preserving its mesh, reduction state, and
+    /// manual-axis variation. The request must have the input rank and cannot reference automatic mesh axes.
+    /// Validation takes place when inferring the result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.options = self.options.with_output_sharding(output_sharding);
         self
     }
 
-    /// Returns the dimension numbers mapping the index input and update windows onto the input axes.
+    /// Returns the [`ScatterDimensionNumbers`] of this [`ScatterOperation`] mapping the index input and update windows
+    /// onto the input axes.
     #[inline]
     pub fn dimensions(&self) -> &ScatterDimensionNumbers {
         &self.dimensions
     }
 
-    /// Returns the combiner applied where an update meets the existing input value.
+    /// Returns the [`ScatterReductionKind`] applied where an update meets the existing input value for this
+    /// [`ScatterOperation`].
     #[inline]
     pub fn kind(&self) -> ScatterReductionKind {
         self.kind
     }
 
-    /// Returns the bounds handling, index promises, and output placement for this operation.
+    /// Returns the bounds handling, index promises, and output placement of this [`ScatterOperation`].
     #[inline]
     pub fn options(&self) -> &ScatterOptions {
         &self.options
     }
 
-    /// Returns the out-of-bounds index handling mode.
+    /// Returns the out-of-bounds index handling [`ScatterMode`] of this [`ScatterOperation`].
     #[inline]
     pub fn mode(&self) -> ScatterMode {
         self.options.mode()
     }
 
-    /// Returns whether the caller promises that the index vectors are sorted. This property is not checked.
-    /// Implementations and transformations may rely on it; `false` makes no such promise.
+    /// Returns whether the caller promises that the index vectors are sorted for this [`ScatterOperation`]. This
+    /// property is not checked. Implementations and transformations may rely on it. `false` makes no such promise.
     #[inline]
     pub fn indices_are_sorted(&self) -> bool {
         self.options.indices_are_sorted()
     }
 
     /// Returns whether the caller promises that the scattered windows do not overlap. This property is not checked.
-    /// Implementations and transformations may rely on it; `false` makes no such promise. In particular, uniqueness
+    /// Implementations and transformations may rely on it. `false` makes no such promise. In particular, uniqueness
     /// permits direct linear rules for overwrite scatter and is required for multiplication derivatives with respect
     /// to updates.
     #[inline]
@@ -487,32 +478,32 @@ impl ScatterOperation {
     }
 
     /// Returns `true` when this scatter is a linear map in its input and updates with the indices held fixed, which is
-    /// the case for the [`Add`](ScatterReductionKind::Add) combiner and for
-    /// [`Overwrite`](ScatterReductionKind::Overwrite) with the unique-indices promise (each output element then comes
-    /// from exactly one source). These are the scatters with direct linear derivative rules: their tangent is the same
-    /// scatter of the tangents, and their transpose is a dual gather (plus, for overwrite, erasing the written windows
-    /// of the input cotangent). The other combiners use coefficients computed from the primals and have no transpose.
+    /// the case for the [`ScatterReductionKind::Add`] reduction and for [`ScatterReductionKind::Overwrite`] with the
+    /// unique-indices promise (each output element then comes from exactly one source). These are the scatters with
+    /// direct linear derivative rules: their tangent is the same scatter of the tangents, and their transpose is a dual
+    /// gather (plus, for [`ScatterReductionKind::Overwrite`], erasing the written windows of the input cotangent). The
+    /// other reduction kinds use coefficients computed from the primals and have no transpose.
     #[inline]
     pub fn is_linear(&self) -> bool {
         self.kind == ScatterReductionKind::Add
             || (self.kind == ScatterReductionKind::Overwrite && self.options.unique_indices)
     }
 
-    /// Builds the [`GatherOperation`] that reads the windows targeted by this [`ScatterOperation`]. In the
-    /// scatter-add transpose, gathering the output cotangent gives one cotangent per update, including a separate
-    /// copy for every repeated index. For example, scalar updates at indices `[2, 0, 2]` receive cotangents
-    /// `[c, a, c]` from an output cotangent `[a, b, c]`. Nonlinear derivative rules use the same mapping to read
-    /// primal values or winner identifiers at the update locations.
+    /// Builds the [`GatherOperation`] that reads the windows targeted by this [`ScatterOperation`]. In the scatter-add
+    /// transpose, gathering the output cotangent gives one cotangent per update, including a separate copy for every
+    /// repeated index. For example, scalar updates at indices `[2, 0, 2]` receive cotangents `[c, a, c]` from an output
+    /// cotangent `[a, b, c]`. Nonlinear derivative rules use the same mapping to read primal values or winner
+    /// identifiers at the update locations.
     ///
-    /// Update window axes become gather offset axes, inserted input axes become collapsed axes, and the index map
-    /// and paired batching axes are retained. Window sizes come from the static update extents; inserted axes use
-    /// one, while paired axes use zero if their extent may be empty and one otherwise. A dynamic inserted axis
-    /// must have a positive lower bound because the gather collapses it through a size-one window.
+    /// Update window axes become gather offset axes, inserted input axes become collapsed axes, and the index map and
+    /// paired batching axes are retained. Window sizes come from the static update extents, inserted axes use one,
+    /// while paired axes use zero if their extent may be empty and one otherwise. A dynamic inserted axis must have
+    /// a positive lower bound because the gather collapses it through a size-one window.
     ///
-    /// Clipping and in-bounds promises retain their policies. Drop mode becomes fill mode; callers choose the fill
-    /// appropriate to the derivative: the transpose and overwrite winner identifiers use a typed zero, while
-    /// extremal coefficients retain the default fill (NaN for floating-point inputs). Sortedness and non-overlap
-    /// promises also carry over. This function constructs the operation without executing the gather.
+    /// Clipping and in-bounds promises retain their policies. Drop mode becomes fill mode and callers choose the fill
+    /// appropriate to the derivative: the transpose and overwrite winner identifiers use a typed zero, while extremal
+    /// coefficients retain the default fill (e.g., NaN for floating-point inputs). Sortedness and non-overlap promises
+    /// also carry over. This function constructs the operation without executing the gather.
     ///
     /// # Parameters
     ///
@@ -537,22 +528,23 @@ impl ScatterOperation {
                         message: format!(
                             "`{SCATTER_OPERATION_NAME}` differentiation requires inserted window axis {axis} to have a \
                              nonzero minimum extent, because its dual gather collapses that axis through a one-element \
-                             window"
+                             window",
                         ),
                     });
                 }
                 slice_sizes.push(1);
-            } else if dimensions.operand_batching_dimensions().contains(&axis) {
-                // A possibly empty paired axis needs a zero window to satisfy gather's extent bounds. Its
-                // output extent still comes from the paired indices dimension, so nonempty batches stay nonempty.
+            } else if dimensions.input_batching_dimensions().contains(&axis) {
+                // A possibly empty paired axis needs a zero window to satisfy gather's extent bounds. Its output
+                // extent still comes from the paired indices dimension, so nonempty batches stay nonempty.
                 slice_sizes.push(input_type.dimension(axis).bounds().lower().min(1));
             } else {
                 let update_axis = dimensions.update_window_dimensions()[window_position];
                 slice_sizes.push(updates_type.dimension(update_axis).value().ok_or_else(|| {
                     ProgramError::UnsupportedOperation {
                         message: format!(
-                            "`{SCATTER_OPERATION_NAME}` differentiation requires a static update window on axis \
-                             {update_axis} but its extent is `{}`",
+                            "`{}` differentiation requires a static update window on axis {} but its extent is `{}`",
+                            SCATTER_OPERATION_NAME,
+                            update_axis,
                             updates_type.dimension(update_axis),
                         ),
                     }
@@ -560,6 +552,7 @@ impl ScatterOperation {
                 window_position += 1;
             }
         }
+
         let gather_dimensions = GatherDimensionNumbers::new(
             dimensions.update_window_dimensions().to_vec(),
             dimensions.inserted_window_dimensions().to_vec(),
@@ -567,12 +560,13 @@ impl ScatterOperation {
         )
         .with_batching_dimensions(
             dimensions
-                .operand_batching_dimensions()
+                .input_batching_dimensions()
                 .iter()
                 .copied()
                 .zip(dimensions.scatter_indices_batching_dimensions().iter().copied())
                 .collect(),
         );
+
         Ok(GatherOperation::new(gather_dimensions, slice_sizes)
             .with_mode(match self.options.mode {
                 ScatterMode::PromiseInBounds => GatherMode::PromiseInBounds,
@@ -583,6 +577,8 @@ impl ScatterOperation {
             .with_unique_indices(self.options.unique_indices)
             .with_output_sharding(output_sharding))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Shares coefficient construction between homogeneous and projected differentiation. Coefficients depend only
     /// on primals; the staged tangent graph uses ordinary linear gather/scatter and elementwise operations.
@@ -866,7 +862,7 @@ impl Operation for ScatterOperation {
                     self.dimensions.update_window_dimensions,
                     self.dimensions.inserted_window_dimensions,
                     self.dimensions.scatter_dimensions_to_operand_dimensions,
-                    self.dimensions.operand_batching_dimensions,
+                    self.dimensions.input_batching_dimensions,
                     self.dimensions.scatter_indices_batching_dimensions,
                 ),
             )?;
@@ -963,13 +959,13 @@ where
                     shift(dimensions.scatter_dimensions_to_operand_dimensions()),
                 )
                 .with_batching_dimensions(
-                    shift(dimensions.operand_batching_dimensions()),
+                    shift(dimensions.input_batching_dimensions()),
                     dimensions.scatter_indices_batching_dimensions().to_vec(),
                 ),
             )
         } else {
             let indices = P::match_axis(context, &inputs[1], Axis::from(0))?;
-            let mut input_batching_dimensions = shift(dimensions.operand_batching_dimensions());
+            let mut input_batching_dimensions = shift(dimensions.input_batching_dimensions());
             input_batching_dimensions.insert(0, 0);
             let mut indices_batching_dimensions = shift(dimensions.scatter_indices_batching_dimensions());
             indices_batching_dimensions.insert(0, 0);
@@ -1479,8 +1475,8 @@ impl Scatter for ArrayType {
         )?;
         validate_unique_in_range(
             SCATTER_OPERATION_NAME,
-            "operand_batching_dimensions",
-            dimensions.operand_batching_dimensions(),
+            "input_batching_dimensions",
+            dimensions.input_batching_dimensions(),
             input_rank,
             true,
         )?;
@@ -1499,11 +1495,11 @@ impl Scatter for ArrayType {
             input_rank,
             false,
         )?;
-        if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
+        if dimensions.scatter_indices_batching_dimensions().len() != dimensions.input_batching_dimensions().len() {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input and scatter-indices batching dimensions must align 1:1, but got \
                      {} and {}",
-                dimensions.operand_batching_dimensions().len(),
+                dimensions.input_batching_dimensions().len(),
                 dimensions.scatter_indices_batching_dimensions().len(),
             ))
             .into());
@@ -1524,10 +1520,10 @@ impl Scatter for ArrayType {
         }
 
         let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
-        let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let operand_batching: BTreeSet<usize> = dimensions.input_batching_dimensions().iter().copied().collect();
         if inserted.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `operand_batching_dimensions` must be \
+                "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` must be \
                      disjoint"
             ))
             .into());
@@ -1597,10 +1593,8 @@ impl Scatter for ArrayType {
         }
 
         // Batching extents must match between input and indices.
-        for (&input_axis, &indices_axis) in dimensions
-            .operand_batching_dimensions()
-            .iter()
-            .zip(dimensions.scatter_indices_batching_dimensions())
+        for (&input_axis, &indices_axis) in
+            dimensions.input_batching_dimensions().iter().zip(dimensions.scatter_indices_batching_dimensions())
         {
             if !input.dimension(input_axis).has_equal_extents(&indices.dimension(indices_axis)) {
                 return Err(TypeError::invalid(format!(
@@ -1794,7 +1788,7 @@ impl Array {
         let indices_data_type = indices.r#type().data_type();
 
         let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
-        let batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
+        let batching: BTreeSet<usize> = dimensions.input_batching_dimensions().iter().copied().collect();
         let input_window_axes: Vec<usize> =
             (0..input_rank).filter(|axis| !inserted.contains(axis) && !batching.contains(axis)).collect();
         let update_window: BTreeSet<usize> = dimensions.update_window_dimensions().iter().copied().collect();
@@ -1829,7 +1823,7 @@ impl Array {
             if query_changed {
                 input_origin.fill(0);
                 dropped = false;
-                for (batch, &input_axis) in dimensions.operand_batching_dimensions().iter().enumerate() {
+                for (batch, &input_axis) in dimensions.input_batching_dimensions().iter().enumerate() {
                     input_origin[input_axis] = indices_index[dimensions.scatter_indices_batching_dimensions()[batch]];
                 }
                 for (component, &input_axis) in dimensions.scatter_dimensions_to_operand_dimensions().iter().enumerate()
@@ -2244,12 +2238,12 @@ mod tests {
         assert_eq!(dimensions.update_window_dimensions(), &[1]);
         assert_eq!(dimensions.inserted_window_dimensions(), &[0]);
         assert_eq!(dimensions.scatter_dimensions_to_operand_dimensions(), &[0]);
-        assert_eq!(dimensions.operand_batching_dimensions(), &[] as &[usize]);
+        assert_eq!(dimensions.input_batching_dimensions(), &[] as &[usize]);
         assert_eq!(dimensions.scatter_indices_batching_dimensions(), &[] as &[usize]);
         assert_eq!(
             format!("{dimensions:?}"),
             "ScatterDimensionNumbers { update_window_dimensions: [1], inserted_window_dimensions: [0], \
-             scatter_dimensions_to_operand_dimensions: [0], operand_batching_dimensions: [], \
+             scatter_dimensions_to_operand_dimensions: [0], input_batching_dimensions: [], \
              scatter_indices_batching_dimensions: [] }"
         );
         let lookup = HashMap::from([(dimensions.clone(), 7)]);
@@ -2264,7 +2258,7 @@ mod tests {
         assert_eq!(dimensions.update_window_dimensions(), &[2]);
         assert_eq!(dimensions.inserted_window_dimensions(), &[1]);
         assert_eq!(dimensions.scatter_dimensions_to_operand_dimensions(), &[1]);
-        assert_eq!(dimensions.operand_batching_dimensions(), &[0]);
+        assert_eq!(dimensions.input_batching_dimensions(), &[0]);
         assert_eq!(dimensions.scatter_indices_batching_dimensions(), &[1]);
     }
 
@@ -2671,7 +2665,7 @@ mod tests {
             cases = [{
                 input_types = [input.clone(), indices.clone(), updates.clone()],
                 error = format!(
-                    "`{SCATTER_OPERATION_NAME}` `operand_batching_dimensions` entry 2 is out of range for bound 2",
+                    "`{SCATTER_OPERATION_NAME}` `input_batching_dimensions` entry 2 is out of range for bound 2",
                 ),
             }],
         );
@@ -2782,7 +2776,7 @@ mod tests {
             cases = [{
                 input_types = [input.clone(), indices.clone(), updates.clone()],
                 error = format!(
-                    "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `operand_batching_dimensions` must \
+                    "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` must \
                      be disjoint",
                 ),
             }],

@@ -11254,7 +11254,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     let window_axes = (0..input_types[0].rank())
         .filter(|axis| {
             !dimensions.inserted_window_dimensions().contains(axis)
-                && !dimensions.operand_batching_dimensions().contains(axis)
+                && !dimensions.input_batching_dimensions().contains(axis)
         })
         .collect::<Vec<_>>();
     for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
@@ -11394,7 +11394,7 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     let attribute = context.stable_hlo_scatter_dimensions(
         dimensions.update_window_dimensions(),
         dimensions.inserted_window_dimensions(),
-        dimensions.operand_batching_dimensions(),
+        dimensions.input_batching_dimensions(),
         dimensions.scatter_indices_batching_dimensions(),
         dimensions.scatter_dimensions_to_operand_dimensions(),
         index_vector_dimension,
