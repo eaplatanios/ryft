@@ -113,6 +113,12 @@ impl<C: Context<Type = ArrayType, Value: Reverse>, P: ArrayExtentBatchingPolicy<
             .axes
             .normalize(inputs[0].unbatched_type().rank())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
+
+        // Identity reversal preserves the packed value and all ragged geometry without reindexing storage.
+        if axes.is_empty() {
+            return Ok(vec![inputs[0].clone()].into());
+        }
+
         if !inputs[0].ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("`{REVERSE_OPERATION_NAME}` does not support bounded ragged array inputs"),
@@ -162,6 +168,7 @@ impl_differentiable_operation! {
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
             match &outputs[0] {
+                MaybeZero::Value(_) if !accumulators[0].is_needed() => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     let contribution = MaybeZero::Value(
                         cotangent.reverse(operation.axes())?.unalign_cotangent(&inputs[0].r#type().cotangent()?)?,
@@ -180,7 +187,8 @@ impl_differentiable_operation! {
 /// exactly, including NaN payloads. An empty axis list returns the input unchanged. A non-empty reversal clears the
 /// physical layout, since its result may use different storage. This operation supports symbolic extents and is
 /// linear and self-adjoint. Batching preserves the mapped axis and reverses only the selected per-item axes.
-/// Bounded ragged batches are rejected because reversing their padded storage would move padding into valid data.
+/// Non-empty reversals of bounded ragged batches are rejected because reversing their padded storage would move
+/// padding into valid data. Empty axis lists preserve the ragged batch unchanged.
 ///
 /// # Example
 ///
@@ -262,12 +270,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, RaggedAxis, Shape,
+        StridedLayout,
+    };
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, TransposableOperation, TranspositionContext,
     };
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_transposition,
+        check_operation_transposition, check_operation_type_inference,
     };
+    use crate::partial::PartialValue;
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 
@@ -283,14 +298,23 @@ mod tests {
     fn test_reverse_type_inference() {
         let dimension = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![dimension]));
-        assert_eq!(ReverseOperation::new([-1]).infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![input]));
-        assert_eq!(
-            ReverseOperation::new([0, 0]).infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[]),
-            Err(TypeError::invalid("axes contain duplicate axis 0")),
+        check_operation_type_inference!(
+            operation = ReverseOperation::new([-1]),
+            cases = [{ input_types = [input.clone()], output_types = [input] }],
         );
-        assert_eq!(
-            ReverseOperation::new([1]).infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[]),
-            Err(TypeError::invalid("axis 1 is out of bounds for rank 1")),
+        check_operation_type_inference!(
+            operation = ReverseOperation::new([0, 0]),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                error = "axes contain duplicate axis 0",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReverseOperation::new([1]),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                error = "axis 1 is out of bounds for rank 1",
+            }],
         );
     }
 
@@ -302,7 +326,7 @@ mod tests {
         assert_eq!(input.reverse(Vec::<usize>::new()).unwrap(), input);
         assert_eq!(
             Array::vector(Vec::<i32>::new()).unwrap().reverse([0]).unwrap(),
-            Array::vector(Vec::<i32>::new()).unwrap()
+            Array::vector(Vec::<i32>::new()).unwrap(),
         );
 
         // Logical addressing preserves noncontiguous storage and exact floating-point encodings.
@@ -314,7 +338,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             input.reverse([1]).unwrap().storage_bytes(),
-            Array::matrix(2, 2, vec![values[1], values[0], values[3], values[2]]).unwrap().storage_bytes()
+            Array::matrix(2, 2, vec![values[1], values[0], values[3], values[2]]).unwrap().storage_bytes(),
         );
     }
 
@@ -346,11 +370,51 @@ mod tests {
             @exact,
             operation = ReverseOperation::new([-1]),
             axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]).unwrap())],
-            }],
+            cases = [
+                {
+                    inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                    outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]).unwrap())],
+                },
+                {
+                    inputs = [(@mapped(axis = 1), Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                    outputs = [(@mapped(axis = 1), Array::matrix(3, 2, vec![5.0, 6.0, 3.0, 4.0, 1.0, 2.0]).unwrap())],
+                },
+                {
+                    inputs = [(@mapped(axis = 1), Array::from_elements(
+                        ArrayType::new_static(DataType::F64, [1, 2, 3]),
+                        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    ).unwrap())],
+                    outputs = [(@mapped(axis = 1), Array::from_elements(
+                        ArrayType::new_static(DataType::F64, [1, 2, 3]),
+                        &[3.0, 2.0, 1.0, 6.0, 5.0, 4.0],
+                    ).unwrap())],
+                },
+                {
+                    inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]).unwrap())],
+                    outputs = [(@replicated, Array::vector(vec![3.0, 2.0, 1.0]).unwrap())],
+                },
+            ],
         );
+
+        // Only identity reversal can preserve ragged geometry without moving padded elements into valid data.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let input =
+            ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 0.0, 3.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2_i32, 1]).unwrap(), length, vec![0])])
+                .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
+        assert!(matches!(
+            ReverseOperation::new([0]).batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!("`{REVERSE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+        ));
+        let outputs = ReverseOperation::new(Vec::<usize>::new())
+            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs, vec![input]);
     }
 
     #[test]
@@ -365,6 +429,23 @@ mod tests {
                 tangent_outputs = [Array::vector(vec![6.0, 5.0, 4.0]).unwrap()],
             }],
         );
+
+        // Invoke the rule directly so the driver's zero-tangent shortcut cannot hide a materialized zero.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let dimension = DimensionVariable::new("length", DimensionBounds::unbounded());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dimension.into()]));
+        let input = context.input(input_type.clone());
+        let outputs = ReverseOperation::new([0])
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].tangent().is_zero());
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &input_type.tangent().unwrap());
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
     }
 
     #[test]
@@ -378,5 +459,35 @@ mod tests {
                 input_cotangents = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
             }],
         );
+
+        // Structural zeros and unrequested cotangents must not stage reversal or alignment instructions.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input_type = ArrayType::new_static(DataType::F64, [3]);
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let mut rule_context = TranspositionContext::new(context.clone());
+        let accumulators = rule_context.cotangent_accumulators(&inputs, &[]).unwrap();
+        ReverseOperation::new([0])
+            .transpose(
+                &mut rule_context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(input_type.cotangent().unwrap())],
+                &accumulators,
+            )
+            .unwrap();
+        let contributions = rule_context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(contributions.len(), 1);
+        assert!(contributions[0].is_zero());
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent().unwrap());
+        let accumulators = rule_context.cotangent_accumulators(&inputs, &[false]).unwrap();
+        let cotangent = context.input(input_type.cotangent().unwrap());
+        ReverseOperation::new([0])
+            .transpose(&mut rule_context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(cotangent)], &accumulators)
+            .unwrap();
+        let contributions = rule_context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(contributions.len(), 1);
+        assert!(contributions[0].is_zero());
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent().unwrap());
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 }
