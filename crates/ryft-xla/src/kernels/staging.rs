@@ -259,15 +259,9 @@ impl<Extension: Operation<Type = ArrayIrType> + Into<XlaKernelExtension>> From<K
     for XlaKernelOperation
 {
     fn from(operation: KernelOperation<Extension>) -> Self {
-        // This conversion only widens a supported family and cannot fail.
-        Self(
-            operation
-                .map_extension(|extension| match Into::<XlaKernelExtension>::into(extension) {
-                    #[cfg(feature = "mosaic-gpu")]
-                    extension @ XlaKernelExtension::Mosaic(_) => Ok(extension),
-                })
-                .unwrap(),
-        )
+        // This conversion only widens a supported family and cannot fail. Map the conversion over the result
+        // so it also works when no adapters are enabled and XlaKernelExtension has no inhabited variants.
+        Self(operation.map_extension(|extension| Ok(extension).map(Into::into)).unwrap())
     }
 }
 

@@ -29,7 +29,7 @@ pre-release-replacements = [
 
 [dependencies]
 ryft-core.workspace = true
-ryft-cuda = { workspace = true, optional = true }
+ryft-cuda.workspace = true
 ryft-macros.workspace = true
 ryft-mlir.workspace = true
 ryft-mosaic = { workspace = true, optional = true }

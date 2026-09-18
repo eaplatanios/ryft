@@ -21,24 +21,24 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
-use crate::operations::compare::{CompareOperation, ComparisonDirection};
+use crate::operations::compare::Compare;
 use crate::operations::constants::constant::DimensionConstant;
-use crate::operations::constants::iota::IotaOperation;
-use crate::operations::constants::one_like::OneLikeOperation;
+use crate::operations::constants::iota::{Iota, IotaOperation};
+use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::constants::zero_like::ZeroLikeOperation;
-use crate::operations::control_flow::select::SelectOperation;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
-use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
+use crate::operations::manipulation::broadcasting::Broadcast;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::gathering::{
-    GatherDimensionNumbers, GatherMode, GatherOperation, validate_unique_in_range,
+    Gather, GatherDimensionNumbers, GatherMode, GatherOperation, validate_unique_in_range,
 };
-use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape, ReshapeOperation};
+use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
-use crate::operations::math::div::DivOperation;
-use crate::operations::math::mul::MulOperation;
+use crate::operations::math::add::Add;
+use crate::operations::math::div::Div;
+use crate::operations::math::mul::Mul;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
@@ -482,7 +482,8 @@ impl ScatterOperation {
     /// unique-indices promise (each output element then comes from exactly one source). These are the scatters with
     /// direct linear derivative rules: their tangent is the same scatter of the tangents, and their transpose is a dual
     /// gather (plus, for [`ScatterReductionKind::Overwrite`], erasing the written windows of the input cotangent). The
-    /// other reduction kinds use coefficients computed from the primals and have no transpose.
+    /// other reduction kinds require primal-dependent derivative rules. Multiplication also has a partitioned
+    /// transpose when only the input is linear and the indices and updates are retained constants.
     #[inline]
     pub fn is_linear(&self) -> bool {
         self.kind == ScatterReductionKind::Add
@@ -578,154 +579,110 @@ impl ScatterOperation {
             .with_output_sharding(output_sharding))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Shares coefficient construction between homogeneous and projected differentiation. Coefficients depend only
-    /// on primals; the staged tangent graph uses ordinary linear gather/scatter and elementwise operations.
+    /// Linearizes a scatter, computing coefficients with primal values and applying them to tangent values only
+    /// after `primal_to_tangent` imports them into the tangent context. Value capabilities preserve the receiver's
+    /// context. `context` is used only for the nullary winner-ID construction.
+    ///
+    /// Structural-zero flags describe absent tangent contributions, not arrays whose numeric elements happen to be
+    /// zero. The caller materializes missing tangents using the appropriate static or retained runtime geometry.
     ///
     /// # Parameters
     ///
-    ///   - `contexts`: The primal context, in which coefficients are computed, and the tangent context, in which the
-    ///     linear tangent graph is staged.
-    ///   - `inputs`: The primal input, indices, and updates.
-    ///   - `primal`: The primal output of this scatter, which repeated overwrite replaces by its winner reconstruction.
-    ///   - `tangents`: The materialized input and update tangents, each paired with whether it is a structural zero so
-    ///     that inactive terms are omitted rather than multiplied by possibly nonfinite coefficients.
-    ///   - `primal_to_tangent`: Transfers a primal-context value across the differentiation boundary.
-    fn linearize_values<C>(
+    ///   - `context`: Primal context used to construct winner IDs for overlapping overwrite windows.
+    ///   - `inputs`: Primal input, integer indices, and updates, in operation input order.
+    ///   - `tangents`: Input and update tangents, each paired with whether it is a materialized structural zero.
+    ///   - `primal_to_tangent`: Imports primal coefficients and indices into the tangent context. It must retain
+    ///     their dependence on primal inputs so that subsequent differentiation can recover those dependencies.
+    fn linearize_values<
+        C: Context<
+                Type = ArrayType,
+                Value: ZeroLike
+                           + OneLike
+                           + Add
+                           + Mul
+                           + Div
+                           + Compare
+                           + Select
+                           + ConvertElementType
+                           + Broadcast
+                           + Reshape
+                           + Gather
+                           + Scatter,
+            > + Iota<C::Value>,
+        F: Fn(C::Value) -> Result<C::Value, ProgramError>,
+    >(
         &self,
-        contexts: (&C, &C),
+        context: &C,
         inputs: [&C::Value; 3],
-        primal: C::Value,
         tangents: [(&C::Value, bool); 2],
-        primal_to_tangent: impl Fn(C::Value) -> Result<C::Value, ProgramError>,
-    ) -> Result<(C::Value, C::Value), ProgramError>
-    where
-        C: Context<Type = ArrayType>,
-        C::Operation: From<IotaOperation<ArrayType>>
-            + From<ScatterOperation>
-            + From<GatherOperation>
-            + From<ZeroLikeOperation<ArrayType>>
-            + From<OneLikeOperation<ArrayType>>
-            + From<CompareOperation<ArrayType>>
-            + From<SelectOperation<ArrayType>>
-            + From<ConvertElementTypeOperation<ArrayType>>
-            + From<AddOperation<ArrayType>>
-            + From<MulOperation<ArrayType>>
-            + From<DivOperation<ArrayType>>
-            + From<ReshapeOperation>
-            + From<BroadcastOperation>,
-    {
-        let (context, tangent_context) = contexts;
-        let [input, indices, updates] = inputs;
-        let [(input_tangent, input_is_zero), (updates_tangent, updates_are_zero)] = tangents;
-        let bind = |context: &C, operation: C::Operation, inputs: &[C::Value]| {
-            let mut outputs = context.bind(operation, Vec::new(), inputs)?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok::<_, ProgramError>(outputs.remove(0))
-        };
-        let zero =
-            |context: &C, value: &C::Value| bind(context, ZeroLikeOperation::new().into(), std::slice::from_ref(value));
-        let one =
-            |context: &C, value: &C::Value| bind(context, OneLikeOperation::new().into(), std::slice::from_ref(value));
-        let add = |context: &C, lhs: &C::Value, rhs: &C::Value| {
-            bind(context, AddOperation::new().into(), &[lhs.clone(), rhs.clone()])
-        };
-        let mul = |context: &C, lhs: &C::Value, rhs: &C::Value| {
-            bind(context, MulOperation::new().into(), &[lhs.clone(), rhs.clone()])
-        };
-        let div = |context: &C, lhs: &C::Value, rhs: &C::Value| {
-            bind(context, DivOperation::new().into(), &[lhs.clone(), rhs.clone()])
-        };
-        let equal = |context: &C, lhs: &C::Value, rhs: &C::Value| {
-            bind(context, CompareOperation::new(ComparisonDirection::Equal).into(), &[lhs.clone(), rhs.clone()])
-        };
-        let convert = |context: &C, value: &C::Value, data_type: DataType| {
-            bind(context, ConvertElementTypeOperation::new(data_type, false).into(), std::slice::from_ref(value))
-        };
-        let select = |context: &C, condition: &C::Value, on_true: &C::Value, on_false: &C::Value| {
-            bind(context, SelectOperation::new().into(), &[condition.clone(), on_true.clone(), on_false.clone()])
-        };
-        let scatter = |context: &C, input: &C::Value, indices: &C::Value, updates: &C::Value, operation: &Self| {
-            bind(context, operation.clone().into(), &[input.clone(), indices.clone(), updates.clone()])
-        };
-        let gather = |context: &C, input: &C::Value, indices: &C::Value, operation: &GatherOperation| {
-            bind(context, operation.clone().into(), &[input.clone(), indices.clone()])
-        };
-        let align = |context: &C, value: &C::Value, target: &ArrayType| {
+        primal_to_tangent: F,
+    ) -> Result<(C::Value, C::Value), ProgramError> {
+        /// Aligns a value with the validated placement required by a derivative term, retaining its context. Equal
+        /// types need no operation; otherwise an identity-axis broadcast records the metadata conversion explicitly.
+        fn align_linearization_value<V: Value<Type = ArrayType> + Broadcast>(
+            value: &V,
+            target: &ArrayType,
+        ) -> Result<V, ProgramError> {
             if value.r#type().as_ref() == target {
                 Ok(value.clone())
             } else {
-                bind(
-                    context,
-                    BroadcastOperation::new(target.clone(), (0..target.rank()).collect()).into(),
-                    std::slice::from_ref(value),
-                )
+                value.broadcast(target.clone(), &(0..target.rank()).collect::<Vec<_>>())
             }
-        };
-        // An empty input has no destinations, so every update is inactive for every combiner. Preserve the input
-        // tangent and its requested result metadata without constructing a dual gather with an invalid size-one
-        // window along an empty axis.
-        if input.r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))? == Some(0) {
-            let tangent = align(tangent_context, input_tangent, &primal.r#type().tangent()?)?;
-            return Ok((primal, tangent));
         }
-        if self.is_linear() {
-            return Ok((
-                primal,
-                scatter(tangent_context, input_tangent, &primal_to_tangent(indices.clone())?, updates_tangent, self)?,
-            ));
-        }
-        let zeros = zero(tangent_context, input_tangent)?;
-        let mut additive = self.clone();
-        additive.kind = ScatterReductionKind::Add;
-        if self.kind() == ScatterReductionKind::Mul {
-            if !updates_are_zero && !self.unique_indices() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{SCATTER_OPERATION_NAME}` multiplication derivatives with respect to updates require \
-                         `unique_indices=true`"
-                    ),
-                });
-            }
-            // Omit structural-zero terms before multiplication so an inactive derivative never becomes `0 * inf`.
-            let input_contribution = if input_is_zero {
-                None
-            } else {
-                let coefficient = scatter(context, &one(context, input)?, indices, updates, self)?;
-                let input_tangent = align(tangent_context, input_tangent, coefficient.r#type().as_ref())?;
-                Some(mul(tangent_context, &input_tangent, &primal_to_tangent(coefficient)?)?)
-            };
-            let update_contribution = if updates_are_zero {
-                None
-            } else {
-                let updates =
-                    scatter(tangent_context, &zeros, &primal_to_tangent(indices.clone())?, updates_tangent, &additive)?;
-                let coefficient = align(context, input, updates.r#type().as_ref())?;
-                Some(mul(tangent_context, &primal_to_tangent(coefficient)?, &updates)?)
-            };
-            let tangent = match (input_contribution, update_contribution) {
-                (Some(input), Some(updates)) => add(tangent_context, &input, &updates)?,
-                (Some(value), None) | (None, Some(value)) => value,
-                (None, None) => zeros,
-            };
-            return Ok((primal, tangent));
-        }
-        let update_zeros = zero(tangent_context, updates_tangent)?;
-        let input_type = input.r#type();
-        let updates_type = updates.r#type();
-        let mut dual_gather = self.adjoint_gather_operation(
-            input_type.as_ref(),
-            updates_type.as_ref(),
-            updates_type.sharding().cloned(),
-        )?;
-        if self.kind() == ScatterReductionKind::Overwrite {
+
+        /// Selects a consistent winner for each overwritten element and reconstructs both primal and tangent from
+        /// those winners. Positive integer IDs distinguish updates from untouched input elements, whose ID is zero.
+        fn linearize_overwrite<
+            V: Value<Type = ArrayType>
+                + ZeroLike
+                + OneLike
+                + Add
+                + Compare
+                + Select
+                + ConvertElementType
+                + Broadcast
+                + Reshape
+                + Gather
+                + Scatter,
+            C: Context<Type = ArrayType, Value = V> + Iota<V>,
+            F: Fn(V) -> Result<V, ProgramError>,
+        >(
+            operation: &ScatterOperation,
+            context: &C,
+            inputs: [&V; 3],
+            tangents: [&V; 2],
+            primal_to_tangent: F,
+        ) -> Result<(V, V), ProgramError> {
+            let [input, indices, updates] = inputs;
+            let [input_tangent, updates_tangent] = tangents;
+            let input_type = input.r#type();
+            let updates_type = updates.r#type();
+            let output_type = operation
+                .infer_output_types(
+                    &[
+                        input_type.clone().into_owned(),
+                        indices.r#type().into_owned(),
+                        updates_type.clone().into_owned(),
+                    ],
+                    &[],
+                )?
+                .remove(0);
+            let zeros = input_tangent.zero_like()?;
+            let update_zeros = updates_tangent.zero_like()?;
+            let mut additive = operation.clone();
+            additive.kind = ScatterReductionKind::Add;
+            let mut dual_gather = operation.adjoint_gather_operation(
+                input_type.as_ref(),
+                updates_type.as_ref(),
+                updates_type.sharding().cloned(),
+            )?;
+
             // Distinct positive IDs select one winning update at each output element. Reconstruct both primal
             // and tangent from those same winners, since duplicate overwrite order is unspecified by the backend.
             let update_shape = updates_type.static_shape().ok_or_else(|| ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{SCATTER_OPERATION_NAME}` overwrite differentiation with repeated indices requires a static \
-                     update shape"
+                     update shape",
                 ),
             })?;
             let count =
@@ -734,91 +691,271 @@ impl ScatterOperation {
                 )?;
             if count == usize::MAX {
                 return Err(TypeError::invalid(format!(
-                    "`{SCATTER_OPERATION_NAME}` update IDs (the element count plus one) overflow `u64`"
+                    "`{SCATTER_OPERATION_NAME}` update IDs (the element count plus one) overflow `u64`",
                 ))
                 .into());
             }
+
             let id_type = ArrayType::new_static(DataType::U64, [count]).with_memory(updates_type.memory());
-            let mut ids = context.bind(IotaOperation::new(id_type, 0)?, Vec::new(), &[])?;
-            check_count!("output", ids, 1, ProgramError);
-            let ids = bind(context, ReshapeOperation::new(updates_type.shape().clone()).into(), &[ids.remove(0)])?;
-            let ids = add(context, &ids, &one(context, &ids)?)?;
+            let ids = context.iota(&id_type, 0)?.reshape(updates_type.shape().clone())?;
+            let ids = ids.add(&ids.one_like()?)?;
+
             // IDs are discrete selectors, so preserve their array placement while clearing data reduction state.
             let update_ids_type = updates_type.without_reduction_axes().with_data_type(DataType::U64).with_layout(None);
-            let ids = bind(
-                context,
-                BroadcastOperation::new(update_ids_type.clone(), (0..updates_type.rank()).collect()).into(),
-                &[ids],
-            )?;
-            let zero_ids = convert(context, &zero(context, input)?, DataType::U64)?;
+            let ids = ids.broadcast(update_ids_type.clone(), &(0..updates_type.rank()).collect::<Vec<_>>())?;
+            let zero_ids = input.zero_like()?.convert_element_type(DataType::U64)?;
             let input_ids_type = input_type.without_reduction_axes().with_data_type(DataType::U64).with_layout(None);
-            let zero_ids = bind(
-                context,
-                BroadcastOperation::new(input_ids_type, (0..input_type.rank()).collect()).into(),
-                &[zero_ids],
-            )?;
+            let zero_ids = zero_ids.broadcast(input_ids_type, &(0..input_type.rank()).collect::<Vec<_>>())?;
             let id_operation =
-                self.clone().with_output_sharding(primal.r#type().without_reduction_axes().sharding().cloned());
-            let scattered_ids = scatter(context, &zero_ids, indices, &ids, &id_operation)?;
+                operation.clone().with_output_sharding(output_type.without_reduction_axes().sharding().cloned());
+            let scattered_ids = zero_ids.scatter(
+                indices,
+                &ids,
+                id_operation.dimensions(),
+                id_operation.kind(),
+                id_operation.options(),
+            )?;
             dual_gather = dual_gather.with_output_sharding(update_ids_type.sharding().cloned());
-            if self.mode() == ScatterMode::Drop {
+
+            if operation.mode() == ScatterMode::Drop {
                 // A dropped window must not match any positive ID, so pin a zero fill instead of gather's default.
                 dual_gather = dual_gather.with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(0u64)?)) });
             }
-            let gathered_ids = gather(context, &scattered_ids, indices, &dual_gather)?;
-            let input_ids = align(context, &scattered_ids, zero_ids.r#type().as_ref())?;
-            let input_selected = equal(context, &input_ids, &zero_ids)?;
-            let update_selected = equal(context, &ids, &gathered_ids)?;
-            let primal_input = select(context, &input_selected, input, &zero(context, input)?)?;
-            let primal_updates = select(context, &update_selected, updates, &zero(context, updates)?)?;
-            let tangent_input = select(tangent_context, &primal_to_tangent(input_selected)?, input_tangent, &zeros)?;
-            let tangent_updates =
-                select(tangent_context, &primal_to_tangent(update_selected)?, updates_tangent, &update_zeros)?;
-            return Ok((
-                scatter(context, &primal_input, indices, &primal_updates, &additive)?,
-                scatter(
-                    tangent_context,
-                    &tangent_input,
+
+            let gathered_ids = scattered_ids.gather(
+                indices,
+                dual_gather.dimensions(),
+                dual_gather.slice_sizes(),
+                dual_gather.options(),
+            )?;
+
+            let input_ids = align_linearization_value(&scattered_ids, zero_ids.r#type().as_ref())?;
+            let input_selected = input_ids.equal(&zero_ids)?;
+            let update_selected = ids.equal(&gathered_ids)?;
+            let primal_input = V::select(&input_selected, input, &input.zero_like()?)?;
+            let primal_updates = V::select(&update_selected, updates, &updates.zero_like()?)?;
+            let tangent_input = V::select(&primal_to_tangent(input_selected)?, input_tangent, &zeros)?;
+            let tangent_updates = V::select(&primal_to_tangent(update_selected)?, updates_tangent, &update_zeros)?;
+
+            Ok((
+                primal_input.scatter(
+                    indices,
+                    &primal_updates,
+                    additive.dimensions(),
+                    additive.kind(),
+                    additive.options(),
+                )?,
+                tangent_input.scatter(
                     &primal_to_tangent(indices.clone())?,
                     &tangent_updates,
-                    &additive,
+                    additive.dimensions(),
+                    additive.kind(),
+                    additive.options(),
                 )?,
-            ));
+            ))
         }
-        // Each tied extremum receives equal weight, including the original input when it is also retained.
-        // Input masks use input placement even when the requested result placement differs.
-        let input_primal = align(context, &primal, input.r#type().as_ref())?;
-        let selected_input = equal(context, input, &input_primal)?;
-        // An untouched input is an identity edge even when it contains NaN and equality is false.
-        let references = scatter(context, &zero(context, input)?, indices, &one(context, updates)?, &additive)?;
-        let references = align(context, &references, input.r#type().as_ref())?;
-        let untouched = equal(context, &references, &zero(context, &references)?)?;
-        let selected_input = select(context, &untouched, &one(context, &selected_input)?, &selected_input)?;
-        // The dual gather keeps its default fill: NaN cannot match a floating-point update. Integer extremes can
-        // match integer updates, but integer tangents are structural zeros. Moreover, the count and numerator
-        // scatters below discard the same out-of-bounds windows, so dropped updates cannot affect the output tangent.
-        let targets = gather(context, &primal, indices, &dual_gather)?;
-        let selected_updates = equal(context, updates, &targets)?;
-        let input_count = convert(context, &selected_input, input_tangent.r#type().data_type())?;
-        let update_count = convert(context, &selected_updates, updates_tangent.r#type().data_type())?;
-        let count = scatter(context, &input_count, indices, &update_count, &additive)?;
-        // NaN extrema compare unequal to every source. No source receives a tangent at those locations.
-        let count = select(context, &equal(context, &count, &zero(context, &count)?)?, &one(context, &count)?, &count)?;
-        let selected_input_tangent =
-            select(tangent_context, &primal_to_tangent(selected_input)?, input_tangent, &zeros)?;
-        let selected_update_tangent =
-            select(tangent_context, &primal_to_tangent(selected_updates)?, updates_tangent, &update_zeros)?;
-        let numerator = scatter(
-            tangent_context,
-            &selected_input_tangent,
-            &primal_to_tangent(indices.clone())?,
-            &selected_update_tangent,
-            &additive,
-        )?;
-        // Normalize in the primal context so the linear region only multiplies by a constant coefficient.
-        // Multiplication also preserves the dual reduction state when this rule is transposed.
-        let coefficient = div(context, &one(context, &count)?, &count)?;
-        Ok((primal, mul(tangent_context, &numerator, &primal_to_tangent(coefficient)?)?))
+
+        /// Computes the product rule without forming an intermediate product of all updates. Input tangents pass
+        /// through the multiply scatter itself. Update tangents are multiplied only at their actual destinations.
+        /// The latter term requires non-overlapping windows. Structural-zero terms are omitted before multiplication.
+        fn linearize_multiplication<
+            V: Value<Type = ArrayType>
+                + ZeroLike
+                + OneLike
+                + Add
+                + Mul
+                + Compare
+                + Select
+                + ConvertElementType
+                + Broadcast
+                + Scatter,
+            F: Fn(V) -> Result<V, ProgramError>,
+        >(
+            operation: &ScatterOperation,
+            inputs: [&V; 3],
+            tangents: [(&V, bool); 2],
+            primal_to_tangent: F,
+        ) -> Result<V, ProgramError> {
+            let [input, indices, updates] = inputs;
+            let [(input_tangent, input_is_zero), (updates_tangent, updates_are_zero)] = tangents;
+            if !updates_are_zero && !operation.unique_indices() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{SCATTER_OPERATION_NAME}` multiplication derivatives with respect to updates require \
+                         `unique_indices=true`"
+                    ),
+                });
+            }
+
+            // Some element types use a wider tangent representation (e.g., `F8E8M0FNU` uses `F32`). Form factors
+            // and masks in that representation, which also supplies the zero missing from the primal format.
+            let factors = updates.convert_element_type(input_tangent.r#type().data_type())?;
+            let tangent_indices = primal_to_tangent(indices.clone())?;
+            let input_contribution = if input_is_zero {
+                None
+            } else {
+                // Multiplying a tiny tangent by large updates sequentially can remain finite even when their product
+                // alone overflows. Retain that evaluation order instead of multiplying by `scatter(ones, updates)`.
+                Some(input_tangent.scatter(
+                    &tangent_indices,
+                    &primal_to_tangent(factors.clone())?,
+                    operation.dimensions(),
+                    operation.kind(),
+                    operation.options(),
+                )?)
+            };
+
+            let update_contribution = if updates_are_zero {
+                None
+            } else {
+                // Mark the destinations without a dual gather as dynamic windows and possibly empty inserted axes
+                // can be scattered even when their geometry cannot be represented by a static gather window.
+                let input = input.convert_element_type(updates_tangent.r#type().data_type())?;
+                let touched = input.zero_like()?.scatter(
+                    indices,
+                    &factors.one_like()?,
+                    operation.dimensions(),
+                    ScatterReductionKind::Add,
+                    operation.options(),
+                )?;
+                let untouched = touched.equal(&touched.zero_like()?)?;
+                let coefficient = align_linearization_value(&input, touched.r#type().as_ref())?;
+                let coefficient = V::select(&untouched, &touched.zero_like()?, &coefficient)?;
+
+                // Mask before multiplying as an untouched infinity must not be multiplied by a scattered zero.
+                // This mask depends only on the primal indices and crosses the boundary as a retained coefficient.
+                let scattered_tangent = input_tangent.zero_like()?.scatter(
+                    &tangent_indices,
+                    updates_tangent,
+                    operation.dimensions(),
+                    ScatterReductionKind::Add,
+                    operation.options(),
+                )?;
+                Some(scattered_tangent.mul(&primal_to_tangent(coefficient)?)?)
+            };
+
+            match (input_contribution, update_contribution) {
+                (Some(input), Some(updates)) => input.add(&updates),
+                (Some(value), None) | (None, Some(value)) => Ok(value),
+                (None, None) => input_tangent.zero_like(),
+            }
+        }
+
+        /// Averages the tangents of all sources equal to the selected extremum, including the original input.
+        /// Untouched inputs retain their identity edge even for NaNs; touched NaN extrema receive zero tangents.
+        fn linearize_extremum<
+            V: Value<Type = ArrayType>
+                + ZeroLike
+                + OneLike
+                + Mul
+                + Div
+                + Compare
+                + Select
+                + ConvertElementType
+                + Broadcast
+                + Gather
+                + Scatter,
+            F: Fn(V) -> Result<V, ProgramError>,
+        >(
+            operation: &ScatterOperation,
+            inputs: [&V; 3],
+            primal: &V,
+            tangents: [&V; 2],
+            primal_to_tangent: F,
+        ) -> Result<V, ProgramError> {
+            let [input, indices, updates] = inputs;
+            let [input_tangent, updates_tangent] = tangents;
+            let zeros = input_tangent.zero_like()?;
+            let update_zeros = updates_tangent.zero_like()?;
+            let mut additive = operation.clone();
+            additive.kind = ScatterReductionKind::Add;
+            let dual_gather = operation.adjoint_gather_operation(
+                input.r#type().as_ref(),
+                updates.r#type().as_ref(),
+                updates.r#type().sharding().cloned(),
+            )?;
+
+            // Each tied extremum receives equal weight, including the original input when it is also retained.
+            // Input masks use input placement even when the requested result placement differs.
+            let input_primal = align_linearization_value(primal, input.r#type().as_ref())?;
+            let selected_input = input.equal(&input_primal)?;
+
+            // An untouched input is an identity edge even when it contains NaN and equality is false.
+            let references = input.zero_like()?.scatter(
+                indices,
+                &updates.one_like()?,
+                additive.dimensions(),
+                additive.kind(),
+                additive.options(),
+            )?;
+            let references = align_linearization_value(&references, input.r#type().as_ref())?;
+            let untouched = references.equal(&references.zero_like()?)?;
+            let selected_input = V::select(&untouched, &selected_input.one_like()?, &selected_input)?;
+
+            // The dual gather keeps its default fill as NaN cannot match a floating-point update. Integer extremes
+            // can match integer updates, but integer tangents are structural zeros. Moreover, the count and numerator
+            // scatters below discard the same out-of-bounds windows, so dropped updates cannot affect the output
+            // tangent.
+            let targets =
+                primal.gather(indices, dual_gather.dimensions(), dual_gather.slice_sizes(), dual_gather.options())?;
+            let selected_updates = updates.equal(&targets)?;
+            let input_count = selected_input.convert_element_type(input_tangent.r#type().data_type())?;
+            let update_count = selected_updates.convert_element_type(updates_tangent.r#type().data_type())?;
+            let count = input_count.scatter(
+                indices,
+                &update_count,
+                additive.dimensions(),
+                additive.kind(),
+                additive.options(),
+            )?;
+
+            // NaN extrema compare unequal to every source. No source receives a tangent at those locations.
+            let count = V::select(&count.equal(&count.zero_like()?)?, &count.one_like()?, &count)?;
+            let selected_input_tangent = V::select(&primal_to_tangent(selected_input)?, input_tangent, &zeros)?;
+            let selected_update_tangent =
+                V::select(&primal_to_tangent(selected_updates)?, updates_tangent, &update_zeros)?;
+            let numerator = selected_input_tangent.scatter(
+                &primal_to_tangent(indices.clone())?,
+                &selected_update_tangent,
+                additive.dimensions(),
+                additive.kind(),
+                additive.options(),
+            )?;
+
+            // Normalize in the primal context so the linear region only multiplies by a constant coefficient.
+            // Multiplication also preserves the dual reduction state when this rule is transposed.
+            let coefficient = count.one_like()?.div(&count)?;
+            numerator.mul(&primal_to_tangent(coefficient)?)
+        }
+
+        let [input, indices, updates] = inputs;
+        let [(input_tangent, _), (updates_tangent, _)] = tangents;
+        let empty = input.r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))? == Some(0);
+
+        // Duplicate overwrites reconstruct the primal from the same winners as the tangent. Do not stage an independent
+        // data scatter first as its unspecified winners need not agree and its result would be discarded.
+        if !empty && self.kind() == ScatterReductionKind::Overwrite && !self.unique_indices() {
+            return linearize_overwrite(&self, context, inputs, [input_tangent, updates_tangent], primal_to_tangent);
+        }
+
+        let primal = input.scatter(indices, updates, self.dimensions(), self.kind(), self.options())?;
+        let tangent = if empty {
+            align_linearization_value(input_tangent, &primal.r#type().tangent()?)?
+        } else if self.is_linear() {
+            input_tangent.scatter(
+                &primal_to_tangent(indices.clone())?,
+                updates_tangent,
+                self.dimensions(),
+                self.kind(),
+                self.options(),
+            )?
+        } else if self.kind() == ScatterReductionKind::Mul {
+            linearize_multiplication(&self, inputs, tangents, primal_to_tangent)?
+        } else {
+            linearize_extremum(&self, inputs, &primal, [input_tangent, updates_tangent], primal_to_tangent)?
+        };
+
+        Ok((primal, tangent))
     }
 }
 
@@ -886,6 +1023,7 @@ impl Operation for ScatterOperation {
 impl_reference_dischargeable_operation!(@reference_free ScatterOperation);
 
 impl<C: Domain<Type = ArrayType, Value: Scatter>> InterpretableOperation<C> for ScatterOperation {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -897,19 +1035,14 @@ impl<C: Domain<Type = ArrayType, Value: Scatter>> InterpretableOperation<C> for 
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of
-// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScatterOperation where
     C::Operation: From<ScatterOperation>
 {
 }
 
-// Lift window and batching dimensions to carry one leading mapped axis. The input and updates acquire that axis;
-// mapped indices use an explicit paired batching dimension, while replicated indices keep it in the update window.
-impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ScatterOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ScatterOperation
 where
-    C: Context<Type = ArrayType>,
-    C::Value: Broadcast + Transpose,
     ScatterOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -918,6 +1051,9 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Lift window and batching dimensions to carry one leading mapped axis. The input and updates acquire that
+        // axis. Mapped indices use an explicit paired batching dimension, while replicated indices keep it in the
+        // update window.
         check_count!("input", inputs, 3, ProgramError);
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(ProgramError::UnsupportedOperation {
@@ -925,9 +1061,11 @@ where
             }
             .into());
         }
+
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         }
+
         let axis_dimension = P::axis_dimension(context)?;
         for input in inputs {
             if let Some(axis) = input.batch_axis_position()
@@ -935,15 +1073,17 @@ where
             {
                 return Err(BatchingError::MisalignedBatchAxes {
                     message: format!(
-                        "`{SCATTER_OPERATION_NAME}` mapped input extent {} does not match batching extent \
-                         {axis_dimension}",
+                        "`{}` mapped input extent {} does not match batching extent {}",
+                        SCATTER_OPERATION_NAME,
                         input.r#type().dimension(axis),
+                        axis_dimension,
                     ),
                 });
             }
         }
-        // Every mapped item needs an independent input and update. Matching the leading axis broadcasts
-        // replicated values without constructing an intermediate zero array, including for empty batches.
+
+        // Every mapped item needs an independent input and update. Matching the leading axis broadcasts replicated
+        // values without constructing an intermediate zero array, including for empty batches.
         let input = P::match_axis(context, &inputs[0], Axis::from(0))?;
         let updates = P::match_axis(context, &inputs[2], Axis::from(0))?;
         let dimensions = self.dimensions();
@@ -979,8 +1119,9 @@ where
                 .with_batching_dimensions(input_batching_dimensions, indices_batching_dimensions),
             )
         };
-        // The index promises stay valid in both cases: with replicated indices every item writes into its own slice of
-        // the new leading window axis, and with mapped indices the paired batching axes keep every item's windows
+
+        // The index promises stay valid in both cases. With replicated indices every item writes into its own slice
+        // of the new leading window axis, and with mapped indices the paired batching axes keep every item's windows
         // within its own input, so windows that were disjoint stay disjoint.
         let operation = Self::new(lifted_dimensions, self.kind())
             .with_mode(self.mode())
@@ -993,6 +1134,7 @@ where
                     })
                     .transpose()?,
             );
+
         Ok(operation
             .interpret_with_batch_axes(context, &[input, indices, updates], &[BatchAxis::from_position(0)])?
             .into())
@@ -1003,21 +1145,19 @@ impl_differentiable_operation! {
     ScatterOperation,
     jvp<C>
     where
-        C: Context<Type = ArrayType> + Zero<C::Value>,
-        C::Operation: From<IotaOperation<ArrayType>>
-            + From<ScatterOperation>
-            + From<GatherOperation>
-            + From<ZeroLikeOperation<ArrayType>>
-            + From<OneLikeOperation<ArrayType>>
-            + From<CompareOperation<ArrayType>>
-            + From<SelectOperation<ArrayType>>
-            + From<ConvertElementTypeOperation<ArrayType>>
-            + From<AddOperation<ArrayType>>
-            + From<MulOperation<ArrayType>>
-            + From<DivOperation<ArrayType>>
-            + From<ReshapeOperation>
-            + From<BroadcastOperation>,
-        C::Value: Scatter,
+        C: Context<Type = ArrayType> + Zero<C::Value> + Iota<C::Value>,
+        C::Value: ZeroLike
+            + OneLike
+            + Add
+            + Mul
+            + Div
+            + Compare
+            + Select
+            + ConvertElementType
+            + Broadcast
+            + Reshape
+            + Gather
+            + Scatter,
     {
         |operation, context, _driver, inputs| {
             // Coefficients are constructed in the primal context and transferred through the differentiation boundary
@@ -1027,30 +1167,26 @@ impl_differentiable_operation! {
             let input = &inputs[0];
             let indices = inputs[1].primal();
             let updates = &inputs[2];
-            let mut primal = input.primal().scatter(
-                indices,
-                updates.primal(),
-                operation.dimensions(),
-                operation.kind(),
-                operation.options(),
-            )?;
-            let tangent = if input.tangent().is_zero() && updates.tangent().is_zero() {
-                MaybeZero::Zero(primal.r#type().tangent()?)
+            let (primal, tangent) = if input.tangent().is_zero() && updates.tangent().is_zero() {
+                let primal = input.primal().scatter(
+                    indices,
+                    updates.primal(),
+                    operation.dimensions(),
+                    operation.kind(),
+                    operation.options(),
+                )?;
+                let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
+                (primal, tangent)
             } else {
                 let input_tangent = input.tangent().clone().materialize(context.tangent())?;
                 let updates_tangent = updates.tangent().clone().materialize(context.tangent())?;
-                let (linearized_primal, tangent) = operation.linearize_values(
-                    (context.primal(), context.tangent()),
+                let (primal, tangent) = operation.linearize_values(
+                    context.primal(),
                     [input.primal(), indices, updates.primal()],
-                    primal.clone(),
                     [(&input_tangent, input.tangent().is_zero()), (&updates_tangent, updates.tangent().is_zero())],
                     |value| context.primal_to_tangent(value).map_err(ProgramError::from),
                 )?;
-                // The winner-ID rule also defines the primal overwrite choice.
-                if operation.kind() == ScatterReductionKind::Overwrite && !operation.unique_indices() {
-                    primal = linearized_primal;
-                }
-                MaybeZero::Value(tangent)
+                (primal, MaybeZero::Value(tangent))
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -1065,24 +1201,50 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Partition-aware transpose rule for the primal [`ScatterOperation`] with an
-            // [`Add`](ScatterReductionKind::Add) combiner. The integer index input (input 1) has no tangent space, so
-            // in a valid pushforward it is the known input while the scattered input (input 0) and the updates (input
-            // 2) are the linear ones. Scatter-add accumulates into its input (`output = input + scattered(updates)`, so
-            // the input Jacobian is the identity), so the input cotangent is the output cotangent unchanged; the update
-            // cotangent gathers the output cotangent at the scattered windows via the dual gather built by mirroring
-            // the scatter geometry. The transpose reads the known indices from the pullback boundary and stages an
-            // ordinary [`GatherOperation`], so linearization retains the indices as regular SSA residuals. The indices
-            // receive a structural zero, and a zero output cotangent stays a structural zero. Unique-index overwrite
-            // erases the input cotangent at the written windows; other combiners are rejected.
+            // For the partition-aware transpose rule for the primal `ScatterOperation` with a
+            // `ScatterReductionKind::Add` reduction, the integer index input (i.e., input 1) has no tangent space, so
+            // in a valid pushforward it is the known input while the scattered input (i.e., input 0) and the updates
+            // (i.e., input 2) are the linear ones. Scatter-add accumulates into its input (i.e., `output = input +
+            // scattered(updates)`, and so the input Jacobian is the identity), so the input cotangent is the output
+            // cotangent unchanged. The update cotangent gathers the output cotangent at the scattered windows via the
+            // dual gather built by mirroring the scatter geometry. The transpose reads the known indices from the
+            // pullback boundary and stages an ordinary `GatherOperation`, so linearization retains the indices as
+            // regular Single Static Assignment (SSA) residuals. The indices receive a structural zero, and a zero
+            // output cotangent stays a structural zero. Unique-index overwrite erases the input cotangent at the
+            // written windows. Multiply scatter also has a linear partition when only its base is unknown and both
+            // indices and updates are retained constants.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 3, DifferentiationError);
-            // A structural-zero output cotangent contributes nothing for every combiner. Untouched accumulators
+
+            // A structural-zero output cotangent contributes nothing for every reduction. Untouched accumulators
             // default to structural zeros when the transposition context collects its cotangents.
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 return Ok(());
             };
+
+            // Multiply scatter is linear in the base when its indices and updates are retained constants. Its Jacobian
+            // is diagonal and so applying the same factors to the output cotangent computes the base cotangent without
+            // first forming a potentially overflowing product. No update cotangent is needed for this partition; update
+            // derivatives are separately linearized through gather and scatter-add.
+            if operation.kind() == ScatterReductionKind::Mul && inputs[2].as_known().is_some() {
+                if accumulators[0].is_needed() {
+                    let indices = inputs[1].as_known().ok_or_else(|| {
+                        TypeError::invalid(format!("`{SCATTER_OPERATION_NAME}` transpose requires known indices"))
+                    })?;
+                    let updates = inputs[2].as_known().unwrap();
+                    let mut contributions = context.stage_operation(
+                        operation.clone().with_output_sharding(inputs[0].r#type().cotangent()?.sharding().cloned()),
+                        Vec::new(),
+                        &[cotangent.clone(), indices.clone(), updates.clone()],
+                    )?;
+                    check_count!("output", contributions, 1, ProgramError);
+                    let contribution = contributions.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
+                    accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
+                }
+                return Ok(());
+            }
+
             if !operation.is_linear() {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
@@ -1093,8 +1255,9 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            // Empty inputs have no writable locations, including in clipping mode. The base keeps its
-            // identity edge and update cotangents remain structural zeros; no size-one gather is valid here.
+
+            // Empty inputs have no writable locations, including in clipping mode. The base keeps its identity edge
+            // and update cotangents remain structural zeros; no size-one gather is valid here.
             let element_count =
                 inputs[0].r#type().element_count().map_err(|error| TypeError::invalid(error.to_string()))?;
             if element_count == Some(0) {
@@ -1104,6 +1267,7 @@ impl_differentiable_operation! {
                 }
                 return Ok(());
             }
+
             if accumulators[0].is_needed() {
                 let contribution = if operation.kind() == ScatterReductionKind::Overwrite {
                     // Unique replacement windows erase the input tangent exactly where updates are written.
@@ -1127,10 +1291,12 @@ impl_differentiable_operation! {
                 let contribution = contribution.unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
                 accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
             }
+
             // Only the update input needs a gather; the base input's cotangent is the seed itself.
             if !accumulators[2].is_needed() {
                 return Ok(());
             }
+
             // The indices are the known input: an integer type has no tangent space, so a valid pullback never
             // routes them as the linear input.
             let indices = inputs[1]
@@ -1145,12 +1311,16 @@ impl_differentiable_operation! {
                 updates_type.as_ref(),
                 updates_type.cotangent()?.sharding().cloned(),
             )?;
+
             // Dropped updates have zero derivative, independent of gather's default replacement value.
             if operation.mode() == ScatterMode::Drop {
                 gather_operation = gather_operation.with_mode(GatherMode::Fill {
-                    value: Some(Box::new(EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?)),
+                    value: Some(Box::new(
+                        EagerContext::<Array>::new().zero(&ArrayType::scalar(cotangent.r#type().data_type()))?,
+                    )),
                 });
             }
+
             let update_cotangents =
                 context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
             check_count!("output", update_cotangents, 1, ProgramError);
@@ -1164,29 +1334,32 @@ impl_differentiable_operation! {
     },
 }
 
-// Mixed input extents require missing tangents to be materialized from their primal runtime geometry. Coefficient
-// construction remains shared with the homogeneous rule, with ordinary projected operations retaining residuals.
-impl<C> MemberDifferentiableOperation<C> for ScatterOperation
+impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> MemberDifferentiableOperation<C> for ScatterOperation
 where
-    C: Context<Type = ArrayIrType> + Zero<C::Value>,
+    C::Value: ValueProjection<
+            ArrayType,
+            Projected: Value<Type = ArrayType>
+                           + ZeroLike
+                           + OneLike
+                           + Add
+                           + Mul
+                           + Div
+                           + Compare
+                           + Select
+                           + ConvertElementType
+                           + Broadcast
+                           + Reshape
+                           + Gather
+                           + Scatter,
+        >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation> + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<IotaOperation<ArrayType>>
-        + From<ScatterOperation>
-        + From<GatherOperation>
-        + From<ZeroLikeOperation<ArrayType>>
-        + From<OneLikeOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<SelectOperation<ArrayType>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<AddOperation<ArrayType>>
-        + From<MulOperation<ArrayType>>
-        + From<DivOperation<ArrayType>>
-        + From<ReshapeOperation>
-        + From<BroadcastOperation>
-        + From<ZeroOperation<ArrayType>>,
+    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+        + OperationProjection<
+            ArrayType,
+            Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                           + From<IotaOperation<ArrayType>>
+                           + From<ScatterOperation>,
+        >,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1194,6 +1367,9 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Mixed input extents require missing tangents to be materialized from their primal runtime geometry.
+        // Coefficient construction remains shared with the homogeneous rule, with ordinary projected operations
+        // retaining residuals.
         let destinations = context;
         let [input, _, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() }.into());
@@ -1209,29 +1385,28 @@ where
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primal_outputs = destinations.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let mut output_primal = primal_outputs.remove(0);
-        let tangent_primal = destinations.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
         let updates = &tangent_inputs[2];
         let tangent_context = destinations.tangent();
-        let tangent = if input.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(tangent_primal.r#type().tangent()?)
+        let (output_primal, tangent) = if input.tangent().is_zero() && updates.tangent().is_zero() {
+            let mut outputs = destinations.primal().bind(operation, Vec::new(), &primal_inputs)?;
+            check_count!("output", outputs, 1, ProgramError);
+            let primal = outputs.remove(0);
+            let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
+            (primal, tangent)
         } else {
             let projected_context = ProjectedContext::<C, ArrayType>::new(tangent_context.clone());
             let input_tangent = materialize_array_tangent(&projected_context, input)?;
             let updates_tangent = materialize_array_tangent(&projected_context, updates)?;
             let primal_context = ProjectedContext::<C, ArrayType>::new(destinations.primal().clone());
             let (linearized_primal, tangent) = self.linearize_values(
-                (&primal_context, &projected_context),
+                &primal_context,
                 [
                     &<_ as ValueProjection<ArrayType>>::into_projected(primal_inputs[0].clone())?,
                     &<_ as ValueProjection<ArrayType>>::into_projected(primal_inputs[1].clone())?,
                     &<_ as ValueProjection<ArrayType>>::into_projected(primal_inputs[2].clone())?,
                 ],
-                <_ as ValueProjection<ArrayType>>::into_projected(output_primal.clone())?,
                 [(&input_tangent, input.tangent().is_zero()), (&updates_tangent, updates.tangent().is_zero())],
                 |value| {
                     let value = destinations
@@ -1239,14 +1414,17 @@ where
                     Ok(<_ as ValueProjection<ArrayType>>::into_projected(value)?)
                 },
             )?;
-            if self.kind() == ScatterReductionKind::Overwrite && !self.unique_indices() {
-                output_primal = <C::Value as ValueProjection<ArrayType>>::from_projected(linearized_primal);
-            }
-            MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::from_projected(tangent))
+            (
+                <C::Value as ValueProjection<ArrayType>>::from_projected(linearized_primal),
+                MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::from_projected(tangent)),
+            )
         };
+
         Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Combines update windows with an array at positions supplied by an integer index array.
 ///
@@ -1255,8 +1433,11 @@ where
 /// All three values must reside in the same memory space. The output preserves the input shape, element type,
 /// layout, and memory placement. Its placement normally follows the input and includes any additional manual-axis
 /// variation introduced by indices or updates; an explicit output placement must preserve reduction and manual-axis
-/// state and use the same mesh. Input and update reduction states must match; unreduced inputs support additive or
-/// overwrite updates with replicated, invariant indices.
+/// state and use the same mesh. Input and update reduction states normally must match, with unreduced data supporting
+/// additive or overwrite updates. Multiplication also permits unreduced input contributions when the updates are
+/// reduced over those axes: applying the same factors to each contribution commutes with their pending sum. Other
+/// nonlinear updates do not support unreduced inputs. Indices must be replicated and invariant whenever the data
+/// carries reduction state.
 ///
 /// Negative starts are out of bounds and do not wrap from an axis end. Clip mode moves the entire update window
 /// inside the input; fill-or-drop mode discards a whole invalid window. Empty inputs remain empty. Repeated updates
@@ -1626,13 +1807,22 @@ impl Scatter for ArrayType {
         let reduced_axes = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
         let updates_unreduced = updates.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
         let updates_reduced = updates.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-        if unreduced_axes != updates_unreduced || reduced_axes != updates_reduced {
+        // Multiplication is linear in the base when its factors are invariant across each pending reduction.
+        // In particular, the transpose of a reduced multiply-scatter scales unreduced cotangent contributions
+        // by reduced retained updates. Summing those scaled contributions gives the same result as scaling the sum.
+        let linear_multiplication = kind == ScatterReductionKind::Mul
+            && updates_unreduced.is_empty()
+            && updates_reduced == reduced_axes.union(&unreduced_axes).cloned().collect();
+        if !linear_multiplication && (unreduced_axes != updates_unreduced || reduced_axes != updates_reduced) {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input and updates must have matching reduction state"
             ))
             .into());
         }
-        if !unreduced_axes.is_empty() && !matches!(kind, ScatterReductionKind::Add | ScatterReductionKind::Overwrite) {
+        if !linear_multiplication
+            && !unreduced_axes.is_empty()
+            && !matches!(kind, ScatterReductionKind::Add | ScatterReductionKind::Overwrite)
+        {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` nonlinear reductions do not support unreduced inputs"
             ))
@@ -1757,15 +1947,18 @@ impl Scatter for ArrayType {
 impl Array {
     /// Applies one already-validated scatter using a byte-slice combiner, keeping index traversal independent of the
     /// selected element arithmetic. The combiner receives one mutable input encoding and one update encoding.
-    fn scatter_with_combiner(
+    fn scatter_with_combiner<F>(
         &self,
         indices: &Self,
         updates: &Self,
         output_type: ArrayType,
         dimensions: &ScatterDimensionNumbers,
         mode: ScatterMode,
-        combine: impl Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
-    ) -> Result<Self, ProgramError> {
+        combine: F,
+    ) -> Result<Self, ProgramError>
+    where
+        F: Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
+    {
         let input_shape = self.r#type().static_shape().unwrap();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         // No update can address an element of an empty input, even in clipping mode.
@@ -3984,6 +4177,113 @@ mod tests {
         assert_eq!(input_gradient.to_f64s(), vec![0.0, 3.0]);
         assert_eq!(updates_gradient.to_f64s(), vec![2.0, 5.0]);
 
+        // An untouched nonfinite base has no update derivative. Multiplying after scattering the tangent would
+        // incorrectly evaluate infinity times zero at element 0; masking the coefficient keeps that edge absent.
+        let (primal, tangent) = differentiate_at(Array::vector(vec![3.0]).unwrap())
+            .jvp(Array::vector(vec![1.0]).unwrap(), |updates| {
+                let input = updates.context().lift(Array::vector(vec![f64::INFINITY, 2.0]).unwrap())?;
+                let indices = index_array(&updates, vec![1, 1], vec![1]);
+                input.scatter(
+                    &indices,
+                    &updates,
+                    &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                    ScatterReductionKind::Mul,
+                    &ScatterOptions::new().with_unique_indices(true),
+                )
+            })
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![f64::INFINITY, 6.0]);
+        assert_eq!(tangent.to_f64s(), vec![0.0, 2.0]);
+
+        // A tiny input tangent stays finite as the large factors are applied. Their standalone product overflows,
+        // so the linear region must retain multiply-scatter rather than factor out a product of the updates.
+        let (primal, tangent) = differentiate_at(Array::vector(vec![1e-300]).unwrap())
+            .jvp(Array::vector(vec![1e-300]).unwrap(), |input| {
+                let indices = index_array(&input, vec![2, 1], vec![0, 0]);
+                let updates = input.context().lift(Array::vector(vec![1e200, 1e200]).unwrap())?;
+                input.scatter(
+                    &indices,
+                    &updates,
+                    &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                    ScatterReductionKind::Mul,
+                    &ScatterOptions::new(),
+                )
+            })
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![1e100]);
+        assert_eq!(tangent.to_f64s(), vec![1e100]);
+
+        // Reverse mode likewise applies retained factors to the seed before they can overflow on their own.
+        let (_, gradient) = differentiate_at(Array::vector(vec![1e-300]).unwrap())
+            .value_and_gradient(|input| {
+                let indices = index_array(&input, vec![2, 1], vec![0, 0]);
+                let updates = input.context().lift(Array::vector(vec![1e200, 1e200]).unwrap()).unwrap();
+                let output = input
+                    .scatter(
+                        &indices,
+                        &updates,
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Mul,
+                        &ScatterOptions::new(),
+                    )
+                    .unwrap();
+                let scale = output.context().lift(Array::vector(vec![1e-300]).unwrap()).unwrap();
+                output.mul(&scale).unwrap().reduce(&[0], ReductionKind::Sum)
+            })
+            .unwrap();
+        assert_eq!(gradient.to_f64s(), vec![1e100]);
+
+        // The zero-less exponent-only format uses F32 tangents. Both retained factors and the touched mask
+        // must use that wider representation; the primal remains encoded in its original element format.
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Mul)
+                .with_unique_indices(true);
+        let outputs = operation
+            .jvp(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(
+                        Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80]).unwrap(),
+                        MaybeZero::Value(Array::vector(vec![3.0_f32]).unwrap()),
+                    )
+                    .unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::matrix(1, 1, vec![0_i32]).unwrap()).unwrap(),
+                    DifferentiationDual::new(
+                        Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x81]).unwrap(),
+                        MaybeZero::Value(Array::vector(vec![5.0_f32]).unwrap()),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            outputs[0].primal(),
+            &Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x82]).unwrap()
+        );
+        assert_eq!(outputs[0].tangent().as_value(), Some(&Array::vector(vec![22.0_f32]).unwrap()));
+
+        // The retained factors remain differentiable under forward-over-reverse. Scattering a value into itself
+        // multiplicatively is x squared, so its gradient at 3 is 6 and the derivative of that gradient is 2.
+        let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f64]).unwrap())
+            .jvp(Array::vector(vec![1.0_f64]).unwrap(), |input| {
+                let seed = input.context().lift(Array::vector(vec![1.0_f64]).unwrap())?;
+                let (_, pullback) = differentiate_at(input).vjp(|input| {
+                    let indices = index_array(&input, vec![1, 1], vec![0]);
+                    input.scatter(
+                        &indices,
+                        &input,
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Mul,
+                        &ScatterOptions::new().with_unique_indices(true),
+                    )
+                })?;
+                pullback.apply(seed)
+            })
+            .unwrap();
+        assert_eq!(gradient, Array::vector(vec![6.0_f64]).unwrap());
+        assert_eq!(tangent, Array::vector(vec![2.0_f64]).unwrap());
+
         // Forward mode through `f(x) = scatter_add(x, [[1], [3]], [10, 20])` exercises the captured-index scatter-add
         // under batched basis tangents. Scatter-add is the identity in its input, so the Jacobian with respect to the
         // input is the identity matrix.
@@ -4623,37 +4923,34 @@ mod tests {
                 lambda %0:f64[4], %1:f64[2] .
                 let %2:f64[4] = zero_like %0
                     %3:u64[4] = convert_element_type [data_type=u64] %2
-                    %4:u64[4] = broadcast [output_type=u64[4], output_axes=[0]] %3
-                    %5:i32[2, 1] = const [[1], [1]]
-                    %6:u64[2] = iota [type=u64[2], dimension=0]
-                    %7:u64[2] = reshape [shape=[2]] %6
-                    %8:u64[2] = one_like %7
-                    %9:u64[2] = add %7 %8
-                    %10:u64[2] = broadcast [output_type=u64[2], output_axes=[0]] %9
-                    %11:u64[4] = scatter [
+                    %4:i32[2, 1] = const [[1], [1]]
+                    %5:u64[2] = iota [type=u64[2], dimension=0]
+                    %6:u64[2] = one_like %5
+                    %7:u64[2] = add %5 %6
+                    %8:u64[4] = scatter [
                         kind=overwrite,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
+                    operand_batching=[], scatter_indices_batching=[]),
                         indices_are_sorted=true,
-                    ] %4 %5 %10
-                    %12:bool[4] = compare [direction=Equal] %11 %4
-                    %13:f64[4] = zero_like %0
-                    %14:f64[4] = select %12 %0 %13
-                    %15:u64[2] = gather [
+                    ] %3 %4 %7
+                    %9:bool[4] = compare [direction=Equal] %8 %3
+                    %10:f64[4] = zero_like %0
+                    %11:f64[4] = select %9 %0 %10
+                    %12:u64[2] = gather [
                         dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
                         slice_sizes=[1],
                         indices_are_sorted=true,
-                    ] %11 %5
-                    %16:bool[2] = compare [direction=Equal] %10 %15
-                    %17:f64[2] = zero_like %1
-                    %18:f64[2] = select %16 %1 %17
-                    %19:f64[4] = scatter [
+                    ] %8 %4
+                    %13:bool[2] = compare [direction=Equal] %7 %12
+                    %14:f64[2] = zero_like %1
+                    %15:f64[2] = select %13 %1 %14
+                    %16:f64[4] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
+                    operand_batching=[], scatter_indices_batching=[]),
                         indices_are_sorted=true,
-                    ] %14 %5 %18
-                in (%19, %12, %16)
+                    ] %11 %4 %15
+                in (%16, %9, %13)
             "}
             .trim_end(),
         );
@@ -4705,8 +5002,8 @@ mod tests {
             ),
         );
 
-        // Multiplication: the input coefficient is the scatter of the updates into ones and the update coefficient is
-        // the input itself, so no gather is needed until the pullback reads the update cotangents back.
+        // Multiplication retains the updates for the input tangent and masks untouched input coefficients for the
+        // update tangent. No gather is needed until the pullback reads the update cotangents back.
         let program = constant_index_scatter_program(
             ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Mul).with_unique_indices(true),
             input_type.clone(),
@@ -4722,35 +5019,45 @@ mod tests {
                     %3:f64[4] = scatter [
                         kind=mul,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
+                    operand_batching=[], scatter_indices_batching=[]),
                         unique_indices=true,
                     ] %0 %2 %1
-                    %4:f64[4] = one_like %0
-                    %5:f64[4] = scatter [
-                        kind=mul,
+                    %4:f64[4] = zero_like %0
+                    %5:f64[2] = one_like %1
+                    %6:f64[4] = scatter [
+                        kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
+                    operand_batching=[], scatter_indices_batching=[]),
                         unique_indices=true,
-                    ] %4 %2 %1
-                in (%3, %5, %0)
+                    ] %4 %2 %5
+                    %7:f64[4] = zero_like %6
+                    %8:bool[4] = compare [direction=Equal] %6 %7
+                    %9:f64[4] = zero_like %6
+                    %10:f64[4] = select %8 %9 %0
+                in (%3, %1, %10)
             "}
             .trim_end(),
         );
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f64[4], %1:f64[2], %2:f64[4], %3:f64[4] .
-                let %4:f64[4] = mul %0 %2
-                    %5:f64[4] = zero_like %0
-                    %6:i32[2, 1] = const [[1], [3]]
+                lambda %0:f64[4], %1:f64[2], %2:f64[2], %3:f64[4] .
+                let %4:i32[2, 1] = const [[1], [3]]
+                    %5:f64[4] = scatter [
+                        kind=mul,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                    operand_batching=[], scatter_indices_batching=[]),
+                        unique_indices=true,
+                    ] %0 %4 %2
+                    %6:f64[4] = zero_like %0
                     %7:f64[4] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
-                            operand_batching=[], scatter_indices_batching=[]),
+                    operand_batching=[], scatter_indices_batching=[]),
                         unique_indices=true,
-                    ] %5 %6 %1
-                    %8:f64[4] = mul %3 %7
-                    %9:f64[4] = add %4 %8
+                    ] %6 %4 %1
+                    %8:f64[4] = mul %7 %3
+                    %9:f64[4] = add %5 %8
                 in (%9)
             "}
             .trim_end(),
@@ -4758,7 +5065,7 @@ mod tests {
         assert_eq!(
             linearization.pullback().unwrap().to_string(),
             indoc! {"
-                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                lambda %0:f64[4], %1:f64[2], %2:f64[4] .
                 let %3:f64[4] = mul %2 %0
                     %4:i32[2, 1] = const [[1], [3]]
                     %5:f64[2] = gather [
@@ -4766,7 +5073,12 @@ mod tests {
                         slice_sizes=[1],
                         unique_indices=true,
                     ] %3 %4
-                    %6:f64[4] = mul %1 %0
+                    %6:f64[4] = scatter [
+                        kind=mul,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                    operand_batching=[], scatter_indices_batching=[]),
+                        unique_indices=true,
+                    ] %0 %4 %1
                 in (%6, %5)
             "}
             .trim_end(),
@@ -5213,7 +5525,7 @@ mod tests {
     fn test_scatter_differentiation_batched_dynamic_extent_nonlinear() {
         // The nonlinear rules compose with the same batched geometry. The extremal rule reads each update's target
         // back through the shared dual gather, which takes the zero batching window over the possibly-empty extent,
-        // while the product rule never builds a gather and only exercises the batched scatter itself.
+        // while the product rule marks touched destinations through scatter and retains the multiplicative updates.
         let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
         let items_type = DimensionType::new(items.clone());
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
@@ -5329,8 +5641,8 @@ mod tests {
             ),
         );
 
-        // Multiplication scales one element per row, so its input coefficient is the batched scatter of the updates
-        // into ones and its update cotangent gathers the input times the cotangent.
+        // Multiplication applies the retained updates to input tangents and cotangents. Its update cotangent
+        // gathers the output cotangent weighted by the masked input coefficients.
         let multiply = ScatterOperation::new(dimensions, ScatterReductionKind::Mul).with_unique_indices(true);
         let linearization = jointly_mapped_dynamic_scatter_program(items, 0, multiply)
             .linearize_with_respect_to(&[1, 3])
@@ -5381,6 +5693,30 @@ mod tests {
             .unwrap_err(),
             expected,
         );
+
+        // Multiplication's forward rule needs only scatter geometry, so it also supports the possibly empty
+        // inserted axis. The update pullback still has the pre-existing dual-gather restriction tested above.
+        let extent = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
+        let linearization = constant_index_scatter_program(
+            ScatterOperation::new(dimensions.clone(), ScatterReductionKind::Mul)
+                .with_unique_indices(true)
+                .with_mode(ScatterMode::Drop),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])),
+            indices.clone(),
+            updates_type.clone(),
+        )
+        .linearize()
+        .unwrap();
+        let empty = ArrayIrValue::Array(Array::vector(Vec::<f64>::new()).unwrap());
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![empty.clone(), ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap())])
+            .unwrap();
+        assert_eq!(primal_outputs[0], empty);
+        let mut tangent_inputs = vec![empty.clone(), ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0]).unwrap())];
+        tangent_inputs.extend(primal_outputs.split_off(1));
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![empty]));
+        assert_eq!(linearization.pullback().unwrap_err(), expected);
 
         // A positive guaranteed minimum extent admits the one-element collapsed window.
         let nonempty = DimensionVariable::new("items", DimensionBounds::new(4, Some(9)).unwrap());
@@ -5507,6 +5843,45 @@ mod tests {
                     Array::from_elements(updates_type.cotangent().unwrap(), &[20.0_f64, 40.0]).unwrap(),
                 ),
             ]),
+        );
+
+        // Reduced factors scale unreduced cotangents without losing the pending sum. This exercises the
+        // partitioned multiply-scatter transpose, including the full types of both returned cotangents.
+        let multiply =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Mul)
+                .with_unique_indices(true);
+        let linearization =
+            constant_index_scatter_program(multiply, input_type.clone(), indices.clone(), updates_type.clone())
+                .linearize()
+                .unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![input.clone(), updates.clone()]).unwrap();
+        assert_eq!(
+            primal_outputs[0],
+            ArrayIrValue::Array(Array::from_elements(input_type.clone(), &[1.0_f64, 20.0, 3.0, 80.0]).unwrap(),)
+        );
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![input_tangent.clone(), updates_tangent.clone()];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayIrValue::Array(
+                Array::from_elements(input_type.tangent().unwrap(), &[1.0_f64, 30.0, 3.0, 104.0]).unwrap(),
+            )])
+        );
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.output_types(), expected_cotangent_types);
+        let mut pullback_inputs = vec![cotangent.clone()];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            pullback.interpret(pullback_inputs),
+            Ok(vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(input_type.cotangent().unwrap(), &[10.0_f64, 200.0, 30.0, 800.0]).unwrap()
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements(updates_type.cotangent().unwrap(), &[40.0_f64, 160.0]).unwrap()
+                ),
+            ])
         );
 
         // The minimum keeps the input at both targets (2 < 10 and 4 < 20), so the updates receive nothing.
