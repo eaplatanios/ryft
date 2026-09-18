@@ -1541,21 +1541,21 @@ fn infer_reshape_output_type(
 
                         let input_group_start = input_start;
                         let output_group_start = output_start;
-                        let mut input_product = static_positive_size(&input_dimensions[input_start].1)?;
-                        let mut output_product = static_positive_size(&output_dimensions[output_start].1)?;
+                        let mut input_product = static_positive_dimension_size(&input_dimensions[input_start].1)?;
+                        let mut output_product = static_positive_dimension_size(&output_dimensions[output_start].1)?;
                         input_start += 1;
                         output_start += 1;
                         while input_product != output_product {
                             if input_product < output_product {
                                 let (_, size) = input_dimensions.get(input_start).ok_or_else(alignment_error)?;
                                 input_product = input_product
-                                    .checked_mul(static_positive_size(size)?)
+                                    .checked_mul(static_positive_dimension_size(size)?)
                                     .ok_or_else(alignment_error)?;
                                 input_start += 1;
                             } else {
                                 let (_, size) = output_dimensions.get(output_start).ok_or_else(alignment_error)?;
                                 output_product = output_product
-                                    .checked_mul(static_positive_size(size)?)
+                                    .checked_mul(static_positive_dimension_size(size)?)
                                     .ok_or_else(alignment_error)?;
                                 output_start += 1;
                             }
@@ -1590,7 +1590,7 @@ fn infer_reshape_output_type(
                         // Each axis must divide its factor.
                         let mut mesh_axis_index = 0usize;
                         for (output_axis, size) in &output_dimensions[output_group_start..output_start] {
-                            let mut remaining = static_positive_size(size)?;
+                            let mut remaining = static_positive_dimension_size(size)?;
                             let start = mesh_axis_index;
                             while remaining > 1 && mesh_axis_index < mesh_axes.len() {
                                 let mesh_axis = &mesh_axes[mesh_axis_index];
@@ -1672,13 +1672,11 @@ fn infer_dynamic_reshape_output_type(
     infer_reshape_output_type(input, output_shape, requested_sharding)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the positive static value of `size` for split/merge factorization.
-fn static_positive_size(size: &Dimension) -> Result<usize, TypeError> {
+fn static_positive_dimension_size(size: &Dimension) -> Result<usize, TypeError> {
     size.value().filter(|value| *value > 0).ok_or_else(|| {
         TypeError::invalid(format!(
-            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
+            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions",
         ))
     })
 }
@@ -1876,6 +1874,7 @@ mod tests {
     fn test_reshape_type_inference() {
         let shape = Shape::new(vec![2.into(), 3.into()]);
         let operation = ReshapeOperation::new(shape.clone());
+
         // Type inference validates the element count and returns the target shape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
         let output_type = ArrayType::new(DataType::F64, shape.clone());
@@ -1954,6 +1953,7 @@ mod tests {
         let shape = Shape::new(vec![2.into(), 3.into()]);
         let operation = ReshapeOperation::new(shape.clone());
         let output_type = ArrayType::new(DataType::F64, shape);
+
         // Interpretation reinterprets the row-major payload under the target shape.
         let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
@@ -2009,6 +2009,7 @@ mod tests {
             .unwrap();
         assert_eq!(*removed[0].r#type(), ArrayType::new_static(DataType::F64, [3, 4]));
         assert_eq!(removed[0].to_f64s(), input.to_f64s());
+
         // A permutation is applied before the singleton change, and a non-singleton mismatch still reports the
         // type-level rejection rather than refining.
         let permuted = ReshapeOperation::new(Shape::new(vec![4.into(), 1.into(), rows.clone()]))
@@ -2028,7 +2029,7 @@ mod tests {
             ),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension inputs for a dynamic output shape that \
-                 does not only insert or remove singleton axes"
+                 does not only insert or remove singleton axes",
             )))),
         );
     }
@@ -2238,7 +2239,7 @@ mod tests {
             BatchingError::UnsupportedOperation {
                 message: format!(
                     "`{RESHAPE_OPERATION_NAME}` with a dynamic mapped extent requires using a dynamic reshape \
-                     operation and explicit result-dimension inputs"
+                     operation and explicit result-dimension inputs",
                 ),
             },
         );
@@ -2533,7 +2534,7 @@ mod tests {
             input.reshape(Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension inputs for a dynamic output shape that \
-                 does not only insert or remove singleton axes"
+                 does not only insert or remove singleton axes",
             )))),
         );
         assert!(trace.builder().borrow().instructions().is_empty());
@@ -2558,37 +2559,37 @@ mod tests {
         assert_eq!(
             input.reshape_to_sizes(&[-1, -1]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension"
+                "`{RESHAPE_OPERATION_NAME}` accepts at most one inferred `-1` dimension",
             )))),
         );
         assert_eq!(
             input.reshape_to_sizes(&[-2]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`"
+                "`{RESHAPE_OPERATION_NAME}` dimensions must be nonnegative or the inferred size `-1`",
             )))),
         );
         assert_eq!(
             input.reshape_to_sizes(&[4, -1]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count"
+                "`{RESHAPE_OPERATION_NAME}` inferred dimension does not divide the input element count",
             )))),
         );
         assert_eq!(
             input.reshape_to_sizes(&[5]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` output element count 5 differs from input element count 6"
+                "`{RESHAPE_OPERATION_NAME}` output element count 5 differs from input element count 6",
             )))),
         );
         assert_eq!(
             input.reshape_to_sizes(&[isize::MAX; 3]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`"
+                "`{RESHAPE_OPERATION_NAME}` output element count does not fit in `usize`",
             )))),
         );
         assert_eq!(
             Array::vector(Vec::<i32>::new()).unwrap().reshape_to_sizes(&[0, -1]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero"
+                "cannot infer a `{RESHAPE_OPERATION_NAME}` dimension when another output dimension is zero",
             )))),
         );
         let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
@@ -2598,7 +2599,7 @@ mod tests {
         assert_eq!(
             ArrayType::new(DataType::F32, dynamic).reshape_to_sizes(&[-1]),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count"
+                "`{RESHAPE_OPERATION_NAME}` size inference requires a known input element count",
             )))),
         );
     }
@@ -2863,7 +2864,7 @@ mod tests {
         // when a static singleton is inserted or removed at the same time.
         let dynamic_output_error = format!(
             "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension inputs for a dynamic output shape that does \
-             not only insert or remove singleton axes"
+             not only insert or remove singleton axes",
         );
         assert_eq!(
             input_type.reshape(Shape::new(vec![Dimension::Dynamic(columns.clone()), Dimension::Dynamic(rows.clone())])),
@@ -3053,9 +3054,9 @@ mod tests {
                 .unwrap()),
         );
 
-        // A requested sharding is validated against the sharding contract (rank, mesh, mesh-axis kinds, and
-        // reduction and manual-axis state) independently of the split/merge inference. A merge that inference rejects
-        // as non-contiguous, and a split whose factor the mesh axis does not divide, are both accepted when the caller
+        // A requested sharding is validated against the sharding contract (rank, mesh, mesh-axis kinds, and reduction
+        // and manual-axis state) independently of the split/merge inference. A merge that inference rejects as
+        // non-contiguous, and a split whose factor the mesh axis does not divide, are both accepted when the caller
         // states the placement explicitly, because the requested placement is the caller's own contract.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let non_contiguous_input =
@@ -3071,7 +3072,7 @@ mod tests {
         assert_eq!(
             non_contiguous_input.reshape(Shape::new(vec![Dimension::Static(8)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
+                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge",
             )))),
         );
         let merged_requested = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3088,7 +3089,7 @@ mod tests {
         assert_eq!(
             odd_input.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
+                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors",
             )))),
         );
         let odd_requested =
@@ -3149,7 +3150,7 @@ mod tests {
         assert_eq!(
             sharded_dynamic_input.reshape(Shape::new(vec![Dimension::Static(0)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape",
             )))),
         );
         let zero_requested = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3209,14 +3210,14 @@ mod tests {
             input_type.reshape(Shape::new(vec![Dimension::Static(8)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding to place the sharded singleton input \
-                 axis 0 in the output"
+                 axis 0 in the output",
             )))),
         );
         assert_eq!(
             input_type.reshape(Shape::new(vec![Dimension::Static(8), Dimension::Static(1), Dimension::Static(1)])),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding to place the sharded singleton input \
-                 axis 0 in the output"
+                 axis 0 in the output",
             )))),
         );
 
@@ -3243,7 +3244,7 @@ mod tests {
             ])),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding to place the sharded singleton input \
-                 axis 0 in the output"
+                 axis 0 in the output",
             )))),
         );
         assert_eq!(
@@ -3330,7 +3331,7 @@ mod tests {
         ];
         assert_eq!(
             operation.with_input_types(&input_types).unwrap().to_string(),
-            "reshape [requires_runtime_assertion=false]"
+            "reshape [requires_runtime_assertion=false]",
         );
 
         // The requested output sharding renders after the assertion requirement and
@@ -3417,6 +3418,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
+
         // The proof must not survive reuse with independent dynamic identities. Explicit replication lets the
         // count-proof diagnostic be reached before sharding inference for the unrelated identity.
         let other = DimensionType::new(DimensionVariable::new("other", DimensionBounds::new(1, Some(9)).unwrap()));
@@ -3446,6 +3448,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = DynamicReshapeOperation::new(),
             cases = [
@@ -3467,6 +3470,7 @@ mod tests {
                 },
             ],
         );
+
         assert_eq!(operation.effects().classes(), EffectClasses::NONE);
         assert_eq!(
             DynamicReshapeOperation::new().effects().classes(),
@@ -5458,7 +5462,7 @@ mod tests {
         assert_eq!(
             infer_reshape_output_type(&input, Shape::new(vec![8.into()]), Some(&requested)),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding rank (2) does not match the output rank (1)"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding rank (2) does not match the output rank (1)",
             ))),
         );
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -5468,7 +5472,7 @@ mod tests {
         assert_eq!(
             infer_reshape_output_type(&input, output_shape.clone(), Some(&other_requested)),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh",
             ))),
         );
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -5477,7 +5481,7 @@ mod tests {
         assert_eq!(
             infer_reshape_output_type(&unsharded_input, output_shape.clone(), Some(&auto_requested)),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes",
             ))),
         );
         assert_eq!(
@@ -5487,7 +5491,7 @@ mod tests {
                 Some(&requested.clone().with_unreduced_axes(["r"]).unwrap()),
             ),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the unreduced mesh axes"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the unreduced mesh axes",
             ))),
         );
         assert_eq!(
@@ -5497,7 +5501,7 @@ mod tests {
                 Some(&requested.clone().with_reduced_axes(["r"]).unwrap()),
             ),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the reduced mesh axes"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the reduced mesh axes",
             ))),
         );
         assert_eq!(
@@ -5507,7 +5511,7 @@ mod tests {
                 Some(&requested.with_varying_manual_axes(["m"]).unwrap()),
             ),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes"
+                "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes",
             ))),
         );
     }
@@ -5557,7 +5561,7 @@ mod tests {
         assert_eq!(
             infer(vec![0.into(), 4.into(), 2.into()], vec![0.into(), 2.into()], &middle_sharding),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape",
             ))),
         );
         let dynamic_sharding = Sharding::new(
@@ -5572,7 +5576,7 @@ mod tests {
                 &dynamic_sharding,
             ),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions",
             ))),
         );
         assert_eq!(
@@ -5582,7 +5586,7 @@ mod tests {
                 &dynamic_sharding,
             ),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions",
             ))),
         );
     }
@@ -5634,20 +5638,20 @@ mod tests {
         assert_eq!(
             infer(vec![2.into(), 4.into()], vec![8.into()], &suffix_sharding),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
+                "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge",
             ))),
         );
         let unconstrained_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap();
         assert_eq!(
             infer(vec![8.into()], vec![2.into(), 4.into()], &unconstrained_sharding),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions"
+                "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions",
             ))),
         );
         assert_eq!(
             infer(vec![6.into()], vec![3.into(), 2.into()], &split_sharding),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
+                "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors",
             ))),
         );
         // A trailing unit-size mesh axis still needs placement after all output factors are exhausted.
@@ -5661,7 +5665,7 @@ mod tests {
         assert_eq!(
             infer(vec![4.into()], vec![2.into(), 2.into()], &unit_sharding),
             Err(TypeError::invalid(format!(
-                "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions"
+                "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions",
             ))),
         );
     }
