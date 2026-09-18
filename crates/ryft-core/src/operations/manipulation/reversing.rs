@@ -175,14 +175,12 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Reverses element order along selected axes, retaining shape, element type, sharding, and memory placement.
-/// Negative axes count from the end; duplicate or out-of-range axes are errors. Reversal preserves element bytes
-/// exactly, including NaN payloads. An empty axis list returns the input unchanged. A nonempty reversal clears the
+/// Negative axes count from the end, and duplicate or out-of-range axes are errors. Reversal preserves element bytes
+/// exactly, including NaN payloads. An empty axis list returns the input unchanged. A non-empty reversal clears the
 /// physical layout, since its result may use different storage. This operation supports symbolic extents and is
-/// linear and self-adjoint. Batching preserves the mapped axis and reverses only the selected per-item axes;
-/// bounded ragged batches are rejected because reversing their padded storage would move padding into valid data.
+/// linear and self-adjoint. Batching preserves the mapped axis and reverses only the selected per-item axes.
+/// Bounded ragged batches are rejected because reversing their padded storage would move padding into valid data.
 ///
 /// # Example
 ///
@@ -218,16 +216,18 @@ impl Reverse for Array {
         let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
+
         // Empty arrays and structural-zero arrays have no bytes to copy, even for enormous logical shapes.
         if bytes.is_empty() {
             return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
         }
+
         let mut output_index = vec![0; output_type.rank()];
         let mut input_index = output_index.clone();
         for output_flat in 0..output_addressing.element_count() {
             input_index.copy_from_slice(&output_index);
             for &axis in &axes {
-                // Nonempty storage guarantees a positive extent on each axis. Addressing maps logical coordinates
+                // Non-empty storage guarantees a positive extent on each axis. Addressing maps logical coordinates
                 // to physical bytes, so reversal also works for noncontiguous input layouts.
                 input_index[axis] = output_type.dimension(axis).value().unwrap() - 1 - output_index[axis];
             }
@@ -235,6 +235,7 @@ impl Reverse for Array {
                 .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             output_addressing.advance_index(&mut output_index);
         }
+
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
@@ -258,7 +259,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use pretty_assertions::assert_eq;
+
     use crate::arrays::{
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
     };
@@ -266,7 +268,8 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition,
     };
-    use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[test]
     fn test_reverse() {
@@ -280,7 +283,7 @@ mod tests {
     fn test_reverse_type_inference() {
         let dimension = Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()));
         let input = ArrayType::new(DataType::F32, Shape::new(vec![dimension]));
-        assert_eq!(ReverseOperation::new([-1]).infer_output_types(&[input.clone()], &[]), Ok(vec![input]));
+        assert_eq!(ReverseOperation::new([-1]).infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![input]));
         assert_eq!(
             ReverseOperation::new([0, 0]).infer_output_types(&[ArrayType::new_static(DataType::F32, [2])], &[]),
             Err(TypeError::invalid("axes contain duplicate axis 0")),
@@ -301,6 +304,7 @@ mod tests {
             Array::vector(Vec::<i32>::new()).unwrap().reverse([0]).unwrap(),
             Array::vector(Vec::<i32>::new()).unwrap()
         );
+
         // Logical addressing preserves noncontiguous storage and exact floating-point encodings.
         let values = [f32::from_bits(0x7fc00123), -0.0, 1.0, 2.0];
         let input = Array::from_elements(
@@ -318,36 +322,61 @@ mod tests {
     fn test_reverse_partial_evaluation() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let expected = Array::vector(vec![3.0, 2.0, 1.0]).unwrap();
-        check_operation_partial_evaluation!(backend = (Array, ArrayOperation<Array>), operation = ReverseOperation::new([0]), cases = [
-            { inputs = [(@known, input.clone())], outputs = [(@known, expected.clone())], residual_instructions = 0, },
-            { inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))], outputs = [(@residual, expected)], residual_instructions = 1, },
-        ],);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ReverseOperation::new([0]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
     }
 
     #[test]
     fn test_reverse_batching() {
-        check_operation_batching!(@exact, operation = ReverseOperation::new([-1]), axis_size = 2, cases = [{
-            inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
-            outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]).unwrap())],
-        }],);
+        check_operation_batching!(
+            @exact,
+            operation = ReverseOperation::new([-1]),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]).unwrap())],
+            }],
+        );
     }
 
     #[test]
     fn test_reverse_differentiation() {
-        check_operation_differentiation!(@approx(step = 0.125, epsilon = 1e-9), operation = ReverseOperation::new([0]), cases = [{
-            primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
-            tangents = [Array::vector(vec![4.0, 5.0, 6.0]).unwrap()],
-            primal_outputs = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
-            tangent_outputs = [Array::vector(vec![6.0, 5.0, 4.0]).unwrap()],
-        }],);
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = ReverseOperation::new([0]),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![4.0, 5.0, 6.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![6.0, 5.0, 4.0]).unwrap()],
+            }],
+        );
     }
 
     #[test]
     fn test_reverse_transposition() {
-        check_operation_transposition!(@exact, operation = ReverseOperation::new([0]), cases = [{
-            inputs = [(@linear(type = ArrayType::new_static(DataType::F64, [3])))],
-            output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
-            input_cotangents = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
-        }],);
+        check_operation_transposition!(
+            @exact,
+            operation = ReverseOperation::new([0]),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new_static(DataType::F64, [3])))],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
+            }],
+        );
     }
 }
