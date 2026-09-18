@@ -48,16 +48,11 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this.
-
 /// Canonical operation name for [`SliceOperation`].
 pub const SLICE_OPERATION_NAME: &str = "slice";
 
 /// [`Operation`] that extracts a (possibly strided) sub-array from its input using static start, limit, and stride
 /// values. Refer to the documentation of [`Slice`] for more information.
-///
-/// Its [`MemberTransposableOperation`] rule can add the cotangent directly into a slice of an enclosing reference
-/// accumulator. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SliceOperation {
     /// Refer to the documentation of [`start_indices`](Self::start_indices) for more information.
@@ -71,8 +66,8 @@ pub struct SliceOperation {
 }
 
 impl SliceOperation {
-    /// Creates a new [`SliceOperation`] with the provided start and limit indices and unit strides. Use
-    /// [`with_strides`](Self::with_strides) to attach non-unit strides.
+    /// Creates a new [`SliceOperation`] with the provided start and limit indices and unit strides.
+    /// Use [`with_strides`](Self::with_strides) to attach non-unit strides.
     #[inline]
     pub fn new(start_indices: Vec<usize>, limit_indices: Vec<usize>) -> Self {
         let strides = vec![1; start_indices.len()];
@@ -93,7 +88,7 @@ impl SliceOperation {
         }
         if let Some(axis) = strides.iter().position(|stride| *stride == 0) {
             return Err(TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis {axis} has stride 0"
+                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis {axis} has stride 0",
             ))
             .into());
         }
@@ -140,11 +135,13 @@ impl Operation for SliceOperation {
         input_types: &[ArrayType],
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("region", region_interfaces, 0, TypeError);
         check_count!("input", input_types, 1, TypeError);
-        let result =
-            input_types[0].slice(self.start_indices.as_slice(), self.limit_indices.as_slice(), self.strides.as_slice());
-        match result {
+        check_count!("region", region_interfaces, 0, TypeError);
+        match input_types[0].slice(
+            self.start_indices.as_slice(),
+            self.limit_indices.as_slice(),
+            self.strides.as_slice(),
+        ) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError::invalid(error.to_string())),
@@ -166,6 +163,7 @@ impl Operation for SliceOperation {
 impl_reference_dischargeable_operation!(@reference_free SliceOperation);
 
 impl<C: Domain<Type = ArrayType, Value: Slice>> InterpretableOperation<C> for SliceOperation {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -197,8 +195,8 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        // Batching rule for [`SliceOperation`]: a batched input keeps its batch axis by slicing it fully, so the lifted
-        // operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
+        // A batched input keeps its batch axis by slicing it fully, so the lifted operation inserts start index `0`,
+        // limit `axis_size`, and stride `1` at the batch axis position.
         reject_ragged_inputs(SLICE_OPERATION_NAME, inputs)?;
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
@@ -220,6 +218,8 @@ where
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl_differentiable_operation! {
     SliceOperation,
