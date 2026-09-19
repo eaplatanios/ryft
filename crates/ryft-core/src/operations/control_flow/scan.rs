@@ -4828,12 +4828,12 @@ mod tests {
                 lambda %0:f32[], %1:f32[3] .
                 let %2:f32[3] = zero [type=f32[3]]
                     %3:ref<f32[3]> = reference_new %2
-                    reference_add_update %3 %1
+                    () = reference_add_update %3 %1
                     %4:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                             let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
-                                reference_add_update %3 %1
+                                () = reference_add_update %3 %1
                                 %4:f32[] = reference_read %3
                                 %5:f32[] = add %1 %4
                             in (%5)
@@ -6335,7 +6335,7 @@ mod tests {
                             let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
                                 %4:f32[] = reference_read %3
                                 %5:f32[] = add %1 %4
-                                reference_write %3 %5
+                                () = reference_write %3 %5
                             in (%5)
                         },
                     ]
@@ -6659,7 +6659,7 @@ mod tests {
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
                             let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
-                                reference_add_update %3 %1
+                                () = reference_add_update %3 %1
                                 %4:f32[] = reference_read %3
                                 %5:f32[] = add %1 %4
                             in (%5)
@@ -6711,8 +6711,8 @@ mod tests {
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:ref<f32[3]>, %4:ref<f32[3]> .
                             let %5:ref<f32[]> = reference_dynamic_index [axis=0] %3 %0
                                 %6:ref<f32[]> = reference_dynamic_index [axis=0] %4 %0
-                                reference_add_update %5 %1
-                                reference_add_update %6 %2
+                                () = reference_add_update %5 %1
+                                () = reference_add_update %6 %2
                                 %7:f32[] = reference_read %5
                                 %8:f32[] = reference_read %6
                                 %9:f32[] = add %1 %7
@@ -7981,7 +7981,7 @@ mod tests {
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:ref<f32[3, 2]> .
                             let %4:ref<f32[2]> = reference_dynamic_index [axis=0] %3 %0
-                                reference_add_update %4 %2
+                                () = reference_add_update %4 %2
                                 %5:f32[2] = reference_read %4
                                 %6:f32[2] = add %2 %5
                             in (%1, %6)

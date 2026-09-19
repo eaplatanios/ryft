@@ -4474,9 +4474,9 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[3], %2:ref<f64[5]> .
                 let %3:ref<f64[3]> = reference_slice [axes=[ArraySliceAxis { start: 2, size: 3, stride: 1 }]] %2
-                    reference_add_update %3 %1
+                    () = reference_add_update %3 %1
                     %4:ref<f64[3]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 3, stride: 1 }]] %2
-                    reference_add_update %4 %0
+                    () = reference_add_update %4 %0
                 in ()
             "}
             .trim_end(),
@@ -6499,7 +6499,7 @@ mod tests {
                     %4:f64[2] = dynamic_slice [sizes=[2]] %3 %2
                     %5:f64[2] = add %4 %0
                     %6:f64[5] = dynamic_update_slice %3 %5 %2
-                    reference_write %1 %6
+                    () = reference_write %1 %6
                 in ()
             "}
             .trim_end(),

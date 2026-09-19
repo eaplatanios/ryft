@@ -672,7 +672,7 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = zero [type=f32[]]
                     %2:ref<f32[]> = reference_new %1
-                    reference_add_update %2 %0
+                    () = reference_add_update %2 %0
                     %3:f32[] = reference_freeze %2
                 in (%3)"},
         );

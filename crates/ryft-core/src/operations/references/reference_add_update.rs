@@ -704,7 +704,7 @@ mod tests {
             indoc! {"
                 lambda %0:ref<f32[]>, %1:ref<f32[]> .
                 let %2:f32[] = const 1.0
-                    reference_add_update %0 %2
+                    () = reference_add_update %0 %2
                 in (%0, %1)
             "}
             .trim_end(),
@@ -785,7 +785,7 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = zero [type=f32[]]
                     %2:ref<f32[]> = reference_new %1
-                    reference_add_update %2 %0
+                    () = reference_add_update %2 %0
                     %3:f32[] = reference_read %2
                     %4:f32[] = reference_freeze %2
                 in (%4, %3)
@@ -808,7 +808,7 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = zero [type=f32[]]
                     %3:ref<f32[]> = reference_new %2
-                    reference_add_update %3 %0
+                    () = reference_add_update %3 %0
                     %4:f32[] = reference_freeze %3
                 in (%4)
             "}
@@ -930,7 +930,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2], %1:f32[2] .
                 let %2:ref<f32[2]> = reference_new %0
-                    reference_add_update %2 %1
+                    () = reference_add_update %2 %1
                     %3:f32[2] = reference_freeze %2
                 in (%3)
             "}
@@ -960,7 +960,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:ref<f32[2]>, %1:f32[2] .
-                let reference_add_update %0 %1
+                let () = reference_add_update %0 %1
                 in (%0)
             "}
             .trim_end(),

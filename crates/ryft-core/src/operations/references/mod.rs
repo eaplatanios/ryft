@@ -1055,9 +1055,9 @@ pub(crate) mod tests {
             indoc! {"
                 lambda %0:ref<value<i7,p16>>, %1:value<i7,p16> .
                 let %2:value<i7,p16> = reference_read %0
-                    reference_write %0 %1
+                    () = reference_write %0 %1
                     %3:value<i7,p16> = reference_swap %0 %1
-                    reference_add_update %0 %1
+                    () = reference_add_update %0 %1
                     %4:value<i7,p16> = reference_freeze %0
                 in (%2, %3, %4)"},
         );

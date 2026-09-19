@@ -7038,7 +7038,7 @@ mod tests {
                     %1:f32[2, 3][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
                 let %2:dimension<2> = constant [value=2]
                     %3:dimension<2> = constant [value=2]
-                    dimension_requirement [predicate=Equal] %2 %3
+                    () = dimension_requirement [predicate=Equal] %2 %3
                     %4:dimension<3> = constant [value=3]
                     %5:f32[2, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = broadcast [output_axes=[0, 1], \
                         output_sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] %1 %2 %4

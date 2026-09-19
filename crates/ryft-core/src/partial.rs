@@ -3516,7 +3516,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
-                let reference_add_update %0 %1
+                let () = reference_add_update %0 %1
                     %3:ref<f32[]> = reference_new %2
                 in (%3)
             "}
@@ -4418,7 +4418,7 @@ mod tests {
                 let %1:f32[] = print [label=deferred] %0
                     %2:f32[] = const 0.0
                     %3:ref<f32[]> = reference_new %2
-                    reference_write %3 %2
+                    () = reference_write %3 %2
                 in ()
             "}
             .trim_end(),
@@ -4857,8 +4857,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]> .
                 let %2:f32[] = const 1.0
-                    reference_add_update %1 %2
-                    reference_write %1 %0
+                    () = reference_add_update %1 %2
+                    () = reference_write %1 %0
                     %3:f32[] = reference_read %1
                 in (%3)
             "}
@@ -4995,8 +4995,8 @@ mod tests {
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[] .
                 let %2:f32[] = const 1.0
-                    reference_add_update %0 %2
-                    reference_write %0 %1
+                    () = reference_add_update %0 %2
+                    () = reference_write %0 %1
                     %3:f32[] = reference_read %0
                 in (%3)
             "}
@@ -5059,7 +5059,7 @@ mod tests {
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]> .
-                let reference_write %1 %0
+                let () = reference_write %1 %0
                     %3:f32[] = reference_read %1
                     %4:f32[] = reference_read %2
                 in (%3, %4)
@@ -5098,7 +5098,7 @@ mod tests {
             false_evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]> .
-                let reference_write %1 %0
+                let () = reference_write %1 %0
                     %3:f32[] = reference_read %2
                     %4:f32[] = reference_read %1
                 in (%3, %4)

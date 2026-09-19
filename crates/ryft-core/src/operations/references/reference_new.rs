@@ -688,7 +688,7 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = zero [type=f32[]]
                     %2:ref<f32[]> = reference_new %1
-                    reference_add_update %2 %0
+                    () = reference_add_update %2 %0
                     %3:f32[] = reference_freeze %2
                 in (%3)"},
         );
@@ -804,7 +804,7 @@ mod tests {
             indoc! {"
             lambda %0:value<i7,p16>, %1:value<i7,p16> .
             let %2:ref<value<i7,p16>> = reference_new %0
-                reference_add_update %2 %1
+                () = reference_add_update %2 %1
                 %3:value<i7,p16> = reference_freeze %2
             in (%3)"},
         );

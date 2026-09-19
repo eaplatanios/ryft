@@ -1787,7 +1787,7 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
         indoc! {"
             lambda %0:register, %1:ref<register>, %2:register .
             let %3:register = reference_read %1
-                reference_write %1 %2
+                () = reference_write %1 %2
             in (%0, %3)"},
     );
 }
@@ -2410,7 +2410,7 @@ fn test_downstream_reference_add_update_stages_the_family_operation() {
         program.to_string(),
         indoc! {"
             lambda %0:ref<register>, %1:register .
-            let register.add_update %0 %1
+            let () = register.add_update %0 %1
             in (%1)"},
     );
     let reference = Reference::new(RegisterValue::Register(4)).unwrap();
@@ -2746,7 +2746,7 @@ fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_r
         indoc! {"
             lambda %0:register, %1:ref<register>, %2:register .
             let %3:ref<register> = register.bit %1 %2
-                register.add_update %3 %0
+                () = register.add_update %3 %0
                 %4:register = register.zero
                 %5:register = reference_swap %3 %4
                 %6:register = register.zero

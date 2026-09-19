@@ -575,7 +575,7 @@ mod tests {
             indoc! {"
                 lambda %0:ref<f32[]>, %1:ref<f32[]> .
                 let %2:f32[] = const 1.0
-                    reference_atomic_add_update %0 %2
+                    () = reference_atomic_add_update %0 %2
                 in (%0, %1)
             "}
             .trim_end(),

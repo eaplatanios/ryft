@@ -756,7 +756,7 @@ mod tests {
                 lambda %0:f32[], %1:f32[] .
                 let %2:f32[] = zero [type=f32[]]
                     %3:ref<f32[]> = reference_new %2
-                    reference_add_update %3 %1
+                    () = reference_add_update %3 %1
                     %4:f32[] = reference_swap %3 %0
                     %5:f32[] = reference_freeze %3
                 in (%5, %4)
@@ -796,7 +796,7 @@ mod tests {
                 lambda %0:f32[] .
                 let %1:f32[] = zero [type=f32[]]
                     %2:ref<f32[]> = reference_new %1
-                    reference_add_update %2 %0
+                    () = reference_add_update %2 %0
                     %3:f32[] = zero [type=f32[]]
                     %4:f32[] = reference_swap %2 %3
                     %5:f32[] = reference_freeze %2

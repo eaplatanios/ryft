@@ -6691,7 +6691,7 @@ mod tests {
                             lambda %0:dimension<2>, %1:f32[], %2:ref<f32[2]> .
                             let %3:f32[2] = reference_read %2
                                 %4:f32[] = const -1.0
-                                reference_add_update %2 %3
+                                () = reference_add_update %2 %3
                                 %5:f32[] = add %1 %4
                             in (%0, %5, %2)
                         },

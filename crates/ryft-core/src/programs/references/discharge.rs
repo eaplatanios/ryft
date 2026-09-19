@@ -7420,7 +7420,7 @@ mod tests {
             indoc! {"
                 lambda %0:ref<list<1>> .
                 let %1:list<1> = const [5]
-                    list.add_update %0 %1
+                    () = list.add_update %0 %1
                     %2:list<1> = list.read %0
                 in (%2)"},
         );
@@ -9776,7 +9776,7 @@ mod tests {
                     %4:f32[] = condition %0 %1 %3 [
                         true={
                             lambda %0:f32[], %1:ref<f32[]> .
-                            let reference_write %1 %0
+                            let () = reference_write %1 %0
                             in (%0)
                         },
                         false={
@@ -9836,7 +9836,7 @@ mod tests {
                 lambda %0:list<4>, %1:list<2> .
                 let %2:ref<list<4>> = list.reference_new %0
                     %3:ref<list<2>> = list.slice %2
-                    list.add_update %3 %1
+                    () = list.add_update %3 %1
                     %4:list<4> = list.freeze %2
                 in (%4)"},
         );
@@ -10513,7 +10513,7 @@ mod tests {
                     callee={
                         lambda %0:ref<list<2>>, %1:ref<list<2>> .
                         let %2:list<2> = const [7, 8]
-                            list.write %0 %2
+                            () = list.write %0 %2
                             %3:list<2> = list.read %0
                         in (%3)
                     },

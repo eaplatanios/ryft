@@ -1011,8 +1011,8 @@ mod tests {
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, input_split, input_concat], \
                     %2:dimension<output_split ∈ [1, 65)>, %3:dimension<output_concat ∈ [1, 129)> .
                 let %4:dimension<4> = constant [value=4]
-                    dimension_requirement [predicate=Equal] %0 %4
-                    dimension_requirement [predicate=DivisibleBy] %3 %0
+                    () = dimension_requirement [predicate=Equal] %0 %4
+                    () = dimension_requirement [predicate=DivisibleBy] %3 %0
                     %5:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
                     %6:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
                     %7:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %6

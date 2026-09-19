@@ -4151,7 +4151,7 @@ mod tests {
                         true={
                             lambda %0:dimension<2>, %1:ref<f32[2]> .
                             let %2:f32[2] = reference_read %1
-                                reference_add_update %1 %2
+                                () = reference_add_update %1 %2
                                 %3:f32[2] = reference_read %1
                             in (%0, %3)
                         },

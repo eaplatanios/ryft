@@ -17,17 +17,8 @@ use crate::programs::{
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Canonical operation name for an equality [`DimensionRequirementOperation`].
-pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";
-
-/// Canonical operation name for a less-than-or-equal [`DimensionRequirementOperation`].
-pub const DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME: &str = "dimension_require_less_than_or_equal";
-
-/// Canonical operation name for a divisibility [`DimensionRequirementOperation`].
-pub const DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME: &str = "dimension_require_divisible_by";
-
-/// Canonical operation name for an explicit-bounds [`DimensionRequirementOperation`].
-pub const DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME: &str = "dimension_require_bounds";
+/// Canonical operation name for [`DimensionRequirementOperation`].
+pub const DIMENSION_REQUIREMENT_OPERATION_NAME: &str = "dimension_requirement";
 
 /// Requirement predicate selected by [`DimensionRequirementOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,6 +34,18 @@ pub enum DimensionRequirementPredicate {
 
     /// Requires one input to lie within the provided bounds.
     Bounds(DimensionBounds),
+}
+
+impl Display for DimensionRequirementPredicate {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Equal => "Equal",
+            Self::LessThanOrEqual => "LessThanOrEqual",
+            Self::DivisibleBy => "DivisibleBy",
+            Self::Bounds(_) => "Bounds",
+        })
+    }
 }
 
 /// Zero-output runtime-dimension assertion used by [`DimensionRequirement`].
@@ -150,16 +153,6 @@ impl DimensionRequirementOperation {
         }
     }
 
-    /// Returns this requirement's canonical program name.
-    fn operation_name(&self) -> &'static str {
-        match self.predicate {
-            DimensionRequirementPredicate::Equal => DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
-            DimensionRequirementPredicate::LessThanOrEqual => DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME,
-            DimensionRequirementPredicate::DivisibleBy => DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
-            DimensionRequirementPredicate::Bounds(_) => DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
-        }
-    }
-
     /// Proves, disproves, or retains this requirement from type-level facts.
     fn prove_from_types(&self) -> DimensionRequirementProof {
         let left = AbstractDimensionValue::from_type(&self.left);
@@ -211,8 +204,8 @@ impl DimensionRequirementOperation {
                     Ok(())
                 } else {
                     Err(TypeError::invalid(format!(
-                        "`{}` input {index} has type {actual} but the operation was constructed for type {expected}",
-                        self.operation_name(),
+                        "`{}` input {index} has type `{actual}` but the operation was constructed for type `{expected}`",
+                        self.name(),
                     )))
                 }
             },
@@ -407,7 +400,7 @@ impl Operation for DimensionRequirementOperation {
 
     #[inline]
     fn name(&self) -> &'static str {
-        self.operation_name()
+        DIMENSION_REQUIREMENT_OPERATION_NAME
     }
 
     fn infer_output_types(
@@ -440,13 +433,13 @@ impl Operation for DimensionRequirementOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self.predicate {
-            DimensionRequirementPredicate::Bounds(bounds) => {
-                OperationFormatter::new(formatter, indentation, self.name())?
-                    .bracketed(|operation| operation.field("bounds", bounds))
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("predicate", self.predicate)?;
+            if let DimensionRequirementPredicate::Bounds(bounds) = self.predicate {
+                operation.field("bounds", bounds)?;
             }
-            _ => formatter.write_str(self.name()),
-        }
+            Ok(())
+        })
     }
 }
 
@@ -659,8 +652,7 @@ mod tests {
     use crate::arrays::{DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::dimensions::dimension_add::DIMENSION_ADD_OPERATION_NAME;
-    use crate::operations::dimensions::dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
+    use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
     use crate::operations::math::add::Add;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -674,23 +666,24 @@ mod tests {
         let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
         let equal = DimensionRequirementOperation::equal(&left, &right);
+        assert_eq!(equal.name(), DIMENSION_REQUIREMENT_OPERATION_NAME);
         assert_eq!(equal.predicate(), DimensionRequirementPredicate::Equal);
         assert_eq!(equal.left_type(), &left);
         assert_eq!(equal.right_type(), Some(&right));
         assert_eq!(equal.input_count(), 2);
-        assert_eq!(equal.to_string(), "dimension_require_equal");
+        assert_eq!(equal.to_string(), "dimension_requirement [predicate=Equal]");
 
         let ordered = DimensionRequirementOperation::less_than_or_equal(&left, &right);
         assert_eq!(ordered.predicate(), DimensionRequirementPredicate::LessThanOrEqual);
         assert_eq!(ordered.left_type(), &left);
         assert_eq!(ordered.right_type(), Some(&right));
-        assert_eq!(ordered.to_string(), "dimension_require_less_than_or_equal");
+        assert_eq!(ordered.to_string(), "dimension_requirement [predicate=LessThanOrEqual]");
 
         let divisible = DimensionRequirementOperation::divisible_by(&left, &right);
         assert_eq!(divisible.predicate(), DimensionRequirementPredicate::DivisibleBy);
         assert_eq!(divisible.left_type(), &left);
         assert_eq!(divisible.right_type(), Some(&right));
-        assert_eq!(divisible.to_string(), "dimension_require_divisible_by");
+        assert_eq!(divisible.to_string(), "dimension_requirement [predicate=DivisibleBy]");
 
         let required_bounds = DimensionBounds::new(2, Some(8)).unwrap();
         let bounded = DimensionRequirementOperation::bounds(&left, required_bounds);
@@ -698,7 +691,7 @@ mod tests {
         assert_eq!(bounded.left_type(), &left);
         assert_eq!(bounded.right_type(), None);
         assert_eq!(bounded.input_count(), 1);
-        assert_eq!(bounded.to_string(), "dimension_require_bounds [bounds=[2, 8)]");
+        assert_eq!(bounded.to_string(), "dimension_requirement [predicate=Bounds, bounds=[2, 8)]");
 
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let inputs = vec![builder.add_input(left), builder.add_input(right)];
@@ -710,7 +703,7 @@ mod tests {
             program.to_string(),
             indoc! {"
             lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
-            let dimension_require_equal %0 %1
+            let () = dimension_requirement [predicate=Equal] %0 %1
             in ()"},
         );
     }
@@ -833,13 +826,20 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<left ∈ [0, 20)>, %1:dimension<right ∈ [0, 20)> .
-                let dimension_require_less_than_or_equal %0 %1
-                    dimension_require_bounds [bounds=[2, 8)] %1
+                let () = dimension_requirement [predicate=LessThanOrEqual] %0 %1
+                    () = dimension_requirement [predicate=Bounds, bounds=[2, 8)] %1
                 in ()"},
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+            program
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "dimension_requirement [predicate=LessThanOrEqual]",
+                "dimension_requirement [predicate=Bounds, bounds=[2, 8)]"
+            ],
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
@@ -852,8 +852,15 @@ mod tests {
             .unwrap();
         assert_eq!(imported.to_string(), program.to_string());
         assert_eq!(
-            imported.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+            imported
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "dimension_requirement [predicate=LessThanOrEqual]",
+                "dimension_requirement [predicate=Bounds, bounds=[2, 8)]"
+            ],
         );
         assert_eq!(imported.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         let error = imported
@@ -1020,17 +1027,21 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
-                let dimension_require_less_than_or_equal %0 %1
+                let () = dimension_requirement [predicate=LessThanOrEqual] %0 %1
                     %2:dimension<left + right ∈ [0, 19)> = dimension_add %0 %1
-                    dimension_require_bounds [bounds=[2, 8)] %1
+                    () = dimension_requirement [predicate=Bounds, bounds=[2, 8)] %1
                 in (%2)"},
         );
         assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            program
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().to_string())
+                .collect::<Vec<_>>(),
             vec![
-                DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME,
-                DIMENSION_ADD_OPERATION_NAME,
-                DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
+                "dimension_requirement [predicate=LessThanOrEqual]",
+                "dimension_add",
+                "dimension_requirement [predicate=Bounds, bounds=[2, 8)]",
             ],
         );
 
@@ -1056,9 +1067,9 @@ mod tests {
             swapped.to_string(),
             indoc! {"
                 lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
-                let dimension_require_bounds [bounds=[2, 8)] %1
+                let () = dimension_requirement [predicate=Bounds, bounds=[2, 8)] %1
                     %2:dimension<left + right ∈ [0, 19)> = dimension_add %0 %1
-                    dimension_require_less_than_or_equal %0 %1
+                    () = dimension_requirement [predicate=LessThanOrEqual] %0 %1
                 in (%2)"},
         );
         assert_ne!(swapped.to_string(), program.to_string());
@@ -1148,9 +1159,9 @@ mod tests {
             simplified
                 .instructions()
                 .iter()
-                .map(|instruction| instruction.operation().name())
+                .map(|instruction| instruction.operation().to_string())
                 .collect::<Vec<_>>(),
-            vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,],
+            vec!["dimension_requirement [predicate=LessThanOrEqual]", "dimension_requirement [predicate=Equal]",],
         );
 
         // Erasing the proven self-equality does not weaken the requirements that survive: each retained assertion
@@ -1264,9 +1275,9 @@ mod tests {
                 .program()
                 .instructions()
                 .iter()
-                .map(|instruction| instruction.operation().name())
+                .map(|instruction| instruction.operation().to_string())
                 .collect::<Vec<_>>(),
-            vec![DIMENSION_MUL_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME],
+            vec!["dimension_mul", "dimension_requirement [predicate=DivisibleBy]"],
         );
         assert_eq!(residual.program().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }

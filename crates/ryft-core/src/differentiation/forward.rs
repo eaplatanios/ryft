@@ -4664,7 +4664,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[] .
-                let reference_write %0 %1
+                let () = reference_write %0 %1
                 in (%1)
             "}
             .trim_end(),
@@ -5376,7 +5376,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[] .
                 let %1:ref<f32[]> = reference_new %0
-                    reference_add_update %1 %0
+                    () = reference_add_update %1 %0
                     %2:f32[] = reference_freeze %1
                 in (%2)
             "}
@@ -5387,7 +5387,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[] .
                 let %1:ref<f32[]> = reference_new %0
-                    reference_add_update %1 %0
+                    () = reference_add_update %1 %0
                     %2:f32[] = reference_freeze %1
                 in (%2)
             "}
@@ -6065,7 +6065,7 @@ mod tests {
             pushforward.program().to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[] .
-                let reference_add_update %0 %1
+                let () = reference_add_update %0 %1
                     %2:f32[] = reference_read %0
                 in (%2)
             "}

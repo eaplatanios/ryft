@@ -1299,14 +1299,14 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// reference renders as that identifier alone. [`RegionId`]s are arena indices and therefore deterministic
     /// [`Program`]-local names.
     ///
-    /// A [`Region`] body renders as a sequence of statements between its `lambda` header and its `in (...)` result
+    /// A [`Region`] body renders as a sequence of statements between its `lambda` header and its `in (...)` output
     /// list, where the first statement carries the `let` keyword and every later one is aligned beneath it. A statement
-    /// is either a binding of the form `%0:f64 = operation ...operands`, a constant binding of the form `%0:f64 = const
-    /// 1.0`, or, for an [`Instruction`] that binds no output atom (e.g., an effectful assertion), the resultless form
-    /// `operation ...operands` without the `%0:f64 =` binder. Constant payloads render through their [`Display`]
-    /// implementation, whose [`Value`] contract requires a deterministic and semantically complete representation.
-    /// Resultless instructions render in [`Instruction`] order relative to the instructions that do bind atoms, so
-    /// programs whose only difference is the presence or ordering of such instructions render differently.
+    /// is either a binding of the form `%0:f64 = operation ...inputs`, a constant binding of the form `%0:f64 = const
+    /// 1.0`, or, for an [`Instruction`] that binds no output atom (e.g., an effectful assertion), the empty binding
+    /// `() = operation ...inputs`. Constant payloads render through their [`Display`] implementation, whose [`Value`]
+    /// contract requires a deterministic and semantically complete representation. Zero-output instructions render in
+    /// [`Instruction`] order relative to the instructions that do bind atoms, so programs whose only difference is the
+    /// presence or ordering of such instructions render differently.
     pub fn render(
         &self,
         formatter: &mut std::fmt::Formatter<'_>,
@@ -1315,7 +1315,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     ) -> std::fmt::Result {
         /// Renders one [`Instruction`] as a single statement of the enclosing region's `let` block, recursively
         /// rendering its attached regions according to `reference_counts` and `rendered`. An instruction that binds
-        /// no output atom renders without the leading binder. `statement_count` is the number of statements already
+        /// no output atom renders with an empty `()` binding. `statement_count` is the number of statements already
         /// rendered in this block and selects the `let` keyword for the first one. Under
         /// [`ProgramRenderingMode::WithProvenance`], a non-unknown provenance renders as a comment-style ` ; ...`
         /// suffix immediately before the statement's final newline (i.e., after the final closing bracket for
@@ -1335,7 +1335,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             let line_indentation = if statement_count == 0 { indentation } else { indentation + 4 };
             write!(formatter, "{:indentation$}", "")?;
             write!(formatter, "{} ", if statement_count == 0 { "let" } else { "   " })?;
-            if !instruction.outputs.is_empty() {
+            if instruction.outputs.is_empty() {
+                write!(formatter, "()")?;
+            } else {
                 instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
                     if index > 0 {
                         write!(formatter, ", {output}:{}", atoms[output.index()].r#type())
@@ -1343,8 +1345,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         write!(formatter, "{output}:{}", atoms[output.index()].r#type())
                     }
                 })?;
-                write!(formatter, " = ")?;
             }
+            write!(formatter, " = ")?;
             instruction.operation.render(formatter, line_indentation)?;
             instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
             if !instruction.regions.is_empty() {
@@ -2922,8 +2924,8 @@ mod tests {
         assert_eq!(effectful.simplified().unwrap().to_string(), expected);
         assert_eq!(build().into_simplified().unwrap().to_string(), expected);
 
-        // An effectful instruction with no outputs must still render as a resultless statement and remain rooted as
-        // there is no result atom from which rendering or either simplification implementation could discover it.
+        // An effectful instruction with no outputs must still render with an empty binding and remain rooted as
+        // there is no output atom from which rendering or either simplification implementation could discover it.
         let build_zero_output_effect = || {
             let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2940,7 +2942,7 @@ mod tests {
             zero_output_effect.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let zero_output_effect %0
+                let () = zero_output_effect %0
                 in ()
             "}
             .trim_end(),

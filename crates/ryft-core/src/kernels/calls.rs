@@ -1644,7 +1644,7 @@ mod tests {
             KernelCallOperation::new_with_prefetch(Grid::new(vec![]).unwrap(), vec![], vec![invalid.clone()])
                 .unwrap_err(),
             KernelError::Type(TypeError::invalid(format!(
-                "`dimension_from_scalar` input must be a rank-0 integer array but has type {invalid}",
+                "`dimension_from_scalar` input must be a rank-0 integer array but has type `{invalid}`",
             ))),
         );
     }
