@@ -774,7 +774,7 @@ mod tests {
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
         let rendered_tangent = linearization.tangent().to_string();
-        assert!(rendered_tangent.contains("dynamic_shape_slice"));
+        assert!(rendered_tangent.contains("dynamic_slice"));
         assert!(rendered_tangent.contains("reshape"));
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
@@ -827,7 +827,7 @@ mod tests {
         assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
         assert!(pullback.contains("dimension_from_scalar"));
         assert!(pullback.contains("dimension_mul"));
-        assert!(pullback.contains("dynamic_shape_slice"));
+        assert!(pullback.contains("dynamic_slice"));
     }
 
     #[test]

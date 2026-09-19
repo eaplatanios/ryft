@@ -29,7 +29,7 @@ use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
-use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
+use crate::operations::manipulation::slicing::{DynamicSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -597,7 +597,7 @@ impl_differentiable_operation! {
         C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
             + From<ConcatenateOperation<ArrayIrType>>
             + From<DimensionSizeOperation>
-            + From<DynamicShapeSliceOperation>
+            + From<DynamicSliceOperation<ArrayIrType>>
             + From<LinearCallOperation<ArrayIrType>>
             + From<ConstantOperation<DimensionValue>>
             + OperationProjection<
@@ -721,7 +721,7 @@ impl_differentiable_operation! {
                                 slice_inputs.extend(starts);
                                 slice_inputs.extend(sizes.iter().cloned());
                                 let mut outputs = transpose_context.bind(
-                                    DynamicShapeSliceOperation::new(sizes.len()),
+                                    DynamicSliceOperation::<ArrayIrType>::from_rank(sizes.len()),
                                     Vec::new(),
                                     slice_inputs.as_slice(),
                                 )?;
@@ -758,7 +758,7 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayIrType>
             + From<ConstantOperation<DimensionValue>>
             + From<DimensionSizeOperation>
-            + From<DynamicShapeSliceOperation>
+            + From<DynamicSliceOperation<ArrayIrType>>
             + From<DynamicBroadcastOperation>
             + OperationProjection<
                 ArrayType,
@@ -926,7 +926,7 @@ impl_differentiable_operation! {
                     slice_inputs.push(extent.clone().unwrap_or_else(|| size.clone()));
                 }
                 let slice = context.stage_operation(
-                    DynamicShapeSliceOperation::new(rank),
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(rank),
                     Vec::new(),
                     slice_inputs.as_slice(),
                 )?;
@@ -2225,7 +2225,7 @@ mod tests {
         // A dynamic non-concatenated axis cannot be expressed by this homogeneous rule, whose `slice` bounds are
         // static payload values, so transposition rejects the case instead of consulting hidden input-shape metadata.
         // The composite rule does not inherit that rejection: it delegates here only for fully static inputs and
-        // otherwise stages a `dynamic_shape_slice` whose extents it reads off the live output cotangent, which is
+        // otherwise stages a `dynamic_slice` whose extents it reads off the live output cotangent, which is
         // pinned by `test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent` in
         // this module.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
@@ -3207,9 +3207,9 @@ mod tests {
                             lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
                 %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
                             let %4:dimension<0> = constant [value=0]
-                                %5:f32[left] = dynamic_shape_slice [strides=[1]] %3 %4 %1
+                                %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
                                 %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                                %7:f32[right] = dynamic_shape_slice [strides=[1]] %3 %6 %2
+                                %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
                             in (%5, %7)
                         },
                     ]
@@ -3263,12 +3263,14 @@ mod tests {
                         in (%5)
                     },
                     transpose={
-                        lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
+                        lambda %0:dimension<left + right ∈ [2, 10)>, \
+                               %1:dimension<left ∈ [1, 5)>, \
+                               %2:dimension<right ∈ [1, 6)>, \
+                               %3:f32[left + right] .
                         let %4:dimension<0> = constant [value=0]
-                            %5:f32[left] = dynamic_shape_slice [strides=[1]] %3 %4 %1
+                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
                             %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                            %7:f32[right] = dynamic_shape_slice [strides=[1]] %3 %6 %2
+                            %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
                         in (%5, %7)
                     },
                 ]
@@ -3288,9 +3290,9 @@ mod tests {
                         lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
                 %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
                         let %4:dimension<0> = constant [value=0]
-                            %5:f32[left] = dynamic_shape_slice [strides=[1]] %3 %4 %1
+                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
                             %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                            %7:f32[right] = dynamic_shape_slice [strides=[1]] %3 %6 %2
+                            %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
                         in (%5, %7)
                     },
                     transpose={
@@ -3397,9 +3399,9 @@ mod tests {
                         transpose={
                             lambda %0:dimension<result ∈ [2, 15)>, %1:dimension<extent ∈ [1, 8)>, %2:f32[result] .
                             let %3:dimension<0> = constant [value=0]
-                                %4:f32[extent] = dynamic_shape_slice [strides=[1]] %2 %3 %1
+                                %4:f32[extent] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %3 %1
                                 %5:dimension<0 + extent ∈ [1, 8)> = dimension_add %3 %1
-                                %6:f32[extent] = dynamic_shape_slice [strides=[1]] %2 %5 %1
+                                %6:f32[extent] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %5 %1
                             in (%4, %6)
                         },
                     ]
@@ -3463,10 +3465,10 @@ mod tests {
                         transpose={
                             lambda %0:dimension<result ∈ [2, 5)>, %1:dimension<left ∈ [1, 4)>, %2:f64[result] .
                             let %3:dimension<0> = constant [value=0]
-                                %4:f64[left] = dynamic_shape_slice [strides=[1]] %2 %3 %1
+                                %4:f64[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %3 %1
                                 %5:dimension<0 + left ∈ [1, 4)> = dimension_add %3 %1
                                 %6:dimension<1> = constant [value=1]
-                                %7:f64[1] = dynamic_shape_slice [strides=[1]] %2 %5 %6
+                                %7:f64[1] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %5 %6
                             in (%4, %7)
                         },
                     ]
@@ -3524,12 +3526,12 @@ mod tests {
                     %2:dimension<0> = constant [value=0]
                     %3:dimension<columns ∈ [1, 5)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]
-                    %5:f32[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+                    %5:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %2 %2 %4 %3
                     %6:f32[2, columns][layout=strided{16,4}] = \
                 broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %5
                     %7:dimension<2> = constant [value=2]
                     %8:dimension<2> = constant [value=2]
-                    %9:f32[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %7 %2 %8 %3
+                    %9:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %7 %2 %8 %3
                     %10:f32[2, columns][layout=strided{16,4}] = \
                 broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %9
                 in (%6, %10)
@@ -3596,12 +3598,12 @@ mod tests {
                     %3:dimension<columns ∈ [1, 5)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]
                     %5:f32[2, columns][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = \
-                dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+                dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %2 %2 %4 %3
                     %6:f32[2, columns] = broadcast [output_type=f32[2, columns], output_axes=[0, 1]] %5
                     %7:dimension<2> = constant [value=2]
                     %8:dimension<2> = constant [value=2]
                     %9:f32[2, columns][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = \
-                dynamic_shape_slice [strides=[1, 1]] %0 %7 %2 %8 %3
+                dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %7 %2 %8 %3
                 in (%6, %9)
             "}
             .trim_end(),
@@ -3737,10 +3739,10 @@ mod tests {
                     %2:dimension<0> = constant [value=0]
                     %3:dimension<columns ∈ [1, 9)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]
-                    %5:f64[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+                    %5:f64[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %2 %2 %4 %3
                     %6:dimension<2> = constant [value=2]
                     %7:dimension<1> = constant [value=1]
-                    %8:f64[1, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %6 %2 %7 %3
+                    %8:f64[1, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %6 %2 %7 %3
                 in (%5, %8)
             "}
             .trim_end(),

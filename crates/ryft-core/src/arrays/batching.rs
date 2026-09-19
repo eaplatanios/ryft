@@ -2660,7 +2660,16 @@ where
                 // one whose per-item extents have been lost).
                 let packed_axis =
                     logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
-                if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
+                let packed_dimension = packed_type.shape().dimensions().get(packed_axis);
+                if packed_dimension == Some(dimension) {
+                    continue;
+                }
+
+                // Specialization can prove a shared extent exactly (e.g. `n` is always 3) while the packed
+                // result spells that extent statically. This is dense geometry, not erased ragged metadata.
+                if variable.bounds().upper() == variable.bounds().lower().checked_add(1)
+                    && packed_dimension == Some(&Dimension::Static(variable.bounds().lower()))
+                {
                     continue;
                 }
                 return Err(BatchingError::UnsupportedOperation {
@@ -6568,6 +6577,33 @@ mod tests {
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap()),
                 BatchAxis::new(0),
                 &logical_type,
+                &[],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "linear call output f32[length] has bounded dynamic dimension length but no input carries \
+                          its per-item extents"
+                    .to_string(),
+            }),
+        );
+
+        // A proven singleton extent is dense even when the logical declaration retains its dimension identity.
+        let fixed = DimensionVariable::new("length", DimensionBounds::new(3, Some(4))?);
+        let fixed_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![fixed.into()])));
+        let physical = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap());
+        assert_eq!(
+            <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrEagerContext>>::restore_batch(
+                physical.clone(),
+                BatchAxis::new(0),
+                &fixed_type,
+                &[],
+            ),
+            Ok(ArrayIrBatch::new(physical, BatchAxis::new(0))?),
+        );
+        assert_eq!(
+            <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrEagerContext>>::restore_batch(
+                ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32; 8]).unwrap()),
+                BatchAxis::new(0),
+                &fixed_type,
                 &[],
             ),
             Err(BatchingError::UnsupportedOperation {

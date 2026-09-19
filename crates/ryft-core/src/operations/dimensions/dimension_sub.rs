@@ -1,12 +1,9 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::sub::{Sub, SubOperation};
 use crate::parameters::Parameter;
-use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
-
-use super::maximum_extent;
 
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
@@ -29,19 +26,11 @@ define_dimension_arithmetic_operation!(
         }
         let bounds =
             DimensionBounds::new(left_lower.saturating_sub(right_maximum), (left_maximum - right_lower).checked_add(1))?;
-        let requires_runtime_assertion = maximum_extent(right).is_none_or(|right| left.bounds().lower() < right);
+        let requires_runtime_assertion = right.maximum_extent().is_none_or(|right| left.bounds().lower() < right);
         Ok((bounds, requires_runtime_assertion))
     },
+    provider = SubOperation<DimensionType>,
 );
-
-impl OperationProvider<DimensionType> for SubOperation<DimensionType> {
-    type Operation = DimensionSubOperation;
-
-    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(DimensionSubOperation::new(input_types[0], input_types[1])?)
-    }
-}
 
 #[cfg(test)]
 mod tests {

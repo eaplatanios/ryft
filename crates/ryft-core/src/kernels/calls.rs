@@ -1137,7 +1137,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::Broadcast(_)
             | ArrayIrOperation::Concatenate(_)
             | ArrayIrOperation::Pad(_)
-            | ArrayIrOperation::DynamicShapeSlice(_)
+            | ArrayIrOperation::DynamicSlice(_)
             | ArrayIrOperation::RngBitGenerator(_)
             | ArrayIrOperation::AllGather(_)
             | ArrayIrOperation::ParallelSumScatter(_)

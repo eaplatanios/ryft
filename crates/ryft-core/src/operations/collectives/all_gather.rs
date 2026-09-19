@@ -32,7 +32,7 @@ use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
-use crate::operations::manipulation::slicing::DynamicShapeSliceOperation;
+use crate::operations::manipulation::slicing::DynamicSliceOperation;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
@@ -678,7 +678,7 @@ where
     C::Operation: From<AllGatherOperation>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
+        + From<DynamicSliceOperation<ArrayIrType>>
         + From<LinearCallOperation<ArrayIrType>>
         + From<ParallelSumScatterOperation>
         + From<DynamicReshapeOperation>
@@ -830,7 +830,7 @@ where
     C::Operation: From<AllGatherOperation>
         + From<DimensionFromScalarOperation>
         + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
+        + From<DynamicSliceOperation<ArrayIrType>>
         + From<LinearCallOperation<ArrayIrType>>
         + From<DynamicReshapeOperation>
         + From<ConstantOperation<DimensionValue>>
@@ -936,7 +936,11 @@ where
                     slice_inputs.extend(starts);
                     slice_inputs.extend(slice_sizes);
                     let selected = transpose_context
-                        .bind(DynamicShapeSliceOperation::new(output_rank), Vec::new(), slice_inputs.as_slice())?
+                        .bind(
+                            DynamicSliceOperation::<ArrayIrType>::from_rank(output_rank),
+                            Vec::new(),
+                            slice_inputs.as_slice(),
+                        )?
                         .remove(0);
                     let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
                     reshape_inputs.push(selected);

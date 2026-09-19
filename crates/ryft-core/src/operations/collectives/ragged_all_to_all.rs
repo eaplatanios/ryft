@@ -41,7 +41,7 @@ use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterOptions, ScatterReductionKind,
 };
-use crate::operations::manipulation::slicing::{Slice, SliceOperation};
+use crate::operations::manipulation::slicing::{DynamicSliceOperation, Slice, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::math::mul::{Mul, MulOperation};
@@ -746,7 +746,7 @@ impl_differentiable_operation! {
             + From<ReshapeOperation>
             + From<ScatterOperation>
             + From<SelectOperation<ArrayType>>
-            + From<SliceOperation>
+            + From<SliceOperation> + From<DynamicSliceOperation>
             + From<TransferToMemoryOperation>
             + From<ZeroOperation<ArrayType>>,
     {
@@ -957,7 +957,10 @@ fn transpose_physical_offsets<V, O>(
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ConcatenateOperation<ArrayType>> + From<SliceOperation>,
+    O: Operation<Type = ArrayType>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<SliceOperation>
+        + From<DynamicSliceOperation>,
 {
     let offset_type = offsets.r#type();
     let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
@@ -995,7 +998,8 @@ where
     O: Operation<Type = ArrayType>
         + From<AllToAllOperation>
         + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>,
+        + From<SliceOperation>
+        + From<DynamicSliceOperation>,
 {
     if operation.is_physical() {
         transpose_physical_offsets(operation, offsets)
@@ -1026,6 +1030,7 @@ where
         + From<ScatterOperation>
         + From<SelectOperation<ArrayType>>
         + From<SliceOperation>
+        + From<DynamicSliceOperation>
         + From<TransferToMemoryOperation>
         + From<ZeroOperation<ArrayType>>,
 {

@@ -49,17 +49,17 @@ use crate::operations::{
     DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
     Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
-    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation,
-    LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, LogSumExp,
-    LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
-    ParallelReduceOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt,
-    RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
+    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation,
+    Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p, Log1pOperation,
+    LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max,
+    MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike,
+    OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow, PowOperation,
+    PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
+    ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
     ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation,
     StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
     TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
@@ -273,7 +273,7 @@ pub trait ArrayOperations:
     + Compare + Select
     // Shape and layout manipulation.
     + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
-    + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
+    + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
     + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
     + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
@@ -293,7 +293,7 @@ where
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
-    V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
+    V: DynamicUpdateSlice + ConvertElementType + Sort,
     V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
     V: ZeroLike + OneLike + StopGradient,
@@ -497,7 +497,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Pad(PadOperation<ArrayIrType>),
 
     /// Mixed slice whose starts and output sizes are first-class dimension operands.
-    DynamicShapeSlice(DynamicShapeSliceOperation),
+    DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
     /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
@@ -2991,7 +2991,7 @@ mod tests {
             ArrayIrOperation::Concatenate(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::CustomCall(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::Pad(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::DynamicShapeSlice(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::DynamicSlice(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::AllGather(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::GeometryMixed,
@@ -3107,7 +3107,7 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::DynamicShapeSlice(DynamicShapeSliceOperation::new(1)),
+                ArrayIrOperation::DynamicSlice(DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
                 MemberKindSignature::GeometryMixed,
             ),
             (

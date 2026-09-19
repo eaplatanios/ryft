@@ -461,7 +461,7 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceDynamicIndex>> Differentiabl
 /// Derives a reference view using a scalar integer index supplied as a value.
 pub trait ReferenceDynamicIndex<Index = Self, Output = Self>: Sized {
     /// Returns a reference selecting one element on `axis`, removing that axis and sharing the original allocation.
-    /// The index is clamped to the valid range, as for [`DynamicSlice`](crate::operations::DynamicSlice). Executing a
+    /// The index is clamped to the valid range, as for [`Slice`](crate::operations::DynamicSlice). Executing a
     /// selection on an empty axis fails; a staged selection can still appear in an unexecuted zero-trip scan body.
     ///
     /// # Parameters

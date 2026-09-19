@@ -21,9 +21,9 @@ use ryft_core::{
     ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
     ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
-    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
+    ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
+    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
+    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -5004,6 +5004,17 @@ fn array_data_dependent_padding_discipline(
         // data-derived extent on the kept axis, which is the admission's execution evidence.
         ArrayOperation::LogSumExp(_) => XlaMasked,
         ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
+        // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update lanes;
+        // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
+        // Other window shapes, modes, and combiners retain their independent admission requirements.
+        ArrayOperation::Scatter(operation)
+            if operation.kind() == ScatterReductionKind::Add
+                && operation.mode() == ScatterMode::PromiseInBounds
+                && operation.unique_indices()
+                && operation.dimensions().update_window_dimensions().is_empty() =>
+        {
+            XlaMasked
+        }
         ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
         // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
         // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
@@ -5146,7 +5157,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Broadcast(_)
         | XlaOperation::Concatenate(_)
         | XlaOperation::Pad(_)
-        | XlaOperation::DynamicShapeSlice(_)
+        | XlaOperation::DynamicSlice(_)
         | XlaOperation::AllGather(_)
         | XlaOperation::ParallelSumScatter(_)
         | XlaOperation::AllToAll(_)
@@ -6231,17 +6242,17 @@ mod tests {
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
         DimensionRequirementOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicShapeSlice,
-        DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, LogSumExpOperation, MulOperation,
-        NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-        ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation, StaticShape, SubOperation,
-        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, LogSumExpOperation,
+        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, Slice,
+        SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation,
+        batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -8913,7 +8924,7 @@ mod tests {
     }
 
     #[test]
-    fn test_production_composite_lowering_executes_dynamic_shape_slice() {
+    fn test_production_composite_lowering_executes_dynamic_slice_with_dimensions() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
@@ -8942,7 +8953,9 @@ mod tests {
             .unwrap()[0];
         let output = builder
             .add_instruction(
-                XlaOperation::DynamicShapeSlice(DynamicShapeSliceOperation::new(1).with_strides(vec![2]).unwrap()),
+                XlaOperation::DynamicSlice(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_strides(vec![2]).unwrap(),
+                ),
                 Vec::new(),
                 vec![input, start, size],
                 None,
@@ -8965,6 +8978,188 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape().as_slice(), &[3]);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_compiled_dynamic_slice_runtime_size_pullback() {
+        // The size comes from device data and changes without recompilation. Seed the pullback with the sliced
+        // values so this fixture tests both the strided forward and point-scatter adjoint, including an empty result.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let size = builder.add_input(size_type.clone().into());
+        let size = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(DimensionVariable::new(
+                    "size",
+                    DimensionBounds::new(0, Some(4)).unwrap(),
+                )),
+                Vec::new(),
+                vec![size],
+                None,
+            )
+            .unwrap()[0];
+        let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(9).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+                    .with_strides(vec![2])
+                    .unwrap()
+                    .with_bounds(ryft_core::SliceBounds::Clamp),
+                Vec::new(),
+                vec![input, start, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap();
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let inputs = vec![context.input(input_type.clone().into()), context.input(size_type.clone().into())];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_xla_program(&combined, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&[0_f32, 1., 2., 3., 4., 5.]))
+                .unwrap();
+        let size =
+            Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), values_to_bytes(&[2_i64])).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
+        let size = Array::from_host_buffer(&client, size_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input, size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 6]);
+    }
+
+    #[test]
+    fn test_compiled_dynamic_slice_runtime_input_pullback() {
+        use ryft_core::DimensionArithmetic;
+        use ryft_core::operations::DimensionConstant;
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let input = context.input(input_type.clone().into());
+        let rows = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap()))
+            .unwrap();
+        let columns = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("columns", DimensionBounds::new(0, Some(6)).unwrap()))
+            .unwrap();
+        let zero = context.dimension_constant(0).unwrap();
+        let one = context.dimension_constant(1).unwrap();
+        let two = context.dimension_constant(2).unwrap();
+        let height = rows.dimension_add(&one).unwrap().dimension_div_floor(&two).unwrap();
+        let width = columns.dimension_add(&one).unwrap().dimension_div_floor(&two).unwrap();
+        // The inner slice receives a genuinely runtime-shaped array. Its pullback must allocate that exact shape,
+        // before the outer prefix slice embeds it back into the original static input geometry.
+        let prefix = input
+            .dynamic_slice_with_dimensions(&[zero.clone(), zero.clone()], &[rows, columns], &[1, 1])
+            .unwrap();
+        let output = prefix.dynamic_slice_with_dimensions(&[zero.clone(), zero], &[height, width], &[2, 2]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap();
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let inputs = vec![
+            context.input(input_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+        ];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        // Replaying arithmetic dimensions creates fresh identities. Instantiate this standalone pullback's
+        // formal dimension identities for the replayed residual signature before importing its operations.
+        let input_types = arguments.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let pullback = pullback.with_instantiated_type_identities(&input_types).unwrap();
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_xla_program(&combined, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let values = [
+            0_f32,
+            1.,
+            2.,
+            3.,
+            f32::NAN,
+            5.,
+            6.,
+            7.,
+            8.,
+            f32::NAN,
+            10.,
+            11.,
+            12.,
+            13.,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let input = Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let rows =
+            Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3_i64])).unwrap();
+        let columns =
+            Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4_i64])).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
+        assert_eq!(
+            read_f32s(&client, &outputs[1]),
+            vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
+        );
+        let rows = Array::from_host_buffer(&client, scalar_type, mesh, values_to_bytes(&[0_i64])).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![input, rows, columns]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0_f32; 20]);
     }
 
     #[test]
@@ -10312,7 +10507,12 @@ mod tests {
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
-            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count], None)
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![values, start, count],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -10419,7 +10619,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_derived_dynamic_shape_slice_checks_runtime_input_and_result_extents() {
+    fn test_data_derived_dynamic_slice_checks_runtime_input_and_result_extents() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
@@ -10446,7 +10646,12 @@ mod tests {
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
-            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, result_dimension], None)
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![input, start, result_dimension],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -10480,7 +10685,7 @@ mod tests {
             Ok(invalid) => invalid[0].block_until_ready().unwrap_err().to_string(),
             Err(error) => error.to_string(),
         };
-        assert_eq!(error, "`dynamic_shape_slice` limit 4 exceeds input axis 0 extent 2");
+        assert_eq!(error, "`dynamic_slice` limit 4 exceeds input axis 0 extent 2");
     }
 
     #[test]

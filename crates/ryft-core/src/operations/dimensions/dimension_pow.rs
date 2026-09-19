@@ -1,10 +1,10 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::{define_arithmetic_dimension_capability, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 
 // TODO(eaplatanios): Review this module.
 
-use super::{checked_power, maximum_extent};
+use super::checked_power;
 
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
@@ -44,31 +44,29 @@ define_dimension_arithmetic_operation!(
             checked_power(left_maximum, right_maximum).unwrap_or(usize::MAX).min(MAX_DIMENSION_EXTENT)
         };
         let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
-        let requires_runtime_assertion = maximum_extent(left)
-            .zip(maximum_extent(right))
+        let requires_runtime_assertion = left.maximum_extent()
+            .zip(right.maximum_extent())
             .and_then(|(left, right)| checked_power(left, right))
             .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
-);
-
-define_arithmetic_dimension_capability!(
-    /// Raises one runtime dimension to another dimension's power using checked integer exponentiation.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionPow, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(3)?.dimension_pow(&DimensionValue::constant(4)?)?;
-    /// assert_eq!(result.extent(), 81);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionPow,
-    /// Returns `self` raised to the nonnegative integer power `right`.
-    dimension_pow(right),
-    DimensionPowOperation,
+    capability = {
+        /// Raises one runtime dimension to another dimension's power using checked integer exponentiation.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// # use ryft_core::{DimensionPow, DimensionValue, ProgramError};
+        /// # fn main() -> Result<(), ProgramError> {
+        /// let result = DimensionValue::constant(3)?.dimension_pow(&DimensionValue::constant(4)?)?;
+        /// assert_eq!(result.extent(), 81);
+        /// # Ok(())
+        /// # }
+        /// ```
+        trait;
+        /// Returns `self` raised to the nonnegative integer power `right`.
+        fn(right);
+    },
 );
 
 #[cfg(test)]

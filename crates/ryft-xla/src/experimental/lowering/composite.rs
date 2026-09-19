@@ -10,9 +10,9 @@
 //! requires finite input and output allocation bounds too.
 
 use ryft_core::{
-    ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
-    Dimension, DimensionAddOperation, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionType, DimensionVariable, EffectClass, Layout, Operation, ProgramError, Shape,
+    ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
+    DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
+    DimensionType, DimensionVariable, EffectClass, Layout, Operation, ProgramError, Shape, SliceBounds,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -26,12 +26,11 @@ use super::{
     lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_concatenate_tree,
     lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
     lower_dimension_arithmetic_assertion, lower_dimension_extent, lower_dimension_requirement_to_assertion,
-    lower_dynamic_shape_slice_assertion, lower_pad_extent_assertion, lower_pad_to_mlir,
-    lower_parallel_sum_scatter_to_mlir, lower_physical_bound_value, lower_ragged_all_to_all_to_mlir,
-    lower_reshape_element_count_assertion, lower_restore_dynamic_dimensions, lower_rng_bit_generator_to_mlir,
-    lower_runtime_dimension_size_i64, lower_sharding_constraint, lower_static_index_constants, lower_tensor_type,
-    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    lower_dynamic_slice_assertion, lower_pad_extent_assertion, lower_pad_to_mlir, lower_parallel_sum_scatter_to_mlir,
+    lower_physical_bound_value, lower_ragged_all_to_all_to_mlir, lower_reshape_element_count_assertion,
+    lower_restore_dynamic_dimensions, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
+    lower_sharding_constraint, lower_static_index_constants, lower_tensor_type, physical_bound_type,
+    reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Constrains a statically allocated constructor result before attaching its runtime dimensions.
@@ -83,7 +82,7 @@ pub(super) fn lower_constructor_layout<'b, 'c: 'b, 't: 'c>(
 
 /// Physical lowering plan for one axis of a first-class dynamic shape slice.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct DynamicShapeSliceAxisPlan {
+struct DynamicSliceAxisPlan {
     /// Maximum logical output size admitted by the size operand's type.
     size: usize,
 
@@ -95,16 +94,16 @@ struct DynamicShapeSliceAxisPlan {
 }
 
 /// Plans one axis of a first-class dynamic shape slice from its declared input, start, and size bounds.
-fn plan_dynamic_shape_slice_axis(
+fn plan_dynamic_slice_axis(
     axis: usize,
     stride: usize,
     input_dimension: &Dimension,
     start_type: &DimensionType,
     size_type: &DimensionType,
-) -> Result<DynamicShapeSliceAxisPlan, LoweringError> {
+) -> Result<DynamicSliceAxisPlan, LoweringError> {
     let Some(size_upper) = size_type.bounds().upper() else {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
+            op: format!("{DYNAMIC_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
         });
     };
     let size = size_upper - 1;
@@ -113,7 +112,7 @@ fn plan_dynamic_shape_slice_axis(
     } else {
         (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
             LoweringError::UnsupportedOp {
-                op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
+                op: format!("{DYNAMIC_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
             }
         })?
     };
@@ -122,14 +121,14 @@ fn plan_dynamic_shape_slice_axis(
         Dimension::Dynamic(variable) => {
             let Some(upper) = variable.bounds().upper() else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
+                    op: format!("{DYNAMIC_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
                 });
             };
             (variable.bounds().lower(), upper - 1)
         }
     };
     let padded_size = input_physical_size.checked_add(span).ok_or_else(|| LoweringError::UnsupportedOp {
-        op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
+        op: format!("{DYNAMIC_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
     })?;
     reshape_dimension_i32(padded_size)?;
     let bounds_prove_runtime_in_bounds = start_type
@@ -138,7 +137,7 @@ fn plan_dynamic_shape_slice_axis(
         .and_then(|upper| upper.checked_sub(1))
         .and_then(|start_maximum| start_maximum.checked_add(span))
         .is_some_and(|limit| limit <= input_minimum);
-    Ok(DynamicShapeSliceAxisPlan { size, span, needs_runtime_assertion: !bounds_prove_runtime_in_bounds })
+    Ok(DynamicSliceAxisPlan { size, span, needs_runtime_assertion: !bounds_prove_runtime_in_bounds })
 }
 
 /// Lowers a composite array IR type to its physical StableHLO tensor type.
@@ -1105,7 +1104,7 @@ where
             )?;
             Ok(results)
         }
-        ArrayIrOperation::DynamicShapeSlice(operation) => {
+        ArrayIrOperation::DynamicSlice(operation) => {
             let Some((input, bounds)) = input_values.split_first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1123,6 +1122,7 @@ where
                 );
             }
             let (starts, sizes) = bounds.split_at(rank);
+            let mut starts = starts.to_vec();
             let start_types = &input_types[1..1 + rank];
             let size_types = &input_types[1 + rank..];
             let mut physical_sizes = Vec::with_capacity(rank);
@@ -1132,7 +1132,59 @@ where
                     .map_err(|error| LoweringError::Tracing(error.into()))?;
                 let size_type = <&DimensionType>::try_from(&size_types[axis])
                     .map_err(|error| LoweringError::Tracing(error.into()))?;
-                let plan = plan_dynamic_shape_slice_axis(
+                // Clamping is relative to the logical span, not the larger physical allocation window.
+                // Normalize once and reuse the same origin for validation and extraction.
+                let zero_start =
+                    DimensionType::new(DimensionVariable::new("start", DimensionBounds::new(0, Some(1)).unwrap()));
+                let start_type = if operation.bounds() == SliceBounds::Clamp {
+                    let constants =
+                        lower_static_index_constants(&[0, 1, operation.strides()[axis]], block, context, location)?;
+                    let difference = block
+                        .append_operation(stable_hlo::subtract(sizes[axis], constants[1], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let steps = block
+                        .append_operation(stable_hlo::maximum(difference, constants[0], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let steps = block
+                        .append_operation(stable_hlo::multiply(steps, constants[2], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let occupied = block
+                        .append_operation(stable_hlo::minimum(sizes[axis], constants[1], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let span = block
+                        .append_operation(stable_hlo::add(steps, occupied, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
+                    let maximum_start = block
+                        .append_operation(stable_hlo::subtract(input_size, span, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    let maximum_start = block
+                        .append_operation(stable_hlo::maximum(maximum_start, constants[0], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    starts[axis] = block
+                        .append_operation(stable_hlo::minimum(starts[axis], maximum_start, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                    &zero_start
+                } else {
+                    start_type
+                };
+                let plan = plan_dynamic_slice_axis(
                     axis,
                     operation.strides()[axis],
                     &input_type.shape().dimensions()[axis],
@@ -1141,7 +1193,7 @@ where
                 )?;
                 if plan.needs_runtime_assertion {
                     let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
-                    lower_dynamic_shape_slice_assertion(
+                    lower_dynamic_slice_assertion(
                         axis,
                         operation.strides()[axis],
                         input_size,
@@ -1185,7 +1237,7 @@ where
                 .as_ref();
             let slice = block.append_operation(stable_hlo::dynamic_slice(
                 padded,
-                starts,
+                &starts,
                 physical_spans.as_slice(),
                 location,
             )?)?;
@@ -1407,52 +1459,52 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_dynamic_shape_slice_axis() {
+    fn test_plan_dynamic_slice_axis() {
         let unbounded = dimension_type("unbounded", DimensionBounds::unbounded());
         let bounded_start = dimension_type("start", DimensionBounds::non_negative(Some(5)).unwrap());
         let bounded_size = dimension_type("size", DimensionBounds::non_negative(Some(5)).unwrap());
 
         assert_eq!(
             unsupported_operation(
-                plan_dynamic_shape_slice_axis(2, 1, &Dimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
+                plan_dynamic_slice_axis(2, 1, &Dimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
             ),
-            "dynamic_shape_slice size on axis 2 needs a finite upper bound",
+            "dynamic_slice size on axis 2 needs a finite upper bound",
         );
 
         let unbounded_input = Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
         assert_eq!(
             unsupported_operation(
-                plan_dynamic_shape_slice_axis(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
+                plan_dynamic_slice_axis(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
             ),
-            "dynamic_shape_slice input on axis 1 needs a finite upper bound",
+            "dynamic_slice input on axis 1 needs a finite upper bound",
         );
 
         let overflowing_size = dimension_type("size", DimensionBounds::non_negative(Some(usize::MAX)).unwrap());
         assert_eq!(
             unsupported_operation(
-                plan_dynamic_shape_slice_axis(3, 2, &Dimension::Static(usize::MAX), &bounded_start, &overflowing_size,)
+                plan_dynamic_slice_axis(3, 2, &Dimension::Static(usize::MAX), &bounded_start, &overflowing_size,)
                     .unwrap_err(),
             ),
-            "dynamic_shape_slice physical span overflows on axis 3",
+            "dynamic_slice physical span overflows on axis 3",
         );
 
         assert_eq!(
-            plan_dynamic_shape_slice_axis(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap(),
-            DynamicShapeSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
+            plan_dynamic_slice_axis(0, 1, &Dimension::Static(3), &bounded_start, &bounded_size).unwrap(),
+            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
         );
 
         let bounded_input =
             Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
         assert_eq!(
-            plan_dynamic_shape_slice_axis(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
-            DynamicShapeSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
+            plan_dynamic_slice_axis(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
+            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
         );
 
         let proven_start = dimension_type("start", DimensionBounds::non_negative(Some(1)).unwrap());
         let proven_size = dimension_type("size", DimensionBounds::non_negative(Some(4)).unwrap());
         assert_eq!(
-            plan_dynamic_shape_slice_axis(0, 1, &Dimension::Static(4), &proven_start, &proven_size).unwrap(),
-            DynamicShapeSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
+            plan_dynamic_slice_axis(0, 1, &Dimension::Static(4), &proven_start, &proven_size).unwrap(),
+            DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
         );
     }
 }

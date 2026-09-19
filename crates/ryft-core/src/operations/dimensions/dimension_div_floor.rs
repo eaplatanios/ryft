@@ -1,8 +1,7 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::div::{Div, DivOperation};
 use crate::parameters::Parameter;
-use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -27,16 +26,8 @@ define_dimension_arithmetic_operation!(
             DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))?;
         Ok((bounds, right.bounds().lower() == 0))
     },
+    provider = DivOperation<DimensionType>,
 );
-
-impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
-    type Operation = DimensionDivFloorOperation;
-
-    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(DimensionDivFloorOperation::new(input_types[0], input_types[1])?)
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -367,7 +367,13 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         let boundary_operand_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let forward_output_types = driver.region(0)?.output_types();
+
+        // Refine the logical boundary using the carriers' per-item types before restoring output metadata. For example,
+        // a retained source extent `n` may now be 3 for every mapped item. Using the old `f64[n]` declaration with a
+        // concrete `f64[batch, 3]` result would incorrectly demand ragged extent metadata. Ragged carriers retain their
+        // symbolic per-item types here, so their metadata is still restored below.
+        let logical_input_types = inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>();
+        let forward_output_types = driver.region(0)?.to_program().specialize(&logical_input_types)?.output_types();
         let forward = forward.specialize(forward_input_types.as_slice())?;
         let physical_output_types = forward.output_types();
         let mut transpose_input_types = packed_inputs[..boundary_operand_count + self.residual_count]
@@ -585,8 +591,10 @@ impl<
 }
 
 impl<
-    C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
-        + Zero<C::Value>,
+    C: Context<
+            Type: DifferentiableType,
+            Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
+        > + Zero<C::Value>,
 > DifferentiableOperation<C> for LinearCallOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -617,6 +625,44 @@ impl<
         if inputs.iter().all(|input| input.tangent().is_zero()) {
             let primal_outputs = forward.interpret_in_context(context.primal(), primals)?;
             return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
+        }
+
+        // With fixed residuals this is already a linear map. Preserve its paired regions when applying it to tangents
+        // as differentiating the implementation would discard the supplied transpose, and may require rules that the
+        // mathematical map does not need (e.g., transposing a runtime-sized scatter used by a slice pullback). Reuse
+        // is valid only when taking tangents preserves the linear boundary types. Low-precision storage whose tangent
+        // representation differs must still take the general differentiation path below.
+        let output_types = forward.output_types();
+        if inputs[..self.residual_count].iter().all(|input| input.tangent().is_zero())
+            && inputs[self.residual_count..]
+                .iter()
+                .all(|input| input.tangent().r#type() == input.primal().r#type())
+            && output_types.iter().all(|r#type| r#type.tangent().is_ok_and(|tangent| &tangent == r#type))
+        {
+            let outputs = forward.interpret_in_context(context.primal(), primals)?;
+            let sources = inputs
+                .iter()
+                .map(|input| context.primal_to_tangent(input.primal().clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut tangent_inputs = sources[..self.residual_count].to_vec();
+            for input in &inputs[self.residual_count..] {
+                tangent_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
+                    input.tangent().clone(),
+                    sources.iter(),
+                )?);
+            }
+            let tangents = context.tangent().bind(
+                self.clone(),
+                vec![forward.to_program(), driver.region(1)?.to_program()],
+                &tangent_inputs,
+            )?;
+            check_count!("output", tangents, outputs.len(), ProgramError);
+            return outputs
+                .into_iter()
+                .zip(tangents)
+                .map(|(primal, tangent)| DifferentiationDual::new(primal, MaybeZero::Value(tangent)))
+                .collect();
         }
 
         // Differentiate the dependence on residual parameters as well as the map's linear arguments.
@@ -1641,6 +1687,20 @@ mod tests {
             ]),
             Ok(vec![Array::scalar(6.0).unwrap(), Array::scalar(29.0).unwrap()]),
         );
+
+        // Holding the coefficient fixed applies the same paired map to the linear tangent. The residual-dependent
+        // case above must still differentiate the coefficient itself.
+        let linearization = program.linearize_with_respect_to(&[1]).unwrap();
+        let mut outputs = linearization
+            .primal()
+            .interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()])
+            .unwrap();
+        let mut tangent_inputs = vec![Array::scalar(7.0).unwrap()];
+        tangent_inputs.extend(outputs.split_off(1));
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(14.0).unwrap()]));
+        assert!(linearization.tangent().instructions().iter().any(|instruction| matches!(
+            instruction.operation(), ArrayOperation::LinearCall(operation) if operation.residual_count() == 1,
+        )));
     }
 
     #[test]
@@ -1698,9 +1758,15 @@ mod tests {
                 vec![Array::scalar(2.0_f32).unwrap().into()],
             ],
         );
+        let tangent = linearization.tangent();
+        let call = tangent
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_),))
+            .unwrap();
+        let forward = tangent.region_ref(call.regions()[0]).unwrap();
         assert_eq!(
-            linearization
-                .tangent()
+            forward
                 .instructions()
                 .iter()
                 .filter(|instruction| instruction.operation().name() == "reference_new")

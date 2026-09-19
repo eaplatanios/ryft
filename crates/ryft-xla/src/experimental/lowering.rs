@@ -25,9 +25,9 @@ use ryft_core::{
     CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
     CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
     CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ComparisonDirection, ConstantOperation,
-    ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
-    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
-    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
+    ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
+    DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation, Layout,
     Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
     MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
@@ -1576,10 +1576,61 @@ where
 {
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    Ok([
-        normalize_elementwise_operand(input_values[0], &output_types[0], block, context, location)?,
-        normalize_elementwise_operand(input_values[1], &output_types[0], block, context, location)?,
-    ])
+    let output_type = &output_types[0];
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let multiple_dynamic_axes = output_type
+        .shape()
+        .dimensions()
+        .iter()
+        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+        .count()
+        > 1;
+    let mut inputs = [input_values[0], input_values[1]];
+    for index in 0..2 {
+        let input_tensor_type = input_values[index].r#type()?.cast::<TensorTypeRef>();
+        let peer_tensor_type = input_values[1 - index].r#type()?.cast::<TensorTypeRef>();
+        if multiple_dynamic_axes
+            && input_tensor_type.is_some_and(|r#type| r#type.rank() == 0)
+            && peer_tensor_type.is_some_and(|r#type| r#type.dimensions().eq(output_tensor_type.dimensions()))
+        {
+            // Native broadcast accepts at most one bounded dynamic result axis. For scalar arithmetic over
+            // e.g. `[rows, columns]`, broadcast to physical capacity and restore both logical extents from the
+            // array input. The scalar itself cannot supply these sizes, and inventing the maximum sizes would
+            // incorrectly make padding observable. Other broadcasting cases use the ordinary path below.
+            let scalar = normalize_elementwise_operand(
+                input_values[index],
+                &ArrayType::scalar(output_type.data_type()),
+                block,
+                context,
+                location,
+            )?;
+            let physical_type = physical_bound_type(output_type)?;
+            let broadcast = block.append_operation(stable_hlo::broadcast(
+                scalar,
+                lower_tensor_type(&physical_type, context, location)?,
+                &[],
+                location,
+            )?)?;
+            let result = composite::lower_constructor_layout(
+                broadcast.result(0).unwrap().as_ref(),
+                &physical_type,
+                &mut block.as_ref(),
+                location.as_ref(),
+            )?;
+            let sources = (0..output_type.rank()).map(|axis| (input_values[1 - index], axis)).collect::<Vec<_>>();
+            inputs[index] = lower_restore_dynamic_dimensions(
+                result,
+                output_type,
+                &sources,
+                &mut block.as_ref(),
+                context,
+                location.as_ref(),
+            )?;
+        } else {
+            inputs[index] = normalize_elementwise_operand(input_values[index], output_type, block, context, location)?;
+        }
+    }
+    Ok(inputs)
 }
 
 /// Returns the promoted numeric operand descriptor for one comparison result descriptor.
@@ -4201,7 +4252,7 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one runtime bounds check for an axis of a dynamic-shape-slice operation.
-fn lower_dynamic_shape_slice_assertion<'b, 'c: 'b, 't: 'c>(
+fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     axis: usize,
     stride: usize,
     input_size: ValueRef<'b, 'c, 't>,
@@ -4217,7 +4268,7 @@ fn lower_dynamic_shape_slice_assertion<'b, 'c: 'b, 't: 'c>(
     let backend_config = context.dictionary_attribute(&[
         context.named_attribute(
             context.identifier(ASSERT_ACTOR_ATTRIBUTE),
-            context.string_attribute("dynamic_shape_slice"),
+            context.string_attribute(DYNAMIC_SLICE_OPERATION_NAME),
         ),
         context.named_attribute(
             context.identifier(ASSERT_KIND_ATTRIBUTE),
@@ -11880,14 +11931,14 @@ mod tests {
         CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate, Dimension,
         DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
-        LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
-        PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope,
-        RaggedDot, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
-        SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile,
-        TileDimension, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation,
-        XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation, LogSumExpOperation, LogicalMesh,
+        MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder,
+        ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation,
+        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape,
+        Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
+        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
+        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -17954,7 +18005,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_dynamic_shape_slice_runtime_windows() {
+    fn test_lower_dynamic_slice_runtime_windows() {
         let client = execution_client();
         crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, [4]);
@@ -17979,7 +18030,12 @@ mod tests {
             );
         }
         let result = builder
-            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, bounds[0], bounds[1]], None)
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![input, bounds[0], bounds[1]],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
@@ -18028,7 +18084,7 @@ mod tests {
                 )
                 .and_then(|execution| execution.block_until_ready());
             if start + size > 4 {
-                assert!(result.err().unwrap().to_string().contains("dynamic_shape_slice"));
+                assert!(result.err().unwrap().to_string().contains("dynamic_slice"));
             } else {
                 let outputs = result.unwrap().remove(0).outputs;
                 let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
@@ -22782,7 +22838,7 @@ mod tests {
 
     #[test]
     fn test_slicing_vjp_pullbacks_lower_to_stablehlo() {
-        use ryft_core::{DynamicSlice, Slice};
+        use ryft_core::Slice;
 
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
         // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.

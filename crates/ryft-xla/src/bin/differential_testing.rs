@@ -18,11 +18,11 @@ use ryft_core::operations::collectives::{
     ParallelSwapAxes,
 };
 use ryft_core::{
-    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
-    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
-    DynamicShapeSliceOperation, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder,
-    ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension,
+    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType,
+    Device, DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
+    DotDimensionNumbers, DynamicSliceOperation, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
+    ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -406,8 +406,12 @@ fn data_dependent_prefix_program() -> Result<
     let count =
         builder.add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)?[0];
     let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
-    let output =
-        builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count], None)?[0];
+    let output = builder.add_instruction(
+        DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+        Vec::new(),
+        vec![values, start, count],
+        None,
+    )?[0];
     builder.build::<Vec<ArrayIrValue<CpuArray>>, Vec<ArrayIrValue<CpuArray>>>(
         vec![output],
         vec![Placeholder, Placeholder],

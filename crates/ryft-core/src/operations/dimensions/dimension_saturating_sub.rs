@@ -1,5 +1,5 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{define_arithmetic_dimension_capability, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 
 // TODO(eaplatanios): Review this module.
@@ -26,26 +26,24 @@ define_dimension_arithmetic_operation!(
         )?;
         Ok((bounds, false))
     },
-);
-
-define_arithmetic_dimension_capability!(
-    /// Subtracts one runtime dimension from another, saturating at zero instead of producing a negative result.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionSaturatingSub, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(3)?
-    ///     .dimension_saturating_sub(&DimensionValue::constant(7)?)?;
-    /// assert_eq!(result.extent(), 0);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionSaturatingSub,
-    /// Returns `max(0, self - right)`.
-    dimension_saturating_sub(right),
-    DimensionSaturatingSubOperation,
+    capability = {
+        /// Subtracts one runtime dimension from another, saturating at zero instead of producing a negative result.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// # use ryft_core::{DimensionSaturatingSub, DimensionValue, ProgramError};
+        /// # fn main() -> Result<(), ProgramError> {
+        /// let result = DimensionValue::constant(3)?
+        ///     .dimension_saturating_sub(&DimensionValue::constant(7)?)?;
+        /// assert_eq!(result.extent(), 0);
+        /// # Ok(())
+        /// # }
+        /// ```
+        trait;
+        /// Returns `max(0, self - right)`.
+        fn(right);
+    },
 );
 
 #[cfg(test)]

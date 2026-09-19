@@ -41,7 +41,7 @@ use crate::operations::manipulation::reshaping::DynamicReshape;
 use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
-use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
+use crate::operations::manipulation::slicing::{DynamicSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::Add;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
@@ -971,7 +971,7 @@ impl_differentiable_operation! {
         C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
             + From<DimensionSizeOperation>
-            + From<DynamicShapeSliceOperation>
+            + From<DynamicSliceOperation<ArrayIrType>>
             + From<LinearCallOperation<ArrayIrType>>
             + From<PadOperation<ArrayIrType>>
             + From<ZeroOperation<ArrayType>>
@@ -1259,7 +1259,7 @@ impl_differentiable_operation! {
                                     })
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let mut input_cotangent = transpose_context.bind(
-                                    DynamicShapeSliceOperation::new(transpose_operand_type.rank())
+                                    DynamicSliceOperation::<ArrayIrType>::from_rank(transpose_operand_type.rank())
                                         .with_strides(strides)?,
                                     Vec::new(),
                                     slice_inputs.as_slice(),
@@ -4798,10 +4798,17 @@ mod tests {
                             %6:dimension<1> = constant [value=1]
                             %7:dimension<max(0, source - 1) * 1 ∈ [0, 4)> = dimension_mul %5 %6
                             %8:dimension<source + max(0, source - 1) * 1 ∈ [0, 8)> = dimension_add %1 %7
-                            %9:f64[source + max(0, source - 1) * 1] = pad [edge_padding_low=[-1], \
-                                edge_padding_high=[-2], interior_padding=[0]] %2 %3 %8
+                            %9:f64[source + max(0, source - 1) * 1] = pad [\
+                                edge_padding_low=[-1], \
+                                edge_padding_high=[-2], \
+                                interior_padding=[0]\
+                            ] %2 %3 %8
                             %10:dimension<0> = constant [value=0]
-                            %11:f64[source] = dynamic_shape_slice [strides=[2]] %9 %10 %1
+                            %11:f64[source] = dynamic_slice [\
+                                strides=[2], \
+                                bounds=checked, \
+                                requires_runtime_assertion=true\
+                            ] %9 %10 %1
                             %12:bool[source] = zero [type=bool[source]] %1
                             %13:bool[] = one [type=bool[]]
                             %14:bool[result] = pad [edge_padding_low=[1], edge_padding_high=[2], \
@@ -5298,7 +5305,7 @@ mod tests {
                             %9:f32[size + max(0, size - 1) * 1] = pad [edge_padding_low=[0], edge_padding_high=[0], \
                                 interior_padding=[0]] %2 %3 %8
                             %10:dimension<0> = constant [value=0]
-                            %11:f32[size] = dynamic_shape_slice [strides=[2]] %9 %10 %1
+                            %11:f32[size] = dynamic_slice [strides=[2], bounds=checked, requires_runtime_assertion=true] %9 %10 %1
                             %12:bool[size] = zero [type=bool[size]] %1
                             %13:bool[] = one [type=bool[]]
                             %14:bool[output_size] = pad [edge_padding_low=[0], edge_padding_high=[0], \
@@ -5445,10 +5452,17 @@ mod tests {
                             lambda %0:dimension<4>, %1:dimension<columns ∈ [1, 5)>, %2:f64[4, columns] .
                             let %3:f64[] = zero [type=f64[]]
                                 %4:dimension<2> = constant [value=2]
-                                %5:f64[2, columns] = pad [edge_padding_low=[-1, 0], edge_padding_high=[-1, 0], \
-                                    interior_padding=[0, 0]] %2 %3 %4 %1
+                                %5:f64[2, columns] = pad [\
+                                    edge_padding_low=[-1, 0], \
+                                    edge_padding_high=[-1, 0], \
+                                    interior_padding=[0, 0]\
+                                ] %2 %3 %4 %1
                                 %6:dimension<0> = constant [value=0]
-                                %7:f64[2, columns] = dynamic_shape_slice [strides=[1, 1]] %5 %6 %6 %4 %1
+                                %7:f64[2, columns] = dynamic_slice [\
+                                    strides=[1, 1], \
+                                    bounds=checked, \
+                                    requires_runtime_assertion=true\
+                                ] %5 %6 %6 %4 %1
                                 %8:bool[2, columns] = zero [type=bool[2, columns]] %1
                                 %9:bool[] = one [type=bool[]]
                                 %10:bool[4, columns] = pad [edge_padding_low=[1, 0], edge_padding_high=[1, 0], \

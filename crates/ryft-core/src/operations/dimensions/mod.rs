@@ -4,9 +4,7 @@
 //! program operations over [`DimensionType`], not integer array operations and not a parallel symbolic-expression
 //! language.
 
-use crate::arrays::{
-    ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
-};
+use crate::arrays::{ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
@@ -251,12 +249,6 @@ impl ArithmeticDimensionOperationMetadata {
             requires_runtime_assertion: self.requires_runtime_assertion,
         })
     }
-}
-
-/// Returns the largest portable extent admitted by `r#type` when its upper bound is finite.
-#[inline]
-pub(crate) fn maximum_extent(r#type: &DimensionType) -> Option<usize> {
-    r#type.bounds().upper()?.checked_sub(1).map(|maximum| maximum.min(MAX_DIMENSION_EXTENT))
 }
 
 /// Computes `base.pow(exponent)` without narrowing `exponent`.

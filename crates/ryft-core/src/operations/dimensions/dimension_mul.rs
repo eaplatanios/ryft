@@ -1,12 +1,9 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::{check_count, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::mul::{Mul, MulOperation};
 use crate::parameters::Parameter;
-use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
-
-use super::maximum_extent;
 
 /// Canonical operation name for [`DimensionMulOperation`].
 pub const DIMENSION_MUL_OPERATION_NAME: &str = "dimension_mul";
@@ -30,22 +27,14 @@ define_dimension_arithmetic_operation!(
         })?;
         let maximum = left_maximum.saturating_mul(right_maximum).min(MAX_DIMENSION_EXTENT);
         let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
-        let requires_runtime_assertion = maximum_extent(left)
-            .zip(maximum_extent(right))
+        let requires_runtime_assertion = left.maximum_extent()
+            .zip(right.maximum_extent())
             .and_then(|(left, right)| left.checked_mul(right))
             .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
+    provider = MulOperation<DimensionType>,
 );
-
-impl OperationProvider<DimensionType> for MulOperation<DimensionType> {
-    type Operation = DimensionMulOperation;
-
-    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(DimensionMulOperation::new(input_types[0], input_types[1])?)
-    }
-}
 
 #[cfg(test)]
 mod tests {

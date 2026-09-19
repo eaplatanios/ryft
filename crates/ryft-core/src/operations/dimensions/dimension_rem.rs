@@ -1,8 +1,7 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::rem::{Rem, RemOperation};
 use crate::parameters::Parameter;
-use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -31,16 +30,8 @@ define_dimension_arithmetic_operation!(
         };
         Ok((bounds, right.bounds().lower() == 0))
     },
+    provider = RemOperation<DimensionType>,
 );
-
-impl OperationProvider<DimensionType> for RemOperation<DimensionType> {
-    type Operation = DimensionRemOperation;
-
-    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(DimensionRemOperation::new(input_types[0], input_types[1])?)
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,5 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{define_arithmetic_dimension_capability, define_dimension_arithmetic_operation};
+use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 
 // TODO(eaplatanios): Review this module.
@@ -23,25 +23,23 @@ define_dimension_arithmetic_operation!(
         let bounds = DimensionBounds::new(left_lower.max(right_lower), left_maximum.max(right_maximum).checked_add(1))?;
         Ok((bounds, false))
     },
-);
-
-define_arithmetic_dimension_capability!(
-    /// Returns the larger of two runtime dimensions.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::{DimensionMax, DimensionValue, ProgramError};
-    /// # fn main() -> Result<(), ProgramError> {
-    /// let result = DimensionValue::constant(7)?.dimension_max(&DimensionValue::constant(3)?)?;
-    /// assert_eq!(result.extent(), 7);
-    /// # Ok(())
-    /// # }
-    /// ```
-    DimensionMax,
-    /// Returns `max(self, right)`.
-    dimension_max(right),
-    DimensionMaxOperation,
+    capability = {
+        /// Returns the larger of two runtime dimensions.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// # use ryft_core::{DimensionMax, DimensionValue, ProgramError};
+        /// # fn main() -> Result<(), ProgramError> {
+        /// let result = DimensionValue::constant(7)?.dimension_max(&DimensionValue::constant(3)?)?;
+        /// assert_eq!(result.extent(), 7);
+        /// # Ok(())
+        /// # }
+        /// ```
+        trait;
+        /// Returns `max(self, right)`.
+        fn(right);
+    },
 );
 
 #[cfg(test)]

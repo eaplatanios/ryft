@@ -33,9 +33,8 @@ pub use scattering::{
     ScatterOptions, ScatterReductionKind,
 };
 pub use slicing::{
-    DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-    DynamicShapeSlice, DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation,
+    DynamicUpdateSlice, DynamicUpdateSliceOperation, SLICE_OPERATION_NAME, Slice, SliceBounds, SliceOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};

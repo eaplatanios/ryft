@@ -239,11 +239,14 @@ macro_rules! check_builders {
 /// The caller supplies the operation's public documentation and name, its value-level capability and semantic method,
 /// a diagnostic result-name expression, and a bounds-transfer expression. This keeps operation structure and
 /// interpretation centralized while leaving concrete value semantics in backend capability implementations.
+/// Exactly one dispatch form is required: `provider = Type` implements [`OperationProvider`](crate::OperationProvider)
+/// for an existing capability's marker, while `capability = { ... }` defines a dimension-specific capability through
+/// [`define_arithmetic_dimension_capability!`]. Both forms use the supplied capability and function identifiers.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
-/// define_arithmetic_dimension_operation!(
+/// define_dimension_arithmetic_operation!(
 ///     /// Checked dimension-addition operation used by [`Add`].
 ///     DimensionAddOperation,
 ///     DIMENSION_ADD_OPERATION_NAME,
@@ -253,6 +256,27 @@ macro_rules! check_builders {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
 ///     infer_bounds = infer_add_bounds,
+///     provider = AddOperation<DimensionType>,
+/// );
+/// ```
+///
+/// A dimension-specific capability supplies its trait and function documentation inline:
+///
+/// ```rust,ignore
+/// define_dimension_arithmetic_operation!(
+///     /// Dimension-minimum operation.
+///     DimensionMinOperation, DIMENSION_MIN_OPERATION_NAME,
+///     DimensionMin, dimension_min,
+///     output_name = |left: &DimensionType, right: &DimensionType| {
+///         format!("min({}, {})", left.variable(), right.variable())
+///     },
+///     infer_bounds = infer_min_bounds,
+///     capability = {
+///         /// Returns the smaller of two runtime dimensions.
+///         trait;
+///         /// Returns `min(self, right)`.
+///         fn(right);
+///     },
 /// );
 /// ```
 ///
@@ -269,9 +293,78 @@ macro_rules! check_builders {
 ///   - `$infer_bounds`: Expression evaluating to a function or closure that accepts references to the left and right
 ///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
 ///     The Boolean reports whether their bounds leave a checked runtime failure possible.
+///   - `$provider`: Explicit marker type whose provider validates two inputs and constructs the generated operation.
+///     This argument is mutually exclusive with `capability`.
+///   - `capability`: Documentation attributes before `trait;` document the generated capability trait. Attributes
+///     before `fn($argument);` document its binary function. `$argument` names the non-receiver operand. This argument
+///     is mutually exclusive with `provider`.
 #[macro_export]
 macro_rules! define_dimension_arithmetic_operation {
+    // Defines an operation selected through an existing capability's explicit provider marker.
     (
+        $(#[$documentation:meta])*
+        $operation:ident, $name:ident,
+        $capability:ident, $method:ident,
+        output_name = $output_name:expr,
+        infer_bounds = $infer_bounds:expr,
+        provider = $provider:ty $(,)?
+    ) => {
+        $crate::define_dimension_arithmetic_operation!(
+            @operation
+            $(#[$documentation])*
+            $operation, $name, $capability, $method,
+            output_name = $output_name,
+            infer_bounds = $infer_bounds,
+        );
+
+        impl $crate::programs::OperationProvider<$crate::arrays::DimensionType> for $provider {
+            type Operation = $operation;
+
+            #[inline]
+            fn provide(
+                _request: (),
+                input_types: &[&$crate::arrays::DimensionType],
+            ) -> Result<Self::Operation, $crate::programs::ProgramError> {
+                $crate::check_count!("input", input_types, 2, ProgramError);
+                Ok($operation::new(input_types[0], input_types[1])?)
+            }
+        }
+    };
+
+    // Defines an operation together with a dimension-specific capability and its documented binary function.
+    (
+        $(#[$documentation:meta])*
+        $operation:ident, $name:ident,
+        $capability:ident, $method:ident,
+        output_name = $output_name:expr,
+        infer_bounds = $infer_bounds:expr,
+        capability = {
+            $(#[$capability_documentation:meta])+
+            trait;
+            $(#[$method_documentation:meta])+
+            fn($argument:ident);
+        } $(,)?
+    ) => {
+        $crate::define_dimension_arithmetic_operation!(
+            @operation
+            $(#[$documentation])*
+            $operation, $name, $capability, $method,
+            output_name = $output_name,
+            infer_bounds = $infer_bounds,
+        );
+
+        $crate::define_arithmetic_dimension_capability!(
+            $(#[$capability_documentation])*
+            $capability,
+            $(#[$method_documentation])*
+            $method($argument),
+            $operation,
+        );
+    };
+
+    // Generates the operation payload and shared implementations for both public dispatch forms.
+    (
+        @operation
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident,
@@ -5013,7 +5106,7 @@ mod tests {
     const TEST_ARITHMETIC_DIMENSION_OPERATION_NAME: &str = "test_arithmetic_dimension";
 
     define_dimension_arithmetic_operation!(
-        /// Dimension-arithmetic operation used to test [`define_arithmetic_dimension_operation!`].
+        /// Dimension-arithmetic operation used to test [`define_dimension_arithmetic_operation!`].
         TestArithmeticDimensionOperation,
         TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,
         TestArithmeticDimension,
@@ -5035,6 +5128,7 @@ mod tests {
             };
             Ok((DimensionBounds::new(lower, upper)?, false))
         },
+        provider = TestBinaryOperation<DimensionType>,
     );
 
     define_arithmetic_dimension_capability!(
@@ -5043,6 +5137,24 @@ mod tests {
         /// Adds this test dimension to `right`.
         test_arithmetic_dimension(right),
         TestArithmeticDimensionOperation,
+    );
+
+    const TEST_GENERATED_DIMENSION_OPERATION_NAME: &str = "test_generated_dimension";
+
+    define_dimension_arithmetic_operation!(
+        /// Dimension operation testing inline capability generation.
+        TestGeneratedDimensionOperation, TEST_GENERATED_DIMENSION_OPERATION_NAME,
+        TestGeneratedDimension, test_generated_dimension,
+        output_name = |left: &DimensionType, _right: &DimensionType| left.variable().to_string(),
+        infer_bounds = |left: &DimensionType, _right: &DimensionType| -> Result<_, DimensionError> {
+            Ok((left.bounds(), false))
+        },
+        capability = {
+            /// Dimension capability generated together with its operation.
+            trait;
+            /// Returns a dimension with the same bounds as `self` after consuming `other`.
+            fn(other);
+        },
     );
 
     const TEST_DIFFERENTIABLE_OPERATION_NAME: &str = "test_differentiable";
@@ -5221,15 +5333,6 @@ mod tests {
 
         /// Applies the operator selected for this tracer's program type.
         fn apply_provided_binary(self, right: Self) -> Self::Output;
-    }
-
-    impl OperationProvider<DimensionType> for TestBinaryOperation<DimensionType> {
-        type Operation = TestArithmeticDimensionOperation;
-
-        fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
-            check_count!("input", input_types, 2, ProgramError);
-            Ok(TestArithmeticDimensionOperation::new(input_types[0], input_types[1])?)
-        }
     }
 
     define_elementwise_capability!(
@@ -5659,7 +5762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_define_arithmetic_dimension_operation() {
+    fn test_define_dimension_arithmetic_operation() {
         let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
         let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
         let operation = TestArithmeticDimensionOperation::new(&left_type, &right_type).unwrap();
@@ -5679,6 +5782,18 @@ mod tests {
             Operation::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
+        // Providers check arity before indexing and preserve the constructor's operand metadata.
+        let provided = TestBinaryOperation::<DimensionType>::provide((), &[&left_type, &right_type]).unwrap();
+        assert_eq!(provided.left_type(), &left_type);
+        assert_eq!(provided.right_type(), &right_type);
+        assert_eq!(provided.output_bounds(), operation.output_bounds());
+        for input_types in [&[][..], &[&left_type][..], &[&left_type, &right_type, &left_type][..]] {
+            assert!(matches!(
+                TestBinaryOperation::<DimensionType>::provide((), input_types),
+                Err(ProgramError::InvalidInputCount { expected: 2, actual }) if actual == input_types.len(),
+            ));
+        }
+
         fn assert_arithmetic_dimension_operation<O: ArithmeticDimensionOperation>() {}
         assert_arithmetic_dimension_operation::<TestArithmeticDimensionOperation>();
 
@@ -5704,6 +5819,22 @@ mod tests {
         {
         }
         assert_partially_evaluatable::<TracingContext<DimensionValue, TestArithmeticDimensionOperation>>();
+    }
+
+    #[test]
+    fn test_define_dimension_arithmetic_operation_capability() {
+        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
+        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let context = TracingContext::<DimensionValue, TestGeneratedDimensionOperation>::new();
+        let left = context.input(left_type.clone());
+        let right = context.input(right_type);
+        let output = left.test_generated_dimension(&right).unwrap();
+        assert_eq!(output.r#type().bounds(), left_type.bounds());
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_GENERATED_DIMENSION_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
+        assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
     }
 
     #[test]
