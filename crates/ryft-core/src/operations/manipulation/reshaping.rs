@@ -21,10 +21,10 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::mul::Mul;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
@@ -1136,8 +1136,8 @@ impl_differentiable_operation! {
 /// Computed or input dimensions remain ordinary Single Static Assignment (SSA) inputs, which is what makes a
 /// runtime-derived output shape expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent
 /// is read off the input while its trailing extent is an exact lifted dimension. Extents derived by first-class
-/// dimension arithmetic work the same way, using the [`DimensionArithmetic`] capability (e.g.,
-/// `rows.dimension_mul(&columns)?`) directly on the composite values.
+/// dimension arithmetic work the same way: project the composite values onto [`DimensionType`] with
+/// [`ValueProjection`], apply ordinary capabilities such as [`Mul`], and lift the result back.
 ///
 /// ```rust
 /// # use ryft_core::{
@@ -1218,7 +1218,7 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: DimensionSize + DimensionArithmetic,
+        Self: DimensionSize + ValueProjection<DimensionType, Projected: Mul>,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
     {
         let input_type = self.r#type();
@@ -1240,12 +1240,12 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
 
         // Seed the product with the leading extent instead of a constant one, so that no multiplication by one is
         // staged. At least two axes remain here because vectors returned above.
-        let mut size = self.dimension_size(0)?;
+        let mut size = self.dimension_size(0)?.into_projected()?;
         for axis in 1..input_type.rank() {
-            size = size.dimension_mul(&self.dimension_size(axis)?)?;
+            size = size.mul(&self.dimension_size(axis)?.into_projected()?)?;
         }
 
-        self.dynamic_reshape(&[size])
+        self.dynamic_reshape(&[Self::from_projected(size)])
     }
 
     /// Inserts a size-one axis while preserving all existing extents, including runtime dimensions. The output
@@ -5071,10 +5071,11 @@ mod tests {
         );
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| {
-                // Dimension arithmetic is a composite capability, so the two static extents multiply directly.
+                // Project the extents onto their dimension member to use ordinary multiplication.
                 let rows = input.dimension_size(0)?;
-                let columns = input.dimension_size(1)?.dimension_mul(&input.dimension_size(2)?)?;
-                input.dynamic_reshape(&[rows, columns])
+                let columns = ValueProjection::<DimensionType>::into_projected(input.dimension_size(1)?)?
+                    .mul(&ValueProjection::<DimensionType>::into_projected(input.dimension_size(2)?)?)?;
+                input.dynamic_reshape(&[rows, columns.into_value()])
             },
             ArrayIrType::Array(input_type),
         )

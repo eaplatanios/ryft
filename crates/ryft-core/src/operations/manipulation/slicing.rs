@@ -27,7 +27,8 @@ use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::DimensionArithmetic;
+use crate::operations::dimensions::dimension_min::DimensionMin;
+use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSub;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::Broadcast;
@@ -1440,8 +1441,8 @@ impl DynamicSliceOperation<ArrayIrType> {
         V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
             + DimensionToScalar
-            + DimensionArithmetic
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>,
+            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
+            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
     >(
         &self,
         zeros: &V,
@@ -1470,39 +1471,48 @@ impl DynamicSliceOperation<ArrayIrType> {
         let mut query_shape = cotangent_type.shape().dimensions().to_vec();
         query_shape.push(Dimension::Static(1));
         let query_type = ArrayType::new(DataType::I64, Shape::new(query_shape)).with_memory(cotangent_type.memory());
-        let one = context.dimension_constant(1)?;
+        let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1)?)?;
         let mut coordinates = Vec::with_capacity(rank);
         for axis in 0..rank {
             let step = context.dimension_constant(self.strides[axis])?;
             let start = if self.bounds == DynamicSliceBounds::Clamp {
                 // `min(size, 1)` makes the span zero for empty windows without a data-dependent branch.
-                let span = dimensions[axis]
+                let dimension = ValueProjection::<DimensionType>::into_projected(dimensions[axis].clone())?;
+                let span = dimension
                     .dimension_saturating_sub(&one)?
-                    .dimension_mul(&step)?
-                    .dimension_add(&dimensions[axis].dimension_min(&one)?)?;
-                starts[axis].dimension_min(&zeros.dimension_size(axis)?.dimension_saturating_sub(&span)?)?
+                    .mul(&ValueProjection::<DimensionType>::into_projected(step.clone())?)?
+                    .add(&dimension.dimension_min(&one)?)?;
+                let start = ValueProjection::<DimensionType>::into_projected(starts[axis].clone())?;
+                let size = ValueProjection::<DimensionType>::into_projected(zeros.dimension_size(axis)?)?;
+                ValueProjection::<DimensionType>::from_projected(
+                    start.dimension_min(&size.dimension_saturating_sub(&span)?)?,
+                )
             } else {
                 starts[axis].clone()
             };
             let positions = context.dynamic_iota(&query_type, axis, &dynamic_dimensions)?;
-            let start = start.to_scalar()?.into_projected()?.transfer_to_memory(cotangent_type.memory())?;
-            let mut positions = positions.into_projected()?;
+            let start = ValueProjection::<ArrayType>::into_projected(start.to_scalar()?)?
+                .transfer_to_memory(cotangent_type.memory())?;
+            let mut positions = ValueProjection::<ArrayType>::into_projected(positions)?;
             if self.strides[axis] != 1 {
-                let step = step.to_scalar()?.into_projected()?.transfer_to_memory(cotangent_type.memory())?;
+                let step = ValueProjection::<ArrayType>::into_projected(step.to_scalar()?)?
+                    .transfer_to_memory(cotangent_type.memory())?;
                 positions = positions.mul(&step)?;
             }
             coordinates.push(positions.add(&start)?);
         }
-        let coordinates = <V::Projected as Concatenate>::concatenate(&coordinates, rank as i64)?;
+        let coordinates = Concatenate::concatenate(&coordinates, rank as i64)?;
         let dimensions = ScatterDimensionNumbers::new(Vec::new(), (0..rank).collect(), (0..rank).collect());
         let options = ScatterOptions::new().with_mode(ScatterMode::PromiseInBounds).with_unique_indices(true);
-        Ok(V::from_projected(zeros.clone().into_projected()?.scatter(
-            &coordinates,
-            &cotangent.clone().into_projected()?,
-            &dimensions,
-            ScatterReductionKind::Add,
-            &options,
-        )?))
+        Ok(ValueProjection::<ArrayType>::from_projected(
+            ValueProjection::<ArrayType>::into_projected(zeros.clone())?.scatter(
+                &coordinates,
+                &ValueProjection::<ArrayType>::into_projected(cotangent.clone())?,
+                &dimensions,
+                ScatterReductionKind::Add,
+                &options,
+            )?,
+        ))
     }
 }
 
@@ -2192,8 +2202,9 @@ impl_differentiable_operation! {
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
         Tracer<NestedTracingContext<C>>: Value<Type = ArrayIrType, DispatchDomain = NestedTracingContext<C>>
-            + DimensionSize + DimensionToScalar + DimensionArithmetic
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>,
+            + DimensionSize + DimensionToScalar
+            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
+            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
         NestedTracingContext<C>: Context<
                 Type = ArrayIrType, Value = Tracer<NestedTracingContext<C>>, Operation = C::Operation,
             > + DimensionConstant + DynamicIota<Tracer<NestedTracingContext<C>>>
@@ -2258,8 +2269,9 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
         Tracer<TracingContext<V, O>>: Value<Type = ArrayIrType, DispatchDomain = TracingContext<V, O>>
-            + DimensionSize + DimensionToScalar + DimensionArithmetic
-            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>,
+            + DimensionSize + DimensionToScalar
+            + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>
+            + ValueProjection<DimensionType, Projected: Add + Mul + DimensionMin + DimensionSaturatingSub>,
         TracingContext<V, O>: Context<
                 Type = ArrayIrType, Value = Tracer<TracingContext<V, O>>, Operation = O,
             > + DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
@@ -2638,7 +2650,7 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
         let start_indices = start_indices
             .iter()
             .cloned()
-            .map(<Self as ValueProjection<ArrayType>>::into_projected)
+            .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self::Array(input.dynamic_slice(&start_indices, sizes)?))
     }
@@ -2664,7 +2676,7 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
             .iter()
             .chain(sizes)
             .cloned()
-            .map(<Self as ValueProjection<DimensionType>>::into_projected)
+            .map(ValueProjection::<DimensionType>::into_projected)
             .map(|result| {
                 let value = result?;
                 refinements.bind(value.r#type().variable(), value.extent())?;
@@ -3364,7 +3376,7 @@ impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for Arr
         let start_indices = start_indices
             .iter()
             .cloned()
-            .map(<Self as ValueProjection<ArrayType>>::into_projected)
+            .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self::Array(input.dynamic_update_slice(update, &start_indices)?))
     }

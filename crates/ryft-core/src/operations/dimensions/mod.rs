@@ -4,11 +4,10 @@
 //! program operations over [`DimensionType`], not integer array operations and not a parallel symbolic-expression
 //! language.
 
-use crate::arrays::{ArrayIrType, DimensionBounds, DimensionError, DimensionType, DimensionVariable};
-use crate::contexts::{Context, Domain};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Type, TypeError, TypeIdentityRenaming, Value};
+use crate::programs::{Operation, Type, TypeError, TypeIdentityRenaming};
 
 // TODO(eaplatanios): Review this module.
 
@@ -98,83 +97,6 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     }
 }
 
-/// Defines [`DimensionArithmetic`] and its staging implementation from one method-to-operation table.
-macro_rules! define_dimension_arithmetic {
-    // Each accepted item pairs one capability method with the first-class dimension operation that it binds.
-    (
-        $(
-            $(#[$method_documentation:meta])+
-            $method:ident => $operation:ident
-        ),+ $(,)?
-    ) => {
-        /// Represents the ability to compute checked arithmetic over two first-class dimensions of a *composite*
-        /// value (i.e., one typed [`ArrayIrType`], such as an [`ArrayIrValue`](crate::ArrayIrValue) or a tracer over
-        /// the composite universe).
-        ///
-        /// Each method is the composite-level counterpart of one member capability on
-        /// [`DimensionType`]-typed values: [`Add`](crate::operations::Add), [`Sub`](crate::operations::Sub),
-        /// [`Mul`](crate::operations::Mul), [`Div`](crate::operations::Div), [`Rem`](crate::operations::Rem), and the
-        /// dedicated [`DimensionSaturatingSub`], [`DimensionPow`], [`DimensionMin`], and [`DimensionMax`]. It exists
-        /// because those member capabilities require a [`DimensionType`]-typed receiver, which a composite value
-        /// never is: shape arithmetic written against a composite universe would otherwise have to project each
-        /// operand, apply the member capability, and lift the result back at every step. Both operands must hold
-        /// first-class dimensions, and a composite value that holds an array is rejected with a kind-mismatch
-        /// [`TypeError`].
-        ///
-        /// Result bounds, identity freshness, and the runtime assertions that checked arithmetic requires are all
-        /// owned by the bound operation, so this capability adds vocabulary and nothing else.
-        pub trait DimensionArithmetic: Value<Type = ArrayIrType> + Sized {
-            $(
-                $(#[$method_documentation])+
-                fn $method(&self, right: &Self) -> Result<Self, ProgramError>;
-            )+
-        }
-
-        impl<V: Value<Type = ArrayIrType>> DimensionArithmetic for V
-        where
-            V::DispatchDomain: Context<Type = ArrayIrType>,
-            <V::DispatchDomain as Domain>::Operation: $(From<$operation> +)+,
-        {
-            $(
-                #[inline]
-                fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                    let left_type = self.r#type();
-                    let right_type = right.r#type();
-                    let operation = $operation::new(
-                        <&DimensionType>::try_from(left_type.as_ref())?,
-                        <&DimensionType>::try_from(right_type.as_ref())?,
-                    )?;
-                    Ok(self
-                        .dispatch_domain()
-                        .bind(operation, Vec::new(), &[self.clone(), right.clone()])?
-                        .remove(0))
-                }
-            )+
-        }
-    };
-}
-
-define_dimension_arithmetic!(
-    /// Returns `self + right`.
-    dimension_add => DimensionAddOperation,
-    /// Returns `self - right`, which requires that `right` never exceed `self` at run time.
-    dimension_sub => DimensionSubOperation,
-    /// Returns `max(self - right, 0)`, which admits a subtrahend that exceeds `self`.
-    dimension_saturating_sub => DimensionSaturatingSubOperation,
-    /// Returns `self * right`.
-    dimension_mul => DimensionMulOperation,
-    /// Returns `self.pow(right)`.
-    dimension_pow => DimensionPowOperation,
-    /// Returns the nonnegative integer quotient `self / right`, rounded down. A zero divisor returns an error.
-    dimension_div => DimensionDivOperation,
-    /// Returns `self % right`, which requires that `right` be positive at run time.
-    dimension_rem => DimensionRemOperation,
-    /// Returns `min(self, right)`.
-    dimension_min => DimensionMinOperation,
-    /// Returns `max(self, right)`.
-    dimension_max => DimensionMaxOperation,
-);
-
 /// Shared type-identity inference and effect metadata stored by every binary dimension arithmetic operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub(crate) struct ArithmeticDimensionOperationMetadata {
@@ -256,9 +178,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionValue};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, DimensionValue};
     use crate::contexts::EagerContext;
-    use crate::programs::{EffectClass, EffectClasses, Operation, TypeError, TypeIdentityRenaming};
+    use crate::operations::math::add::Add;
+    use crate::operations::math::div::Div;
+    use crate::operations::math::mul::Mul;
+    use crate::operations::math::rem::Rem;
+    use crate::operations::math::sub::Sub;
+    use crate::programs::{EffectClass, EffectClasses, Operation, TypeError, TypeIdentityRenaming, ValueProjection};
     use crate::tracing::Trace;
 
     use super::*;
@@ -380,30 +307,28 @@ mod tests {
 
     #[test]
     fn test_composite_dimension_arithmetic() {
-        // An eager composite value projects onto its first-class dimension member, applies the member capability, and
-        // injects the result back, so every method returns a first-class dimension.
-        let extent = |value: ArrayIrValue<Array>| match value {
-            ArrayIrValue::Dimension(dimension) => dimension.extent(),
-            value => panic!("expected a first-class dimension but got {value:?}"),
-        };
         let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(6).unwrap());
         let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(4).unwrap());
         let two = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
-        assert_eq!(extent(left.dimension_add(&right).unwrap()), 10);
-        assert_eq!(extent(left.dimension_sub(&right).unwrap()), 2);
-        assert_eq!(extent(right.dimension_saturating_sub(&left).unwrap()), 0);
-        assert_eq!(extent(left.dimension_mul(&right).unwrap()), 24);
-        assert_eq!(extent(left.dimension_pow(&two).unwrap()), 36);
-        assert_eq!(extent(left.dimension_div(&right).unwrap()), 1);
-        assert_eq!(extent(left.dimension_rem(&right).unwrap()), 2);
-        assert_eq!(extent(left.dimension_min(&right).unwrap()), 4);
-        assert_eq!(extent(left.dimension_max(&right).unwrap()), 6);
+        let left = ValueProjection::<DimensionType>::into_projected(left).unwrap();
+        let right = ValueProjection::<DimensionType>::into_projected(right).unwrap();
+        let two = ValueProjection::<DimensionType>::into_projected(two).unwrap();
+        assert_eq!(left.add(&right).unwrap().extent(), 10);
+        assert_eq!(left.sub(&right).unwrap().extent(), 2);
+        assert_eq!(right.dimension_saturating_sub(&left).unwrap().extent(), 0);
+        assert_eq!(left.mul(&right).unwrap().extent(), 24);
+        assert_eq!(left.dimension_pow(&two).unwrap().extent(), 36);
+        assert_eq!(left.div(&right).unwrap().extent(), 1);
+        assert_eq!(left.rem(&right).unwrap().extent(), 2);
+        assert_eq!(left.dimension_min(&right).unwrap().extent(), 4);
+        assert_eq!(left.dimension_max(&right).unwrap().extent(), 6);
+        let result = <ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(left.add(&right).unwrap());
+        assert!(matches!(result, ArrayIrValue::Dimension(value) if value.extent() == 10));
 
-        // An array member is not a first-class dimension, so the capability rejects it by kind.
+        // An array member is rejected before dimension arithmetic can be invoked.
         assert!(matches!(
-            ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()).dimension_add(&right),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "expected dimension type but got array type",
+            ValueProjection::<DimensionType>::into_projected(ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap())),
+            Err(TypeError::Invalid { message }) if message == "expected dimension type but got array type",
         ));
     }
 
@@ -413,13 +338,15 @@ mod tests {
         let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(rows, columns)| {
-                let padded = rows.dimension_mul(&columns)?.dimension_add(&columns)?;
+                let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
+                let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
+                let padded = rows.mul(&columns)?.add(&columns)?;
                 let trimmed = padded.dimension_saturating_sub(&rows)?;
                 Ok((
-                    trimmed.dimension_div(&columns)?,
-                    trimmed.dimension_rem(&columns)?,
-                    rows.dimension_pow(&columns)?,
-                    rows.dimension_max(&columns)?.dimension_sub(&rows.dimension_min(&columns)?)?,
+                    trimmed.div(&columns)?.into_value(),
+                    trimmed.rem(&columns)?.into_value(),
+                    rows.dimension_pow(&columns)?.into_value(),
+                    rows.dimension_max(&columns)?.sub(&rows.dimension_min(&columns)?)?.into_value(),
                 ))
             },
             (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),

@@ -19,11 +19,10 @@ use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::{
-    Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivOperation,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
-    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
+    Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
+    DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSaturatingSubOperation,
+    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
 };
 use crate::programs::{Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -128,35 +127,6 @@ impl_dimension_operator!(Sub, sub, Sub, sub);
 impl_dimension_operator!(Mul, mul, Mul, mul);
 impl_dimension_operator!(Div, div, Div, div);
 impl_dimension_operator!(Rem, rem, Rem, rem);
-
-/// Implements the composite dimension arithmetic capability for eager composite values, which have no context to
-/// stage into and therefore project both operands, apply the member capability, and inject the result back.
-macro_rules! impl_composite_dimension_arithmetic {
-    // Each accepted item pairs one composite capability method with the member capability method that performs it.
-    ($($method:ident => $member_method:ident),+ $(,)?) => {
-        impl<A: Value<Type = ArrayType>> DimensionArithmetic for ArrayIrValue<A> {
-            $(
-                fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                    let left = <Self as ValueProjection<DimensionType>>::projected(self)?;
-                    let right = <Self as ValueProjection<DimensionType>>::projected(right)?;
-                    Ok(Self::Dimension(left.$member_method(right)?))
-                }
-            )+
-        }
-    };
-}
-
-impl_composite_dimension_arithmetic!(
-    dimension_add => add,
-    dimension_sub => sub,
-    dimension_saturating_sub => dimension_saturating_sub,
-    dimension_mul => mul,
-    dimension_pow => dimension_pow,
-    dimension_div => div,
-    dimension_rem => rem,
-    dimension_min => dimension_min,
-    dimension_max => dimension_max,
-);
 
 impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayIrValue<A> {
     fn dimension_size<AxisValue: Into<crate::Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {

@@ -9055,8 +9055,8 @@ mod tests {
 
     #[test]
     fn test_compiled_dynamic_slice_runtime_input_pullback() {
-        use ryft_core::DimensionArithmetic;
         use ryft_core::operations::DimensionConstant;
+        use ryft_core::{Add, Div};
 
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -9074,10 +9074,12 @@ mod tests {
             .to_dimension(DimensionVariable::new("columns", DimensionBounds::new(0, Some(6)).unwrap()))
             .unwrap();
         let zero = context.dimension_constant(0).unwrap();
-        let one = context.dimension_constant(1).unwrap();
-        let two = context.dimension_constant(2).unwrap();
-        let height = rows.dimension_add(&one).unwrap().dimension_div(&two).unwrap();
-        let width = columns.dimension_add(&one).unwrap().dimension_div(&two).unwrap();
+        let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1).unwrap()).unwrap();
+        let two = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(2).unwrap()).unwrap();
+        let height = ValueProjection::<DimensionType>::into_projected(rows.clone()).unwrap();
+        let height = height.add(&one).unwrap().div(&two).unwrap().into_value();
+        let width = ValueProjection::<DimensionType>::into_projected(columns.clone()).unwrap();
+        let width = width.add(&one).unwrap().div(&two).unwrap().into_value();
         // The inner slice receives a genuinely runtime-shaped array. Its pullback must allocate that exact shape,
         // before the outer prefix slice embeds it back into the original static input geometry.
         let prefix = input

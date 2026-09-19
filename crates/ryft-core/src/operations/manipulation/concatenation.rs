@@ -25,12 +25,12 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::Add;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
@@ -1136,8 +1136,8 @@ where
 /// array inputs obey [`Concatenate`]'s element [`DataType`](crate::DataType), rank, [`Memory`](crate::Memory), and
 /// non-concatenated dimension requirements. The output axis is described by a first-class result extent that must
 /// equal the exact runtime sum of the input extents. [`Self::concatenate`] derives that extent by summing the inputs'
-/// [`DimensionSize`]s with [`DimensionArithmetic::dimension_add`], and [`Self::concatenate_with_known_extent`] takes
-/// it from the caller.
+/// [`DimensionSize`]s through their [`DimensionType`] projection with [`Add`], and
+/// [`Self::concatenate_with_known_extent`] takes it from the caller.
 ///
 /// The result extent's type describes the concatenated output axis. An exact dimension type yields a static axis, so
 /// statically shaped inputs stay pure under both entry points. Otherwise, its variable and bounds are retained. A
@@ -1169,8 +1169,8 @@ where
 pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
     /// Joins array `inputs` along `axis`, deriving the result extent as the sum of the input extents on that axis.
     /// Each extent is read with [`DimensionSize::dimension_size`] and the extents are summed with
-    /// [`DimensionArithmetic::dimension_add`], so the derivation stages dimension operations under a tracer and
-    /// evaluates eagerly on concrete values. Exact extents fold to a static output axis; dynamic extents produce a
+    /// [`Add`] on their [`DimensionType`] projections, so the derivation stages dimension operations under a tracer
+    /// and evaluates eagerly on concrete values. Exact extents fold to a static output axis; dynamic extents produce a
     /// fresh dimension identity whose equality with the concatenated size is asserted at runtime.
     ///
     /// # Parameters
@@ -1182,7 +1182,7 @@ pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
         axis: A,
     ) -> Result<Self, ProgramError>
     where
-        Self: 'i + DimensionSize + DimensionArithmetic,
+        Self: 'i + DimensionSize + ValueProjection<DimensionType, Projected: Add>,
     {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
@@ -1201,10 +1201,11 @@ pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
         let axis = ConcatenateOperation::<ArrayType>::normalize_axis(axis.into(), input_types[0].rank())?;
         validate_concatenation_inputs(&input_types.iter().collect::<Vec<_>>(), axis)?;
 
-        let mut extent = first.dimension_size(axis)?;
+        let mut extent = first.dimension_size(axis)?.into_projected()?;
         for input in &inputs[1..] {
-            extent = extent.dimension_add(&input.dimension_size(axis)?)?;
+            extent = extent.add(&input.dimension_size(axis)?.into_projected()?)?;
         }
+        let extent = Self::from_projected(extent);
         Self::concatenate_with_known_extent(inputs, &extent, axis)
     }
 
@@ -1221,7 +1222,7 @@ pub trait DynamicConcatenate: Value<Type = ArrayIrType> + Sized {
         axis: A,
     ) -> Result<Self, ProgramError>
     where
-        Self: 'i + DimensionSize + DimensionArithmetic,
+        Self: 'i + DimensionSize + ValueProjection<DimensionType, Projected: Add>,
     {
         Self::concatenate(std::iter::once(self).chain(others), axis)
     }

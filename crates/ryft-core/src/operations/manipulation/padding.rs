@@ -28,7 +28,6 @@ use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::DimensionArithmetic;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
@@ -1742,13 +1741,12 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         extent: &Self,
     ) -> Result<Self, ProgramError>
     where
-        Self: DimensionArithmetic
-            + DimensionSize
+        Self: DimensionSize
             + DimensionToScalar
             + DynamicBroadcast
             + DynamicReshape
             + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: DimensionRequirement>,
+            + ValueProjection<DimensionType, Projected: Add + DimensionRequirement>,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
         let input_type = self.r#type();
@@ -1775,9 +1773,9 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             .map(|input_axis| self.dimension_size(input_axis))
             .collect::<Result<Vec<_>, _>>()?;
         let size = input_dimensions[axis].clone();
-        let end = edge_padding_low.dimension_add(&size)?;
-        <Self as ValueProjection<DimensionType>>::into_projected(end)?
-            .require_less_than_or_equal(&<Self as ValueProjection<DimensionType>>::into_projected(extent.clone())?)?;
+        let end = ValueProjection::<DimensionType>::into_projected(edge_padding_low.clone())?
+            .add(&ValueProjection::<DimensionType>::into_projected(size.clone())?)?;
+        end.require_less_than_or_equal(&ValueProjection::<DimensionType>::into_projected(extent.clone())?)?;
 
         // For the output geometry, the padded axis takes the target extent and every other axis
         // keeps its runtime extent.
@@ -1798,12 +1796,12 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             0,
             if matches!(input_type.dimension(axis), Dimension::Dynamic(_)) { std::slice::from_ref(&size) } else { &[] },
         )?;
-        let offset = <Self as ValueProjection<ArrayType>>::into_projected(edge_padding_low.to_scalar()?)?
+        let offset = ValueProjection::<ArrayType>::into_projected(edge_padding_low.to_scalar()?)?
             .transfer_to_memory(input_type.memory())?;
         let offset = <Self as ValueProjection<ArrayType>>::from_projected(offset).dynamic_broadcast(&[size], &[])?;
-        let queries = <Self as ValueProjection<ArrayType>>::into_projected(queries)?
-            .add(&<Self as ValueProjection<ArrayType>>::into_projected(offset)?)?;
-        let indices = <Self as ValueProjection<ArrayType>>::into_projected(
+        let queries = ValueProjection::<ArrayType>::into_projected(queries)?
+            .add(&ValueProjection::<ArrayType>::into_projected(offset)?)?;
+        let indices = ValueProjection::<ArrayType>::into_projected(
             <Self as ValueProjection<ArrayType>>::from_projected(queries).dynamic_expand_dimensions(-1)?,
         )?;
 
@@ -1816,16 +1814,15 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
             .with_mode(ScatterMode::PromiseInBounds)
             .with_indices_are_sorted(true)
             .with_unique_indices(true);
-        let fill = <Self as ValueProjection<ArrayType>>::into_projected(
-            padding_value.dynamic_broadcast_with_output_sharding(
+        let fill =
+            ValueProjection::<ArrayType>::into_projected(padding_value.dynamic_broadcast_with_output_sharding(
                 &output_dimensions,
                 &[],
                 output_type.sharding().cloned(),
-            )?,
-        )?;
+            )?)?;
         let padded = fill.scatter(
             &indices,
-            &<Self as ValueProjection<ArrayType>>::into_projected(self.clone())?,
+            &ValueProjection::<ArrayType>::into_projected(self.clone())?,
             &dimensions,
             ScatterReductionKind::Overwrite,
             &options.with_output_sharding(output_type.sharding().cloned()),

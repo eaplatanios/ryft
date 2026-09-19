@@ -43,7 +43,7 @@ use crate::operations::{
     ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, CumulativeLogSumExp,
     CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
     CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, CustomJvpOperation,
-    CustomVjpOperation, DimensionAddOperation, DimensionArithmetic, DimensionDivOperation, DimensionFromScalar,
+    CustomVjpOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
     DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
     DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
@@ -343,8 +343,8 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 ///     [`ArrayIrOperations`]. [`DimensionToScalar`] does have a dimension-typed receiver, but its output is an array
 ///     representation the member universe cannot name, so it is reached through the composite value instead.
 ///
-/// The composite counterpart of this bundle's arithmetic is [`DimensionArithmetic`], which spells the same operations
-/// directly on [`ArrayIrType`]-typed values so that composite shape arithmetic needs no projection vocabulary.
+/// Composite values reach these capabilities through [`ValueProjection<DimensionType>`], just as they reach
+/// [`ArrayOperations`] through [`ValueProjection<ArrayType>`].
 ///
 /// # Tracers
 ///
@@ -566,11 +566,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///     [`DynamicReshape`], the whole-value reference capabilities [`ReferenceNew`], [`ReferenceRead`],
 ///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and [`ReferenceFreeze`], and the reference view
 ///     derivations [`ReferenceIndex`], [`ReferenceDynamicIndex`], and [`ReferenceSlice`].
-///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
-///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
-///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand
-///     `From<AddOperation<ArrayIrType>>`-style conversions of every array operation, which the composite family
-///     intentionally does not provide.
+///   - Homogeneous array and dimension capabilities such as [`Add`], [`Dot`], and [`DimensionPow`] are reached
+///     through member projections. The composite family carries array payloads through [`ArrayIrOperation::Array`]
+///     and dimension payloads through [`ArrayIrOperation::Dimension`]. Composite values perform their capabilities
+///     through [`ValueProjection`] onto [`ArrayType`] or [`DimensionType`], respectively. Bounding homogeneous
+///     capabilities directly here would demand `From<AddOperation<ArrayIrType>>`-style conversions of every array
+///     operation, which the composite family intentionally does not provide.
 ///
 /// # Member Profiles
 ///
@@ -582,26 +583,25 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
 /// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
 ///
-/// Checked arithmetic over two first-class dimensions is a bundle member in its own right, through
-/// [`DimensionArithmetic`], so composite shape arithmetic needs no projection vocabulary at all:
+/// Checked arithmetic over first-class dimensions uses their member projection:
 ///
 /// ```rust
 /// use ryft_core::arrays::DimensionValue;
-/// use ryft_core::{Array, ArrayIrValue, DimensionArithmetic, ProgramError};
+/// use ryft_core::{Array, ArrayIrValue, DimensionType, Mul, ProgramError, ValueProjection};
 ///
 /// # fn main() -> Result<(), ProgramError> {
 /// let rows: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
 /// let columns: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
-/// let ArrayIrValue::Dimension(elements) = rows.dimension_mul(&columns)? else {
-///     unreachable!("dimension arithmetic returns a first-class dimension");
-/// };
+/// let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
+/// let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
+/// let elements = rows.mul(&columns)?;
 /// assert_eq!(elements.extent(), 6);
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// Every other member surface is reached by the general mechanism instead: project the composite value, use the
-/// member capability, and inject the member result back. For the array member that reads
+/// The same mechanism applies to arrays: project the composite value, use the member capability, and inject the
+/// member result back when a composite consumer needs it. For the array member that reads
 /// `value.into_projected()?.mul(&other.into_projected()?)`, followed by `from_projected`:
 ///
 /// ```rust
@@ -637,7 +637,7 @@ pub trait ArrayIrOperations:
     // Comparison of first-class dimensions, producing ordinary Boolean array data.
     + Compare
     // First-class dimensions.
-    + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
+    + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
     + ReferenceNew + ReferenceDynamicIndex + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
@@ -651,7 +651,7 @@ pub trait ArrayIrOperations:
 impl<V> ArrayIrOperations for V
 where
     V: Value<Type = ArrayIrType> + Compare,
-    V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
+    V: DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
     V: ReferenceNew
         + ReferenceDynamicIndex
@@ -1082,9 +1082,11 @@ mod tests {
         fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
             // The array member carries both the fallible capability and its panicking operator sugar, so the
             // capability is named explicitly here.
-            let array = <V as ValueProjection<ArrayType>>::into_projected(value.clone())?;
-            let square = <V as ValueProjection<ArrayType>>::from_projected(Mul::mul(&array, &array)?);
-            let elements = value.dimension_size(0)?.dimension_mul(&value.dimension_size(1)?)?;
+            let array = ValueProjection::<ArrayType>::into_projected(value.clone())?;
+            let square = ValueProjection::<ArrayType>::from_projected(Mul::mul(&array, &array)?);
+            let rows = ValueProjection::<DimensionType>::into_projected(value.dimension_size(0)?)?;
+            let columns = ValueProjection::<DimensionType>::into_projected(value.dimension_size(1)?)?;
+            let elements = ValueProjection::<DimensionType>::from_projected(rows.mul(&columns)?);
             Ok((square, elements))
         }
 

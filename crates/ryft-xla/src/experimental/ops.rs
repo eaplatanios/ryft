@@ -587,8 +587,7 @@ macro_rules! impl_composite_operation_conversion {
 }
 
 // Every first-class dimension arithmetic operation lifts directly, mirroring the composite family, so that generic
-// staging code (e.g., the `DimensionArithmetic` capability) can bound `From<DimensionMulOperation>`-style conversions
-// without naming this family's dimension member.
+// staging code can bound `From<DimensionMulOperation>`-style conversions without naming this family's dimension member.
 impl_composite_operation_conversion!(
     DimensionAddOperation,
     DimensionSubOperation,
