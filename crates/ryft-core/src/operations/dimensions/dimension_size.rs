@@ -125,7 +125,7 @@ impl DimensionSizeOperation {
         }
 
         Err(TypeError::invalid(format!(
-            "`{}` input axis {} dimension {} does not refine declared dimension {}",
+            "`{}` input axis {} dimension `{}` does not refine declared dimension `{}`",
             DIMENSION_SIZE_OPERATION_NAME, self.axis, actual_dimension, self.input_dimension,
         )))
     }
@@ -551,7 +551,8 @@ mod tests {
                         DataType::F32,
                         Shape::new(vec![Dimension::Dynamic(dimension_type.variable().clone())]),
                     ).into()],
-                    error = "`dimension_size` input axis 0 dimension other does not refine declared dimension extent",
+                    error = "`dimension_size` input axis 0 dimension `other` does not refine declared \
+                             dimension `extent`",
                 },
             ],
         );
@@ -583,7 +584,7 @@ mod tests {
             operation = DimensionSizeOperation::new(&static_type, 0).unwrap(),
             cases = [{
                 input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into()],
-                error = "`dimension_size` input axis 0 dimension 4 does not refine declared dimension 3",
+                error = "`dimension_size` input axis 0 dimension `4` does not refine declared dimension `3`",
             }],
         );
 

@@ -54,7 +54,7 @@ impl DimensionFromScalarOperation {
         if input_type.rank() != 0 || !input_type.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
                 "`{DIMENSION_FROM_SCALAR_OPERATION_NAME}` input must be a rank-0 integer array but has type \
-                 {input_type}",
+                 `{input_type}`",
             )));
         }
         Ok(())
@@ -306,41 +306,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionError,
-        DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT, Shape, i1, i2, i4, u1, u2, u4,
+        Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionError, DimensionValue,
+        MAX_DIMENSION_EXTENT, Shape, i1, i2, i4, u1, u2, u4,
     };
+    use crate::batching::batch;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::dimensions::dimension_requirement::{
-        DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DimensionRequirementOperation,
-    };
-    use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
-    use crate::operations::math::sin::SinOperation;
+    use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
     use crate::parameters::Placeholder;
-    use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface, ValueProjection,
-    };
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface, ValueProjection};
     use crate::tracing::TracingContext;
 
     use super::*;
-
-    /// Returns the names of `program`'s ordered-assertion instructions, in program order.
-    fn assertion_operation_names(
-        program: &Program<
-            ArrayIrValue<Array>,
-            ArrayIrOperation<Array>,
-            Vec<ArrayIrValue<Array>>,
-            Vec<ArrayIrValue<Array>>,
-        >,
-    ) -> Vec<&'static str> {
-        program
-            .instructions()
-            .iter()
-            .filter(|instruction| instruction.operation().effects().classes().contains(EffectClass::OrderedAssertion))
-            .map(|instruction| instruction.operation().name())
-            .collect::<Vec<_>>()
-    }
 
     #[test]
     fn test_dimension_from_scalar() {
@@ -353,30 +331,22 @@ mod tests {
         assert_eq!(operation.to_string(), "dimension_from_scalar [bounds=[0, 9)]");
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = context.input(ArrayType::scalar(DataType::I32).into());
-        let input_id = input.atom_id().unwrap();
-        let output = input.to_dimension(variable.clone()).unwrap();
-        let output_id = output.atom_id().unwrap();
-        let builder = context.builder().borrow();
-        let [instruction] = builder.instructions() else {
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.to_dimension(variable.clone()),
+            ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+        )
+        .unwrap();
+        let [instruction] = program.instructions() else {
             panic!("expected one dimension-from-scalar instruction");
         };
-        assert_eq!(instruction.inputs(), &[input_id]);
-        assert_eq!(instruction.outputs(), &[output_id]);
+        assert_eq!(instruction.inputs(), program.input_ids());
+        assert_eq!(instruction.outputs(), program.output_ids());
         assert!(instruction.regions().is_empty());
-        assert!(matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(_)));
-        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::from(variable.clone())));
+        assert!(
+            matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(actual) if actual == &operation)
+        );
+        assert_eq!(output_type, ArrayIrType::Dimension(DimensionType::from(variable.clone())));
 
-        let program = builder
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output_id],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        drop(builder);
         assert_eq!(program.type_identity_signature().internal_identities(), std::slice::from_ref(&variable));
         assert_eq!(
             program.to_string(),
@@ -395,6 +365,30 @@ mod tests {
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
+                {
+                    input_types = [ArrayType::scalar(DataType::I1).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::I2).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::I4).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::U1).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::U2).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::U4).into()],
+                    output_types = [DimensionType::from(variable.clone()).into()],
+                },
                 {
                     input_types = [ArrayType::scalar(DataType::I8).into()],
                     output_types = [DimensionType::from(variable.clone()).into()],
@@ -429,11 +423,15 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(1)])).into()],
-                    error = "`dimension_from_scalar` input must be a rank-0 integer array but has type i32[1]",
+                    error = "`dimension_from_scalar` input must be a rank-0 integer array but has type `i32[1]`",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::Boolean).into()],
+                    error = "`dimension_from_scalar` input must be a rank-0 integer array but has type `bool[]`",
                 },
                 {
                     input_types = [ArrayType::scalar(DataType::F32).into()],
-                    error = "`dimension_from_scalar` input must be a rank-0 integer array but has type f32[]",
+                    error = "`dimension_from_scalar` input must be a rank-0 integer array but has type `f32[]`",
                 },
                 {
                     input_types = [DimensionType::from(variable.clone()).into()],
@@ -511,94 +509,10 @@ mod tests {
 
     #[test]
     fn test_dimension_from_scalar_interpretation() {
-        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let variable = DimensionVariable::new("extent", bounds);
-        let operation = DimensionFromScalarOperation::new(variable.clone());
-
-        // Every integer element type uses the same checked conversion contract.
-        for array in [
-            Array::scalar(7_i8).unwrap(),
-            Array::scalar(7_i16).unwrap(),
-            Array::scalar(7_i32).unwrap(),
-            Array::scalar(7_i64).unwrap(),
-            Array::scalar(7_u8).unwrap(),
-            Array::scalar(7_u16).unwrap(),
-            Array::scalar(7_u32).unwrap(),
-            Array::scalar(7_u64).unwrap(),
-        ] {
-            assert_eq!(
-                array.to_dimension(variable.clone()),
-                Ok(DimensionValue::new(operation.output_type().clone(), 7).unwrap()),
-            );
-        }
-        assert_eq!(
-            Array::scalar(i1::new(0).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 0).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(i2::new(1).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 1).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(i4::new(7).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 7).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(u1::new(1).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 1).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(u2::new(3).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 3).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(u4::new(7).unwrap()).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(operation.output_type().clone(), 7).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(0_i32).unwrap().to_dimension(variable.clone()),
-            Ok(DimensionValue::new(DimensionType::from(variable.clone()), 0).unwrap()),
-        );
-        let bounded_variable = DimensionVariable::new("bounded", DimensionBounds::new(2, Some(5)).unwrap());
-        assert_eq!(
-            Array::scalar(2_i32).unwrap().to_dimension(bounded_variable.clone()),
-            Ok(DimensionValue::new(DimensionType::from(bounded_variable.clone()), 2).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(4_i32).unwrap().to_dimension(bounded_variable.clone()),
-            Ok(DimensionValue::new(DimensionType::from(bounded_variable.clone()), 4).unwrap()),
-        );
-        assert_eq!(
-            Array::scalar(-1_i32).unwrap().to_dimension(variable.clone()),
-            Err(ProgramError::Concretization {
-                message: "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range".to_string(),
-            }),
-        );
-
-        let error = Array::scalar(5_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::BindingOutOfBounds {
-                variable: "bounded".to_string(),
-                value: 5,
-                bounds: bounded_variable.bounds(),
-            }),
-        );
-
-        if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
-            let error = Array::scalar(u64::try_from(unrepresentable).unwrap())
-                .unwrap()
-                .to_dimension(DimensionVariable::new("wide", DimensionBounds::at_least(0)))
-                .unwrap_err();
-            assert_eq!(
-                error.downcast_custom::<DimensionError>(),
-                Some(&DimensionError::ExtentExceedsBackendWidth {
-                    value: unrepresentable,
-                    maximum: MAX_DIMENSION_EXTENT,
-                }),
-            );
-        }
-
+        let operation = DimensionFromScalarOperation::new(DimensionVariable::new(
+            "extent",
+            DimensionBounds::new(0, Some(9)).unwrap(),
+        ));
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
             context.bind(operation.clone(), Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i32).unwrap())],),
@@ -611,80 +525,6 @@ mod tests {
                 &[ArrayIrValue::Dimension(DimensionValue::new(operation.output_type().clone(), 7).unwrap(),)],
             ),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
-        );
-    }
-
-    #[test]
-    fn test_dimension_from_scalar_interpretation_multiple_bounded_outputs() {
-        // A data-dependent extent is an ordinary SSA value with one definition. Two sibling shape-carrying constructors
-        // consume that one gateway output as an explicit input instead of each recovering an extent of its own, so both
-        // outputs are governed by a single identity and a single bounds assertion.
-        let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let first_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let second_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar], None)
-            .unwrap()[0];
-        let first = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent], None)
-            .unwrap()[0];
-        let second = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![second_value, extent], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![first, second],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:i32[], %1:f64[], %2:f64[] .
-                let %3:dimension<total ∈ [1, 9)> = dimension_from_scalar [bounds=[1, 9)] %0
-                    %4:f64[total] = broadcast [output_axes=[]] %1 %3
-                    %5:f64[total] = broadcast [output_axes=[]] %2 %3
-                in (%4, %5)"},
-        );
-        let output_types = program.output_types();
-        assert_eq!(output_types[0], output_types[1]);
-
-        // Both outputs share the lower bound, an interior extent, and the last admitted extent.
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(1_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 1]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 1]).unwrap()),
-            ]),
-        );
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(5_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 5]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 5]).unwrap()),
-            ]),
-        );
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(8_i32).unwrap()),
-                ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap()),
-                ArrayIrValue::Array(Array::scalar(3.0_f64).unwrap()),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![2.0_f64; 8]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![3.0_f64; 8]).unwrap()),
-            ]),
         );
     }
 
@@ -728,6 +568,35 @@ mod tests {
     }
 
     #[test]
+    fn test_dimension_from_scalar_batching() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+        let output: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |input| input.to_dimension(variable.clone())?.to_scalar(),
+            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(output, Ok(ArrayIrValue::Array(Array::vector(vec![1_i64, 3]).unwrap())));
+
+        let output: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |input| input.to_dimension(variable.clone())?.to_scalar(),
+            ArrayIrValue::Array(Array::vector(vec![1_i32, 4]).unwrap()),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        let BatchingError::Program(error) = output.unwrap_err() else {
+            panic!("expected a dimension bounds error from the batched operation");
+        };
+        assert!(matches!(
+            error.downcast_custom::<DimensionError>(),
+            Some(DimensionError::BindingOutOfBounds { variable, value: 4, bounds })
+                if variable == "extent" && *bounds == DimensionBounds::new(1, Some(4)).unwrap(),
+        ));
+    }
+
+    #[test]
     fn test_dimension_from_scalar_differentiation() {
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let variable = DimensionVariable::new("extent", bounds);
@@ -746,77 +615,10 @@ mod tests {
         assert_eq!(differentiated.input_ids().len(), 1);
         assert_eq!(differentiated.output_ids().len(), 1);
         assert_eq!(differentiated.to_string(), program.to_string());
-    }
-
-    #[test]
-    fn test_dimension_from_scalar_differentiation_ordered_assertions() {
-        // A tier-3 composite program whose differentiable array body is shaped by a data-derived dimension. The
-        // gateway always carries an ordered assertion because its bounds check can only run against runtime data, and
-        // the requirement is inconclusive from the declared `[1, 9)` bounds alone, so it residualizes as a second
-        // ordered assertion. Their relative order defines which failure is observed first and must never change.
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let value = builder.add_input(ArrayType::scalar(DataType::F64).into());
-        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                DimensionOperation::Requirement(DimensionRequirementOperation::bounds(
-                    &DimensionType::from(rows),
-                    DimensionBounds::new(2, Some(8)).unwrap(),
-                )),
-                Vec::new(),
-                vec![extent],
-                None,
-            )
-            .unwrap();
-        let broadcast = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, extent], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Sin(SinOperation::new())),
-                Vec::new(),
-                vec![broadcast],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
-            assertion_operation_names(&program),
-            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+            differentiated.interpret(vec![ArrayIrValue::Array(Array::scalar(7_i32).unwrap())]),
+            Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(variable), 7).unwrap())]),
         );
-
-        // Forward differentiation stages both assertions once, in their original relative order: a dimension carries
-        // no tangent, so neither assertion may be duplicated into a tangent computation or reordered against the
-        // other by the interleaved dual program.
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(
-            assertion_operation_names(&jvp),
-            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
-        );
-
-        // Linearization splits the dual program by known-ness. Both assertions are nonlinear primal work, so they
-        // stay in the primal sub-program in their original order, and the compact linear tangent sub-program is left
-        // pure: it consumes the checked extent as an ordinary residual instead of re-asserting it.
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
-        assert_eq!(
-            assertion_operation_names(linearization.primal()),
-            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
-        );
-        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
-        assert_eq!(assertion_operation_names(linearization.tangent()), Vec::<&str>::new());
     }
 
     #[test]
@@ -831,7 +633,7 @@ mod tests {
                 ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
-                &mut TranspositionContext::new(transposition_context.clone()),
+                &mut TranspositionContext::new(transposition_context),
                 &EmptyRegionDriver,
                 &[],
                 &[],
@@ -840,6 +642,86 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dimension_from_scalar` is not transposable",
         ));
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_to_dimension() {
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let variable = DimensionVariable::new("extent", bounds);
+        let operation = DimensionFromScalarOperation::new(variable.clone());
+
+        // Every integer element type preserves the output identity and checked extent.
+        for (array, extent) in [
+            (Array::scalar(7_i8).unwrap(), 7),
+            (Array::scalar(7_i16).unwrap(), 7),
+            (Array::scalar(7_i32).unwrap(), 7),
+            (Array::scalar(7_i64).unwrap(), 7),
+            (Array::scalar(7_u8).unwrap(), 7),
+            (Array::scalar(7_u16).unwrap(), 7),
+            (Array::scalar(7_u32).unwrap(), 7),
+            (Array::scalar(7_u64).unwrap(), 7),
+            (Array::scalar(i1::new(0).unwrap()).unwrap(), 0),
+            (Array::scalar(i2::new(1).unwrap()).unwrap(), 1),
+            (Array::scalar(i4::new(7).unwrap()).unwrap(), 7),
+            (Array::scalar(u1::new(1).unwrap()).unwrap(), 1),
+            (Array::scalar(u2::new(3).unwrap()).unwrap(), 3),
+            (Array::scalar(u4::new(7).unwrap()).unwrap(), 7),
+        ] {
+            assert_eq!(
+                array.to_dimension(variable.clone()),
+                Ok(DimensionValue::new(operation.output_type().clone(), extent).unwrap()),
+            );
+        }
+        assert_eq!(
+            Array::scalar(0_i32).unwrap().to_dimension(variable.clone()),
+            Ok(DimensionValue::new(DimensionType::from(variable.clone()), 0).unwrap()),
+        );
+        let bounded_variable = DimensionVariable::new("bounded", DimensionBounds::new(2, Some(5)).unwrap());
+        assert_eq!(
+            Array::scalar(2_i32).unwrap().to_dimension(bounded_variable.clone()),
+            Ok(DimensionValue::new(DimensionType::from(bounded_variable.clone()), 2).unwrap()),
+        );
+        assert_eq!(
+            Array::scalar(4_i32).unwrap().to_dimension(bounded_variable.clone()),
+            Ok(DimensionValue::new(DimensionType::from(bounded_variable.clone()), 4).unwrap()),
+        );
+        assert_eq!(
+            Array::scalar(-1_i32).unwrap().to_dimension(variable.clone()),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range".to_string(),
+            }),
+        );
+
+        let error = Array::scalar(1_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<DimensionError>(),
+            Some(DimensionError::BindingOutOfBounds { variable, value: 1, bounds })
+                if variable == "bounded" && *bounds == bounded_variable.bounds(),
+        ));
+
+        let error = Array::scalar(5_i32).unwrap().to_dimension(bounded_variable.clone()).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds {
+                variable: "bounded".to_string(),
+                value: 5,
+                bounds: bounded_variable.bounds(),
+            }),
+        );
+
+        if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let error = Array::scalar(u64::try_from(unrepresentable).unwrap())
+                .unwrap()
+                .to_dimension(DimensionVariable::new("wide", DimensionBounds::at_least(0)))
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<DimensionError>(),
+                Some(&DimensionError::ExtentExceedsBackendWidth {
+                    value: unrepresentable,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }),
+            );
+        }
     }
 
     #[test]

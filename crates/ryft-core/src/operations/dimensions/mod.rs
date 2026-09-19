@@ -32,9 +32,8 @@ pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
 pub use dimension_pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
 pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRemOperation};
 pub use dimension_requirement::{
-    DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
-    DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DimensionRequirement,
-    DimensionRequirementOperation, DimensionRequirementPredicate,
+    DIMENSION_REQUIREMENT_OPERATION_NAME, DimensionRequirement, DimensionRequirementOperation,
+    DimensionRequirementPredicate,
 };
 pub use dimension_saturating_sub::{
     DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
@@ -81,8 +80,11 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
                     Ok(())
                 } else {
                     Err(TypeError::invalid(format!(
-                        "`{}` input {index} has type {actual} but the operation was constructed for type {expected}",
+                        "`{}` input {} has type `{}` but the operation was constructed for type `{}`",
                         self.name(),
+                        index,
+                        actual,
+                        expected,
                     )))
                 }
             },
@@ -205,13 +207,13 @@ mod tests {
         assert_eq!(
             ArithmeticDimensionOperation::infer_output_types(&operation, &[unexpected.clone(), right.clone()]),
             Err(TypeError::invalid(format!(
-                "`dimension_add` input 0 has type {unexpected} but the operation was constructed for type {left}",
+                "`dimension_add` input 0 has type `{unexpected}` but the operation was constructed for type `{left}`",
             ))),
         );
         assert_eq!(
             ArithmeticDimensionOperation::infer_output_types(&operation, &[left, unexpected.clone()]),
             Err(TypeError::invalid(format!(
-                "`dimension_add` input 1 has type {unexpected} but the operation was constructed for type {right}",
+                "`dimension_add` input 1 has type `{unexpected}` but the operation was constructed for type `{right}`",
             ))),
         );
     }

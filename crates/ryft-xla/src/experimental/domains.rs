@@ -7398,7 +7398,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("`dimension_require_less_than_or_equal` failed: first <= second; observed first=4, second=3"),
+                .contains("`dimension_requirement` failed: first <= second; observed first=4, second=3"),
             "{error}",
         );
         assert!(!error.to_string().contains("second <= third"), "{error}");
@@ -7460,19 +7460,19 @@ mod tests {
             DimensionRequirementOperation::equal(&left_type, &right_type),
             3,
             4,
-            "`dimension_require_equal` failed: left == right; observed left=3, right=4",
+            "`dimension_requirement` failed: left == right; observed left=3, right=4",
         );
         check(
             DimensionRequirementOperation::divisible_by(&left_type, &right_type),
             7,
             3,
-            "`dimension_require_divisible_by` failed: left % right == 0; observed left=7, right=3",
+            "`dimension_requirement` failed: left % right == 0; observed left=7, right=3",
         );
         check(
             DimensionRequirementOperation::divisible_by(&left_type, &right_type),
             7,
             0,
-            "`dimension_require_divisible_by` failed: right > 0 for divisibility; observed left=7, right=0",
+            "`dimension_requirement` failed: right > 0 for divisibility; observed left=7, right=0",
         );
     }
 

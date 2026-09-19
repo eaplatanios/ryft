@@ -1645,8 +1645,8 @@ mod tests {
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[sequence, width], %2:dimension<gathered ∈ [1, 65)>, \
                     %3:dimension<width ∈ [1, 33)> .
                 let %4:dimension<4> = constant [value=4]
-                    dimension_require_equal %0 %4
-                    dimension_require_divisible_by %2 %0
+                    dimension_requirement [predicate=Equal] %0 %4
+                    dimension_requirement [predicate=DivisibleBy] %2 %0
                     %5:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
                     %6:f32[gathered / batch, width] = reshape %1 %5 %3
                     %7:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %6 %0 %5 %3

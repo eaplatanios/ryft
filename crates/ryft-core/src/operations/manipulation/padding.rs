@@ -5816,7 +5816,7 @@ mod tests {
                 let %4:dimension<2> = constant [value=2]
                     %5:dimension<size ∈ [1, 5)> = dimension_size [axis=1] %0
                     %6:dimension<low + size ∈ [1, 8)> = dimension_add %2 %5
-                    dimension_require_less_than_or_equal %6 %3
+                    dimension_requirement [predicate=LessThanOrEqual] %6 %3
                     %7:i64[size] = iota [type=i64[size], dimension=0] %5
                     %8:i64[] = dimension_to_scalar %2
                     %9:i64[] = transfer_to_memory [destination=Device] %8

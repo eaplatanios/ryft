@@ -136,7 +136,7 @@ mod tests {
         let requirement =
             DimensionOperation::Requirement(DimensionRequirementOperation::equal(&left_type, &right_type));
         assert!(matches!(lowering.dimension(&mut block, &requirement, &[left, right]),
-            Err(Error::Unsupported { operation: "dimension_require_equal", reason })
+            Err(Error::Unsupported { operation: "dimension_requirement", reason })
                 if reason == "runtime dimension assertions require native failure propagation"));
         assert_eq!(block.operations().unwrap().count(), 4);
     }
