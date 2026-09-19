@@ -375,6 +375,14 @@ impl DimensionType {
         (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
     }
 
+    /// Returns the exclusive upper bound minus one, capped at [`MAX_DIMENSION_EXTENT`], or [`None`] when this
+    /// [`DimensionType`]'s bounds have no finite upper bound. Unlike [`DimensionBounds::representable_extent_range`],
+    /// this function preserves the distinction between finite and unbounded declared bounds.
+    #[inline]
+    pub fn maximum_extent(&self) -> Option<usize> {
+        self.bounds().upper()?.checked_sub(1).map(|maximum| maximum.min(MAX_DIMENSION_EXTENT))
+    }
+
     /// Returns the most precise [`Dimension`] described by this [`DimensionType`]. Exact singleton bounds become
     /// a static dimension. All other cases retain this type's [`DimensionVariable`] as a dynamic dimension.
     #[inline]
@@ -1102,16 +1110,26 @@ mod tests {
         assert!(declared.is_refined_by(&actual));
         assert_eq!(declared.to_dimension(), Dimension::Dynamic(declared_variable.clone()));
 
-        // A dimension type is strictly identity plus bounds: exact singleton bounds are the only source of a static
+        // A dimension type is strictly identity plus bounds. Exact singleton bounds are the only source of a static
         // extent, and no concrete boundary observation participates in the type itself.
         assert_eq!(declared.extent(), None);
+        assert_eq!(declared.maximum_extent(), Some(64));
         let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
         let exact_type = DimensionType::new(exact_variable);
         assert_eq!(exact_type.extent(), Some(7));
+        assert_eq!(exact_type.maximum_extent(), Some(7));
         assert_eq!(exact_type.to_string(), "dimension<7>");
         assert_eq!(exact_type.to_dimension(), Dimension::Static(7));
         assert!(declared.is_refined_by(&exact_type));
         assert!(!exact_type.is_refined_by(&declared));
+
+        let unbounded = DimensionType::new(DimensionVariable::new("unbounded", DimensionBounds::unbounded()));
+        assert_eq!(unbounded.maximum_extent(), None);
+        let zero = DimensionType::new(DimensionVariable::new("zero", DimensionBounds::new(0, Some(1)).unwrap()));
+        assert_eq!(zero.maximum_extent(), Some(0));
+        let wide =
+            DimensionType::new(DimensionVariable::new("wide", DimensionBounds::new(0, Some(usize::MAX)).unwrap()));
+        assert_eq!(wide.maximum_extent(), Some((usize::MAX - 1).min(MAX_DIMENSION_EXTENT)));
 
         let identities =
             declared.identities().map(|(position, variable)| (position, variable.clone())).collect::<Vec<_>>();
