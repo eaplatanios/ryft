@@ -39,7 +39,7 @@ pub use differentiation::{
     custom_vjp,
 };
 pub use dimensions::{
-    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_OPERATION_NAME,
+    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
     DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME,
     DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
@@ -50,7 +50,7 @@ pub use dimensions::{
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
     DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
+    DimensionToScalarOperation,
 };
 pub use dot::{
     DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,

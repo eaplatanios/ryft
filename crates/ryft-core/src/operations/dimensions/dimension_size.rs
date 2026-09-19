@@ -291,9 +291,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// # Example
 ///
 /// ```rust
-/// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
-/// # use ryft_core::arrays::Array;
-/// #
+/// # use ryft_core::{Array, ArrayIrValue, DimensionSize, ProgramError};
 /// # fn main() -> Result<(), ProgramError> {
 /// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]).unwrap());
 /// let columns = array.dimension_size(-1)?;

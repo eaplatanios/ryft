@@ -27,7 +27,7 @@ use crate::operations::control_flow::scan::{
 };
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
-    DynamicUpdateSliceOperation, Fill, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind,
+    DynamicUpdateSliceOperation, Fill, OneOperation, DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind,
     Reshape, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
     WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
@@ -40,7 +40,7 @@ impl TemporalResidualType for ArrayIrType {
     fn temporal_storage_type(&self) -> Result<Self, TypeError> {
         Ok(match self {
             Self::Array(r#type) => Self::Array(r#type.clone()),
-            Self::Dimension(_) => Self::Array(ArrayType::scalar(RUNTIME_DIMENSION_DATA_TYPE)),
+            Self::Dimension(_) => Self::Array(ArrayType::scalar(DIMENSION_DATA_TYPE)),
             Self::Reference(_) => {
                 return Err(TypeError::invalid(
                     "a reference cannot be stored as a temporal residual; references are threaded as carries",

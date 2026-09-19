@@ -42,7 +42,7 @@ pub use dimension_saturating_sub::{
 pub use dimension_size::{DIMENSION_SIZE_OPERATION_NAME, DimensionSize, DimensionSizeOperation};
 pub use dimension_sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSubOperation};
 pub use dimension_to_scalar::{
-    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
+    DIMENSION_DATA_TYPE, DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation,
 };
 
 /// Shared contract implemented by binary arithmetic [`Operation`]s over [`DimensionValue`](crate::DimensionValue)s.
