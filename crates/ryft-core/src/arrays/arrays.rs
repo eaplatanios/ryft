@@ -46,9 +46,11 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
 /// each dynamic axis is carried by an explicit dimension operand.
 ///
-/// Host concretization supports scalar Boolean values through [`Concretizable<bool>`] and scalar integers through
-/// [`Concretizable<i128>`]. The wider integer representation preserves all signed and unsigned element values,
-/// including [`u64::MAX`], before callers perform range checks or clamping.
+/// Host concretization through [`Concretizable`] requires rank zero. Integer scalars can be extracted into any Rust
+/// integer or Ryft sub-byte integer type when the value fits; [`Concretizable<i128>`] preserves every supported integer
+/// value, including [`u64::MAX`]. Boolean, floating-point, and complex extraction requires the matching element type
+/// and preserves its exact encoding, including signed zeros and NaN payloads. Incompatible shapes, element types, and
+/// out-of-range integers return [`ProgramError::Concretization`]. Use [`Array::converted_to`] for numerical conversions.
 ///
 /// # Warning
 ///
@@ -817,53 +819,143 @@ impl AbsDiffEq for Array {
     }
 }
 
-impl Concretizable<bool> for Array {
-    fn concretize(&self) -> Result<bool, ProgramError> {
-        // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
-        // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
-        if self.r#type.rank() == 0 && self.r#type.data_type().is_boolean() {
-            let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
-            return Ok(self.bytes[range.start] != 0);
+/// Implements checked integer extraction or exact element decoding for supported host scalar types.
+macro_rules! impl_array_scalar_concretization {
+    // Boolean extraction shares exact decoding while preserving its established diagnostic.
+    (@exact bool) => {
+        impl_array_scalar_concretization!(@decode bool, |array| format!(
+            "cannot extract a concrete boolean from a value of type `{}`; expected `bool[]`",
+            array.r#type(),
+        ));
+    };
+
+    // Exact floating-point and complex extraction requires the matching element type.
+    (@exact $scalar:ty) => {
+        impl_array_scalar_concretization!(@decode $scalar, |array| format!(
+            "cannot extract a concrete `{}` from `{}`; expected `{}[]`",
+            stringify!($scalar),
+            array.r#type,
+            <$scalar>::data_type(),
+        ));
+    };
+
+    // Shared exact extraction preserves the stored representation without numerical conversion.
+    (@decode $scalar:ty, |$array:ident| $message:expr) => {
+        impl Concretizable<$scalar> for Array {
+            fn concretize(&self) -> Result<$scalar, ProgramError> {
+                if self.r#type.rank() != 0 || self.r#type.data_type() != <$scalar>::data_type() {
+                    let $array = self;
+                    return Err(ProgramError::Concretization { message: $message });
+                }
+                let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
+                Ok(<$scalar>::decode(&self.bytes[range]))
+            }
         }
-        Err(ProgramError::Concretization {
-            message: format!(
-                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
-                self.r#type()
-            ),
-        })
-    }
+    };
+
+    // The lossless integer decoder is the base case used by every other integer target.
+    (@integer i128) => {
+        impl Concretizable<i128> for Array {
+            fn concretize(&self) -> Result<i128, ProgramError> {
+                if self.r#type.rank() != 0 || !self.r#type.data_type().is_integer() {
+                    return Err(ProgramError::Concretization {
+                        message: format!(
+                            "cannot extract a concrete integer from `{}`; expected a scalar integer",
+                            self.r#type,
+                        ),
+                    });
+                }
+
+                // The wider host representation preserves every signed and unsigned array integer before clamping.
+                let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
+                let bytes = &self.bytes[range];
+                Ok(match self.r#type.data_type() {
+                    DataType::I1 => i128::from(i1::decode(bytes).value()),
+                    DataType::I2 => i128::from(i2::decode(bytes).value()),
+                    DataType::I4 => i128::from(i4::decode(bytes).value()),
+                    DataType::I8 => i128::from(i8::decode(bytes)),
+                    DataType::I16 => i128::from(i16::decode(bytes)),
+                    DataType::I32 => i128::from(i32::decode(bytes)),
+                    DataType::I64 => i128::from(i64::decode(bytes)),
+                    DataType::U1 => i128::from(u1::decode(bytes).value()),
+                    DataType::U2 => i128::from(u2::decode(bytes).value()),
+                    DataType::U4 => i128::from(u4::decode(bytes).value()),
+                    DataType::U8 => i128::from(u8::decode(bytes)),
+                    DataType::U16 => i128::from(u16::decode(bytes)),
+                    DataType::U32 => i128::from(u32::decode(bytes)),
+                    DataType::U64 => i128::from(u64::decode(bytes)),
+                    _ => unreachable!(),
+                })
+            }
+        }
+    };
+
+    // Integer targets use checked conversion from the lossless common integer representation.
+    (@integer $scalar:ty) => {
+        impl_array_scalar_concretization!(@checked $scalar, |value| <$scalar>::try_from(value).ok());
+    };
+
+    // Sub-byte targets validate their narrower range after conversion to their storage integer.
+    (@sub_byte $scalar:ty => $storage:ty) => {
+        impl_array_scalar_concretization!(@checked $scalar, |value| {
+            <$storage>::try_from(value).ok().and_then(|value| <$scalar>::new(value).ok())
+        });
+    };
+
+    // Shared integer extraction rejects incompatible arrays before checking the target's range.
+    (@checked $scalar:ty, |$value:ident| $convert:expr) => {
+        impl Concretizable<$scalar> for Array {
+            fn concretize(&self) -> Result<$scalar, ProgramError> {
+                let $value: i128 = self.concretize()?;
+                ($convert).ok_or_else(|| ProgramError::Concretization {
+                    message: format!(
+                        "cannot extract a concrete `{}` from `{}`; value `{}` is out of range",
+                        stringify!($scalar),
+                        self.r#type,
+                        $value,
+                    ),
+                })
+            }
+        }
+    };
 }
 
-impl Concretizable<i128> for Array {
-    fn concretize(&self) -> Result<i128, ProgramError> {
-        if self.r#type.rank() != 0 || !self.r#type.data_type().is_integer() {
-            return Err(ProgramError::Concretization {
-                message: format!("cannot extract a concrete integer from `{}`; expected a scalar integer", self.r#type),
-            });
-        }
-
-        // The wider host representation preserves every signed and unsigned array integer before clamping.
-        let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
-        let bytes = &self.bytes[range];
-        Ok(match self.r#type.data_type() {
-            DataType::I1 => i128::from(i1::decode(bytes).value()),
-            DataType::I2 => i128::from(i2::decode(bytes).value()),
-            DataType::I4 => i128::from(i4::decode(bytes).value()),
-            DataType::I8 => i128::from(i8::decode(bytes)),
-            DataType::I16 => i128::from(i16::decode(bytes)),
-            DataType::I32 => i128::from(i32::decode(bytes)),
-            DataType::I64 => i128::from(i64::decode(bytes)),
-            DataType::U1 => i128::from(u1::decode(bytes).value()),
-            DataType::U2 => i128::from(u2::decode(bytes).value()),
-            DataType::U4 => i128::from(u4::decode(bytes).value()),
-            DataType::U8 => i128::from(u8::decode(bytes)),
-            DataType::U16 => i128::from(u16::decode(bytes)),
-            DataType::U32 => i128::from(u32::decode(bytes)),
-            DataType::U64 => i128::from(u64::decode(bytes)),
-            _ => unreachable!(),
-        })
-    }
-}
+impl_array_scalar_concretization!(@exact bool);
+impl_array_scalar_concretization!(@integer i8);
+impl_array_scalar_concretization!(@integer i16);
+impl_array_scalar_concretization!(@integer i32);
+impl_array_scalar_concretization!(@integer i64);
+impl_array_scalar_concretization!(@integer i128);
+impl_array_scalar_concretization!(@integer isize);
+impl_array_scalar_concretization!(@integer u8);
+impl_array_scalar_concretization!(@integer u16);
+impl_array_scalar_concretization!(@integer u32);
+impl_array_scalar_concretization!(@integer u64);
+impl_array_scalar_concretization!(@integer u128);
+impl_array_scalar_concretization!(@integer usize);
+impl_array_scalar_concretization!(@sub_byte i1 => i8);
+impl_array_scalar_concretization!(@sub_byte i2 => i8);
+impl_array_scalar_concretization!(@sub_byte i4 => i8);
+impl_array_scalar_concretization!(@sub_byte u1 => u8);
+impl_array_scalar_concretization!(@sub_byte u2 => u8);
+impl_array_scalar_concretization!(@sub_byte u4 => u8);
+impl_array_scalar_concretization!(@exact f4e2m1fn);
+impl_array_scalar_concretization!(@exact f6e2m3fn);
+impl_array_scalar_concretization!(@exact f6e3m2fn);
+impl_array_scalar_concretization!(@exact f8e3m4);
+impl_array_scalar_concretization!(@exact f8e4m3);
+impl_array_scalar_concretization!(@exact f8e4m3b11fnuz);
+impl_array_scalar_concretization!(@exact f8e4m3fn);
+impl_array_scalar_concretization!(@exact f8e4m3fnuz);
+impl_array_scalar_concretization!(@exact f8e5m2);
+impl_array_scalar_concretization!(@exact f8e5m2fnuz);
+impl_array_scalar_concretization!(@exact f8e8m0fnu);
+impl_array_scalar_concretization!(@exact bf16);
+impl_array_scalar_concretization!(@exact f16);
+impl_array_scalar_concretization!(@exact f32);
+impl_array_scalar_concretization!(@exact f64);
+impl_array_scalar_concretization!(@exact Complex<f32>);
+impl_array_scalar_concretization!(@exact Complex<f64>);
 
 impl_array_elementwise_operation!(
     @binary
@@ -1485,13 +1577,15 @@ mod tests {
         assert_eq!(
             vector_result,
             Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a value of type bool[2]; expected bool[]".to_string(),
+                message: "cannot extract a concrete boolean from a value of type `bool[2]`; expected `bool[]`"
+                    .to_string(),
             }),
         );
         assert_eq!(
             scalar_result,
             Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a value of type f64[]; expected bool[]".to_string(),
+                message: "cannot extract a concrete boolean from a value of type `f64[]`; expected `bool[]`"
+                    .to_string(),
             }),
         );
     }
@@ -1509,6 +1603,197 @@ mod tests {
                 message: "cannot extract a concrete integer from `f32[]`; expected a scalar integer".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_array_concretize_integers() {
+        // Each target accepts values from another integer representation without changing their value.
+        macro_rules! check_integer {
+            // Exercise signed and unsigned sources together with the target's own boundary representation.
+            ($target:ty, $minimum:expr, $maximum:expr) => {{
+                let minimum = $minimum;
+                let maximum = $maximum;
+                let lower: Result<$target, _> = Array::scalar(minimum).unwrap().concretize();
+                let upper: Result<$target, _> = Array::scalar(maximum).unwrap().concretize();
+                assert_eq!(lower, Ok(<$target>::MIN));
+                assert_eq!(upper, Ok(<$target>::MAX));
+            }};
+        }
+
+        check_integer!(i1, -1i64, 0u64);
+        check_integer!(i2, -2i64, 1u64);
+        check_integer!(i4, -8i64, 7u64);
+        check_integer!(i8, -128i64, 127u64);
+        check_integer!(i16, -32768i64, 32767u64);
+        check_integer!(i32, i64::from(i32::MIN), u64::from(i32::MAX as u32));
+        check_integer!(i64, i64::MIN, i64::MAX as u64);
+        check_integer!(isize, isize::MIN as i64, isize::MAX as u64);
+        check_integer!(u1, 0i64, 1u64);
+        check_integer!(u2, 0i64, 3u64);
+        check_integer!(u4, 0i64, 15u64);
+        check_integer!(u8, 0i64, 255u64);
+        check_integer!(u16, 0i64, 65535u64);
+        check_integer!(u32, 0i64, u64::from(u32::MAX));
+        check_integer!(u64, 0i64, u64::MAX);
+        check_integer!(usize, 0i64, usize::MAX as u64);
+
+        let wide: Result<u128, _> = Array::scalar(u64::MAX).unwrap().concretize();
+        assert_eq!(wide, Ok(u128::from(u64::MAX)));
+
+        // Sub-byte integer sources retain their signedness and numeric value when widened.
+        assert_eq!(Concretizable::<i8>::concretize(&Array::scalar(i1::MIN).unwrap()), Ok(-1));
+        assert_eq!(Concretizable::<i16>::concretize(&Array::scalar(i2::MIN).unwrap()), Ok(-2));
+        assert_eq!(Concretizable::<i32>::concretize(&Array::scalar(i4::MIN).unwrap()), Ok(-8));
+        assert_eq!(Concretizable::<u8>::concretize(&Array::scalar(u1::MAX).unwrap()), Ok(1));
+        assert_eq!(Concretizable::<u16>::concretize(&Array::scalar(u2::MAX).unwrap()), Ok(3));
+        assert_eq!(Concretizable::<u32>::concretize(&Array::scalar(u4::MAX).unwrap()), Ok(15));
+    }
+
+    #[test]
+    fn test_array_concretize_integers_out_of_range() {
+        macro_rules! check_out_of_range {
+            // Pin checked-conversion diagnostics for each narrower target.
+            ($target:ty, $value:expr, $message:literal $(,)?) => {
+                assert!(matches!(
+                    Concretizable::<$target>::concretize(&Array::scalar($value).unwrap()),
+                    Err(ProgramError::Concretization { message }) if message == $message,
+                ));
+            };
+        }
+
+        check_out_of_range!(i1, 1i8, "cannot extract a concrete `i1` from `i8[]`; value `1` is out of range");
+        check_out_of_range!(i2, -3i8, "cannot extract a concrete `i2` from `i8[]`; value `-3` is out of range");
+        check_out_of_range!(i4, 8i8, "cannot extract a concrete `i4` from `i8[]`; value `8` is out of range");
+        check_out_of_range!(u1, 2u8, "cannot extract a concrete `u1` from `u8[]`; value `2` is out of range");
+        check_out_of_range!(u2, -1i8, "cannot extract a concrete `u2` from `i8[]`; value `-1` is out of range");
+        check_out_of_range!(u4, 16u8, "cannot extract a concrete `u4` from `u8[]`; value `16` is out of range");
+        check_out_of_range!(i8, 128i16, "cannot extract a concrete `i8` from `i16[]`; value `128` is out of range");
+        check_out_of_range!(
+            i16,
+            32768i32,
+            "cannot extract a concrete `i16` from `i32[]`; value `32768` is out of range"
+        );
+        check_out_of_range!(
+            i32,
+            2147483648i64,
+            "cannot extract a concrete `i32` from `i64[]`; value `2147483648` is out of range",
+        );
+        check_out_of_range!(
+            i64,
+            u64::MAX,
+            "cannot extract a concrete `i64` from `u64[]`; value `18446744073709551615` is out of range",
+        );
+        check_out_of_range!(u8, -1i8, "cannot extract a concrete `u8` from `i8[]`; value `-1` is out of range");
+        check_out_of_range!(
+            u16,
+            65536u32,
+            "cannot extract a concrete `u16` from `u32[]`; value `65536` is out of range"
+        );
+        check_out_of_range!(
+            u32,
+            4294967296u64,
+            "cannot extract a concrete `u32` from `u64[]`; value `4294967296` is out of range",
+        );
+        check_out_of_range!(u64, -1i8, "cannot extract a concrete `u64` from `i8[]`; value `-1` is out of range");
+        check_out_of_range!(u128, -1i8, "cannot extract a concrete `u128` from `i8[]`; value `-1` is out of range");
+        check_out_of_range!(usize, -1i8, "cannot extract a concrete `usize` from `i8[]`; value `-1` is out of range");
+        check_out_of_range!(
+            isize,
+            u64::MAX,
+            "cannot extract a concrete `isize` from `u64[]`; value `18446744073709551615` is out of range",
+        );
+    }
+
+    #[test]
+    fn test_array_concretize_floating_point() {
+        macro_rules! check_encoding {
+            // Compare encoded bits so NaN payloads and signed zeros are observable.
+            ($target:ty, $bits:expr $(,)?) => {
+                for bits in $bits {
+                    let array =
+                        Array::new(ArrayType::new_static(<$target>::data_type(), []), bits.to_le_bytes().to_vec())
+                            .unwrap();
+                    let scalar: $target = array.concretize().unwrap();
+                    assert_eq!(scalar.to_bits(), bits);
+                }
+            };
+        }
+
+        check_encoding!(f4e2m1fn, 0u8..16);
+        check_encoding!(f6e2m3fn, 0u8..64);
+        check_encoding!(f6e3m2fn, 0u8..64);
+        check_encoding!(f8e3m4, 0u8..=255);
+        check_encoding!(f8e4m3, 0u8..=255);
+        check_encoding!(f8e4m3b11fnuz, 0u8..=255);
+        check_encoding!(f8e4m3fn, 0u8..=255);
+        check_encoding!(f8e4m3fnuz, 0u8..=255);
+        check_encoding!(f8e5m2, 0u8..=255);
+        check_encoding!(f8e5m2fnuz, 0u8..=255);
+        check_encoding!(f8e8m0fnu, 0u8..=255);
+        check_encoding!(bf16, [0x0000u16, 0x8000, 0x7f80, 0xff80, 0x7fc1]);
+        check_encoding!(f16, [0x0000u16, 0x8000, 0x7c00, 0xfc00, 0x7e01]);
+        check_encoding!(f32, [0x0000_0000u32, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234]);
+        check_encoding!(
+            f64,
+            [
+                0x0000_0000_0000_0000u64,
+                0x8000_0000_0000_0000,
+                0x7ff0_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+                0x7ff8_0000_0000_1234,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_concretize_complex() {
+        let narrow = ComplexNumber::new(f32::from_bits(0x7fc0_1234), -0.0f32);
+        let narrow_output: ComplexNumber<f32> = Array::scalar(narrow).unwrap().concretize().unwrap();
+        assert_eq!(narrow_output.re.to_bits(), narrow.re.to_bits());
+        assert_eq!(narrow_output.im.to_bits(), narrow.im.to_bits());
+        let wide = ComplexNumber::new(-0.0f64, f64::from_bits(0x7ff8_0000_0000_1234));
+        let wide_output: ComplexNumber<f64> = Array::scalar(wide).unwrap().concretize().unwrap();
+        assert_eq!(wide_output.re.to_bits(), wide.re.to_bits());
+        assert_eq!(wide_output.im.to_bits(), wide.im.to_bits());
+    }
+
+    #[test]
+    fn test_array_concretize_incompatible() {
+        assert!(matches!(
+            Concretizable::<bool>::concretize(&Array::vector(vec![true]).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete boolean from a value of type `bool[1]`; expected `bool[]`",
+        ));
+        assert!(matches!(
+            Concretizable::<usize>::concretize(&Array::vector(vec![1i32]).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete integer from `i32[1]`; expected a scalar integer",
+        ));
+        assert!(matches!(
+            Concretizable::<u8>::concretize(&Array::scalar(1.0f32).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete integer from `f32[]`; expected a scalar integer",
+        ));
+        assert!(matches!(
+            Concretizable::<i8>::concretize(&Array::scalar(true).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete integer from `bool[]`; expected a scalar integer",
+        ));
+        assert!(matches!(
+            Concretizable::<f32>::concretize(&Array::vector(vec![1.0f32]).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `f32` from `f32[1]`; expected `f32[]`",
+        ));
+        assert!(matches!(
+            Concretizable::<f64>::concretize(&Array::scalar(1.0f32).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `f64` from `f32[]`; expected `f64[]`",
+        ));
+        assert!(matches!(
+            Concretizable::<ComplexNumber<f32>>::concretize(&Array::scalar(1.0f32).unwrap()),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `Complex<f32>` from `f32[]`; expected `c64[]`",
+        ));
     }
 
     #[test]

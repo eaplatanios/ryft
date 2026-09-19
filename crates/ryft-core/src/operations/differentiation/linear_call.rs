@@ -1819,7 +1819,7 @@ mod tests {
         assert!(transposed.input_ids().is_empty());
         assert!(transposed.output_ids().is_empty());
         assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::InvalidArgument { message })
-            if message == "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is -1"));
+            if message == "`dimension_from_scalar` scalar input must be a non-negative host-representable extent but is -1"));
     }
 
     #[test]

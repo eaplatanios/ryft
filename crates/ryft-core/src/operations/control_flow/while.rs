@@ -5122,7 +5122,7 @@ mod tests {
                 Self::Bool(value) => Ok(*value),
                 value => Err(ProgramError::Concretization {
                     message: format!(
-                        "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                        "cannot extract a concrete boolean from a value of type `{}`; expected `bool[]`",
                         value.r#type().as_ref(),
                     ),
                 }),

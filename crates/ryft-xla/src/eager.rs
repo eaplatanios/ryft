@@ -63,7 +63,7 @@ impl Concretizable<bool> for Array<'_> {
         }
         Err(ProgramError::Concretization {
             message: format!(
-                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                "cannot extract a concrete boolean from a value of type `{}`; expected `bool[]`",
                 self.r#type().as_ref(),
             ),
         })
