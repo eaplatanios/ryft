@@ -2873,8 +2873,8 @@ where
             let input_extent = match batch.value.r#type().as_ref() {
                 ArrayIrType::Reference(r#type) => match r#type.referent().shape().dimensions().get(position) {
                     Some(Dimension::Static(extent)) => context.dimension_constant(*extent)?,
-                    Some(Dimension::Dynamic(variable)) if DimensionType::new(variable.clone()).extent().is_some() => {
-                        context.dimension_constant(DimensionType::new(variable.clone()).extent().unwrap())?
+                    Some(Dimension::Dynamic(variable)) if DimensionType::from(variable.clone()).extent().is_some() => {
+                        context.dimension_constant(DimensionType::from(variable.clone()).extent().unwrap())?
                     }
                     Some(Dimension::Dynamic(variable))
                         if axis_extent.as_ref().is_some_and(|extent| {
@@ -4583,7 +4583,7 @@ mod tests {
         );
 
         // A first-class dimension has no axes to map, so it only admits the replicated batch axis.
-        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let dimension_type = DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap());
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type.clone(), 4).unwrap());
         let batch = ArrayIrBatch::new(dimension.clone(), BatchAxis::replicated())?;
         assert_eq!(batch.batch_axis_position(), None);
@@ -4632,22 +4632,22 @@ mod tests {
         // A mapped first-class dimension stores its per-item extents directly: the carrier is the integer extent array
         // mapped along the batch axis, while the per-item type is the recorded dimension type.
         let mapped =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(-1), DimensionType::new(variable.clone()))
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(-1), DimensionType::from(variable.clone()))
                 .unwrap();
         assert_eq!(mapped.batch_axis(), BatchAxis::new(0));
         assert_eq!(mapped.batch_axis_position(), Some(0));
-        assert_eq!(mapped.mapped_dimension_type(), Some(&DimensionType::new(variable.clone())));
+        assert_eq!(mapped.mapped_dimension_type(), Some(&DimensionType::from(variable.clone())));
         assert_eq!(mapped.mapped_dimension_extents(), Some(&extents));
         assert_eq!(mapped.ragged_axes(), &[]);
         assert_eq!(mapped.value(), &extents);
-        assert_eq!(mapped.unbatched_type(), ArrayIrType::Dimension(DimensionType::new(variable.clone())));
+        assert_eq!(mapped.unbatched_type(), ArrayIrType::Dimension(DimensionType::from(variable.clone())));
 
         // The extents must be an integer array that is actually mapped along a batch axis.
         assert_eq!(
             ArrayIrBatch::mapped_dimension(
                 ArrayIrValue::<Array>::Array(Array::vector(vec![1.0_f32, 3.0]).unwrap()),
                 BatchAxis::new(0),
-                DimensionType::new(variable.clone()),
+                DimensionType::from(variable.clone()),
             ),
             Err(BatchingError::Type(TypeError::Invalid {
                 message: "ragged dimension extents must use an integer array type but got f32[2]".to_string(),
@@ -4657,14 +4657,14 @@ mod tests {
             ArrayIrBatch::mapped_dimension(
                 ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap()),
                 BatchAxis::new(0),
-                DimensionType::new(variable.clone()),
+                DimensionType::from(variable.clone()),
             ),
             Err(BatchingError::Type(TypeError::Invalid {
                 message: "expected array type but got dimension type".to_string(),
             })),
         );
         assert_eq!(
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::replicated(), DimensionType::new(variable)),
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::replicated(), DimensionType::from(variable)),
             Err(BatchingError::InvalidBatchMetadata {
                 message: "a mapped dimension requires a mapped batch axis".to_string(),
             }),
@@ -4735,11 +4735,11 @@ mod tests {
 
         // A mapped first-class dimension reports the dedicated error instead.
         let mapped =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable.clone())).unwrap();
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(variable.clone())).unwrap();
         assert_eq!(
             mapped.with_ragged_axes(vec![ragged_axis]),
             Err(BatchingError::MappedDimension {
-                r#type: Box::new(DimensionType::new(variable)),
+                r#type: Box::new(DimensionType::from(variable)),
                 axis: BatchAxis::new(0),
             }),
         );
@@ -4767,7 +4767,7 @@ mod tests {
     fn test_array_ir_batch_validate_replicated_dimension() {
         // Only a replicated first-class dimension passes. A mapped dimension reports its recorded per-item type, and a
         // non-dimension member fails the dimension projection itself.
-        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let dimension_type = DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap());
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type.clone(), 4).unwrap());
         assert_eq!(ArrayIrBatch::replicated(dimension).validate_replicated_dimension(), Ok(()));
         let mapped = ArrayIrBatch::mapped_dimension(
@@ -4848,8 +4848,7 @@ mod tests {
 
         // The leading bookkeeping output must also be a first-class dimension.
         let mut builder = TestProgramBuilder::new();
-        builder
-            .add_input(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(8))?)).into());
+        builder.add_input(DimensionType::new("extent", DimensionBounds::new(0, Some(8))?).into());
         let array = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![array],
@@ -4864,11 +4863,9 @@ mod tests {
 
         // A merely compatible dimension output is insufficient: the program must forward the exact input atom.
         let mut builder = TestProgramBuilder::new();
-        builder
-            .add_input(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(8))?)).into());
-        let other_extent = builder.add_input(
-            DimensionType::new(DimensionVariable::new("other_extent", DimensionBounds::new(0, Some(8))?)).into(),
-        );
+        builder.add_input(DimensionType::new("extent", DimensionBounds::new(0, Some(8))?).into());
+        let other_extent =
+            builder.add_input(DimensionType::new("other_extent", DimensionBounds::new(0, Some(8))?).into());
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![other_extent],
             vec![Placeholder, Placeholder],
@@ -4885,8 +4882,7 @@ mod tests {
 
         // A well-formed threaded boundary preserves its program and excludes the bookkeeping output from its axes.
         let mut builder = TestProgramBuilder::new();
-        let extent = builder
-            .add_input(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(8))?)).into());
+        let extent = builder.add_input(DimensionType::new("extent", DimensionBounds::new(0, Some(8))?).into());
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![extent],
             vec![Placeholder],
@@ -5157,7 +5153,7 @@ mod tests {
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
-            trace.input(DimensionType::new(items.clone()).into()),
+            trace.input(DimensionType::from(items.clone()).into()),
         );
         assert_eq!(DynamicArrayExtentBatchingPolicy::axis_dimension(&context), Ok(Dimension::Dynamic(items)));
         assert_eq!(
@@ -5173,7 +5169,7 @@ mod tests {
     fn test_dynamic_array_extent_batching_policy_match_axis() -> Result<(), ProgramError> {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let mapped = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(items.clone())]))
                 .into(),
@@ -5235,7 +5231,7 @@ mod tests {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let width = DimensionVariable::new("width", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let replicated = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
         let other = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(width.clone())]))
@@ -5297,7 +5293,7 @@ mod tests {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let packed = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
                 .into(),
@@ -5364,7 +5360,7 @@ mod tests {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let packed = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
                 .into(),
@@ -5414,7 +5410,7 @@ mod tests {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let packed = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
                 .into(),
@@ -5512,7 +5508,7 @@ mod tests {
             let trace = ArrayIrTraceContext::new();
             let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
             let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-            let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+            let batch_extent = trace.input(DimensionType::from(items.clone()).into());
             let packed = trace.input(
                 ArrayType::new(data_type, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
                     .into(),
@@ -5558,7 +5554,7 @@ mod tests {
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let packed_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Dynamic(length.clone())]),
@@ -5588,7 +5584,7 @@ mod tests {
         type Projected = ProjectedContext<ArrayIrTraceContext, DimensionType>;
         let trace = ArrayIrTraceContext::new();
         let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
-        let dimension = trace.input(DimensionType::new(variable.clone()).into()).into_projected().unwrap();
+        let dimension = trace.input(DimensionType::from(variable.clone()).into()).into_projected().unwrap();
         let batch = <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::batch(
             dimension.clone(),
             BatchAxis::replicated(),
@@ -5602,7 +5598,7 @@ mod tests {
         );
         assert_eq!(
             <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::unbatched_type(&batch).into_owned(),
-            DimensionType::new(variable.clone()),
+            DimensionType::from(variable.clone()),
         );
         assert_eq!(
             <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::replicated(dimension.clone()),
@@ -5611,7 +5607,7 @@ mod tests {
         assert_eq!(
             <ReplicatedDimensionBatchingPolicy as BatchingPolicy<Projected>>::batch(dimension, BatchAxis::new(0)),
             Err(BatchingError::MappedDimension {
-                r#type: Box::new(DimensionType::new(variable)),
+                r#type: Box::new(DimensionType::from(variable)),
                 axis: BatchAxis::new(0)
             }),
         );
@@ -6088,7 +6084,7 @@ mod tests {
             ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
         );
 
-        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let dimension_type = DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap());
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type.clone(), 2).unwrap());
         assert_eq!(
             <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::batch(dimension, BatchAxis::new(0)),
@@ -6114,7 +6110,7 @@ mod tests {
                 .unwrap();
         let ragged_output = dense.clone().with_ragged_axes(vec![ragged_axis]).unwrap();
         let mapped_dimension_output =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(length.clone())).unwrap();
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(length.clone())).unwrap();
         let validate = <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::validate_operation_outputs;
         assert_eq!(
             validate("neg", std::slice::from_ref(&input), std::slice::from_ref(&ragged_output), &Vec::new()),
@@ -6421,7 +6417,7 @@ mod tests {
         let parent = ArrayIrTraceContext::new();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             parent.clone(),
-            parent.input(DimensionType::new(items).into()),
+            parent.input(DimensionType::from(items).into()),
         );
         let batched = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batch_program(
             &context,
@@ -6759,7 +6755,7 @@ mod tests {
         );
 
         // A first-class dimension has no packed axis to align, in either spelling of a dimension carrier.
-        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(8))?));
+        let dimension_type = DimensionType::new("n", DimensionBounds::new(1, Some(8))?);
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type.clone(), 3)?);
         assert_eq!(
             ArrayIrBatchingPolicy::align_batch_axis(&context, ArrayIrBatch::replicated(dimension), Axis::from(0)),
@@ -6796,7 +6792,7 @@ mod tests {
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
         let staged = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             trace.clone(),
-            trace.input(DimensionType::new(items).into()),
+            trace.input(DimensionType::from(items).into()),
         );
         assert_eq!(ArrayIrBatchingPolicy::static_batch_axis_extent(&staged), None);
         Ok(())
@@ -6826,7 +6822,7 @@ mod tests {
         )?;
         assert_eq!(
             context.axis_extent().r#type().into_owned(),
-            ArrayIrType::Dimension(DimensionType::new(items.clone()))
+            ArrayIrType::Dimension(DimensionType::from(items.clone()))
         );
         assert_eq!(context.axis_name(), Some("items"));
         assert_eq!(context.axis_sharding(), &ShardingDimension::replicated());
@@ -6976,7 +6972,7 @@ mod tests {
             Some(expected),
         );
         let variable = reference_type.referent().shape().dimensions()[0].variable().unwrap().clone();
-        let extent = trace.input(DimensionType::new(variable).into());
+        let extent = trace.input(DimensionType::from(variable).into());
         let (context, _) = pack_inputs(
             &trace,
             vec![reference],
@@ -7141,12 +7137,12 @@ mod tests {
         let mapped_dimension = ArrayIrBatch::mapped_dimension(
             ArrayIrValue::<Array>::Array(Array::vector(vec![1_i32, 3]).unwrap()),
             BatchAxis::new(0),
-            DimensionType::new(variable.clone()),
+            DimensionType::from(variable.clone()),
         )?;
         assert_eq!(
             ArrayIrBatchingPolicy::materialize_output(&context, mapped_dimension, BatchAxis::new(0)),
             Err(BatchingError::MappedDimension {
-                r#type: Box::new(DimensionType::new(variable)),
+                r#type: Box::new(DimensionType::from(variable)),
                 axis: BatchAxis::new(0)
             }),
         );
@@ -7266,7 +7262,7 @@ mod tests {
         // positioned mapped operands are reconciled by one transpose.
         let trace = ArrayIrTraceContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch_variable.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch_variable.clone()).into());
         let mapped = trace.input(
             ArrayType::new(
                 DataType::F32,
@@ -7397,8 +7393,7 @@ mod tests {
             ArrayIrEagerContext::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
-        let dimension_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()));
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::new(dimension_type.clone(), 4).unwrap());
         let mapped_dimension = ArrayIrBatch {
             value: dimension.clone(),
@@ -8826,8 +8821,7 @@ mod tests {
         // bookkeeping output, and every mapped boundary type carries the extent at its batch axis.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
-        let shared_dimension_type =
-            DimensionType::new(DimensionVariable::new("shared", DimensionBounds::new(0, Some(17))?));
+        let shared_dimension_type = DimensionType::new("shared", DimensionBounds::new(0, Some(17))?);
         let dimension = builder.add_input(shared_dimension_type.clone().into());
         let negated = builder.add_instruction(
             ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())),
@@ -8842,7 +8836,7 @@ mod tests {
         )?;
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let batched = program.batched_with_threaded_extent(
-            DimensionType::new(batch.clone()),
+            DimensionType::from(batch.clone()),
             ShardingDimension::Replicated,
             &[BatchAxis::new(0), BatchAxis::replicated()],
             ProgramBatchingOutputAxesPolicy::Natural,
@@ -8862,7 +8856,7 @@ mod tests {
         // Structural callers may force each output axis independently. Alignment happens while the replayed values are
         // still live tracers, and the extent bookkeeping stays separate from the reported axis metadata.
         let forced = program.batched_with_threaded_extent(
-            DimensionType::new(batch.clone()),
+            DimensionType::from(batch.clone()),
             ShardingDimension::Replicated,
             &[BatchAxis::new(0), BatchAxis::replicated()],
             ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(1), BatchAxis::replicated()]),
@@ -8871,7 +8865,7 @@ mod tests {
         assert_eq!(
             forced.into_parts().0.output_types(),
             vec![
-                ArrayIrType::Dimension(DimensionType::new(batch.clone())),
+                ArrayIrType::Dimension(DimensionType::from(batch.clone())),
                 ArrayIrType::Array(ArrayType::new(
                     DataType::F32,
                     Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(batch.clone())]),
@@ -8884,7 +8878,7 @@ mod tests {
         assert_eq!(
             program
                 .batched_with_threaded_extent(
-                    DimensionType::new(batch),
+                    DimensionType::from(batch),
                     ShardingDimension::Replicated,
                     &[BatchAxis::new(0), BatchAxis::new(0)],
                     ProgramBatchingOutputAxesPolicy::Natural,
@@ -8924,8 +8918,7 @@ mod tests {
         // bookkeeping value. Branch alignment, per-item selection, and loop semantics are covered by the operations'
         // own tests; this test pins the boundary contract that this module threads through them.
         let unbatched_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let shared_dimension_type =
-            DimensionType::new(DimensionVariable::new("shared", DimensionBounds::new(0, Some(17))?));
+        let shared_dimension_type = DimensionType::new("shared", DimensionBounds::new(0, Some(17))?);
         let mut branch_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let branch_array = branch_builder.add_input(unbatched_array_type.clone().into());
         let branch_dimension = branch_builder.add_input(shared_dimension_type.clone().into());
@@ -8943,7 +8936,7 @@ mod tests {
 
         let trace = ArrayIrTraceContext::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let predicate = trace.input(ArrayType::scalar(DataType::Boolean).into());
         let batched_array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
@@ -8994,7 +8987,7 @@ mod tests {
         let shared_dimension_value = DimensionValue::new(shared_dimension_type.clone(), 4)?;
         assert_eq!(
             program.interpret(vec![
-                ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(batch.clone()), 2)?),
+                ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(batch.clone()), 2)?),
                 ArrayIrValue::Array(Array::scalar(true).unwrap()),
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
                 ArrayIrValue::Dimension(shared_dimension_value.clone()),
@@ -9010,7 +9003,7 @@ mod tests {
         // operand, so nested batching never recovers either extent from array metadata.
         let outer_batch = DimensionVariable::new("outer_batch", DimensionBounds::new(1, Some(5))?);
         let nested = program.batched_with_threaded_extent(
-            DimensionType::new(outer_batch.clone()),
+            DimensionType::from(outer_batch.clone()),
             ShardingDimension::Replicated,
             &[BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated()],
             ProgramBatchingOutputAxesPolicy::Natural,
@@ -9561,7 +9554,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(width)]))
             .with_sharding(Sharding::replicated(mesh.clone(), 2))
             .unwrap();
-        let extent = trace.input(DimensionType::new(items).into());
+        let extent = trace.input(DimensionType::from(items).into());
         let value = trace.input(r#type.clone().into());
         let (output, output_axes) =
             broadcast_replicated_array(value, &r#type, 1, &extent, &ShardingDimension::sharded(["x"]))?;

@@ -181,7 +181,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
+        Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, MAX_DIMENSION_EXTENT,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
@@ -195,8 +195,7 @@ mod tests {
     #[test]
     fn test_dimension_to_scalar() {
         let operation = DimensionToScalarOperation;
-        let dimension_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap()));
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
 
         assert_eq!(operation.name(), DIMENSION_TO_SCALAR_OPERATION_NAME);
@@ -217,10 +216,8 @@ mod tests {
 
         let zero = DimensionValue::new(dimension_type.clone(), 0).unwrap();
         assert_eq!(zero.to_scalar(), Ok(Array::scalar(0_i64).unwrap()));
-        let maximum_type = DimensionType::new(DimensionVariable::new(
-            "maximum",
-            DimensionBounds::new(0, Some(MAX_DIMENSION_EXTENT + 1)).unwrap(),
-        ));
+        let maximum_type =
+            DimensionType::new("maximum", DimensionBounds::new(0, Some(MAX_DIMENSION_EXTENT + 1)).unwrap());
         let maximum = DimensionValue::new(maximum_type, MAX_DIMENSION_EXTENT).unwrap();
         assert_eq!(maximum.to_scalar(), Ok(Array::scalar(i64::try_from(MAX_DIMENSION_EXTENT).unwrap()).unwrap()));
 

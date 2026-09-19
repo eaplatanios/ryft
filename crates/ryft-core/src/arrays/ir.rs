@@ -282,8 +282,7 @@ mod tests {
         // and concrete extents never participate in structural type equality, hashing, or display. Otherwise, every
         // concrete extent would acquire its own compiled specialization, turning a runtime dynamic dimension back into
         // a static specialization parameter.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let three = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let four = ArrayIrValue::<Array>::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap());
         assert_eq!(three.r#type().into_owned(), ArrayIrType::Dimension(extent_type));
@@ -315,7 +314,7 @@ mod tests {
     #[test]
     fn test_array_ir_dimension_projection() {
         let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
-        let dimension = DimensionValue::new(DimensionType::new(variable), 4).unwrap();
+        let dimension = DimensionValue::new(DimensionType::from(variable), 4).unwrap();
         let stored = ArrayIrValue::<Array>::Dimension(dimension.clone());
         assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored), Ok(&dimension));
         assert_eq!(

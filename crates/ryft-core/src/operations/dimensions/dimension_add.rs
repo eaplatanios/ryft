@@ -44,7 +44,6 @@ mod tests {
 
     use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
-    use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{ProgramBuilder, Typed};
@@ -54,8 +53,8 @@ mod tests {
 
     #[test]
     fn test_dimension_add_operation() {
-        let left = test_dimension_type("left", 2, 9);
-        let right = test_dimension_type("right", 1, 5);
+        let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_ADD_OPERATION_NAME);
         assert_eq!(operation.left_type(), &left);
@@ -69,8 +68,8 @@ mod tests {
 
     #[test]
     fn test_dimension_add_program() {
-        let left_type = test_dimension_type("left", 1, 9);
-        let right_type = test_dimension_type("right", 1, 5);
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left_type, &right_type).unwrap();
 
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();

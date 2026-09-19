@@ -4,9 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::operations::DimensionOperation;
-use crate::arrays::types::dimensions::{
-    DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT,
-};
+use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value};
@@ -48,7 +46,7 @@ impl DimensionValue {
     #[inline]
     pub fn constant(extent: usize) -> Result<Self, DimensionError> {
         let bounds = DimensionBounds::new(extent, extent.checked_add(1))?;
-        Self::new(DimensionType::new(DimensionVariable::new(extent.to_string(), bounds)), extent)
+        Self::new(DimensionType::new(extent.to_string(), bounds), extent)
     }
 
     /// Returns the concrete non-negative extent of this [`DimensionValue`].
@@ -114,8 +112,7 @@ mod tests {
 
     #[test]
     fn test_dimension_value() {
-        let batch_type =
-            DimensionType::new(DimensionVariable::new("batch", DimensionBounds::new(1, Some(65)).unwrap()));
+        let batch_type = DimensionType::new("batch", DimensionBounds::new(1, Some(65)).unwrap());
         let batch = DimensionValue::new(batch_type.clone(), 32).unwrap();
         assert_eq!(batch.r#type().as_ref(), &batch_type);
         assert_eq!(batch.extent(), 32);
@@ -146,9 +143,8 @@ mod tests {
 
         // Concrete capabilities derive fresh result types from their operands without exposing IR operations in the
         // value-level API.
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(10)).unwrap()));
-        let right_type =
-            DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
         let left = DimensionValue::new(left_type.clone(), 7).unwrap();
         let right = DimensionValue::new(right_type.clone(), 3).unwrap();
         let sum = left.add(&right).unwrap();

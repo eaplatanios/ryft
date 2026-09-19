@@ -51,7 +51,7 @@ impl DimensionFromScalarOperation {
     /// Creates a checked scalar-data gateway that produces a dimension described by `result`.
     #[inline]
     pub fn new(result: DimensionVariable) -> Self {
-        Self { result_type: DimensionType::new(result) }
+        Self { result_type: DimensionType::from(result) }
     }
 
     /// Returns the first-class dimension type produced by this operation.
@@ -342,7 +342,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
 
         assert_eq!(operation.name(), DIMENSION_FROM_SCALAR_OPERATION_NAME);
-        assert_eq!(operation.result_type(), &DimensionType::new(variable.clone()));
+        assert_eq!(operation.result_type(), &DimensionType::from(variable.clone()));
         assert_eq!(operation.to_string(), "dimension_from_scalar [bounds=[0, 9)]");
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(instruction.outputs(), &[output_id]);
         assert!(instruction.regions().is_empty());
         assert!(matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(_)));
-        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::new(variable.clone())));
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::from(variable.clone())));
 
         let program = builder
             .clone()
@@ -556,7 +556,10 @@ mod tests {
             <Tracer<TestContext> as ValueProjection<ArrayType>>::into_projected(projected_input).unwrap();
         let projected_variable = DimensionVariable::new("projected", bounds);
         let projected_output = projected_input.to_dimension(projected_variable.clone()).unwrap();
-        assert_eq!(projected_output.r#type().as_ref(), &ArrayIrType::Dimension(DimensionType::new(projected_variable)),);
+        assert_eq!(
+            projected_output.r#type().as_ref(),
+            &ArrayIrType::Dimension(DimensionType::from(projected_variable)),
+        );
         assert!(matches!(
             projected_context.builder().borrow().instructions(),
             [instruction] if matches!(instruction.operation(), ArrayIrOperation::DimensionFromScalar(_)),
@@ -600,7 +603,7 @@ mod tests {
         builder
             .add_instruction(
                 DimensionOperation::Requirement(DimensionRequirementOperation::bounds(
-                    &DimensionType::new(rows),
+                    &DimensionType::from(rows),
                     DimensionBounds::new(2, Some(8)).unwrap(),
                 )),
                 Vec::new(),

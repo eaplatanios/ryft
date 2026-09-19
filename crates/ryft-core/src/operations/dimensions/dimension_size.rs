@@ -70,7 +70,7 @@ impl DimensionSizeOperation {
             Dimension::Static(_) => DimensionVariable::new(format!("size(axis={position})"), input_dimension.bounds()),
             Dimension::Dynamic(variable) => variable.clone(),
         };
-        Ok(Self { axis: position, input_dimension, result_type: DimensionType::new(result_variable) })
+        Ok(Self { axis: position, input_dimension, result_type: DimensionType::from(result_variable) })
     }
 
     /// Returns the normalized nonnegative input axis.
@@ -160,7 +160,7 @@ impl Operation for DimensionSizeOperation {
         let result_type = if bounds == self.result_type.bounds() {
             self.result_type.clone()
         } else {
-            DimensionType::new(DimensionVariable::new(self.result_type.variable().name(), bounds))
+            DimensionType::new(self.result_type.variable().name(), bounds)
         };
         Ok(vec![result_type.into()])
     }
@@ -434,7 +434,7 @@ mod tests {
         }
 
         // The mixed signature requires one array input, no regions, and a compatible selected dimension.
-        let dimension_type = DimensionType::new(DimensionVariable::new("other", bounds));
+        let dimension_type = DimensionType::new("other", bounds);
         assert_eq!(operation.infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")),);
         assert_eq!(
             operation.infer_output_types(&[dimension_type.clone().into()], &[]),

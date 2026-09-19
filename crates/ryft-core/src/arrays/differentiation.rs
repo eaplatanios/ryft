@@ -47,7 +47,7 @@ where
             ArrayIrType::Array(r#type) => ExactShape::for_residual_zero(r#type.shape())
                 .1
                 .into_iter()
-                .map(|(_, variable)| DimensionType::new(variable).into())
+                .map(|(_, variable)| DimensionType::from(variable).into())
                 .collect(),
             ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
         }
@@ -533,14 +533,14 @@ mod tests {
         );
         assert_eq!(
             ArrayIrOperation::<Array>::zero_residual_types(&r#type.into()),
-            vec![DimensionType::new(rows).into(), DimensionType::new(columns.clone()).into()],
+            vec![DimensionType::from(rows).into(), DimensionType::from(columns.clone()).into()],
         );
         assert_eq!(
             ArrayIrOperation::<Array>::zero_residual_types(&ArrayType::scalar(DataType::F32).into(),),
             Vec::<ArrayIrType>::new(),
         );
         assert_eq!(
-            ArrayIrOperation::<Array>::zero_residual_types(&DimensionType::new(columns).into(),),
+            ArrayIrOperation::<Array>::zero_residual_types(&DimensionType::from(columns).into(),),
             Vec::<ArrayIrType>::new(),
         );
     }
@@ -582,7 +582,7 @@ mod tests {
         // to be reused rather than re-read.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
-        let rows_residual_type = ArrayIrType::Dimension(DimensionType::new(rows.clone()));
+        let rows_residual_type = ArrayIrType::Dimension(DimensionType::from(rows.clone()));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 
         // A first-class dimension of exactly the residual type is the extent already and is reused verbatim.
@@ -624,7 +624,7 @@ mod tests {
                 .unwrap()
                 .is_none(),
         );
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(rows));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(rows));
         assert!(
             ArrayIrOperation::<Array>::capture_zero_residual_value(
                 &context,
@@ -641,13 +641,13 @@ mod tests {
     #[test]
     fn test_array_ir_operation_capture_zero_residual_value_reference() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
-        let dimension_type = DimensionType::new(extent.clone());
+        let dimension_type = DimensionType::from(extent.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = context.input(ReferenceType::new(array_type).into());
 
         // A candidate with no matching dimension must not read the reference or stage an extent query.
-        let unrelated = DimensionType::new(DimensionVariable::new("other", DimensionBounds::unbounded())).into();
+        let unrelated = DimensionType::new("other", DimensionBounds::unbounded()).into();
         assert_eq!(ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &reference, &unrelated), Ok(None));
         assert!(context.builder().borrow().instructions().is_empty());
 
@@ -733,8 +733,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_dynamic_disconnected_pullback_uses_explicit_extent_residual() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(
             DataType::F8E8M0FNU,
             Shape::new(vec![
@@ -810,7 +809,7 @@ mod tests {
     fn test_exact_shape_dimensions() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
         let shape = Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(n.variable().clone())]);
         let (plan, _) = ExactShape::for_residual_zero(&shape);
 
@@ -836,8 +835,8 @@ mod tests {
 
     #[test]
     fn test_linear_residuals() {
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
-        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
         let mut residuals = LinearResiduals::<ArrayIrValue<Array>>::new();
         assert!(residuals.values().is_empty());
 
@@ -872,7 +871,7 @@ mod tests {
     fn test_linear_residuals_retain_shape() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
         let array_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![
@@ -924,8 +923,7 @@ mod tests {
 
         // Non-array values are rejected with a kind mismatch.
         let context = TestContext::new();
-        let dimension = context
-            .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
+        let dimension = context.input(DimensionType::new("k", DimensionBounds::new(1, Some(9)).unwrap()).into());
         let mut residuals = LinearResiduals::new();
         assert_eq!(
             residuals.retain_shape(&context, &dimension),
@@ -935,8 +933,8 @@ mod tests {
 
     #[test]
     fn test_exact_shape_for_residual_zero() {
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
-        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::new(1, Some(9)).unwrap());
         let shape = Shape::new(vec![
             Dimension::Static(2),
             Dimension::Dynamic(n.variable().clone()),
@@ -1038,8 +1036,7 @@ mod tests {
         drop(builder);
 
         // Dimension-typed cotangents cannot be projected to the array member.
-        let dimension = context
-            .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
+        let dimension = context.input(DimensionType::new("k", DimensionBounds::new(1, Some(9)).unwrap()).into());
         assert!(matches!(
             <ArrayIrBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
@@ -1054,7 +1051,7 @@ mod tests {
     fn test_materialize_array_tangent() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let n = DimensionType::new("n", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let context = TestContext::new();

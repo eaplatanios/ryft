@@ -628,7 +628,6 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::operations::dimensions::dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
     use crate::operations::dimensions::dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
-    use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder, Typed};
@@ -654,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_dimension_requirement_operation() {
-        let shared = DimensionType::new(DimensionVariable::new("shared", DimensionBounds::new(0, Some(10)).unwrap()));
+        let shared = DimensionType::new("shared", DimensionBounds::new(0, Some(10)).unwrap());
         let equal = DimensionRequirementOperation::equal(&shared, &shared);
         assert_eq!(equal.predicate(), DimensionRequirementPredicate::Equal);
         assert_eq!(equal.left_type(), &shared);
@@ -663,8 +662,8 @@ mod tests {
         assert_eq!(equal.effects().classes(), EffectClasses::NONE);
         assert_eq!(equal.to_string(), DIMENSION_REQUIRE_EQUAL_OPERATION_NAME);
 
-        let low = DimensionType::new(DimensionVariable::new("low", DimensionBounds::new(0, Some(4)).unwrap()));
-        let high = DimensionType::new(DimensionVariable::new("high", DimensionBounds::new(5, Some(9)).unwrap()));
+        let low = DimensionType::new("low", DimensionBounds::new(0, Some(4)).unwrap());
+        let high = DimensionType::new("high", DimensionBounds::new(5, Some(9)).unwrap());
         let error = DimensionRequirementOperation::equal(&low, &high)
             .infer_output_types(&[low.clone(), high.clone()], &[])
             .unwrap_err();
@@ -675,8 +674,7 @@ mod tests {
             }),
         );
 
-        let overlapping =
-            DimensionType::new(DimensionVariable::new("overlapping", DimensionBounds::new(2, Some(7)).unwrap()));
+        let overlapping = DimensionType::new("overlapping", DimensionBounds::new(2, Some(7)).unwrap());
         let equal = DimensionRequirementOperation::equal(&low, &overlapping);
         assert_eq!(equal.infer_output_types(&[low.clone(), overlapping.clone()], &[]), Ok(Vec::new()),);
         assert_eq!(equal.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
@@ -689,8 +687,8 @@ mod tests {
 
     #[test]
     fn test_dimension_requirement_effects_and_partial_evaluation() {
-        let left = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(10)).unwrap()));
-        let right = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
 
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let left_atom = builder.add_input(left.clone());
@@ -791,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_dimension_requirement_partial_evaluation_retains_unproven_congruence() {
-        let extent = test_dimension_type("extent", 1, 9);
+        let extent = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let four = DimensionValue::constant(4).unwrap();
         let two = DimensionValue::constant(2).unwrap();
         let multiplication = DimensionMulOperation::new(&extent, four.r#type().as_ref()).unwrap();
@@ -835,8 +833,8 @@ mod tests {
 
     #[test]
     fn test_dimension_requirement_program_rendering_and_relocation() {
-        let left = test_dimension_type("left", 0, 20);
-        let right = test_dimension_type("right", 0, 20);
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(20)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(20)).unwrap());
 
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let left_atom = builder.add_input(left.clone());
@@ -904,10 +902,10 @@ mod tests {
     #[test]
     fn test_dimension_requirement_failure_diagnostics() {
         let context = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new();
-        let left = test_dimension_type("left", 0, 20);
-        let right = test_dimension_type("right", 0, 20);
-        let elements = test_dimension_type("elements", 1, 33);
-        let alignment = test_dimension_type("alignment", 1, 17);
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(20)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(20)).unwrap());
+        let elements = DimensionType::new("elements", DimensionBounds::new(1, Some(33)).unwrap());
+        let alignment = DimensionType::new("alignment", DimensionBounds::new(1, Some(17)).unwrap());
 
         // Every runtime failure names the requirement and both observed actors with their concrete extents.
         let failures = [
@@ -965,8 +963,8 @@ mod tests {
 
         // Failures proven from declared bounds alone are raised during type inference, where no concrete extent has
         // been observed yet, so they cite the requirement and its provenance instead of observed actor values.
-        let low = test_dimension_type("low", 0, 4);
-        let high = test_dimension_type("high", 5, 9);
+        let low = DimensionType::new("low", DimensionBounds::new(0, Some(4)).unwrap());
+        let high = DimensionType::new("high", DimensionBounds::new(5, Some(9)).unwrap());
         let error = DimensionRequirementOperation::less_than_or_equal(&high, &low)
             .infer_output_types(&[high.clone(), low.clone()], &[])
             .unwrap_err();
@@ -989,8 +987,8 @@ mod tests {
 
     #[test]
     fn test_dimension_requirement_order_is_deterministic() {
-        let left = test_dimension_type("left", 0, 10);
-        let right = test_dimension_type("right", 0, 10);
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
 
         // Building the same requirement sequence twice yields byte-identical programs, so assertion placement never
         // depends on iteration order over a hashed collection.

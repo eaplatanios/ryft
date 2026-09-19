@@ -449,8 +449,8 @@ impl ArrayType {
                     if declared.bounds().contains_bounds(actual.bounds()) =>
                 {
                     DimensionType::extend_identity_renaming(
-                        &DimensionType::new(declared.clone()),
-                        &DimensionType::new(actual.clone()),
+                        &DimensionType::from(declared.clone()),
+                        &DimensionType::from(actual.clone()),
                         renaming,
                     )
                 }
@@ -810,7 +810,7 @@ impl ArrayTypeRefinements {
                 // declared variable as the refinement key, so independent observations must still agree.
                 let exact_actual = match actual {
                     Dimension::Dynamic(variable) => {
-                        DimensionType::new(variable.clone()).extent().map(Dimension::Static)
+                        DimensionType::from(variable.clone()).extent().map(Dimension::Static)
                     }
                     Dimension::Static(_) => None,
                 };
@@ -1416,11 +1416,11 @@ mod tests {
             ArrayIrType::derive_identity_renaming(
                 &[
                     ArrayIrType::Array(declared.clone()),
-                    ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(declared_variable.clone())),
                 ],
                 &[
                     ArrayIrType::Array(static_actual),
-                    ArrayIrType::Dimension(DimensionType::new(actual_variable.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(actual_variable.clone())),
                 ],
             ),
             Err(error),
@@ -1430,8 +1430,8 @@ mod tests {
         // signature orders admit that agreement, but an unequal exact extent or an unknown extent still conflicts.
         for (lower, upper, accepted) in [(3, 4, true), (4, 5, false), (2, 5, false)] {
             let target = DimensionVariable::new("target", DimensionBounds::new(lower, Some(upper)).unwrap());
-            let declared_dimension = ArrayIrType::Dimension(DimensionType::new(declared_variable.clone()));
-            let actual_dimension = ArrayIrType::Dimension(DimensionType::new(target.clone()));
+            let declared_dimension = ArrayIrType::Dimension(DimensionType::from(declared_variable.clone()));
+            let actual_dimension = ArrayIrType::Dimension(DimensionType::from(target.clone()));
             let static_array = ArrayIrType::Array(ArrayType::new_static(F32, [3]));
             let declared_array = ArrayIrType::Array(declared.clone());
             for (declared_types, actual_types) in [

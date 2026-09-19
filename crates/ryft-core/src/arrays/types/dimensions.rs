@@ -323,6 +323,9 @@ impl TypeIdentity for DimensionVariable {
 /// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each tier-2 or tier-3
 /// dynamic extent inside a static envelope that backends can plan buffers and generate loops against.
 ///
+/// Note that constructing a type with [`DimensionType::new`] creates a fresh variable identity while converting
+/// an existing [`DimensionVariable`] through [`From`] preserves its identity, name, and bounds.
+///
 /// # Example
 ///
 /// The following program reshapes a `f64[source, 4]` input into `f64[2, source * 2]`. The input array type's dynamic
@@ -348,10 +351,11 @@ pub struct DimensionType {
 }
 
 impl DimensionType {
-    /// Creates a new [`DimensionType`] whose values define `variable`.
+    /// Creates a new [`DimensionType`] whose values define a fresh [`DimensionVariable`] with the provided `name`
+    /// and `bounds`. Each call creates a distinct identity, even when the name and bounds are identical.
     #[inline]
-    pub fn new(variable: DimensionVariable) -> Self {
-        Self { variable }
+    pub fn new<N: Into<String>>(name: N, bounds: DimensionBounds) -> Self {
+        Self::from(DimensionVariable::new(name, bounds))
     }
 
     /// Returns the [`DimensionVariable`] defined by values of this [`DimensionType`].
@@ -427,7 +431,7 @@ impl DimensionType {
         if let Some(extent) = actual.extent()
             && let Some((_, existing)) =
                 renaming.replacements().iter().find(|(source, _)| source == declared.variable())
-            && Self::new(existing.clone()).extent() == Some(extent)
+            && Self::from(existing.clone()).extent() == Some(extent)
         {
             // Several first-class reads can reify one source dimension as independently named exact literals.
             // Keep the first representative when both bounds prove the same single extent. This does not equate
@@ -480,7 +484,7 @@ impl Type for DimensionType {
                 variable.bounds(),
             )));
         }
-        Ok(Self::new(variable))
+        Ok(Self::from(variable))
     }
 
     #[inline]
@@ -507,7 +511,7 @@ impl Type for DimensionType {
 impl From<DimensionVariable> for DimensionType {
     #[inline]
     fn from(variable: DimensionVariable) -> Self {
-        Self::new(variable)
+        Self { variable }
     }
 }
 
@@ -1099,10 +1103,18 @@ mod tests {
     fn test_dimension_type() {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::new(1, Some(65)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::new(1, Some(33)).unwrap());
-        let declared = DimensionType::new(declared_variable.clone());
-        let actual = DimensionType::new(actual_variable.clone());
+        let fresh = DimensionType::new("declared", declared_variable.bounds());
+        let another_fresh = DimensionType::new(String::from("declared"), declared_variable.bounds());
+        assert_eq!(fresh.variable().name(), "declared");
+        assert_eq!(fresh.bounds(), declared_variable.bounds());
+        assert_ne!(fresh.variable(), &declared_variable);
+        assert_ne!(fresh.variable(), another_fresh.variable());
+
+        let declared = DimensionType::from(declared_variable.clone());
+        let actual = DimensionType::from(actual_variable.clone());
 
         assert_eq!(declared.variable(), &declared_variable);
+        assert_eq!(DimensionType::from(declared_variable.clone()), declared);
         assert_eq!(declared.bounds(), DimensionBounds::new(1, Some(65)).unwrap());
         assert_eq!(declared.to_string(), "dimension<declared ∈ [1, 65)>");
         assert!(!declared.is_scalar());
@@ -1115,7 +1127,7 @@ mod tests {
         assert_eq!(declared.extent(), None);
         assert_eq!(declared.maximum_extent(), Some(64));
         let exact_variable = DimensionVariable::new("7", DimensionBounds::new(7, Some(8)).unwrap());
-        let exact_type = DimensionType::new(exact_variable);
+        let exact_type = DimensionType::from(exact_variable);
         assert_eq!(exact_type.extent(), Some(7));
         assert_eq!(exact_type.maximum_extent(), Some(7));
         assert_eq!(exact_type.to_string(), "dimension<7>");
@@ -1123,12 +1135,11 @@ mod tests {
         assert!(declared.is_refined_by(&exact_type));
         assert!(!exact_type.is_refined_by(&declared));
 
-        let unbounded = DimensionType::new(DimensionVariable::new("unbounded", DimensionBounds::unbounded()));
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
         assert_eq!(unbounded.maximum_extent(), None);
-        let zero = DimensionType::new(DimensionVariable::new("zero", DimensionBounds::new(0, Some(1)).unwrap()));
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
         assert_eq!(zero.maximum_extent(), Some(0));
-        let wide =
-            DimensionType::new(DimensionVariable::new("wide", DimensionBounds::new(0, Some(usize::MAX)).unwrap()));
+        let wide = DimensionType::new("wide", DimensionBounds::new(0, Some(usize::MAX)).unwrap());
         assert_eq!(wide.maximum_extent(), Some((usize::MAX - 1).min(MAX_DIMENSION_EXTENT)));
 
         let identities =
@@ -1141,7 +1152,7 @@ mod tests {
         assert_eq!(renaming.replacements(), &[(declared_variable.clone(), actual_variable.clone())]);
         assert_eq!(declared.rename_identities(&renaming), Ok(actual.clone()));
 
-        let wider = DimensionType::new(DimensionVariable::new("wider", DimensionBounds::new(0, Some(129)).unwrap()));
+        let wider = DimensionType::new("wider", DimensionBounds::new(0, Some(129)).unwrap());
         assert!(!declared.is_refined_by(&wider));
         assert_eq!(
             DimensionType::derive_identity_renaming(&[declared.clone()], &[wider]),
@@ -1152,7 +1163,7 @@ mod tests {
         );
 
         // Separate exact definitions can represent the same proven extent without becoming nominally equal.
-        let second_exact = DimensionType::new(DimensionVariable::new("another_seven", exact_type.bounds()));
+        let second_exact = DimensionType::new("another_seven", exact_type.bounds());
         let renaming = DimensionType::derive_identity_renaming(
             &[declared.clone(), declared.clone()],
             &[exact_type.clone(), second_exact.clone()],
@@ -1160,14 +1171,14 @@ mod tests {
         .unwrap();
         assert_eq!(renaming.replacements(), &[(declared_variable.clone(), exact_type.variable().clone())]);
         assert_ne!(exact_type.variable(), second_exact.variable());
-        let eight = DimensionType::new(DimensionVariable::new("eight", DimensionBounds::new(8, Some(9)).unwrap()));
+        let eight = DimensionType::new("eight", DimensionBounds::new(8, Some(9)).unwrap());
         assert!(
             DimensionType::derive_identity_renaming(&[declared.clone(), declared.clone()], &[exact_type, eight],)
                 .is_err()
         );
 
         // A repeated declared variable must rename consistently across the complete signature.
-        let other = DimensionType::new(DimensionVariable::new("other", DimensionBounds::new(1, Some(65)).unwrap()));
+        let other = DimensionType::new("other", DimensionBounds::new(1, Some(65)).unwrap());
         assert_eq!(
             DimensionType::derive_identity_renaming(&[declared.clone(), declared], &[actual.clone(), other.clone()],),
             Err(TypeError::invalid(format!(

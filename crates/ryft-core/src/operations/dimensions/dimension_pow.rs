@@ -74,14 +74,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionValue};
-    use crate::operations::dimensions::test_dimension_type;
 
     use super::*;
 
     #[test]
     fn test_dimension_pow_operation() {
-        let base = test_dimension_type("base", 0, 3);
-        let exponent = test_dimension_type("exponent", 0, 3);
+        let base = DimensionType::new("base", DimensionBounds::new(0, Some(3)).unwrap());
+        let exponent = DimensionType::new("exponent", DimensionBounds::new(0, Some(3)).unwrap());
         let operation = DimensionPowOperation::new(&base, &exponent).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_POW_OPERATION_NAME);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(5)).unwrap());

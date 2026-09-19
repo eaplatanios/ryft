@@ -1711,7 +1711,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Shape,
+        DimensionType, DimensionValue, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
@@ -2386,8 +2386,7 @@ mod tests {
         // Two calls with different runtime extents share one abstract input type, and therefore one retained trace,
         // lowering, and compiled specialization, while still producing outputs with different logical shapes. This is
         // the retained-JIT contract that would break if concrete extents ever became part of type or cache identity.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert_eq!(
             function.call((), ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap())),
             Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())),
@@ -2434,8 +2433,8 @@ mod tests {
             });
 
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
-        let rows = DimensionType::new(DimensionVariable::new("rows", bounds));
-        let columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+        let rows = DimensionType::new("rows", bounds);
+        let columns = DimensionType::new("columns", bounds);
 
         // Only the declared dimension identities enter the dispatch key, so two calls that differ solely in their
         // runtime extents share one specialization.
@@ -2464,8 +2463,8 @@ mod tests {
 
         // New dimension variables have distinct identities even when their names and bounds match. They therefore
         // change the input types and require a separate compiled specialization.
-        let independent_rows = DimensionType::new(DimensionVariable::new("rows", bounds));
-        let independent_columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+        let independent_rows = DimensionType::new("rows", bounds);
+        let independent_columns = DimensionType::new("columns", bounds);
         assert_eq!(
             function.call(
                 (),

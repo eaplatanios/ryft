@@ -51,14 +51,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionValue};
-    use crate::operations::dimensions::test_dimension_type;
 
     use super::*;
 
     #[test]
     fn test_dimension_saturating_sub_operation() {
-        let left = test_dimension_type("left", 1, 5);
-        let right = test_dimension_type("right", 2, 9);
+        let left = DimensionType::new("left", DimensionBounds::new(1, Some(5)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(2, Some(9)).unwrap());
         let operation = DimensionSaturatingSubOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_SATURATING_SUB_OPERATION_NAME);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(3)).unwrap());

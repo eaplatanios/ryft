@@ -94,7 +94,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
         // Reusing an operation with narrower inputs must recompute its bounds formula. Its stored effect metadata
         // remains conservative: refinement never removes an assertion from the original operation.
         let bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
-        Ok(vec![DimensionType::new(DimensionVariable::new(self.output_name(), bounds))])
+        Ok(vec![DimensionType::new(self.output_name(), bounds)])
     }
 }
 
@@ -278,11 +278,6 @@ pub(crate) fn positive_divisor_lower_bound(divisor: &DimensionType, maximum: usi
 }
 
 #[cfg(test)]
-fn test_dimension_type(name: &'static str, lower: usize, upper: usize) -> DimensionType {
-    DimensionType::new(DimensionVariable::new(name, DimensionBounds::new(lower, Some(upper)).unwrap()))
-}
-
-#[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -296,8 +291,8 @@ mod tests {
 
     #[test]
     fn test_arithmetic_dimension_operation() {
-        let left = test_dimension_type("left", 2, 9);
-        let right = test_dimension_type("right", 1, 5);
+        let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
         let result = Operation::infer_output_types(&operation, &[left.clone(), right.clone()], &[]).unwrap();
         assert_eq!(result[0].bounds(), operation.output_bounds());
@@ -306,10 +301,10 @@ mod tests {
 
         // All arithmetic formulas use the actual input bounds when a retained operation is specialized. Results
         // remain fresh definitions, and conservative assertion effects are preserved on the retained operation.
-        let declared_left = test_dimension_type("left", 1, 9);
-        let declared_right = test_dimension_type("right", 1, 5);
-        let exact_left = test_dimension_type("left", 6, 7);
-        let exact_right = test_dimension_type("right", 2, 3);
+        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
+        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
         macro_rules! check_refinement {
             // Check each concrete arithmetic operation with the same declarations and exact input refinements.
             ($operation:ident, $extent:literal) => {{
@@ -336,7 +331,7 @@ mod tests {
         assert_eq!(result[0].extent(), Some(4));
         assert_eq!(checked_subtraction.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion),);
 
-        let unexpected = test_dimension_type("unexpected", 0, 6);
+        let unexpected = DimensionType::new("unexpected", DimensionBounds::new(0, Some(6)).unwrap());
         assert_eq!(
             Operation::infer_output_types(&operation, &[unexpected.clone(), right.clone()], &[]),
             Err(TypeError::invalid(format!(
@@ -344,8 +339,8 @@ mod tests {
             ))),
         );
 
-        let renamed_left = test_dimension_type("renamed_left", 2, 9);
-        let renamed_right = test_dimension_type("renamed_right", 1, 5);
+        let renamed_left = DimensionType::new("renamed_left", DimensionBounds::new(2, Some(9)).unwrap());
+        let renamed_right = DimensionType::new("renamed_right", DimensionBounds::new(1, Some(5)).unwrap());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(left.variable().clone(), renamed_left.variable().clone()).unwrap();
         renaming.insert(right.variable().clone(), renamed_right.variable().clone()).unwrap();
@@ -356,12 +351,12 @@ mod tests {
 
     #[test]
     fn test_arithmetic_dimension_operation_effects() {
-        let bounded_left = test_dimension_type("bounded_left", 2, 9);
-        let bounded_right = test_dimension_type("bounded_right", 1, 5);
-        let safe_subtrahend = test_dimension_type("safe_subtrahend", 1, 4);
-        let safe_minuend = test_dimension_type("safe_minuend", 5, 9);
-        let maybe_zero = test_dimension_type("maybe_zero", 0, 5);
-        let unbounded = DimensionType::new(DimensionVariable::new("unbounded", DimensionBounds::unbounded()));
+        let bounded_left = DimensionType::new("bounded_left", DimensionBounds::new(2, Some(9)).unwrap());
+        let bounded_right = DimensionType::new("bounded_right", DimensionBounds::new(1, Some(5)).unwrap());
+        let safe_subtrahend = DimensionType::new("safe_subtrahend", DimensionBounds::new(1, Some(4)).unwrap());
+        let safe_minuend = DimensionType::new("safe_minuend", DimensionBounds::new(5, Some(9)).unwrap());
+        let maybe_zero = DimensionType::new("maybe_zero", DimensionBounds::new(0, Some(5)).unwrap());
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
         let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
 
         // Arithmetic is pure exactly when operand bounds prove that its checked eager operation is total.
@@ -440,8 +435,8 @@ mod tests {
 
     #[test]
     fn test_composite_dimension_arithmetic_stages_ordinary_dimension_operands() {
-        let rows = DimensionType::new(DimensionVariable::new("rows", DimensionBounds::new(5, Some(9)).unwrap()));
-        let columns = DimensionType::new(DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap()));
+        let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
+        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(rows, columns)| {
                 let padded = rows.dimension_mul(&columns)?.dimension_add(&columns)?;

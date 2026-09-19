@@ -47,14 +47,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionValue};
-    use crate::operations::dimensions::test_dimension_type;
 
     use super::*;
 
     #[test]
     fn test_dimension_max_operation() {
-        let left = test_dimension_type("left", 2, 9);
-        let right = test_dimension_type("right", 1, 5);
+        let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionMaxOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MAX_OPERATION_NAME);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(2, Some(9)).unwrap());

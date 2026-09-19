@@ -419,8 +419,8 @@ mod tests {
         // static, retains wider-bounded dimensions as dynamic, and rejects non-dimension members.
         let exact_variable = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
         let extent_types = [
-            ArrayIrType::Dimension(DimensionType::new(exact_variable)),
-            ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
+            ArrayIrType::Dimension(DimensionType::from(exact_variable)),
+            ArrayIrType::Dimension(DimensionType::from(declared_variable.clone())),
         ];
         assert_eq!(ArrayIrType::extents(std::iter::empty::<ArrayIrType>()), Ok(Vec::new()));
         assert_eq!(
@@ -435,11 +435,11 @@ mod tests {
         // One identity may be defined by a dimension member and referenced by an array member. Signature matching
         // must preserve that relationship under one consistent renaming and reject arity or member-kind mismatches.
         let declared = [
-            ArrayIrType::Dimension(DimensionType::new(declared_variable.clone())),
+            ArrayIrType::Dimension(DimensionType::from(declared_variable.clone())),
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]))),
         ];
         let actual = [
-            ArrayIrType::Dimension(DimensionType::new(actual_variable.clone())),
+            ArrayIrType::Dimension(DimensionType::from(actual_variable.clone())),
             ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]))),
         ];
         assert_eq!(
@@ -551,7 +551,7 @@ mod tests {
         // A dimension member with wider bounds contributes no concrete fact. Its variable instead belongs to the
         // boundary's closed identity signature, so output validation may establish the concrete extent for it on first
         // observation and must reject an inconsistent repeated observation within the same validated signature.
-        let declared_dimension = ArrayIrType::Dimension(DimensionType::new(batch.clone()));
+        let declared_dimension = ArrayIrType::Dimension(DimensionType::from(batch.clone()));
         let refinements = ArrayIrTypeRefinements::establish(
             std::slice::from_ref(&declared_dimension),
             std::slice::from_ref(&declared_dimension),
@@ -587,10 +587,10 @@ mod tests {
         // Singleton dimension bounds and static array axes constrain the same boundary variable. Record their
         // agreement in either signature order and reject contradictory extents before executing any instruction.
         for extent in [2, 3] {
-            let exact_dimension = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+            let exact_dimension = ArrayIrType::Dimension(DimensionType::new(
                 "exact",
                 DimensionBounds::new(extent, Some(extent + 1)).unwrap(),
-            )));
+            ));
             for (declared, actual) in [
                 ([declared_array.clone(), declared_dimension.clone()], [actual_two.clone(), exact_dimension.clone()]),
                 ([declared_dimension.clone(), declared_array.clone()], [exact_dimension.clone(), actual_two.clone()]),
@@ -650,7 +650,7 @@ mod tests {
     fn test_array_ir_type_validate_zero() {
         let array = ArrayType::scalar(F32);
         assert_eq!(ArrayIrType::Array(array.clone()).validate_zero(), Ok(()));
-        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let dimension = DimensionType::new("size", DimensionBounds::unbounded());
         assert_eq!(
             ArrayIrType::Dimension(dimension).validate_zero(),
             Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
@@ -669,7 +669,7 @@ mod tests {
     fn test_array_ir_type_validate_one() {
         let array = ArrayType::scalar(F32);
         assert_eq!(ArrayIrType::Array(array.clone()).validate_one(), Ok(()));
-        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let dimension = DimensionType::new("size", DimensionBounds::unbounded());
         assert_eq!(
             ArrayIrType::Dimension(dimension).validate_one(),
             Err(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
@@ -702,8 +702,7 @@ mod tests {
         );
 
         // A dimension member provides the symmetric successful dimension projection and array-kind diagnostic.
-        let dimension =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap()));
+        let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(9)).unwrap());
         let stored = ArrayIrType::from(dimension.clone());
         assert_eq!(<&DimensionType>::try_from(&stored), Ok(&dimension));
         assert!(!stored.is_reference());
@@ -744,8 +743,7 @@ mod tests {
         let array = ArrayType::new_static(F32, [3]);
         let reference_member = ArrayIrType::from(ReferenceType::new(array.clone()));
         let array_member = ArrayIrType::from(array.clone());
-        let dimension_member =
-            ArrayIrType::from(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded())));
+        let dimension_member = ArrayIrType::from(DimensionType::new("extent", DimensionBounds::unbounded()));
         assert_eq!(reference_member.referent(), Some(&array));
         assert_eq!(array_member.referent(), None);
         assert_eq!(dimension_member.referent(), None);
@@ -763,8 +761,7 @@ mod tests {
         let array = ArrayType::new_static(F32, [3]);
         let array_member = ArrayIrType::from(array.clone());
         let reference_member = ArrayIrType::from(ReferenceType::new(array.clone()));
-        let dimension_member =
-            ArrayIrType::from(DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded())));
+        let dimension_member = ArrayIrType::from(DimensionType::new("extent", DimensionBounds::unbounded()));
         assert_eq!(array_member.as_referent(), Some(&array));
         assert_eq!(reference_member.as_referent(), None);
         assert_eq!(dimension_member.as_referent(), None);
