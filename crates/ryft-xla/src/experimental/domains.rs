@@ -1249,7 +1249,7 @@ impl<'c> XlaDomain<'c> {
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
             let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
             let extent = array.dimension_size(operation.axis())?;
-            return Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?)]);
+            return Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?)]);
         }
         if let XlaOperation::DimensionFromScalar(operation) = &operation {
             if driver.regions().count() != 0 {
@@ -1258,7 +1258,7 @@ impl<'c> XlaDomain<'c> {
             check_count!("input", inputs, 1, ProgramError);
             operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
             let array = <ArrayIrValue<Array<'c>> as ryft_core::ValueProjection<ArrayType>>::projected(&inputs[0])?;
-            return Ok(vec![ArrayIrValue::Dimension(array.to_dimension(operation.result_type().variable().clone())?)]);
+            return Ok(vec![ArrayIrValue::Dimension(array.to_dimension(operation.output_type().variable().clone())?)]);
         }
 
         let Some(client) = self.client else {
@@ -5188,7 +5188,7 @@ fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), X
     for region in program.regions() {
         for instruction in region.instructions() {
             if let XlaOperation::DimensionFromScalar(operation) = instruction.operation() {
-                let variable = operation.result_type().variable();
+                let variable = operation.output_type().variable();
                 if variable.bounds().upper().is_none() {
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
@@ -7764,7 +7764,7 @@ mod tests {
             let zero = builder.add_input(ArrayType::scalar(DataType::I32).into());
             builder.add_input(updates_type.into());
             let extent_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
-            let extent_type = extent_operation.result_type().clone();
+            let extent_type = extent_operation.output_type().clone();
             let extent = builder.add_instruction(extent_operation, vec![], vec![input], None).unwrap()[0];
             let two_value = DimensionValue::constant(2).unwrap();
             let two_type = two_value.r#type().into_owned();
@@ -8737,7 +8737,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let add =
-                DimensionAddOperation::new(size_operation.result_type(), increment_value.r#type().as_ref()).unwrap();
+                DimensionAddOperation::new(size_operation.output_type(), increment_value.r#type().as_ref()).unwrap();
             let output_extent = builder
                 .add_instruction(
                     XlaOperation::Dimension(DimensionOperation::Add(add)),

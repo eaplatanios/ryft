@@ -39,7 +39,7 @@ pub struct DimensionSizeOperation {
     input_dimension: Dimension,
 
     /// First-class dimension type produced by this operation.
-    result_type: DimensionType,
+    output_type: DimensionType,
 }
 
 impl DimensionSizeOperation {
@@ -61,11 +61,11 @@ impl DimensionSizeOperation {
             }
             .into());
         }
-        let result_variable = match &input_dimension {
+        let output_variable = match &input_dimension {
             Dimension::Static(_) => DimensionVariable::new(format!("size(axis={position})"), input_dimension.bounds()),
             Dimension::Dynamic(variable) => variable.clone(),
         };
-        Ok(Self { axis: position, input_dimension, result_type: DimensionType::from(result_variable) })
+        Ok(Self { axis: position, input_dimension, output_type: DimensionType::from(output_variable) })
     }
 
     /// Returns the normalized nonnegative input axis.
@@ -82,8 +82,8 @@ impl DimensionSizeOperation {
 
     /// Returns the first-class dimension type produced by this operation.
     #[inline]
-    pub fn result_type(&self) -> &DimensionType {
-        &self.result_type
+    pub fn output_type(&self) -> &DimensionType {
+        &self.output_type
     }
 
     /// Validates one complete composite input type against this operation's selected declared axis.
@@ -152,19 +152,19 @@ impl Operation for DimensionSizeOperation {
         let bounds = input_type.shape().dimensions()[self.axis].bounds();
         // Dimension variables have immutable bounds. A concrete refinement therefore defines a new exact-bound
         // identity, which program replay relates to the original definition before validating downstream uses.
-        let result_type = if bounds == self.result_type.bounds() {
-            self.result_type.clone()
+        let output_type = if bounds == self.output_type.bounds() {
+            self.output_type.clone()
         } else {
-            DimensionType::new(self.result_type.variable().name(), bounds)
+            DimensionType::new(self.output_type.variable().name(), bounds)
         };
-        Ok(vec![result_type.into()])
+        Ok(vec![output_type.into()])
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self {
             axis: self.axis,
             input_dimension: self.input_dimension.rename_type_identities(renaming),
-            result_type: self.result_type.rename_identities(renaming)?,
+            output_type: self.output_type.rename_identities(renaming)?,
         })
     }
 
@@ -239,7 +239,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
             return Ok(vec![ArrayIrBatch::mapped_dimension(
                 ragged_axis.extents().clone(),
                 BatchAxis::from_position(extent_axis),
-                self.result_type().clone(),
+                self.output_type().clone(),
             )?]
             .into());
         }
@@ -262,18 +262,18 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
 /// selected by `Output`: a materialized array backend can return its host extent, while a composite program value
 /// returns a dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other
-/// dimension operations. A program result is not an integer array; convert it to ordinary scalar data explicitly when
+/// dimension operations. A program output is not an integer array; convert it to ordinary scalar data explicitly when
 /// a numerical computation needs the extent as data.
 ///
 /// In a composite trace, the capability works both on the outer array member and on a
 /// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
-/// an array operation result to feed shape computation without exposing an adapter conversion in user code.
+/// an array operation output to feed shape computation without exposing an adapter conversion in user code.
 ///
-/// Negative axes index from the final array axis. The representation of the result depends on whether the type already
+/// Negative axes index from the final array axis. The representation of the output depends on whether the type already
 /// pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the axis's
 /// [`DimensionVariable`]. A static selected axis is folded: its extent is known from the type, so staging
 /// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
-/// and staged programs therefore contain no `dimension_size` reads whose results the type system already knows. Eager
+/// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
 ///
 /// # Example
@@ -341,7 +341,7 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayI
         let input_type = array.r#type();
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
         let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
-        Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
+        Ok(Self::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?))
     }
 }
 
@@ -397,11 +397,11 @@ mod tests {
         // Dynamic axes preserve their identity and accept compatible static refinements.
         assert_eq!(operation.axis(), 0);
         assert_eq!(operation.input_dimension(), &Dimension::Dynamic(variable.clone()));
-        assert_eq!(operation.result_type().variable(), &variable);
+        assert_eq!(operation.output_type().variable(), &variable);
         assert_eq!(operation.to_string(), "dimension_size [axis=0]");
         assert_eq!(
             operation.infer_output_types(&[dynamic_type.clone().into()], &[]),
-            Ok(vec![operation.result_type().clone().into()]),
+            Ok(vec![operation.output_type().clone().into()]),
         );
         let refined_result = operation
             .infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(5)])).into()], &[])
@@ -414,8 +414,8 @@ mod tests {
         let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let static_operation = DimensionSizeOperation::new(&static_type, 0).unwrap();
         assert_eq!(static_operation.input_dimension(), &Dimension::Static(3));
-        assert_eq!(static_operation.result_type().bounds(), DimensionBounds::new(3, Some(4)).unwrap());
-        assert_ne!(static_operation.result_type().variable(), operation.result_type().variable());
+        assert_eq!(static_operation.output_type().bounds(), DimensionBounds::new(3, Some(4)).unwrap());
+        assert_ne!(static_operation.output_type().variable(), operation.output_type().variable());
 
         assert_eq!(
             DimensionSizeOperation::new(&static_type, 1),
@@ -502,13 +502,13 @@ mod tests {
             Err(TypeError::invalid("`dimension_size` input axis 0 dimension 4 does not refine declared dimension 3",)),
         );
 
-        // Renaming preserves the relationship between the selected dynamic input dimension and the result.
+        // Renaming preserves the relationship between the selected dynamic input dimension and the output.
         let renamed = DimensionVariable::new("renamed", bounds);
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(variable, renamed.clone()).unwrap();
         let renamed_operation = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed_operation.input_dimension(), &Dimension::Dynamic(renamed.clone()));
-        assert_eq!(renamed_operation.result_type().variable(), &renamed);
+        assert_eq!(renamed_operation.output_type().variable(), &renamed);
 
         // Eager execution reads shape metadata without consuming or copying the array payload.
         let reference_array = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
@@ -518,11 +518,11 @@ mod tests {
             .unwrap()
             .storage_bytes()
             .as_ptr();
-        let result = array.dimension_size(-1).unwrap();
-        let ArrayIrValue::Dimension(result) = result else {
-            panic!("expected one dimension result");
+        let output = array.dimension_size(-1).unwrap();
+        let ArrayIrValue::Dimension(output) = output else {
+            panic!("expected one dimension output");
         };
-        assert_eq!(result.extent(), 3);
+        assert_eq!(output.extent(), 3);
         assert_eq!(
             <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&array)
                 .unwrap()
@@ -539,13 +539,13 @@ mod tests {
 
         // A dynamic staged declaration executes against its compatible concrete static refinement.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let result = context
+        let output = context
             .bind(operation, Vec::new(), &[ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap())])
             .unwrap();
-        let [ArrayIrValue::Dimension(result)] = result.as_slice() else {
-            panic!("expected one dimension result");
+        let [ArrayIrValue::Dimension(output)] = output.as_slice() else {
+            panic!("expected one dimension output");
         };
-        assert_eq!(result.extent(), 5);
+        assert_eq!(output.extent(), 5);
     }
 
     #[test]
@@ -564,7 +564,7 @@ mod tests {
         )
         .unwrap();
         let (ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)) = output_types else {
-            panic!("expected two dimension result types");
+            panic!("expected two dimension output types");
         };
         assert_eq!(first.variable(), &variable);
         assert_eq!(second.variable(), &variable);
@@ -591,7 +591,7 @@ mod tests {
         let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap());
         let (first, second) = program.interpret(concrete.clone()).unwrap();
         let (ArrayIrValue::Dimension(first), ArrayIrValue::Dimension(second)) = (first, second) else {
-            panic!("expected two concrete dimension results");
+            panic!("expected two concrete dimension outputs");
         };
         assert_eq!(first.extent(), 5);
         assert_eq!(second.extent(), 5);
@@ -610,7 +610,7 @@ mod tests {
         assert!(imported.type_identity_signature().internal_identities().is_empty());
         let output_types = imported.output_types();
         let [ArrayIrType::Dimension(first), ArrayIrType::Dimension(second)] = output_types.as_slice() else {
-            panic!("expected two imported dimension result types");
+            panic!("expected two imported dimension output types");
         };
         assert_eq!(first.variable(), &variable);
         assert_eq!(second.variable(), &variable);
@@ -626,7 +626,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let size_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
-        let size_type = size_operation.result_type().clone();
+        let size_type = size_operation.output_type().clone();
         let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
         let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
         let one_value = DimensionValue::constant(1).unwrap();
@@ -674,9 +674,9 @@ mod tests {
                 in (%5)"},
         );
 
-        // Drift gate: an instruction result may only *reference* a dimension identity that one of its own operands
+        // Drift gate: an instruction output may only *reference* a dimension identity that one of its own operands
         // carries. A rule that recovered geometry from stored metadata instead of an operand edge would produce a
-        // result type naming an identity that reaches the instruction through no rendered edge.
+        // output type naming an identity that reaches the instruction through no rendered edge.
         let atoms = program.atoms();
         for instruction in program.instructions() {
             let mut operand_identities = Vec::new();
@@ -689,7 +689,7 @@ mod tests {
                 for (position, identity) in r#type.identities() {
                     assert!(
                         position != TypeIdentityPosition::Reference || operand_identities.contains(identity),
-                        "instruction `{}` result type {} references identity {identity} that no operand carries",
+                        "instruction `{}` output type {} references identity {identity} that no operand carries",
                         instruction.operation().name(),
                         r#type.as_ref(),
                     );
@@ -712,10 +712,10 @@ mod tests {
             .partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]).unwrap()))])
             .unwrap();
         assert!(known.program().instructions().is_empty());
-        let [PartialEvaluationOutput::Known(ArrayIrValue::Dimension(result))] = known.outputs() else {
-            panic!("expected one known dimension result");
+        let [PartialEvaluationOutput::Known(ArrayIrValue::Dimension(output))] = known.outputs() else {
+            panic!("expected one known dimension output");
         };
-        assert_eq!(result.extent(), 5);
+        assert_eq!(output.extent(), 5);
 
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input_type.into())]).unwrap();
         assert_eq!(unknown.program().instructions().len(), 1);
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn test_dimension_size_folds_static_axes() {
         // A dynamic axis is read back from the array and keeps its dimension identity, while a static axis is folded
-        // into a literal instead of a read, so the trace carries no `dimension_size` whose result the type already
+        // into a literal instead of a read, so the trace carries no `dimension_size` whose output the type already
         // knows.
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

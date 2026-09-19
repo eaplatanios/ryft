@@ -621,7 +621,7 @@ impl<'c, 't> Lowering<'c, 't> {
                 )?)],
                 KernelOperation::Portable(ArrayIrOperation::DimensionToScalar(_)) => vec![inputs[0].clone()],
                 KernelOperation::Portable(ArrayIrOperation::DimensionFromScalar(operation)) => {
-                    let bounds = operation.result_type().bounds();
+                    let bounds = operation.output_type().bounds();
                     let minimum = self.integer(block, bounds.lower() as i64)?;
                     let maximum = self.integer(block, bounds.upper().unwrap() as i64)?;
                     let above = append(

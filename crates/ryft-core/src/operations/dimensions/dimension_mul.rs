@@ -23,7 +23,7 @@ define_dimension_arithmetic_operation!(
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
         let lower = left_lower.checked_mul(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while deriving `{DIMENSION_MUL_OPERATION_NAME}` result bounds \
+                "dimension arithmetic overflow while deriving `{DIMENSION_MUL_OPERATION_NAME}` output bounds \
                  with operands `{left}` and `{right}`",
             ),
         })?;
@@ -32,7 +32,7 @@ define_dimension_arithmetic_operation!(
         let requires_runtime_assertion = left.maximum_extent()
             .zip(right.maximum_extent())
             .and_then(|(left, right)| left.checked_mul(right))
-            .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
+            .is_none_or(|output| output > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
     provider = MulOperation<DimensionType>,
@@ -49,7 +49,7 @@ impl Mul for DimensionValue {
     fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionMulOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
         let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
                 "dimension arithmetic overflow while multiplying dimensions with operands {}={}, {}={}",
@@ -59,7 +59,7 @@ impl Mul for DimensionValue {
                 right.extent(),
             ),
         })?;
-        Ok(Self::new(result_type, extent)?)
+        Ok(Self::new(output_type, extent)?)
     }
 }
 
@@ -123,14 +123,14 @@ mod tests {
             EffectClasses::single(EffectClass::OrderedAssertion),
         );
 
-        // Specializing the input bounds recomputes this operation's result bounds.
+        // Specializing the input bounds recomputes this operation's output bounds.
         let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionMulOperation::new(&declared_left, &declared_right).unwrap();
         let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
         let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
-        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
-        assert_eq!(result[0].extent(), Some(12));
+        let output = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(output[0].extent(), Some(12));
 
         assert_eq!(
             DimensionValue::constant(7).unwrap().mul(&DimensionValue::constant(3).unwrap()).unwrap().extent(),

@@ -1483,7 +1483,7 @@ mod tests {
             let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
             let size = DimensionSizeOperation::new(&input_type, 0).unwrap();
-            let addition = DimensionAddOperation::new(size.result_type(), &one_type).unwrap();
+            let addition = DimensionAddOperation::new(size.output_type(), &one_type).unwrap();
             let input = builder.add_input(input_type.into());
             let size = builder.add_instruction(size, Vec::new(), vec![input], None).unwrap()[0];
             let result = builder

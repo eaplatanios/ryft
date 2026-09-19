@@ -1053,7 +1053,7 @@ impl<'c, 't> Lowering<'c, 't> {
                         value =
                             append(block, arith::extui(value, self.context.signless_integer_type(64), self.location)?)?;
                     }
-                    let bounds = operation.result_type().bounds();
+                    let bounds = operation.output_type().bounds();
                     let lower = self.literal(block, DataType::I64, bounds.lower() as u64)?;
                     let upper = self.literal(
                         block,

@@ -22375,7 +22375,7 @@ mod tests {
         let first_size_operation = DimensionSizeOperation::new(&first_type, 0).unwrap();
         let second_size_operation = DimensionSizeOperation::new(&second_type, 0).unwrap();
         let add_operation =
-            DimensionAddOperation::new(first_size_operation.result_type(), second_size_operation.result_type())
+            DimensionAddOperation::new(first_size_operation.output_type(), second_size_operation.output_type())
                 .unwrap();
         let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
         let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(

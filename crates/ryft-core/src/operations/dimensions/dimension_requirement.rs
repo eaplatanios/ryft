@@ -48,7 +48,7 @@ pub enum DimensionRequirementPredicate {
     Bounds(DimensionBounds),
 }
 
-/// Zero-result runtime-dimension assertion used by [`DimensionRequirement`].
+/// Zero-output runtime-dimension assertion used by [`DimensionRequirement`].
 ///
 /// Refer to [`DimensionRequirement`] for semantic details and an example.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -669,7 +669,7 @@ mod tests {
 
     use super::*;
 
-    /// Builds a zero-result program containing one dimension requirement.
+    /// Builds a zero-output program containing one dimension requirement.
     fn requirement_program(
         operation: DimensionRequirementOperation,
         input_types: &[DimensionType],

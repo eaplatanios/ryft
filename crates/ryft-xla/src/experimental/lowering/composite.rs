@@ -618,7 +618,7 @@ where
             let converted = block.append_operation(stable_hlo::convert(*input, i64_type, location)?)?;
             let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
             let requirement =
-                DimensionRequirementOperation::bounds(operation.result_type(), operation.result_type().bounds());
+                DimensionRequirementOperation::bounds(operation.output_type(), operation.output_type().bounds());
             lower_dimension_requirement_to_assertion(
                 &requirement,
                 operation.name(),
@@ -910,11 +910,11 @@ where
                     .map_err(|error| LoweringError::Tracing(error.into()))?;
                 let mut inferred_extent = DimensionSizeOperation::new(inputs[0], operation.axis())
                     .map_err(ProgramError::from)?
-                    .result_type()
+                    .output_type()
                     .clone();
                 for input in &inputs[1..] {
                     let extent = DimensionSizeOperation::new(input, operation.axis()).map_err(ProgramError::from)?;
-                    let sum = DimensionAddOperation::new(&inferred_extent, extent.result_type())
+                    let sum = DimensionAddOperation::new(&inferred_extent, extent.output_type())
                         .map_err(ProgramError::from)?;
                     inferred_extent = DimensionType::new(sum.output_name(), sum.output_bounds());
                 }

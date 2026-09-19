@@ -862,7 +862,7 @@ impl Encoder {
                 ArrayIrOperation::While(operation) => WireOperation::While { bound: operation.iteration_bound() },
                 ArrayIrOperation::Condition(_) => WireOperation::Condition,
                 ArrayIrOperation::DimensionFromScalar(operation) => {
-                    WireOperation::DimensionFromScalar(self.identity(operation.result_type().variable()))
+                    WireOperation::DimensionFromScalar(self.identity(operation.output_type().variable()))
                 }
                 ArrayIrOperation::DimensionToScalar(_) => WireOperation::DimensionToScalar,
                 ArrayIrOperation::ReferenceNew(_) => WireOperation::ReferenceNew,

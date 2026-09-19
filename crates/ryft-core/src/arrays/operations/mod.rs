@@ -2893,7 +2893,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let per_item_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let extent_operation = DimensionSizeOperation::new(&per_item_type, 0).unwrap();
-        let extent_type = extent_operation.result_type().clone();
+        let extent_type = extent_operation.output_type().clone();
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(per_item_type.clone().into());

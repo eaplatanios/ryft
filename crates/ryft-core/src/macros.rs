@@ -374,7 +374,7 @@ macro_rules! define_dimension_arithmetic_operation {
         $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
         pub struct $operation {
-            /// Shared operand contract and result inference metadata for this arithmetic dimension operation.
+            /// Shared input contract and output inference metadata for this arithmetic dimension operation.
             metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata,
         }
 
@@ -397,13 +397,13 @@ macro_rules! define_dimension_arithmetic_operation {
                 })
             }
 
-            /// Returns the expected left operand [`DimensionType`](crate::DimensionType).
+            /// Returns the expected left input [`DimensionType`](crate::DimensionType).
             #[inline]
             pub fn left_type(&self) -> &$crate::arrays::DimensionType {
                 self.metadata.left_type()
             }
 
-            /// Returns the expected right operand [`DimensionType`](crate::DimensionType).
+            /// Returns the expected right input [`DimensionType`](crate::DimensionType).
             #[inline]
             pub fn right_type(&self) -> &$crate::arrays::DimensionType {
                 self.metadata.right_type()
@@ -478,8 +478,8 @@ macro_rules! define_dimension_arithmetic_operation {
                 formatter: &mut ::std::fmt::Formatter<'_>,
                 indentation: usize,
             ) -> ::std::fmt::Result {
-                // The result name and bounds are recoverable from the instruction's rendered output atom type, and each
-                // declared operand type is pinned by the input atom type that must refine it, so the only payload field
+                // The output name and bounds are recoverable from the instruction's rendered output atom type, and each
+                // declared input type is pinned by the input atom type that must refine it, so the only payload field
                 // this rendering must carry is the runtime assertion classification, which is invisible to the types
                 // and decides this operation's effects. It is elided when it is `false`.
                 let operation =

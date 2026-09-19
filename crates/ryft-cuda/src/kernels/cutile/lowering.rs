@@ -278,7 +278,7 @@ impl Lowering {
                     vec![Value::Expression(self.assign(format!("ct.astype({}, ct.int64)", expression(0)?)))]
                 }
                 KernelOperation::Portable(ArrayIrOperation::DimensionFromScalar(operation)) => {
-                    let bounds = operation.result_type().bounds();
+                    let bounds = operation.output_type().bounds();
                     let value = expression(0)?;
                     let upper = bounds.upper().map_or_else(
                         || format!("({value} <= {})", ryft_core::MAX_DIMENSION_EXTENT),

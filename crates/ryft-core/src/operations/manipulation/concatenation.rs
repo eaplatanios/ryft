@@ -1574,8 +1574,8 @@ mod tests {
         let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(right_variable.clone())]));
         let left_size_operation = DimensionSizeOperation::new(&left_type, 0).unwrap();
         let right_size_operation = DimensionSizeOperation::new(&right_type, 0).unwrap();
-        let left_size_type = left_size_operation.result_type().clone();
-        let right_size_type = right_size_operation.result_type().clone();
+        let left_size_type = left_size_operation.output_type().clone();
+        let right_size_type = right_size_operation.output_type().clone();
         let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
         let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
         let dynamic_operation = ConcatenateOperation::<ArrayIrType>::new(

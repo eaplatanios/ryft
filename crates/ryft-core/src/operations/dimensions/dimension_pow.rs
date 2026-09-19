@@ -31,7 +31,7 @@ define_dimension_arithmetic_operation!(
         } else {
             checked_power(left_lower, right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
-                    "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` result bounds \
+                    "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` output bounds \
                      with operands `{left}` and `{right}`",
                 ),
             })?
@@ -47,7 +47,7 @@ define_dimension_arithmetic_operation!(
         let requires_runtime_assertion = left.maximum_extent()
             .zip(right.maximum_extent())
             .and_then(|(left, right)| checked_power(left, right))
-            .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
+            .is_none_or(|output| output > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
     capability = {
@@ -58,8 +58,8 @@ define_dimension_arithmetic_operation!(
         /// ```rust
         /// # use ryft_core::{DimensionPow, DimensionValue, ProgramError};
         /// # fn main() -> Result<(), ProgramError> {
-        /// let result = DimensionValue::constant(3)?.dimension_pow(&DimensionValue::constant(4)?)?;
-        /// assert_eq!(result.extent(), 81);
+        /// let output = DimensionValue::constant(3)?.dimension_pow(&DimensionValue::constant(4)?)?;
+        /// assert_eq!(output.extent(), 81);
         /// # Ok(())
         /// # }
         /// ```
@@ -80,7 +80,7 @@ impl DimensionPow for DimensionValue {
     fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionPowOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
         let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent =
             checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
@@ -92,23 +92,23 @@ impl DimensionPow for DimensionValue {
                     right.extent(),
                 ),
             })?;
-        Ok(Self::new(result_type, extent)?)
+        Ok(Self::new(output_type, extent)?)
     }
 }
 
 /// Computes `base.pow(exponent)` without narrowing `exponent`.
 fn checked_power(mut base: usize, mut exponent: usize) -> Option<usize> {
-    let mut result = 1usize;
+    let mut output = 1usize;
     while exponent != 0 {
         if exponent & 1 != 0 {
-            result = result.checked_mul(base)?;
+            output = output.checked_mul(base)?;
         }
         exponent >>= 1;
         if exponent != 0 {
             base = base.checked_mul(base)?;
         }
     }
-    Some(result)
+    Some(output)
 }
 
 #[cfg(test)]
@@ -139,14 +139,14 @@ mod tests {
             EffectClasses::single(EffectClass::OrderedAssertion),
         );
 
-        // Specializing the input bounds recomputes this operation's result bounds.
+        // Specializing the input bounds recomputes this operation's output bounds.
         let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionPowOperation::new(&declared_left, &declared_right).unwrap();
         let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
         let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
-        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
-        assert_eq!(result[0].extent(), Some(36));
+        let output = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(output[0].extent(), Some(36));
 
         assert_eq!(
             DimensionValue::constant(3)

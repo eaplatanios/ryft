@@ -97,15 +97,15 @@ impl DimensionSize<usize> for Array<'_> {
                 message: format!("cannot read the extent of an array of type {} with no shard metadata", self.r#type()),
             }
         })?;
-        DimensionValue::new(operation.result_type().clone(), extent)?;
+        DimensionValue::new(operation.output_type().clone(), extent)?;
         Ok(extent)
     }
 }
 
 impl DimensionFromScalar<DimensionValue> for Array<'_> {
     /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
-    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
-        let operation = DimensionFromScalarOperation::new(result);
+    fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(output);
         let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {

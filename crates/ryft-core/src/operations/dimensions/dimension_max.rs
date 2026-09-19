@@ -31,8 +31,8 @@ define_dimension_arithmetic_operation!(
         /// ```rust
         /// # use ryft_core::{DimensionMax, DimensionValue, ProgramError};
         /// # fn main() -> Result<(), ProgramError> {
-        /// let result = DimensionValue::constant(7)?.dimension_max(&DimensionValue::constant(3)?)?;
-        /// assert_eq!(result.extent(), 7);
+        /// let output = DimensionValue::constant(7)?.dimension_max(&DimensionValue::constant(3)?)?;
+        /// assert_eq!(output.extent(), 7);
         /// # Ok(())
         /// # }
         /// ```
@@ -53,8 +53,8 @@ impl DimensionMax for DimensionValue {
     fn dimension_max(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionMaxOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
         let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        Ok(Self::new(result_type, self.extent().max(right.extent()))?)
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(output_type, self.extent().max(right.extent()))?)
     }
 }
 
@@ -76,14 +76,14 @@ mod tests {
         assert_eq!(operation.output_bounds(), DimensionBounds::new(2, Some(9)).unwrap());
         assert_eq!(operation.effects().classes(), EffectClasses::NONE);
 
-        // Specializing the input bounds recomputes this operation's result bounds.
+        // Specializing the input bounds recomputes this operation's output bounds.
         let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionMaxOperation::new(&declared_left, &declared_right).unwrap();
         let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
         let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
-        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
-        assert_eq!(result[0].extent(), Some(6));
+        let output = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(output[0].extent(), Some(6));
 
         assert_eq!(
             DimensionValue::constant(7)

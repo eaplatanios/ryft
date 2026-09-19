@@ -65,7 +65,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     fn output_bounds(&self) -> DimensionBounds;
 
     /// Infers output [`DimensionBounds`] from the actual input [`DimensionType`]s, which may refine the declared
-    /// output [`DimensionBounds`] (i.e., the result of calling [`Self::output_bounds`]).
+    /// output [`DimensionBounds`] (i.e., the bounds returned by [`Self::output_bounds`]).
     fn infer_output_bounds(
         &self,
         left: &DimensionType,
@@ -116,7 +116,7 @@ pub(crate) struct ArithmeticDimensionOperationMetadata {
 }
 
 impl ArithmeticDimensionOperationMetadata {
-    /// Constructs a new [`ArithmeticDimensionOperationMetadata`] instance that is used to infer one fresh result
+    /// Constructs a new [`ArithmeticDimensionOperationMetadata`] instance that is used to infer one fresh output
     /// variable and classify its effects.
     pub(crate) fn new(
         left: &DimensionType,
@@ -181,21 +181,21 @@ mod tests {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
-        let result =
+        let output =
             ArithmeticDimensionOperation::infer_output_types(&operation, &[left.clone(), right.clone()]).unwrap();
-        assert_eq!(result[0].bounds(), operation.output_bounds());
-        assert_ne!(result[0].variable(), left.variable());
-        assert_ne!(result[0].variable(), right.variable());
+        assert_eq!(output[0].bounds(), operation.output_bounds());
+        assert_ne!(output[0].variable(), left.variable());
+        assert_ne!(output[0].variable(), right.variable());
 
-        // Actual input types refine the output bounds, and every inference creates a fresh result identity.
+        // Actual input types refine the output bounds, and every inference creates a fresh output identity.
         let inputs = [
             DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap()),
             DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap()),
         ];
-        let result = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
+        let output = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
         let repeated = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
-        assert_eq!(result[0].extent(), Some(8));
-        assert_ne!(result[0].variable(), repeated[0].variable());
+        assert_eq!(output[0].extent(), Some(8));
+        assert_ne!(output[0].variable(), repeated[0].variable());
 
         assert_eq!(
             ArithmeticDimensionOperation::infer_output_types(&operation, std::slice::from_ref(&left)),

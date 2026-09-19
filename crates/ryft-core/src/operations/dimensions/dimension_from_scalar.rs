@@ -33,26 +33,25 @@ use crate::programs::{
 /// Canonical operation name for [`DimensionFromScalarOperation`].
 pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 
-/// Mixed scalar-array-to-dimension operation used by [`DimensionFromScalar`].
-///
+/// Scalar-array-to-dimension operation used by [`DimensionFromScalar`].
 /// Refer to [`DimensionFromScalar`] for semantic details and an example.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionFromScalarOperation {
-    /// First-class dimension type produced by this operation.
-    result_type: DimensionType,
+    /// [`DimensionType`] produced by this [`DimensionFromScalarOperation`].
+    output_type: DimensionType,
 }
 
 impl DimensionFromScalarOperation {
-    /// Creates a checked scalar-data gateway that produces a dimension described by `result`.
+    /// Creates a checked scalar-data gateway that produces a dimension described by `output`.
     #[inline]
-    pub fn new(result: DimensionVariable) -> Self {
-        Self { result_type: DimensionType::from(result) }
+    pub fn new(output: DimensionVariable) -> Self {
+        Self { output_type: DimensionType::from(output) }
     }
 
     /// Returns the first-class dimension type produced by this operation.
     #[inline]
-    pub fn result_type(&self) -> &DimensionType {
-        &self.result_type
+    pub fn output_type(&self) -> &DimensionType {
+        &self.output_type
     }
 
     /// Validates the array member accepted by this gateway without allocating an inferred output collection.
@@ -91,7 +90,7 @@ impl Operation for DimensionFromScalarOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
         Self::validate_input_type(input_type)?;
-        Ok(vec![self.result_type.clone().into()])
+        Ok(vec![self.output_type.clone().into()])
     }
 
     #[inline]
@@ -100,13 +99,13 @@ impl Operation for DimensionFromScalarOperation {
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
-        Ok(Self { result_type: self.result_type.rename_identities(renaming)? })
+        Ok(Self { output_type: self.output_type.rename_identities(renaming)? })
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, DIMENSION_FROM_SCALAR_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("bounds", self.result_type.bounds()))
+            .bracketed(|operation| operation.field("bounds", self.output_type.bounds()))
     }
 }
 
@@ -123,7 +122,7 @@ impl<C: Domain<Type = ArrayIrType, Value: DimensionFromScalar<C::Value>>> Interp
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
-        Ok(vec![inputs[0].to_dimension(self.result_type.variable().clone())?])
+        Ok(vec![inputs[0].to_dimension(self.output_type.variable().clone())?])
     }
 }
 
@@ -198,7 +197,7 @@ where
         Ok(vec![ArrayIrBatch::mapped_dimension(
             outputs.remove(0),
             BatchAxis::from_position(0),
-            self.result_type().clone(),
+            self.output_type().clone(),
         )?]
         .into())
     }
@@ -209,7 +208,7 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 
 /// Converts ordinary rank-zero integer array data into a checked first-class dimension.
 ///
-/// This is the explicit boundary that converts numerical data into a dimension value. `result` declares the fresh
+/// This is the explicit boundary that converts numerical data into a dimension value. `output` declares the fresh
 /// [`DimensionVariable`] and authoritative bounds of the produced dimension. Eager execution rejects negative,
 /// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
 ///
@@ -256,8 +255,8 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// # }
 /// ```
 pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
-    /// Returns this rank-zero integer array as a first-class dimension described by `result`.
-    fn to_dimension(&self, result: DimensionVariable) -> Result<Output, ProgramError>;
+    /// Returns this rank-zero integer array as a first-class dimension described by `output`.
+    fn to_dimension(&self, output: DimensionVariable) -> Result<Output, ProgramError>;
 }
 
 impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for V
@@ -265,17 +264,17 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
 {
-    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
+    fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self))?
+            .bind(DimensionFromScalarOperation::new(output), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
 
 impl DimensionFromScalar<DimensionValue> for Array {
-    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
-        let operation = DimensionFromScalarOperation::new(result);
+    fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(output);
         DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
         let (scalar, extent) = match self.r#type().data_type() {
             DataType::I8 => {
@@ -318,14 +317,14 @@ impl DimensionFromScalar<DimensionValue> for Array {
                 operation.name(),
             ),
         })?;
-        Ok(DimensionValue::new(operation.result_type().clone(), extent)?)
+        Ok(DimensionValue::new(operation.output_type().clone(), extent)?)
     }
 }
 
 impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> DimensionFromScalar for ArrayIrValue<A> {
-    fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
+    fn to_dimension(&self, output: DimensionVariable) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
-        Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
+        Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, output)?))
     }
 }
 
@@ -334,11 +333,11 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
 {
-    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
+    fn to_dimension(&self, output: DimensionVariable) -> Result<V, ProgramError> {
         Ok(self
             .value()
             .dispatch_domain()
-            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self.value()))?
+            .bind(DimensionFromScalarOperation::new(output), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
     }
 }
@@ -393,12 +392,12 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
 
         assert_eq!(operation.name(), DIMENSION_FROM_SCALAR_OPERATION_NAME);
-        assert_eq!(operation.result_type(), &DimensionType::from(variable.clone()));
+        assert_eq!(operation.output_type(), &DimensionType::from(variable.clone()));
         assert_eq!(operation.to_string(), "dimension_from_scalar [bounds=[0, 9)]");
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_type), &[]),
-            Ok(vec![operation.result_type().clone().into()]),
+            Ok(vec![operation.output_type().clone().into()]),
         );
         for data_type in [
             DataType::I8,
@@ -412,7 +411,7 @@ mod tests {
         ] {
             assert_eq!(
                 operation.infer_output_types(&[ArrayType::scalar(data_type).into()], &[]),
-                Ok(vec![operation.result_type().clone().into()]),
+                Ok(vec![operation.output_type().clone().into()]),
             );
         }
         assert_eq!(
@@ -429,7 +428,7 @@ mod tests {
             Err(TypeError::invalid("`dimension_from_scalar` input must be a rank-0 integer array but has type f32[]",)),
         );
         assert_eq!(
-            operation.infer_output_types(&[operation.result_type().clone().into()], &[]),
+            operation.infer_output_types(&[operation.output_type().clone().into()], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         assert_eq!(operation.infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
@@ -445,8 +444,8 @@ mod tests {
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(variable.clone(), renamed_variable.clone()).unwrap();
         let renamed_operation = operation.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed_operation.result_type().variable(), &renamed_variable);
-        assert_eq!(renamed_operation.result_type().bounds(), bounds);
+        assert_eq!(renamed_operation.output_type().variable(), &renamed_variable);
+        assert_eq!(renamed_operation.output_type().bounds(), bounds);
 
         // Every integer element type uses the same checked conversion contract.
         for array in [
@@ -499,13 +498,13 @@ mod tests {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(
             context.bind(operation.clone(), Vec::new(), &[ArrayIrValue::Array(Array::scalar(7_i32).unwrap())],),
-            Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)]),
+            Ok(vec![ArrayIrValue::Dimension(DimensionValue::new(operation.output_type().clone(), 7).unwrap(),)]),
         );
         assert_eq!(
             context.bind(
                 operation.clone(),
                 Vec::new(),
-                &[ArrayIrValue::Dimension(DimensionValue::new(operation.result_type().clone(), 7).unwrap(),)],
+                &[ArrayIrValue::Dimension(DimensionValue::new(operation.output_type().clone(), 7).unwrap(),)],
             ),
             Err(TypeError::invalid("expected array type but got dimension type").into()),
         );
@@ -519,7 +518,7 @@ mod tests {
                     ],
                     outputs = [
                         (@known, ArrayIrValue::Dimension(
-                            DimensionValue::new(operation.result_type().clone(), 7).unwrap()
+                            DimensionValue::new(operation.output_type().clone(), 7).unwrap()
                         )),
                     ],
                     residual_instructions = 0,
@@ -533,7 +532,7 @@ mod tests {
                     ],
                     outputs = [
                         (@residual, ArrayIrValue::Dimension(
-                            DimensionValue::new(operation.result_type().clone(), 7).unwrap()
+                            DimensionValue::new(operation.output_type().clone(), 7).unwrap()
                         )),
                     ],
                     residual_instructions = 1,
@@ -586,9 +585,9 @@ mod tests {
         let ArrayIrOperation::DimensionFromScalar(relocated_operation) = relocated_instruction.operation() else {
             panic!("expected a relocated dimension-from-scalar operation");
         };
-        assert_ne!(relocated_operation.result_type().variable(), &variable);
-        assert_eq!(relocated_operation.result_type().variable().name(), variable.name());
-        assert_eq!(relocated_operation.result_type().bounds(), bounds);
+        assert_ne!(relocated_operation.output_type().variable(), &variable);
+        assert_eq!(relocated_operation.output_type().variable().name(), variable.name());
+        assert_eq!(relocated_operation.output_type().bounds(), bounds);
 
         // The relocated identity is nominally fresh but alpha-equivalent, so the relocated program renders exactly
         // like its source.
@@ -712,7 +711,7 @@ mod tests {
     #[test]
     fn test_dimension_from_scalar_extent_controls_multiple_bounded_outputs() {
         // A data-dependent extent is an ordinary SSA value with one definition. Two sibling shape-carrying
-        // constructors consume that one gateway result as an explicit operand instead of each recovering an extent of
+        // constructors consume that one gateway output as an explicit operand instead of each recovering an extent of
         // its own, so both outputs are governed by a single identity and a single bounds assertion.
         let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(9)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

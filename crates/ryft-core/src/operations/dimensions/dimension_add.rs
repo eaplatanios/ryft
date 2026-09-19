@@ -23,7 +23,7 @@ define_dimension_arithmetic_operation!(
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
         let lower = left_lower.checked_add(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while deriving `{DIMENSION_ADD_OPERATION_NAME}` result bounds \
+                "dimension arithmetic overflow while deriving `{DIMENSION_ADD_OPERATION_NAME}` output bounds \
                  with operands `{left}` and `{right}`",
             ),
         })?;
@@ -32,7 +32,7 @@ define_dimension_arithmetic_operation!(
         let requires_runtime_assertion = left.maximum_extent()
             .zip(right.maximum_extent())
             .and_then(|(left, right)| left.checked_add(right))
-            .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
+            .is_none_or(|output| output > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
     provider = AddOperation<DimensionType>,
@@ -49,7 +49,7 @@ impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
         let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
                 "dimension arithmetic overflow while adding dimensions with operands {}={}, {}={}",
@@ -59,7 +59,7 @@ impl Add for DimensionValue {
                 right.extent(),
             ),
         })?;
-        Ok(Self::new(result_type, extent)?)
+        Ok(Self::new(output_type, extent)?)
     }
 }
 
@@ -130,14 +130,14 @@ mod tests {
             EffectClasses::single(EffectClass::OrderedAssertion),
         );
 
-        // Specializing the input bounds recomputes this operation's result bounds.
+        // Specializing the input bounds recomputes this operation's output bounds.
         let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&declared_left, &declared_right).unwrap();
         let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
         let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
-        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
-        assert_eq!(result[0].extent(), Some(8));
+        let output = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(output[0].extent(), Some(8));
 
         assert_eq!(
             DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
@@ -151,10 +151,10 @@ mod tests {
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let left = builder.add_input(left_type.clone());
         let right = builder.add_input(right_type.clone());
-        let result = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
-                vec![result],
+                vec![output],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder],
             )
@@ -170,7 +170,7 @@ mod tests {
                 in (%2)"},
         );
 
-        // Relocating the program into a fresh region renames the internal result identity but renders identically.
+        // Relocating the program into a fresh region renames the internal output identity but renders identically.
         let mut relocated_builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let relocated_inputs =
             vec![relocated_builder.add_input(left_type.clone()), relocated_builder.add_input(right_type.clone())];
@@ -184,9 +184,9 @@ mod tests {
             .unwrap();
         assert_eq!(relocated.to_string(), program.to_string());
 
-        let result_type = program.output_types().remove(0);
-        assert_ne!(result_type.variable(), left_type.variable());
-        assert_ne!(result_type.variable(), right_type.variable());
+        let output_type = program.output_types().remove(0);
+        assert_ne!(output_type.variable(), left_type.variable());
+        assert_ne!(output_type.variable(), right_type.variable());
         let left = DimensionValue::new(left_type.clone(), 7).unwrap();
         let right = DimensionValue::new(right_type.clone(), 3).unwrap();
         assert_eq!(program.interpret(vec![left.clone(), right.clone()]).unwrap()[0].extent(), 10);
@@ -197,7 +197,7 @@ mod tests {
             panic!("expected the dimension addition to fold to a known value");
         };
         assert_eq!(output.extent(), 10);
-        assert_eq!(output.r#type().bounds(), result_type.bounds());
+        assert_eq!(output.r#type().bounds(), output_type.bounds());
 
         let (traced_type, traced_program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |left| {
