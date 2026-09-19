@@ -9,10 +9,10 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperationProvider, ReferenceNewOperationProvider};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, ReferenceMemberType, Type, Typed, Value};
+use crate::programs::{OperationProvider, ProgramError, ReferenceMemberType, Type, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
@@ -259,9 +259,15 @@ where
                            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
                            + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + ReferenceNewOperationProvider<C::Type>
-                           + ReferenceAddUpdateOperationProvider<C::Type>
-                           + From<AddOperation<C::Type>>,
+                           + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
         >,
     Input: Parameterized<
             C::Value,

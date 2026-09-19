@@ -8,27 +8,12 @@
 //!
 //! # Reference Operation Providers
 //!
-//! [`ReferenceNewOperationProvider`], [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`]
-//! select allocation, accumulation, and freezing operations over a universe's referent family
-//! ([`ReferenceMemberType::Referent`](crate::programs::ReferenceMemberType::Referent)). Each constructor receives
-//! the borrowed referent and returns the family's operation for it, so a family selects on the referent instead of
-//! on a request marker and input types. Selection
-//! is fallible because a family over a composite universe may provide no reference operations (e.g., a downstream
-//! value-only family over [`ArrayIrType`](crate::arrays::ArrayIrType)); such a family reports
-//! [`ProgramError::UnsupportedOperation`]. A universe whose referent family is [`NoReferent`](crate::NoReferent)
-//! implements the providers with `match *referent {}` bodies: no referent value exists, so the constructors are
-//! unreachable and reference-free universes need no runtime rejection.
-//!
-//! Each capability requires only the providers it uses. [`ReferenceAddUpdate`] needs only
-//! [`ReferenceAddUpdateOperationProvider`]. Reverse-mode transposition requires allocation and accumulation, while
-//! scalar gradient extraction additionally requires freezing to return the contents of its cotangent references.
-//!
-//! Implementors must ensure that the operation family's [`Operation::Type`] is `T`. The provider supertrait is a plain
-//! [`Operation`] rather than `Operation<Type = T>` because the current trait solver cannot discharge that projection
-//! equality at bound sites whose tracing context is built from the same operation family (E0284). For example,
-//! `C::Operation: ReferenceNewOperationProvider<C::Type>` would introduce a second source for the type equality that
-//! [`Domain`] already establishes. Context-based callers obtain the agreement from their context; other generic
-//! callers must require `Operation<Type = T>` explicitly.
+//! Reference allocation, accumulation, and freezing are selected through
+//! [`OperationProvider`](crate::OperationProvider) requests using their canonical operation payloads and ordered input
+//! types. The provider returns the operation family's selected payload, including downstream alternatives. Unsupported
+//! families and reference-free universes return [`ProgramError::UnsupportedOperation`]. Each capability requires only
+//! the requests it uses: reverse-mode transposition needs allocation and accumulation, while scalar gradient extraction
+//! also needs freezing.
 
 // TODO(eaplatanios): Review this module.
 
@@ -177,20 +162,12 @@ mod reference_read;
 mod reference_swap;
 mod reference_write;
 
-pub use reference_add_update::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAddUpdateOperationProvider,
-};
+pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation};
 pub use reference_atomic_add_update::{
     REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperationProvider,
 };
-pub use reference_freeze::{
-    REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider,
-};
-pub use reference_new::{
-    REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
-};
+pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
+pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};

@@ -99,9 +99,7 @@
 //! Scalar gradient functions return ordinary values at every active input position. An input of type `T` returns
 //! `cotangent(T)`; an input of type `ref<T>` returns `cotangent(T)`, the derivative with respect to its initial
 //! contents. The original parameter structure is preserved, so the value family must represent both references and
-//! their referents. [`ReferenceNewOperationProvider`] and [`ReferenceFreezeOperationProvider`] select the allocation
-//! and freeze operations over the universe's referent family, and [`ReferenceAddUpdateOperationProvider`] selects the
-//! accumulation operation.
+//! their referents.
 //!
 //! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
 //! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
@@ -159,8 +157,8 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperationProvider, ReferenceFreezeOperationProvider,
-    ReferenceNewOperationProvider, Zero, ZeroLikeOperation,
+    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
+    ZeroLikeOperation,
 };
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -914,9 +912,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -949,9 +953,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1054,9 +1064,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1120,9 +1136,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1178,9 +1200,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -1223,9 +1251,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -1254,6 +1288,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// # Parameters
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn jacobian_forward<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -1303,6 +1338,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// # Parameters
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn jacobian_reverse<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -1318,9 +1354,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1354,6 +1396,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// # Parameters
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn hessian<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -1373,9 +1416,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1549,9 +1598,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1583,9 +1638,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
         Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1676,9 +1737,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1735,9 +1802,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1806,9 +1879,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -1852,9 +1931,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         C: Context<Type = V::Type, Value = V>
             + ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = C::Operation,
+                > + OperationProvider<V::Type, OneOperation<V::Type>, Operation = C::Operation>
                                + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
         V: Value<Type: DifferentiableType + ReferenceMemberType>,
@@ -1885,6 +1970,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     /// # Parameters
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn jacobian_forward<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -1938,6 +2024,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     /// # Parameters
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn jacobian_reverse<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -1953,9 +2040,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,
@@ -1994,6 +2087,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     /// # Parameters
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
+    #[allow(clippy::type_complexity)]
     #[inline]
     pub fn hessian<C, V, Output, AuxiliaryOutput, F>(
         self,
@@ -2013,9 +2107,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>> + ReferenceMemberType,
         Input: Parameterized<V, To<V> = Input>,

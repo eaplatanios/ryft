@@ -21,10 +21,10 @@ use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, NoReferent, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
-    ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
-    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    EffectClasses, Effects, MaybeZero, NoReferent, Operation, OperationProvider, ProgramError, ProjectedValue,
+    ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType,
+    ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
 use super::{align_stored_batch, stored_tangents, validate_operand_types};
@@ -244,36 +244,54 @@ impl_differentiable_operation! {
     },
 }
 
-/// Selects the canonical atomic accumulation operation for the reference member of a type universe.
-/// Reference-free universes have no constructible referent and therefore cannot invoke this provider.
-pub trait ReferenceAtomicAddUpdateOperationProvider<T: ReferenceMemberType>: Operation + Sized {
-    /// Returns this family's operation that adds an update into a reference over `referent`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when this family provides no reference accumulation.
-    fn reference_atomic_add_update(referent: &T::Referent) -> Result<Self, ProgramError>;
-}
-
-// Composite array families select the canonical payload; the reference-free array and scalar universes have no
-// referent values, so their providers are unreachable by construction.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>>
-    ReferenceAtomicAddUpdateOperationProvider<ArrayIrType> for O
+    OperationProvider<ArrayIrType, ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>> for O
 {
-    fn reference_atomic_add_update(_referent: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(ReferenceAtomicAddUpdateOperation::new().into())
+    type Operation = Self;
+
+    fn provide(
+        request: ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        request.infer_output_types(&[input_types[0].clone(), input_types[1].clone()], &[])?;
+        Ok(request.into())
     }
 }
 
-impl<O: Operation<Type = ArrayType>> ReferenceAtomicAddUpdateOperationProvider<ArrayType> for O {
-    fn reference_atomic_add_update(referent: &NoReferent) -> Result<Self, ProgramError> {
-        match *referent {}
+impl<O: Operation<Type = ArrayType>>
+    OperationProvider<ArrayType, ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>,
+        input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+            ),
+        })
     }
 }
 
-impl<O: Operation<Type = DataType>> ReferenceAtomicAddUpdateOperationProvider<DataType> for O {
-    fn reference_atomic_add_update(referent: &NoReferent) -> Result<Self, ProgramError> {
-        match *referent {}
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicAddUpdateOperation<NoReferent, DataType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAtomicAddUpdateOperation<NoReferent, DataType>,
+        input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+            ),
+        })
     }
 }
 
@@ -325,14 +343,23 @@ where
 // value that is not a reference member of its universe has no referent and is rejected before any selection.
 impl<V: Value<Type: ReferenceMemberType>> ReferenceAtomicAddUpdate for V
 where
-    V::DispatchDomain: Context<Operation: ReferenceAtomicAddUpdateOperationProvider<V::Type>>,
+    V::DispatchDomain: Context<
+        Operation: OperationProvider<
+            V::Type,
+            ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = <V::DispatchDomain as Domain>::Operation,
+        >,
+    >,
 {
     fn atomic_add_update(&self, update: &Self) -> Result<(), ProgramError> {
         let reference_type = self.r#type();
-        let referent = reference_type
+        reference_type
             .referent()
             .ok_or_else(|| TypeError::invalid(format!("expected reference type but got `{reference_type}`")))?;
-        let operation = <V::DispatchDomain as Domain>::Operation::reference_atomic_add_update(referent)?;
+        let operation = <V::DispatchDomain as Domain>::Operation::provide(
+            ReferenceAtomicAddUpdateOperation::new(),
+            &[reference_type.as_ref(), update.r#type().as_ref()],
+        )?;
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
         Ok(())
     }
@@ -344,13 +371,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayReference, DimensionBounds, DimensionType,
-        DimensionValue,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation, ArrayReference, DimensionBounds,
+        DimensionType, DimensionValue,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::macros::check_operation_type_inference;
+    use crate::operations::math::add::AddOperation;
     use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;
@@ -373,7 +401,7 @@ mod tests {
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),
-            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::AtomicAccumulate }]
+            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::AtomicAccumulate }],
         );
         assert_eq!(operation.effects().reference_aliases(), &[]);
     }
@@ -408,7 +436,7 @@ mod tests {
             AtomicAddUpdate::new().interpret(
                 &TestContext::new(),
                 &EmptyRegionDriver,
-                &[reference.clone(), TestValue::Array(Array::scalar(3_i32).unwrap())]
+                &[reference.clone(), TestValue::Array(Array::scalar(3_i32).unwrap())],
             ),
             Ok(Vec::new()),
         );
@@ -645,6 +673,36 @@ mod tests {
             ]),
             Ok(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())])
         );
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_provider() {
+        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(
+            TestOperation::provide(AtomicAddUpdate::new(), &[&reference_type, &value_type]),
+            Ok(ArrayIrOperation::ReferenceAtomicAddUpdate(_)),
+        ));
+        assert!(matches!(
+            TestOperation::provide(AtomicAddUpdate::new(), &[]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        ));
+        assert!(matches!(
+            TestOperation::provide(AtomicAddUpdate::new(), &[&value_type, &value_type]),
+            Err(ProgramError::Type(_)),
+        ));
+        assert!(matches!(
+            AddOperation::<DataType>::provide(
+                ReferenceAtomicAddUpdateOperation::new(),
+                &[&DataType::F32, &DataType::F32],
+            ),
+            Err(ProgramError::UnsupportedOperation { .. }),
+        ));
+        let array_type = ArrayType::scalar(DataType::F32);
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(ReferenceAtomicAddUpdateOperation::new(), &[&array_type, &array_type]),
+            Err(ProgramError::UnsupportedOperation { .. }),
+        ));
     }
 
     #[test]

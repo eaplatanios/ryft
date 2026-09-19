@@ -15,7 +15,7 @@ use crate::differentiation::zeros::{
 };
 use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError};
 use crate::macros::check_count;
-use crate::operations::{AddOperation, ReferenceAddUpdateOperationProvider, ReferenceNewOperationProvider};
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
@@ -23,10 +23,10 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceBoundary, ReferenceIdentity,
-    ReferenceMemberType, ReferenceRoot, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
-    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider,
+    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceBoundary,
+    ReferenceIdentity, ReferenceMemberType, ReferenceRoot, Region, RegionDriver, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -463,9 +463,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         V::Type: DifferentiableType + ReferenceMemberType,
         O: TransposableOperation<V, O>
             + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceNewOperationProvider<V::Type>
-            + ReferenceAddUpdateOperationProvider<V::Type>
-            + From<AddOperation<V::Type>>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = O,
+            > + OperationProvider<
+                V::Type,
+                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = O,
+            > + From<AddOperation<V::Type>>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are

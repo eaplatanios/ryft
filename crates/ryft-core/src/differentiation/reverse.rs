@@ -18,8 +18,7 @@ use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationErr
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceAddUpdateOperationProvider, ReferenceFreezeOperationProvider,
-    ReferenceNewOperationProvider, Zero,
+    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
 };
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -282,12 +281,17 @@ impl<V: Typed> CotangentReferenceAccumulator<V> {
 impl<V: Value<Type: DifferentiableType + ReferenceMemberType>, O: Operation<Type = V::Type>>
     CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>
 where
-    O: ResidualZeroProvider<V::Type, Operation = O> + ReferenceNewOperationProvider<V::Type>,
+    O: ResidualZeroProvider<V::Type, Operation = O>
+        + OperationProvider<
+            V::Type,
+            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = O,
+        >,
 {
     /// Returns this [`CotangentReferenceAccumulator`]'s cotangent reference, allocating it with a zero initial value
     /// first if it has not been allocated yet. The zero referent is materialized through the operation family's
-    /// [`ResidualZeroProvider`] implementation and then allocated through its [`ReferenceNewOperationProvider`]
-    /// implementation, both in `context`.
+    /// [`ResidualZeroProvider`] implementation and then allocated through its [`OperationProvider`] implementation,
+    /// both in `context`.
     ///
     /// # Parameters
     ///
@@ -321,7 +325,11 @@ where
                     MaybeZero::Zero(V::Type::from(referent.clone())),
                     sources.iter(),
                 )?;
-                let mut references = context.bind(O::reference_new(referent)?, Vec::new(), &[zero])?;
+                let mut references = context.bind(
+                    O::provide(ReferenceNewOperation::new(), &[zero.r#type().as_ref()])?,
+                    Vec::new(),
+                    &[zero],
+                )?;
                 check_count!("output", references, 1, ProgramError);
                 *self = Self::Allocated { reference: references.remove(0) };
                 Ok(self.reference().unwrap())
@@ -488,9 +496,9 @@ enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
         /// Reference receiving the accumulated contributions.
         reference: Tracer<TracingContext<V, O>>,
 
-        /// Accumulation operation selected through [`ReferenceAddUpdateOperationProvider`]. Retaining it preserves
-        /// operation-family dispatch without adding reference-operation provider bounds to every transpose rule for
-        /// non-reference values.
+        /// Accumulation operation selected through [`OperationProvider`]. Retaining it preserves operation-family
+        /// dispatch without adding reference-operation provider bounds to every transpose rule for non-reference
+        /// values.
         operation: O,
     },
 }
@@ -770,7 +778,11 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         V::Type: DifferentiableType + ReferenceMemberType,
         O: ReferenceViewOperation
             + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceNewOperationProvider<V::Type>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = O,
+            >,
     {
         let (_, value, root) = self.reference_input(driver, input_index)?;
         let root_reference = {
@@ -974,7 +986,11 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         V::Type: DifferentiableType + ReferenceMemberType,
         O: ReferenceViewOperation
             + ResidualZeroProvider<V::Type, Operation = O>
-            + ReferenceNewOperationProvider<V::Type>,
+            + OperationProvider<
+                V::Type,
+                ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                Operation = O,
+            >,
     {
         if !accumulators.is_empty() {
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
@@ -1326,9 +1342,15 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
     {
         self.linear_program
             .transpose_with_trailing_residuals_shared(self.residuals.len(), destination_kinds)
@@ -1375,9 +1397,15 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
     {
         self.validate_reference_boundary()?;
         let program = self.transposed_program(&[])?;
@@ -1399,9 +1427,15 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
     {
         self.validate_reference_boundary()?;
         let seeds = cotangents.into_parameters().map(CotangentSeed::Value).collect::<Vec<_>>();
@@ -1466,9 +1500,15 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
         Input::Family: ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<C::Value>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
     {
@@ -1488,12 +1528,21 @@ impl<
         destinations: Vec<CotangentDestination<C::Value>>,
     ) -> Result<Input::To<C::Value>, ProgramError>
     where
-        C::Operation: ReferenceFreezeOperationProvider<C::Type>
-            + TransposableOperation<C::Constant, C::Operation>
+        C::Operation: OperationProvider<
+                C::Type,
+                ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
     {
         let cotangents = self.apply_impl(seeds, &destinations)?;
         let gradients = destinations
@@ -1502,12 +1551,12 @@ impl<
             .map(|(destination, cotangent)| match destination {
                 CotangentDestination::Reference(reference) => {
                     let reference_type = reference.r#type();
-                    let referent = reference_type.referent().ok_or_else(|| {
+                    reference_type.referent().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "gradient destination of type `{reference_type}` is not a reference type",
                         ))
                     })?;
-                    let freeze = C::Operation::reference_freeze(referent)?;
+                    let freeze = C::Operation::provide(ReferenceFreezeOperation::new(), &[reference_type.as_ref()])?;
                     let mut outputs = self.context.bind(freeze, Vec::new(), &[reference])?;
                     check_count!("output", outputs, 1, ProgramError);
                     Ok(outputs.remove(0))
@@ -1540,9 +1589,15 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceNewOperationProvider<C::Type>
-            + ReferenceAddUpdateOperationProvider<C::Type>
-            + From<AddOperation<C::Type>>,
+            + OperationProvider<
+                C::Type,
+                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
     {
         // Validate the seeds against the complete primal output boundary, including the leaves whose differential
         // spaces contain only zero. Only information-carrying values become program inputs because the compact program
@@ -1838,9 +1893,15 @@ impl<
     V: Value<Type: DifferentiableType + ReferenceMemberType>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<V::Type, Operation = O>
-        + ReferenceNewOperationProvider<V::Type>
-        + ReferenceAddUpdateOperationProvider<V::Type>
-        + From<AddOperation<V::Type>>,
+        + OperationProvider<
+            V::Type,
+            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = O,
+        > + OperationProvider<
+            V::Type,
+            ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = O,
+        > + From<AddOperation<V::Type>>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
 {
     #[inline]
@@ -2065,8 +2126,8 @@ impl<
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
-        + ReferenceNewOperationProvider<T>
-        + ReferenceAddUpdateOperationProvider<T>
+        + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
+        + OperationProvider<T, ReferenceAddUpdateOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
         + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
 {
@@ -2467,7 +2528,8 @@ impl<
                                 ),
                             })?;
                         let reference_type = T::from(ReferenceType::new(referent.clone()));
-                        let update = O::reference_add_update(referent)?;
+                        let update =
+                            O::provide(ReferenceAddUpdateOperation::new(), &[&reference_type, &cotangent_type])?;
                         let reference = context.input(reference_type);
                         let handle = &atom_accumulators[input.index()];
                         let slot = &mut context.cotangent_storage[handle.storage_index];
@@ -2880,8 +2942,8 @@ where
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
-        + ReferenceNewOperationProvider<T>
-        + ReferenceAddUpdateOperationProvider<T>
+        + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
+        + OperationProvider<T, ReferenceAddUpdateOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
         + From<AddOperation<T>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -3117,9 +3179,15 @@ pub trait ReverseModeDifferentiate:
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
-                       + ReferenceNewOperationProvider<Self::Type>
-                       + ReferenceAddUpdateOperationProvider<Self::Type>
-                       + From<AddOperation<Self::Type>>,
+                       + OperationProvider<
+            Self::Type,
+            ReferenceNewOperation<<Self::Type as ReferenceMemberType>::Referent, Self::Type>,
+            Operation = Self::Operation,
+        > + OperationProvider<
+            Self::Type,
+            ReferenceAddUpdateOperation<<Self::Type as ReferenceMemberType>::Referent, Self::Type>,
+            Operation = Self::Operation,
+        > + From<AddOperation<Self::Type>>,
     >
 {
     /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
@@ -3200,9 +3268,15 @@ impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseMo
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
-        + ReferenceNewOperationProvider<C::Type>
-        + ReferenceAddUpdateOperationProvider<C::Type>
-        + From<AddOperation<C::Type>>
+        + OperationProvider<
+            C::Type,
+            ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<
+            C::Type,
+            ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + From<AddOperation<C::Type>>
 {
 }
 
@@ -3222,9 +3296,15 @@ pub(crate) fn value_and_gradient_in_context<
     holomorphic: bool,
 ) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError>
 where
-    C::Operation: ReferenceNewOperationProvider<C::Type>
-        + ReferenceFreezeOperationProvider<C::Type>
-        + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    C::Operation: OperationProvider<
+            C::Type,
+            ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<
+            C::Type,
+            ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
 {
     let destinations = gradient_destinations(context, &primals)?;
     let (output, pullback) = context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
@@ -3255,9 +3335,15 @@ pub(crate) fn value_and_gradient_auxiliary_in_context<
     holomorphic: bool,
 ) -> Result<((C::Value, AuxiliaryOutput), Input::To<C::Value>), DifferentiationError>
 where
-    C::Operation: ReferenceNewOperationProvider<C::Type>
-        + ReferenceFreezeOperationProvider<C::Type>
-        + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
+    C::Operation: OperationProvider<
+            C::Type,
+            ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<
+            C::Type,
+            ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + OperationProvider<C::Type, OneOperation<C::Type>, Operation = C::Operation>,
     (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>): Parameterized<
             LinearizationTracer<C>,
             To<C::Value> = (C::Value, AuxiliaryOutput),
@@ -3644,7 +3730,11 @@ fn gradient_destinations<C: Context + Zero<C::Value>, Input: Parameterized<C::Va
 ) -> Result<Vec<CotangentDestination<C::Value>>, ProgramError>
 where
     C::Type: DifferentiableType + ReferenceMemberType,
-    C::Operation: ReferenceNewOperationProvider<C::Type> + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+    C::Operation: OperationProvider<
+            C::Type,
+            ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            Operation = C::Operation,
+        > + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     primals
         .parameters()
@@ -3661,7 +3751,11 @@ where
                 MaybeZero::Zero(C::Type::from(referent.clone())),
                 std::iter::once(primal),
             )?;
-            let mut outputs = context.bind(C::Operation::reference_new(referent)?, Vec::new(), &[zero])?;
+            let mut outputs = context.bind(
+                C::Operation::provide(ReferenceNewOperation::new(), &[zero.r#type().as_ref()])?,
+                Vec::new(),
+                &[zero],
+            )?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(CotangentDestination::Reference(outputs.remove(0)))
         })

@@ -31,8 +31,8 @@
 //! ([`ReferenceNewOperation`] and its siblings) are wrapped by the family and interpret eagerly through the value-level
 //! capabilities implemented on [`RegisterValue`], and their generic differentiation, transposition, and batching rules
 //! apply at the eager context and at the staged contexts that transforms instantiate. The family selects allocation,
-//! accumulation, and freezing operations through [`ReferenceNewOperationProvider`],
-//! [`ReferenceAddUpdateOperationProvider`], and [`ReferenceFreezeOperationProvider`] over its register referent family.
+//! accumulation, and freezing operations through [`ReferenceNewOperation`],
+//! [`ReferenceAddUpdateOperation`], and [`ReferenceFreezeOperation`] over its register referent family.
 //! Generic transposition can therefore allocate cotangent references and use [`ReferenceAddUpdate`] on core-owned
 //! tracers without a downstream tracer implementation. `register.add_update` retains family-owned addition semantics;
 //! the other reference primitives reuse their generic transform rules. The gradient convenience boundary also uses
@@ -61,14 +61,13 @@ use ryft_core::{
     OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
     PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
     ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
-    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge,
+    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
     ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceFreezeOperationProvider, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
-    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
+    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId,
+    ReferenceMemberType, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
     RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, Trace,
     Tracer, TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
@@ -585,20 +584,40 @@ impl From<ReferenceFreezeOperation<RegisterType, RegisterIrType>> for RegisterOp
     }
 }
 
-impl ReferenceNewOperationProvider<RegisterIrType> for RegisterOperation {
-    fn reference_new(_referent: &RegisterType) -> Result<Self, ProgramError> {
+impl OperationProvider<RegisterIrType, ReferenceNewOperation<RegisterType, RegisterIrType>> for RegisterOperation {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<RegisterType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
         Ok(Self::ReferenceNew(ReferenceNewOperation::new()))
     }
 }
 
-impl ReferenceFreezeOperationProvider<RegisterIrType> for RegisterOperation {
-    fn reference_freeze(_referent: &RegisterType) -> Result<Self, ProgramError> {
+impl OperationProvider<RegisterIrType, ReferenceFreezeOperation<RegisterType, RegisterIrType>> for RegisterOperation {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<RegisterType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
         Ok(Self::Freeze(ReferenceFreezeOperation::new()))
     }
 }
 
-impl ReferenceAddUpdateOperationProvider<RegisterIrType> for RegisterOperation {
-    fn reference_add_update(_referent: &RegisterType) -> Result<Self, ProgramError> {
+impl OperationProvider<RegisterIrType, ReferenceAddUpdateOperation<RegisterType, RegisterIrType>>
+    for RegisterOperation
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<RegisterType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
         Ok(Self::AddUpdate)
     }
 }
@@ -2587,24 +2606,42 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
 
     // The family converts from no reference payload, so the array-IR blankets do not apply and it states its own
     // answer for the array referent family.
-    impl ReferenceNewOperationProvider<ArrayIrType> for ValueOnlyOperation {
-        fn reference_new(_referent: &ArrayType) -> Result<Self, ProgramError> {
+    impl OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+        type Operation = Self;
+
+        fn provide(
+            _request: ReferenceNewOperation<ArrayType, ArrayIrType>,
+            input_types: &[&ArrayIrType],
+        ) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
             Err(ProgramError::UnsupportedOperation {
                 message: "this operation family does not support reference allocation".to_string(),
             })
         }
     }
 
-    impl ReferenceAddUpdateOperationProvider<ArrayIrType> for ValueOnlyOperation {
-        fn reference_add_update(_referent: &ArrayType) -> Result<Self, ProgramError> {
+    impl OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+        type Operation = Self;
+
+        fn provide(
+            _request: ReferenceAddUpdateOperation<ArrayType, ArrayIrType>,
+            input_types: &[&ArrayIrType],
+        ) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 2, ProgramError);
             Err(ProgramError::UnsupportedOperation {
                 message: "this operation family does not support reference accumulation".to_string(),
             })
         }
     }
 
-    impl ReferenceFreezeOperationProvider<ArrayIrType> for ValueOnlyOperation {
-        fn reference_freeze(_referent: &ArrayType) -> Result<Self, ProgramError> {
+    impl OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+        type Operation = Self;
+
+        fn provide(
+            _request: ReferenceFreezeOperation<ArrayType, ArrayIrType>,
+            input_types: &[&ArrayIrType],
+        ) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
             Err(ProgramError::UnsupportedOperation {
                 message: "this operation family does not support reference freezing".to_string(),
             })
@@ -2628,17 +2665,17 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
 
     // Unsupported constructors are fallible; ordinary gradients do not call them for value-only inputs.
     assert!(matches!(
-        ValueOnlyOperation::reference_new(&ArrayType::scalar(DataType::F32)),
+        ValueOnlyOperation::provide(ReferenceNewOperation::new(), &[&ArrayIrType::Array(ArrayType::scalar(DataType::F32))]),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference allocation",
     ));
     assert!(matches!(
-        ValueOnlyOperation::reference_add_update(&ArrayType::scalar(DataType::F32)),
+        ValueOnlyOperation::provide(ReferenceAddUpdateOperation::new(), &[&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))), &ArrayIrType::Array(ArrayType::scalar(DataType::F32))]),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference accumulation",
     ));
     assert!(matches!(
-        ValueOnlyOperation::reference_freeze(&ArrayType::scalar(DataType::F32)),
+        ValueOnlyOperation::provide(ReferenceFreezeOperation::new(), &[&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))]),
         Err(ProgramError::UnsupportedOperation { message, .. })
             if message == "this operation family does not support reference freezing",
     ));

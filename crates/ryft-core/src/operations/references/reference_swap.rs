@@ -18,15 +18,16 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::zero::Zero;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
+use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType, ReferenceViewOperation,
     RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
-use super::{ReferenceNewOperationProvider, align_stored_batch, stored_tangents, validate_operand_types};
+use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
@@ -232,7 +233,7 @@ impl_differentiable_operation! {
         V: Value<Type = U>,
         O: ReferenceViewOperation<Type = U>
             + ResidualZeroProvider<U, Operation = O>
-            + ReferenceNewOperationProvider<U>
+            + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>
             + From<ReferenceSwapOperation<T, U>>,
     {
         |operation, context, driver, inputs, outputs, accumulators| {
