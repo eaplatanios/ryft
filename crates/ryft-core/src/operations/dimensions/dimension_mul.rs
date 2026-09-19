@@ -60,6 +60,7 @@ mod tests {
 
     use crate::arrays::{DimensionBounds, DimensionValue};
     use crate::operations::math::mul::Mul;
+    use crate::programs::{EffectClass, EffectClasses};
 
     use super::*;
 
@@ -70,6 +71,22 @@ mod tests {
         let operation = DimensionMulOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MUL_OPERATION_NAME);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(2, Some(33)).unwrap());
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
+        assert_eq!(
+            DimensionMulOperation::new(&unbounded, &right).unwrap().effects().classes(),
+            EffectClasses::single(EffectClass::OrderedAssertion),
+        );
+
+        // Specializing the input bounds recomputes this operation's result bounds.
+        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = DimensionMulOperation::new(&declared_left, &declared_right).unwrap();
+        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
+        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
+        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(result[0].extent(), Some(12));
+
         assert_eq!(
             DimensionValue::constant(7).unwrap().mul(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             21,

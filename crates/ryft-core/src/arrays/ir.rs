@@ -303,6 +303,10 @@ mod tests {
             <ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
+        assert!(matches!(
+            ValueProjection::<DimensionType>::into_projected(stored.clone()),
+            Err(TypeError::Invalid { message }) if message == "expected dimension type but got array type",
+        ));
         assert_eq!(
             <ArrayIrValue<Array> as ValueProjection<ReferenceType<ArrayType>>>::projected(&stored),
             Err(TypeError::invalid("expected reference type but got array type")),
@@ -316,6 +320,7 @@ mod tests {
         let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
         let dimension = DimensionValue::new(DimensionType::from(variable), 4).unwrap();
         let stored = ArrayIrValue::<Array>::Dimension(dimension.clone());
+        assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(dimension.clone()), stored);
         assert_eq!(<ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(&stored), Ok(&dimension));
         assert_eq!(
             <ArrayIrValue<Array> as ValueProjection<ArrayType>>::projected(&stored),

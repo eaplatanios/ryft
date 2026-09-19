@@ -62,6 +62,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::programs::{EffectClass, EffectClasses};
 
     use super::*;
 
@@ -72,6 +73,22 @@ mod tests {
         let operation = DimensionRemOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_REM_OPERATION_NAME);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(4)).unwrap());
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+        let maybe_zero = DimensionType::new("maybe_zero", DimensionBounds::new(0, Some(5)).unwrap());
+        assert_eq!(
+            DimensionRemOperation::new(&left, &maybe_zero).unwrap().effects().classes(),
+            EffectClasses::single(EffectClass::OrderedAssertion),
+        );
+
+        // Specializing the input bounds recomputes this operation's result bounds.
+        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = DimensionRemOperation::new(&declared_left, &declared_right).unwrap();
+        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
+        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
+        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(result[0].extent(), Some(0));
+
         assert_eq!(
             DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             1,

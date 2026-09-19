@@ -1,15 +1,11 @@
-//! First-class dimension SSA operations.
-//!
-//! These operations compute and validate runtime extents used by shape-carrying array operations. They are ordinary
-//! program operations over [`DimensionType`], not integer array operations and not a parallel symbolic-expression
-//! language.
+//! Operations and value capabilities for [`DimensionType`] values. These operations compute array extents, infer their
+//! [`DimensionBounds`], and validate runtime shape requirements. Dimension values are ordinary program inputs and
+//! outputs, so shape computations can be traced and transformed.
 
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::{Operation, Type, TypeError, TypeIdentityRenaming};
-
-// TODO(eaplatanios): Review this module.
 
 pub mod dimension_add;
 pub mod dimension_div;
@@ -176,197 +172,71 @@ impl ArithmeticDimensionOperationMetadata {
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
-
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, DimensionValue};
-    use crate::contexts::EagerContext;
-    use crate::operations::math::add::Add;
-    use crate::operations::math::div::Div;
-    use crate::operations::math::mul::Mul;
-    use crate::operations::math::rem::Rem;
-    use crate::operations::math::sub::Sub;
-    use crate::programs::{EffectClass, EffectClasses, Operation, TypeError, TypeIdentityRenaming, ValueProjection};
-    use crate::tracing::Trace;
 
     use super::*;
 
     #[test]
-    fn test_arithmetic_dimension_operation() {
+    fn test_arithmetic_dimension_operation_infer_output_types() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
-        let result = Operation::infer_output_types(&operation, &[left.clone(), right.clone()], &[]).unwrap();
+        let result =
+            ArithmeticDimensionOperation::infer_output_types(&operation, &[left.clone(), right.clone()]).unwrap();
         assert_eq!(result[0].bounds(), operation.output_bounds());
         assert_ne!(result[0].variable(), left.variable());
         assert_ne!(result[0].variable(), right.variable());
 
-        // All arithmetic formulas use the actual input bounds when a retained operation is specialized. Results
-        // remain fresh definitions, and conservative assertion effects are preserved on the retained operation.
-        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
-        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
-        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
-        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
-        macro_rules! check_refinement {
-            // Check each concrete arithmetic operation with the same declarations and exact input refinements.
-            ($operation:ident, $extent:literal) => {{
-                let operation = $operation::new(&declared_left, &declared_right).unwrap();
-                let inputs = [exact_left.clone(), exact_right.clone()];
-                let result = Operation::infer_output_types(&operation, &inputs, &[]).unwrap();
-                let repeated = Operation::infer_output_types(&operation, &inputs, &[]).unwrap();
-                assert_eq!(result[0].extent(), Some($extent));
-                assert_ne!(result[0].variable(), repeated[0].variable());
-            }};
-        }
-        check_refinement!(DimensionAddOperation, 8);
-        check_refinement!(DimensionSubOperation, 4);
-        check_refinement!(DimensionSaturatingSubOperation, 4);
-        check_refinement!(DimensionMulOperation, 12);
-        check_refinement!(DimensionPowOperation, 36);
-        check_refinement!(DimensionDivOperation, 3);
-        check_refinement!(DimensionRemOperation, 0);
-        check_refinement!(DimensionMinOperation, 2);
-        check_refinement!(DimensionMaxOperation, 6);
+        // Actual input types refine the output bounds, and every inference creates a fresh result identity.
+        let inputs = [
+            DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap()),
+            DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap()),
+        ];
+        let result = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
+        let repeated = ArithmeticDimensionOperation::infer_output_types(&operation, &inputs).unwrap();
+        assert_eq!(result[0].extent(), Some(8));
+        assert_ne!(result[0].variable(), repeated[0].variable());
 
-        let checked_subtraction = DimensionSubOperation::new(&declared_left, &declared_right).unwrap();
-        let result = Operation::infer_output_types(&checked_subtraction, &[exact_left, exact_right], &[]).unwrap();
-        assert_eq!(result[0].extent(), Some(4));
-        assert_eq!(checked_subtraction.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion),);
-
+        assert_eq!(
+            ArithmeticDimensionOperation::infer_output_types(&operation, std::slice::from_ref(&left)),
+            Err(TypeError::invalid("expected 2 inputs but got 1")),
+        );
         let unexpected = DimensionType::new("unexpected", DimensionBounds::new(0, Some(6)).unwrap());
         assert_eq!(
-            Operation::infer_output_types(&operation, &[unexpected.clone(), right.clone()], &[]),
+            ArithmeticDimensionOperation::infer_output_types(&operation, &[unexpected.clone(), right.clone()]),
             Err(TypeError::invalid(format!(
                 "`dimension_add` input 0 has type {unexpected} but the operation was constructed for type {left}",
             ))),
         );
+        assert_eq!(
+            ArithmeticDimensionOperation::infer_output_types(&operation, &[left, unexpected.clone()]),
+            Err(TypeError::invalid(format!(
+                "`dimension_add` input 1 has type {unexpected} but the operation was constructed for type {right}",
+            ))),
+        );
+    }
 
-        let renamed_left = DimensionType::new("renamed_left", DimensionBounds::new(2, Some(9)).unwrap());
-        let renamed_right = DimensionType::new("renamed_right", DimensionBounds::new(1, Some(5)).unwrap());
+    #[test]
+    fn test_arithmetic_dimension_operation_metadata_rename_type_identities() {
+        let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let metadata = ArithmeticDimensionOperationMetadata::new(
+            &left,
+            &right,
+            "sum".to_string(),
+            DimensionBounds::new(3, Some(13)).unwrap(),
+            true,
+        );
+        let renamed_left = DimensionType::new("renamed_left", left.bounds());
+        let renamed_right = DimensionType::new("renamed_right", right.bounds());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(left.variable().clone(), renamed_left.variable().clone()).unwrap();
         renaming.insert(right.variable().clone(), renamed_right.variable().clone()).unwrap();
-        let renamed = operation.rename_type_identities(&renaming).unwrap();
+        let renamed = metadata.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
-    }
-
-    #[test]
-    fn test_arithmetic_dimension_operation_effects() {
-        let bounded_left = DimensionType::new("bounded_left", DimensionBounds::new(2, Some(9)).unwrap());
-        let bounded_right = DimensionType::new("bounded_right", DimensionBounds::new(1, Some(5)).unwrap());
-        let safe_subtrahend = DimensionType::new("safe_subtrahend", DimensionBounds::new(1, Some(4)).unwrap());
-        let safe_minuend = DimensionType::new("safe_minuend", DimensionBounds::new(5, Some(9)).unwrap());
-        let maybe_zero = DimensionType::new("maybe_zero", DimensionBounds::new(0, Some(5)).unwrap());
-        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
-        let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
-
-        // Arithmetic is pure exactly when input bounds prove that its checked eager operation is total.
-        assert_eq!(
-            DimensionAddOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionAddOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionSubOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionSaturatingSubOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(
-            DimensionMulOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionMulOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionPowOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionDivOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionDivOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(DimensionRemOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
-        assert_eq!(
-            DimensionMinOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-        assert_eq!(
-            DimensionMaxOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE,
-        );
-    }
-
-    #[test]
-    fn test_composite_dimension_arithmetic() {
-        let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(6).unwrap());
-        let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(4).unwrap());
-        let two = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
-        let left = ValueProjection::<DimensionType>::into_projected(left).unwrap();
-        let right = ValueProjection::<DimensionType>::into_projected(right).unwrap();
-        let two = ValueProjection::<DimensionType>::into_projected(two).unwrap();
-        assert_eq!(left.add(&right).unwrap().extent(), 10);
-        assert_eq!(left.sub(&right).unwrap().extent(), 2);
-        assert_eq!(right.dimension_saturating_sub(&left).unwrap().extent(), 0);
-        assert_eq!(left.mul(&right).unwrap().extent(), 24);
-        assert_eq!(left.dimension_pow(&two).unwrap().extent(), 36);
-        assert_eq!(left.div(&right).unwrap().extent(), 1);
-        assert_eq!(left.rem(&right).unwrap().extent(), 2);
-        assert_eq!(left.dimension_min(&right).unwrap().extent(), 4);
-        assert_eq!(left.dimension_max(&right).unwrap().extent(), 6);
-        let result = <ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(left.add(&right).unwrap());
-        assert!(matches!(result, ArrayIrValue::Dimension(value) if value.extent() == 10));
-
-        // An array member is rejected before dimension arithmetic can be invoked.
-        assert!(matches!(
-            ValueProjection::<DimensionType>::into_projected(ArrayIrValue::Array(Array::scalar(2.0_f64).unwrap())),
-            Err(TypeError::Invalid { message }) if message == "expected dimension type but got array type",
-        ));
-    }
-
-    #[test]
-    fn test_composite_dimension_arithmetic_stages_ordinary_dimension_inputs() {
-        let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
-        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
-        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(rows, columns)| {
-                let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
-                let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
-                let padded = rows.mul(&columns)?.add(&columns)?;
-                let trimmed = padded.dimension_saturating_sub(&rows)?;
-                Ok((
-                    trimmed.div(&columns)?.into_value(),
-                    trimmed.rem(&columns)?.into_value(),
-                    rows.dimension_pow(&columns)?.into_value(),
-                    rows.dimension_max(&columns)?.sub(&rows.dimension_min(&columns)?)?.into_value(),
-                ))
-            },
-            (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),
-        )
-        .unwrap();
-        assert_eq!(output_type.0.to_string(), "dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)>",);
-        let expected = indoc! {"
-            lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
-            let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
-                %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
-                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = dimension_saturating_sub %3 %0
-                %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
-                %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
-                %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
-                %8:dimension<max(rows, columns) ∈ [5, 9)> = dimension_max %0 %1
-                %9:dimension<min(rows, columns) ∈ [1, 5)> = dimension_min %0 %1
-                %10:dimension<max(rows, columns) - min(rows, columns) ∈ [1, 8)> = dimension_sub %8 %9
-            in (%5, %6, %7, %10)
-        "};
-        assert_eq!(program.to_string(), expected.trim_end());
+        assert_eq!(renamed.output_name(), metadata.output_name());
+        assert_eq!(renamed.output_bounds(), metadata.output_bounds());
+        assert_eq!(renamed.requires_runtime_assertion(), metadata.requires_runtime_assertion());
     }
 }

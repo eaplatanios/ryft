@@ -59,6 +59,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::programs::{EffectClass, EffectClasses};
 
     use super::*;
 
@@ -68,10 +69,29 @@ mod tests {
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionSubOperation::new(&left, &right).unwrap();
 
-        // These operand bounds admit an underflow, so the rendering carries the runtime-assertion classification
+        // These input bounds admit an underflow, so the rendering carries the runtime-assertion classification
         // that makes this instruction effectful.
         assert_eq!(operation.to_string(), format!("{DIMENSION_SUB_OPERATION_NAME} [requires_runtime_assertion=true]"));
         assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let safe_minuend = DimensionType::new("safe_minuend", DimensionBounds::new(5, Some(9)).unwrap());
+        let safe_subtrahend = DimensionType::new("safe_subtrahend", DimensionBounds::new(1, Some(4)).unwrap());
+        assert_eq!(
+            DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects().classes(),
+            EffectClasses::NONE,
+        );
+
+        // Specializing the input bounds recomputes this operation's result bounds.
+        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = DimensionSubOperation::new(&declared_left, &declared_right).unwrap();
+        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
+        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
+        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(result[0].extent(), Some(4));
+        // Refinement retains the original conservative assertion effect.
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+
         assert_eq!(
             DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             4,

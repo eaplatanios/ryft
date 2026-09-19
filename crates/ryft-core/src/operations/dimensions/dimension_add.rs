@@ -63,7 +63,7 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{ProgramBuilder, Typed};
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, Typed};
     use crate::tracing::Trace;
 
     use super::*;
@@ -77,6 +77,23 @@ mod tests {
         assert_eq!(operation.left_type(), &left);
         assert_eq!(operation.right_type(), &right);
         assert_eq!(operation.output_bounds(), DimensionBounds::new(3, Some(13)).unwrap());
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
+
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
+        assert_eq!(
+            DimensionAddOperation::new(&unbounded, &right).unwrap().effects().classes(),
+            EffectClasses::single(EffectClass::OrderedAssertion),
+        );
+
+        // Specializing the input bounds recomputes this operation's result bounds.
+        let declared_left = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let declared_right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = DimensionAddOperation::new(&declared_left, &declared_right).unwrap();
+        let exact_left = DimensionType::new("left", DimensionBounds::new(6, Some(7)).unwrap());
+        let exact_right = DimensionType::new("right", DimensionBounds::new(2, Some(3)).unwrap());
+        let result = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
+        assert_eq!(result[0].extent(), Some(8));
+
         assert_eq!(
             DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             10,

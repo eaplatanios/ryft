@@ -224,13 +224,52 @@ impl DimensionSize<usize> for Array {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::types::dimensions::{DimensionBounds, DimensionError};
     use crate::contexts::EagerContext;
+    use crate::operations::{DimensionMax, DimensionMin, DimensionPow, DimensionSaturatingSub};
     use crate::tracing::Trace;
 
     use super::*;
+
+    #[test]
+    fn test_dimension_tracer_projection() {
+        let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
+        let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
+        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(rows, columns)| {
+                let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
+                let columns = ValueProjection::<DimensionType>::into_projected(columns)?;
+                let padded = rows.mul(&columns)?.add(&columns)?;
+                let trimmed = padded.dimension_saturating_sub(&rows)?;
+                Ok((
+                    trimmed.div(&columns)?.into_value(),
+                    trimmed.rem(&columns)?.into_value(),
+                    rows.dimension_pow(&columns)?.into_value(),
+                    rows.dimension_max(&columns)?.sub(&rows.dimension_min(&columns)?)?.into_value(),
+                ))
+            },
+            (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),
+        )
+        .unwrap();
+        assert_eq!(output_type.0.to_string(), "dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)>",);
+        let expected = indoc! {"
+            lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
+            let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
+                %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
+                %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = dimension_saturating_sub %3 %0
+                %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
+                %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
+                %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
+                %8:dimension<max(rows, columns) ∈ [5, 9)> = dimension_max %0 %1
+                %9:dimension<min(rows, columns) ∈ [1, 5)> = dimension_min %0 %1
+                %10:dimension<max(rows, columns) - min(rows, columns) ∈ [1, 8)> = dimension_sub %8 %9
+            in (%5, %6, %7, %10)
+        "};
+        assert_eq!(program.to_string(), expected.trim_end());
+    }
 
     #[test]
     fn test_dimension_value_operators() {
