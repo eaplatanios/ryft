@@ -13,7 +13,7 @@ use crate::programs::{Operation, ProgramError, Type, TypeError, TypeIdentityRena
 // TODO(eaplatanios): Review this module.
 
 pub mod dimension_add;
-pub mod dimension_div_floor;
+pub mod dimension_div;
 pub mod dimension_from_scalar;
 pub mod dimension_max;
 pub mod dimension_min;
@@ -27,7 +27,7 @@ pub mod dimension_sub;
 pub mod dimension_to_scalar;
 
 pub use dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
-pub use dimension_div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloorOperation};
+pub use dimension_div::{DIMENSION_DIV_OPERATION_NAME, DimensionDivOperation};
 pub use dimension_from_scalar::{
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DimensionFromScalar, DimensionFromScalarOperation,
 };
@@ -165,8 +165,8 @@ define_dimension_arithmetic!(
     dimension_mul => DimensionMulOperation,
     /// Returns `self.pow(right)`.
     dimension_pow => DimensionPowOperation,
-    /// Returns `self / right` rounded towards zero, which requires that `right` be positive at run time.
-    dimension_div_floor => DimensionDivFloorOperation,
+    /// Returns the nonnegative integer quotient `self / right`, rounded down. A zero divisor returns an error.
+    dimension_div => DimensionDivOperation,
     /// Returns `self % right`, which requires that `right` be positive at run time.
     dimension_rem => DimensionRemOperation,
     /// Returns `min(self, right)`.
@@ -251,17 +251,6 @@ impl ArithmeticDimensionOperationMetadata {
     }
 }
 
-/// Returns the smallest positive divisor admitted by `divisor`, rejecting an exact-zero divisor.
-pub(crate) fn positive_divisor_lower_bound(divisor: &DimensionType, maximum: usize) -> Result<usize, DimensionError> {
-    if maximum == 0 {
-        Err(DimensionError::RequirementViolation {
-            message: format!("{} > 0 is impossible from declared bounds", divisor.variable()),
-        })
-    } else {
-        Ok(divisor.bounds().lower().max(1))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -306,7 +295,7 @@ mod tests {
         check_refinement!(DimensionSaturatingSubOperation, 4);
         check_refinement!(DimensionMulOperation, 12);
         check_refinement!(DimensionPowOperation, 36);
-        check_refinement!(DimensionDivFloorOperation, 3);
+        check_refinement!(DimensionDivOperation, 3);
         check_refinement!(DimensionRemOperation, 0);
         check_refinement!(DimensionMinOperation, 2);
         check_refinement!(DimensionMaxOperation, 6);
@@ -370,10 +359,10 @@ mod tests {
         );
         assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
         assert_eq!(
-            DimensionDivFloorOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            DimensionDivOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
             EffectClasses::NONE
         );
-        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
+        assert_eq!(DimensionDivOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
             EffectClasses::NONE
@@ -405,7 +394,7 @@ mod tests {
         assert_eq!(extent(right.dimension_saturating_sub(&left).unwrap()), 0);
         assert_eq!(extent(left.dimension_mul(&right).unwrap()), 24);
         assert_eq!(extent(left.dimension_pow(&two).unwrap()), 36);
-        assert_eq!(extent(left.dimension_div_floor(&right).unwrap()), 1);
+        assert_eq!(extent(left.dimension_div(&right).unwrap()), 1);
         assert_eq!(extent(left.dimension_rem(&right).unwrap()), 2);
         assert_eq!(extent(left.dimension_min(&right).unwrap()), 4);
         assert_eq!(extent(left.dimension_max(&right).unwrap()), 6);
@@ -427,7 +416,7 @@ mod tests {
                 let padded = rows.dimension_mul(&columns)?.dimension_add(&columns)?;
                 let trimmed = padded.dimension_saturating_sub(&rows)?;
                 Ok((
-                    trimmed.dimension_div_floor(&columns)?,
+                    trimmed.dimension_div(&columns)?,
                     trimmed.dimension_rem(&columns)?,
                     rows.dimension_pow(&columns)?,
                     rows.dimension_max(&columns)?.dimension_sub(&rows.dimension_min(&columns)?)?,
@@ -436,16 +425,13 @@ mod tests {
             (ArrayIrType::Dimension(rows), ArrayIrType::Dimension(columns)),
         )
         .unwrap();
-        assert_eq!(
-            output_type.0.to_string(),
-            "dimension<max(0, rows * columns + columns - rows) // columns ∈ [0, 32)>",
-        );
+        assert_eq!(output_type.0.to_string(), "dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)>",);
         let expected = indoc! {"
             lambda %0:dimension<rows ∈ [5, 9)>, %1:dimension<columns ∈ [1, 5)> .
             let %2:dimension<rows * columns ∈ [5, 33)> = dimension_mul %0 %1
                 %3:dimension<rows * columns + columns ∈ [6, 37)> = dimension_add %2 %1
                 %4:dimension<max(0, rows * columns + columns - rows) ∈ [0, 32)> = dimension_saturating_sub %3 %0
-                %5:dimension<max(0, rows * columns + columns - rows) // columns ∈ [0, 32)> = dimension_div_floor %4 %1
+                %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
                 %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
                 %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
                 %8:dimension<max(rows, columns) ∈ [5, 9)> = dimension_max %0 %1

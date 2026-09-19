@@ -745,7 +745,7 @@ fn dimension(operation: &DimensionOperation<DimensionValue>, inputs: &[String]) 
         DimensionOperation::Add(_) => format!("({} + {})", inputs[0], inputs[1]),
         DimensionOperation::Sub(_) => format!("({} - {})", inputs[0], inputs[1]),
         DimensionOperation::Mul(_) => format!("({} * {})", inputs[0], inputs[1]),
-        DimensionOperation::DivFloor(_) => format!("({} // {})", inputs[0], inputs[1]),
+        DimensionOperation::Div(_) => format!("({} // {})", inputs[0], inputs[1]),
         DimensionOperation::Rem(_) => format!("({} % {})", inputs[0], inputs[1]),
         DimensionOperation::Min(_) => format!("ct.minimum({}, {})", inputs[0], inputs[1]),
         DimensionOperation::Max(_) => format!("ct.maximum({}, {})", inputs[0], inputs[1]),

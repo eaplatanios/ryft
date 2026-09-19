@@ -65,7 +65,7 @@ pub(crate) const ASSERT_MUL_KIND: &str = "mul";
 pub(crate) const ASSERT_POW_KIND: &str = "pow";
 
 /// Formatting kind used for a nonzero floor-division divisor.
-pub(crate) const ASSERT_DIV_FLOOR_KIND: &str = "div_floor";
+pub(crate) const ASSERT_DIV_KIND: &str = "div";
 
 /// Formatting kind used for a nonzero remainder divisor.
 pub(crate) const ASSERT_REM_KIND: &str = "rem";
@@ -332,7 +332,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
 
     let arithmetic = matches!(
         kind,
-        ASSERT_ADD_KIND | ASSERT_SUB_KIND | ASSERT_MUL_KIND | ASSERT_POW_KIND | ASSERT_DIV_FLOOR_KIND | ASSERT_REM_KIND
+        ASSERT_ADD_KIND | ASSERT_SUB_KIND | ASSERT_MUL_KIND | ASSERT_POW_KIND | ASSERT_DIV_KIND | ASSERT_REM_KIND
     );
     if arithmetic {
         if buffers.len() != 3 {
@@ -416,7 +416,7 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
         ASSERT_SUB_KIND => left >= right,
         ASSERT_MUL_KIND => left.checked_mul(right).is_some(),
         ASSERT_POW_KIND => checked_power(left, right).is_some(),
-        ASSERT_DIV_FLOOR_KIND | ASSERT_REM_KIND => right > 0,
+        ASSERT_DIV_KIND | ASSERT_REM_KIND => right > 0,
         _ => return Err(format!("unsupported arithmetic assertion kind `{kind}`")),
     };
     if valid {
@@ -436,7 +436,7 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
             "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
              {left_name}={left}, {right_name}={right}",
         ),
-        ASSERT_DIV_FLOOR_KIND | ASSERT_REM_KIND => {
+        ASSERT_DIV_KIND | ASSERT_REM_KIND => {
             format!("{right_name} > 0; observed {left_name}={left}, {right_name}={right}")
         }
         _ => unreachable!(),
@@ -608,7 +608,7 @@ mod tests {
             eager_message(eager_dimension("left", 2).sub(&eager_dimension("right", 5)).unwrap_err()),
         );
         assert_eq!(
-            compiled(ASSERT_DIV_FLOOR_KIND, 7, 0),
+            compiled(ASSERT_DIV_KIND, 7, 0),
             eager_message(eager_dimension("left", 7).div(&eager_dimension("right", 0)).unwrap_err()),
         );
         assert_eq!(
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(validate_arithmetic(ASSERT_SUB_KIND, "left", 3, "right", 2), Ok(()));
         assert_eq!(validate_arithmetic(ASSERT_MUL_KIND, "left", 2, "right", 3), Ok(()));
         assert_eq!(validate_arithmetic(ASSERT_POW_KIND, "left", 2, "right", 3), Ok(()));
-        assert_eq!(validate_arithmetic(ASSERT_DIV_FLOOR_KIND, "left", 7, "right", 3), Ok(()));
+        assert_eq!(validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 3), Ok(()));
         assert_eq!(validate_arithmetic(ASSERT_REM_KIND, "left", 7, "right", 3), Ok(()));
 
         assert_eq!(
@@ -667,7 +667,7 @@ mod tests {
                 .to_string(),),
         );
         assert_eq!(
-            validate_arithmetic(ASSERT_DIV_FLOOR_KIND, "left", 7, "right", 0),
+            validate_arithmetic(ASSERT_DIV_KIND, "left", 7, "right", 0),
             Err("right > 0; observed left=7, right=0".to_string()),
         );
         assert_eq!(

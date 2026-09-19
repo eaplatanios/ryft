@@ -19,7 +19,7 @@ use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::{
-    Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation,
+    Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivOperation,
     DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
     DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
     DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
@@ -74,7 +74,7 @@ impl_dimension_operation_lift!(
     DimensionSaturatingSubOperation,
     DimensionMulOperation,
     DimensionPowOperation,
-    DimensionDivFloorOperation,
+    DimensionDivOperation,
     DimensionRemOperation,
     DimensionMinOperation,
     DimensionMaxOperation,
@@ -152,7 +152,7 @@ impl_composite_dimension_arithmetic!(
     dimension_saturating_sub => dimension_saturating_sub,
     dimension_mul => mul,
     dimension_pow => dimension_pow,
-    dimension_div_floor => div,
+    dimension_div => div,
     dimension_rem => rem,
     dimension_min => dimension_min,
     dimension_max => dimension_max,
@@ -307,7 +307,7 @@ mod tests {
         assert!(matches!(program.instructions()[0].operation(), DimensionOperation::Add(_)));
         assert!(matches!(program.instructions()[1].operation(), DimensionOperation::Mul(_)));
         assert!(matches!(program.instructions()[2].operation(), DimensionOperation::Sub(_)));
-        assert!(matches!(program.instructions()[3].operation(), DimensionOperation::DivFloor(_)));
+        assert!(matches!(program.instructions()[3].operation(), DimensionOperation::Div(_)));
         assert!(matches!(program.instructions()[4].operation(), DimensionOperation::Rem(_)));
     }
 

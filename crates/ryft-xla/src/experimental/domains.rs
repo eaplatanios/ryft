@@ -6239,7 +6239,7 @@ mod tests {
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
         CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
         CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
-        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
         DimensionRequirementOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
         DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
@@ -7548,7 +7548,7 @@ mod tests {
             "left >= right; observed left=2, right=5",
         );
         check(
-            DimensionOperation::DivFloor(DimensionDivFloorOperation::new(&left_type, &right_type).unwrap()),
+            DimensionOperation::Div(DimensionDivOperation::new(&left_type, &right_type).unwrap()),
             (7, 3),
             2,
             (7, 0),
@@ -7662,10 +7662,10 @@ mod tests {
         assert_eq!(domain.cache_size(), 0);
 
         let two = DimensionValue::constant(2).unwrap();
-        let division = DimensionDivFloorOperation::new(extent.r#type().as_ref(), two.r#type().as_ref()).unwrap();
+        let division = DimensionDivOperation::new(extent.r#type().as_ref(), two.r#type().as_ref()).unwrap();
         let three = domain
             .bind(
-                XlaOperation::Dimension(DimensionOperation::DivFloor(division)),
+                XlaOperation::Dimension(DimensionOperation::Div(division)),
                 Vec::new(),
                 &[ArrayIrValue::Dimension(extent), ArrayIrValue::Dimension(two.clone())],
             )
@@ -9076,8 +9076,8 @@ mod tests {
         let zero = context.dimension_constant(0).unwrap();
         let one = context.dimension_constant(1).unwrap();
         let two = context.dimension_constant(2).unwrap();
-        let height = rows.dimension_add(&one).unwrap().dimension_div_floor(&two).unwrap();
-        let width = columns.dimension_add(&one).unwrap().dimension_div_floor(&two).unwrap();
+        let height = rows.dimension_add(&one).unwrap().dimension_div(&two).unwrap();
+        let width = columns.dimension_add(&one).unwrap().dimension_div(&two).unwrap();
         // The inner slice receives a genuinely runtime-shaped array. Its pullback must allocate that exact shape,
         // before the outer prefix slice embeds it back into the original static input geometry.
         let prefix = input

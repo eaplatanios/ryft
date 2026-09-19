@@ -38,7 +38,7 @@ use crate::kernels::operations::KernelOperation;
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::{
     AbsOperation, AddOperation, AndOperation, CompareOperation, ComparisonDirection, ConditionOperation,
-    ConstantOperation, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
+    ConstantOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
     DimensionMulOperation, DimensionRemOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
     DotDimensionNumbers, DotOperation, ExpOperation, LogOperation, MaxOperation, MinOperation, MulOperation,
     NegOperation, NotOperation, OrOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
@@ -72,7 +72,7 @@ pub enum KernelSerializationError {
 }
 
 /// Independent transport schema version; it is not the semantic-key encoding version.
-const SOURCE_SCHEMA_VERSION: u32 = 1;
+const SOURCE_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum total physical bytes allocated for decoded literals, including layout padding.
 const MAXIMUM_LITERAL_BYTES: usize = 64 * 1024 * 1024;
@@ -479,7 +479,7 @@ enum WireOperation {
         left: usize,
         right: usize,
     },
-    DimensionDivFloor {
+    DimensionDiv {
         left: usize,
         right: usize,
     },
@@ -829,15 +829,15 @@ impl Encoder {
                             right: self.identity(operation.right_type().variable()),
                         }
                     }
-                    DimensionOperation::DivFloor(operation) => {
+                    DimensionOperation::Div(operation) => {
                         // Refinement may retain cached assertion effects and diagnostic names from wider operands.
                         let reconstructed =
-                            DimensionDivFloorOperation::new(operation.left_type(), operation.right_type())
+                            DimensionDivOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;
                         if *operation != reconstructed {
                             return Err(unsupported(format!("{} cached inference metadata", operation.name())));
                         }
-                        WireOperation::DimensionDivFloor {
+                        WireOperation::DimensionDiv {
                             left: self.identity(operation.left_type().variable()),
                             right: self.identity(operation.right_type().variable()),
                         }
@@ -1087,13 +1087,11 @@ impl Decoder {
                     .map_err(ProgramError::from)?,
             ))
             .into(),
-            WireOperation::DimensionDivFloor { left, right } => {
-                ArrayIrOperation::Dimension(DimensionOperation::DivFloor(
-                    DimensionDivFloorOperation::new(&self.identity(left)?, &self.identity(right)?)
-                        .map_err(ProgramError::from)?,
-                ))
-                .into()
-            }
+            WireOperation::DimensionDiv { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Div(
+                DimensionDivOperation::new(&self.identity(left)?, &self.identity(right)?)
+                    .map_err(ProgramError::from)?,
+            ))
+            .into(),
             WireOperation::DimensionRem { left, right } => ArrayIrOperation::Dimension(DimensionOperation::Rem(
                 DimensionRemOperation::new(&self.identity(left)?, &self.identity(right)?)
                     .map_err(ProgramError::from)?,

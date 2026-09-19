@@ -6,8 +6,6 @@ use crate::programs::{Operation, ProgramError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
-use super::positive_divisor_lower_bound;
-
 /// Canonical operation name for [`DimensionRemOperation`].
 pub const DIMENSION_REM_OPERATION_NAME: &str = "dimension_rem";
 
@@ -22,7 +20,11 @@ define_dimension_arithmetic_operation!(
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (_, left_maximum) = left.bounds().representable_extent_range()?;
         let (_, right_maximum) = right.bounds().representable_extent_range()?;
-        positive_divisor_lower_bound(right, right_maximum)?;
+        if right_maximum == 0 {
+            return Err(DimensionError::RequirementViolation {
+                message: format!("{} > 0 is impossible from declared bounds", right.variable()),
+            });
+        }
         let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
             let remainder = left % right;
             DimensionBounds::new(remainder, remainder.checked_add(1))?

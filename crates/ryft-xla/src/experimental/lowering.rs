@@ -52,7 +52,7 @@ use ryft_mlir::{
 use crate::ToMlir;
 use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
-    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_FLOOR_KIND, ASSERT_DIVISIBLE_BY_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND,
+    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DIVISIBLE_BY_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND,
     ASSERT_EQUAL_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_LESS_THAN_OR_EQUAL_KIND, ASSERT_MUL_KIND,
     ASSERT_PAD_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
 };
@@ -4128,7 +4128,7 @@ fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
         DimensionOperation::Sub(_) => ASSERT_SUB_KIND,
         DimensionOperation::Mul(_) => ASSERT_MUL_KIND,
         DimensionOperation::Pow(_) => ASSERT_POW_KIND,
-        DimensionOperation::DivFloor(_) => ASSERT_DIV_FLOOR_KIND,
+        DimensionOperation::Div(_) => ASSERT_DIV_KIND,
         DimensionOperation::Rem(_) => ASSERT_REM_KIND,
         _ => return Ok(()),
     };

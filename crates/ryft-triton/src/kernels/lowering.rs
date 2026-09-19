@@ -379,7 +379,7 @@ impl<'c, 't> Lowering<'c, 't> {
             DimensionOperation::Add(_) => append(block, arith::addi(inputs[0], inputs[1], location)?)?,
             DimensionOperation::Sub(_) => append(block, arith::subi(inputs[0], inputs[1], location)?)?,
             DimensionOperation::Mul(_) => append(block, arith::muli(inputs[0], inputs[1], location)?)?,
-            DimensionOperation::DivFloor(_) => append(block, arith::divsi(inputs[0], inputs[1], location)?)?,
+            DimensionOperation::Div(_) => append(block, arith::divsi(inputs[0], inputs[1], location)?)?,
             DimensionOperation::Rem(_) => append(block, arith::remsi(inputs[0], inputs[1], location)?)?,
             DimensionOperation::Min(_) => append(block, arith::minsi(inputs[0], inputs[1], location)?)?,
             DimensionOperation::Max(_) => append(block, arith::maxsi(inputs[0], inputs[1], location)?)?,

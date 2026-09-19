@@ -436,7 +436,7 @@ where
                 | DimensionOperation::SaturatingSub(_)
                 | DimensionOperation::Mul(_)
                 | DimensionOperation::Pow(_)
-                | DimensionOperation::DivFloor(_)
+                | DimensionOperation::Div(_)
                 | DimensionOperation::Rem(_)
                 | DimensionOperation::Min(_)
                 | DimensionOperation::Max(_) => {
@@ -471,7 +471,7 @@ where
                     // Select a valid divisor for the data operation so speculative or reordered execution cannot
                     // evaluate division by zero before the host callback reports the original operands.
                     let safe_right = if requires_runtime_assertion
-                        && matches!(operation, DimensionOperation::DivFloor(_) | DimensionOperation::Rem(_))
+                        && matches!(operation, DimensionOperation::Div(_) | DimensionOperation::Rem(_))
                     {
                         let constants = lower_static_index_constants(&[0, 1], block, context, location)?;
                         let positive = lower_compare_to_mlir(
@@ -510,7 +510,7 @@ where
                         DimensionOperation::Pow(_) => {
                             block.append_operation(stable_hlo::power(*left, *right, location)?)?
                         }
-                        DimensionOperation::DivFloor(_) => {
+                        DimensionOperation::Div(_) => {
                             block.append_operation(stable_hlo::divide(*left, safe_right, location)?)?
                         }
                         DimensionOperation::Rem(_) => {

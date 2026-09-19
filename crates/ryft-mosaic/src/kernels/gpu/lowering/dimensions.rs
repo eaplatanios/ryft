@@ -32,7 +32,7 @@ impl<'c, 't> Lowering<'c, 't> {
                 append(block, arith::subi(maximum, inputs[1], self.location)?)?
             }
             DimensionOperation::Mul(_) => append(block, arith::muli(inputs[0], inputs[1], self.location)?)?,
-            DimensionOperation::DivFloor(_) => append(block, arith::divui(inputs[0], inputs[1], self.location)?)?,
+            DimensionOperation::Div(_) => append(block, arith::divui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Rem(_) => append(block, arith::remui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Min(_) => append(block, arith::minui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Max(_) => append(block, arith::maxui(inputs[0], inputs[1], self.location)?)?,

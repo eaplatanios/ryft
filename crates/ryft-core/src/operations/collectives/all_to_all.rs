@@ -1014,10 +1014,10 @@ mod tests {
                     dimension_require_equal %0 %4
                     dimension_require_divisible_by %3 %0
                     %5:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
-                    %6:dimension<output_concat // batch ∈ [0, 129)> = dimension_div_floor %3 %0
-                    %7:f32[batch, batch, output_split, output_concat // batch] = reshape %1 %0 %0 %2 %6
-                    %8:f32[batch, batch, output_split, output_concat // batch] = transpose [permutation=[1, 0, 2, 3]] %7
-                    %9:f32[batch, output_split, batch, output_concat // batch] = transpose [permutation=[0, 2, 1, 3]] %8
+                    %6:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
+                    %7:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %6
+                    %8:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %7
+                    %9:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %8
                     %10:f32[batch, output_split, output_concat] = reshape %9 %0 %2 %3
                 in (%10)
             "}

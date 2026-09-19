@@ -1647,9 +1647,9 @@ mod tests {
                 let %4:dimension<4> = constant [value=4]
                     dimension_require_equal %0 %4
                     dimension_require_divisible_by %2 %0
-                    %5:dimension<gathered // batch ∈ [0, 65)> = dimension_div_floor %2 %0
-                    %6:f32[gathered // batch, width] = reshape %1 %5 %3
-                    %7:f32[batch, gathered // batch, width] = broadcast [output_axes=[1, 2]] %6 %0 %5 %3
+                    %5:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
+                    %6:f32[gathered / batch, width] = reshape %1 %5 %3
+                    %7:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %6 %0 %5 %3
                     %8:f32[gathered, width] = reshape %7 %2 %3
                 in (%8)
             "}
