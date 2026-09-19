@@ -469,11 +469,11 @@ mod tests {
 
         // A universe only needs to project references and values out of itself for an accumulation to type-check.
         check_operation_type_inference!(
-            operation = ReferenceAddUpdateOperation::<TestReferent, AddUpdateUniverse>::new(),
+            operation = ReferenceAddUpdateOperation::<TestReferent, StoreUniverse>::new(),
             cases = [{
                 input_types = [
-                    AddUpdateUniverse::Reference(ReferenceType::new(referent)),
-                    AddUpdateUniverse::Value(referent),
+                    StoreUniverse::Reference(ReferenceType::new(referent)),
+                    StoreUniverse::Value(referent),
                 ],
                 output_types = [],
             }],

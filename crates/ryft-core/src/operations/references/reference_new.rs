@@ -357,10 +357,11 @@ mod tests {
     use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_write::ReferenceWrite;
     use crate::operations::references::tests::*;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue, ReferencePlacement};
     use crate::programs::{
         EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, TypeIdentityPosition,
+        TypeIdentityRenaming,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -386,6 +387,91 @@ mod tests {
 
     #[test]
     fn test_reference_new_type_inference() {
+        /// Test universe that can represent a reference whose immediate referent is itself a reference.
+        #[derive(Clone, Debug, PartialEq)]
+        enum NestedTestType {
+            Reference(ReferenceType<TestReferent>),
+            Nested(ReferenceType<ReferenceType<TestReferent>>),
+        }
+
+        impl Display for NestedTestType {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::Reference(r#type) => Display::fmt(r#type, formatter),
+                    Self::Nested(r#type) => Display::fmt(r#type, formatter),
+                }
+            }
+        }
+
+        impl Parameter for NestedTestType {}
+
+        impl From<ReferenceType<ReferenceType<TestReferent>>> for NestedTestType {
+            fn from(r#type: ReferenceType<ReferenceType<TestReferent>>) -> Self {
+                Self::Nested(r#type)
+            }
+        }
+
+        impl<'t> TryFrom<&'t NestedTestType> for &'t ReferenceType<TestReferent> {
+            type Error = TypeError;
+
+            fn try_from(r#type: &'t NestedTestType) -> Result<Self, Self::Error> {
+                match r#type {
+                    NestedTestType::Reference(r#type) => Ok(r#type),
+                    NestedTestType::Nested(_) => {
+                        Err(TypeError::invalid("expected reference type but got nested reference type"))
+                    }
+                }
+            }
+        }
+
+        impl Type for NestedTestType {
+            type Identity = TestIdentity;
+            type Refinements = ();
+
+            fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+                match self {
+                    Self::Reference(r#type) => r#type.identities().collect::<Vec<_>>(),
+                    Self::Nested(r#type) => r#type.identities().collect::<Vec<_>>(),
+                }
+                .into_iter()
+            }
+
+            fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+                Ok(match self {
+                    Self::Reference(r#type) => Self::Reference(r#type.rename_identities(renaming)?),
+                    Self::Nested(r#type) => Self::Nested(r#type.rename_identities(renaming)?),
+                })
+            }
+
+            fn is_compatible_with(&self, other: &Self) -> bool {
+                match (self, other) {
+                    (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+                    (Self::Nested(left), Self::Nested(right)) => left.is_compatible_with(right),
+                    _ => false,
+                }
+            }
+
+            fn is_refined_by(&self, other: &Self) -> bool {
+                match (self, other) {
+                    (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
+                    (Self::Nested(left), Self::Nested(right)) => left.is_refined_by(right),
+                    _ => false,
+                }
+            }
+
+            fn is_scalar(&self) -> bool {
+                false
+            }
+
+            fn is_complex(&self) -> bool {
+                false
+            }
+
+            fn is_reference(&self) -> bool {
+                true
+            }
+        }
+
         let referent = TestReferent::new(7, 16);
         let value = TestType::Value(referent);
         let reference = TestType::Reference(ReferenceType::new(referent));

@@ -415,9 +415,9 @@ mod tests {
 
         // A universe only needs to project references and values out of itself for a write to type-check.
         check_operation_type_inference!(
-            operation = ReferenceWriteOperation::<TestReferent, WriteUniverse>::new(),
+            operation = ReferenceWriteOperation::<TestReferent, StoreUniverse>::new(),
             cases = [{
-                input_types = [WriteUniverse::Reference(ReferenceType::new(referent)), WriteUniverse::Value(referent)],
+                input_types = [StoreUniverse::Reference(ReferenceType::new(referent)), StoreUniverse::Value(referent)],
                 output_types = [],
             }],
         );
@@ -812,6 +812,43 @@ mod tests {
 
     #[test]
     fn test_reference_write_reference_discharge() {
+        /// Reference policy that deliberately supports write discharge without supporting accumulation.
+        #[derive(Copy, Clone, Debug)]
+        struct WriteOnlyReferenceDischarge;
+
+        impl<C: Context<Type = TestType, Operation: From<TestOperation>>> ReferenceDischargePolicy<C>
+            for WriteOnlyReferenceDischarge
+        {
+            type Referent = TestReferent;
+            type Alias = TestAlias;
+
+            fn storage_alias(_referent: &TestReferent) -> TestAlias {
+                TestAlias
+            }
+
+            fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
+                Ok(current.clone())
+            }
+
+            fn write(
+                _context: &C,
+                _current: &C::Value,
+                replacement: C::Value,
+                _alias: &TestAlias,
+            ) -> Result<C::Value, ProgramError> {
+                Ok(replacement)
+            }
+
+            fn swap(
+                _context: &C,
+                _current: &C::Value,
+                _replacement: C::Value,
+                _alias: &TestAlias,
+            ) -> Result<(C::Value, C::Value), ProgramError> {
+                Err(ProgramError::MalformedProgram("write-only discharge policy must not swap".to_string()))
+            }
+        }
+
         // A policy with no accumulation capability replaces state through `write`, produces no old-value output,
         // and marks the allocation mutated. Its `swap` path is an error, making accidental swap dispatch visible.
         let context =

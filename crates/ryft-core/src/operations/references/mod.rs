@@ -1,15 +1,4 @@
-//! Reference operations for allocating, reading, updating, and consuming mutable state.
-//!
-//! Each operation module defines its type inference, effects, transform rules, and value-level capability.
-//!
-//! Allocation, accumulation, and freezing use [`OperationProvider`](crate::programs::OperationProvider) requests with
-//! ordered input types to select an operation family's payload, including downstream alternatives. Reference-free
-//! families reject these requests with
-//! [`UnsupportedOperation`](crate::programs::ProgramError::UnsupportedOperation), while satisfying the provider bounds
-//! required by generic differentiation. Reverse-mode transposition needs allocation and accumulation; gradient
-//! extraction also needs freezing.
-
-// TODO(eaplatanios): Review this module.
+//! Contains operations for working with references (i.e., allocating, reading, updating, and consuming mutable state).
 
 mod reference_add_update;
 mod reference_atomic_add_update;
@@ -34,20 +23,18 @@ pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::{Debug, Display};
 
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
+    use ryft_macros::Parameter;
 
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
-    use crate::operations::math::add::{Add, AddOperation};
-    use crate::parameters::{Parameter, Placeholder};
+    use crate::operations::{Add, AddOperation};
+    use crate::parameters::Parameter;
     use crate::programs::{
-        Effects, EmptyRegionDriver, Operation, ProgramBuilder, ProgramError, ReferenceAccumulationPolicy,
-        ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
-        RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-        discharge_reference_free_operation,
+        Effects, EmptyRegionDriver, Operation, ProgramError, ReferenceAccumulationPolicy, ReferenceDischargeContext,
+        ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeValue,
+        ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError,
+        TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, discharge_reference_free_operation,
     };
 
     use super::*;
@@ -69,7 +56,7 @@ pub(crate) mod tests {
     }
 
     /// Referent type used to exercise generic reference operations without array-specific behavior.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Parameter)]
     pub(crate) struct TestReferent {
         /// Identity preserved by reference operations.
         pub(crate) identity: TestIdentity,
@@ -90,8 +77,6 @@ pub(crate) mod tests {
             write!(formatter, "value<{},p{}>", self.identity, self.precision)
         }
     }
-
-    impl Parameter for TestReferent {}
 
     impl Type for TestReferent {
         type Identity = TestIdentity;
@@ -249,95 +234,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test universe that can represent a reference whose immediate referent is itself a reference.
-    #[derive(Clone, Debug, PartialEq)]
-    pub(crate) enum NestedTestType {
-        Reference(ReferenceType<TestReferent>),
-        Nested(ReferenceType<ReferenceType<TestReferent>>),
-    }
-
-    impl Display for NestedTestType {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Reference(r#type) => Display::fmt(r#type, formatter),
-                Self::Nested(r#type) => Display::fmt(r#type, formatter),
-            }
-        }
-    }
-
-    impl Parameter for NestedTestType {}
-
-    impl From<ReferenceType<ReferenceType<TestReferent>>> for NestedTestType {
-        fn from(r#type: ReferenceType<ReferenceType<TestReferent>>) -> Self {
-            Self::Nested(r#type)
-        }
-    }
-
-    impl<'t> TryFrom<&'t NestedTestType> for &'t ReferenceType<TestReferent> {
-        type Error = TypeError;
-
-        fn try_from(r#type: &'t NestedTestType) -> Result<Self, Self::Error> {
-            match r#type {
-                NestedTestType::Reference(r#type) => Ok(r#type),
-                NestedTestType::Nested(_) => {
-                    Err(TypeError::invalid("expected reference type but got nested reference type"))
-                }
-            }
-        }
-    }
-
-    impl Type for NestedTestType {
-        type Identity = TestIdentity;
-        type Refinements = ();
-
-        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-            match self {
-                Self::Reference(r#type) => r#type.identities().collect::<Vec<_>>(),
-                Self::Nested(r#type) => r#type.identities().collect::<Vec<_>>(),
-            }
-            .into_iter()
-        }
-
-        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-            Ok(match self {
-                Self::Reference(r#type) => Self::Reference(r#type.rename_identities(renaming)?),
-                Self::Nested(r#type) => Self::Nested(r#type.rename_identities(renaming)?),
-            })
-        }
-
-        fn is_compatible_with(&self, other: &Self) -> bool {
-            match (self, other) {
-                (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
-                (Self::Nested(left), Self::Nested(right)) => left.is_compatible_with(right),
-                _ => false,
-            }
-        }
-
-        fn is_refined_by(&self, other: &Self) -> bool {
-            match (self, other) {
-                (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
-                (Self::Nested(left), Self::Nested(right)) => left.is_refined_by(right),
-                _ => false,
-            }
-        }
-
-        fn is_scalar(&self) -> bool {
-            false
-        }
-
-        fn is_complex(&self) -> bool {
-            false
-        }
-
-        fn is_reference(&self) -> bool {
-            true
-        }
-    }
-
     macro_rules! define_partial_test_universe {
-        // Defines one non-array universe whose conversion implementations are selected independently below.
+        // Defines a shared test universe; conversions are supplied separately for each operation.
         ($name:ident) => {
-            /// Minimal type universe used to verify one reference primitive's required conversion boundary.
+            /// Minimal type universe used to verify reference operations' required conversions.
             #[derive(Clone, Debug, PartialEq, ryft_macros::Parameter)]
             pub(crate) enum $name {
                 Value(TestReferent),
@@ -407,10 +307,6 @@ pub(crate) mod tests {
     }
 
     define_partial_test_universe!(NewUniverse);
-    define_partial_test_universe!(ReadFreezeUniverse);
-    define_partial_test_universe!(WriteUniverse);
-    define_partial_test_universe!(SwapUniverse);
-    define_partial_test_universe!(AddUpdateUniverse);
 
     impl From<ReferenceType<TestReferent>> for NewUniverse {
         fn from(r#type: ReferenceType<TestReferent>) -> Self {
@@ -429,44 +325,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl From<TestReferent> for ReadFreezeUniverse {
-        fn from(r#type: TestReferent) -> Self {
-            Self::Value(r#type)
-        }
-    }
-
-    impl<'t> TryFrom<&'t ReadFreezeUniverse> for &'t ReferenceType<TestReferent> {
-        type Error = TypeError;
-
-        fn try_from(r#type: &'t ReadFreezeUniverse) -> Result<Self, Self::Error> {
-            match r#type {
-                ReadFreezeUniverse::Reference(r#type) => Ok(r#type),
-                ReadFreezeUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
-            }
-        }
-    }
-
-    impl<'t> TryFrom<&'t WriteUniverse> for &'t TestReferent {
-        type Error = TypeError;
-
-        fn try_from(r#type: &'t WriteUniverse) -> Result<Self, Self::Error> {
-            match r#type {
-                WriteUniverse::Value(r#type) => Ok(r#type),
-                WriteUniverse::Reference(_) => Err(TypeError::invalid("expected value type but got reference type")),
-            }
-        }
-    }
-
-    impl<'t> TryFrom<&'t WriteUniverse> for &'t ReferenceType<TestReferent> {
-        type Error = TypeError;
-
-        fn try_from(r#type: &'t WriteUniverse) -> Result<Self, Self::Error> {
-            match r#type {
-                WriteUniverse::Reference(r#type) => Ok(r#type),
-                WriteUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
-            }
-        }
-    }
+    define_partial_test_universe!(SwapUniverse);
 
     impl From<TestReferent> for SwapUniverse {
         fn from(r#type: TestReferent) -> Self {
@@ -496,26 +355,44 @@ pub(crate) mod tests {
         }
     }
 
-    impl<'t> TryFrom<&'t AddUpdateUniverse> for &'t TestReferent {
+    define_partial_test_universe!(ReadFreezeUniverse);
+    define_partial_test_universe!(StoreUniverse);
+
+    impl From<TestReferent> for ReadFreezeUniverse {
+        fn from(r#type: TestReferent) -> Self {
+            Self::Value(r#type)
+        }
+    }
+
+    impl<'t> TryFrom<&'t ReadFreezeUniverse> for &'t ReferenceType<TestReferent> {
         type Error = TypeError;
 
-        fn try_from(r#type: &'t AddUpdateUniverse) -> Result<Self, Self::Error> {
+        fn try_from(r#type: &'t ReadFreezeUniverse) -> Result<Self, Self::Error> {
             match r#type {
-                AddUpdateUniverse::Value(r#type) => Ok(r#type),
-                AddUpdateUniverse::Reference(_) => {
-                    Err(TypeError::invalid("expected value type but got reference type"))
-                }
+                ReadFreezeUniverse::Reference(r#type) => Ok(r#type),
+                ReadFreezeUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
             }
         }
     }
 
-    impl<'t> TryFrom<&'t AddUpdateUniverse> for &'t ReferenceType<TestReferent> {
+    impl<'t> TryFrom<&'t StoreUniverse> for &'t TestReferent {
         type Error = TypeError;
 
-        fn try_from(r#type: &'t AddUpdateUniverse) -> Result<Self, Self::Error> {
+        fn try_from(r#type: &'t StoreUniverse) -> Result<Self, Self::Error> {
             match r#type {
-                AddUpdateUniverse::Reference(r#type) => Ok(r#type),
-                AddUpdateUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
+                StoreUniverse::Value(r#type) => Ok(r#type),
+                StoreUniverse::Reference(_) => Err(TypeError::invalid("expected value type but got reference type")),
+            }
+        }
+    }
+
+    impl<'t> TryFrom<&'t StoreUniverse> for &'t ReferenceType<TestReferent> {
+        type Error = TypeError;
+
+        fn try_from(r#type: &'t StoreUniverse) -> Result<Self, Self::Error> {
+            match r#type {
+                StoreUniverse::Reference(r#type) => Ok(r#type),
+                StoreUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
             }
         }
     }
@@ -527,15 +404,8 @@ pub(crate) mod tests {
     pub(crate) type AddUpdate = ReferenceAddUpdateOperation<TestReferent, TestType>;
     pub(crate) type Freeze = ReferenceFreezeOperation<TestReferent, TestType>;
 
-    // The fixtures below give the reference-primitive discharge rules a destination to write into. The universe is
-    // deliberately view-less, so that these tests isolate the rules themselves: composed views are the policy's
-    // concern and are covered where a universe with real view mechanics lives.
-    //
-    // Two destinations are named because the rules serve two kinds of allocation. A discharged reference's rewrite
-    // reaches only values, so the eager destination executes it and the tests read the outputs directly. A
-    // preserved reference is a *reference* of the destination universe, which an eager value of this fixture cannot
-    // be, so the preserved replay is exercised against the staging destination and read back as the program it
-    // recorded.
+    // These fixtures exercise discharge without array or view behavior. Addition executes eagerly; program-level
+    // tests stage preserved reference operations.
 
     /// Destination universe of the discharge-rule tests.
     pub(crate) type TestDestination = EagerContext<TestValue, TestOperation>;
@@ -546,11 +416,7 @@ pub(crate) mod tests {
     /// Carrier flowing through the discharge-rule tests.
     pub(crate) type TestDischargeValue = ReferenceDischargeValue<TestDestination, TestReferenceDischarge>;
 
-    /// Operation family of the discharge-rule test destinations.
-    ///
-    /// It carries the six reference primitives, because replaying an access to a preserved reference binds the access
-    /// itself into the destination, and one addition, because that is how this universe's accumulation policy reaches
-    /// its sum. A real family reaches the same shape through a dispatch derive.
+    /// Operation family required by the discharge rules; only addition executes in the eager destination.
     #[derive(Copy, Clone, Debug)]
     pub(crate) enum TestOperation {
         Add,
@@ -621,8 +487,7 @@ pub(crate) mod tests {
         }
     }
 
-    // The family delegates each variant to the primitive rule that owns it, which is exactly what a dispatch derive
-    // generates, and is what lets the program-level entry point drive these rules over this universe.
+    // Allocation-preservation tests replay whole programs through this operation family.
     impl<C, P> ReferenceDischargeableOperation<C, P> for TestOperation
     where
         C: Context<Type = TestType, Operation = TestOperation>,
@@ -646,9 +511,6 @@ pub(crate) mod tests {
         }
     }
 
-    // Only the addition is executable: a reference primitive reaches an eager destination exclusively as the replay of
-    // an access to a preserved reference, and a preserved reference lives in the staging destination, which records
-    // rather than executes.
     impl<C: Domain<Type = TestType, Value = TestValue>> InterpretableOperation<C> for TestOperation {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
@@ -669,8 +531,7 @@ pub(crate) mod tests {
     }
 
     macro_rules! impl_test_operation_from_reference_primitive {
-        // Lifts one reference primitive into the test destination family, which is the conversion seam a rule spends
-        // when it replays an access to a preserved reference.
+        // Supplies the operation conversion required by each discharge rule's context bound.
         ($variant:ident, $payload:ident) => {
             impl From<$payload> for TestOperation {
                 fn from(operation: $payload) -> Self {
@@ -690,7 +551,10 @@ pub(crate) mod tests {
     /// Destination value of the discharge-rule tests: one integer payload carrying its own referent type.
     #[derive(Copy, Clone, Debug, PartialEq)]
     pub(crate) struct TestValue {
+        /// Type carried by this value.
         referent: TestReferent,
+
+        /// Integer stored in the discharged reference state.
         payload: i64,
     }
 
@@ -754,9 +618,7 @@ pub(crate) mod tests {
         type Policy = TestReferenceDischarge;
     }
 
-    // The policy leaves the destination value generic, which is what lets one implementation serve both the eager and
-    // the staging destination: a view-less universe needs no destination capability at all to read or replace, and it
-    // reaches its sum by binding this family's addition rather than by requiring value-level arithmetic.
+    // Reads and replacements need no value-level capabilities; accumulation binds the test addition operation.
     impl<C: Context<Type = TestType, Operation: From<TestOperation>>> ReferenceDischargePolicy<C>
         for TestReferenceDischarge
     {
@@ -796,109 +658,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// Reference policy that deliberately supports write discharge without supporting accumulation.
-    #[derive(Copy, Clone, Debug)]
-    pub(crate) struct WriteOnlyReferenceDischarge;
-
-    impl<C: Context<Type = TestType, Operation: From<TestOperation>>> ReferenceDischargePolicy<C>
-        for WriteOnlyReferenceDischarge
-    {
-        type Referent = TestReferent;
-        type Alias = TestAlias;
-
-        fn storage_alias(_referent: &TestReferent) -> TestAlias {
-            TestAlias
-        }
-
-        fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
-            Ok(current.clone())
-        }
-
-        fn write(
-            _context: &C,
-            _current: &C::Value,
-            replacement: C::Value,
-            _alias: &TestAlias,
-        ) -> Result<C::Value, ProgramError> {
-            Ok(replacement)
-        }
-
-        fn swap(
-            _context: &C,
-            _current: &C::Value,
-            _replacement: C::Value,
-            _alias: &TestAlias,
-        ) -> Result<(C::Value, C::Value), ProgramError> {
-            Err(ProgramError::MalformedProgram("write-only discharge policy must not swap".to_string()))
-        }
-    }
-
-    /// Handle to one live allocation in the discharge-rule test universe.
-    pub(crate) type TestDischargeReference = ReferenceDischargeReference<TestDestination, TestReferenceDischarge>;
-
-    /// Referent every discharge-rule test allocates its allocation over.
+    /// Default referent type used by the discharge-rule tests.
     pub(crate) const REFERENT: TestReferent = TestReferent::new(7, 16);
 
     /// Referent whose canonical reference projection deliberately fails to exercise the allocation diagnostic.
     pub(crate) const NON_PROJECTING_REFERENT: TestReferent = TestReferent::new(7, u8::MAX);
 
     /// Allocates a reference containing `payload` through the allocation discharge rule.
-    ///
     /// Returns the discharge context together with the handle denoting the new allocation.
-    pub(crate) fn allocated_reference(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
+    pub(crate) fn allocated_reference(
+        payload: i64,
+    ) -> (TestDischargeContext, ReferenceDischargeReference<TestDestination, TestReferenceDischarge>) {
         let context = TestDischargeContext::new(TestDestination::new());
         let initial = ReferenceDischargeValue::Value(TestValue::new(REFERENT, payload));
         let allocated = New::new().discharge_references(&context, &EmptyRegionDriver, &[initial]).unwrap();
         let reference = allocated[0].try_as_reference("the allocated reference").unwrap().clone();
         (context, reference)
-    }
-
-    #[test]
-    fn test_reference_primitive_discharge_replays_accesses_to_a_preserved_allocation() {
-        // An allocation that partial discharge preserved survives in the destination as a reference value, so the
-        // dispatch path replays every access verbatim over the handle's destination value instead of acting on
-        // threaded state, and the access rules themselves never run. The rewritten program therefore performs the
-        // same reference operations the source did, in the same order, and the consumed allocation contributes no
-        // binding.
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(TestType::Reference(ReferenceType::new(REFERENT)));
-        let update = builder.add_input(TestType::Value(REFERENT));
-        let observed = builder
-            .add_instruction(TestOperation::Read(Read::new()), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(TestOperation::Write(Write::new()), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let previous = builder
-            .add_instruction(TestOperation::Swap(Swap::new()), Vec::new(), vec![reference, update], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let frozen = builder
-            .add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let source = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![observed, previous, frozen],
-                vec![Placeholder; 2],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-
-        let preserved = source.partially_discharge_references(0, &[]).unwrap();
-        assert_eq!(preserved.output_count(), 3);
-        assert_eq!(preserved.external_reference_bindings(), &[]);
-        assert_eq!(
-            preserved.program().to_string(),
-            indoc! {"
-                lambda %0:ref<value<i7,p16>>, %1:value<i7,p16> .
-                let %2:value<i7,p16> = reference_read %0
-                    () = reference_write %0 %1
-                    %3:value<i7,p16> = reference_swap %0 %1
-                    () = reference_add_update %0 %1
-                    %4:value<i7,p16> = reference_freeze %0
-                in (%2, %3, %4)"},
-        );
     }
 }
