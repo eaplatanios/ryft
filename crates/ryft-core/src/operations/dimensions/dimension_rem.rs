@@ -1,17 +1,17 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::macros::{check_count, define_dimension_arithmetic_operation};
 use crate::operations::math::rem::{Rem, RemOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
-use super::{positive_divisor_lower_bound, representable_extent_range};
+use super::positive_divisor_lower_bound;
 
 /// Canonical operation name for [`DimensionRemOperation`].
 pub const DIMENSION_REM_OPERATION_NAME: &str = "dimension_rem";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Checked dimension-remainder operation used by [`Rem`].
     DimensionRemOperation, DIMENSION_REM_OPERATION_NAME,
     Rem, rem,
@@ -32,8 +32,8 @@ impl OperationProvider<DimensionType> for RemOperation<DimensionType> {
 
 /// Derives sound bounds for checked remainder and reports whether a zero runtime divisor remains possible.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (_, left_maximum) = representable_extent_range(left.bounds())?;
-    let (_, right_maximum) = representable_extent_range(right.bounds())?;
+    let (_, left_maximum) = left.bounds().representable_extent_range()?;
+    let (_, right_maximum) = right.bounds().representable_extent_range()?;
     positive_divisor_lower_bound(right, right_maximum)?;
     let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
         let remainder = left % right;

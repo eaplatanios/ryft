@@ -1,17 +1,17 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::macros::{check_count, define_dimension_arithmetic_operation};
 use crate::operations::math::mul::{Mul, MulOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
-use super::{bounds_overflow, maximum_extent, representable_extent_range};
+use super::maximum_extent;
 
 /// Canonical operation name for [`DimensionMulOperation`].
 pub const DIMENSION_MUL_OPERATION_NAME: &str = "dimension_mul";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Checked dimension-multiplication operation used by [`Mul`].
     DimensionMulOperation, DIMENSION_MUL_OPERATION_NAME,
     Mul, mul,
@@ -32,10 +32,14 @@ impl OperationProvider<DimensionType> for MulOperation<DimensionType> {
 
 /// Derives sound bounds for checked dimension multiplication and reports whether runtime overflow remains possible.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
-    let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
-    let overflow = || bounds_overflow(DIMENSION_MUL_OPERATION_NAME, left, right);
-    let lower = left_lower.checked_mul(right_lower).ok_or_else(overflow)?;
+    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+    let lower = left_lower.checked_mul(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
+        message: format!(
+            "dimension arithmetic overflow while deriving `{DIMENSION_MUL_OPERATION_NAME}` result bounds \
+             with operands {left}, {right}",
+        ),
+    })?;
     let maximum = left_maximum.saturating_mul(right_maximum).min(MAX_DIMENSION_EXTENT);
     let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
     let requires_runtime_assertion = maximum_extent(left)

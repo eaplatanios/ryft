@@ -143,6 +143,16 @@ impl DimensionBounds {
         self.upper
     }
 
+    /// Returns the inclusive lower and upper endpoints of the portable extents admitted by this [`DimensionBounds`].
+    /// The upper endpoint is capped at [`MAX_DIMENSION_EXTENT`], including when the bounds are unbounded. Returns
+    /// [`DimensionError::ExtentExceedsBackendWidth`] if the lower bound exceeds [`MAX_DIMENSION_EXTENT`].
+    pub fn representable_extent_range(self) -> Result<(usize, usize), DimensionError> {
+        if self.lower > MAX_DIMENSION_EXTENT {
+            return Err(DimensionError::ExtentExceedsBackendWidth { value: self.lower, maximum: MAX_DIMENSION_EXTENT });
+        }
+        Ok((self.lower, self.upper.map(|upper| upper - 1).unwrap_or(MAX_DIMENSION_EXTENT).min(MAX_DIMENSION_EXTENT)))
+    }
+
     /// Returns `true` if this [`DimensionBounds`] instance contains (i.e., admits) `value`.
     #[inline]
     pub fn contains(&self, value: usize) -> bool {
@@ -1007,12 +1017,16 @@ mod tests {
         let nonnegative = DimensionBounds::non_negative(Some(5)).unwrap();
         assert_eq!(nonnegative.lower(), 0);
         assert_eq!(nonnegative.upper(), Some(5));
+        assert_eq!(nonnegative.representable_extent_range(), Ok((0, 4)));
+        assert_eq!(DimensionBounds::new(0, Some(1)).unwrap().representable_extent_range(), Ok((0, 0)));
         assert!(nonnegative.contains(0));
         assert!(nonnegative.contains(4));
         assert!(!nonnegative.contains(5));
         assert_eq!(nonnegative.to_string(), "[0, 5)");
 
         let positive = DimensionBounds::positive(Some(5)).unwrap();
+        assert_eq!(positive.representable_extent_range(), Ok((1, 4)));
+        assert_eq!(DimensionBounds::new(2, Some(9)).unwrap().representable_extent_range(), Ok((2, 8)));
         assert!(!positive.contains(0));
         assert!(positive.contains(1));
         assert!(nonnegative.contains_bounds(positive));
@@ -1020,10 +1034,30 @@ mod tests {
 
         let unbounded = DimensionBounds::unbounded();
         assert_eq!(unbounded, DimensionBounds::at_least(0));
+        assert_eq!(unbounded.representable_extent_range(), Ok((0, MAX_DIMENSION_EXTENT)));
         assert!(unbounded.contains(usize::MAX));
         assert!(unbounded.contains_bounds(nonnegative));
         assert!(!nonnegative.contains_bounds(unbounded));
         assert_eq!(unbounded.to_string(), "[0, ∞)");
+
+        assert_eq!(
+            DimensionBounds::at_least(MAX_DIMENSION_EXTENT).representable_extent_range(),
+            Ok((MAX_DIMENSION_EXTENT, MAX_DIMENSION_EXTENT)),
+        );
+
+        if let Some(unrepresentable_extent) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            assert_eq!(
+                DimensionBounds::new(2, Some(usize::MAX)).unwrap().representable_extent_range(),
+                Ok((2, MAX_DIMENSION_EXTENT)),
+            );
+            assert_eq!(
+                DimensionBounds::at_least(unrepresentable_extent).representable_extent_range(),
+                Err(DimensionError::ExtentExceedsBackendWidth {
+                    value: unrepresentable_extent,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }),
+            );
+        }
 
         let error = DimensionError::InvalidBounds { lower: 7, upper: 7 };
         assert_eq!(error.to_string(), "invalid dimension bounds [7, 7)");

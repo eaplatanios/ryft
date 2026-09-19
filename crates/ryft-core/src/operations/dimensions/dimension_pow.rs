@@ -1,15 +1,15 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
+use crate::macros::{define_arithmetic_dimension_capability, define_dimension_arithmetic_operation};
 use crate::parameters::Parameter;
 
 // TODO(eaplatanios): Review this module.
 
-use super::{bounds_overflow, checked_power, maximum_extent, representable_extent_range};
+use super::{checked_power, maximum_extent};
 
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Checked dimension-exponentiation operation used by [`DimensionPow`].
     ///
     /// Refer to [`DimensionPow`] for semantic details and an example.
@@ -42,9 +42,8 @@ define_arithmetic_dimension_capability!(
 
 /// Derives sound bounds for checked dimension exponentiation and reports whether runtime overflow remains possible.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
-    let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
-    let overflow = || bounds_overflow(DIMENSION_POW_OPERATION_NAME, left, right);
+    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
     let lower = if right_maximum == 0 {
         1
     } else if left_lower == 0 {
@@ -52,7 +51,12 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
     } else if left_lower == 1 {
         1
     } else {
-        checked_power(left_lower, right_lower).ok_or_else(overflow)?
+        checked_power(left_lower, right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` result bounds \
+                 with operands {left}, {right}",
+            ),
+        })?
     };
     let maximum = if right_maximum == 0 || left_maximum == 1 {
         1

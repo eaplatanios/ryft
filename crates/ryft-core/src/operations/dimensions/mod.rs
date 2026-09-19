@@ -253,15 +253,6 @@ impl ArithmeticDimensionOperationMetadata {
     }
 }
 
-/// Returns the inclusive range of portable extents admitted by `bounds`.
-pub(crate) fn representable_extent_range(bounds: DimensionBounds) -> Result<(usize, usize), DimensionError> {
-    if bounds.lower() > MAX_DIMENSION_EXTENT {
-        return Err(DimensionError::ExtentExceedsBackendWidth { value: bounds.lower(), maximum: MAX_DIMENSION_EXTENT });
-    }
-    let maximum = bounds.upper().map(|upper| upper - 1).unwrap_or(MAX_DIMENSION_EXTENT).min(MAX_DIMENSION_EXTENT);
-    Ok((bounds.lower(), maximum))
-}
-
 /// Returns the largest portable extent admitted by `r#type` when its upper bound is finite.
 #[inline]
 pub(crate) fn maximum_extent(r#type: &DimensionType) -> Option<usize> {
@@ -291,16 +282,6 @@ pub(crate) fn positive_divisor_lower_bound(divisor: &DimensionType, maximum: usi
         })
     } else {
         Ok(divisor.bounds().lower().max(1))
-    }
-}
-
-/// Constructs a bounds-inference overflow diagnostic.
-pub(crate) fn bounds_overflow(operation_name: &str, left: &DimensionType, right: &DimensionType) -> DimensionError {
-    DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while deriving `{operation_name}` result bounds with operands {left}, \
-             {right}",
-        ),
     }
 }
 

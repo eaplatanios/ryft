@@ -1,17 +1,17 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::macros::{check_count, define_dimension_arithmetic_operation};
 use crate::operations::math::div::{Div, DivOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
-use super::{positive_divisor_lower_bound, representable_extent_range};
+use super::positive_divisor_lower_bound;
 
 /// Canonical operation name for [`DimensionDivFloorOperation`].
 pub const DIMENSION_DIV_FLOOR_OPERATION_NAME: &str = "dimension_div_floor";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Checked dimension-floor-division operation used by [`Div`].
     DimensionDivFloorOperation, DIMENSION_DIV_FLOOR_OPERATION_NAME,
     Div, div,
@@ -32,8 +32,8 @@ impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
 
 /// Derives sound bounds for checked floor division and reports whether a zero runtime divisor remains possible.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
-    let (_, right_maximum) = representable_extent_range(right.bounds())?;
+    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+    let (_, right_maximum) = right.bounds().representable_extent_range()?;
     let positive_right_lower = positive_divisor_lower_bound(right, right_maximum)?;
     let bounds =
         DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))?;

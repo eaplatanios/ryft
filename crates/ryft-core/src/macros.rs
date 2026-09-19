@@ -270,7 +270,7 @@ macro_rules! check_builders {
 ///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
 ///     The Boolean reports whether their bounds leave a checked runtime failure possible.
 #[macro_export]
-macro_rules! define_arithmetic_dimension_operation {
+macro_rules! define_dimension_arithmetic_operation {
     (
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
@@ -4892,7 +4892,7 @@ macro_rules! check_gradient {
 pub use crate::{
     check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
-    check_types, define_arithmetic_dimension_capability, define_arithmetic_dimension_operation,
+    check_types, define_arithmetic_dimension_capability, define_dimension_arithmetic_operation,
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
     impl_differentiable_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
@@ -5012,7 +5012,7 @@ mod tests {
 
     const TEST_ARITHMETIC_DIMENSION_OPERATION_NAME: &str = "test_arithmetic_dimension";
 
-    define_arithmetic_dimension_operation!(
+    define_dimension_arithmetic_operation!(
         /// Dimension-arithmetic operation used to test [`define_arithmetic_dimension_operation!`].
         TestArithmeticDimensionOperation,
         TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,

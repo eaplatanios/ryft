@@ -1,15 +1,13 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
+use crate::macros::{define_arithmetic_dimension_capability, define_dimension_arithmetic_operation};
 use crate::parameters::Parameter;
 
 // TODO(eaplatanios): Review this module.
 
-use super::representable_extent_range;
-
 /// Canonical operation name for [`DimensionSaturatingSubOperation`].
 pub const DIMENSION_SATURATING_SUB_OPERATION_NAME: &str = "dimension_saturating_sub";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Saturating dimension-subtraction operation used by [`DimensionSaturatingSub`].
     ///
     /// Refer to [`DimensionSaturatingSub`] for semantic details and an example.
@@ -43,8 +41,8 @@ define_arithmetic_dimension_capability!(
 
 /// Derives sound bounds for total, saturating dimension subtraction.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
-    let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
+    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
     let bounds = DimensionBounds::new(
         left_lower.saturating_sub(right_maximum),
         left_maximum.saturating_sub(right_lower).checked_add(1),

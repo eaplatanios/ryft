@@ -1,17 +1,17 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
-use crate::macros::{check_count, define_arithmetic_dimension_operation};
+use crate::macros::{check_count, define_dimension_arithmetic_operation};
 use crate::operations::math::sub::{Sub, SubOperation};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError};
 
 // TODO(eaplatanios): Review this module.
 
-use super::{maximum_extent, representable_extent_range};
+use super::maximum_extent;
 
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
 
-define_arithmetic_dimension_operation!(
+define_dimension_arithmetic_operation!(
     /// Checked dimension-subtraction operation used by [`Sub`].
     DimensionSubOperation, DIMENSION_SUB_OPERATION_NAME,
     Sub, sub,
@@ -32,8 +32,8 @@ impl OperationProvider<DimensionType> for SubOperation<DimensionType> {
 
 /// Derives sound bounds for checked dimension subtraction and reports whether runtime underflow remains possible.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
-    let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
+    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
     if left_maximum < right_lower {
         return Err(DimensionError::RequirementViolation {
             message: format!("{} >= {} is impossible from declared bounds", left.variable(), right.variable()),
