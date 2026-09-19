@@ -2,7 +2,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType};
+use crate::arrays::{
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType, DimensionValue,
+};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -175,14 +177,20 @@ where
     }
 }
 
+impl DimensionToScalar<Array> for DimensionValue {
+    #[inline]
+    fn to_scalar(&self) -> Result<Array, ProgramError> {
+        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
+        Array::scalar(i64::try_from(self.extent()).unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, MAX_DIMENSION_EXTENT,
-    };
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, MAX_DIMENSION_EXTENT};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_partial_evaluation;

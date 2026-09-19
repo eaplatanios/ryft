@@ -1,21 +1,21 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::mul::{Mul, MulOperation};
 use crate::parameters::Parameter;
-
-// TODO(eaplatanios): Review this module.
+use crate::programs::{Operation, ProgramError, Typed};
 
 /// Canonical operation name for [`DimensionMulOperation`].
 pub const DIMENSION_MUL_OPERATION_NAME: &str = "dimension_mul";
 
 define_dimension_arithmetic_operation!(
-    /// Checked dimension-multiplication operation used by [`Mul`].
-    DimensionMulOperation, DIMENSION_MUL_OPERATION_NAME,
-    Mul, mul,
+    /// Checked dimension-multiplication operation used by [`Mul`] for [`DimensionValue`]s.
+    DimensionMulOperation,
+    DIMENSION_MUL_OPERATION_NAME,
+    Mul,
+    mul,
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} * {}", left.variable(), right.variable())
     },
-    // Derives sound bounds for checked dimension multiplication and reports whether runtime overflow remains possible.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
@@ -36,6 +36,24 @@ define_dimension_arithmetic_operation!(
     provider = MulOperation<DimensionType>,
 );
 
+impl Mul for DimensionValue {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionMulOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while multiplying dimensions with operands {}={}, {}={}",
+                self.r#type().variable(),
+                self.extent(),
+                right.r#type().variable(),
+                right.extent(),
+            ),
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -46,7 +64,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_mul_operation() {
+    fn test_dimension_mul() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionMulOperation::new(&left, &right).unwrap();

@@ -12,7 +12,7 @@
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
     DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionType, EffectClass, Layout, Operation, ProgramError, Shape, SliceBounds,
+    DimensionType, DynamicSliceBounds, EffectClass, Layout, Operation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -1134,7 +1134,7 @@ where
                 // Clamping is relative to the logical span, not the larger physical allocation window.
                 // Normalize once and reuse the same origin for validation and extraction.
                 let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
-                let start_type = if operation.bounds() == SliceBounds::Clamp {
+                let start_type = if operation.bounds() == DynamicSliceBounds::Clamp {
                     let constants =
                         lower_static_index_constants(&[0, 1, operation.strides()[axis]], block, context, location)?;
                     let difference = block

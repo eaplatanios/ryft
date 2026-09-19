@@ -1,7 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::sub::{Sub, SubOperation};
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -32,6 +33,26 @@ define_dimension_arithmetic_operation!(
     provider = SubOperation<DimensionType>,
 );
 
+impl Sub for DimensionValue {
+    fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| {
+            let left_variable = self.r#type().variable().to_string();
+            let right_variable = right.r#type().variable().to_string();
+            DimensionError::RequirementViolation {
+                message: format!(
+                    "{left_variable} >= {right_variable}; observed {left_variable}={}, {right_variable}={}",
+                    self.extent(),
+                    right.extent(),
+                ),
+            }
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -41,7 +62,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_sub_operation() {
+    fn test_dimension_sub() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionSubOperation::new(&left, &right).unwrap();

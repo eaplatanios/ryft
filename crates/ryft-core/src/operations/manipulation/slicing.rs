@@ -1251,11 +1251,9 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// How a dynamic slice resolves its start coordinates against the input's logical extents.
+/// Determines how a [`DynamicSliceOperation`] resolves its start coordinates against the input's logical extents.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SliceBounds {
+pub enum DynamicSliceBounds {
     /// Clamp each start so the entire requested window fits. The window itself must fit the input.
     Clamp,
 
@@ -1267,12 +1265,11 @@ pub enum SliceBounds {
 pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 
 /// [`Operation`] that extracts a sub-array at runtime start indices. The [`ArrayType`] form stores its sizes and
-/// accepts scalar-array starts with clamping and unit strides; refer to [`DynamicSlice::dynamic_slice`]. The
-/// [`ArrayIrType`] form accepts dimension starts and sizes, positive static strides, and a [`SliceBounds`] policy;
-/// refer to [`DynamicSlice`]. The homogeneous [`MemberTransposableOperation`] rule adds to the selected block of an
-/// enclosing reference accumulator without constructing a dense zero gradient. It currently reads and replaces the
-/// complete referent, which may copy storage in eager execution. Value accumulators use the ordinary projected
-/// transpose rule.
+/// accepts scalar-array starts with clamping and unit strides. The [`ArrayIrType`] form accepts dimension starts and
+/// sizes, positive static strides, and a [`DynamicSliceBounds`] policy. The homogeneous [`MemberTransposableOperation`]
+/// rule adds to the selected block of an enclosing reference accumulator without constructing a dense zero gradient. It
+/// currently reads and replaces the complete referent, which may copy storage in eager execution. Value accumulators
+/// use the ordinary projected transpose rule. Refer to [`DynamicSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation<T: Type = ArrayType> {
     /// Refer to the documentation of [`sizes`](DynamicSliceOperation::<ArrayType>::sizes) for more information.
@@ -1282,7 +1279,7 @@ pub struct DynamicSliceOperation<T: Type = ArrayType> {
     strides: Vec<usize>,
 
     /// Refer to the documentation of [`bounds`](Self::bounds) for more information.
-    bounds: SliceBounds,
+    bounds: DynamicSliceBounds,
 
     /// Refer to the documentation of [`requires_runtime_assertion`](Self::requires_runtime_assertion)
     /// for more information.
@@ -1293,17 +1290,20 @@ pub struct DynamicSliceOperation<T: Type = ArrayType> {
 }
 
 impl<T: Type> DynamicSliceOperation<T> {
-    /// Returns whether starts are clamped or checked against the input's logical extents.
-    pub fn bounds(&self) -> SliceBounds {
+    /// Returns whether starts are clamped or checked against the input's logical extents
+    /// for this [`DynamicSliceOperation`].
+    #[inline]
+    pub fn bounds(&self) -> DynamicSliceBounds {
         self.bounds
     }
 
-    /// Returns whether execution must validate the mixed slice window against the input's logical extents. When
-    /// `true`, this operation carries an [`EffectClass::OrderedAssertion`]: an invalid window must report an error
-    /// even if its result is unused. When `false`, type inference requires a proof that every admitted window fits.
-    /// The homogeneous form proves that its stored sizes fit and clamps starts, so it never needs this assertion.
-    /// Mixed construction is conservative until
-    /// [`with_input_types`](DynamicSliceOperation::<ArrayIrType>::with_input_types) proves the window fits.
+    /// Returns whether execution must validate the mixed slice window against the input's logical extents. When `true`,
+    /// this operation carries an [`EffectClass::OrderedAssertion`] (i.e., an invalid window must report an error even
+    /// if its result is unused). When `false`, type inference requires a proof that every admitted window fits. The
+    /// homogeneous form proves that its stored sizes fit and clamps starts, so it never needs this assertion. Mixed
+    /// construction is conservative until [`with_input_types`](DynamicSliceOperation::<ArrayIrType>::with_input_types)
+    /// proves that the window fits.
+    #[inline]
     pub fn requires_runtime_assertion(&self) -> bool {
         self.requires_runtime_assertion
     }
@@ -1316,13 +1316,13 @@ impl DynamicSliceOperation<ArrayType> {
         Self {
             sizes,
             strides: Vec::new(),
-            bounds: SliceBounds::Clamp,
+            bounds: DynamicSliceBounds::Clamp,
             requires_runtime_assertion: false,
             marker: PhantomData,
         }
     }
 
-    /// Returns the size of the extracted slice along each input axis.
+    /// Returns the size of the extracted slice along each input axis for this [`DynamicSliceOperation`].
     #[inline]
     pub fn sizes(&self) -> &[usize] {
         self.sizes.as_slice()
@@ -1339,15 +1339,15 @@ impl DynamicSliceOperation<ArrayIrType> {
         Self {
             sizes: Vec::new(),
             strides: vec![1; rank],
-            bounds: SliceBounds::Checked,
+            bounds: DynamicSliceBounds::Checked,
             requires_runtime_assertion: true,
             marker: PhantomData,
         }
     }
 
     /// Returns a copy of this [`DynamicSliceOperation`] with its strides set to `strides`. The number of strides must
-    /// match the rank supplied to [`from_rank`](Self::from_rank), and every stride must be strictly positive;
-    /// otherwise, this function returns a [`TypeError`].
+    /// match the rank supplied to [`from_rank`](Self::from_rank), and every stride must be strictly positive.
+    /// Otherwise, this function returns a [`TypeError`].
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, TypeError> {
         if strides.len() != self.strides.len() {
             return Err(TypeError::invalid(format!(
@@ -1369,7 +1369,8 @@ impl DynamicSliceOperation<ArrayIrType> {
 
     /// Returns a copy of this [`DynamicSliceOperation`] with its bounds policy set to `bounds`. Changing the policy
     /// discards any previous proof that execution can omit its window assertion.
-    pub fn with_bounds(mut self, bounds: SliceBounds) -> Self {
+    #[inline]
+    pub fn with_bounds(mut self, bounds: DynamicSliceBounds) -> Self {
         self.bounds = bounds;
         self.requires_runtime_assertion = true;
         self
@@ -1380,7 +1381,9 @@ impl DynamicSliceOperation<ArrayIrType> {
     /// Type inference revalidates a discharged assertion, so replay cannot reuse a proof with wider input bounds.
     /// For example, an input extent of `10`, start in `[0, 3)`, size in `[0, 5)`, and unit stride prove that the
     /// exclusive limit is at most `6`. An input extent that may be smaller than `6` still requires a runtime check.
-    /// Under [`SliceBounds::Clamp`], only the maximum window span has to fit; starts are normalized at execution.
+    /// Under [`DynamicSliceBounds::Clamp`], only the maximum window span has to fit and starts are normalized at
+    /// execution time.
+    #[inline]
     pub fn with_input_types(mut self, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
         self.requires_runtime_assertion = true;
         self.infer_output_types(input_types, &[])?;
@@ -1388,14 +1391,14 @@ impl DynamicSliceOperation<ArrayIrType> {
         Ok(self)
     }
 
-    /// Returns the static stride applied along each sliced axis.
+    /// Returns the static stride applied along each sliced axis for this [`DynamicSliceOperation`].
     #[inline]
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
 
-    /// Returns whether all admitted starts and sizes fit the input's minimum extent, without assuming correlations between
-    /// independent dimension identities. Call only after the input kinds and counts have been validated.
+    /// Returns whether all admitted starts and sizes fit the input's minimum extent, without assuming correlations
+    /// between independent dimension identities. Call only after the input kinds and counts have been validated.
     fn has_proven_window(&self, input_types: &[ArrayIrType]) -> Result<bool, TypeError> {
         let input = <&ArrayType>::try_from(&input_types[0])?;
         for axis in 0..self.strides.len() {
@@ -1410,8 +1413,8 @@ impl DynamicSliceOperation<ArrayIrType> {
                 (maximum_size - 1).checked_mul(self.strides[axis]).and_then(|span| span.checked_add(1))
             };
             let maximum_start = match self.bounds {
-                SliceBounds::Clamp => Some(0),
-                SliceBounds::Checked => start.bounds().upper().and_then(|upper| upper.checked_sub(1)),
+                DynamicSliceBounds::Clamp => Some(0),
+                DynamicSliceBounds::Checked => start.bounds().upper().and_then(|upper| upper.checked_sub(1)),
             };
             let minimum_input = match input.dimension(axis) {
                 Dimension::Static(size) => size,
@@ -1430,18 +1433,22 @@ impl DynamicSliceOperation<ArrayIrType> {
 
     /// Adds the slice cotangent to a zero with the original input geometry. Every update is a point, so no scatter
     /// window dimension has to be static. `dimensions` supplies the cotangent extents, reusing retained size inputs
-    /// when available instead of staging new definitions of their dimension identities.
-    /// Positive strides make the logical coordinates unique. Physical padding and inactive updates remain the
-    /// responsibility of the existing bounded scatter lowering, rather than becoming extra logical updates here.
-    fn scatter_cotangent<V>(&self, zeros: &V, cotangent: &V, starts: &[V], dimensions: &[V]) -> Result<V, ProgramError>
-    where
-        V: Value<Type = ArrayIrType>
+    /// when available instead of staging new definitions of their dimension identities. Positive strides make the
+    /// logical coordinates unique. Physical padding and inactive updates remain the responsibility of the existing
+    /// bounded scatter lowering, rather than becoming extra logical updates here.
+    fn scatter_cotangent<
+        V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
             + DimensionToScalar
             + DimensionArithmetic
             + ValueProjection<ArrayType, Projected: Add + Mul + Concatenate + Scatter + TransferToMemory>,
-        V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>,
-    {
+    >(
+        &self,
+        zeros: &V,
+        cotangent: &V,
+        starts: &[V],
+        dimensions: &[V],
+    ) -> Result<V, ProgramError> {
         let context = cotangent.dispatch_domain();
         let cotangent_type = cotangent.r#type();
         let cotangent_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
@@ -1449,6 +1456,7 @@ impl DynamicSliceOperation<ArrayIrType> {
         if rank == 0 {
             return Ok(cotangent.clone());
         }
+
         let dynamic_dimensions = cotangent_type
             .shape()
             .dimensions()
@@ -1456,7 +1464,8 @@ impl DynamicSliceOperation<ArrayIrType> {
             .zip(dimensions)
             .filter_map(|(dimension, value)| matches!(dimension, Dimension::Dynamic(_)).then_some(value.clone()))
             .collect::<Vec<_>>();
-        // Build the trailing index-vector axis directly; reshaping symbolic coordinate arrays would add an
+
+        // Build the trailing index-vector axis directly as reshaping symbolic coordinate arrays would add an
         // unnecessary element-count proof when this pullback is specialized or batched.
         let mut query_shape = cotangent_type.shape().dimensions().to_vec();
         query_shape.push(Dimension::Static(1));
@@ -1465,7 +1474,7 @@ impl DynamicSliceOperation<ArrayIrType> {
         let mut coordinates = Vec::with_capacity(rank);
         for axis in 0..rank {
             let step = context.dimension_constant(self.strides[axis])?;
-            let start = if self.bounds == SliceBounds::Clamp {
+            let start = if self.bounds == DynamicSliceBounds::Clamp {
                 // `min(size, 1)` makes the span zero for empty windows without a data-dependent branch.
                 let span = dimensions[axis]
                     .dimension_saturating_sub(&one)?
@@ -1496,6 +1505,8 @@ impl DynamicSliceOperation<ArrayIrType> {
         )?))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type> Display for DynamicSliceOperation<T>
 where
@@ -2000,7 +2011,7 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
         let sizes = &input_types[1 + input_type.rank()..];
         for (axis, (start, size)) in starts.iter().zip(sizes).enumerate() {
             let start = <&DimensionType>::try_from(start)?.bounds().lower();
-            let start = if self.bounds == SliceBounds::Clamp { 0 } else { start };
+            let start = if self.bounds == DynamicSliceBounds::Clamp { 0 } else { start };
             let size = <&DimensionType>::try_from(size)?.bounds().lower();
             // Bounds can disprove a slice even before its dimension inputs become concrete. Wider valid ranges
             // retain the runtime assertion because separate identities cannot prove the joint bounds relation.
@@ -2059,7 +2070,7 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("strides", format_args!("{:?}", self.strides))?;
-            operation.field("bounds", if self.bounds == SliceBounds::Clamp { "clamp" } else { "checked" })?;
+            operation.field("bounds", if self.bounds == DynamicSliceBounds::Clamp { "clamp" } else { "checked" })?;
             operation.field("requires_runtime_assertion", self.requires_runtime_assertion)
         })
     }
@@ -2317,7 +2328,7 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 ///
 /// With dimension inputs, the result sizes may vary at runtime. Starts are non-negative dimensions. By default every
 /// selected element must lie within the input, and an empty axis permits a start at its end. Explicit
-/// [`SliceBounds::Clamp`] moves the start so the requested window fits without shrinking it.
+/// [`DynamicSliceBounds::Clamp`] moves the start so the requested window fits without shrinking it.
 /// Positive static strides select `start + i * stride`, for `0 <= i < size`. Invalid runtime bounds remain observable
 /// even when the result is unused. The output preserves memory and inferred sharding. An identity slice preserves
 /// the input layout; other slices use a fresh dense layout. Array tangents follow the same slice. Reverse mode retains
@@ -2402,7 +2413,7 @@ pub trait DynamicSlice: Sized {
     where
         Self: Value<Type = ArrayIrType>,
     {
-        self.dynamic_slice_with_bounds(start_indices, sizes, strides, SliceBounds::Checked)
+        self.dynamic_slice_with_bounds(start_indices, sizes, strides, DynamicSliceBounds::Checked)
     }
 
     /// Extracts a dimension-sized window using the provided bounds policy. `Clamp` moves the origin without changing
@@ -2412,7 +2423,7 @@ pub trait DynamicSlice: Sized {
         start_indices: &[Self],
         sizes: &[Self],
         strides: &[usize],
-        bounds: SliceBounds,
+        bounds: DynamicSliceBounds,
     ) -> Result<Self, ProgramError>
     where
         Self: Value<Type = ArrayIrType>;
@@ -2588,7 +2599,7 @@ impl DynamicSlice for ArrayType {
         _start_indices: &[Self],
         _sizes: &[Self],
         _strides: &[usize],
-        _bounds: SliceBounds,
+        _bounds: DynamicSliceBounds,
     ) -> Result<Self, ProgramError> {
         // The trait restricts this function to `Value<Type = ArrayIrType>`, which this type cannot implement.
         unreachable!("dimension inputs require a mixed array value")
@@ -2614,7 +2625,7 @@ impl DynamicSlice for Array {
         _start_indices: &[Self],
         _sizes: &[Self],
         _strides: &[usize],
-        _bounds: SliceBounds,
+        _bounds: DynamicSliceBounds,
     ) -> Result<Self, ProgramError> {
         // The trait restricts this function to `Value<Type = ArrayIrType>`, which this type cannot implement.
         unreachable!("dimension inputs require a mixed array value")
@@ -2637,7 +2648,7 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
         start_indices: &[Self],
         sizes: &[Self],
         strides: &[usize],
-        policy: SliceBounds,
+        policy: DynamicSliceBounds,
     ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let rank = input.r#type().rank();
@@ -2681,7 +2692,7 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
                         })?
                 };
                 let input_size = input.dimension_size(axis)?;
-                if policy == SliceBounds::Clamp && span <= input_size {
+                if policy == DynamicSliceBounds::Clamp && span <= input_size {
                     *start = (*start).min(input_size - span);
                 }
                 let limit = start.checked_add(span).ok_or_else(|| {
@@ -2733,7 +2744,7 @@ where
         start_indices: &[Self],
         sizes: &[Self],
         strides: &[usize],
-        policy: SliceBounds,
+        policy: DynamicSliceBounds,
     ) -> Result<Self, ProgramError>
     where
         Self: Value<Type = ArrayIrType>,
@@ -6857,7 +6868,7 @@ mod tests {
         assert!(!operation.requires_runtime_assertion());
         assert_eq!(operation.effects().classes(), EffectClasses::NONE);
         assert!(operation.clone().with_strides(vec![1]).unwrap().requires_runtime_assertion());
-        assert!(operation.clone().with_bounds(SliceBounds::Clamp).requires_runtime_assertion());
+        assert!(operation.clone().with_bounds(DynamicSliceBounds::Clamp).requires_runtime_assertion());
         let mut wider = input_types.clone();
         wider[1] = DimensionType::new("start", DimensionBounds::new(0, Some(4)).unwrap()).into();
         assert_eq!(
@@ -6867,9 +6878,9 @@ mod tests {
                     .to_string(),
             ))
         );
-        let clamped = operation.with_bounds(SliceBounds::Clamp).with_input_types(&wider).unwrap();
+        let clamped = operation.with_bounds(DynamicSliceBounds::Clamp).with_input_types(&wider).unwrap();
         assert!(!clamped.requires_runtime_assertion());
-        assert_eq!(clamped.bounds(), SliceBounds::Clamp);
+        assert_eq!(clamped.bounds(), DynamicSliceBounds::Clamp);
     }
 
     #[test]

@@ -9009,7 +9009,7 @@ mod tests {
                 DynamicSliceOperation::<ArrayIrType>::from_rank(1)
                     .with_strides(vec![2])
                     .unwrap()
-                    .with_bounds(ryft_core::SliceBounds::Clamp),
+                    .with_bounds(ryft_core::DynamicSliceBounds::Clamp),
                 Vec::new(),
                 vec![input, start, size],
                 None,

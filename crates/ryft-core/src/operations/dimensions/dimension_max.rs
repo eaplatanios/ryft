@@ -1,6 +1,7 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
 /// Canonical operation name for [`DimensionMaxOperation`].
 pub const DIMENSION_MAX_OPERATION_NAME: &str = "dimension_max";
@@ -40,6 +41,15 @@ define_dimension_arithmetic_operation!(
         fn(other);
     },
 );
+
+impl DimensionMax for DimensionValue {
+    fn dimension_max(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionMaxOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(result_type, self.extent().max(right.extent()))?)
+    }
+}
 
 #[cfg(test)]
 mod tests {

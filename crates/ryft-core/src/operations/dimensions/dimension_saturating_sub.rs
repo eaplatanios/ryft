@@ -1,6 +1,7 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -46,6 +47,15 @@ define_dimension_arithmetic_operation!(
     },
 );
 
+impl DimensionSaturatingSub for DimensionValue {
+    fn dimension_saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionSaturatingSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(result_type, self.extent().saturating_sub(right.extent()))?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -55,7 +65,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_saturating_sub_operation() {
+    fn test_dimension_saturating_sub() {
         let left = DimensionType::new("left", DimensionBounds::new(1, Some(5)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(2, Some(9)).unwrap());
         let operation = DimensionSaturatingSubOperation::new(&left, &right).unwrap();

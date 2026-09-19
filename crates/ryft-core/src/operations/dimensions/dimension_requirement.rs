@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable};
 use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -616,6 +616,32 @@ impl AbstractDimensionValue {
     #[inline]
     fn maximum(&self) -> usize {
         self.exact.unwrap_or_else(|| self.bounds.upper().map_or(usize::MAX, |upper| upper - 1))
+    }
+}
+
+impl DimensionRequirement for DimensionValue {
+    fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
+        DimensionRequirementOperation::equal(self.r#type().as_ref(), right.r#type().as_ref())
+            .evaluate_extents(self.extent(), Some(right.extent()))
+            .map_err(Into::into)
+    }
+
+    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
+        DimensionRequirementOperation::less_than_or_equal(self.r#type().as_ref(), right.r#type().as_ref())
+            .evaluate_extents(self.extent(), Some(right.extent()))
+            .map_err(Into::into)
+    }
+
+    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
+        DimensionRequirementOperation::divisible_by(self.r#type().as_ref(), right.r#type().as_ref())
+            .evaluate_extents(self.extent(), Some(right.extent()))
+            .map_err(Into::into)
+    }
+
+    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
+        DimensionRequirementOperation::bounds(self.r#type().as_ref(), bounds)
+            .evaluate_extents(self.extent(), None)
+            .map_err(Into::into)
     }
 }
 

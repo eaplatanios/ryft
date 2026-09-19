@@ -1,7 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
 /// Canonical operation name for [`DimensionAddOperation`].
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
@@ -34,6 +35,24 @@ define_dimension_arithmetic_operation!(
     },
     provider = AddOperation<DimensionType>,
 );
+
+impl Add for DimensionValue {
+    fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while adding dimensions with operands {}={}, {}={}",
+                self.r#type().variable(),
+                self.extent(),
+                right.r#type().variable(),
+                right.extent(),
+            ),
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
+}
 
 #[cfg(test)]
 mod tests {

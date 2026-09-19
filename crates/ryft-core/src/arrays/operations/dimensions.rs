@@ -1,8 +1,8 @@
 //! Array-universe implementations of the dimension operation family contracts.
 //!
-//! First-class dimensions execute as checked host integers, project through the mixed array IR, and batch only as
-//! replicated values. This module also owns the explicit dimension-to-array and array-to-dimension gateways and
-//! concrete reference-array dimension-size queries.
+//! First-class dimensions project through the mixed array IR and batch only as replicated values. This module owns
+//! standard operator wrappers, the array-to-dimension gateway, and concrete reference-array dimension-size queries.
+//! Checked host-integer capability implementations live beside their dimension operation definitions.
 
 // TODO(eaplatanios): Review this module.
 
@@ -13,18 +13,17 @@ use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+use crate::arrays::types::dimensions::{DimensionType, DimensionVariable};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
-use crate::operations::dimensions::checked_power;
 use crate::operations::{
     Add, DIMENSION_SIZE_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation,
     DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
     DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirement, DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
-    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
+    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
 };
 use crate::programs::{Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -82,151 +81,6 @@ impl_dimension_operation_lift!(
     DimensionRequirementOperation,
 );
 
-impl Add for DimensionValue {
-    fn add(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
-            message: format!(
-                "dimension arithmetic overflow while adding dimensions with operands {}={}, {}={}",
-                self.r#type().variable(),
-                self.extent(),
-                right.r#type().variable(),
-                right.extent(),
-            ),
-        })?;
-        Ok(Self::new(result_type, extent)?)
-    }
-}
-
-impl Sub for DimensionValue {
-    fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
-            DimensionError::RequirementViolation {
-                message: format!(
-                    "{left_variable} >= {right_variable}; observed {left_variable}={}, {right_variable}={}",
-                    self.extent(),
-                    right.extent(),
-                ),
-            }
-        })?;
-        Ok(Self::new(result_type, extent)?)
-    }
-}
-
-impl DimensionSaturatingSub for DimensionValue {
-    fn dimension_saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionSaturatingSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        Ok(Self::new(result_type, self.extent().saturating_sub(right.extent()))?)
-    }
-}
-
-impl Mul for DimensionValue {
-    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMulOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
-            message: format!(
-                "dimension arithmetic overflow while multiplying dimensions with operands {}={}, {}={}",
-                self.r#type().variable(),
-                self.extent(),
-                right.r#type().variable(),
-                right.extent(),
-            ),
-        })?;
-        Ok(Self::new(result_type, extent)?)
-    }
-}
-
-impl DimensionPow for DimensionValue {
-    fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionPowOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        let extent =
-            checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
-                message: format!(
-                    "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
-                     {}={}, {}={}",
-                    self.r#type().variable(),
-                    self.extent(),
-                    right.r#type().variable(),
-                    right.extent(),
-                ),
-            })?;
-        Ok(Self::new(result_type, extent)?)
-    }
-}
-
-impl Div for DimensionValue {
-    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionDivFloorOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        if right.extent() == 0 {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
-            return Err(DimensionError::RequirementViolation {
-                message: format!(
-                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
-                    self.extent(),
-                    right.extent(),
-                ),
-            }
-            .into());
-        }
-        Ok(Self::new(result_type, self.extent() / right.extent())?)
-    }
-}
-
-impl Rem for DimensionValue {
-    fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionRemOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        if right.extent() == 0 {
-            let left_variable = self.r#type().variable().to_string();
-            let right_variable = right.r#type().variable().to_string();
-            return Err(DimensionError::RequirementViolation {
-                message: format!(
-                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
-                    self.extent(),
-                    right.extent(),
-                ),
-            }
-            .into());
-        }
-        Ok(Self::new(result_type, self.extent() % right.extent())?)
-    }
-}
-
-impl DimensionMin for DimensionValue {
-    fn dimension_min(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMinOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        Ok(Self::new(result_type, self.extent().min(right.extent()))?)
-    }
-}
-
-impl DimensionMax for DimensionValue {
-    fn dimension_max(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMaxOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
-        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
-        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-        Ok(Self::new(result_type, self.extent().max(right.extent()))?)
-    }
-}
-
 /// Implements one panicking standard operator as sugar for a fallible [`DimensionValue`] capability.
 macro_rules! impl_dimension_operator {
     // This branch supports every owned/borrowed operand combination by delegating to one borrowed capability method.
@@ -275,32 +129,6 @@ impl_dimension_operator!(Mul, mul, Mul, mul);
 impl_dimension_operator!(Div, div, Div, div);
 impl_dimension_operator!(Rem, rem, Rem, rem);
 
-impl DimensionRequirement for DimensionValue {
-    fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::equal(self.r#type().as_ref(), right.r#type().as_ref())
-            .evaluate_extents(self.extent(), Some(right.extent()))
-            .map_err(Into::into)
-    }
-
-    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::less_than_or_equal(self.r#type().as_ref(), right.r#type().as_ref())
-            .evaluate_extents(self.extent(), Some(right.extent()))
-            .map_err(Into::into)
-    }
-
-    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::divisible_by(self.r#type().as_ref(), right.r#type().as_ref())
-            .evaluate_extents(self.extent(), Some(right.extent()))
-            .map_err(Into::into)
-    }
-
-    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::bounds(self.r#type().as_ref(), bounds)
-            .evaluate_extents(self.extent(), None)
-            .map_err(Into::into)
-    }
-}
-
 /// Implements the composite dimension arithmetic capability for eager composite values, which have no context to
 /// stage into and therefore project both operands, apply the member capability, and inject the result back.
 macro_rules! impl_composite_dimension_arithmetic {
@@ -337,13 +165,6 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayI
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
         let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
         Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
-    }
-}
-
-impl DimensionToScalar<Array> for DimensionValue {
-    fn to_scalar(&self) -> Result<Array, ProgramError> {
-        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
-        Array::scalar(i64::try_from(self.extent()).unwrap())
     }
 }
 
@@ -435,7 +256,7 @@ impl DimensionSize<usize> for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::types::dimensions::DimensionBounds;
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionError};
     use crate::contexts::EagerContext;
     use crate::tracing::Trace;
 

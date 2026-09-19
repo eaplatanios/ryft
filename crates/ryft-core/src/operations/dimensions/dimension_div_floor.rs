@@ -1,7 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::div::{Div, DivOperation};
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -29,6 +30,27 @@ define_dimension_arithmetic_operation!(
     provider = DivOperation<DimensionType>,
 );
 
+impl Div for DimensionValue {
+    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionDivFloorOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        if right.extent() == 0 {
+            let left_variable = self.r#type().variable().to_string();
+            let right_variable = right.r#type().variable().to_string();
+            return Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
+                    self.extent(),
+                    right.extent(),
+                ),
+            }
+            .into());
+        }
+        Ok(Self::new(result_type, self.extent() / right.extent())?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -39,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_div_floor_operation() {
+    fn test_dimension_div_floor() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionDivFloorOperation::new(&left, &right).unwrap();

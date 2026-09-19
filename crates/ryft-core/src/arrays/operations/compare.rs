@@ -18,22 +18,6 @@ use crate::arrays::types::dimensions::DimensionType;
 use crate::operations::{Compare, ComparisonDirection, ElementType};
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
-// TODO(eaplatanios): Review this.
-
-impl Compare<Array> for DimensionValue {
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
-        let result = match direction {
-            ComparisonDirection::Equal => self.extent() == rhs.extent(),
-            ComparisonDirection::NotEqual => self.extent() != rhs.extent(),
-            ComparisonDirection::LessThan => self.extent() < rhs.extent(),
-            ComparisonDirection::LessThanOrEqual => self.extent() <= rhs.extent(),
-            ComparisonDirection::GreaterThan => self.extent() > rhs.extent(),
-            ComparisonDirection::GreaterThanOrEqual => self.extent() >= rhs.extent(),
-        };
-        Array::scalar(result)
-    }
-}
-
 impl<A: Value<Type = ArrayType>> Compare for ArrayIrValue<A>
 where
     DimensionValue: Compare<A>,

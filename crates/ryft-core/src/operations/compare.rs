@@ -2,7 +2,8 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType,
+    DimensionValue,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -314,6 +315,22 @@ where
             .dispatch_domain()
             .bind(CompareOperation::new(direction), Vec::new(), &[self.value().clone(), rhs.value().clone()])?
             .remove(0))
+    }
+}
+
+// TODO(eaplatanios): Review this.
+
+impl Compare<Array> for DimensionValue {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
+        let result = match direction {
+            ComparisonDirection::Equal => self.extent() == rhs.extent(),
+            ComparisonDirection::NotEqual => self.extent() != rhs.extent(),
+            ComparisonDirection::LessThan => self.extent() < rhs.extent(),
+            ComparisonDirection::LessThanOrEqual => self.extent() <= rhs.extent(),
+            ComparisonDirection::GreaterThan => self.extent() > rhs.extent(),
+            ComparisonDirection::GreaterThanOrEqual => self.extent() >= rhs.extent(),
+        };
+        Array::scalar(result)
     }
 }
 

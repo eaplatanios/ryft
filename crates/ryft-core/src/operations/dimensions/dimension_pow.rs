@@ -1,9 +1,9 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
+use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
+use crate::programs::{Operation, ProgramError, Typed};
 
-// TODO(eaplatanios): Review this module.
-
+// TODO(eaplatanios): Move this to this module.
 use super::checked_power;
 
 /// Canonical operation name for [`DimensionPowOperation`].
@@ -13,12 +13,13 @@ define_dimension_arithmetic_operation!(
     /// Checked dimension-exponentiation operation used by [`DimensionPow`].
     ///
     /// Refer to [`DimensionPow`] for semantic details and an example.
-    DimensionPowOperation, DIMENSION_POW_OPERATION_NAME,
-    DimensionPow, dimension_pow,
+    DimensionPowOperation,
+    DIMENSION_POW_OPERATION_NAME,
+    DimensionPow,
+    dimension_pow,
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} ^ {}", left.variable(), right.variable())
     },
-    // Derives sound bounds for checked dimension exponentiation and reports whether runtime overflow remains possible.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
@@ -51,7 +52,7 @@ define_dimension_arithmetic_operation!(
         Ok((bounds, requires_runtime_assertion))
     },
     capability = {
-        /// Raises one runtime dimension to another dimension's power using checked integer exponentiation.
+        /// Raises one [`DimensionValue`] to another [`DimensionValue`]'s power using checked integer exponentiation.
         ///
         /// # Example
         ///
@@ -64,10 +65,30 @@ define_dimension_arithmetic_operation!(
         /// # }
         /// ```
         trait;
-        /// Returns `self` raised to the nonnegative integer power `right`.
-        fn(right);
+        /// Returns `self` raised to the non-negative integer power `other`.
+        fn(other);
     },
 );
+
+impl DimensionPow for DimensionValue {
+    fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionPowOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent =
+            checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+                message: format!(
+                    "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
+                     {}={}, {}={}",
+                    self.r#type().variable(),
+                    self.extent(),
+                    right.r#type().variable(),
+                    right.extent(),
+                ),
+            })?;
+        Ok(Self::new(result_type, extent)?)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -78,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_pow_operation() {
+    fn test_dimension_pow() {
         let base = DimensionType::new("base", DimensionBounds::new(0, Some(3)).unwrap());
         let exponent = DimensionType::new("exponent", DimensionBounds::new(0, Some(3)).unwrap());
         let operation = DimensionPowOperation::new(&base, &exponent).unwrap();
