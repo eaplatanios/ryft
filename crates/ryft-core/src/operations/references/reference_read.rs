@@ -1,7 +1,3 @@
-//! Generic immutable reference read operation and its value-level capability.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -32,12 +28,10 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::forwarded_tangent;
-
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
 
-/// Reads the current referent snapshot from a reference in the enclosing type universe `U`.
+/// Reads the current referent value from a reference in the enclosing type universe `U`.
 #[derive(Clone, Debug)]
 pub struct ReferenceReadOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
 
@@ -45,6 +39,13 @@ impl<T: Type, U: Type> ReferenceReadOperation<T, U> {
     /// Creates a new [`ReferenceReadOperation`].
     pub const fn new() -> Self {
         Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Default for ReferenceReadOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -57,10 +58,8 @@ impl<T: Type, U: Type> Display for ReferenceReadOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceReadOperation<T, U>
+impl<T: Type, U: Type + From<T>> Operation for ReferenceReadOperation<T, U>
 where
-    T: Type,
-    U: Type + From<T>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
 {
     type Type = U;
@@ -96,13 +95,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceReadOperation<T, U>
-where
+impl<
     T: Type,
     U: Type,
-    ReferenceReadOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
     P: ReferenceDischargePolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceReadOperation<T, U>
+where
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -116,12 +116,10 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceReadOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceRead<C::Value>>> InterpretableOperation<C>
+    for ReferenceReadOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceReadOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceRead<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -134,31 +132,23 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceReadOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceReadOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceReadOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceReadOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceReadOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // A read yields the packed referent, batched at the reference's own axis (or replicated with the reference).
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // A read yields the packed referent, batched at the reference's own axis (or replicated with the reference).
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![P::batch(
             context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
@@ -168,43 +158,44 @@ where
     }
 }
 
-impl<T, U, C> DifferentiableOperation<C> for ReferenceReadOperation<T, U>
+impl<T: Type, U: DifferentiableType, C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>>
+    DifferentiableOperation<C> for ReferenceReadOperation<T, U>
 where
-    T: Type,
-    U: DifferentiableType,
     ReferenceReadOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
 {
-    // Reading a reference reads its tangent reference alongside. A plumbing reference (i.e., a reference dual whose
-    // tangent is a symbolic zero) carries no tangent reference, so the value read from it has a symbolic zero tangent.
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Reading a reference reads its tangent reference alongside. A plumbing reference (i.e., a reference dual
+        // whose tangent is a symbolic zero) carries no tangent reference, so the value read from it has a symbolic
+        // zero tangent.
         check_count!("input", inputs, 1, ProgramError);
         let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
-            Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
-        })?])
+        Ok(vec![match inputs[0].tangent() {
+            MaybeZero::Value(reference) => {
+                let tangent = context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0);
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal)?,
+        }])
     }
 }
 
-impl<T, U, V, O> TransposableOperation<V, O> for ReferenceReadOperation<T, U>
-where
+impl<
     T: Type,
     U: DifferentiableType + ReferenceMemberType,
-    ReferenceReadOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + ResidualZeroProvider<U, Operation = O>
         + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>,
+> TransposableOperation<V, O> for ReferenceReadOperation<T, U>
+where
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
-    // A read is the identity map from the referenced state to its result, so its transpose accumulates the result's
-    // cotangent into the cotangent reference of the read root, viewed exactly as the operand views it. The reference
-    // operand carries no value cotangent of its own; its state cotangent lives in that accumulator.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -213,6 +204,9 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // A read is the identity map from the referenced state to its output, so its transpose accumulates the output's
+        // cotangent into the cotangent reference of the read root, viewed exactly as the input views it. The reference
+        // input carries no value cotangent of its own; its state cotangent lives in that accumulator.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -224,7 +218,7 @@ where
     }
 }
 
-/// Reads an immutable snapshot from a reference value.
+/// Capability to read an immutable snapshot from a reference value.
 pub trait ReferenceRead<Output = Self>: Sized {
     /// Returns the reference's current value as an immutable snapshot.
     fn read(&self) -> Result<Output, ProgramError>;
@@ -232,18 +226,40 @@ pub trait ReferenceRead<Output = Self>: Sized {
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValue<A> {
     fn read(&self) -> Result<Self, ProgramError> {
-        ReferenceReadOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let operation = ReferenceReadOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Array(reference.read()?))
     }
 }
 
-impl<V> ReferenceRead<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceRead<V> for V
+{
+    fn read(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+            >,
+        > + ValueProjection<ArrayType>,
+> ReferenceRead<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
 {
     fn read(&self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
         self.value()
@@ -252,19 +268,6 @@ where
             .remove(0)
             .into_projected()
             .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
-{
-    fn read(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
     }
 }
 
@@ -292,11 +295,12 @@ mod tests {
 
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
-    type TestIrRead = ReferenceReadOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceReadOperation = ReferenceReadOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_read() {
         let operation = Read::new();
+        assert_eq!(Read::default().to_string(), operation.to_string());
         assert_eq!(operation.name(), REFERENCE_READ_OPERATION_NAME);
         assert_eq!(operation.to_string(), REFERENCE_READ_OPERATION_NAME);
         assert_eq!(
@@ -352,7 +356,7 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::F32);
         let dimension_type = DimensionType::new("n", DimensionBounds::unbounded());
         check_operation_type_inference!(
-            operation = TestIrRead::new(),
+            operation = TestIrReferenceReadOperation::new(),
             cases = [
                 {
                     input_types = [ArrayIrType::Reference(ReferenceType::new(array_type.clone()))],
@@ -379,7 +383,7 @@ mod tests {
         // A read returns a snapshot of the current referent and leaves the reference live.
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-                &TestIrRead::new(),
+                &TestIrReferenceReadOperation::new(),
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&reference),
@@ -391,7 +395,7 @@ mod tests {
         // Only reference members can be read.
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-                &TestIrRead::new(),
+                &TestIrReferenceReadOperation::new(),
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&initial),
@@ -414,7 +418,7 @@ mod tests {
             initial_bytes.clone(),
         )));
         let read = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrRead::new(),
+            &TestIrReferenceReadOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&reference),
@@ -428,7 +432,7 @@ mod tests {
         // Reading a consumed reference fails against the shared allocation state.
         reference.clone().freeze().unwrap();
         let error = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrRead::new(),
+            &TestIrReferenceReadOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&reference),
@@ -449,17 +453,18 @@ mod tests {
         // leaves untouched.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let outputs = executing
-            .fold_or_residualize(TestIrRead::new(), Vec::new(), std::slice::from_ref(&reference))
+            .fold_or_residualize(TestIrReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(&reference))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&value));
         assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
 
-        // Under the `Stage` placement the read stays residual regardless of operand knowledge, so eager specialization
+        // Under the `Stage` placement the read stays residual regardless of input knowledge, so eager specialization
         // never observes live reference state.
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
-        let outputs = staging.fold_or_residualize(TestIrRead::new(), Vec::new(), &[reference]).unwrap();
+        let outputs =
+            staging.fold_or_residualize(TestIrReferenceReadOperation::new(), Vec::new(), &[reference]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
 
@@ -470,7 +475,7 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = TestIrRead::new(),
+            operation = TestIrReferenceReadOperation::new(),
             cases = [
                 {
                     inputs = [(@known, known)],
@@ -551,14 +556,16 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // `r = new(v); y = read(r)`: the read is the identity from the referenced state to its result, so its transpose
+        // `r = new(v); y = read(r)`: the read is the identity from the referenced state to its output, so its transpose
         // accumulates `ȳ` into the cotangent reference of the read root, which the allocation then freezes into `v̄`.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar_type.clone());
         let reference = builder
             .add_instruction(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![initial], None)
             .unwrap()[0];
-        let output = builder.add_instruction(TestIrRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = builder
+            .add_instruction(TestIrReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -578,15 +585,15 @@ mod tests {
             Ok(vec![TestIrValue::Array(Array::scalar(5.0_f32).unwrap())]),
         );
 
-        // The rule accumulates through the cotangent reference of its operand's root, which only a transposition
-        // context scoped to the read instruction can resolve, so a detached context rejects a live result cotangent.
+        // The rule accumulates through the cotangent reference of its input's root, which only a transposition
+        // context scoped to the read instruction can resolve, so a detached context rejects a live output cotangent.
         let inputs = [PartialValue::Unknown(reference_type)];
         let tracing = TracingContext::<TestIrValue, TestIrOperation>::new();
         let cotangent = tracing.input(scalar_type);
         let mut context = TranspositionContext::new(tracing);
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrRead::new().transpose(
+            TestIrReferenceReadOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -595,12 +602,12 @@ mod tests {
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "input 0 has no reference root in a transposition context that is not scoped to a \
-                    reference-carrying instruction",
+                               reference-carrying instruction",
         ));
 
-        // A symbolic zero result cotangent contributes nothing, so the rule never touches the cotangent reference.
+        // A symbolic zero output cotangent contributes nothing, so the rule never touches the cotangent reference.
         assert_eq!(
-            TestIrRead::new().transpose(
+            TestIrReferenceReadOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -623,7 +630,7 @@ mod tests {
         );
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
-        // An value operand denotes no allocation, so the rule reports what it expected instead of reading a value.
+        // A value input denotes no allocation, so the rule reports what it expected instead of reading a value.
         let pure: TestDischargeValue = ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4));
         assert_eq!(
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&pure)),
