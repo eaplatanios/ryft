@@ -1,18 +1,11 @@
-//! Checked conversion from ordinary scalar-array data into a first-class dimension value.
-//!
-//! The user-facing semantics and example live on [`DimensionFromScalar`]. The operation records the produced
-//! [`DimensionType`] directly so its identity and authoritative bounds remain one structural SSA definition.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType, DimensionValue,
-    DimensionVariable,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
+    DimensionValue, DimensionVariable,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -34,6 +27,8 @@ use crate::programs::{
     ProgramError, ProjectedValue, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
     ValueProjection,
 };
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
 pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
@@ -275,6 +270,62 @@ where
             .dispatch_domain()
             .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
+    }
+}
+
+impl DimensionFromScalar<DimensionValue> for Array {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(result);
+        DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
+        let (scalar, extent) = match self.r#type().data_type() {
+            DataType::I8 => {
+                let value = self.elements::<i8>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I16 => {
+                let value = self.elements::<i16>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I32 => {
+                let value = self.elements::<i32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::I64 => {
+                let value = self.elements::<i64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U8 => {
+                let value = self.elements::<u8>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U16 => {
+                let value = self.elements::<u16>()?[0];
+                (value.to_string(), Ok(usize::from(value)))
+            }
+            DataType::U32 => {
+                let value = self.elements::<u32>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            DataType::U64 => {
+                let value = self.elements::<u64>()?[0];
+                (value.to_string(), usize::try_from(value))
+            }
+            _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
+        };
+        let extent = extent.map_err(|_| ProgramError::InvalidArgument {
+            message: format!(
+                "`{}` scalar input must be a nonnegative host-representable extent but is {scalar}",
+                operation.name(),
+            ),
+        })?;
+        Ok(DimensionValue::new(operation.result_type().clone(), extent)?)
+    }
+}
+
+impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> DimensionFromScalar for ArrayIrValue<A> {
+    fn to_dimension(&self, result: DimensionVariable) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        Ok(Self::Dimension(<A as DimensionFromScalar<DimensionValue>>::to_dimension(array, result)?))
     }
 }
 

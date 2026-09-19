@@ -3,7 +3,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable};
+use crate::arrays::{
+    ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
+};
 use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -16,7 +18,7 @@ use crate::programs::{
     Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for an equality [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";
@@ -59,6 +61,13 @@ pub struct DimensionRequirementOperation {
 
     /// Expected right operand type for binary predicates.
     right: Option<DimensionType>,
+}
+
+impl<A: Value<Type = ArrayType>> From<DimensionRequirementOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionRequirementOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
 }
 
 impl DimensionRequirementOperation {

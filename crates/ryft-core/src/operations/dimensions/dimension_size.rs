@@ -1,15 +1,10 @@
-//! First-class extraction of an array axis extent.
-//!
-//! The user-facing semantics and example live on [`DimensionSize`]. The capability's output type lets concrete
-//! backends expose host shape metadata while composite program values produce first-class dimensions.
-
 use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType,
-    DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionError,
+    DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -24,10 +19,10 @@ use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
@@ -319,6 +314,34 @@ where
         }
 
         Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+    }
+}
+
+impl DimensionSize<usize> for Array {
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+        let axis = axis.into();
+        let position = axis.normalize(self.r#type().rank()).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {axis} is out of bounds for rank {}",
+                self.r#type().rank(),
+            ))
+        })?;
+        let r#type = self.r#type();
+        let dimension = &r#type.shape().dimensions()[position];
+        dimension.value().ok_or_else(|| {
+            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}",))
+                .into()
+        })
+    }
+}
+
+impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayIrValue<A> {
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {
+        let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let input_type = array.r#type();
+        let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
+        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
+        Ok(Self::Dimension(DimensionValue::new(operation.result_type().clone(), extent)?))
     }
 }
 

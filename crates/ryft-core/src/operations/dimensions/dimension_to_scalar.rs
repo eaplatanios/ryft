@@ -3,7 +3,8 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType, DimensionValue,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
+    DimensionValue,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -16,9 +17,10 @@ use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
+    ValueProjection,
 };
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical element type used when first-class dimensions become ordinary array data.
 ///
@@ -163,6 +165,24 @@ where
     }
 }
 
+impl DimensionToScalar<Array> for DimensionValue {
+    #[inline]
+    fn to_scalar(&self) -> Result<Array, ProgramError> {
+        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
+        Array::scalar(i64::try_from(self.extent()).unwrap())
+    }
+}
+
+impl<A: Value<Type = ArrayType>> DimensionToScalar for ArrayIrValue<A>
+where
+    DimensionValue: DimensionToScalar<A>,
+{
+    fn to_scalar(&self) -> Result<Self, ProgramError> {
+        let dimension = <Self as ValueProjection<DimensionType>>::projected(self)?;
+        Ok(Self::Array(<DimensionValue as DimensionToScalar<A>>::to_scalar(dimension)?))
+    }
+}
+
 impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for ProjectedValue<DimensionType, V>
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
@@ -174,14 +194,6 @@ where
             .dispatch_domain()
             .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
-    }
-}
-
-impl DimensionToScalar<Array> for DimensionValue {
-    #[inline]
-    fn to_scalar(&self) -> Result<Array, ProgramError> {
-        // `DimensionValue::new` enforces the portable extent ceiling, which is no greater than `i64::MAX`.
-        Array::scalar(i64::try_from(self.extent()).unwrap())
     }
 }
 
