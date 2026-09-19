@@ -1245,17 +1245,14 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`DynamicSliceOperation`].
 pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 
 /// [`Operation`] that extracts a statically shaped sub-array from its input at start indices that are computed at run
-/// time. Refer to the documentation of [`DynamicSlice`] for more information.
-///
-/// Its [`MemberTransposableOperation`] rule adds to the selected block of an enclosing reference accumulator without
-/// constructing a dense zero gradient. It currently reads and replaces the complete referent, which may copy storage in
-/// eager execution. Value accumulators use the ordinary projected transpose rule.
+/// time. Refer to the documentation of [`DynamicSlice`] for more information. Its [`MemberTransposableOperation`] rule
+/// adds to the selected block of an enclosing reference accumulator without constructing a dense zero gradient. It
+/// currently reads and replaces the complete referent, which may copy storage in eager execution. Value accumulators
+/// use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation {
     /// Refer to the documentation of [`sizes`](Self::sizes) for more information.
@@ -1282,6 +1279,8 @@ impl Display for DynamicSliceOperation {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for DynamicSliceOperation {
     type Type = ArrayType;
