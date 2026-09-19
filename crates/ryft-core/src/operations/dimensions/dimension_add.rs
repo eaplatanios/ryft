@@ -3,13 +3,11 @@ use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::parameters::Parameter;
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`DimensionAddOperation`].
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
 
 define_dimension_arithmetic_operation!(
-    /// Checked dimension-addition operation used by [`Add`].
+    /// Checked dimension-addition operation used by [`Add`] for [`DimensionValue`]s.
     DimensionAddOperation,
     DIMENSION_ADD_OPERATION_NAME,
     Add,
@@ -52,7 +50,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_add_operation() {
+    fn test_dimension_add() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
@@ -64,10 +62,7 @@ mod tests {
             DimensionValue::constant(7).unwrap().add(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             10,
         );
-    }
 
-    #[test]
-    fn test_dimension_add_program() {
         let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionAddOperation::new(&left_type, &right_type).unwrap();

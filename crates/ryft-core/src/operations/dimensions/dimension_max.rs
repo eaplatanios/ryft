@@ -2,8 +2,6 @@ use crate::arrays::{DimensionBounds, DimensionError, DimensionType};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`DimensionMaxOperation`].
 pub const DIMENSION_MAX_OPERATION_NAME: &str = "dimension_max";
 
@@ -11,12 +9,13 @@ define_dimension_arithmetic_operation!(
     /// Dimension-maximum operation used by [`DimensionMax`].
     ///
     /// Refer to [`DimensionMax`] for semantic details and an example.
-    DimensionMaxOperation, DIMENSION_MAX_OPERATION_NAME,
-    DimensionMax, dimension_max,
+    DimensionMaxOperation,
+    DIMENSION_MAX_OPERATION_NAME,
+    DimensionMax,
+    dimension_max,
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("max({}, {})", left.variable(), right.variable())
     },
-    // Derives sound bounds for total dimension maximum.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
@@ -24,7 +23,7 @@ define_dimension_arithmetic_operation!(
         Ok((bounds, false))
     },
     capability = {
-        /// Returns the larger of two runtime dimensions.
+        /// Returns the larger of two [`DimensionValue`]s.
         ///
         /// # Example
         ///
@@ -37,8 +36,8 @@ define_dimension_arithmetic_operation!(
         /// # }
         /// ```
         trait;
-        /// Returns `max(self, right)`.
-        fn(right);
+        /// Returns the larger value between `self` and `other`.
+        fn(other);
     },
 );
 
@@ -51,7 +50,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_max_operation() {
+    fn test_dimension_max() {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionMaxOperation::new(&left, &right).unwrap();
