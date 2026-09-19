@@ -23,10 +23,6 @@ use crate::programs::{
     RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Review from here onwards.
-
-use super::{align_stored_batch, stored_tangents, validate_input_types};
-
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
 
@@ -122,10 +118,9 @@ where
         let reference = inputs[0].try_as_reference("a reference to replace")?;
         let replacement = inputs[1].try_as_value("a replacement value")?.clone();
 
-        // The replacement must carry exactly the handle's referent. A universe whose write mechanics only require the
-        // replacement to fit inside the selected coordinates would otherwise perform a silent partial write, so the
-        // rule re-derives the input relationship its own inference already states.
-        validate_input_types(self, inputs)?;
+        // Rules can be called outside a validated program, so check the input types before changing reference state.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
         Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
     }
 }
@@ -162,11 +157,20 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The replacement is aligned with the reference's fixed batch axis before the packed swap, and the previous
-        // packed value is batched at that same axis.
         check_count!("input", inputs, 2, ProgramError);
-        let replacement =
-            align_stored_batch(context, driver, REFERENCE_SWAP_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
+        let replacement = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+            (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
+            (None, None) => inputs[1].clone(),
+            (None, Some(_)) => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{REFERENCE_SWAP_OPERATION_NAME}` cannot store a batched value into an unbatched reference; \
+                         pass the reference as a batched input instead",
+                    ),
+                });
+            }
+        };
         let previous = context
             .parent()
             .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?
@@ -187,12 +191,22 @@ impl_differentiable_operation! {
         > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
-            // The tangent reference is swapped exactly as the primal reference is, so the returned previous value pairs
-            // with the previous tangent contents. A plumbing reference returns its previous value with a symbolic zero
-            // tangent. The tangent pairing is resolved before either swap so that a rejected plumbing store leaves both
-            // references untouched.
+            // Swap the tangent state alongside the primal and pair their previous values and reject a live tangent
+            // without tangent storage before either reference can be changed.
             check_count!("input", inputs, 2, ProgramError);
-            let stored = stored_tangents(REFERENCE_SWAP_OPERATION_NAME, &inputs[0], &inputs[1])?;
+            let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
+                (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => None,
+                (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{REFERENCE_SWAP_OPERATION_NAME}` writes a live tangent into a reference that carries no \
+                             tangent; pass the reference as a differentiated input instead of capturing it",
+                        ),
+                    }
+                    .into());
+                }
+            };
             let previous = context
                 .primal()
                 .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?

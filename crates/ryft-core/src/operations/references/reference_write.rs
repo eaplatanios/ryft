@@ -1,5 +1,3 @@
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -24,8 +22,6 @@ use crate::programs::{
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
     TypeError, Typed, Value, ValueProjection,
 };
-
-use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceWriteOperation`].
 pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
@@ -80,8 +76,9 @@ where
         let replacement = <&T>::try_from(&input_types[1])?;
         if replacement != reference.referent() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_WRITE_OPERATION_NAME}` replacement type `{replacement}` must exactly match reference \
-                 referent type `{}`",
+                "`{}` replacement type `{}` must exactly match reference referent type `{}`",
+                REFERENCE_WRITE_OPERATION_NAME,
+                replacement,
                 reference.referent(),
             )));
         }
@@ -121,7 +118,10 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let reference = inputs[0].try_as_reference("a reference to write")?;
         let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-        validate_input_types(self, inputs)?;
+
+        // Rules can be called outside a validated program, so check the input types before changing reference state.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
         context.write(reference, replacement)?;
         Ok(Vec::new())
     }
@@ -160,10 +160,20 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The replacement is aligned with the reference's fixed batch axis before the packed store.
         check_count!("input", inputs, 2, ProgramError);
-        let replacement =
-            align_stored_batch(context, driver, REFERENCE_WRITE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
+        let replacement = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+            (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
+            (None, None) => inputs[1].clone(),
+            (None, Some(_)) => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{REFERENCE_WRITE_OPERATION_NAME}` cannot store a batched value into an unbatched reference; \
+                         pass the reference as a batched input instead",
+                    ),
+                });
+            }
+        };
         context
             .parent()
             .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?;
@@ -183,11 +193,22 @@ impl_differentiable_operation! {
         > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
-            // The replacement's tangent is stored into the tangent reference exactly as the primal replacement is
-            // stored into the primal reference. The tangent pairing is resolved before either store so that a rejected
-            // plumbing store leaves both references untouched.
+            // Store the replacement tangent alongside the primal replacement.
             check_count!("input", inputs, 2, ProgramError);
-            let stored = stored_tangents(REFERENCE_WRITE_OPERATION_NAME, &inputs[0], &inputs[1])?;
+            // Reject a live tangent without tangent storage before either reference can be changed.
+            let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
+                (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => None,
+                (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{REFERENCE_WRITE_OPERATION_NAME}` writes a live tangent into a reference that carries no \
+                             tangent; pass the reference as a differentiated input instead of capturing it",
+                        ),
+                    }
+                    .into());
+                }
+            };
             context
                 .primal()
                 .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
@@ -791,8 +812,8 @@ mod tests {
 
     #[test]
     fn test_reference_write_reference_discharge() {
-        // A policy with no accumulation capability replaces state through `write`, produces no old-value output, and
-        // marks the allocation mutated. Its `swap` path is an error, making accidental swap dispatch visible.
+        // A policy with no accumulation capability replaces state through `write`, produces no old-value output,
+        // and marks the allocation mutated. Its `swap` path is an error, making accidental swap dispatch visible.
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);

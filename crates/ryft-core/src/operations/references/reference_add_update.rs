@@ -1,5 +1,3 @@
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -24,8 +22,6 @@ use crate::programs::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType,
     ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
-
-use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceAddUpdateOperation`].
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
@@ -85,8 +81,9 @@ where
         let addition_output = &addition_outputs[0];
         if addition_output != reference.referent() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` addition output type `{addition_output}` must exactly match \
-                 reference referent type `{}`",
+                "`{}` addition output type `{}` must exactly match reference referent type `{}`",
+                REFERENCE_ADD_UPDATE_OPERATION_NAME,
+                addition_output,
                 reference.referent(),
             )));
         }
@@ -128,8 +125,10 @@ where
         let update = inputs[1].try_as_value("an update value")?.clone();
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
-        // this operation's own inference states and what a universe's addition alone does not guarantee.
-        validate_input_types(self, inputs)?;
+        // this operation's own inference states and what a universe's addition alone does not guarantee. Rules can be
+        // called outside a validated program, so check the input types before changing reference state.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
         context.accumulate(reference, update)?;
         Ok(Vec::new())
     }
@@ -168,10 +167,20 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The update is aligned with the reference's fixed batch axis before the packed accumulation.
+        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
         check_count!("input", inputs, 2, ProgramError);
-        let update =
-            align_stored_batch(context, driver, REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        let update = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+            (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
+            (None, None) => inputs[1].clone(),
+            (None, Some(_)) => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` cannot store a batched value into an unbatched \
+                         reference; pass the reference as a batched input instead",
+                    ),
+                });
+            }
+        };
         context
             .parent()
             .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&update).clone()])?;
@@ -188,12 +197,22 @@ impl_differentiable_operation! {
         C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
     {
         |operation, context, _driver, inputs| {
-            // Addition is linear, so the update's tangent is accumulated into the tangent reference exactly as the
-            // primal update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op
-            // and stages nothing. The tangent pairing is resolved before either accumulation so that a rejected
-            // plumbing store leaves both references untouched.
+            // Accumulate into the tangent reference alongside the primal as a zero update needs no tangent work, and
+            // reject a live tangent without tangent storage before either reference can be changed.
             check_count!("input", inputs, 2, ProgramError);
-            let stored = stored_tangents(REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
+            let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
+                (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => None,
+                (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` writes a live tangent into a reference that \
+                             carries no tangent; pass the reference as a differentiated input instead of capturing it",
+                        ),
+                    }
+                    .into());
+                }
+            };
             context
                 .primal()
                 .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
@@ -246,7 +265,7 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAddUpda
         check_count!("input", input_types, 2, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe",
             ),
         })
     }
@@ -267,16 +286,12 @@ impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUp
         check_count!("input", input_types, 2, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe",
             ),
         })
     }
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
-//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
-//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
-//  implementation constrains its target to `Operation<Type = T>` instead.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
     OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayType, ArrayIrType>> for O
 {
@@ -292,14 +307,12 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayTy
     }
 }
 
-/// Capability to add an update into the value stored by a reference in program order.
-///
-/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a [`Context`]
-/// project the referent of their reference type through [`ReferenceMemberType::referent`] and use the context's
-/// operation family to select and bind the update operation through [`OperationProvider`]. The selected operation
-/// may use a downstream payload, and a family without reference operations may reject construction. This capability
-/// supports arbitrary reference-aware type universes so reverse-mode differentiation can accumulate cotangents through
-/// it without depending on [`ArrayIrType`].
+/// Capability to add an update into the value stored by a reference in program order. Concrete values implement their
+/// runtime update semantics directly. Values whose dispatch domain is a [`Context`] project the referent of their
+/// reference type through [`ReferenceMemberType::referent`] and use the context's operation family to select and bind
+/// the update operation through [`OperationProvider`]. The selected operation may use a downstream payload, and a
+/// family without reference operations may reject construction. This capability supports arbitrary reference-aware type
+/// universes so reverse-mode differentiation can accumulate cotangents through it without depending on [`ArrayIrType`].
 pub trait ReferenceAddUpdate<Update = Self>: Sized {
     /// Adds `update` to the stored value in program order.
     fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
@@ -317,15 +330,18 @@ impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> Reference
 
 // Staged values delegate selection to their operation family over the referent of the reference being updated; a
 // value that is not a reference member of its universe has no referent and is rejected before any selection.
-impl<V: Value<Type: ReferenceMemberType>> ReferenceAddUpdate for V
-where
-    V::DispatchDomain: Context<
-        Operation: OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = <V::DispatchDomain as Domain>::Operation,
+impl<
+    V: Value<
+            Type: ReferenceMemberType,
+            DispatchDomain: Context<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = <V::DispatchDomain as Domain>::Operation,
+                >,
+            >,
         >,
-    >,
+> ReferenceAddUpdate for V
 {
     fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
         let reference_type = self.r#type();
@@ -404,8 +420,8 @@ mod tests {
             format!("ReferenceAddUpdateOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
         );
 
-        // An accumulation orders against other state effects, accumulates into its reference input, and aliases
-        // nothing.
+        // An accumulation orders against other state effects, accumulates into its reference input,
+        // and aliases nothing.
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),

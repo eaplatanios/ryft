@@ -4,8 +4,6 @@ use crate::operations::{Rem, RemOperation};
 use crate::parameters::Parameter;
 use crate::programs::{Operation, ProgramError, Typed, Value};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`DimensionRemOperation`].
 pub const DIMENSION_REM_OPERATION_NAME: &str = "dimension_rem";
 
@@ -24,7 +22,11 @@ define_dimension_arithmetic_operation!(
                 message: format!("{} > 0 is impossible from declared bounds", right.variable()),
             });
         }
-        let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
+        let bounds = if right.bounds().lower() > 0
+            && (left.variable() == right.variable() || left_maximum == 0 || right.extent() == Some(1))
+        {
+            DimensionBounds::new(0, Some(1))?
+        } else if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
             let remainder = left % right;
             DimensionBounds::new(remainder, remainder.checked_add(1))?
         } else {
@@ -101,10 +103,16 @@ impl std::ops::Rem<&DimensionValue> for &DimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
-    use crate::programs::{EffectClass, EffectClasses};
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionBounds, DimensionValue};
+    use crate::operations::assertions::AssertOperation;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};
 
     use super::*;
 
@@ -131,6 +139,22 @@ mod tests {
         let output = operation.infer_output_types(&[exact_left, exact_right], &[]).unwrap();
         assert_eq!(output[0].extent(), Some(0));
 
+        let positive = DimensionType::new("positive", DimensionBounds::new(1, None).unwrap());
+        let one = DimensionValue::constant(1).unwrap();
+        let zero = DimensionValue::constant(0).unwrap();
+        for (left, right) in
+            [(&positive, &positive), (&positive, one.r#type().as_ref()), (zero.r#type().as_ref(), &positive)]
+        {
+            assert_eq!(
+                DimensionRemOperation::new(left, right).unwrap().output_bounds(),
+                DimensionBounds::new(0, Some(1)).unwrap()
+            );
+        }
+        assert_eq!(
+            DimensionRemOperation::new(&maybe_zero, &maybe_zero).unwrap().output_bounds(),
+            DimensionBounds::new(0, Some(4)).unwrap(),
+        );
+
         assert_eq!(
             DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             1,
@@ -142,5 +166,67 @@ mod tests {
         assert_eq!((left.clone() % &right).extent(), 1);
         assert_eq!((&left % right.clone()).extent(), 1);
         assert_eq!((&left % &right).extent(), 1);
+    }
+    #[test]
+    fn test_dimension_rem_partial_evaluation_retains_unproven_congruence() {
+        let extent = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let four = DimensionValue::constant(4).unwrap();
+        let two = DimensionValue::constant(2).unwrap();
+        let multiplication = DimensionMulOperation::new(&extent, four.r#type().as_ref()).unwrap();
+        let product_type = multiplication
+            .infer_output_types(&[extent.clone(), four.r#type().into_owned()], &[])
+            .unwrap()
+            .remove(0);
+        let remainder = DimensionRemOperation::new(&product_type, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(extent.clone().into());
+        let four = builder.add_constant(ArrayIrValue::Dimension(four));
+        let two = builder.add_constant(ArrayIrValue::Dimension(two));
+        let zero = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
+        let product = builder.add_instruction(multiplication, Vec::new(), vec![input, four], None).unwrap()[0];
+        let remainder = builder.add_instruction(remainder, Vec::new(), vec![product, two], None).unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                Vec::new(),
+                vec![remainder, zero],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("product must be divisible by `2`"),
+                Vec::new(),
+                vec![predicate],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![product],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Intervals and identities do not reconstruct modular congruences, even though multiplying by four makes
+        // this assertion mathematically true. The general predicate remains an ordered runtime assertion.
+        let residual = program.partially_evaluate(&[PartialValue::Unknown(extent.into())]).unwrap();
+        assert_eq!(
+            residual.program().to_string(),
+            indoc! {r#"
+                lambda %0:dimension<extent ∈ [1, 9)> .
+                let %1:dimension<4> = const 4
+                    %2:dimension<2> = const 2
+                    %3:dimension<0> = const 0
+                    %4:dimension<extent * 4 ∈ [4, 33)> = dimension_mul %0 %1
+                    %5:dimension<extent * 4 % 2 ∈ [0, 2)> = dimension_rem %4 %2
+                    %6:bool[] = compare [direction=Equal] %5 %3
+                    () = assert [message="product must be divisible by `2`", labels=[]] %6
+                in (%4)
+            "#}
+            .trim(),
+        );
+        assert_eq!(residual.program().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 }

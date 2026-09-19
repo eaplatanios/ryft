@@ -1,124 +1,15 @@
 //! Reference operations for allocating, reading, updating, and consuming mutable state.
 //!
-//! Each operation module defines its type inference, effects, transform rules, and value-level capability. Shared
-//! helpers preserve input validation and reference state across reference discharge, batching, and differentiation.
+//! Each operation module defines its type inference, effects, transform rules, and value-level capability.
 //!
 //! Allocation, accumulation, and freezing use [`OperationProvider`](crate::programs::OperationProvider) requests with
 //! ordered input types to select an operation family's payload, including downstream alternatives. Reference-free
-//! families reject these requests with [`ProgramError::UnsupportedOperation`], while satisfying the provider bounds
+//! families reject these requests with
+//! [`UnsupportedOperation`](crate::programs::ProgramError::UnsupportedOperation), while satisfying the provider bounds
 //! required by generic differentiation. Reverse-mode transposition needs allocation and accumulation; gradient
 //! extraction also needs freezing.
 
 // TODO(eaplatanios): Review this module.
-
-use crate::batching::{BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
-use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiationDual, DifferentiationError};
-use crate::programs::{
-    MaybeZero, Operation, ProgramError, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceType, Type, Typed,
-    Value,
-};
-
-/// Re-derives one reference primitive's own type inference over the carriers it received, so that a rewrite acts only
-/// on inputs the operation itself accepts.
-///
-/// A [`Program`](crate::Program) built through a [`ProgramBuilder`](crate::ProgramBuilder) already ran this inference
-/// when the instruction was added, but a rule invoked outside a checked program replay has no such guarantee, and the
-/// rules that relate two inputs to each other cannot recover that relationship from the carriers alone. Only those
-/// rules call this: an allocation derives its own output type instead, and a read or a freeze relates no inputs, so
-/// re-deriving would restate the projection the rule already performs.
-///
-/// # Parameters
-///
-///   - `operation`: Reference primitive whose inference is re-derived.
-///   - `inputs`: Carriers supplied as this application's inputs, in operation-defined order.
-fn validate_input_types<U: Type, C: Domain<Type = U>, P: ReferenceDischargePolicy<C>, O: Operation<Type = U>>(
-    operation: &O,
-    inputs: &[ReferenceDischargeValue<C, P>],
-) -> Result<(), ProgramError>
-where
-    U: From<ReferenceType<P::Referent>>,
-{
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    operation.infer_output_types(input_types.as_slice(), &[])?;
-    Ok(())
-}
-
-/// Aligns the batch carrier of a value stored into a reference with the reference's batch axis. A reference's batch
-/// axis is fixed by its packed referent and cannot move, so the stored value is the input that adapts: a replicated
-/// value is broadcast to a batched reference's axis and a value mapped elsewhere is moved to it, both through
-/// [`BatchingDriver::align_batch_axis`], which reaches the policy's broadcast and transpose machinery without bounding
-/// the rule by [`RecursiveBatchingPolicy`](crate::batching::RecursiveBatchingPolicy). Storing a batched value into a
-/// replicated reference is rejected, because the reference has no batch axis to receive the per-item values; the
-/// reference must instead enter the transform as a batched input.
-///
-/// # Parameters
-///
-///   - `context`: Batching context whose extent describes the batch axis.
-///   - `driver`: Application-scoped driver through which the value is aligned.
-///   - `operation_name`: Name of the storing operation, used in the rejection diagnostic.
-///   - `reference`: Batch carrier of the reference being stored into.
-///   - `value`: Batch carrier of the stored value.
-///
-/// # Errors
-///
-/// Returns [`BatchingError::UnsupportedOperation`] when `reference` is replicated and `value` is mapped, and propagates
-/// the driver's alignment error otherwise.
-fn align_stored_batch<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
-    context: &BatchingContext<C, P>,
-    driver: &D,
-    operation_name: &str,
-    reference: &P::Batch,
-    value: P::Batch,
-) -> Result<P::Batch, BatchingError> {
-    match (P::batch_axis(reference).axis(), P::batch_axis(&value).axis()) {
-        (Some(axis), _) => driver.align_batch_axis(context, value, axis),
-        (None, None) => Ok(value),
-        (None, Some(_)) => Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{operation_name}` cannot store a batched value into an unbatched reference; pass the reference as a \
-                 batched input instead",
-            ),
-        }),
-    }
-}
-
-/// Pairs the tangent reference of `reference` with the tangent of a value stored into it, for the forward-mode rules of
-/// the storing primitives. A reference dual whose tangent is a [`MaybeZero::Value`] carries a tangent reference that
-/// receives the stored value's tangent, which is returned still symbolic so that each rule decides what a zero stored
-/// tangent means for it: a write or swap must instantiate it because the tangent reference observes the store, while
-/// an additive update of zero is a no-op that stages nothing. A reference dual whose tangent is a [`MaybeZero::Zero`]
-/// is a plumbing reference (i.e., a captured reference without a tangent slot): a zero stored tangent leaves nothing to
-/// record, so `None` is returned, while a live stored tangent has nowhere to go and is rejected.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the storing operation, used in the rejection diagnostic.
-///   - `reference`: Dual of the reference being stored into.
-///   - `value`: Dual of the stored value.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::InvalidArgument`] through [`DifferentiationError::Program`] when `reference` has no
-/// tangent reference but `value` carries a live tangent. Silently discarding that tangent would lose a derivative
-/// contribution; the reference must be passed as a differentiated input so its tangent state can receive the store.
-fn stored_tangents<'r, V: Value>(
-    operation_name: &'static str,
-    reference: &'r DifferentiationDual<V>,
-    value: &DifferentiationDual<V>,
-) -> Result<Option<(&'r V, MaybeZero<V>)>, DifferentiationError> {
-    match (reference.tangent(), value.tangent()) {
-        (MaybeZero::Value(tangent_reference), tangent) => Ok(Some((tangent_reference, tangent.clone()))),
-        (MaybeZero::Zero(_), MaybeZero::Zero(_)) => Ok(None),
-        (MaybeZero::Zero(_), MaybeZero::Value(_)) => Err(ProgramError::InvalidArgument {
-            message: format!(
-                "`{operation_name}` writes a live tangent into a reference that carries no tangent; pass the \
-                 reference as a differentiated input instead of capturing it",
-            ),
-        }
-        .into()),
-    }
-}
 
 mod reference_add_update;
 mod reference_atomic_add_update;
@@ -146,16 +37,17 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::{Context, EagerContext};
+    use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::math::add::{Add, AddOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{
-        Effects, EmptyRegionDriver, ProgramBuilder, ReferenceAccumulationPolicy, ReferenceDischargeContext,
-        ReferenceDischargeDriver, ReferenceDischargeReference, ReferenceDischargeableOperation,
-        ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError, TypeIdentity,
-        TypeIdentityPosition, TypeIdentityRenaming, Value, discharge_reference_free_operation,
+        Effects, EmptyRegionDriver, Operation, ProgramBuilder, ProgramError, ReferenceAccumulationPolicy,
+        ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
+        RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        discharge_reference_free_operation,
     };
 
     use super::*;

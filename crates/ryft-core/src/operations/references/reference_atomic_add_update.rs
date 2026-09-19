@@ -1,5 +1,3 @@
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -24,8 +22,6 @@ use crate::programs::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType,
     ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
-
-use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceAtomicAddUpdateOperation`].
 pub const REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME: &str = "reference_atomic_add_update";
@@ -86,8 +82,9 @@ where
         let addition_output = &addition_outputs[0];
         if addition_output != reference.referent() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` addition output type `{addition_output}` must exactly match \
-                 reference referent type `{}`",
+                "`{}` addition output type `{}` must exactly match reference referent type `{}`",
+                REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME,
+                addition_output,
                 reference.referent(),
             )));
         }
@@ -129,8 +126,11 @@ where
         let update = inputs[1].try_as_value("an update value")?.clone();
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
-        // this operation's own inference states and what a universe's addition alone does not guarantee.
-        validate_input_types(self, inputs)?;
+        // this operation's own inference states and what a universe's addition alone does not guarantee. Rules can be
+        // called outside a validated program, so check the input types before changing reference state.
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
+
         // Discharge is sequential replay, selecting one legal order while preserving the caller's state ordering.
         context.accumulate(reference, update)?;
         Ok(Vec::new())
@@ -174,15 +174,20 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // The update is aligned with the reference's fixed batch axis before the packed accumulation.
         check_count!("input", inputs, 2, ProgramError);
-        let update = align_stored_batch(
-            context,
-            driver,
-            REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME,
-            &inputs[0],
-            inputs[1].clone(),
-        )?;
+        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
+        let update = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+            (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
+            (None, None) => inputs[1].clone(),
+            (None, Some(_)) => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` cannot store a batched value into an unbatched \
+                         reference; pass the reference as a batched input instead",
+                    ),
+                });
+            }
+        };
         context
             .parent()
             .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&update).clone()])?;
@@ -199,12 +204,23 @@ impl_differentiable_operation! {
         C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
     {
         |operation, context, _driver, inputs| {
-            // Addition is linear, so the update's tangent is accumulated into the tangent reference exactly as the
-            // primal update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op
-            // and stages nothing. The tangent pairing is resolved before either accumulation so that a rejected
-            // plumbing store leaves both references untouched.
+            // Accumulate into the tangent reference alongside the primal as a zero update needs no tangent work, and
+            // reject a live tangent without tangent storage before either reference can be changed.
             check_count!("input", inputs, 2, ProgramError);
-            let stored = stored_tangents(REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
+            let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
+                (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => None,
+                (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` writes a live tangent into a reference \
+                             that carries no tangent; pass the reference as a differentiated input instead of \
+                             capturing it",
+                        ),
+                    }
+                    .into());
+                }
+            };
             context
                 .primal()
                 .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
@@ -257,7 +273,7 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicA
         check_count!("input", input_types, 2, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe",
             ),
         })
     }
@@ -278,7 +294,7 @@ impl<O: Operation<Type = ArrayType>>
         check_count!("input", input_types, 2, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe",
             ),
         })
     }
@@ -299,16 +315,15 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<A
     }
 }
 
-/// Capability to atomically add an update into a reference without returning the previous value.
-///
-/// Each selected scalar update occurs exactly once without tearing, with device-scoped sequential consistency:
-/// atomic accesses share a total order consistent with each program instance's order. This does not make an entire
-/// array update indivisible. The caller accepts any allowed ordering of competing additions, including differences
-/// in floating-point sums. Conflicting non-atomic accesses still require synchronization.
+/// Capability to atomically add an update into a reference without returning the previous value. Each selected scalar
+/// update occurs exactly once without tearing, with device-scoped sequential consistency: atomic accesses share a total
+/// order consistent with each program instance's order. This does not make an entire array update indivisible. The
+/// caller accepts any allowed ordering of competing additions, including differences in floating-point sums.
+/// Conflicting non-atomic accesses still require synchronization.
 ///
 /// Sequential interpreters and reference discharge select one permitted execution order. Staged values retain the
-/// atomic operation so parallel lowerings must implement its scope and ordering or reject it. The operation still
-/// carries [`EffectClass::OrderedState`](crate::programs::EffectClass::OrderedState); generic transforms gain no
+/// atomic operation so parallel lowering must implement its scope and ordering or reject it. The operation still
+/// carries [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) and so generic transforms gain no
 /// permission to reorder state effects.
 pub trait ReferenceAtomicAddUpdate<Update = Self>: Sized {
     /// Atomically adds `update` to the selected stored elements under the capability's ordering contract.
@@ -321,23 +336,27 @@ impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> Reference
         operation.infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
+
         // The reference holder serializes the complete read/add/write transaction, including derived views.
         // This is a valid sequential execution of the per-element atomic contract.
         reference.add_update(update)
     }
 }
 
-// Staged values delegate selection to their operation family over the referent of the reference being updated; a
-// value that is not a reference member of its universe has no referent and is rejected before any selection.
-impl<V: Value<Type: ReferenceMemberType>> ReferenceAtomicAddUpdate for V
-where
-    V::DispatchDomain: Context<
-        Operation: OperationProvider<
-            V::Type,
-            ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = <V::DispatchDomain as Domain>::Operation,
+// Staged values delegate selection to their operation family over the referent of the reference being updated;
+// a value that is not a reference member of its universe has no referent and is rejected before any selection.
+impl<
+    V: Value<
+            Type: ReferenceMemberType,
+            DispatchDomain: Context<
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    Operation = <V::DispatchDomain as Domain>::Operation,
+                >,
+            >,
         >,
-    >,
+> ReferenceAtomicAddUpdate for V
 {
     fn atomic_add_update(&self, update: &Self) -> Result<(), ProgramError> {
         let reference_type = self.r#type();
@@ -689,8 +708,8 @@ mod tests {
             error,
             ProgramError::InvalidArgument {
                 message:
-                    "`reference_atomic_add_update` writes a live tangent into a reference that carries no tangent; pass the \
-                     reference as a differentiated input instead of capturing it"
+                    "`reference_atomic_add_update` writes a live tangent into a reference that carries no tangent; \
+                     pass the reference as a differentiated input instead of capturing it"
                         .to_string(),
             },
         );
