@@ -18,7 +18,19 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    // Derives sound bounds for checked remainder and reports whether a zero runtime divisor remains possible.
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (_, left_maximum) = left.bounds().representable_extent_range()?;
+        let (_, right_maximum) = right.bounds().representable_extent_range()?;
+        positive_divisor_lower_bound(right, right_maximum)?;
+        let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
+            let remainder = left % right;
+            DimensionBounds::new(remainder, remainder.checked_add(1))?
+        } else {
+            DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))?
+        };
+        Ok((bounds, right.bounds().lower() == 0))
+    },
 );
 
 impl OperationProvider<DimensionType> for RemOperation<DimensionType> {
@@ -28,20 +40,6 @@ impl OperationProvider<DimensionType> for RemOperation<DimensionType> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(DimensionRemOperation::new(input_types[0], input_types[1])?)
     }
-}
-
-/// Derives sound bounds for checked remainder and reports whether a zero runtime divisor remains possible.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (_, left_maximum) = left.bounds().representable_extent_range()?;
-    let (_, right_maximum) = right.bounds().representable_extent_range()?;
-    positive_divisor_lower_bound(right, right_maximum)?;
-    let bounds = if let (Some(left), Some(right)) = (left.extent(), right.extent()) {
-        let remainder = left % right;
-        DimensionBounds::new(remainder, remainder.checked_add(1))?
-    } else {
-        DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))?
-    };
-    Ok((bounds, right.bounds().lower() == 0))
 }
 
 #[cfg(test)]

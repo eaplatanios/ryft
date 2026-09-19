@@ -18,7 +18,38 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} ^ {}", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    // Derives sound bounds for checked dimension exponentiation and reports whether runtime overflow remains possible.
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let lower = if right_maximum == 0 {
+            1
+        } else if left_lower == 0 {
+            0
+        } else if left_lower == 1 {
+            1
+        } else {
+            checked_power(left_lower, right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
+                message: format!(
+                    "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` result bounds \
+                     with operands `{left}` and `{right}`",
+                ),
+            })?
+        };
+        let maximum = if right_maximum == 0 || left_maximum == 1 {
+            1
+        } else if left_maximum == 0 {
+            usize::from(right_lower == 0)
+        } else {
+            checked_power(left_maximum, right_maximum).unwrap_or(usize::MAX).min(MAX_DIMENSION_EXTENT)
+        };
+        let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
+        let requires_runtime_assertion = maximum_extent(left)
+            .zip(maximum_extent(right))
+            .and_then(|(left, right)| checked_power(left, right))
+            .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
+        Ok((bounds, requires_runtime_assertion))
+    },
 );
 
 define_arithmetic_dimension_capability!(
@@ -39,39 +70,6 @@ define_arithmetic_dimension_capability!(
     dimension_pow(right),
     DimensionPowOperation,
 );
-
-/// Derives sound bounds for checked dimension exponentiation and reports whether runtime overflow remains possible.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
-    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
-    let lower = if right_maximum == 0 {
-        1
-    } else if left_lower == 0 {
-        0
-    } else if left_lower == 1 {
-        1
-    } else {
-        checked_power(left_lower, right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
-            message: format!(
-                "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` result bounds \
-                 with operands {left}, {right}",
-            ),
-        })?
-    };
-    let maximum = if right_maximum == 0 || left_maximum == 1 {
-        1
-    } else if left_maximum == 0 {
-        usize::from(right_lower == 0)
-    } else {
-        checked_power(left_maximum, right_maximum).unwrap_or(usize::MAX).min(MAX_DIMENSION_EXTENT)
-    };
-    let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
-    let requires_runtime_assertion = maximum_extent(left)
-        .zip(maximum_extent(right))
-        .and_then(|(left, right)| checked_power(left, right))
-        .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
-    Ok((bounds, requires_runtime_assertion))
-}
 
 #[cfg(test)]
 mod tests {

@@ -18,7 +18,15 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} // {}", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    // Derives sound bounds for checked floor division and reports whether a zero runtime divisor remains possible.
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (_, right_maximum) = right.bounds().representable_extent_range()?;
+        let positive_right_lower = positive_divisor_lower_bound(right, right_maximum)?;
+        let bounds =
+            DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))?;
+        Ok((bounds, right.bounds().lower() == 0))
+    },
 );
 
 impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
@@ -28,16 +36,6 @@ impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(DimensionDivFloorOperation::new(input_types[0], input_types[1])?)
     }
-}
-
-/// Derives sound bounds for checked floor division and reports whether a zero runtime divisor remains possible.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
-    let (_, right_maximum) = right.bounds().representable_extent_range()?;
-    let positive_right_lower = positive_divisor_lower_bound(right, right_maximum)?;
-    let bounds =
-        DimensionBounds::new(left_lower / right_maximum, (left_maximum / positive_right_lower).checked_add(1))?;
-    Ok((bounds, right.bounds().lower() == 0))
 }
 
 #[cfg(test)]

@@ -20,35 +20,33 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} + {}", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let lower = left_lower.checked_add(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while deriving `{DIMENSION_ADD_OPERATION_NAME}` result bounds \
+                 with operands `{left}` and `{right}`",
+            ),
+        })?;
+        let maximum = left_maximum.saturating_add(right_maximum).min(MAX_DIMENSION_EXTENT);
+        let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
+        let requires_runtime_assertion = maximum_extent(left)
+            .zip(maximum_extent(right))
+            .and_then(|(left, right)| left.checked_add(right))
+            .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
+        Ok((bounds, requires_runtime_assertion))
+    },
 );
 
 impl OperationProvider<DimensionType> for AddOperation<DimensionType> {
     type Operation = DimensionAddOperation;
 
+    #[inline]
     fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(DimensionAddOperation::new(input_types[0], input_types[1])?)
     }
-}
-
-/// Derives sound bounds for checked dimension addition and reports whether runtime overflow remains possible.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
-    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
-    let lower = left_lower.checked_add(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while deriving `{DIMENSION_ADD_OPERATION_NAME}` result bounds \
-             with operands {left}, {right}",
-        ),
-    })?;
-    let maximum = left_maximum.saturating_add(right_maximum).min(MAX_DIMENSION_EXTENT);
-    let bounds = DimensionBounds::new(lower, maximum.checked_add(1))?;
-    let requires_runtime_assertion = maximum_extent(left)
-        .zip(maximum_extent(right))
-        .and_then(|(left, right)| left.checked_add(right))
-        .is_none_or(|result| result > MAX_DIMENSION_EXTENT);
-    Ok((bounds, requires_runtime_assertion))
 }
 
 #[cfg(test)]

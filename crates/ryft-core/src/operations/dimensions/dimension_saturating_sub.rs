@@ -16,7 +16,16 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    // Derives sound bounds for total, saturating dimension subtraction.
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let bounds = DimensionBounds::new(
+            left_lower.saturating_sub(right_maximum),
+            left_maximum.saturating_sub(right_lower).checked_add(1),
+        )?;
+        Ok((bounds, false))
+    },
 );
 
 define_arithmetic_dimension_capability!(
@@ -38,17 +47,6 @@ define_arithmetic_dimension_capability!(
     dimension_saturating_sub(right),
     DimensionSaturatingSubOperation,
 );
-
-/// Derives sound bounds for total, saturating dimension subtraction.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
-    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
-    let bounds = DimensionBounds::new(
-        left_lower.saturating_sub(right_maximum),
-        left_maximum.saturating_sub(right_lower).checked_add(1),
-    )?;
-    Ok((bounds, false))
-}
 
 #[cfg(test)]
 mod tests {

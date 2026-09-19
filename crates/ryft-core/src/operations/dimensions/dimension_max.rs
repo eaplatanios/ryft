@@ -16,7 +16,13 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("max({}, {})", left.variable(), right.variable())
     },
-    infer_bounds = infer_bounds,
+    // Derives sound bounds for total dimension maximum.
+    infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
+        let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
+        let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
+        let bounds = DimensionBounds::new(left_lower.max(right_lower), left_maximum.max(right_maximum).checked_add(1))?;
+        Ok((bounds, false))
+    },
 );
 
 define_arithmetic_dimension_capability!(
@@ -37,14 +43,6 @@ define_arithmetic_dimension_capability!(
     dimension_max(right),
     DimensionMaxOperation,
 );
-
-/// Derives sound bounds for total dimension maximum.
-fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(DimensionBounds, bool), DimensionError> {
-    let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
-    let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
-    let bounds = DimensionBounds::new(left_lower.max(right_lower), left_maximum.max(right_maximum).checked_add(1))?;
-    Ok((bounds, false))
-}
 
 #[cfg(test)]
 mod tests {
