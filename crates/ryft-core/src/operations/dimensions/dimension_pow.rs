@@ -1,7 +1,9 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
+use crate::arrays::{
+    ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT,
+};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
@@ -66,6 +68,13 @@ define_dimension_arithmetic_operation!(
         fn(other);
     },
 );
+
+impl<A: Value<Type = ArrayType>> From<DimensionPowOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionPowOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
 
 impl DimensionPow for DimensionValue {
     fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {

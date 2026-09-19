@@ -1,8 +1,10 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
+use crate::arrays::{
+    ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT,
+};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::mul::{Mul, MulOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionMulOperation`].
 pub const DIMENSION_MUL_OPERATION_NAME: &str = "dimension_mul";
@@ -36,6 +38,13 @@ define_dimension_arithmetic_operation!(
     provider = MulOperation<DimensionType>,
 );
 
+impl<A: Value<Type = ArrayType>> From<DimensionMulOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionMulOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
+
 impl Mul for DimensionValue {
     fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionMulOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
@@ -51,6 +60,42 @@ impl Mul for DimensionValue {
             ),
         })?;
         Ok(Self::new(result_type, extent)?)
+    }
+}
+
+impl std::ops::Mul for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn mul(self, right: DimensionValue) -> Self::Output {
+        Mul::mul(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Mul<&DimensionValue> for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn mul(self, right: &DimensionValue) -> Self::Output {
+        Mul::mul(&self, right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Mul<DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn mul(self, right: DimensionValue) -> Self::Output {
+        Mul::mul(self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Mul<&DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn mul(self, right: &DimensionValue) -> Self::Output {
+        Mul::mul(self, right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -91,5 +136,12 @@ mod tests {
             DimensionValue::constant(7).unwrap().mul(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             21,
         );
+
+        let left = DimensionValue::constant(7).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!((left.clone() * right.clone()).extent(), 21);
+        assert_eq!((left.clone() * &right).extent(), 21);
+        assert_eq!((&left * right.clone()).extent(), 21);
+        assert_eq!((&left * &right).extent(), 21);
     }
 }

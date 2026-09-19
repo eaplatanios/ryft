@@ -11,12 +11,14 @@ use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg a
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
+use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
@@ -314,6 +316,28 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Min(DimensionMinOperation),
     Max(DimensionMaxOperation),
     Requirement(DimensionRequirementOperation),
+}
+
+// Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
+// dimension is rejected by [`ReplicatedDimensionBatchingPolicy`] before this rule is called because representing one
+// extent per batch item would require a ragged value model.
+impl<C: Context<Type = ArrayIrType>>
+    BatchableOperation<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>
+    for DimensionOperation<DimensionValue>
+where
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn batch<D: BatchingDriver<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
+        _driver: &D,
+        inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
+    ) -> Result<BatchedOutputs<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>, BatchingError>
+    {
+        Ok(context.parent().bind(self.clone(), Vec::new(), inputs)?.into())
+    }
 }
 
 /// Value-level capability bundle paired with the [`DimensionOperation`] family.

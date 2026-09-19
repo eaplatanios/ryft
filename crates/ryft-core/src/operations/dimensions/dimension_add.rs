@@ -1,8 +1,10 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT};
+use crate::arrays::{
+    ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT,
+};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionAddOperation`].
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
@@ -36,6 +38,13 @@ define_dimension_arithmetic_operation!(
     provider = AddOperation<DimensionType>,
 );
 
+impl<A: Value<Type = ArrayType>> From<DimensionAddOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionAddOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
+
 impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionAddOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
@@ -51,6 +60,42 @@ impl Add for DimensionValue {
             ),
         })?;
         Ok(Self::new(result_type, extent)?)
+    }
+}
+
+impl std::ops::Add for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn add(self, right: DimensionValue) -> Self::Output {
+        Add::add(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Add<&DimensionValue> for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn add(self, right: &DimensionValue) -> Self::Output {
+        Add::add(&self, right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Add<DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn add(self, right: DimensionValue) -> Self::Output {
+        Add::add(self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Add<&DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn add(self, right: &DimensionValue) -> Self::Output {
+        Add::add(self, right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -164,5 +209,12 @@ mod tests {
         .unwrap();
         assert_eq!(traced_type.bounds(), DimensionBounds::new(5, Some(13)).unwrap());
         assert_eq!(traced_program.interpret(DimensionValue::new(left_type, 6).unwrap()).unwrap().extent(), 10,);
+
+        let left = DimensionValue::constant(7).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!((left.clone() + right.clone()).extent(), 10);
+        assert_eq!((left.clone() + &right).extent(), 10);
+        assert_eq!((&left + right.clone()).extent(), 10);
+        assert_eq!((&left + &right).extent(), 10);
     }
 }

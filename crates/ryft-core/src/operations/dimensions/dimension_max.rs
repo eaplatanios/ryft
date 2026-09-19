@@ -1,7 +1,7 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionMaxOperation`].
 pub const DIMENSION_MAX_OPERATION_NAME: &str = "dimension_max";
@@ -41,6 +41,13 @@ define_dimension_arithmetic_operation!(
         fn(other);
     },
 );
+
+impl<A: Value<Type = ArrayType>> From<DimensionMaxOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionMaxOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
 
 impl DimensionMax for DimensionValue {
     fn dimension_max(&self, right: &Self) -> Result<Self, ProgramError> {

@@ -1,8 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::sub::{Sub, SubOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
@@ -34,6 +34,13 @@ define_dimension_arithmetic_operation!(
     provider = SubOperation<DimensionType>,
 );
 
+impl<A: Value<Type = ArrayType>> From<DimensionSubOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionSubOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
+
 impl Sub for DimensionValue {
     fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionSubOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
@@ -51,6 +58,42 @@ impl Sub for DimensionValue {
             }
         })?;
         Ok(Self::new(result_type, extent)?)
+    }
+}
+
+impl std::ops::Sub for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn sub(self, right: DimensionValue) -> Self::Output {
+        Sub::sub(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Sub<&DimensionValue> for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn sub(self, right: &DimensionValue) -> Self::Output {
+        Sub::sub(&self, right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Sub<DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn sub(self, right: DimensionValue) -> Self::Output {
+        Sub::sub(self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Sub<&DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn sub(self, right: &DimensionValue) -> Self::Output {
+        Sub::sub(self, right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -96,5 +139,22 @@ mod tests {
             DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             4,
         );
+
+        let left = DimensionValue::constant(7).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!((left.clone() - right.clone()).extent(), 4);
+        assert_eq!((left.clone() - &right).extent(), 4);
+        assert_eq!((&left - right.clone()).extent(), 4);
+        assert_eq!((&left - &right).extent(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "left >= right; observed left=1, right=3")]
+    fn test_dimension_sub_operator_panics_on_capability_error() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
+        let left = DimensionValue::new(left_type, 1).unwrap();
+        let right = DimensionValue::new(right_type, 3).unwrap();
+        let _ = left - right;
     }
 }

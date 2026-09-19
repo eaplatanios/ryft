@@ -1,8 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::div::{Div, DivOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionDivOperation`].
 pub const DIMENSION_DIV_OPERATION_NAME: &str = "dimension_div";
@@ -37,6 +37,13 @@ define_dimension_arithmetic_operation!(
     provider = DivOperation<DimensionType>,
 );
 
+impl<A: Value<Type = ArrayType>> From<DimensionDivOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionDivOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
+
 impl Div for DimensionValue {
     fn div(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionDivOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
@@ -55,6 +62,42 @@ impl Div for DimensionValue {
             .into());
         }
         Ok(Self::new(result_type, self.extent() / right.extent())?)
+    }
+}
+
+impl std::ops::Div for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn div(self, right: DimensionValue) -> Self::Output {
+        Div::div(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Div<&DimensionValue> for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn div(self, right: &DimensionValue) -> Self::Output {
+        Div::div(&self, right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Div<DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn div(self, right: DimensionValue) -> Self::Output {
+        Div::div(self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Div<&DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn div(self, right: &DimensionValue) -> Self::Output {
+        Div::div(self, right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -95,5 +138,12 @@ mod tests {
             DimensionValue::constant(7).unwrap().div(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             2,
         );
+
+        let left = DimensionValue::constant(7).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!((left.clone() / right.clone()).extent(), 2);
+        assert_eq!((left.clone() / &right).extent(), 2);
+        assert_eq!((&left / right.clone()).extent(), 2);
+        assert_eq!((&left / &right).extent(), 2);
     }
 }

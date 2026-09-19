@@ -1,8 +1,8 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::math::rem::{Rem, RemOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -16,7 +16,6 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
-    // Derives sound bounds for checked remainder and reports whether a zero runtime divisor remains possible.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (_, left_maximum) = left.bounds().representable_extent_range()?;
         let (_, right_maximum) = right.bounds().representable_extent_range()?;
@@ -36,6 +35,13 @@ define_dimension_arithmetic_operation!(
     provider = RemOperation<DimensionType>,
 );
 
+impl<A: Value<Type = ArrayType>> From<DimensionRemOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionRemOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
+
 impl Rem for DimensionValue {
     fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
         let operation = DimensionRemOperation::new(self.r#type().as_ref(), right.r#type().as_ref())?;
@@ -54,6 +60,42 @@ impl Rem for DimensionValue {
             .into());
         }
         Ok(Self::new(result_type, self.extent() % right.extent())?)
+    }
+}
+
+impl std::ops::Rem for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn rem(self, right: DimensionValue) -> Self::Output {
+        Rem::rem(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Rem<&DimensionValue> for DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn rem(self, right: &DimensionValue) -> Self::Output {
+        Rem::rem(&self, right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Rem<DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn rem(self, right: DimensionValue) -> Self::Output {
+        Rem::rem(self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl std::ops::Rem<&DimensionValue> for &DimensionValue {
+    type Output = DimensionValue;
+
+    #[inline]
+    fn rem(self, right: &DimensionValue) -> Self::Output {
+        Rem::rem(self, right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -93,5 +135,12 @@ mod tests {
             DimensionValue::constant(7).unwrap().rem(&DimensionValue::constant(3).unwrap()).unwrap().extent(),
             1,
         );
+
+        let left = DimensionValue::constant(7).unwrap();
+        let right = DimensionValue::constant(3).unwrap();
+        assert_eq!((left.clone() % right.clone()).extent(), 1);
+        assert_eq!((left.clone() % &right).extent(), 1);
+        assert_eq!((&left % right.clone()).extent(), 1);
+        assert_eq!((&left % &right).extent(), 1);
     }
 }

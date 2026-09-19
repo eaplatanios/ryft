@@ -1,9 +1,7 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
-
-// TODO(eaplatanios): Review this module.
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionSaturatingSubOperation`].
 pub const DIMENSION_SATURATING_SUB_OPERATION_NAME: &str = "dimension_saturating_sub";
@@ -17,7 +15,6 @@ define_dimension_arithmetic_operation!(
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
-    // Derives sound bounds for total, saturating dimension subtraction.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
@@ -35,17 +32,23 @@ define_dimension_arithmetic_operation!(
         /// ```rust
         /// # use ryft_core::{DimensionSaturatingSub, DimensionValue, ProgramError};
         /// # fn main() -> Result<(), ProgramError> {
-        /// let result = DimensionValue::constant(3)?
-        ///     .dimension_saturating_sub(&DimensionValue::constant(7)?)?;
+        /// let result = DimensionValue::constant(3)?.dimension_saturating_sub(&DimensionValue::constant(7)?)?;
         /// assert_eq!(result.extent(), 0);
         /// # Ok(())
         /// # }
         /// ```
         trait;
-        /// Returns `max(0, self - right)`.
-        fn(right);
+        /// Returns `max(0, self - other)`.
+        fn(other);
     },
 );
+
+impl<A: Value<Type = ArrayType>> From<DimensionSaturatingSubOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionSaturatingSubOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
 
 impl DimensionSaturatingSub for DimensionValue {
     fn dimension_saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {

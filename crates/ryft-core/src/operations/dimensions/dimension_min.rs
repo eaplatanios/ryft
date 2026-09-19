@@ -1,7 +1,7 @@
-use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed};
+use crate::programs::{Operation, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionMinOperation`].
 pub const DIMENSION_MIN_OPERATION_NAME: &str = "dimension_min";
@@ -39,6 +39,13 @@ define_dimension_arithmetic_operation!(
         fn(other);
     },
 );
+
+impl<A: Value<Type = ArrayType>> From<DimensionMinOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: DimensionMinOperation) -> Self {
+        Self::Dimension(operation.into())
+    }
+}
 
 impl DimensionMin for DimensionValue {
     fn dimension_min(&self, right: &Self) -> Result<Self, ProgramError> {
