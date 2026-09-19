@@ -49,32 +49,34 @@ pub use dimension_to_scalar::{
     DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionToScalar, DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
 };
 
-/// Shared contract implemented by binary first-class-dimension arithmetic operations.
-///
-/// Each nominal operation owns its bounds formula and is paired with a value capability. This trait centralizes the
-/// common two-input type validation and fresh-result contract without imposing a concrete backend value
-/// representation.
+/// Shared contract implemented by binary arithmetic [`Operation`]s over [`DimensionValue`](crate::DimensionValue)s.
+/// Each nominal operation owns its [`DimensionBounds`] formula and is paired with a value capability. This trait
+/// centralizes the common two-input [`DimensionType`] validation and fresh-output contract without imposing a concrete
+/// backend value representation.
 pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
-    /// Returns the declared left operand type.
+    /// Returns the declared left input [`DimensionType`] of this [`ArithmeticDimensionOperation`].
     fn left_type(&self) -> &DimensionType;
 
-    /// Returns the declared right operand type.
+    /// Returns the declared right input [`DimensionType`] of this [`ArithmeticDimensionOperation`].
     fn right_type(&self) -> &DimensionType;
 
-    /// Returns the diagnostic name used for a freshly inferred output variable.
+    /// Returns the diagnostic name used for a freshly inferred output variable for this
+    /// [`ArithmeticDimensionOperation`].
     fn output_name(&self) -> &str;
 
-    /// Returns the output bounds computed from the declared input types when this operation was constructed.
+    /// Returns the output [`DimensionBounds`] computed from the declared input [`DimensionType`]s when this
+    /// [`ArithmeticDimensionOperation`] was constructed.
     fn output_bounds(&self) -> DimensionBounds;
 
-    /// Computes output bounds from the actual input types, which may refine the declared input bounds.
+    /// Infers output [`DimensionBounds`] from the actual input [`DimensionType`]s, which may refine the declared
+    /// output [`DimensionBounds`] (i.e., the result of calling [`Self::output_bounds`]).
     fn infer_output_bounds(
         &self,
         left: &DimensionType,
         right: &DimensionType,
     ) -> Result<DimensionBounds, DimensionError>;
 
-    /// Infers this operation's one fresh dimension result after validating both operand types.
+    /// Infers this operation's output [`DimensionType`]s after validating the provided input [`DimensionType`]s.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types.iter().zip([self.left_type(), self.right_type()]).enumerate().try_for_each(
@@ -91,7 +93,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
         )?;
 
         // Reusing an operation with narrower inputs must recompute its bounds formula. Its stored effect metadata
-        // remains conservative: refinement never removes an assertion from the original operation.
+        // remains conservative as refinement never removes an assertion from the original operation.
         let bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
         Ok(vec![DimensionType::new(self.output_name(), bounds)])
     }
@@ -100,24 +102,26 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
 /// Shared type-identity inference and effect metadata stored by every binary dimension arithmetic operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub(crate) struct ArithmeticDimensionOperationMetadata {
-    /// Expected left operand type.
+    /// Expected left input [`DimensionType`].
     left: DimensionType,
 
-    /// Expected right operand type.
+    /// Expected right input [`DimensionType`].
     right: DimensionType,
 
     /// Diagnostic name assigned to the output variable when output inference creates it.
     output_name: String,
 
-    /// Output bounds computed at construction; inference recomputes them when actual input bounds are narrower.
+    /// Output [`DimensionBounds`] computed at construction time. Type inference recomputes them when actual input
+    /// bounds are narrower.
     output_bounds: DimensionBounds,
 
-    /// Whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
+    /// Whether the admitted input bounds leave a checked runtime arithmetic failure possible.
     requires_runtime_assertion: bool,
 }
 
 impl ArithmeticDimensionOperationMetadata {
-    /// Constructs shared arithmetic metadata used to infer one fresh result variable and classify its effects.
+    /// Constructs a new [`ArithmeticDimensionOperationMetadata`] instance that is used to infer one fresh result
+    /// variable and classify its effects.
     pub(crate) fn new(
         left: &DimensionType,
         right: &DimensionType,
@@ -128,37 +132,34 @@ impl ArithmeticDimensionOperationMetadata {
         Self { left: left.clone(), right: right.clone(), output_name, output_bounds, requires_runtime_assertion }
     }
 
-    /// Returns the expected left operand type.
-    #[inline]
+    /// Returns the expected left input [`DimensionType`].
     pub(crate) fn left_type(&self) -> &DimensionType {
         &self.left
     }
 
-    /// Returns the expected right operand type.
-    #[inline]
+    /// Returns the expected right input [`DimensionType`].
     pub(crate) fn right_type(&self) -> &DimensionType {
         &self.right
     }
 
     /// Returns the diagnostic name used for a freshly inferred output variable.
-    #[inline]
     pub(crate) fn output_name(&self) -> &str {
         &self.output_name
     }
 
-    /// Returns the output bounds computed from the declared input types when this operation was constructed.
-    #[inline]
+    /// Returns the output [`DimensionBounds`] computed from the declared input [`DimensionType`]s when this operation
+    /// was constructed.
     pub(crate) fn output_bounds(&self) -> DimensionBounds {
         self.output_bounds
     }
 
-    /// Returns whether the admitted operand bounds leave a checked runtime arithmetic failure possible.
-    #[inline]
+    /// Returns whether the admitted input bounds leave a checked runtime arithmetic failure possible.
     pub(crate) fn requires_runtime_assertion(&self) -> bool {
         self.requires_runtime_assertion
     }
 
-    /// Applies one simultaneous identity renaming to both operands.
+    /// Applies one simultaneous [`TypeIdentityRenaming`] to both input [`DimensionType`]s and returns a new
+    /// [`ArithmeticDimensionOperationMetadata`] instance with the renamed types.
     pub(crate) fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<DimensionVariable>,
@@ -260,15 +261,15 @@ mod tests {
         let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
         let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
 
-        // Arithmetic is pure exactly when operand bounds prove that its checked eager operation is total.
+        // Arithmetic is pure exactly when input bounds prove that its checked eager operation is total.
         assert_eq!(
             DimensionAddOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionAddOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionSubOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(), assertion);
         assert_eq!(
@@ -277,31 +278,31 @@ mod tests {
         );
         assert_eq!(
             DimensionMulOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionMulOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionPowOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionDivOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionDivOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(DimensionRemOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
         assert_eq!(
             DimensionMinOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
         assert_eq!(
             DimensionMaxOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
-            EffectClasses::NONE
+            EffectClasses::NONE,
         );
     }
 
@@ -333,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_dimension_arithmetic_stages_ordinary_dimension_operands() {
+    fn test_composite_dimension_arithmetic_stages_ordinary_dimension_inputs() {
         let rows = DimensionType::new("rows", DimensionBounds::new(5, Some(9)).unwrap());
         let columns = DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
