@@ -1,5 +1,3 @@
-//! Generic write-only reference replacement operation and its value-level capability.
-
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
@@ -27,7 +25,7 @@ use crate::programs::{
     TypeError, Typed, Value, ValueProjection,
 };
 
-use super::{align_stored_batch, stored_tangents, validate_operand_types};
+use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceWriteOperation`].
 pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
@@ -43,6 +41,13 @@ impl<T: Type, U: Type> ReferenceWriteOperation<T, U> {
     }
 }
 
+impl<T: Type, U: Type> Default for ReferenceWriteOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Type, U: Type> Copy for ReferenceWriteOperation<T, U> {}
 
 impl<T: Type, U: Type> Display for ReferenceWriteOperation<T, U> {
@@ -52,10 +57,8 @@ impl<T: Type, U: Type> Display for ReferenceWriteOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceWriteOperation<T, U>
+impl<T: Type, U: Type> Operation for ReferenceWriteOperation<T, U>
 where
-    T: Type,
-    U: Type,
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
 {
@@ -100,13 +103,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
-where
+impl<
     T: Type,
-    U: From<T> + From<ReferenceType<T>> + Type,
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    U: Type + From<T> + From<ReferenceType<T>>,
     C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
     P: ReferenceDischargePolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
+where
+    ReferenceWriteOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -117,18 +121,16 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let reference = inputs[0].try_as_reference("a reference to write")?;
         let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-        validate_operand_types(self, inputs)?;
+        validate_input_types(self, inputs)?;
         context.write(reference, replacement)?;
         Ok(Vec::new())
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceWriteOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceWrite<C::Value>>> InterpretableOperation<C>
+    for ReferenceWriteOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceWrite<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -142,31 +144,23 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceWriteOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceWriteOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceWriteOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceWriteOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // The replacement is aligned with the reference's fixed batch axis before the packed store.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // The replacement is aligned with the reference's fixed batch axis before the packed store.
         check_count!("input", inputs, 2, ProgramError);
         let replacement =
             align_stored_batch(context, driver, REFERENCE_WRITE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
@@ -184,9 +178,9 @@ impl_differentiable_operation! {
         T: Type,
         U: DifferentiableType,
         C: Context<
-                Type = U,
-                Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
-            > + Zero<C::Value>,
+            Type = U,
+            Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
             // The replacement's tangent is stored into the tangent reference exactly as the primal replacement is
@@ -253,7 +247,7 @@ impl_differentiable_operation! {
     },
 }
 
-/// Replaces the value stored by a reference without observing the previous value.
+/// Capability to replace the value stored by a reference without observing the previous value.
 pub trait ReferenceWrite<Replacement = Self>: Sized {
     /// Replaces the stored value with `replacement` in program order.
     fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
@@ -261,40 +255,49 @@ pub trait ReferenceWrite<Replacement = Self>: Sized {
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceWrite for ArrayIrValue<A> {
     fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
-        ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
+        let operation = ReferenceWriteOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
         reference.write(replacement)
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceWrite<ProjectedValue<ArrayType, V>>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-{
-    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceWriteOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), replacement.value().clone()],
-        )?;
-        Ok(())
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceWrite<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceWrite<V> for V
 {
     fn write(&self, replacement: &V) -> Result<(), ProgramError> {
         self.dispatch_domain().bind(
             ReferenceWriteOperation::new(),
             Vec::new(),
             &[self.clone(), replacement.clone()],
+        )?;
+        Ok(())
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceWrite<ProjectedValue<ArrayType, V>> for ProjectedValue<ReferenceType<ArrayType>, V>
+{
+    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceWriteOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), replacement.value().clone()],
         )?;
         Ok(())
     }
@@ -330,20 +333,20 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
-    type TestIrWrite = ReferenceWriteOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceWriteOperation = ReferenceWriteOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_write() {
         let operation = Write::new();
+        assert_eq!(Write::default().to_string(), operation.to_string());
         assert_eq!(operation.name(), REFERENCE_WRITE_OPERATION_NAME);
         assert_eq!(operation.to_string(), REFERENCE_WRITE_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            "ReferenceWriteOperation(PhantomData<fn() -> (ryft_core::operations::references::tests::TestReferent, \
-             ryft_core::operations::references::tests::TestType)>)",
+            format!("ReferenceWriteOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
         );
 
-        // A write orders against other state effects, accesses its reference operand for writing, and aliases nothing.
+        // A write orders against other state effects, accesses its reference input for writing, and aliases nothing.
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),
@@ -400,7 +403,7 @@ mod tests {
 
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
         check_operation_type_inference!(
-            operation = TestIrWrite::new(),
+            operation = TestIrReferenceWriteOperation::new(),
             cases = [
                 {
                     input_types = [
@@ -440,7 +443,7 @@ mod tests {
         // A replacement carrying exactly the referent type replaces the stored value and produces no output.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrWrite::new(),
+                &TestIrReferenceWriteOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())],
@@ -449,10 +452,10 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
 
-        // Exact operand inference runs before the store, so a rejected replacement leaves the stored value unchanged.
+        // Exact input inference runs before the store, so a rejected replacement leaves the stored value unchanged.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrWrite::new(),
+                &TestIrReferenceWriteOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0, 7.0]).unwrap())],
@@ -464,11 +467,11 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
 
-        // Each operand must be the member kind the operation expects.
+        // Each input must be the member kind the operation expects.
         let array = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap());
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrWrite::new(),
+                &TestIrReferenceWriteOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[array.clone(), array],
@@ -477,7 +480,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrWrite::new(),
+                &TestIrReferenceWriteOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), reference],
@@ -489,13 +492,13 @@ mod tests {
 
     #[test]
     fn test_reference_write_partial_evaluation() {
-        // Program replay uses the `Stage` placement: a write stages regardless of operand knowledge, the live handle
+        // Program replay uses the `Stage` placement: a write stages regardless of input knowledge, the live handle
         // is passed to the residual program as a known reference input, and the store runs only when that program
         // runs.
         let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         check_operation_partial_evaluation!(
             backend = (TestIrValue, TestIrOperation),
-            operation = TestIrWrite::new(),
+            operation = TestIrReferenceWriteOperation::new(),
             cases = [
                 {
                     inputs = [
@@ -520,21 +523,25 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
-        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every operand
+        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every input
         // is known.
         let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
         let replacement = PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(4.0_f32).unwrap()));
         let staging =
             PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
-        let outputs =
-            staging.fold_or_residualize(TestIrWrite::new(), Vec::new(), &[reference.clone(), replacement.clone()]);
+        let outputs = staging.fold_or_residualize(
+            TestIrReferenceWriteOperation::new(),
+            Vec::new(),
+            &[reference.clone(), replacement.clone()],
+        );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
         // Under the default `Execute` placement an all-known write folds: it runs against the live state in program
         // order at partial evaluation time.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let outputs = executing.fold_or_residualize(TestIrWrite::new(), Vec::new(), &[reference, replacement]);
+        let outputs =
+            executing.fold_or_residualize(TestIrReferenceWriteOperation::new(), Vec::new(), &[reference, replacement]);
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(4.0_f32).unwrap()));
     }
@@ -698,16 +705,16 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // The store transposes through the cotangent accumulator of its reference operand, which only a transposition
+        // The store transposes through the cotangent accumulator of its reference input, which only a transposition
         // context scoped to the instruction being transposed can resolve, so a detached context rejects it.
         let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(scalar_type.clone())];
         let mut context = TranspositionContext::new(TracingContext::<TestIrValue, TestIrOperation>::new());
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrWrite::new().transpose(&mut context, &EmptyRegionDriver, &inputs, &[], &accumulators),
+            TestIrReferenceWriteOperation::new().transpose(&mut context, &EmptyRegionDriver, &inputs, &[], &accumulators),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "input 0 has no reference root in a transposition context that is not scoped to a \
-                    reference-carrying instruction",
+                               reference-carrying instruction",
         ));
 
         // `r = new(v); write(r, x); y = freeze(r)`: the freeze lands `ȳ` in the allocation's accumulator, the write
@@ -784,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_reference_discharge() {
-        // A policy with no accumulation capability replaces state through `write`, produces no old-value result, and
+        // A policy with no accumulation capability replaces state through `write`, produces no old-value output, and
         // marks the allocation mutated. Its `swap` path is an error, making accidental swap dispatch visible.
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
@@ -800,7 +807,7 @@ mod tests {
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
 
-        // Exact operand inference runs before mutation, so a rejected replacement leaves the allocation unchanged.
+        // Exact input inference runs before mutation, so a rejected replacement leaves the allocation unchanged.
         let invalid = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Value(TestValue::new(TestReferent::new(7, 32), 1)),
@@ -854,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_staging() {
-        // A traced reference stages the write as the native variant of its operation family, with no result and the
+        // A traced reference stages the write as the native variant of its operation family, with no output and the
         // ordered-state effect of the program.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let (output_types, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(

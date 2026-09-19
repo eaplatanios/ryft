@@ -1,52 +1,43 @@
-//! Generic reference primitive operations and their value-level capabilities.
+//! Reference operations for allocating, reading, updating, and consuming mutable state.
 //!
-//! Each child module owns one complete primitive, laid out as the type-indexed operation payload with its inference,
-//! effects, reference-discharge rewrite, and transform rules, then the provider trait and implementations selecting
-//! it for array type universes, then the value-level capability trait with its implementations for eager array values,
-//! projected values, and staged values of every transform, and finally its unit tests. This facade retains only
-//! machinery genuinely shared by multiple primitives and re-exports the established public operation surface.
+//! Each operation module defines its type inference, effects, transform rules, and value-level capability. Shared
+//! helpers preserve input validation and reference state across reference discharge, batching, and differentiation.
 //!
-//! # Reference Operation Providers
-//!
-//! Reference allocation, accumulation, and freezing are selected through
-//! [`OperationProvider`](crate::OperationProvider) requests using their canonical operation payloads and ordered input
-//! types. The provider returns the operation family's selected payload, including downstream alternatives. Unsupported
-//! families and reference-free universes return [`ProgramError::UnsupportedOperation`]. Each capability requires only
-//! the requests it uses: reverse-mode transposition needs allocation and accumulation, while scalar gradient extraction
-//! also needs freezing.
+//! Allocation, accumulation, and freezing use [`OperationProvider`](crate::programs::OperationProvider) requests with
+//! ordered input types to select an operation family's payload, including downstream alternatives. Reference-free
+//! families reject these requests with [`ProgramError::UnsupportedOperation`], while satisfying the provider bounds
+//! required by generic differentiation. Reverse-mode transposition needs allocation and accumulation; gradient
+//! extraction also needs freezing.
 
 // TODO(eaplatanios): Review this module.
 
 use crate::batching::{BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{DifferentiationDual, DifferentiationError};
 use crate::programs::{
     MaybeZero, Operation, ProgramError, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceType, Type, Typed,
     Value,
 };
 
 /// Re-derives one reference primitive's own type inference over the carriers it received, so that a rewrite acts only
-/// on operands the operation itself accepts.
+/// on inputs the operation itself accepts.
 ///
 /// A [`Program`](crate::Program) built through a [`ProgramBuilder`](crate::ProgramBuilder) already ran this inference
 /// when the instruction was added, but a rule invoked outside a checked program replay has no such guarantee, and the
-/// rules that relate two operands to each other cannot recover that relationship from the carriers alone. Only those
-/// rules call this: an allocation derives its own output type instead, and a read or a freeze relates no operands, so
+/// rules that relate two inputs to each other cannot recover that relationship from the carriers alone. Only those
+/// rules call this: an allocation derives its own output type instead, and a read or a freeze relates no inputs, so
 /// re-deriving would restate the projection the rule already performs.
 ///
 /// # Parameters
 ///
 ///   - `operation`: Reference primitive whose inference is re-derived.
-///   - `inputs`: Carriers supplied as this application's operands, in operation-defined order.
-fn validate_operand_types<U: Type, C, P, O>(
+///   - `inputs`: Carriers supplied as this application's inputs, in operation-defined order.
+fn validate_input_types<U: Type, C: Domain<Type = U>, P: ReferenceDischargePolicy<C>, O: Operation<Type = U>>(
     operation: &O,
     inputs: &[ReferenceDischargeValue<C, P>],
 ) -> Result<(), ProgramError>
 where
-    C: Domain<Type = U>,
     U: From<ReferenceType<P::Referent>>,
-    P: ReferenceDischargePolicy<C>,
-    O: Operation<Type = U>,
 {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
     operation.infer_output_types(input_types.as_slice(), &[])?;
@@ -54,7 +45,7 @@ where
 }
 
 /// Aligns the batch carrier of a value stored into a reference with the reference's batch axis. A reference's batch
-/// axis is fixed by its packed referent and cannot move, so the stored value is the operand that adapts: a replicated
+/// axis is fixed by its packed referent and cannot move, so the stored value is the input that adapts: a replicated
 /// value is broadcast to a batched reference's axis and a value mapped elsewhere is moved to it, both through
 /// [`BatchingDriver::align_batch_axis`], which reaches the policy's broadcast and transpose machinery without bounding
 /// the rule by [`RecursiveBatchingPolicy`](crate::batching::RecursiveBatchingPolicy). Storing a batched value into a
@@ -129,31 +120,6 @@ fn stored_tangents<'r, V: Value>(
     }
 }
 
-/// Pairs the `primal` result of a reference access or view with its tangent, for the forward-mode rules of the
-/// primitives that read from or view a reference without storing into it (i.e., reads, freezes, and the array view
-/// operations). A reference dual whose tangent is a [`MaybeZero::Value`] carries a tangent reference to which `forward`
-/// applies the same access or view, yielding the live tangent of `primal`. A reference dual whose tangent is a
-/// [`MaybeZero::Zero`] is a plumbing reference that carries no tangent reference, so `primal` receives a symbolic zero
-/// tangent (for a view, that zero is typed with the view's own reference type, so the view stays plumbing).
-///
-/// # Parameters
-///
-///   - `reference`: Dual of the reference being accessed or viewed.
-///   - `primal`: Result of applying the access or view to the primal reference.
-///   - `forward`: Applies the same access or view to the tangent reference.
-pub(crate) fn forwarded_tangent<V: Value<Type: DifferentiableType>, F: FnOnce(&V) -> Result<V, ProgramError>>(
-    reference: &DifferentiationDual<V>,
-    primal: V,
-    forward: F,
-) -> Result<DifferentiationDual<V>, DifferentiationError> {
-    match reference.tangent() {
-        MaybeZero::Value(tangent_reference) => {
-            DifferentiationDual::new(primal, MaybeZero::Value(forward(tangent_reference)?))
-        }
-        MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
-    }
-}
-
 mod reference_add_update;
 mod reference_atomic_add_update;
 mod reference_freeze;
@@ -177,6 +143,9 @@ pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::{Debug, Display};
 
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
@@ -188,8 +157,6 @@ pub(crate) mod tests {
         ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError, TypeIdentity,
         TypeIdentityPosition, TypeIdentityRenaming, Value, discharge_reference_free_operation,
     };
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
 
     use super::*;
 
@@ -212,7 +179,10 @@ pub(crate) mod tests {
     /// Referent type used to exercise generic reference operations without array-specific behavior.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub(crate) struct TestReferent {
+        /// Identity preserved by reference operations.
         pub(crate) identity: TestIdentity,
+
+        /// Precision used to exercise referent compatibility and exact update type checks.
         pub(crate) precision: u8,
     }
 
@@ -670,7 +640,7 @@ pub(crate) mod tests {
     // concern and are covered where a universe with real view mechanics lives.
     //
     // Two destinations are named because the rules serve two kinds of allocation. A discharged reference's rewrite
-    // reaches only values, so the eager destination executes it and the tests read the results directly. A
+    // reaches only values, so the eager destination executes it and the tests read the outputs directly. A
     // preserved reference is a *reference* of the destination universe, which an eager value of this fixture cannot
     // be, so the preserved replay is exercised against the staging destination and read back as the program it
     // recorded.

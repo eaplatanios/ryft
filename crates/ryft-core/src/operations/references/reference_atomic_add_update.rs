@@ -1,5 +1,3 @@
-//! Generic atomic additive reference update operation and its value-level capability.
-
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
@@ -27,12 +25,12 @@ use crate::programs::{
     ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
-use super::{align_stored_batch, stored_tangents, validate_operand_types};
+use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceAtomicAddUpdateOperation`].
 pub const REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME: &str = "reference_atomic_add_update";
 
-/// Applies an atomic additive update whose result retains the exact referent type.
+/// Applies an atomic additive update that preserves the reference's exact referent type.
 /// Refer to [`ReferenceAtomicAddUpdate`] for the ordering, scope, and caller contract.
 #[derive(Clone, Debug)]
 pub struct ReferenceAtomicAddUpdateOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
@@ -41,6 +39,13 @@ impl<T: Type, U: Type> ReferenceAtomicAddUpdateOperation<T, U> {
     /// Creates a new [`ReferenceAtomicAddUpdateOperation`].
     pub const fn new() -> Self {
         Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Default for ReferenceAtomicAddUpdateOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -53,10 +58,8 @@ impl<T: Type, U: Type> Display for ReferenceAtomicAddUpdateOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceAtomicAddUpdateOperation<T, U>
+impl<T: Type, U: Type> Operation for ReferenceAtomicAddUpdateOperation<T, U>
 where
-    T: Type,
-    U: Type,
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
     AddOperation<T>: Operation<Type = T>,
@@ -77,13 +80,13 @@ where
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<T>>::try_from(&input_types[0])?;
         let update = <&T>::try_from(&input_types[1])?;
-        let addition_results =
+        let addition_outputs =
             AddOperation::<T>::new().infer_output_types(&[reference.referent().clone(), update.clone()], &[])?;
-        check_count!("output", addition_results, 1, TypeError);
-        let addition_result = &addition_results[0];
-        if addition_result != reference.referent() {
+        check_count!("output", addition_outputs, 1, TypeError);
+        let addition_output = &addition_outputs[0];
+        if addition_output != reference.referent() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` addition result type `{addition_result}` must exactly match \
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` addition output type `{addition_output}` must exactly match \
                  reference referent type `{}`",
                 reference.referent(),
             )));
@@ -106,13 +109,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
-where
+impl<
     T: Type,
-    U: From<T> + From<ReferenceType<T>> + Type,
-    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
+    U: Type + From<T> + From<ReferenceType<T>>,
     C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
     P: ReferenceAccumulationPolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
+where
+    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -126,19 +130,17 @@ where
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
         // this operation's own inference states and what a universe's addition alone does not guarantee.
-        validate_operand_types(self, inputs)?;
+        validate_input_types(self, inputs)?;
         // Discharge is sequential replay, selecting one legal order while preserving the caller's state ordering.
         context.accumulate(reference, update)?;
         Ok(Vec::new())
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceAtomicAddUpdate<C::Value>>> InterpretableOperation<C>
+    for ReferenceAtomicAddUpdateOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceAtomicAddUpdate<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -152,31 +154,27 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
-where
+impl<
     T: Type,
     U: Type,
-    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
     P: BatchingPolicy<C>,
+> BatchableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
+where
+    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
 {
-    // The update is aligned with the reference's fixed batch axis before the packed accumulation.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // The update is aligned with the reference's fixed batch axis before the packed accumulation.
         check_count!("input", inputs, 2, ProgramError);
         let update = align_stored_batch(
             context,
@@ -244,39 +242,9 @@ impl_differentiable_operation! {
     },
 }
 
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>> for O
-{
-    type Operation = Self;
-
-    fn provide(
-        request: ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        request.infer_output_types(&[input_types[0].clone(), input_types[1].clone()], &[])?;
-        Ok(request.into())
-    }
-}
-
-impl<O: Operation<Type = ArrayType>>
-    OperationProvider<ArrayType, ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>> for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>,
-        input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
-            ),
-        })
-    }
-}
-
+// The blanket ReferenceAtomicAddUpdate implementation requires this provider bound before its method can reject
+// a non-reference input. Providing it keeps that capability available for generic scalar/array values, with a
+// runtime error for unsupported calls. Differentiation itself does not require atomic accumulation.
 impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicAddUpdateOperation<NoReferent, DataType>>
     for O
 {
@@ -295,12 +263,48 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicA
     }
 }
 
-/// Atomically adds an update into a reference without returning the previous value.
+// The blanket ReferenceAtomicAddUpdate implementation requires this provider bound before its method can reject
+// a non-reference input. Providing it keeps that capability available for generic scalar/array values, with a
+// runtime error for unsupported calls. Differentiation itself does not require atomic accumulation.
+impl<O: Operation<Type = ArrayType>>
+    OperationProvider<ArrayType, ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>,
+        input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+            ),
+        })
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        request: ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        request.infer_output_types(&[input_types[0].clone(), input_types[1].clone()], &[])?;
+        Ok(request.into())
+    }
+}
+
+/// Capability to atomically add an update into a reference without returning the previous value.
 ///
 /// Each selected scalar update occurs exactly once without tearing, with device-scoped sequential consistency:
 /// atomic accesses share a total order consistent with each program instance's order. This does not make an entire
 /// array update indivisible. The caller accepts any allowed ordering of competing additions, including differences
-/// in floating-point results. Conflicting non-atomic accesses still require synchronization.
+/// in floating-point sums. Conflicting non-atomic accesses still require synchronization.
 ///
 /// Sequential interpreters and reference discharge select one permitted execution order. Staged values retain the
 /// atomic operation so parallel lowerings must implement its scope and ordering or reject it. The operation still
@@ -313,29 +317,13 @@ pub trait ReferenceAtomicAddUpdate<Update = Self>: Sized {
 
 impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAtomicAddUpdate for ArrayIrValue<A> {
     fn atomic_add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        ReferenceAtomicAddUpdateOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
+        let operation = ReferenceAtomicAddUpdateOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
         // The reference holder serializes the complete read/add/write transaction, including derived views.
         // This is a valid sequential execution of the per-element atomic contract.
         reference.add_update(update)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceAtomicAddUpdate<ProjectedValue<ArrayType, V>>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>,
-{
-    fn atomic_add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceAtomicAddUpdateOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), update.value().clone()],
-        )?;
-        Ok(())
     }
 }
 
@@ -365,6 +353,26 @@ where
     }
 }
 
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceAtomicAddUpdate<ProjectedValue<ArrayType, V>> for ProjectedValue<ReferenceType<ArrayType>, V>
+{
+    fn atomic_add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceAtomicAddUpdateOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), update.value().clone()],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -377,7 +385,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
-    use crate::macros::check_operation_type_inference;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::math::add::AddOperation;
     use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
@@ -388,16 +396,21 @@ mod tests {
 
     use super::*;
 
-    type TestValue = ArrayIrValue<Array>;
-    type TestOperation = ArrayIrOperation<Array>;
-    type TestContext = EagerContext<TestValue, TestOperation>;
-    type AtomicAddUpdate = ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>;
+    type TestIrValue = ArrayIrValue<Array>;
+    type TestIrOperation = ArrayIrOperation<Array>;
+    type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
+    type TestIrReferenceAtomicAddUpdateOperation = ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_atomic_add_update() {
-        let operation = AtomicAddUpdate::new();
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new();
+        assert_eq!(TestIrReferenceAtomicAddUpdateOperation::default().to_string(), operation.to_string());
         assert_eq!(operation.name(), REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME);
+        assert_eq!(
+            format!("{operation:?}"),
+            format!("ReferenceAtomicAddUpdateOperation({:?})", PhantomData::<fn() -> (ArrayType, ArrayIrType)>),
+        );
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),
@@ -410,7 +423,7 @@ mod tests {
     fn test_reference_atomic_add_update_type_inference() {
         let referent = ArrayType::new_static(DataType::F32, [2]);
         check_operation_type_inference!(
-            operation = AtomicAddUpdate::new(),
+            operation = TestIrReferenceAtomicAddUpdateOperation::new(),
             cases = [
                 {
                     input_types = [ReferenceType::new(referent.clone()).into(), referent.clone().into()],
@@ -422,7 +435,8 @@ mod tests {
                 },
                 {
                     input_types = [ReferenceType::new(referent).into(), ArrayType::scalar(DataType::F64).into()],
-                    error = "`reference_atomic_add_update` addition result type `f64[2]` must exactly match reference referent type `f32[2]`",
+                    error = "`reference_atomic_add_update` addition output type `f64[2]` must exactly match reference \
+                             referent type `f32[2]`",
                 },
             ],
         );
@@ -431,18 +445,24 @@ mod tests {
     #[test]
     fn test_reference_atomic_add_update_interpretation() {
         let live = ArrayReference::new(Array::vector(vec![1_i32, 2]).unwrap());
-        let reference = TestValue::Reference(live.clone());
+        let reference = TestIrValue::Reference(live.clone());
         assert_eq!(
-            AtomicAddUpdate::new().interpret(
-                &TestContext::new(),
+            TestIrReferenceAtomicAddUpdateOperation::new().interpret(
+                &TestIrContext::new(),
                 &EmptyRegionDriver,
-                &[reference.clone(), TestValue::Array(Array::scalar(3_i32).unwrap())],
+                &[reference.clone(), TestIrValue::Array(Array::scalar(3_i32).unwrap())],
             ),
             Ok(Vec::new()),
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![4_i32, 5]).unwrap()));
-        assert_eq!(reference.atomic_add_update(&TestValue::Array(Array::scalar(1.0_f64).unwrap())),
-            Err(TypeError::invalid("`reference_atomic_add_update` addition result type `f64[2]` must exactly match reference referent type `i32[2]`").into()));
+        assert_eq!(
+            reference.atomic_add_update(&TestIrValue::Array(Array::scalar(1.0_f64).unwrap())),
+            Err(TypeError::invalid(
+                "`reference_atomic_add_update` addition output type `f64[2]` must exactly match reference \
+                 referent type `i32[2]`",
+            )
+            .into()),
+        );
         assert_eq!(live.read(), Ok(Array::vector(vec![4_i32, 5]).unwrap()));
     }
 
@@ -452,9 +472,9 @@ mod tests {
         std::thread::scope(|scope| {
             let workers = (0..4)
                 .map(|_| {
-                    let reference = TestValue::Reference(live.clone());
+                    let reference = TestIrValue::Reference(live.clone());
                     scope.spawn(move || {
-                        let update = TestValue::Array(Array::scalar(1_i32).unwrap());
+                        let update = TestIrValue::Array(Array::scalar(1_i32).unwrap());
                         for _ in 0..32 {
                             reference.atomic_add_update(&update).unwrap();
                         }
@@ -470,36 +490,70 @@ mod tests {
 
     #[test]
     fn test_reference_atomic_add_update_partial_evaluation() {
+        // Program replay keeps atomic updates residual for both known and unknown update values.
+        let replayed = ArrayReference::new(Array::scalar(1_i32).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (TestIrValue, TestIrOperation),
+            operation = TestIrReferenceAtomicAddUpdateOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(replayed.clone())),
+                        (@known, TestIrValue::Array(Array::scalar(2_i32).unwrap())),
+                    ],
+                    outputs = [],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(replayed.clone())),
+                        (@unknown(
+                            type = ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+                            replay = TestIrValue::Array(Array::scalar(3_i32).unwrap())
+                        )),
+                    ],
+                    outputs = [],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        assert_eq!(replayed.read(), Ok(Array::scalar(6_i32).unwrap()));
+
+        // Staging leaves live state untouched; executing an all-known update changes it immediately.
         let live = ArrayReference::new(Array::scalar(2_i32).unwrap());
-        let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
-        let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3_i32).unwrap()));
+        let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
+        let update = PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(3_i32).unwrap()));
         let staging =
-            PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
+            PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
         assert_eq!(
             staging
-                .fold_or_residualize(AtomicAddUpdate::new(), Vec::new(), &[reference.clone(), update.clone()])
+                .fold_or_residualize(
+                    TestIrReferenceAtomicAddUpdateOperation::new(),
+                    Vec::new(),
+                    &[reference.clone(), update.clone()],
+                )
                 .map(|outputs| outputs.len()),
-            Ok(0)
+            Ok(0),
         );
         assert_eq!(live.read(), Ok(Array::scalar(2_i32).unwrap()));
-        let executing = PartialEvaluationContext::new(TestContext::new());
+        let executing = PartialEvaluationContext::new(TestIrContext::new());
         assert_eq!(
             executing
-                .fold_or_residualize(AtomicAddUpdate::new(), Vec::new(), &[reference, update])
+                .fold_or_residualize(TestIrReferenceAtomicAddUpdateOperation::new(), Vec::new(), &[reference, update])
                 .map(|outputs| outputs.len()),
-            Ok(0)
+            Ok(0),
         );
         assert_eq!(live.read(), Ok(Array::scalar(5_i32).unwrap()));
     }
 
     #[test]
     fn test_reference_atomic_add_update_batching() {
-        let extent = TestValue::Dimension(
+        let extent = TestIrValue::Dimension(
             DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestContext::new(), extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestIrContext::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let initial = TestValue::Array(
+        let initial = TestIrValue::Array(
             Array::from_elements::<f32>(packed_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
         );
         let reference = initial.reference_new().unwrap();
@@ -510,7 +564,7 @@ mod tests {
         let update = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestValue::Array(Array::from_elements::<f32>(packed_type.clone(), &[1.0; 6]).unwrap()),
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type.clone(), &[1.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),
@@ -519,7 +573,7 @@ mod tests {
         assert!(outputs.is_empty());
         assert_eq!(
             reference.read(),
-            Ok(TestValue::Array(
+            Ok(TestIrValue::Array(
                 Array::from_elements::<f32>(packed_type.clone(), &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap()
             )),
         );
@@ -529,7 +583,7 @@ mod tests {
         let update = BatchingTracer::new(
             context.clone(),
             ArrayIrBatch::new(
-                TestValue::Array(Array::from_elements::<f32>(packed_type, &[1.0; 6]).unwrap()),
+                TestIrValue::Array(Array::from_elements::<f32>(packed_type, &[1.0; 6]).unwrap()),
                 BatchAxis::new(0),
             )
             .unwrap(),
@@ -550,9 +604,9 @@ mod tests {
 
     #[test]
     fn test_reference_atomic_add_update_differentiation() {
-        let context = DifferentiationContext::fused(TestContext::new());
-        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
-        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
+        let context = DifferentiationContext::fused(TestIrContext::new());
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap()).reference_new().unwrap();
         let active = DifferentiationTracer::new(
             DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
             context.clone(),
@@ -561,8 +615,8 @@ mod tests {
         // Addition is linear, so the update's tangent accumulates into the tangent reference.
         let update = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
-                TestValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
@@ -571,29 +625,29 @@ mod tests {
             .bind(ReferenceAtomicAddUpdateOperation::new(), Vec::new(), &[active.clone(), update])
             .unwrap();
         assert!(outputs.is_empty());
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![6.0_f32, 8.0]).unwrap())));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![6.0_f32, 8.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
 
         // A symbolic zero update tangent accumulates nothing and is not instantiated.
         let update = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
                 .unwrap(),
             context.clone(),
         );
         context.bind(ReferenceAtomicAddUpdateOperation::new(), Vec::new(), &[active, update]).unwrap();
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 9.0]).unwrap())));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 9.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
 
         // Staged, the zero-tangent accumulation is therefore elided from the tangent side entirely: the fused program
         // accumulates the constant into the primal reference and leaves the tangent reference untouched.
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let reference_atom = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let constant = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32).unwrap()));
+        let constant = builder.add_constant(TestIrValue::Array(Array::scalar(1.0_f32).unwrap()));
         builder
             .add_instruction(ReferenceAtomicAddUpdateOperation::new(), Vec::new(), vec![reference_atom, constant], None)
             .unwrap();
         let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference_atom], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference_atom], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.jvp().unwrap().to_string(),
@@ -613,18 +667,18 @@ mod tests {
             context.clone(),
         );
         let update = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()))
                 .unwrap(),
             context.clone(),
         );
         context
             .bind(ReferenceAtomicAddUpdateOperation::new(), Vec::new(), &[plumbing.clone(), update])
             .unwrap();
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
         let update = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
-                TestValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
+                TestIrValue::Array(Array::vector(vec![1.0_f32, 1.0]).unwrap()),
             )
             .unwrap(),
             context.clone(),
@@ -640,38 +694,66 @@ mod tests {
                         .to_string(),
             },
         );
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![8.0_f32, 10.0]).unwrap())));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![10.0_f32, 12.0]).unwrap())));
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_transposition() {
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(scalar.clone());
+        let update = builder.add_input(scalar);
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(TestIrReferenceAtomicAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.interpret(vec![TestIrValue::Array(Array::scalar(5.0_f32).unwrap())]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
+            ]),
+        );
     }
 
     #[test]
     fn test_reference_atomic_add_update_reference_discharge() {
         let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar.clone());
         let update = builder.add_input(scalar);
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        builder.add_instruction(AtomicAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
+        builder
+            .add_instruction(TestIrReferenceAtomicAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let analysis = program.reference_analysis(0).unwrap();
         let root = analysis.roots().next().unwrap();
         assert!(analysis.is_mutated(root));
         assert_eq!(
             analysis.access_modes_for(root).collect::<Vec<_>>(),
-            vec![ReferenceAccessMode::AtomicAccumulate, ReferenceAccessMode::Consume]
+            vec![ReferenceAccessMode::AtomicAccumulate, ReferenceAccessMode::Consume],
         );
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().interpret(vec![
-                TestValue::Array(Array::scalar(2.0_f32).unwrap()),
-                TestValue::Array(Array::scalar(3.0_f32).unwrap())
+                TestIrValue::Array(Array::scalar(2.0_f32).unwrap()),
+                TestIrValue::Array(Array::scalar(3.0_f32).unwrap()),
             ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())])
+            Ok(vec![TestIrValue::Array(Array::scalar(5.0_f32).unwrap())]),
         );
     }
 
@@ -680,15 +762,15 @@ mod tests {
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         assert!(matches!(
-            TestOperation::provide(AtomicAddUpdate::new(), &[&reference_type, &value_type]),
+            TestIrOperation::provide(TestIrReferenceAtomicAddUpdateOperation::new(), &[&reference_type, &value_type]),
             Ok(ArrayIrOperation::ReferenceAtomicAddUpdate(_)),
         ));
         assert!(matches!(
-            TestOperation::provide(AtomicAddUpdate::new(), &[]),
+            TestIrOperation::provide(TestIrReferenceAtomicAddUpdateOperation::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         ));
         assert!(matches!(
-            TestOperation::provide(AtomicAddUpdate::new(), &[&value_type, &value_type]),
+            TestIrOperation::provide(TestIrReferenceAtomicAddUpdateOperation::new(), &[&value_type, &value_type]),
             Err(ProgramError::Type(_)),
         ));
         assert!(matches!(
@@ -703,29 +785,5 @@ mod tests {
             ArrayOperation::<Array>::provide(ReferenceAtomicAddUpdateOperation::new(), &[&array_type, &array_type]),
             Err(ProgramError::UnsupportedOperation { .. }),
         ));
-    }
-
-    #[test]
-    fn test_reference_atomic_add_update_transposition() {
-        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let initial = builder.add_input(scalar.clone());
-        let update = builder.add_input(scalar);
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        builder.add_instruction(AtomicAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
-        let output =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(
-            transposed.interpret(vec![TestValue::Array(Array::scalar(5.0_f32).unwrap())]),
-            Ok(vec![
-                TestValue::Array(Array::scalar(5.0_f32).unwrap()),
-                TestValue::Array(Array::scalar(5.0_f32).unwrap())
-            ])
-        );
     }
 }

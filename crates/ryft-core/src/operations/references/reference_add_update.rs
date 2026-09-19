@@ -1,5 +1,3 @@
-//! Generic ordered additive reference update operation and its value-level capability.
-
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
@@ -27,12 +25,12 @@ use crate::programs::{
     ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
-use super::{align_stored_batch, stored_tangents, validate_operand_types};
+use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceAddUpdateOperation`].
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
 
-/// Applies an ordered additive update whose result must retain the reference's exact referent type.
+/// Applies an ordered additive update that preserves the reference's exact referent type.
 #[derive(Clone, Debug)]
 pub struct ReferenceAddUpdateOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
 
@@ -40,6 +38,13 @@ impl<T: Type, U: Type> ReferenceAddUpdateOperation<T, U> {
     /// Creates a new [`ReferenceAddUpdateOperation`].
     pub const fn new() -> Self {
         Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Default for ReferenceAddUpdateOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -52,10 +57,8 @@ impl<T: Type, U: Type> Display for ReferenceAddUpdateOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceAddUpdateOperation<T, U>
+impl<T: Type, U: Type> Operation for ReferenceAddUpdateOperation<T, U>
 where
-    T: Type,
-    U: Type,
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
     AddOperation<T>: Operation<Type = T>,
@@ -76,13 +79,13 @@ where
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<T>>::try_from(&input_types[0])?;
         let update = <&T>::try_from(&input_types[1])?;
-        let addition_results =
+        let addition_outputs =
             AddOperation::<T>::new().infer_output_types(&[reference.referent().clone(), update.clone()], &[])?;
-        check_count!("output", addition_results, 1, TypeError);
-        let addition_result = &addition_results[0];
-        if addition_result != reference.referent() {
+        check_count!("output", addition_outputs, 1, TypeError);
+        let addition_output = &addition_outputs[0];
+        if addition_output != reference.referent() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` addition result type `{addition_result}` must exactly match \
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` addition output type `{addition_output}` must exactly match \
                  reference referent type `{}`",
                 reference.referent(),
             )));
@@ -105,13 +108,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
-where
+impl<
     T: Type,
-    U: From<T> + From<ReferenceType<T>> + Type,
-    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
+    U: Type + From<T> + From<ReferenceType<T>>,
     C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
     P: ReferenceAccumulationPolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
+where
+    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -125,18 +129,16 @@ where
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
         // this operation's own inference states and what a universe's addition alone does not guarantee.
-        validate_operand_types(self, inputs)?;
+        validate_input_types(self, inputs)?;
         context.accumulate(reference, update)?;
         Ok(Vec::new())
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceAddUpdateOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceAddUpdate<C::Value>>> InterpretableOperation<C>
+    for ReferenceAddUpdateOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceAddUpdate<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -150,31 +152,23 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceAddUpdateOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceAddUpdateOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // The update is aligned with the reference's fixed batch axis before the packed accumulation.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // The update is aligned with the reference's fixed batch axis before the packed accumulation.
         check_count!("input", inputs, 2, ProgramError);
         let update =
             align_stored_batch(context, driver, REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
@@ -237,6 +231,48 @@ impl_differentiable_operation! {
     },
 }
 
+// Reverse-mode transposition requires an accumulation provider for reference cotangents even when instantiated
+// with a reference-free type universe. This implementation lets ordinary scalar/array gradients satisfy that
+// bound without adding reference support; direct accumulation requests are unsupported.
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAddUpdateOperation<NoReferent, DataType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<NoReferent, DataType>,
+        input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+            ),
+        })
+    }
+}
+
+// Reverse-mode transposition requires an accumulation provider for reference cotangents even when instantiated
+// with a reference-free type universe. This implementation lets ordinary scalar/array gradients satisfy that
+// bound without adding reference support; direct accumulation requests are unsupported.
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<NoReferent, ArrayType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<NoReferent, ArrayType>,
+        input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
+            ),
+        })
+    }
+}
+
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
 //  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
 //  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
@@ -256,51 +292,14 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayTy
     }
 }
 
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<NoReferent, ArrayType>>
-    for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<NoReferent, ArrayType>,
-        input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
-            ),
-        })
-    }
-}
-
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAddUpdateOperation<NoReferent, DataType>>
-    for O
-{
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceAddUpdateOperation<NoReferent, DataType>,
-        input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` is not supported in a reference-free type universe"
-            ),
-        })
-    }
-}
-
-/// Adds an update into the value stored by a reference in program order.
+/// Capability to add an update into the value stored by a reference in program order.
 ///
 /// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a [`Context`]
 /// project the referent of their reference type through [`ReferenceMemberType::referent`] and use the context's
-/// operation family to select and bind the update operation through [`OperationProvider`]. The
-/// selected operation may use a downstream payload, and a family without reference operations may reject construction.
-/// This capability alone is generic over type universes because reverse-mode differentiation accumulates cotangents
-/// through it on tracers of arbitrary universes; the other five reference capabilities are specific to
-/// [`ArrayIrType`], because no core machinery needs them on arbitrary type universes.
+/// operation family to select and bind the update operation through [`OperationProvider`]. The selected operation
+/// may use a downstream payload, and a family without reference operations may reject construction. This capability
+/// supports arbitrary reference-aware type universes so reverse-mode differentiation can accumulate cotangents through
+/// it without depending on [`ArrayIrType`].
 pub trait ReferenceAddUpdate<Update = Self>: Sized {
     /// Adds `update` to the stored value in program order.
     fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
@@ -308,27 +307,11 @@ pub trait ReferenceAddUpdate<Update = Self>: Sized {
 
 impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAddUpdate for ArrayIrValue<A> {
     fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
+        let operation = ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
         reference.add_update(update)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<ProjectedValue<ArrayType, V>>
-    for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
-{
-    fn add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceAddUpdateOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), update.value().clone()],
-        )?;
-        Ok(())
     }
 }
 
@@ -354,6 +337,26 @@ where
             &[reference_type.as_ref(), update.r#type().as_ref()],
         )?;
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
+        Ok(())
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceAddUpdate<ProjectedValue<ArrayType, V>> for ProjectedValue<ReferenceType<ArrayType>, V>
+{
+    fn add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceAddUpdateOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), update.value().clone()],
+        )?;
         Ok(())
     }
 }
@@ -388,20 +391,20 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
-    type TestIrAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceAddUpdateOperation = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_add_update() {
         let operation = AddUpdate::new();
+        assert_eq!(AddUpdate::default().to_string(), operation.to_string());
         assert_eq!(operation.name(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            "ReferenceAddUpdateOperation(PhantomData<fn() -> (ryft_core::operations::references::tests::TestReferent, \
-             ryft_core::operations::references::tests::TestType)>)",
+            format!("ReferenceAddUpdateOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
         );
 
-        // An accumulation orders against other state effects, accumulates into its reference operand, and aliases
+        // An accumulation orders against other state effects, accumulates into its reference input, and aliases
         // nothing.
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
@@ -425,7 +428,7 @@ mod tests {
                 },
                 {
                     input_types = [reference.clone(), TestType::Value(TestReferent::new(7, 32))],
-                    error = "`reference_add_update` addition result type `value<i7,p32>` must exactly match reference \
+                    error = "`reference_add_update` addition output type `value<i7,p32>` must exactly match reference \
                              referent type `value<i7,p16>`",
                 },
                 {
@@ -463,7 +466,7 @@ mod tests {
         // An array update may broadcast against the referent as long as the sum keeps the exact referent type.
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
         check_operation_type_inference!(
-            operation = TestIrAddUpdate::new(),
+            operation = TestIrReferenceAddUpdateOperation::new(),
             cases = [
                 {
                     input_types = [
@@ -484,7 +487,7 @@ mod tests {
                         ArrayIrType::Reference(ReferenceType::new(vector_type.clone())),
                         ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2])),
                     ],
-                    error = "`reference_add_update` addition result type `f64[2]` must exactly match reference \
+                    error = "`reference_add_update` addition output type `f64[2]` must exactly match reference \
                              referent type `f32[2]`",
                 },
                 {
@@ -510,7 +513,7 @@ mod tests {
         // An update is added into the stored value in place and produces no output.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrAddUpdate::new(),
+                &TestIrReferenceAddUpdateOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())],
@@ -522,7 +525,7 @@ mod tests {
         // Broadcasting is valid only because the computed sum preserves the exact stored type.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrAddUpdate::new(),
+                &TestIrReferenceAddUpdateOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::scalar(1.0_f32).unwrap())],
@@ -531,27 +534,27 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![5.0_f32, 7.0]).unwrap()));
 
-        // Exact operand inference runs before the accumulation, so a rejected update leaves the stored value unchanged.
+        // Exact input inference runs before the accumulation, so a rejected update leaves the stored value unchanged.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrAddUpdate::new(),
+                &TestIrReferenceAddUpdateOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![3.0_f64, 4.0]).unwrap())],
             ),
             Err(TypeError::invalid(
-                "`reference_add_update` addition result type `f64[2]` must exactly match reference referent type \
+                "`reference_add_update` addition output type `f64[2]` must exactly match reference referent type \
                  `f32[2]`",
             )
             .into()),
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![5.0_f32, 7.0]).unwrap()));
 
-        // Each operand must be the member kind the operation expects.
+        // Each input must be the member kind the operation expects.
         let array = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap());
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrAddUpdate::new(),
+                &TestIrReferenceAddUpdateOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[array.clone(), array],
@@ -560,7 +563,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrAddUpdate::new(),
+                &TestIrReferenceAddUpdateOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), reference],
@@ -572,13 +575,13 @@ mod tests {
 
     #[test]
     fn test_reference_add_update_partial_evaluation() {
-        // Program replay uses the `Stage` placement: an accumulation stages regardless of operand knowledge, the live
+        // Program replay uses the `Stage` placement: an accumulation stages regardless of input knowledge, the live
         // handle is passed to the residual program as a known reference input, and the sum is formed only when that
         // program runs.
         let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         check_operation_partial_evaluation!(
             backend = (TestIrValue, TestIrOperation),
-            operation = TestIrAddUpdate::new(),
+            operation = TestIrReferenceAddUpdateOperation::new(),
             cases = [
                 {
                     inputs = [
@@ -603,21 +606,25 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::scalar(6.0_f32).unwrap()));
 
-        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every operand
+        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every input
         // is known.
         let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
         let update = PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(4.0_f32).unwrap()));
         let staging =
             PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
-        let outputs =
-            staging.fold_or_residualize(TestIrAddUpdate::new(), Vec::new(), &[reference.clone(), update.clone()]);
+        let outputs = staging.fold_or_residualize(
+            TestIrReferenceAddUpdateOperation::new(),
+            Vec::new(),
+            &[reference.clone(), update.clone()],
+        );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(6.0_f32).unwrap()));
 
         // Under the default `Execute` placement an all-known accumulation folds: it runs against the live state in
         // program order at partial evaluation time.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let outputs = executing.fold_or_residualize(TestIrAddUpdate::new(), Vec::new(), &[reference, update]);
+        let outputs =
+            executing.fold_or_residualize(TestIrReferenceAddUpdateOperation::new(), Vec::new(), &[reference, update]);
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(10.0_f32).unwrap()));
     }
@@ -771,17 +778,17 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // The accumulation transposes through the cotangent accumulator of its reference operand, which only a
+        // The accumulation transposes through the cotangent accumulator of its reference input, which only a
         // transposition context scoped to the instruction being transposed can resolve, so a detached context rejects
         // it.
         let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(scalar_type.clone())];
         let mut context = TranspositionContext::new(TracingContext::<TestIrValue, TestIrOperation>::new());
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrAddUpdate::new().transpose(&mut context, &EmptyRegionDriver, &inputs, &[], &accumulators),
+            TestIrReferenceAddUpdateOperation::new().transpose(&mut context, &EmptyRegionDriver, &inputs, &[], &accumulators),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "input 0 has no reference root in a transposition context that is not scoped to a \
-                    reference-carrying instruction",
+                               reference-carrying instruction",
         ));
 
         // `r = new(v); add_update(r, x); y = freeze(r)`: the freeze lands `ȳ` in the allocation's accumulator, the
@@ -878,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_reference_add_update_reference_discharge() {
-        // An accumulation produces no result and replaces the current state with its sum with the update.
+        // An accumulation produces no output and replaces the current state with its sum with the update.
         let (context, reference) = allocated_reference(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
@@ -900,7 +907,7 @@ mod tests {
         assert_eq!(
             AddUpdate::new().discharge_references(&context, &EmptyRegionDriver, promoted.as_slice()),
             Err(TypeError::invalid(
-                "`reference_add_update` addition result type `value<i7,p32>` must exactly match reference referent \
+                "`reference_add_update` addition output type `value<i7,p32>` must exactly match reference referent \
              type `value<i7,p16>`",
             )
             .into()),
@@ -983,7 +990,7 @@ mod tests {
     #[test]
     fn test_reference_add_update_staging() {
         // A traced reference selects the accumulation through its operation family's provider and stages it as the
-        // native variant, with no result and the ordered-state effect of the program.
+        // native variant, with no output and the ordered-state effect of the program.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let (output_types, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
             |inputs| {
