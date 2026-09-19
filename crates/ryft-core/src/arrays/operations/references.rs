@@ -1278,8 +1278,7 @@ mod tests {
     #[test]
     fn test_array_reference_view_operations_batching() {
         let extent = TestValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestDestination::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
@@ -1388,7 +1387,7 @@ mod tests {
         // A static identity slice cannot be formed for a dynamically sized batch axis.
         let trace = TracingContext::<TestValue, TestOperation>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
-        let extent = trace.input(DimensionType::new(batch.clone()).into());
+        let extent = trace.input(DimensionType::from(batch.clone()).into());
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         let reference = trace.input(ReferenceType::new(dynamic_type.clone()).into());

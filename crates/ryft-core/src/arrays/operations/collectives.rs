@@ -670,7 +670,7 @@ mod tests {
         );
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
-        let dimension_type = DimensionType::new(variable.clone());
+        let dimension_type = DimensionType::from(variable.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(array_type.into());
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn test_array_ir_invariant_all_gather_linearization() {
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dimension_type = DimensionType::new(variable.clone());
+        let dimension_type = DimensionType::from(variable.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(array_type.into());
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn test_array_ir_shape_changing_collective_linearization() {
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dimension_type = DimensionType::new(variable.clone());
+        let dimension_type = DimensionType::from(variable.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let array = builder.add_input(array_type.into());

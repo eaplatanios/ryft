@@ -338,7 +338,7 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>>
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
 /// let r#type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
-/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size), 3).unwrap());
 /// assert_eq!(
 ///     context.dynamic_iota(&r#type, 0, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![0i32, 1, 2]).unwrap())),
@@ -457,7 +457,7 @@ mod tests {
         let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
         let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let extent = builder.add_input(DimensionType::from(formal.clone()).into());
         let output = builder
             .add_instruction(
                 IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(formal)])), 0)
@@ -474,7 +474,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let caller_input = ArrayIrType::Dimension(DimensionType::new(caller.clone()));
+        let caller_input = ArrayIrType::Dimension(DimensionType::from(caller.clone()));
         let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
         let [instruction] = instantiated.instructions() else {
             panic!("expected one instantiated instruction");
@@ -488,7 +488,7 @@ mod tests {
         );
         assert_eq!(
             instantiated
-                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
+                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(caller), 3).unwrap())]),
             Ok(vec![ArrayIrValue::Array(
                 Array::from_elements(
                     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
@@ -666,8 +666,7 @@ mod tests {
 
     #[test]
     fn test_iota_differentiation_dynamic() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let output = builder
@@ -725,8 +724,7 @@ mod tests {
     fn test_iota_transposition_dynamic() {
         // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
         // extent receives a structural zero cotangent regardless of the output cotangent being live.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let operation = ArrayIrOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap());
@@ -798,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_iota() {
-        let extent_type = DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::unbounded());
         let output_type = ArrayType::new(
             DataType::I32,
             Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone()), Dimension::Static(2)]),
@@ -846,7 +844,7 @@ mod tests {
 
         // Matching diagnostic names and bounds do not make separately created identities interchangeable.
         let distinct = DimensionVariable::new("extent", DimensionBounds::unbounded());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(distinct), 3).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct), 3).unwrap());
         assert_eq!(
             context.dynamic_iota(&output_type, 0, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -858,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_iota_staging() {
-        let extent_type = DimensionType::new(DimensionVariable::new("extent", DimensionBounds::unbounded()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::unbounded());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -898,7 +896,7 @@ mod tests {
     fn test_dynamic_iota_staging_singleton_dimension() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
-        let dimension_type = DimensionType::new(size.clone());
+        let dimension_type = DimensionType::from(size.clone());
         let dimension = context.input(dimension_type.clone().into());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output = context.dynamic_iota(&output_type, 0, std::slice::from_ref(&dimension)).unwrap();

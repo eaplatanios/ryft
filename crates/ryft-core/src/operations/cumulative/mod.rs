@@ -44,7 +44,7 @@ use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::padding::{Pad, PadOperation};
-use crate::operations::manipulation::slicing::{DynamicSliceOperation, Slice, SliceOperation};
+use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::math::add::{Add, AddOperation};
 use crate::programs::{MaybeZero, OperationProvider, ProgramError, ProvenanceScope, TypeError, Typed, Value};
 use crate::tracing::{Tracer, TracingContext};
@@ -362,7 +362,6 @@ where
         + From<ConcatenateOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SliceOperation>
-        + From<DynamicSliceOperation>
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
     F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
 {
@@ -652,7 +651,7 @@ macro_rules! define_cumulative_operation {
                 + From<$combine_operation>
                 + From<$operation>
                 + From<PadOperation<ArrayType>>
-                + From<SliceOperation> + From<$crate::operations::manipulation::slicing::DynamicSliceOperation>
+                + From<SliceOperation>
                 + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
             C::Value: $capability,
         {

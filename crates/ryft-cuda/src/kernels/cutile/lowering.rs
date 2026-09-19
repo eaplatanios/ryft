@@ -766,9 +766,7 @@ mod tests {
     use ryft_core::kernels::{
         Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
     };
-    use ryft_core::{
-        DimensionBounds, DimensionMulOperation, DimensionType, DimensionVariable, ReferenceRead, ReferenceWrite,
-    };
+    use ryft_core::{DimensionBounds, DimensionMulOperation, DimensionType, ReferenceRead, ReferenceWrite};
 
     use super::*;
 
@@ -931,8 +929,8 @@ mod tests {
 
     #[test]
     fn test_dimension() {
-        let left = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(8)).unwrap()));
-        let right = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(8)).unwrap()));
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(8)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(8)).unwrap());
         let operation = DimensionOperation::Mul(DimensionMulOperation::new(&left, &right).unwrap());
         assert_eq!(dimension(&operation, &["a".to_owned(), "b".to_owned()]).unwrap(), "(a * b)");
     }

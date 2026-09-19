@@ -2934,7 +2934,7 @@ mod tests {
     #[test]
     fn test_while_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         let array_type =
             ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
         let state_types = vec![dimension_type.clone(), array_type.clone()];
@@ -6436,7 +6436,7 @@ mod tests {
         type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_type = DimensionType::new(batch.clone());
+        let batch_type = DimensionType::from(batch.clone());
         let trace = TraceContext::new();
         let batch_extent = trace.input(batch_type.clone().into());
         let state =

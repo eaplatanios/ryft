@@ -1812,7 +1812,7 @@ mod tests {
         let two = builder.add_constant(ArrayIrValue::Dimension(two_value));
         let doubled_extent = builder
             .add_instruction(
-                DimensionOperation::Mul(DimensionMulOperation::new(&DimensionType::new(source), &two_type).unwrap()),
+                DimensionOperation::Mul(DimensionMulOperation::new(&DimensionType::from(source), &two_type).unwrap()),
                 Vec::new(),
                 vec![source_extent, two],
                 None,
@@ -2204,7 +2204,7 @@ mod tests {
         // The diagnostic directs this case to the mixed operation, which carries that extent as an input.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent = trace.input(DimensionType::new(items.clone()).into());
+        let extent = trace.input(DimensionType::from(items.clone()).into());
         let input = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items), Dimension::Static(6)])).into(),
         );
@@ -3384,7 +3384,7 @@ mod tests {
 
         // Reuse cannot silently drop a runtime check; explicit refinement can restore it for an independent extent.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let unproven = [exact[0].clone(), DimensionType::new(extent).into()];
+        let unproven = [exact[0].clone(), DimensionType::from(extent).into()];
         assert_eq!(
             operation.infer_output_types(&unproven, &[]),
             Err(TypeError::invalid(format!(
@@ -3412,7 +3412,7 @@ mod tests {
             .unwrap();
         let two = ArrayIrType::from(DimensionValue::constant(2).unwrap().r#type().into_owned());
         let input_types =
-            vec![input.clone().into(), DimensionType::new(extent.clone()).into(), two.clone(), two.clone()];
+            vec![input.clone().into(), DimensionType::from(extent.clone()).into(), two.clone(), two.clone()];
         let operation = DynamicReshapeOperation::new().with_input_types(&input_types).unwrap();
         let output =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone()), 2.into(), 2.into()]))
@@ -3431,7 +3431,7 @@ mod tests {
 
         // The proof must not survive reuse with independent dynamic identities. Explicit replication lets the
         // count-proof diagnostic be reached before sharding inference for the unrelated identity.
-        let other = DimensionType::new(DimensionVariable::new("other", DimensionBounds::new(1, Some(9)).unwrap()));
+        let other = DimensionType::new("other", DimensionBounds::new(1, Some(9)).unwrap());
         let unsharded_input = ArrayIrType::Array(ArrayType::new(DataType::F32, input.shape().clone()));
         check_operation_type_inference!(
             operation = operation.clone(),
@@ -3439,7 +3439,7 @@ mod tests {
                 {
                     input_types = [
                         input.clone().into(),
-                        DimensionType::new(extent.clone()).into(),
+                        DimensionType::from(extent.clone()).into(),
                         two.clone(),
                         two.clone(),
                     ],
@@ -3496,7 +3496,7 @@ mod tests {
     fn test_dynamic_reshape_type_inference_identity_instantiation() {
         let bounds = DimensionBounds::new(1, Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
-        let source_dimension_type = DimensionType::new(source.clone());
+        let source_dimension_type = DimensionType::from(source.clone());
         let source_array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Static(4)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3518,7 +3518,7 @@ mod tests {
         // Instantiating the boundary identities renames the identity throughout: the reshape has no stored geometry of
         // its own, so its output type follows the renamed extent input.
         let target = DimensionVariable::new("target", bounds);
-        let target_dimension_type = DimensionType::new(target.clone());
+        let target_dimension_type = DimensionType::from(target.clone());
         let target_array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target), Dimension::Static(4)]));
         let instantiated = program
@@ -3632,8 +3632,7 @@ mod tests {
         // An unused runtime reshape whose element counts are not proven equal must survive simplification, because
         // its ordered assertion still validates the input-dependent element count.
         let input_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4]));
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone());
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type));
@@ -3822,8 +3821,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let mapped_extent = ArrayIrBatch::mapped_dimension(
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[6_i32, 6]).unwrap()),
             BatchAxis::new(0),
@@ -3968,9 +3966,7 @@ mod tests {
         // invalid runtime element count still fails even though nothing consumes the output.
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = parent.input(ArrayType::new_static(DataType::F64, [2, 6]).into());
-        let extent = parent.input(
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap())).into(),
-        );
+        let extent = parent.input(DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap()).into());
         let two = parent.lift(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two);
         let batched = DynamicReshapeOperation::new()
@@ -4077,7 +4073,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(4)]));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = context.input(input_type.clone().into());
-        let extent = context.input(DimensionType::new(total.clone()).into());
+        let extent = context.input(DimensionType::from(total.clone()).into());
         let inputs = vec![
             DifferentiationDual::new(input, MaybeZero::Zero(input_type.tangent().unwrap().into())).unwrap(),
             DifferentiationDual::new_with_zero_tangent(extent).unwrap(),
@@ -4121,7 +4117,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
-        let extent = builder.add_input(DimensionType::new(rows.clone()).into());
+        let extent = builder.add_input(DimensionType::from(rows.clone()).into());
         let output = builder
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
             .unwrap()[0];
@@ -4214,7 +4210,7 @@ mod tests {
         // cotangent returns in the original input order.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [2, 3]).into());
-        let extent = builder.add_input(DimensionType::new(rows).into());
+        let extent = builder.add_input(DimensionType::from(rows).into());
         let input = builder
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Transpose(TransposeOperation::new([1, 0]))),
@@ -4579,7 +4575,7 @@ mod tests {
         // A matching explicit output-extent input is already the authoritative SSA value for the source axis, so
         // the residual path reuses it and does not read the source array again.
         let source = DimensionVariable::new("reused_source", DimensionBounds::new(1, Some(9)).unwrap());
-        let source_type = DimensionType::new(source.clone());
+        let source_type = DimensionType::from(source.clone());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source), Dimension::Static(4)])).into(),
@@ -4836,7 +4832,7 @@ mod tests {
                 .unwrap();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
-        let extent = builder.add_input(DimensionType::new(extent).into());
+        let extent = builder.add_input(DimensionType::from(extent).into());
         let four = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()));
         let output = builder
             .add_instruction(
@@ -4886,7 +4882,7 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let input = builder.add_input(input_type.clone().into());
-            let extent = builder.add_input(DimensionType::new(extent.clone()).into());
+            let extent = builder.add_input(DimensionType::from(extent.clone()).into());
             let two = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
             let output_sharding = Sharding::replicated(mesh, 3);
             let output = builder
@@ -4966,7 +4962,7 @@ mod tests {
         // Structural zeros need no inverse shape reconstruction, even with unresolved input extents.
         let extent = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone()), 4.into()]));
-        let extent_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let extent_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         let output_type = input_type.clone();
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let four = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap())).unwrap();
@@ -5039,7 +5035,7 @@ mod tests {
         let input_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [6]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone());
-        let extent = builder.add_input(DimensionType::new(rows).into());
+        let extent = builder.add_input(DimensionType::from(rows).into());
         let output = builder
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
             .unwrap()[0];
@@ -5347,8 +5343,7 @@ mod tests {
         // A concrete composite value resolves every extent input to its runtime value, binding repeated nominal
         // identities to one extent, and reshapes its array member with the resolved parameters.
         let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6]).unwrap());
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let two = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(

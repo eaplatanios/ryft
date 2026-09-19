@@ -1896,8 +1896,7 @@ mod mixed_members {
     /// instructions consume and produce. The array type is static because reconstructing a mixed instruction from type
     /// metadata alone requires that its geometry not live in runtime identity references.
     fn fixture_types() -> (ArrayType, DimensionType) {
-        let dimension_type =
-            DimensionType::new(DimensionVariable::new("items", DimensionBounds::new(1, Some(8)).unwrap()));
+        let dimension_type = DimensionType::new("items", DimensionBounds::new(1, Some(8)).unwrap());
         (ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])), dimension_type)
     }
 

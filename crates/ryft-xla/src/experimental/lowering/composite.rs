@@ -12,7 +12,7 @@
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
     DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionType, DimensionVariable, EffectClass, Layout, Operation, ProgramError, Shape, SliceBounds,
+    DimensionType, EffectClass, Layout, Operation, ProgramError, Shape, SliceBounds,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -916,8 +916,7 @@ where
                     let extent = DimensionSizeOperation::new(input, operation.axis()).map_err(ProgramError::from)?;
                     let sum = DimensionAddOperation::new(&inferred_extent, extent.result_type())
                         .map_err(ProgramError::from)?;
-                    inferred_extent =
-                        DimensionType::new(DimensionVariable::new(sum.output_name(), sum.output_bounds()));
+                    inferred_extent = DimensionType::new(sum.output_name(), sum.output_bounds());
                 }
                 let mut inferred_dimensions = output_type.shape().dimensions().to_vec();
                 // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.
@@ -1134,8 +1133,7 @@ where
                     .map_err(|error| LoweringError::Tracing(error.into()))?;
                 // Clamping is relative to the logical span, not the larger physical allocation window.
                 // Normalize once and reuse the same origin for validation and extraction.
-                let zero_start =
-                    DimensionType::new(DimensionVariable::new("start", DimensionBounds::new(0, Some(1)).unwrap()));
+                let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
                 let start_type = if operation.bounds() == SliceBounds::Clamp {
                     let constants =
                         lower_static_index_constants(&[0, 1, operation.strides()[axis]], block, context, location)?;
@@ -1419,7 +1417,7 @@ mod tests {
 
     /// Creates a first-class dimension type with the provided bounds.
     fn dimension_type(name: &str, bounds: DimensionBounds) -> DimensionType {
-        DimensionType::new(DimensionVariable::new(name, bounds))
+        DimensionType::new(name, bounds)
     }
 
     /// Extracts the unsupported-operation diagnostic produced by the physical slice planner.

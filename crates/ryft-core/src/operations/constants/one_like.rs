@@ -213,7 +213,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         assert_eq!(operation.infer_output_types(&[r#type.clone().into()], &[]), Ok(vec![r#type.into()]));
         assert_eq!(
-            operation.infer_output_types(&[DimensionType::new(size).into()], &[]),
+            operation.infer_output_types(&[DimensionType::from(size).into()], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
     }

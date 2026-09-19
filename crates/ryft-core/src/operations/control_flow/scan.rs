@@ -1611,7 +1611,7 @@ pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
     }
     let extent = runtime_length_type
         .extent()
-        .filter(|_| DimensionType::new(variable.clone()).is_refined_by(runtime_length_type))
+        .filter(|_| DimensionType::from(variable.clone()).is_refined_by(runtime_length_type))
         .ok_or_else(|| {
             TypeError::invalid(format!(
                 "`{SCAN_OPERATION_NAME}` runtime length operand has type {runtime_length_type} but {SCAN_OPERATION_NAME} length \
@@ -4032,7 +4032,7 @@ mod tests {
     fn test_scan_composite_type_contract() {
         let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         let slice_type =
             ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
         let stacked_type = ArrayIrType::Array(ArrayType::new(
@@ -4102,7 +4102,7 @@ mod tests {
         // concrete extent instead of at the still-symbolic declared length.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let unrelated = DimensionVariable::new("unrelated", DimensionBounds::positive(Some(5)).unwrap());
-        let three = DimensionType::new(DimensionVariable::new("three", DimensionBounds::new(3, Some(4)).unwrap()));
+        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         let dynamic_stacked_type = ArrayIrType::Array(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(extent)]),
@@ -4110,7 +4110,7 @@ mod tests {
         let dynamic_scan = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, Dimension::Dynamic(length.clone()));
         assert_eq!(
             dynamic_scan.infer_output_types(
-                &[dimension_type.clone(), dynamic_stacked_type.clone(), DimensionType::new(unrelated).into()],
+                &[dimension_type.clone(), dynamic_stacked_type.clone(), DimensionType::from(unrelated).into()],
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
@@ -4217,7 +4217,7 @@ mod tests {
         );
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         assert_eq!(
-            ArrayIrType::scan_body_input_types(&[DimensionType::new(extent.clone()).into()], 2, 0, &length),
+            ArrayIrType::scan_body_input_types(&[DimensionType::from(extent.clone()).into()], 2, 0, &length),
             Err(TypeError::invalid(
                 "scan stacked input 0 must be an array or a reference but got dimension<extent ∈ [1, 8)>".to_string(),
             )),
@@ -4263,10 +4263,8 @@ mod tests {
                     .to_string(),
             )),
         );
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
-            "extent",
-            DimensionBounds::positive(Some(8)).unwrap(),
-        )));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
         assert_eq!(
             ArrayIrType::stacked_scan_type(&dimension_type, &length),
             Err(TypeError::invalid(
@@ -4281,7 +4279,7 @@ mod tests {
         // A runtime length operand that pins one exact extent applies the same refinement rule to stacked references
         // as to stacked arrays.
         let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
-        let three = DimensionType::new(DimensionVariable::new("three", DimensionBounds::new(3, Some(4)).unwrap()));
+        let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         assert_eq!(
             ArrayIrType::scan_body_input_types(
                 &[stacked_reference.clone(), three.into()],
@@ -4295,7 +4293,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(dynamic_length.clone()), Dimension::Static(2)]),
         )));
-        let four = DimensionType::new(DimensionVariable::new("four", DimensionBounds::new(4, Some(5)).unwrap()));
+        let four = DimensionType::new("four", DimensionBounds::new(4, Some(5)).unwrap());
         assert_eq!(
             ArrayIrType::scan_body_input_types(
                 &[symbolic_reference, four.into()],
@@ -4771,7 +4769,7 @@ mod tests {
         // Only the final carry is a program output, so the stacked output is dead and its cotangent is a structural
         // zero of the dynamically shaped stacked type.
         let mut builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
-        let runtime_length = builder.add_input(ArrayIrType::Dimension(DimensionType::new(length.clone())));
+        let runtime_length = builder.add_input(ArrayIrType::Dimension(DimensionType::from(length.clone())));
         let carry_init = builder.add_input(item_type);
         let stacked_input = builder.add_input(stacked_type.clone());
         let body_region = builder.import_region(body.entry_region_ref());
@@ -5889,7 +5887,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let runtime_length = builder.add_input(DimensionType::new(length.clone()).into());
+        let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scanned = builder
@@ -5906,7 +5904,7 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let runtime_length = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(length), 4).unwrap());
+        let runtime_length = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(length), 4).unwrap());
         let eager = source
             .clone()
             .interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0).unwrap()), runtime_length.clone()])
@@ -5952,7 +5950,7 @@ mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let input = builder.add_input(array_type.into());
-        let runtime_length = builder.add_input(DimensionType::new(length.clone()).into());
+        let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
         let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let body = builder.import_program(body);
         let output = builder
@@ -5968,10 +5966,10 @@ mod tests {
             .unwrap();
         let discharged = program.clone().discharge_references(0).unwrap();
         let empty = TestIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap());
-        let zero = TestIrValue::Dimension(DimensionValue::new(DimensionType::new(length.clone()), 0).unwrap());
+        let zero = TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 0).unwrap());
         assert_eq!(program.clone().interpret(vec![empty.clone(), zero.clone()]), Ok(vec![empty.clone()]));
         assert_eq!(discharged.program().interpret(vec![empty.clone(), zero]), Ok(vec![empty.clone()]));
-        let one = TestIrValue::Dimension(DimensionValue::new(DimensionType::new(length.clone()), 1).unwrap());
+        let one = TestIrValue::Dimension(DimensionValue::new(DimensionType::from(length.clone()), 1).unwrap());
         let source_error = program.interpret(vec![empty.clone(), one.clone()]).unwrap_err();
         let discharged_error = discharged.program().interpret(vec![empty, one]).unwrap_err();
         assert_eq!(

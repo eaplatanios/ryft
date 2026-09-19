@@ -350,7 +350,7 @@ mod tests {
 
         // The array universe reads array referents and rejects its other members.
         let array_type = ArrayType::scalar(DataType::F32);
-        let dimension_type = DimensionType::new(DimensionVariable::new("n", DimensionBounds::unbounded()));
+        let dimension_type = DimensionType::new("n", DimensionBounds::unbounded());
         check_operation_type_inference!(
             operation = TestIrRead::new(),
             cases = [
@@ -489,8 +489,7 @@ mod tests {
     #[test]
     fn test_reference_read_batching() {
         let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<TestIrValue, TestIrOperation>::new(),

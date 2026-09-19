@@ -697,7 +697,7 @@ mod tests {
                 .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
                 .unwrap();
         let output_extent =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable)).unwrap();
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(variable)).unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),

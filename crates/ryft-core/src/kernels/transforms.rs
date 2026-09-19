@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension,
-    DimensionBounds, DimensionType, DimensionVariable, ReferenceIndexOperation,
+    DimensionBounds, DimensionType, ReferenceIndexOperation,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::Context;
@@ -73,10 +73,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
         let mut dimensions = call.grid().dimensions().to_vec();
         dimensions.push(GridDimension::new(Dimension::Static(batch_size), GridExecution::Parallel));
         let grid = Grid::new(dimensions).map_err(KernelError::from)?;
-        let coordinate = DimensionType::new(DimensionVariable::new(
-            "batch",
-            DimensionBounds::non_negative(Some(batch_size.max(1))).unwrap(),
-        ));
+        let coordinate = DimensionType::new("batch", DimensionBounds::non_negative(Some(batch_size.max(1))).unwrap());
         let mut parameters = Vec::with_capacity(axes.len());
         for (index, (parameter, axis)) in call.parameters().iter().zip(axes).enumerate() {
             if axis.is_none() && parameter.access() != KernelParameterAccess::ReadOnly {

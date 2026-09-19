@@ -883,7 +883,7 @@ mod tests {
     }
     #[test]
     fn test_kernel_operation_partially_evaluate() {
-        use crate::arrays::{DimensionBounds, DimensionVariable};
+        use crate::arrays::DimensionBounds;
         use crate::kernels::calls::KernelParameter;
         use crate::kernels::grids::Grid;
         use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
@@ -894,10 +894,7 @@ mod tests {
         use crate::programs::ProgramBuilder;
 
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        mapping.add_input(
-            DimensionType::new(DimensionVariable::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()))
-                .into(),
-        );
+        mapping.add_input(DimensionType::new("offset", DimensionBounds::non_negative(Some(4)).unwrap()).into());
         let call = KernelCallOperation::new_with_prefetch(
             Grid::new(vec![]).unwrap(),
             vec![

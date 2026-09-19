@@ -2545,7 +2545,7 @@ mod tests {
 
         let trace = TraceContext::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(8)).unwrap());
-        let extent_type = DimensionType::new(batch.clone());
+        let extent_type = DimensionType::from(batch.clone());
         let extent = trace.input(extent_type.clone().into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, extent);
         let input_axes = [BatchAxis::new(0)];

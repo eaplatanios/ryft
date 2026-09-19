@@ -91,7 +91,7 @@ mod tests {
     use ryft_core::kernels::BoundaryPolicy;
     use ryft_core::{
         Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionRequirementOperation,
-        DimensionSaturatingSubOperation, DimensionType, DimensionVariable, Placeholder, ProgramBuilder,
+        DimensionSaturatingSubOperation, DimensionType, Placeholder, ProgramBuilder,
     };
     use ryft_mlir::{Block, Context, Operation as MlirOperation, Value};
 
@@ -118,8 +118,8 @@ mod tests {
             current_instruction: None,
             next_barrier: 0,
         };
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(8)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(4)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(8)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(4)).unwrap());
         let add = DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
         assert_eq!(lowering.dimension(&mut block, &add, &[left, right]).unwrap().len(), 1);
         let sub =
@@ -161,8 +161,7 @@ mod tests {
             current_instruction: None,
             next_barrier: 0,
         };
-        let r#type =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::new(0, Some(4)).unwrap()));
+        let r#type = DimensionType::new("coordinate", DimensionBounds::new(0, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayIrType::Dimension(r#type));
         let zero = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));

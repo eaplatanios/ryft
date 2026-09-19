@@ -2048,7 +2048,7 @@ mod tests {
                 Ok(<IrTracer as ValueProjection<ArrayType>>::from_projected(output))
             },
             (
-                ArrayIrType::Dimension(DimensionType::new(items)),
+                ArrayIrType::Dimension(DimensionType::from(items)),
                 ArrayIrType::Array(input_type),
                 ArrayIrType::Array(indices_type),
             ),
@@ -3538,7 +3538,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        let items_type = DimensionType::new(items);
+        let items_type = DimensionType::from(items);
         assert_eq!(
             program.interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(items_type.clone(), 3).unwrap()),
@@ -3591,7 +3591,7 @@ mod tests {
         // Mapped indices alone add a leading batch axis whose extent stays first-class as well.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent = trace.input(DimensionType::new(items.clone()).into());
+        let extent = trace.input(DimensionType::from(items.clone()).into());
         let input = trace.input(ArrayType::new_static(DataType::F32, [3]).into());
         let input = ValueProjection::<ArrayType>::into_projected(input).unwrap();
         let indices = trace.input(
@@ -3851,7 +3851,7 @@ mod tests {
             &[
                 input_type.tangent().unwrap().into(),
                 indices_type.clone().into(),
-                ArrayIrType::Dimension(DimensionType::new(extent)),
+                ArrayIrType::Dimension(DimensionType::from(extent)),
             ],
         );
         assert_eq!(

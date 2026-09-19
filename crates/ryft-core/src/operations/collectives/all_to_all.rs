@@ -845,7 +845,7 @@ mod tests {
         )
         .with_axis_name("x".to_string());
         let output_extent =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable)).unwrap();
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(variable)).unwrap();
         assert_eq!(
             AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch_in_parent(
                 &context,
@@ -961,7 +961,7 @@ mod tests {
         // mapped extent using ordinary dimension arithmetic; it never reads the source array shape.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let input_split = DimensionVariable::new("input_split", DimensionBounds::new(1, Some(65))?);
         let input_concat = DimensionVariable::new("input_concat", DimensionBounds::new(1, Some(65))?);
         let output_split = DimensionVariable::new("output_split", DimensionBounds::new(1, Some(65))?);
@@ -977,8 +977,8 @@ mod tests {
             )
             .into(),
         );
-        let output_split = trace.input(DimensionType::new(output_split).into());
-        let output_concat = trace.input(DimensionType::new(output_concat).into());
+        let output_split = trace.input(DimensionType::from(output_split).into());
+        let output_concat = trace.input(DimensionType::from(output_concat).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
             .with_axis_name("items".to_string());
         let [output] = context

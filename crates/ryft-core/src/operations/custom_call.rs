@@ -448,11 +448,11 @@ impl CustomCallRaggedContract {
         let mut contract = self.clone();
         for binding in &mut contract.input_bindings {
             binding.dimension =
-                DimensionType::new(binding.dimension.clone()).rename_identities(renaming)?.variable().clone();
+                DimensionType::from(binding.dimension.clone()).rename_identities(renaming)?.variable().clone();
         }
         for binding in &mut contract.output_bindings {
             if let CustomCallRaggedOutputBinding::Fresh { dimension, .. } = binding {
-                *dimension = DimensionType::new(dimension.clone()).rename_identities(renaming)?.variable().clone();
+                *dimension = DimensionType::from(dimension.clone()).rename_identities(renaming)?.variable().clone();
             }
         }
         Ok(contract)
@@ -2234,8 +2234,8 @@ mod tests {
         let dynamic_operation = CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()]);
         let input_types = vec![
             vector_type().into(),
-            DimensionType::new(rows.clone()).into(),
-            DimensionType::new(columns.clone()).into(),
+            DimensionType::from(rows.clone()).into(),
+            DimensionType::from(columns.clone()).into(),
         ];
         let aliased_dynamic_operation =
             CustomCallOperation::new("ryft.test.dynamic", vec![dynamic_output_type.clone()])
@@ -2245,8 +2245,8 @@ mod tests {
             aliased_dynamic_operation.infer_parent_output_types(
                 &[
                     dynamic_output_type.clone().into(),
-                    DimensionType::new(rows.clone()).into(),
-                    DimensionType::new(columns.clone()).into(),
+                    DimensionType::from(rows.clone()).into(),
+                    DimensionType::from(columns.clone()).into(),
                 ],
                 &[],
             ),
@@ -2258,7 +2258,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_operation.infer_parent_output_types(
-                &[vector_type().into(), DimensionType::new(columns).into(), DimensionType::new(rows).into()],
+                &[vector_type().into(), DimensionType::from(columns).into(), DimensionType::from(rows).into()],
                 &[],
             ),
             Err(TypeError::invalid(
@@ -2268,8 +2268,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_operation.infer_parent_output_types(
-                &[DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap(),))
-                    .into()],
+                &[DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap(),).into()],
                 &[],
             ),
             Err(TypeError::invalid(
@@ -3644,7 +3643,7 @@ mod tests {
         ));
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F32, [4]).into());
-        let axis_extent = trace.input(DimensionType::new(batch_size).into());
+        let axis_extent = trace.input(DimensionType::from(batch_size).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, axis_extent);
         let (outputs, evidence) = operation
             .batch_in_parent(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?
@@ -3689,11 +3688,11 @@ mod tests {
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let mapped = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
         );
-        let extent = trace.input(DimensionType::new(rows).into());
+        let extent = trace.input(DimensionType::from(rows).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let inputs = [
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
@@ -3752,7 +3751,7 @@ mod tests {
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5)).unwrap());
-        let axis_extent = trace.input(DimensionType::new(outer.clone()).into());
+        let axis_extent = trace.input(DimensionType::from(outer.clone()).into());
         let input = trace.input(
             ArrayType::new(
                 DataType::F32,
@@ -3805,7 +3804,7 @@ mod tests {
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(vector_type().into());
-        let extent = trace.input(DimensionType::new(rows).into());
+        let extent = trace.input(DimensionType::from(rows).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             trace.clone(),
             trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
@@ -3849,11 +3848,11 @@ mod tests {
 
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let mapped = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
         );
-        let extent = trace.input(DimensionType::new(rows).into());
+        let extent = trace.input(DimensionType::from(rows).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let inputs = [
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
@@ -3894,7 +3893,7 @@ mod tests {
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let axis_extent = trace.input(DimensionType::new(batch_size).into());
+        let axis_extent = trace.input(DimensionType::from(batch_size).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
         let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
             1,

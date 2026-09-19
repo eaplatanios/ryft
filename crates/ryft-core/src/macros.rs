@@ -5003,8 +5003,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType,
-        Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+        Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
     };
     use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
@@ -5763,8 +5763,8 @@ mod tests {
 
     #[test]
     fn test_define_dimension_arithmetic_operation() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(2, Some(6)).unwrap());
         let operation = TestArithmeticDimensionOperation::new(&left_type, &right_type).unwrap();
 
         // The generated operation owns stable operand metadata and the result name and bounds needed to infer a fresh
@@ -5799,8 +5799,8 @@ mod tests {
 
         // The generated identity-renaming implementation rewrites both declared operand identities while preserving
         // the result metadata from which the output atom's identity will be inferred.
-        let renamed_left = DimensionType::new(DimensionVariable::new("renamed_left", left_type.bounds()));
-        let renamed_right = DimensionType::new(DimensionVariable::new("renamed_right", right_type.bounds()));
+        let renamed_left = DimensionType::new("renamed_left", left_type.bounds());
+        let renamed_right = DimensionType::new("renamed_right", right_type.bounds());
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(left_type.variable().clone(), renamed_left.variable().clone()).unwrap();
         renaming.insert(right_type.variable().clone(), renamed_right.variable().clone()).unwrap();
@@ -5823,8 +5823,8 @@ mod tests {
 
     #[test]
     fn test_define_dimension_arithmetic_operation_capability() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(2, Some(6)).unwrap());
         let context = TracingContext::<DimensionValue, TestGeneratedDimensionOperation>::new();
         let left = context.input(left_type.clone());
         let right = context.input(right_type);
@@ -5839,8 +5839,8 @@ mod tests {
 
     #[test]
     fn test_define_arithmetic_dimension_capability() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(2, Some(6)).unwrap());
         let context = TracingContext::<DimensionValue, TestArithmeticDimensionOperation>::new();
         let left = context.input(left_type);
         let right = context.input(right_type);
@@ -6861,8 +6861,8 @@ mod tests {
         drop(builder);
 
         // The same operator implementation selects the nominal dimension operation in the dimension universe.
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(2, Some(6)).unwrap());
         let context = TracingContext::<DimensionValue, TestArithmeticDimensionOperation>::new();
         let left = context.input(left_type);
         let right = context.input(right_type);

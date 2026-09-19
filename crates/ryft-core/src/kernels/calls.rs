@@ -321,10 +321,10 @@ impl KernelCallOperation {
             .iter()
             .enumerate()
             .map(|(axis, &extent)| {
-                DimensionType::new(DimensionVariable::new(
+                DimensionType::new(
                     format!("program_{axis}"),
                     DimensionBounds::non_negative(Some(extent.max(1))).unwrap(),
-                ))
+                )
             })
             .collect();
         Ok(Self { grid, parameters, coordinate_types, prefetch_types })
@@ -1213,10 +1213,7 @@ mod tests {
         .unwrap();
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         for _ in 0..2 {
-            mapping.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
-                name,
-                DimensionBounds::unbounded(),
-            ))));
+            mapping.add_input(ArrayIrType::Dimension(DimensionType::new(name, DimensionBounds::unbounded())));
         }
         let parameter = KernelParameter::new(
             ArrayType::scalar(DataType::I32),
@@ -1239,10 +1236,8 @@ mod tests {
 
     /// Reads an offset-prefetched array window and publishes the prefetched scalar through a singleton output.
     fn prefetch_definition() -> KernelDefinition {
-        let coordinate =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(Some(1)).unwrap()));
-        let offset =
-            DimensionType::new(DimensionVariable::new("offset", DimensionBounds::non_negative(Some(8)).unwrap()));
+        let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(1)).unwrap());
+        let offset = DimensionType::new("offset", DimensionBounds::non_negative(Some(8)).unwrap());
         let mut input_mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         input_mapping.add_input(coordinate.clone().into());
         let offset_input = input_mapping.add_input(offset.clone().into());
@@ -1565,7 +1560,7 @@ mod tests {
             (0, DimensionBounds::positive(Some(3)).unwrap(), true),
         ] {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            builder.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("coordinate", bounds))));
+            builder.add_input(ArrayIrType::Dimension(DimensionType::new("coordinate", bounds)));
             let mapping = BlockMapping::new(
                 builder.build(vec![], vec![Placeholder], vec![]).unwrap(),
                 vec![],
@@ -1596,8 +1591,7 @@ mod tests {
     #[test]
     fn test_kernel_call_operation_new_rejects_coordinate_identity_aliasing() {
         for (extents, accepted) in [([2, 2], false), ([1, 2], false), ([1, 1], true), ([0, 2], true)] {
-            let coordinate =
-                DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+            let coordinate = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             builder.add_input(ArrayIrType::Dimension(coordinate.clone()));
             builder.add_input(ArrayIrType::Dimension(coordinate));
@@ -1870,10 +1864,10 @@ mod tests {
     #[test]
     fn test_kernel_call_operation_validate_body_grid_access() {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        mapping.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+        mapping.add_input(ArrayIrType::Dimension(DimensionType::new(
             "coordinate",
             DimensionBounds::non_negative(None).unwrap(),
-        ))));
+        )));
         let mapping = BlockMapping::new(
             mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
             vec![],

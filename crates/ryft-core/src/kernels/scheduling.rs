@@ -239,7 +239,7 @@ mod tests {
 
     use crate::arrays::{
         ArrayIrOperation, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable,
+        DimensionValue,
     };
     use crate::contexts::Context;
     use crate::kernels::calls::{KernelCallOperation, KernelParameter};
@@ -258,10 +258,10 @@ mod tests {
     /// Two programs with opposite large updates followed by unit updates expose legal floating-point atomic orders.
     fn atomic_definition(execution: GridExecution) -> KernelDefinition {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        mapping.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+        mapping.add_input(ArrayIrType::Dimension(DimensionType::new(
             "coordinate",
             DimensionBounds::non_negative(Some(2)).unwrap(),
-        ))));
+        )));
         let mapping = BlockMapping::new(
             mapping.build(vec![], vec![Placeholder], vec![]).unwrap(),
             vec![],

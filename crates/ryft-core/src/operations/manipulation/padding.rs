@@ -2222,7 +2222,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![size.into()])).into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let output_extent = builder.add_input(DimensionType::new(output_size).into());
+        let output_extent = builder.add_input(DimensionType::from(output_size).into());
         let output = builder
             .add_instruction(
                 PadOperation::<ArrayType>::new(vec![edge_padding_low], vec![edge_padding_high], vec![interior_padding])
@@ -3807,7 +3807,7 @@ mod tests {
         let dynamic_signature = [
             dynamic_type.clone().into(),
             ArrayType::scalar(DataType::F32).into(),
-            DimensionType::new(result_size).into(),
+            DimensionType::from(result_size).into(),
         ];
         assert!(operation.clone().with_input_types(&dynamic_signature).unwrap().requires_runtime_assertion());
         assert_eq!(
@@ -3821,8 +3821,7 @@ mod tests {
             operation.with_input_types(&[
                 dynamic_type.clone().into(),
                 ArrayType::scalar(DataType::F32).into(),
-                DimensionType::new(DimensionVariable::new("disjoint", DimensionBounds::new(9, Some(10)).unwrap()))
-                    .into(),
+                DimensionType::new("disjoint", DimensionBounds::new(9, Some(10)).unwrap()).into(),
             ]),
             Err(TypeError::invalid(format!(
                 "`{PAD_OPERATION_NAME}` output bounds [9, 10) on axis 0 cannot contain a padded extent derived from \
@@ -3835,7 +3834,7 @@ mod tests {
             .with_input_types(&[
                 dynamic_type.into(),
                 ArrayType::scalar(DataType::F32).into(),
-                DimensionType::new(size).into(),
+                DimensionType::from(size).into(),
             ])
             .unwrap();
         assert!(!identity.requires_runtime_assertion());
@@ -3891,7 +3890,7 @@ mod tests {
                     input_types = [
                         input_type.clone().into(),
                         padding_value_type.clone().into(),
-                        DimensionType::new(DimensionVariable::new("wrong", DimensionBounds::new(7, Some(8)).unwrap()))
+                        DimensionType::new("wrong", DimensionBounds::new(7, Some(8)).unwrap())
                             .into(),
                     ],
                     error = format!(
@@ -3904,7 +3903,7 @@ mod tests {
                     input_types = [
                         input_type.clone().into(),
                         padding_value_type.clone().into(),
-                        DimensionType::new(dynamic_variable.clone()).into(),
+                        DimensionType::from(dynamic_variable.clone()).into(),
                     ],
                     output_types = [
                         ArrayType::new(DataType::F64, Shape::new(vec![dynamic_variable.clone().into()])).into(),
@@ -4000,7 +3999,7 @@ mod tests {
                     input_types = [
                         dynamic_input_type.clone().into(),
                         padding_value_type.clone().into(),
-                        DimensionType::new(output_variable.clone()).into(),
+                        DimensionType::from(output_variable.clone()).into(),
                     ],
                     output_types = [ArrayType::new(DataType::F64, Shape::new(vec![output_variable.into()])).into()],
                 },
@@ -4009,7 +4008,7 @@ mod tests {
                     input_types = [
                         dynamic_input_type.clone().into(),
                         padding_value_type.clone().into(),
-                        DimensionType::new(narrow_variable.clone()).into(),
+                        DimensionType::from(narrow_variable.clone()).into(),
                     ],
                     output_types = [ArrayType::new(DataType::F64, Shape::new(vec![narrow_variable.into()])).into()],
                 },
@@ -4030,7 +4029,7 @@ mod tests {
                 input_types = [
                     possibly_empty_type.into(),
                     padding_value_type.clone().into(),
-                    DimensionType::new(cropped_variable.clone()).into(),
+                    DimensionType::from(cropped_variable.clone()).into(),
                 ],
                 output_types = [ArrayType::new(DataType::F64, Shape::new(vec![cropped_variable.into()])).into()],
             }],
@@ -4059,7 +4058,7 @@ mod tests {
                     input_types = [
                         dynamic_input_type.into(),
                         padding_value_type.into(),
-                        DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(3, Some(7)).unwrap()))
+                        DimensionType::new("output", DimensionBounds::new(3, Some(7)).unwrap())
                             .into(),
                     ],
                     error = format!(
@@ -4176,8 +4175,7 @@ mod tests {
 
         // An unused pad whose extent is not proven must survive simplification, because its ordered assertion still
         // validates the supplied extent, while a proven pad has no observable consequence and is eliminated.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let program_input = builder.add_input(input.r#type().into_owned());
         let program_padding_value = builder.add_input(padding_value.r#type().into_owned());
@@ -4378,7 +4376,7 @@ mod tests {
         // inserted batch extent.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let input = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
         let padding_value =
             trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch)])).into());
@@ -4554,8 +4552,7 @@ mod tests {
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = parent.input(ArrayType::new_static(DataType::F64, [2, 3]).into());
         let padding_value = parent.input(ArrayType::scalar(DataType::F64).into());
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent = parent.input(extent_type.clone().into());
         let two = parent.lift(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), two);
@@ -4756,7 +4753,7 @@ mod tests {
         let source = DimensionVariable::new("source", DimensionBounds::new(0, Some(5)).unwrap());
         let result = DimensionVariable::new("result", DimensionBounds::new(3, Some(11)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let result_type = DimensionType::new(result);
+        let result_type = DimensionType::from(result);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
@@ -4927,7 +4924,7 @@ mod tests {
         let padded_columns = DimensionVariable::new("padded_columns", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns)]));
-        let padded_columns_type = DimensionType::new(padded_columns);
+        let padded_columns_type = DimensionType::from(padded_columns);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
@@ -4998,8 +4995,8 @@ mod tests {
         let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(5)).unwrap());
         let result = DimensionVariable::new("result", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let source_type = DimensionType::new(source);
-        let result_type = DimensionType::new(result);
+        let source_type = DimensionType::from(source);
+        let result_type = DimensionType::from(result);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let source_extent = builder.add_input(source_type.clone().into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
@@ -5065,7 +5062,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
         let padding = builder.add_input(padding_type.clone().into());
-        let output_dimension_type = DimensionType::new(output_size);
+        let output_dimension_type = DimensionType::from(output_size);
         let extent = builder.add_input(output_dimension_type.clone().into());
         let output = builder
             .add_instruction(
@@ -5123,8 +5120,7 @@ mod tests {
         .unwrap();
         let padding_value =
             ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[9_f32]).unwrap());
-        let output_size =
-            DimensionType::new(DimensionVariable::new("output_size", DimensionBounds::new(0, Some(2)).unwrap()));
+        let output_size = DimensionType::new("output_size", DimensionBounds::new(0, Some(2)).unwrap());
         let mut outputs = linearization
             .primal()
             .interpret(vec![
@@ -5329,8 +5325,7 @@ mod tests {
         );
         let padding_value =
             ArrayIrValue::Array(Array::from_elements(ArrayType::scalar(DataType::F32), &[9_f32]).unwrap());
-        let output_size =
-            DimensionType::new(DimensionVariable::new("output_size", DimensionBounds::new(0, Some(9)).unwrap()));
+        let output_size = DimensionType::new("output_size", DimensionBounds::new(0, Some(9)).unwrap());
 
         // Three input elements dilate to five output positions, two of which hold the padding value.
         let mut outputs = linearization
@@ -5414,7 +5409,7 @@ mod tests {
         // axes and axes whose identity the padding leaves unchanged need no runtime assertion, so the inverse pad is
         // effect-free even though the forward pad's conservative conversion kept one.
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
-        let columns_type = DimensionType::new(columns.clone());
+        let columns_type = DimensionType::from(columns.clone());
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -5665,8 +5660,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap()).into()]),
         );
-        let output_dimension_type =
-            DimensionType::new(DimensionVariable::new("output_size", DimensionBounds::new(3, Some(7)).unwrap()));
+        let output_dimension_type = DimensionType::new("output_size", DimensionBounds::new(3, Some(7)).unwrap());
         let input_types =
             vec![input_type.into(), ArrayType::scalar(DataType::F32).into(), output_dimension_type.into()];
         let operation = PadOperation::<ArrayIrType>::new(vec![1], vec![1], vec![0]).unwrap();
@@ -5728,7 +5722,7 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = context.input(ArrayType::new(DataType::F32, Shape::new(vec![size.into()])).into());
         let padding_value = context.input(ArrayType::scalar(DataType::F32).into());
-        let extent = context.input(DimensionType::new(output_size.clone()).into());
+        let extent = context.input(DimensionType::from(output_size.clone()).into());
         let output = input.dynamic_pad(&padding_value, std::slice::from_ref(&extent), &[1], &[1], &[0]).unwrap();
         assert_eq!(
             output.r#type().as_ref(),
@@ -5801,8 +5795,8 @@ mod tests {
         let input = context
             .input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), size.clone().into()])).into());
         let padding_value = context.input(ArrayType::scalar(DataType::F32).into());
-        let low_value = context.input(DimensionType::new(low).into());
-        let extent = context.input(DimensionType::new(target.clone()).into());
+        let low_value = context.input(DimensionType::from(low).into());
+        let extent = context.input(DimensionType::from(target.clone()).into());
         let output = input.dynamic_pad_to_extent(&padding_value, 1, &low_value, &extent).unwrap();
         assert_eq!(
             output.r#type().as_ref(),
@@ -6064,7 +6058,7 @@ mod tests {
         let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
         let fill = context.input(ArrayType::scalar(DataType::F32).into());
         let low = context.input(DimensionValue::constant(1).unwrap().r#type().into_owned().into());
-        let extent = context.input(DimensionType::new(target).into());
+        let extent = context.input(DimensionType::from(target).into());
         let output = input.dynamic_pad_to_extent(&fill, 0, &low, &extent).unwrap();
         let program = context
             .builder()

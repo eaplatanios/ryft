@@ -1587,10 +1587,10 @@ mod tests {
         // dimension must respect its validated refinement, including during eager replay.
         let variable = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(8)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(DimensionType::new(variable.clone()).into());
+        let input = builder.add_input(DimensionType::from(variable.clone()).into());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
         let output = builder
-            .add_instruction(ArrayIrOperation::Zero(ZeroOperation::new(output_type.into())), vec![], vec![input], None)
+            .add_instruction(ArrayIrOperation::Zero(ZeroOperation::new(output_type)), vec![], vec![input], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

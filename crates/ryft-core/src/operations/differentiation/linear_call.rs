@@ -1629,7 +1629,7 @@ mod tests {
 
         // The dimension residual remains replicated while the linear input and output carry the inferred mapped
         // extent. Both attached regions are structurally batched with that extent threaded through their boundary.
-        let residual_type = DimensionType::new(DimensionVariable::new("residual", DimensionBounds::new(0, Some(9))?));
+        let residual_type = DimensionType::new("residual", DimensionBounds::new(0, Some(9))?);
         let array_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::new();
         builder.add_input(residual_type.clone().into());
@@ -2071,7 +2071,7 @@ mod tests {
     #[test]
     fn test_linear_call_operation_transposition_preserves_dynamic_zero_extents() {
         let dimension = DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap());
-        let dimension_type = DimensionType::new(dimension.clone());
+        let dimension_type = DimensionType::from(dimension.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut forward_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2120,8 +2120,7 @@ mod tests {
             .unwrap();
         // Specializing the linear input makes it static while the transpose's explicit zero constructor keeps its
         // exact named extent. Both describe the same cotangent space, so this call remains valid and executable.
-        let exact_dimension =
-            DimensionType::new(DimensionVariable::new("size", DimensionBounds::new(2, Some(3)).unwrap()));
+        let exact_dimension = DimensionType::new("size", DimensionBounds::new(2, Some(3)).unwrap());
         let specialized = program
             .clone()
             .specialize(&[exact_dimension.clone().into(), ArrayType::new_static(DataType::F32, [2]).into()])

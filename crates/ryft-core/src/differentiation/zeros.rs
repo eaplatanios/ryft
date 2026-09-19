@@ -617,7 +617,10 @@ mod tests {
         let residuals = TestOperation::capture_zero_residual_values(&context, &primal, &tangent_type).unwrap();
         assert_eq!(
             residuals.iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>(),
-            vec![ArrayIrType::Dimension(DimensionType::new(first)), ArrayIrType::Dimension(DimensionType::new(second)),],
+            vec![
+                ArrayIrType::Dimension(DimensionType::from(first)),
+                ArrayIrType::Dimension(DimensionType::from(second)),
+            ],
         );
         let builder = context.builder().borrow();
         let [first, second] = builder.instructions() else {
@@ -676,7 +679,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k.clone())]),
         );
-        let runtime_length = context.input(DimensionType::new(length.clone()).into());
+        let runtime_length = context.input(DimensionType::from(length.clone()).into());
         let peer = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(k)])).into());
         let stacked = TestOperation::materialize_zero_from_residual_sources(
             &context,

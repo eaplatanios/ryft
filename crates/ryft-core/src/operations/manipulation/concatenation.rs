@@ -1576,8 +1576,7 @@ mod tests {
         let left_size_type = left_size_operation.result_type().clone();
         let right_size_type = right_size_operation.result_type().clone();
         let add_operation = DimensionAddOperation::new(&left_size_type, &right_size_type).unwrap();
-        let result_extent_type =
-            DimensionType::new(DimensionVariable::new(add_operation.output_name(), add_operation.output_bounds()));
+        let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
         let dynamic_operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[left_type.clone().into(), right_type.clone().into(), result_extent_type.into()],
@@ -2470,7 +2469,7 @@ mod tests {
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(left)])).into(),
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                DimensionType::new(result).into(),
+                DimensionType::from(result).into(),
             ],
         )
         .unwrap();
@@ -2629,7 +2628,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(right), Dimension::Dynamic(columns.clone())]),
         );
-        let result_extent_type = DimensionType::new(result.clone());
+        let result_extent_type = DimensionType::from(result.clone());
         let dynamic_input_types =
             [dynamic_left.clone().into(), dynamic_right.clone().into(), result_extent_type.clone().into()];
         check_operation_type_inference!(
@@ -2676,7 +2675,7 @@ mod tests {
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(12)).unwrap());
         let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let fixed_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
-        let result_extent_type = DimensionType::new(result.clone());
+        let result_extent_type = DimensionType::from(result.clone());
         let operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[source_array_type.clone().into(), fixed_array_type.clone().into(), result_extent_type.clone().into()],
@@ -2700,7 +2699,7 @@ mod tests {
         let target = DimensionVariable::new("target", bounds);
         let target_result = DimensionVariable::new("target_result", DimensionBounds::new(2, Some(12)).unwrap());
         let target_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
-        let target_result_type = DimensionType::new(target_result.clone());
+        let target_result_type = DimensionType::from(target_result.clone());
         let instantiated = program
             .with_instantiated_type_identities(&[
                 target_array_type.clone().into(),
@@ -2765,8 +2764,7 @@ mod tests {
             Ok(vec![left.clone()]),
         );
 
-        let observed_extent_type =
-            DimensionType::new(DimensionVariable::new("observed", DimensionBounds::new(1, Some(9)).unwrap()));
+        let observed_extent_type = DimensionType::new("observed", DimensionBounds::new(1, Some(9)).unwrap());
         let checked_operation =
             ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap());
         assert_eq!(
@@ -3027,7 +3025,7 @@ mod tests {
         // operation unchanged.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let mapped = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
         );
@@ -3350,7 +3348,7 @@ mod tests {
         let second_primal = context.input(narrow_type.clone().into());
         let live_tangent = context.input(widened_type.clone().into());
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(15)).unwrap());
-        let result_extent = context.input(DimensionType::new(result.clone()).into());
+        let result_extent = context.input(DimensionType::from(result.clone()).into());
 
         // The first input carries a live tangent so the rule does not short-circuit, while the second carries a
         // structural zero whose type names the runtime extent `extent` but pins nothing.
@@ -3417,8 +3415,8 @@ mod tests {
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(5)).unwrap());
         let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(left.clone())]));
         let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
-        let left_extent_type = DimensionType::new(left);
-        let result_type = DimensionType::new(result);
+        let left_extent_type = DimensionType::from(left);
+        let result_type = DimensionType::from(result);
         let operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[left_type.clone().into(), right_type.clone().into(), result_type.clone().into()],
@@ -3779,7 +3777,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(9)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        let input_types = vec![input_type.clone().into(), input_type.into(), DimensionType::new(result).into()];
+        let input_types = vec![input_type.clone().into(), input_type.into(), DimensionType::from(result).into()];
         let operation = ConcatenateOperation::<ArrayIrType>::new(0, &input_types).unwrap();
         let output_type = operation.infer_output_types(&input_types, &[]).unwrap().remove(0);
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -3814,7 +3812,7 @@ mod tests {
         let total = DimensionVariable::new("total", DimensionBounds::new(2, Some(10)).unwrap());
         let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows)]));
         let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
-        let result_extent_type = DimensionType::new(total);
+        let result_extent_type = DimensionType::from(total);
         let operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[left_type.clone().into(), right_type.clone().into(), result_extent_type.clone().into()],
@@ -3947,7 +3945,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = context.input(input_type.clone().into());
-        let extent = context.input(DimensionType::new(size).into());
+        let extent = context.input(DimensionType::from(size).into());
         let output = Tracer::concatenate_with_known_extent([&input], &extent, 0).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(input_type));
         let builder = context.builder().borrow();

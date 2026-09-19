@@ -1363,16 +1363,13 @@ pub(crate) mod tests {
     fn test_xla_kernel_operation_partially_evaluate_prefetch() {
         use ryft_core::kernels::{BlockMapping, BoundaryPolicy, Grid, KernelParameter, KernelParameterAccess};
         use ryft_core::{
-            ArrayIrOperation, ArrayType, DataType, DimensionBounds, DimensionType, DimensionVariable, ProgramBuilder,
-            ReferenceWrite, StagingContext,
+            ArrayIrOperation, ArrayType, DataType, DimensionBounds, DimensionType, ProgramBuilder, ReferenceWrite,
+            StagingContext,
         };
 
         let scalar = ArrayType::scalar(DataType::I32);
         let mut mapping = ProgramBuilder::<ArrayIrValue<CpuArray>, ArrayIrOperation<CpuArray>>::new();
-        mapping.add_input(
-            DimensionType::new(DimensionVariable::new("prefetched", DimensionBounds::non_negative(Some(4)).unwrap()))
-                .into(),
-        );
+        mapping.add_input(DimensionType::new("prefetched", DimensionBounds::non_negative(Some(4)).unwrap()).into());
         let parameter = KernelParameter::new(
             scalar.clone(),
             KernelParameterAccess::WriteOnly,
@@ -1669,7 +1666,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_fallback_rejects_observable_primal_effects() {
         use ryft_core::{
             DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionType, DimensionValue,
-            DimensionVariable, ProgramBuilder,
+            ProgramBuilder,
         };
 
         let definition = differentiable_definition();
@@ -1678,8 +1675,7 @@ pub(crate) mod tests {
         let inputs =
             definition.body().input_types().into_iter().map(|r#type| body.add_input(r#type)).collect::<Vec<_>>();
         body.splice_program(definition.body(), &inputs).unwrap();
-        let variable =
-            DimensionType::new(DimensionVariable::new("checked", DimensionBounds::non_negative(Some(2)).unwrap()));
+        let variable = DimensionType::new("checked", DimensionBounds::non_negative(Some(2)).unwrap());
         let left = DimensionValue::new(variable.clone(), 0).unwrap();
         let right = DimensionValue::constant(1).unwrap();
         let requirement = DimensionRequirementOperation::equal(&variable, right.r#type().as_ref());

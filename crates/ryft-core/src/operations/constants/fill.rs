@@ -183,7 +183,7 @@ where
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
 /// let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
-/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size), 3).unwrap());
 /// assert_eq!(
 ///     context.dynamic_fill(&r#type, 2.5f32, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![2.5f32; 3]).unwrap())),
@@ -404,8 +404,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_dynamic_literal_fill_jvp_materializes_shaped_zero() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let scalar = builder
@@ -522,7 +521,7 @@ mod tests {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let dimension_type = DimensionType::new(size);
+        let dimension_type = DimensionType::from(size);
         let two = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
         assert_eq!(
@@ -549,7 +548,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(sharding.clone())
             .unwrap();
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(rows), 3).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(rows), 3).unwrap());
         let result = context.dynamic_fill(&output_type, 2.5_f64, &[extent]).unwrap();
         let expected_type = ArrayType::new_static(DataType::F32, [3, 2])
             .with_memory(Memory::Host { pinned: true })
@@ -566,7 +565,7 @@ mod tests {
     fn test_dynamic_fill_invalid_dimensions() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let dimension = context.input(DimensionType::new(size.clone()).into());
+        let dimension = context.input(DimensionType::from(size.clone()).into());
         let invalid_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), usize::MAX.into()]));
         if usize::BITS >= 64 {
             let error = context.dynamic_fill(&invalid_type, 1f32, &[dimension.clone()]).unwrap_err();
@@ -592,7 +591,7 @@ mod tests {
 
         // Singleton inputs also expose statically decidable storage overflow before staging.
         let singleton = DimensionVariable::new("singleton", DimensionBounds::new(2, Some(3)).unwrap());
-        let extent = context.input(DimensionType::new(singleton.clone()).into());
+        let extent = context.input(DimensionType::from(singleton.clone()).into());
         let large_extent = (i64::MAX as usize).min(usize::MAX / 2);
         let invalid_type = ArrayType::new(DataType::F32, Shape::new(vec![singleton.into(), large_extent.into()]));
         let static_type = ArrayType::new_static(DataType::F32, [2, large_extent]);
@@ -608,7 +607,7 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`fill` expects one dimension operand per dynamic output dimension (1) but got 0 operands"));
         assert!(context.builder().borrow().instructions().is_empty());
-        let extent = context.input(DimensionType::new(rows).into());
+        let extent = context.input(DimensionType::from(rows).into());
         let output_type = output_type.with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
         assert!(matches!(context.dynamic_fill(&output_type, 1.0_f32, &[extent]),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
@@ -621,7 +620,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), 2.into()]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
-        let dimension_type = DimensionType::new(size);
+        let dimension_type = DimensionType::from(size);
         let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap());
         let expected_type = r#type.clone().with_shape(Shape::new(vec![3.into(), 2.into()]));
         let expected = ArrayIrValue::Array(Array::from_elements(expected_type, &[7f32; 6]).unwrap());
@@ -716,7 +715,7 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), 2.into()]));
-        let dimension_type = DimensionType::new(rows);
+        let dimension_type = DimensionType::from(rows);
         let extent = context.input(dimension_type.clone().into());
         let result = context.dynamic_fill(&output_type, 3.0_f32, &[extent]).unwrap();
         assert_eq!(result.r#type().as_ref(), &ArrayIrType::Array(output_type));
@@ -750,7 +749,7 @@ mod tests {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
-        let dimension_type = DimensionType::new(size);
+        let dimension_type = DimensionType::from(size);
         let dimension = context.input(dimension_type.clone().into());
         let output = context.dynamic_fill(&r#type, 2f32, &[dimension]).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));

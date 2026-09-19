@@ -1639,8 +1639,7 @@ mod tests {
         }
 
         let inference_count = Rc::new(Cell::new(0));
-        let dimension =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::non_negative(Some(16)).unwrap()));
+        let dimension = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
         let two = DimensionValue::constant(2).unwrap();
         let operation = DimensionAddOperation::new(&dimension, two.r#type().as_ref()).unwrap();
         let mut builder = ProgramBuilder::<DimensionValue, NarrowingOperation>::new();

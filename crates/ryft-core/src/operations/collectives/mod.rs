@@ -1238,7 +1238,7 @@ mod tests {
         // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
         // through the payload's member JVP rule.
         let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
-        let dimension_type = DimensionType::new(variable.clone());
+        let dimension_type = DimensionType::from(variable.clone());
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
         let context = Context::new();
         let primal = context.input(array_type.clone().into());
@@ -1386,7 +1386,7 @@ mod tests {
                 ),
                 &[
                     input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::new(concat_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
@@ -1403,7 +1403,7 @@ mod tests {
                 &ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::new(split_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
@@ -1420,8 +1420,8 @@ mod tests {
                 &AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 &[
                     input_type.clone().into(),
-                    ArrayIrType::Dimension(DimensionType::new(split_result.clone())),
-                    ArrayIrType::Dimension(DimensionType::new(concat_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(split_result.clone())),
+                    ArrayIrType::Dimension(DimensionType::from(concat_result.clone())),
                 ],
             ),
             Ok(vec![
@@ -1437,7 +1437,7 @@ mod tests {
                 &AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()),
                 &[
                     ArrayIrType::Array(input_type.clone()),
-                    ArrayIrType::Dimension(DimensionType::new(input_axis)),
+                    ArrayIrType::Dimension(DimensionType::from(input_axis)),
                     DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),

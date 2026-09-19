@@ -1857,15 +1857,15 @@ mod tests {
         ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
         Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, CumulativeLogSumExp,
         CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
-        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicUpdateSlice,
-        EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp, LogicalMesh, Logistic,
-        Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
-        ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, Slice, StopGradient,
-        StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
-        ZeroLike, differentiate_at,
+        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
+        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
+        ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
+        StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -6704,7 +6704,7 @@ mod tests {
             + Select
             + TopK
             + ArgMax
-            + Slice
+            + DynamicSlice
             + DynamicUpdateSlice
             + Reshape
             + Broadcast

@@ -1902,7 +1902,7 @@ mod tests {
     #[test]
     fn test_condition_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         let array_type =
             ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
         let branch_inputs = vec![dimension_type.clone(), array_type.clone()];
@@ -4050,7 +4050,7 @@ mod tests {
         )?;
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let predicate =
             trace.input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(batch)])).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, batch_extent);

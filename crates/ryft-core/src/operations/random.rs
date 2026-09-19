@@ -858,7 +858,7 @@ mod tests {
         let dynamic_operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, dynamic_bits_type.clone());
         assert_eq!(
             dynamic_operation.infer_output_types(
-                &[RandomAlgorithm::ThreeFry.state_type().into(), DimensionType::new(extent_variable.clone()).into(),],
+                &[RandomAlgorithm::ThreeFry.state_type().into(), DimensionType::from(extent_variable.clone()).into(),],
                 &[],
             ),
             Ok(vec![RandomAlgorithm::ThreeFry.state_type().into(), dynamic_bits_type.into()]),
@@ -870,7 +870,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     ArrayIrValue::Array(state),
-                    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(extent_variable), 5).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(extent_variable), 5).unwrap()),
                 ],
             )
             .unwrap();
@@ -1083,13 +1083,13 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7))?);
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(11))?);
         let trace = Context::new();
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let states = trace.input(
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]))
                 .into(),
         );
-        let row_extent = trace.input(DimensionType::new(rows.clone()).into());
-        let column_extent = trace.input(DimensionType::new(columns.clone()).into());
+        let row_extent = trace.input(DimensionType::from(rows.clone()).into());
+        let column_extent = trace.input(DimensionType::from(columns.clone()).into());
         let input_ids = [batch_extent.clone(), states.clone(), row_extent.clone(), column_extent.clone()]
             .map(|input| input.atom_id().unwrap());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
@@ -1148,7 +1148,7 @@ mod tests {
         // remains an explicit replicated dimension operand while the new mapped extent becomes its leading carry.
         let nested_trace = Context::new();
         let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5))?);
-        let outer_extent = nested_trace.input(DimensionType::new(outer.clone()).into());
+        let outer_extent = nested_trace.input(DimensionType::from(outer.clone()).into());
         let nested_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(nested_trace, outer_extent);
         let nested = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<Context>>::batch_program(
             &nested_context,
@@ -1166,7 +1166,7 @@ mod tests {
                 .count(),
             1,
         );
-        assert_eq!(nested.input_types()[0], ArrayIrType::Dimension(DimensionType::new(outer)));
+        assert_eq!(nested.input_types()[0], ArrayIrType::Dimension(DimensionType::from(outer)));
 
         Ok(())
     }

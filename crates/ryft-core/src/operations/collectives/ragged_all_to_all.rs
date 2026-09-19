@@ -41,7 +41,7 @@ use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterOptions, ScatterReductionKind,
 };
-use crate::operations::manipulation::slicing::{DynamicSliceOperation, Slice, SliceOperation};
+use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::math::mul::{Mul, MulOperation};
@@ -746,7 +746,7 @@ impl_differentiable_operation! {
             + From<ReshapeOperation>
             + From<ScatterOperation>
             + From<SelectOperation<ArrayType>>
-            + From<SliceOperation> + From<DynamicSliceOperation>
+            + From<SliceOperation>
             + From<TransferToMemoryOperation>
             + From<ZeroOperation<ArrayType>>,
     {
@@ -957,10 +957,7 @@ fn transpose_physical_offsets<V, O>(
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<DynamicSliceOperation>,
+    O: Operation<Type = ArrayType> + From<ConcatenateOperation<ArrayType>> + From<SliceOperation>,
 {
     let offset_type = offsets.r#type();
     let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
@@ -998,8 +995,7 @@ where
     O: Operation<Type = ArrayType>
         + From<AllToAllOperation>
         + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<DynamicSliceOperation>,
+        + From<SliceOperation>,
 {
     if operation.is_physical() {
         transpose_physical_offsets(operation, offsets)
@@ -1030,7 +1026,6 @@ where
         + From<ScatterOperation>
         + From<SelectOperation<ArrayType>>
         + From<SliceOperation>
-        + From<DynamicSliceOperation>
         + From<TransferToMemoryOperation>
         + From<ZeroOperation<ArrayType>>,
 {
@@ -2376,7 +2371,7 @@ mod tests {
 
         let context = TestContext::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let batch_extent = context.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = context.input(DimensionType::from(batch.clone()).into());
         let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context.clone(), batch_extent)
             .with_axis_name("y".to_string());
         let packed_type = |data_type, dimensions: &[usize]| {

@@ -296,7 +296,7 @@ impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPol
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
 /// let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
-/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size), 3).unwrap());
 /// assert_eq!(
 ///     context.dynamic_one(&r#type, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![1.0f32; 3]).unwrap())),
@@ -404,7 +404,7 @@ mod tests {
                 "`one` cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
-        let dimension_type = DimensionType::new(rows);
+        let dimension_type = DimensionType::from(rows);
         assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
     }
 
@@ -413,7 +413,7 @@ mod tests {
         let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
         let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let extent = builder.add_input(DimensionType::from(formal.clone()).into());
         let output = builder
             .add_instruction(
                 OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
@@ -429,7 +429,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let caller_input = ArrayIrType::Dimension(DimensionType::new(caller.clone()));
+        let caller_input = ArrayIrType::Dimension(DimensionType::from(caller.clone()));
         let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
         let [instruction] = instantiated.instructions() else {
             panic!("expected one instantiated instruction");
@@ -443,7 +443,7 @@ mod tests {
         );
         assert_eq!(
             instantiated
-                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
+                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(caller), 3).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap())]),
         );
     }
@@ -537,8 +537,7 @@ mod tests {
         // Composite eager one materialization delegates array members and rejects first-class dimensions.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(context.one(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::unbounded()));
         assert_eq!(
             context.one(&dimension_type),
             Err(ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type"))),
@@ -556,8 +555,7 @@ mod tests {
 
     #[test]
     fn test_one_partial_evaluation_dynamic() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let output = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap());
         check_operation_partial_evaluation!(
@@ -618,8 +616,7 @@ mod tests {
 
     #[test]
     fn test_one_differentiation_dynamic() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let output = builder
@@ -657,8 +654,7 @@ mod tests {
 
         // The direct transform context must likewise run the explicit rule rather than taking its all-structural-zero
         // shortcut: a nullary zero cannot recover the dynamic extent after the closure returns.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -718,8 +714,7 @@ mod tests {
     fn test_one_transposition_dynamic() {
         // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
         // extent receives a structural-zero cotangent regardless of the output cotangent being live.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let operation = ArrayIrOperation::<Array>::from(OneOperation::new(output_type.clone()));
@@ -787,7 +782,7 @@ mod tests {
         // ever materializing a one reference.
         assert_eq!(
             ArrayIrOperation::<Array>::provide(
-                OneOperation::new(ArrayIrType::Dimension(DimensionType::new(size))),
+                OneOperation::new(ArrayIrType::Dimension(DimensionType::from(size))),
                 &[],
             )
             .unwrap_err(),
@@ -859,7 +854,7 @@ mod tests {
     fn test_dynamic_one_interpretation() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size.clone()), 2).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size.clone()), 2).unwrap());
         let output_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(3), Dimension::Dynamic(size)]),
@@ -882,7 +877,7 @@ mod tests {
     fn test_dynamic_one_invalid_dimensions() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let dimension = context.input(DimensionType::new(size.clone()).into());
+        let dimension = context.input(DimensionType::from(size.clone()).into());
         for data_type in [DataType::Token, DataType::Zero] {
             let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
             assert_eq!(
@@ -906,7 +901,7 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("`one` operand 0 must be a dimension but has type f32[]"))),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(other), 2).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 2).unwrap());
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -917,7 +912,7 @@ mod tests {
 
         // Matching diagnostic names and bounds do not make separately created identities interchangeable.
         let distinct = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(distinct), 2).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct), 2).unwrap());
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -930,7 +925,7 @@ mod tests {
     fn test_dynamic_one_staging() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension_type = DimensionType::new(size.clone());
+        let dimension_type = DimensionType::from(size.clone());
         let dimension = context.input(dimension_type.clone().into());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output = context.dynamic_one(&output_type, std::slice::from_ref(&dimension)).unwrap();
@@ -972,7 +967,7 @@ mod tests {
     fn test_dynamic_one_staging_singleton_dimension() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
-        let dimension_type = DimensionType::new(size.clone());
+        let dimension_type = DimensionType::from(size.clone());
         let dimension = context.input(dimension_type.clone().into());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output = context.dynamic_one(&output_type, std::slice::from_ref(&dimension)).unwrap();

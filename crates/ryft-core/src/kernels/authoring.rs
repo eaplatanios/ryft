@@ -131,7 +131,7 @@ pub fn tiled_call(
         .enumerate()
         .map(|(axis, &extent)| {
             let bounds = DimensionBounds::new(0, Some(extent.max(1))).map_err(ProgramError::from)?;
-            Ok(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(format!("tile_axis_{axis}"), bounds))))
+            Ok(ArrayIrType::Dimension(DimensionType::new(format!("tile_axis_{axis}"), bounds)))
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
     let mut parameters = Vec::with_capacity(input_types.len() + 1);

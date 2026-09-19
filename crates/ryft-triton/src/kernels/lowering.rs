@@ -1359,15 +1359,12 @@ mod tests {
 
     #[test]
     fn test_check_dimension() {
-        let bounded = ryft_core::DimensionType::new(ryft_core::DimensionVariable::new(
+        let bounded = ryft_core::DimensionType::new(
             "index",
             ryft_core::DimensionBounds::non_negative(Some(i32::MAX as usize + 1)).unwrap(),
-        ));
+        );
         check_dimension(&bounded).unwrap();
-        let unbounded = ryft_core::DimensionType::new(ryft_core::DimensionVariable::new(
-            "index",
-            ryft_core::DimensionBounds::non_negative(None).unwrap(),
-        ));
+        let unbounded = ryft_core::DimensionType::new("index", ryft_core::DimensionBounds::non_negative(None).unwrap());
         assert!(matches!(check_dimension(&unbounded), Err(Error::Unsupported { operation: "dimension", reason })
             if reason == "dimension bounds must fit the signed 32-bit indexing domain"));
     }

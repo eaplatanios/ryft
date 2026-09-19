@@ -320,7 +320,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>, P: DifferentiationPo
 /// let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// let size = DimensionVariable::new("size", DimensionBounds::unbounded());
 /// let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
-/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap());
+/// let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size), 3).unwrap());
 /// assert_eq!(
 ///     context.dynamic_zero(&r#type, &[dimension]),
 ///     Ok(ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap())),
@@ -428,7 +428,7 @@ mod tests {
                 "`zero` cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
-        let dimension_type = DimensionType::new(rows);
+        let dimension_type = DimensionType::from(rows);
         assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
     }
 
@@ -437,7 +437,7 @@ mod tests {
         let formal = DimensionVariable::new("formal", DimensionBounds::new(1, Some(5)).unwrap());
         let caller = DimensionVariable::new("caller", DimensionBounds::new(2, Some(4)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent = builder.add_input(DimensionType::new(formal.clone()).into());
+        let extent = builder.add_input(DimensionType::from(formal.clone()).into());
         let output = builder
             .add_instruction(
                 ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
@@ -457,7 +457,7 @@ mod tests {
         // Genuine cross-program instantiation: deriving the caller renaming from the complete boundary signature
         // renames the whole program, including the dynamic zero's stored output type, and recloses its region
         // arena, so the instantiated payload stays consistent with the instantiated atom types.
-        let caller_input = ArrayIrType::Dimension(DimensionType::new(caller.clone()));
+        let caller_input = ArrayIrType::Dimension(DimensionType::from(caller.clone()));
         let instantiated = program.with_instantiated_type_identities(std::slice::from_ref(&caller_input)).unwrap();
         assert_eq!(instantiated.input_types(), vec![caller_input]);
         assert_eq!(
@@ -479,7 +479,7 @@ mod tests {
         );
         assert_eq!(
             instantiated.interpret(vec![ArrayIrValue::Dimension(
-                DimensionValue::new(DimensionType::new(caller.clone()), 3).unwrap()
+                DimensionValue::new(DimensionType::from(caller.clone()), 3).unwrap()
             )]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())]),
         );
@@ -490,7 +490,7 @@ mod tests {
         // input identity through the closed identity signature.
         assert_eq!(
             program
-                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),
+                .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(caller), 3).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap())]),
         );
     }
@@ -556,8 +556,7 @@ mod tests {
         // references. A reference names an allocation with persistent identity and cannot be conjured from its type.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert_eq!(context.zero(&ArrayIrType::Array(output_type.clone())), Ok(ArrayIrValue::Array(expected)));
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::unbounded()));
         assert_eq!(
             context.zero(&dimension_type),
             Err(ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type"))),
@@ -615,8 +614,7 @@ mod tests {
 
     #[test]
     fn test_zero_partial_evaluation_dynamic() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let output = ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]).unwrap());
         check_operation_partial_evaluation!(
@@ -685,8 +683,7 @@ mod tests {
 
     #[test]
     fn test_zero_differentiation_dynamic() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let output = builder
@@ -765,8 +762,7 @@ mod tests {
     fn test_zero_transposition_dynamic() {
         // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
         // extent receives a structural-zero cotangent regardless of the output cotangent being live.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let operation = ArrayIrOperation::<Array>::from(ZeroOperation::new(output_type.clone()));
@@ -834,7 +830,7 @@ mod tests {
         // of ever materializing a zero reference.
         assert_eq!(
             ArrayIrOperation::<Array>::provide(
-                ZeroOperation::new(ArrayIrType::Dimension(DimensionType::new(size))),
+                ZeroOperation::new(ArrayIrType::Dimension(DimensionType::from(size))),
                 &[],
             )
             .unwrap_err(),
@@ -917,7 +913,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(2)]));
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(rows), 3).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(rows), 3).unwrap());
         assert_eq!(
             context.dynamic_zero(&output_type, &[extent]),
             Ok(ArrayIrValue::Array(
@@ -936,7 +932,7 @@ mod tests {
     fn test_dynamic_zero_invalid_dimensions() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let dimension = context.input(DimensionType::new(size.clone()).into());
+        let dimension = context.input(DimensionType::from(size.clone()).into());
         for data_type in [DataType::Token, DataType::F8E8M0FNU] {
             let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
             assert_eq!(
@@ -960,7 +956,7 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("`zero` operand 0 must be a dimension but has type f32[]",))),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(other), 3).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 3).unwrap());
         assert_eq!(
             context.dynamic_zero(&output_type, &[extent]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -971,7 +967,7 @@ mod tests {
 
         // Matching diagnostic names and bounds do not make separately created identities interchangeable.
         let distinct = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(distinct), 3).unwrap());
+        let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(distinct), 3).unwrap());
         assert_eq!(
             context.dynamic_zero(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -996,7 +992,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(2)]));
-        let extent_type = DimensionType::new(rows);
+        let extent_type = DimensionType::from(rows);
         let extent = context.input(extent_type.clone().into());
         let output = context.dynamic_zero(&output_type, &[extent]).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
@@ -1034,7 +1030,7 @@ mod tests {
     fn test_dynamic_zero_staging_singleton_dimension() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
-        let dimension_type = DimensionType::new(size.clone());
+        let dimension_type = DimensionType::from(size.clone());
         let dimension = context.input(dimension_type.clone().into());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output = context.dynamic_zero(&output_type, std::slice::from_ref(&dimension)).unwrap();
@@ -1078,7 +1074,7 @@ mod tests {
             PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let extent_type = DimensionType::new(rows);
+        let extent_type = DimensionType::from(rows);
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let known = PartialTracer::new(context.clone(), PartialEvaluationValue::known(extent));
         let output = context.dynamic_zero(&output_type, &[known]).unwrap();
@@ -1102,7 +1098,7 @@ mod tests {
         );
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(rows), 3).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(rows), 3).unwrap());
         let extent = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent));
         let output = context.dynamic_zero(&output_type, &[extent]).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
@@ -1115,7 +1111,7 @@ mod tests {
         let context = TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let extent = context.input(DimensionType::new(rows).into());
+        let extent = context.input(DimensionType::from(rows).into());
         let output = context.dynamic_zero(&output_type, &[extent]).unwrap();
         assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
         let builder = context.builder().borrow();

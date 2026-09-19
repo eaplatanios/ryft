@@ -6250,9 +6250,9 @@ mod tests {
         ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
         ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, Slice,
-        SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation,
-        batch, try_jit_with_options,
+        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation,
+        StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch,
+        try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7331,9 +7331,9 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
-        let first_type = DimensionType::new(DimensionVariable::new("first", bounds));
-        let second_type = DimensionType::new(DimensionVariable::new("second", bounds));
-        let third_type = DimensionType::new(DimensionVariable::new("third", bounds));
+        let first_type = DimensionType::new("first", bounds);
+        let second_type = DimensionType::new("second", bounds);
+        let third_type = DimensionType::new("third", bounds);
 
         let mut builder = XlaProgramBuilder::new();
         let first_input = builder.add_input(input_type.clone().into());
@@ -7414,8 +7414,8 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let check = |operation: DimensionRequirementOperation, left_value: i64, right_value: i64, expected: &str| {
             let mut builder = XlaProgramBuilder::new();
             let left_input = builder.add_input(input_type.clone().into());
@@ -7486,8 +7486,8 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let check = |operation: DimensionOperation<DimensionValue>,
                      valid_operands: (i64, i64),
                      expected_output: i64,
@@ -7576,8 +7576,8 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let bounds = DimensionBounds::new(0, Some(10)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
 
         let mut builder = XlaProgramBuilder::new();
         let left_input = builder.add_input(input_type.clone().into());
@@ -10919,8 +10919,7 @@ mod tests {
             .unwrap();
         let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
         let single_device_domain = XlaDomain::with_mesh(&single_device_client, single_device_mesh.clone());
-        let dimension_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert!(matches!(
             single_device_domain.dispatch_signature(
                 vec![dimension_type.clone().into()],
@@ -12775,7 +12774,7 @@ mod tests {
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
-        let length = DimensionValue::new(DimensionType::new(length_variable.clone()), 3).unwrap();
+        let length = DimensionValue::new(DimensionType::from(length_variable.clone()), 3).unwrap();
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
@@ -13728,11 +13727,8 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let length = DimensionValue::new(
-            DimensionType::new(DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap())),
-            3,
-        )
-        .unwrap();
+        let length =
+            DimensionValue::new(DimensionType::new("length", DimensionBounds::new(0, Some(9)).unwrap()), 3).unwrap();
 
         let body = {
             let mut builder = XlaProgramBuilder::new();

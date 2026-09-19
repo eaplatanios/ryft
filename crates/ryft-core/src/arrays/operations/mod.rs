@@ -49,12 +49,12 @@ use crate::operations::{
     DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
     Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation,
-    Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p, Log1pOperation,
-    LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max,
-    MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike,
-    OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow, PowOperation,
-    PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
+    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p,
+    Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic,
+    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
+    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow,
+    PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
     ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
     ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
     ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
@@ -273,7 +273,7 @@ pub trait ArrayOperations:
     + Compare + Select
     // Shape and layout manipulation.
     + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
-    + DynamicUpdateSlice + ConvertElementType + Sort
+    + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
     + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
     + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
@@ -293,7 +293,7 @@ where
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
-    V: DynamicUpdateSlice + ConvertElementType + Sort,
+    V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
     V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
     V: ZeroLike + OneLike + StopGradient,
@@ -1125,8 +1125,7 @@ mod tests {
 
     #[test]
     fn test_composite_pushforward_materializes_a_dynamic_zero_space_output_tangent() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type =
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let context = TracingContext::<TestValue, TestOperation>::new();
@@ -1195,8 +1194,8 @@ mod tests {
         assert_eq!(promoted_scan.captures(), &[ArrayIrValue::Array(capture)]);
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let dimension_operation = ArrayIrOperation::<Array>::from(DimensionOperation::Add(
             DimensionAddOperation::new(&left_type, &right_type).unwrap(),
         ));
@@ -1290,7 +1289,7 @@ mod tests {
         let dynamic_one = ArrayIrOperation::<Array>::from(OneOperation::new(dynamic_one_type.clone()));
         assert!(matches!(dynamic_one, ArrayIrOperation::One(_)));
         assert_eq!(
-            dynamic_one.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
+            dynamic_one.infer_output_types(&[DimensionType::from(source.clone()).into()], &[]),
             Ok(vec![dynamic_one_type.into()]),
         );
         assert_eq!(
@@ -1301,7 +1300,7 @@ mod tests {
         );
         let other = DimensionVariable::new("other", bounds);
         assert_eq!(
-            dynamic_one.infer_output_types(&[DimensionType::new(other).into()], &[]),
+            dynamic_one.infer_output_types(&[DimensionType::from(other).into()], &[]),
             Err(TypeError::invalid(
                 "`one` operand 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
                  dimension<source ∈ [1, 9)>",
@@ -1309,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_one.infer_output_types(
-                &[DimensionType::new(source.clone()).into()],
+                &[DimensionType::from(source.clone()).into()],
                 &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("`one` expects no regions but got 1")),
@@ -1327,7 +1326,7 @@ mod tests {
         let dynamic_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0).unwrap());
         assert!(matches!(dynamic_iota, ArrayIrOperation::Iota(_)));
         assert_eq!(
-            dynamic_iota.infer_output_types(&[DimensionType::new(source.clone()).into()], &[]),
+            dynamic_iota.infer_output_types(&[DimensionType::from(source.clone()).into()], &[]),
             Ok(vec![dynamic_iota_type.clone().into()]),
         );
         assert_eq!(
@@ -1354,7 +1353,7 @@ mod tests {
         assert_eq!(dimension_size.name(), "dimension_size");
         assert_eq!(
             dimension_size.infer_output_types(&[dynamic_type.into()], &[]),
-            Ok(vec![DimensionType::new(source).into()]),
+            Ok(vec![DimensionType::from(source).into()]),
         );
 
         // Canonical reshape derives its entire result shape from its ordered first-class dimension operand types.
@@ -1372,8 +1371,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),).into()
             ]),
         );
-        let output_extent =
-            DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(1, Some(7)).unwrap()));
+        let output_extent = DimensionType::new("output", DimensionBounds::new(1, Some(7)).unwrap());
         assert_eq!(
             reshape.infer_output_types(
                 &[input_type.into(), output_extent.clone().into(), three.r#type().into_owned().into()],
@@ -1443,7 +1441,7 @@ mod tests {
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)])).into(),
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                DimensionType::new(result).into(),
+                DimensionType::from(result).into(),
             ],
         )
         .unwrap();
@@ -1454,8 +1452,8 @@ mod tests {
         // A dimension requirement is likewise pure when provable and otherwise needs an ordered runtime assertion.
         // Both states must reach the composite family unchanged.
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
 
         // Provable: the same dimension variable is trivially equal to itself.
         let proven = DimensionRequirementOperation::equal(&left_type, &left_type);
@@ -1486,8 +1484,8 @@ mod tests {
         );
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let operation = DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap());
         let result = context
             .bind(
@@ -1604,8 +1602,7 @@ mod tests {
                 .unwrap(),
             )],
         );
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("iota_extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("iota_extent", DimensionBounds::new(1, Some(5)).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap());
         let extent_program_type = extent.r#type().into_owned();
         let output = ArrayIrValue::Array(
@@ -1709,8 +1706,8 @@ mod tests {
         array.dispatch_domain().bind(AddOperation::new(), Vec::new(), &[array.clone(), array]).unwrap();
 
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let left = context.input(left_type.clone().into());
         let right = context.input(right_type.clone().into());
         let left_atom = left.atom_id().unwrap();
@@ -2012,7 +2009,7 @@ mod tests {
     fn batched_composite_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
         let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let trace = TracingContext::<TestValue, TestOperation>::new();
-        let extent_input = trace.input(DimensionType::new(extent.clone()).into());
+        let extent_input = trace.input(DimensionType::from(extent.clone()).into());
         let mapped = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent_input);
         let input = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
@@ -2611,7 +2608,7 @@ mod tests {
     fn test_array_ir_explicit_shape_vertical_slice() {
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let extent_variable = DimensionVariable::new("extent", bounds);
-        let extent_type = DimensionType::new(extent_variable.clone());
+        let extent_type = DimensionType::from(extent_variable.clone());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
 
         // Build one stored program in which ordinary dimension arithmetic supplies explicit reshape and broadcast
@@ -2752,7 +2749,7 @@ mod tests {
         // Instantiation and import rename the boundary identity while preserving the internal arithmetic result and
         // both consumers of its SSA value.
         let target_variable = DimensionVariable::new("target", bounds);
-        let target_type = DimensionType::new(target_variable.clone());
+        let target_type = DimensionType::from(target_variable.clone());
         let target_array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(target_variable.clone())]));
         let instantiated = program
@@ -3012,8 +3009,8 @@ mod tests {
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let first = DimensionVariable::new("first", bounds);
         let second = DimensionVariable::new("second", bounds);
-        let first_type = DimensionType::new(first.clone());
-        let second_type = DimensionType::new(second.clone());
+        let first_type = DimensionType::from(first.clone());
+        let second_type = DimensionType::from(second.clone());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
         let dynamic_integer_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);

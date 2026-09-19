@@ -4,7 +4,7 @@ use pretty_assertions::assert_eq;
 
 use crate::arrays::{
     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-    DimensionValue, DimensionVariable,
+    DimensionValue,
 };
 use crate::contexts::Context;
 use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelParameter};
@@ -62,10 +62,8 @@ impl MaskedCopyCase {
         let block = self.mask.len();
         let programs = self.input.len().div_ceil(block);
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let coordinate_type = DimensionType::new(DimensionVariable::new(
-            "coordinate",
-            DimensionBounds::non_negative(Some(programs.max(1))).unwrap(),
-        ));
+        let coordinate_type =
+            DimensionType::new("coordinate", DimensionBounds::non_negative(Some(programs.max(1))).unwrap());
         let coordinate = mapping.add_input(coordinate_type.clone().into());
         let width = DimensionValue::constant(block).unwrap();
         let width_input = mapping.add_constant(ArrayIrValue::Dimension(width.clone()));

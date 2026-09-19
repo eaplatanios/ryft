@@ -891,8 +891,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Layout,
-        Memory, ReferenceIndexOperation, StridedLayout,
+        ArrayIrOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Layout, Memory,
+        ReferenceIndexOperation, StridedLayout,
     };
     use crate::contexts::Context;
     use crate::kernels::authoring::whole_array_parameter;
@@ -920,10 +920,10 @@ mod tests {
     fn definition(vector: bool, addition: bool) -> KernelDefinition {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let outputs = if vector {
-            vec![mapping.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+            vec![mapping.add_input(ArrayIrType::Dimension(DimensionType::new(
                 "coordinate",
                 DimensionBounds::non_negative(None).unwrap(),
-            ))))]
+            )))]
         } else {
             vec![]
         };
@@ -972,8 +972,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let mut starts = Vec::new();
         for &block in &block_shape {
-            let coordinate_type =
-                DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+            let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
             let coordinate = builder.add_input(coordinate_type.clone().into());
             let size = DimensionValue::constant(block).unwrap();
             let size_id = builder.add_constant(ArrayIrValue::Dimension(size.clone()));
@@ -1128,10 +1127,10 @@ mod tests {
     #[test]
     fn test_kernel_definition_interpret_coordinates() {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let coordinate = mapping.add_input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+        let coordinate = mapping.add_input(ArrayIrType::Dimension(DimensionType::new(
             "coordinate",
             DimensionBounds::non_negative(None).unwrap(),
-        ))));
+        )));
         let mapping = BlockMapping::new(
             mapping.build(vec![coordinate], vec![Placeholder], vec![Placeholder]).unwrap(),
             vec![1],

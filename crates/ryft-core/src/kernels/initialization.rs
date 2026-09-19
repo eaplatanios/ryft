@@ -894,8 +894,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, DimensionBounds, DimensionType, DimensionVariable, ReferenceIndexOperation,
-        ReferenceSliceOperation,
+        ArrayOperation, DataType, DimensionBounds, DimensionType, ReferenceIndexOperation, ReferenceSliceOperation,
     };
     use crate::contexts::EagerContext;
     use crate::kernels::calls::KernelParameter;
@@ -1150,8 +1149,7 @@ mod tests {
     /// Builds one static write-only vector parameter whose blocks advance by their logical size.
     fn call(extent: usize, block: usize, programs: usize) -> KernelCallOperation {
         let mut mapping = ProgramBuilder::new();
-        let coordinate_type =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
         let coordinate = mapping.add_input(coordinate_type.clone().into());
         let size = DimensionValue::constant(block).unwrap();
         let constant = mapping.add_constant(ArrayIrValue::Dimension(size.clone()));
@@ -1187,8 +1185,7 @@ mod tests {
     fn repeated_call(executions: &[GridExecution], separable: bool) -> KernelCallOperation {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         for _ in executions {
-            let coordinate_type =
-                DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+            let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
             let coordinate = mapping.add_input(coordinate_type.clone().into());
             if !separable {
                 let zero = DimensionValue::constant(0).unwrap();
@@ -2146,8 +2143,7 @@ mod tests {
     #[test]
     fn test_validate_kernel_initialization_enumeration_limit() {
         let mut mapping = ProgramBuilder::new();
-        let coordinate_type =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
         let coordinate = mapping.add_input(coordinate_type.clone().into());
         let zero = DimensionValue::constant(0).unwrap();
         let constant = mapping.add_constant(ArrayIrValue::Dimension(zero.clone()));
@@ -2218,11 +2214,8 @@ mod tests {
             let inputs = (0..rank)
                 .map(|axis| {
                     mapping.add_input(
-                        DimensionType::new(DimensionVariable::new(
-                            format!("coordinate_{axis}"),
-                            DimensionBounds::non_negative(None).unwrap(),
-                        ))
-                        .into(),
+                        DimensionType::new(format!("coordinate_{axis}"), DimensionBounds::non_negative(None).unwrap())
+                            .into(),
                     )
                 })
                 .collect::<Vec<_>>();

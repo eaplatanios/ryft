@@ -344,7 +344,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
@@ -604,8 +604,7 @@ mod tests {
     #[test]
     fn test_reference_add_update_batching() {
         let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestIrContext::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);

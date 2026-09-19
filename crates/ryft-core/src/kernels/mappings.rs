@@ -346,7 +346,7 @@ impl BlockWindow {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, DimensionBounds, DimensionError, DimensionType, DimensionVariable};
+    use crate::arrays::{ArrayType, DataType, DimensionBounds, DimensionError, DimensionType};
     use crate::operations::{DimensionMulOperation, ZERO_OPERATION_NAME, ZeroOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{ProgramBuilder, ReferenceType};
@@ -359,11 +359,7 @@ mod tests {
         let outputs = (0..rank)
             .map(|axis| {
                 builder.add_input(
-                    DimensionType::new(DimensionVariable::new(
-                        format!("axis_{axis}"),
-                        DimensionBounds::non_negative(None).unwrap(),
-                    ))
-                    .into(),
+                    DimensionType::new(format!("axis_{axis}"), DimensionBounds::non_negative(None).unwrap()).into(),
                 )
             })
             .collect();
@@ -471,8 +467,8 @@ mod tests {
             crate::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let first = builder.add_input(crate::arrays::DimensionType::new(variable.clone()).into());
-        let second = builder.add_input(crate::arrays::DimensionType::new(variable.clone()).into());
+        let first = builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
+        let second = builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
         let mapping = BlockMapping::new(
             builder.build(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap(),
             vec![1, 1],
@@ -510,8 +506,8 @@ mod tests {
             crate::arrays::DimensionBounds::non_negative(Some(4)).unwrap(),
         );
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        builder.add_input(crate::arrays::DimensionType::new(variable.clone()).into());
-        let output = builder.add_input(crate::arrays::DimensionType::new(variable).into());
+        builder.add_input(crate::arrays::DimensionType::from(variable.clone()).into());
+        let output = builder.add_input(crate::arrays::DimensionType::from(variable).into());
         let mapping = BlockMapping::new(
             builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap(),
             vec![1],
@@ -536,7 +532,7 @@ mod tests {
         assert_eq!(mapping.tiling_axes(), Some(vec![]));
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let coordinate_type = DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::unbounded()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::unbounded());
         let coordinate = builder.add_input(ArrayIrType::Dimension(coordinate_type.clone()));
         let factor = DimensionValue::constant(4).unwrap();
         let factor_type = factor.r#type().into_owned();
@@ -560,7 +556,7 @@ mod tests {
     #[test]
     fn test_block_mapping_tiling_axes_rejects_dead_arithmetic() {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let coordinate_type = DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::unbounded()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::unbounded());
         let coordinate = builder.add_input(ArrayIrType::Dimension(coordinate_type.clone()));
         let factor = DimensionValue::constant(4).unwrap();
         let factor_type = factor.r#type().into_owned();
@@ -586,8 +582,7 @@ mod tests {
     #[test]
     fn test_block_mapping_evaluate() {
         let mut builder = ProgramBuilder::new();
-        let coordinate_type =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(Some(4)).unwrap()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(Some(4)).unwrap());
         let tile_size = DimensionValue::constant(4).unwrap();
         let coordinate = builder.add_input(coordinate_type.clone().into());
         let size = builder.add_constant(ArrayIrValue::Dimension(tile_size.clone()));
@@ -659,8 +654,7 @@ mod tests {
     #[test]
     fn test_block_mapping_evaluate_checked_dimension_arithmetic() {
         let mut builder = ProgramBuilder::new();
-        let coordinate_type =
-            DimensionType::new(DimensionVariable::new("coordinate", DimensionBounds::non_negative(None).unwrap()));
+        let coordinate_type = DimensionType::new("coordinate", DimensionBounds::non_negative(None).unwrap());
         let coordinate = builder.add_input(coordinate_type.clone().into());
         let start = builder
             .add_instruction(

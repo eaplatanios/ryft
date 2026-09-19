@@ -935,7 +935,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView,
         ArrayReferenceViewIndex, ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, REFERENCE_INDEX_OPERATION_NAME, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
+        REFERENCE_INDEX_OPERATION_NAME, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
         ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::contexts::{EagerContext, StagingContext};
@@ -1290,8 +1290,7 @@ mod tests {
     #[test]
     fn test_reference_view_operation_batch() {
         let extent = TestValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let context =
             BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
@@ -1394,11 +1393,7 @@ mod tests {
         let parent = TracingContext::<TestValue, TestViewOperation>::new();
         let extent = parent
             .lift(TestValue::Dimension(
-                DimensionValue::new(
-                    DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())),
-                    2,
-                )
-                .unwrap(),
+                DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
             ))
             .unwrap();
         let input = ArrayIrBatch::new(parent.input(reference_type([2, 3])), BatchAxis::new(0)).unwrap();
@@ -1447,11 +1442,7 @@ mod tests {
         let parent = TracingContext::<TestValue, TestViewOperation>::new();
         let extent = parent
             .lift(TestValue::Dimension(
-                DimensionValue::new(
-                    DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())),
-                    2,
-                )
-                .unwrap(),
+                DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
             ))
             .unwrap();
         let input = ArrayIrBatch::replicated(parent.input(reference_type([2])));
@@ -1471,8 +1462,7 @@ mod tests {
     #[test]
     fn test_reference_view_operation_batch_rejects_additional_behavior() {
         let extent = TestValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let parent = TracingContext::<TestValue, TestViewOperation>::new();
         let extent = parent.lift(extent).unwrap();

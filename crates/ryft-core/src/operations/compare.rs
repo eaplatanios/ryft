@@ -323,7 +323,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
+        DimensionBounds, DimensionType, DimensionValue, Layout, Memory, Shape, StridedLayout,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -415,8 +415,8 @@ mod tests {
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let left = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left = DimensionType::new("left", bounds);
+        let right = DimensionType::new("right", bounds);
         let operation = CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan);
         assert_eq!(
             operation.infer_output_types(&[left.clone().into(), right.clone().into()], &[]),
@@ -456,8 +456,8 @@ mod tests {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         let context = TestContext::new();
         let left = context.input(left_type.clone().into());
         let right = context.input(right_type.clone().into());
@@ -496,10 +496,8 @@ mod tests {
         );
 
         let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let relocated_left =
-            relocated_builder.add_input(DimensionType::new(DimensionVariable::new("relocated_left", bounds)).into());
-        let relocated_right =
-            relocated_builder.add_input(DimensionType::new(DimensionVariable::new("relocated_right", bounds)).into());
+        let relocated_left = relocated_builder.add_input(DimensionType::new("relocated_left", bounds).into());
+        let relocated_right = relocated_builder.add_input(DimensionType::new("relocated_right", bounds).into());
         let relocated_outputs = relocated_builder.splice_program(&program, &[relocated_left, relocated_right]).unwrap();
         let [relocated_instruction] = relocated_builder.instructions() else {
             panic!("expected one relocated comparison instruction");
@@ -540,8 +538,8 @@ mod tests {
         );
 
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
             operation = CompareOperation::new(ComparisonDirection::LessThan),

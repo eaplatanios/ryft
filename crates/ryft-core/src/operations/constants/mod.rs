@@ -213,7 +213,7 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
             // Repeated reads may give one concrete extent separate nominal definitions after specialization.
             // An exact matching extent is sufficient only when another input grounds the stored identity itself.
             // Otherwise, the output would still reference an identity that this constructor never received.
-            let required_type = DimensionType::new(variable.clone());
+            let required_type = DimensionType::from(variable.clone());
             if required_type.extent().is_some()
                 && required_type.extent() == dimension_type.extent()
                 && input_types
@@ -306,7 +306,7 @@ mod tests {
         ));
 
         // Replay may rename an input identity; consistency is enforced against the stored output identity.
-        let renamed = DimensionType::new(DimensionVariable::new("renamed", DimensionBounds::unbounded()));
+        let renamed = DimensionType::new("renamed", DimensionBounds::unbounded());
         let two = ArrayIrValue::Dimension(DimensionValue::new(renamed.clone(), 2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(renamed, 3).unwrap());
         assert_eq!(
@@ -345,7 +345,7 @@ mod tests {
             infer_array_ir_constant_constructor_output_types(
                 "zero",
                 &dynamic_type,
-                &[ArrayIrType::Dimension(DimensionType::new(rows.clone()))],
+                &[ArrayIrType::Dimension(DimensionType::from(rows.clone()))],
                 &[],
             ),
             Ok(vec![ArrayIrType::Array(dynamic_type.clone())]),
@@ -361,7 +361,7 @@ mod tests {
             infer_array_ir_constant_constructor_output_types(
                 "zero",
                 &dynamic_type,
-                &[ArrayIrType::Dimension(DimensionType::new(other))],
+                &[ArrayIrType::Dimension(DimensionType::from(other))],
                 &[],
             ),
             Err(TypeError::invalid(
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_infer_array_ir_constant_constructor_output_types_singleton_dimensions() {
-        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap()));
+        let dimension = DimensionType::new("size", DimensionBounds::new(3, Some(4)).unwrap());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.variable().clone().into(), 2.into()]));
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &r#type, &[dimension.into()], &[]),
@@ -423,9 +423,9 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), 2.into(), columns.clone().into()]));
         let row_extent =
-            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::new(rows.clone()), 3).unwrap());
+            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::from(rows.clone()), 3).unwrap());
         let column_extent =
-            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::new(columns), 4).unwrap());
+            ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::from(columns), 4).unwrap());
 
         // Operands correspond only to dynamic axes and must follow their order in the stored shape.
         assert_eq!(
@@ -475,11 +475,8 @@ mod tests {
             .into()),
         );
         let wider = ArrayIrValue::<Array>::Dimension(
-            DimensionValue::new(
-                DimensionType::new(DimensionVariable::new("wider", DimensionBounds::non_negative(Some(8)).unwrap())),
-                2,
-            )
-            .unwrap(),
+            DimensionValue::new(DimensionType::new("wider", DimensionBounds::non_negative(Some(8)).unwrap()), 2)
+                .unwrap(),
         );
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), wider]),

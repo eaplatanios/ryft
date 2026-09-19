@@ -1360,10 +1360,10 @@ impl_differentiable_operation! {
 /// let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 /// // Shapes: input [] (scalar) -> output [extent], where extent is a symbolic dimension.
 /// let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-/// let extent = context.input(ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
+/// let extent = context.input(ArrayIrType::Dimension(DimensionType::new(
 ///     "extent",
 ///     DimensionBounds::new(1, Some(9))?,
-/// ))));
+/// )));
 /// let output = scalar.dynamic_broadcast_to(&[extent])?;
 /// assert_eq!(output.r#type().to_string(), "f32[extent]");
 /// # Ok(())
@@ -3254,7 +3254,7 @@ mod tests {
         let two = DimensionValue::constant(2).unwrap().r#type().into_owned();
         let three = DimensionValue::constant(3).unwrap().r#type().into_owned();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_extent = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let dynamic_extent = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let placed_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
@@ -3347,7 +3347,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let layout = Layout::Strided(StridedLayout::new(vec![8]));
         let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let extent_type = ArrayIrType::Dimension(DimensionType::new(extent.clone()));
+        let extent_type = ArrayIrType::Dimension(DimensionType::from(extent.clone()));
         check_operation_type_inference!(
             operation = DynamicBroadcastOperation::new(vec![]).with_output_layout(layout.clone()),
             cases = [{
@@ -3384,7 +3384,7 @@ mod tests {
         let source = DimensionVariable::new("source", bounds);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
-        let extent = builder.add_input(DimensionType::new(source.clone()).into());
+        let extent = builder.add_input(DimensionType::from(source.clone()).into());
         let one = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
         let output = builder
             .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![input, extent, one], None)
@@ -3400,7 +3400,7 @@ mod tests {
         let instantiated = program
             .with_instantiated_type_identities(&[
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into(),
-                DimensionType::new(target.clone()).into(),
+                DimensionType::from(target.clone()).into(),
             ])
             .unwrap()
             .into_owned();
@@ -3416,7 +3416,7 @@ mod tests {
         );
         let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = destination.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).into());
-        let extent = destination.add_input(DimensionType::new(target.clone()).into());
+        let extent = destination.add_input(DimensionType::from(target.clone()).into());
         let outputs = destination.splice_program(&instantiated, &[input, extent]).unwrap();
         let [instruction] = destination.instructions() else {
             panic!("expected the imported broadcast instruction");
@@ -3462,8 +3462,7 @@ mod tests {
             ),
             Ok(vec![expected_output.clone()]),
         );
-        let eager_dynamic_type =
-            DimensionType::new(DimensionVariable::new("eager_extent", DimensionBounds::new(1, Some(9)).unwrap()));
+        let eager_dynamic_type = DimensionType::new("eager_extent", DimensionBounds::new(1, Some(9)).unwrap());
         assert_eq!(
             context.bind(
                 DynamicBroadcastOperation::new(vec![1]),
@@ -3514,7 +3513,7 @@ mod tests {
     #[test]
     fn test_dynamic_broadcast_interpretation_repeated_dimensions() {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let dimension = DimensionType::new("size", DimensionBounds::unbounded());
         let input = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap());
         let two = ArrayIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(dimension, 3).unwrap());
@@ -3532,7 +3531,7 @@ mod tests {
             )),
         );
         // Equal diagnostic names do not equate independently created dimension identities.
-        let other = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let other = DimensionType::new("size", DimensionBounds::unbounded());
         let three = ArrayIrValue::Dimension(DimensionValue::new(other, 3).unwrap());
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[input, two, three]),
@@ -3540,7 +3539,7 @@ mod tests {
                 Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0f32; 6]).unwrap()
             )]),
         );
-        let dimension = DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded()));
+        let dimension = DimensionType::new("size", DimensionBounds::unbounded());
         let input = ArrayIrValue::Array(Array::scalar(1.0f32).unwrap());
         let two = ArrayIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
         let three = ArrayIrValue::Dimension(DimensionValue::new(dimension, 3).unwrap());
@@ -3682,13 +3681,14 @@ mod tests {
         .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let dimension =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(size.clone()))
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(size.clone()))
                 .unwrap();
 
         // Distinct logical dimensions cannot become equal merely because their packed bounds match.
         let other_size = DimensionVariable::new("other_size", DimensionBounds::new(0, Some(4)).unwrap());
         let other_dimension =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(other_size)).unwrap();
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(other_size))
+                .unwrap();
         assert!(matches!(
             DynamicBroadcastOperation::new(vec![0]).batch(
                 &context, &EmptyRegionDriver, &[input.clone(), other_dimension],
@@ -3719,7 +3719,7 @@ mod tests {
         .with_ragged_axes(vec![RaggedAxis::new(1, narrow_extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let narrow_dimension =
-            ArrayIrBatch::mapped_dimension(narrow_extents, BatchAxis::new(0), DimensionType::new(size.clone()))
+            ArrayIrBatch::mapped_dimension(narrow_extents, BatchAxis::new(0), DimensionType::from(size.clone()))
                 .unwrap();
         assert!(matches!(
             DynamicBroadcastOperation::new(vec![0]).batch(
@@ -3797,7 +3797,7 @@ mod tests {
         .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), size.clone(), vec![0])])
         .unwrap();
         let dimension = ArrayIrBatch::replicated(ArrayIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(size.clone()), 3).unwrap(),
+            DimensionValue::new(DimensionType::from(size.clone()), 3).unwrap(),
         ));
         // A replicated dimension still describes packed ragged storage when the array has a mapped batch axis.
         let mapped_input = ArrayIrBatch::new(input.value().clone(), BatchAxis::new(0))
@@ -3850,7 +3850,7 @@ mod tests {
                 .with_ragged_axes(vec![RaggedAxis::new(0, extents.clone(), size, vec![1])])
                 .unwrap();
         let other_dimension =
-            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(other_size)).unwrap();
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(other_size)).unwrap();
         assert!(matches!(
             DynamicBroadcastOperation::new(vec![0]).batch(&context, &EmptyRegionDriver, &[input, other_dimension]),
             Err(BatchingError::InvalidBatchMetadata { message })
@@ -3875,7 +3875,7 @@ mod tests {
         let input =
             ArrayIrBatch::new(trace.input(ArrayType::new_static(DataType::F32, [3, 2]).into()), BatchAxis::new(1))
                 .unwrap();
-        let dimension = ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(size)).unwrap();
+        let dimension = ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::from(size)).unwrap();
         let operation = DynamicBroadcastOperation::new(vec![0]);
         assert!(matches!(
             operation.batch(&context, &EmptyRegionDriver, &[input.clone(), dimension.clone()]),
@@ -3954,7 +3954,7 @@ mod tests {
         // that reconstructed output geometry from the input type would have to stage its own `dimension_size` read.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(9)).unwrap());
-        let declared_extent = trace.input(DimensionType::new(columns.clone()).into());
+        let declared_extent = trace.input(DimensionType::from(columns.clone()).into());
         let input = trace
             .input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)])).into());
         let declared_extent_id = declared_extent.atom_id().unwrap();
@@ -4127,7 +4127,7 @@ mod tests {
         );
 
         let dynamic_variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_extent = DimensionType::new(dynamic_variable.clone());
+        let dynamic_extent = DimensionType::from(dynamic_variable.clone());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder
             .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_variable)])).into());
@@ -4225,7 +4225,7 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
-        let dimension = builder.add_input(DimensionType::new(size).into());
+        let dimension = builder.add_input(DimensionType::from(size).into());
         let three = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
             .add_instruction(
@@ -4270,7 +4270,7 @@ mod tests {
         let layout = Layout::Strided(StridedLayout::new(vec![4]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
-        let dimension = builder.add_input(DimensionType::new(size).into());
+        let dimension = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(
                 DynamicBroadcastOperation::new(vec![0]).with_output_layout(layout.clone()),
@@ -4321,7 +4321,7 @@ mod tests {
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
-        let dimension = builder.add_input(DimensionType::new(size).into());
+        let dimension = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(
                 DynamicBroadcastOperation::new(vec![0]).with_output_sharding(sharding.clone()),
@@ -4370,7 +4370,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), 1.into()]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
-        let dimension = builder.add_input(DimensionType::new(size).into());
+        let dimension = builder.add_input(DimensionType::from(size).into());
         let three = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
             .add_instruction(
@@ -4468,7 +4468,7 @@ mod tests {
         // A zero cotangent needs no dynamic geometry residual and leaves every input accumulator structural.
         let size = DimensionVariable::new("size", DimensionBounds::positive(Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
-        let input_types = vec![ArrayIrType::Array(input_type), DimensionType::new(size).into()];
+        let input_types = vec![ArrayIrType::Array(input_type), DimensionType::from(size).into()];
         let operation = DynamicBroadcastOperation::new(vec![0]);
         let output_type = operation.infer_output_types(&input_types, &[]).unwrap().remove(0);
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -4503,7 +4503,7 @@ mod tests {
             ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(size.clone())])));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone());
-        let extent = builder.add_input(DimensionType::new(size).into());
+        let extent = builder.add_input(DimensionType::from(size).into());
         let two = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let output = builder
             .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![input, two, extent], None)
@@ -4624,8 +4624,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_broadcast_dynamic_broadcast_to_first_class_dimensions() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let scalar = context.input(ArrayType::scalar(DataType::F64).into());
         let extent = context.input(extent_type.clone().into());

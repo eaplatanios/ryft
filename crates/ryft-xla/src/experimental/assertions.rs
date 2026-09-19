@@ -579,16 +579,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue, DimensionVariable, Div,
-        ProgramError, Rem, Sub,
+        DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue, Div, ProgramError, Rem, Sub,
     };
 
     use super::*;
 
     /// Builds an eager dimension value whose diagnostic variable name matches the FFI-reported operand name.
     fn eager_dimension(name: &str, extent: usize) -> DimensionValue {
-        DimensionValue::new(DimensionType::new(DimensionVariable::new(name, DimensionBounds::unbounded())), extent)
-            .unwrap()
+        DimensionValue::new(DimensionType::new(name, DimensionBounds::unbounded()), extent).unwrap()
     }
 
     /// Extracts the checked-arithmetic diagnostic carried by an eager dimension error.

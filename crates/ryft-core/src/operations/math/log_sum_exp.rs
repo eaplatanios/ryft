@@ -470,7 +470,7 @@ mod tests {
         type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let trace = TraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
         let packed = trace.input(
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
                 .into(),

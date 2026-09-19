@@ -11931,14 +11931,14 @@ mod tests {
         CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate, Dimension,
         DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation, LogSumExpOperation, LogicalMesh,
-        MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder,
-        ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation,
-        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape,
-        Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile, TileDimension,
-        TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation,
-        ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
+        LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
+        PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope,
+        RaggedDot, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
+        SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile,
+        TileDimension, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation,
+        XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -12108,7 +12108,7 @@ mod tests {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7)).unwrap());
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
-        let extent = builder.add_input(DimensionType::new(rows).into());
+        let extent = builder.add_input(DimensionType::from(rows).into());
         let output = builder
             .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
             .unwrap()[0];
@@ -12914,7 +12914,7 @@ mod tests {
             let dimension_type = if static_output {
                 DimensionValue::constant(4).unwrap().r#type().into_owned()
             } else {
-                DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(0, Some(5)).unwrap()))
+                DimensionType::new("output", DimensionBounds::new(0, Some(5)).unwrap())
             };
             let dimension = if static_output {
                 builder
@@ -13043,8 +13043,7 @@ mod tests {
     #[test]
     fn test_lower_reshape_physical_capacities() {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
-        let dimension_type =
-            DimensionType::new(DimensionVariable::new("columns", DimensionBounds::new(0, Some(4)).unwrap()));
+        let dimension_type = DimensionType::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder
@@ -13557,8 +13556,7 @@ mod tests {
         // program reshapes the tangent alongside the primal. Both outputs report the batch and row extents.
         let client = execution_client();
         crate::experimental::assertions::ensure_assertion_handler_registered(&client).unwrap();
-        let batch =
-            DimensionType::new(DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap()));
+        let batch = DimensionType::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
         let (batched, output_axes) = static_input_dynamic_output_reshape_program()
             .batched_with_threaded_extent(
                 batch,
@@ -13696,8 +13694,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), dynamic_dimension("input", Some(5))]));
         let input = parent.input(input_type.clone().into());
         let size = parent.input(ArrayType::scalar(DataType::I64).into());
-        let output_type =
-            DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(0, Some(5)).unwrap()));
+        let output_type = DimensionType::new("output", DimensionBounds::new(0, Some(5)).unwrap());
         let dimension = parent
             .bind(DimensionFromScalarOperation::new(output_type.variable().clone()), Vec::new(), &[size])
             .unwrap()
@@ -13984,10 +13981,7 @@ mod tests {
                     let extent = match bound {
                         None => DimensionValue::constant(expected.len()).unwrap(),
                         Some(bound) => DimensionValue::new(
-                            DimensionType::new(DimensionVariable::new(
-                                "output",
-                                DimensionBounds::non_negative(Some(bound + 1)).unwrap(),
-                            )),
+                            DimensionType::new("output", DimensionBounds::non_negative(Some(bound + 1)).unwrap()),
                             expected.len(),
                         )
                         .unwrap(),
@@ -14811,8 +14805,7 @@ mod tests {
         // it materializes as a scalar `i64` `stablehlo.constant` in the function body instead of consuming a hidden
         // capture argument. That is exactly what makes first-class extents usable where no capture table is
         // reachable, such as inside a `shard_map` manual region.
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = CompositeXlaProgramBuilder::new();
         let extent = builder.add_constant(XlaConstant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
         let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent], None).unwrap()[0];
@@ -18834,7 +18827,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_forwards_dimension_extent_through_condition() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent_type = DimensionType::new(extent.clone());
+        let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
@@ -18986,7 +18979,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_forwards_loop_carried_dimension_extent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent_type = DimensionType::new(extent.clone());
+        let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
@@ -19167,7 +19160,7 @@ mod tests {
         // condition region still `or`-reduces the per-item predicate into the scalar continuation decision.
         use ryft_core::{CompareOperation, OneLikeOperation, ZeroLikeOperation};
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent_type = DimensionType::new(extent.clone());
+        let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
@@ -19338,7 +19331,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_forwards_scan_carried_dimension_extent() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent_type = DimensionType::new(extent.clone());
+        let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
 
         let body = {
@@ -19397,7 +19390,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_dynamic_scan_length_as_scalar_ssa() {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
-        let length_type = DimensionType::new(length.clone());
+        let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
 
@@ -19453,7 +19446,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_program_lowers_mapped_rng_as_dynamic_scan() {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_type = DimensionType::new(batch.clone());
+        let batch_type = DimensionType::from(batch.clone());
         let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
         let stacked_state_type =
             ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
@@ -21603,8 +21596,8 @@ mod tests {
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
         let requirement = DimensionRequirementOperation::equal(
-            &DimensionType::new(left_variable.clone()),
-            &DimensionType::new(right_variable.clone()),
+            &DimensionType::from(left_variable.clone()),
+            &DimensionType::from(right_variable.clone()),
         );
         let mut builder = CompositeXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
@@ -21654,8 +21647,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let left_dimension_type = DimensionType::new(left_variable.clone());
-        let right_dimension_type = DimensionType::new(right_variable.clone());
+        let left_dimension_type = DimensionType::from(left_variable.clone());
+        let right_dimension_type = DimensionType::from(right_variable.clone());
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
@@ -21729,8 +21722,8 @@ mod tests {
         let build = |left_bounds: DimensionBounds, right_bounds: DimensionBounds| {
             let left_variable = DimensionVariable::new("left", left_bounds);
             let right_variable = DimensionVariable::new("right", right_bounds);
-            let left_type = DimensionType::new(left_variable.clone());
-            let right_type = DimensionType::new(right_variable.clone());
+            let left_type = DimensionType::from(left_variable.clone());
+            let right_type = DimensionType::from(right_variable.clone());
             let mut builder = CompositeXlaProgramBuilder::new();
             let left = builder.add_input(scalar_type.clone().into());
             let right = builder.add_input(scalar_type.clone().into());
@@ -22384,8 +22377,7 @@ mod tests {
         let add_operation =
             DimensionAddOperation::new(first_size_operation.result_type(), second_size_operation.result_type())
                 .unwrap();
-        let result_extent_type =
-            DimensionType::new(DimensionVariable::new(add_operation.output_name(), add_operation.output_bounds()));
+        let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
         let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
             0,
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
@@ -22454,16 +22446,10 @@ mod tests {
             let element = if data_type == DataType::I64 { "i64" } else { "complex<f32>" };
             for extent in [
                 DimensionValue::constant(3).unwrap(),
-                DimensionValue::new(
-                    DimensionType::new(DimensionVariable::new("result", DimensionBounds::new(0, Some(5)).unwrap())),
-                    3,
-                )
-                .unwrap(),
-                DimensionValue::new(
-                    DimensionType::new(DimensionVariable::new("result", DimensionBounds::new(0, Some(11)).unwrap())),
-                    3,
-                )
-                .unwrap(),
+                DimensionValue::new(DimensionType::new("result", DimensionBounds::new(0, Some(5)).unwrap()), 3)
+                    .unwrap(),
+                DimensionValue::new(DimensionType::new("result", DimensionBounds::new(0, Some(11)).unwrap()), 3)
+                    .unwrap(),
             ] {
                 let first_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("first", Some(5))]));
                 let second_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("second", Some(5))]));
@@ -23222,7 +23208,7 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
         let mut builder = CompositeXlaProgramBuilder::new();
         let dimension =
-            builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(size), 3).unwrap()));
+            builder.add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(size), 3).unwrap()));
         let zero = builder
             .add_instruction(
                 ArrayIrOperation::<XlaArrayConstant>::Zero(ZeroOperation::new(output_type.clone())),
@@ -23307,9 +23293,10 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let rows_input = builder
-            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(rows.clone()), 2).unwrap()));
-        let columns_input = builder
-            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::new(columns.clone()), 3).unwrap()));
+            .add_constant(XlaConstant::Dimension(DimensionValue::new(DimensionType::from(rows.clone()), 2).unwrap()));
+        let columns_input = builder.add_constant(XlaConstant::Dimension(
+            DimensionValue::new(DimensionType::from(columns.clone()), 3).unwrap(),
+        ));
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
         let output = builder
             .add_instruction(
@@ -23351,7 +23338,7 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let dimension = builder.add_constant(XlaConstant::Dimension(
-                DimensionValue::new(DimensionType::new(size.clone()), 2).unwrap(),
+                DimensionValue::new(DimensionType::from(size.clone()), 2).unwrap(),
             ));
             let output = builder
                 .add_instruction(

@@ -265,7 +265,7 @@ impl Grid {
                     let extent = match &dimension.extent {
                         Dimension::Static(extent) => Dimension::Static(*extent),
                         Dimension::Dynamic(variable) => Dimension::Dynamic(
-                            DimensionType::new(variable.clone()).rename_identities(renaming)?.variable().clone(),
+                            DimensionType::from(variable.clone()).rename_identities(renaming)?.variable().clone(),
                         ),
                     };
                     Ok(GridDimension { extent, name: dimension.name.clone(), execution: dimension.execution })

@@ -545,7 +545,7 @@ mod tests {
             let trace = TraceContext::new();
             let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
             let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-            let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+            let batch_extent = trace.input(DimensionType::from(items.clone()).into());
             let packed = trace.input(
                 ArrayType::new(
                     DataType::F32,

@@ -1262,7 +1262,7 @@ mod tests {
         let extent =
             |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
         let ragged_extent =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(variable.clone()))
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::from(variable.clone()))
                 .unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
@@ -1319,7 +1319,7 @@ mod tests {
         let extent =
             |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
         let ragged_extent = ArrayIrBatch::replicated(ArrayIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(variable.clone()), 2).unwrap(),
+            DimensionValue::new(DimensionType::from(variable.clone()), 2).unwrap(),
         ));
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
@@ -1600,7 +1600,7 @@ mod tests {
         // identity, and the rule introduces no metadata read from the source array.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch).into());
+        let batch_extent = trace.input(DimensionType::from(batch).into());
         let sequence = DimensionVariable::new("sequence", DimensionBounds::new(1, Some(17))?);
         let width = DimensionVariable::new("width", DimensionBounds::new(1, Some(33))?);
         let gathered = DimensionVariable::new("gathered", DimensionBounds::new(1, Some(65))?);
@@ -1611,8 +1611,8 @@ mod tests {
             )
             .into(),
         );
-        let gathered_extent = trace.input(DimensionType::new(gathered).into());
-        let width_extent = trace.input(DimensionType::new(width).into());
+        let gathered_extent = trace.input(DimensionType::from(gathered).into());
+        let width_extent = trace.input(DimensionType::from(width).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
             .with_axis_name("items".to_string());
         let [output] = context
@@ -1664,7 +1664,7 @@ mod tests {
         // index and complete result shape are lifted around the current mapped axis, without reading the source shape.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let logical_extent = DimensionVariable::new("logical", DimensionBounds::new(1, Some(17))?);
         let result_extent = DimensionVariable::new("result", DimensionBounds::new(1, Some(33))?);
         let input = trace.input(
@@ -1674,7 +1674,7 @@ mod tests {
             )
             .into(),
         );
-        let result_extent = trace.input(DimensionType::new(result_extent).into());
+        let result_extent = trace.input(DimensionType::from(result_extent).into());
         let width_extent = trace.input(DimensionValue::constant(3)?.r#type().into_owned().into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
             .with_axis_name("outer".to_string());

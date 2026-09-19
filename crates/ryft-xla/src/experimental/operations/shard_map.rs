@@ -1976,8 +1976,8 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context, CotangentDestinationKind,
         CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionType, DimensionVariable, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis,
-        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, Program, ProgramBuilder, ProgramError,
+        DimensionType, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, Operation, PartialValue, Placeholder, Program, ProgramBuilder, ProgramError,
         ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceType, RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension,
         StagingContext, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, TypeError,
@@ -2210,10 +2210,8 @@ mod tests {
             Err(TypeError::invalid("expected 1 region but got 0")),
         );
 
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
-            "size",
-            DimensionBounds::positive(Some(8)).unwrap(),
-        )));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(8)).unwrap()));
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&array_body)),
             Err(TypeError::invalid("expected array type but got dimension type")),

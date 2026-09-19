@@ -435,7 +435,7 @@ impl DimensionSize<usize> for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
+    use crate::arrays::types::dimensions::DimensionBounds;
     use crate::contexts::EagerContext;
     use crate::tracing::Trace;
 
@@ -461,8 +461,8 @@ mod tests {
 
     #[test]
     fn test_dimension_tracer_operators() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(3, Some(9)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(1, Some(4)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(3, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(4)).unwrap());
         let (output_type, program) = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |(left, right)| {
                 let sum = left.clone() + right.clone();
@@ -492,8 +492,8 @@ mod tests {
 
     #[test]
     fn test_dimension_tracer_operator_propagates_construction_error() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(2)).unwrap()));
-        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(3, Some(5)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(2)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(3, Some(5)).unwrap());
         let result = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
             |(left, right)| Ok(left - right),
             (left_type, right_type),
@@ -513,9 +513,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "left >= right; observed left=1, right=3")]
     fn test_dimension_value_operator_panics_on_capability_error() {
-        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(10)).unwrap()));
-        let right_type =
-            DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
+        let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
         let left = DimensionValue::new(left_type, 1).unwrap();
         let right = DimensionValue::new(right_type, 3).unwrap();
 

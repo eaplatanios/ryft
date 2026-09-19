@@ -904,7 +904,7 @@ impl Decoder {
         self.variables
             .get(index)
             .cloned()
-            .map(DimensionType::new)
+            .map(DimensionType::from)
             .ok_or_else(|| invalid(format!("dimension identity {index} is out of bounds")))
     }
 
@@ -1562,8 +1562,8 @@ mod tests {
     #[test]
     fn test_kernel_definition_serialize_refined_dimension_metadata() {
         let bounds = DimensionBounds::non_negative(Some(4)).unwrap();
-        let left = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right = DimensionType::new(DimensionVariable::new("right", bounds));
+        let left = DimensionType::new("left", bounds);
+        let right = DimensionType::new("right", bounds);
         let operation = DimensionMulOperation::new(&left, &right).unwrap();
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(left.variable().clone(), DimensionVariable::new("renamed", bounds)).unwrap();

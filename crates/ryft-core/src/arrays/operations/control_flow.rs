@@ -430,8 +430,7 @@ mod tests {
 
     #[test]
     fn test_composite_condition_tracing_rendering_and_eager_execution() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
@@ -507,8 +506,7 @@ mod tests {
 
     #[test]
     fn test_composite_condition_jvp_preserves_dimension_outputs_without_tangent_slots() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
@@ -566,8 +564,7 @@ mod tests {
 
     #[test]
     fn test_composite_condition_all_zero_jvp_materializes_a_dynamic_output_tangent() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let branch = || {
@@ -702,8 +699,7 @@ mod tests {
 
     #[test]
     fn test_composite_condition_jvp_shapes_a_disconnected_dynamic_operand_tangent_from_its_primal() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let branch = || {
@@ -803,8 +799,7 @@ mod tests {
 
     #[test]
     fn test_composite_condition_pullback_shapes_a_dead_dynamic_output_cotangent_from_a_live_peer() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let branch = || {
@@ -978,8 +973,7 @@ mod tests {
 
     #[test]
     fn test_composite_scan_pullback_shapes_a_dead_dynamic_carry_cotangent_from_a_live_peer() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -1061,10 +1055,9 @@ mod tests {
 
     #[test]
     fn test_composite_scan_jvp_forwards_a_dynamic_length_and_dimension_carry() {
-        let carry_extent_type =
-            DimensionType::new(DimensionVariable::new("carry_extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let carry_extent_type = DimensionType::new("carry_extent", DimensionBounds::positive(Some(8)).unwrap());
         let length_variable = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-        let length_type = DimensionType::new(length_variable.clone());
+        let length_type = DimensionType::from(length_variable.clone());
         let length = Dimension::Dynamic(length_variable);
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let extent = builder.add_input(ArrayIrType::Dimension(carry_extent_type.clone()));
@@ -1241,8 +1234,7 @@ mod tests {
 
     #[test]
     fn test_composite_while_jvp_omits_the_dimension_state_tangent() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         let state = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
@@ -1352,8 +1344,7 @@ mod tests {
 
     #[test]
     fn test_composite_bounded_while_differentiation_supports_batched_predicates_with_dimension_state() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         // Condition: a per-item predicate `state < [2, 4, 8]` that ignores the loop-invariant dimension carry.
@@ -1443,7 +1434,7 @@ mod tests {
     #[test]
     fn test_composite_bounded_while_pullback_threads_invariant_dimension_residuals_as_scan_carries() {
         let extent_variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let extent_type = DimensionType::new(extent_variable.clone());
+        let extent_type = DimensionType::from(extent_variable.clone());
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable)]));
 
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();

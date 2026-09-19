@@ -2422,7 +2422,7 @@ mod tests {
             ArrayIrType::Array(ArrayType::new(data_type, Shape::new(dimensions)))
         };
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let extent = trace.input(ArrayIrType::Dimension(DimensionType::new(items.clone())));
+        let extent = trace.input(ArrayIrType::Dimension(DimensionType::from(items.clone())));
         let input = trace.input(with_items(DataType::F64, &[3]));
         let indices = trace.input(with_items(DataType::I32, &[1, 1]));
         let updates = trace.input(with_items(DataType::F64, &[1]));
@@ -5416,7 +5416,7 @@ mod tests {
         // exceed the guaranteed minimum extent; the batching axis contributes no window elements, so the zero window
         // does not empty the gathered cotangent.
         let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
-        let items_type = DimensionType::new(items.clone());
+        let items_type = DimensionType::from(items.clone());
         let add =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
         let program = jointly_mapped_dynamic_scatter_program(items.clone(), 0, add.clone());
@@ -5591,7 +5591,7 @@ mod tests {
         // back through the shared dual gather, which takes the zero batching window over the possibly-empty extent,
         // while the product rule marks touched destinations through scatter and retains the multiplicative updates.
         let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(9)).unwrap());
-        let items_type = DimensionType::new(items.clone());
+        let items_type = DimensionType::from(items.clone());
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         let matrix = |values: Vec<f64>| {
             ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::F64, [3, 3]), &values).unwrap())
@@ -5976,7 +5976,7 @@ mod tests {
         // Mixed scatter materializes a structurally zero input tangent through the residual protocol, using the
         // input primal as the runtime source for each symbolic extent omitted by its tangent type.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(7)).unwrap());
-        let extent_type = DimensionType::new(extent);
+        let extent_type = DimensionType::from(extent);
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let updates_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

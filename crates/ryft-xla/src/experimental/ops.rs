@@ -1648,8 +1648,7 @@ mod tests {
     fn test_xla_constant() {
         let array_type = vector_type();
         let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let extent = DimensionValue::new(extent_type.clone(), 4).unwrap();
 
         // Both variants are reachable through the payload conversions, report their own member type, and render
@@ -2003,7 +2002,7 @@ mod tests {
                 DataType::F8E8M0FNU,
                 Shape::new(vec![Dimension::Dynamic(rows)]),
             ))),
-            context.input(ArrayIrType::Dimension(DimensionType::new(columns))),
+            context.input(ArrayIrType::Dimension(DimensionType::from(columns))),
         ];
 
         // No single source has the zero's type, so the geometry is assembled per declared residual: the statically
@@ -2030,10 +2029,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_supports_composite_region_boundaries() {
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
-            "size",
-            DimensionBounds::positive(Some(9)).unwrap(),
-        )));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(vector_type());
         let interface = RegionInterface::new(
             vec![dimension_type.clone()],
@@ -2095,10 +2092,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_jvp_omits_zero_space_boundary_tangents() {
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new(
-            "size",
-            DimensionBounds::positive(Some(9)).unwrap(),
-        )));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
 
         let mut callee_builder = XlaProgramBuilder::new();
@@ -2577,7 +2572,7 @@ mod tests {
     #[test]
     fn test_gateway_region_program_imports_with_fresh_alpha_equivalent_identities() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let extent_type = DimensionType::new(extent.clone());
+        let extent_type = DimensionType::from(extent.clone());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
@@ -2726,8 +2721,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_dynamic_zero_transpose_uses_known_extent_operand() {
-        let extent_type =
-            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap()));
+        let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type = ArrayIrType::Array(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]),

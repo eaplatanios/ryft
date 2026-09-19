@@ -588,8 +588,7 @@ mod tests {
     #[test]
     fn test_reference_swap_batching() {
         let extent = TestIrValue::Dimension(
-            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
-                .unwrap(),
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestIrContext::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);

@@ -20,7 +20,7 @@ fn stored_array() -> ArrayIrValue<Array> {
 /// Constructs a stored first-class runtime dimension outside the measured interval.
 fn stored_dimension() -> ArrayIrValue<Array> {
     let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
-    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(variable), 4).unwrap())
+    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(variable), 4).unwrap())
 }
 
 #[test]
