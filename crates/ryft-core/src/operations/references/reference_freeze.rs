@@ -1,7 +1,3 @@
-//! Generic consuming reference finalization operation and its value-level capability.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -46,6 +42,13 @@ impl<T: Type, U: Type> ReferenceFreezeOperation<T, U> {
     }
 }
 
+impl<T: Type, U: Type> Default for ReferenceFreezeOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Type, U: Type> Copy for ReferenceFreezeOperation<T, U> {}
 
 impl<T: Type, U: Type> Display for ReferenceFreezeOperation<T, U> {
@@ -55,10 +58,8 @@ impl<T: Type, U: Type> Display for ReferenceFreezeOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceFreezeOperation<T, U>
+impl<T: Type, U: Type + From<T>> Operation for ReferenceFreezeOperation<T, U>
 where
-    T: Type,
-    U: Type + From<T>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
 {
     type Type = U;
@@ -94,13 +95,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceFreezeOperation<T, U>
-where
+impl<
     T: Type,
     U: Type,
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
     P: ReferenceDischargePolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceFreezeOperation<T, U>
+where
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -114,12 +116,10 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceFreezeOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceFreeze<C::Value>>> InterpretableOperation<C>
+    for ReferenceFreezeOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceFreeze<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -127,43 +127,34 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-
         // Interpretation replays an already-built instruction, so the operand is borrowed from the environment rather
-        // than owned, and cloning it is the faithful replay: a clone names the same allocation, so consuming it
+        // than owned, and cloning it is the faithful replay as a clone names the same allocation, and so consuming it
         // invalidates the whole alias family exactly as the source program asked. The linearity the value-level
-        // capability enforces is not weakened by the clone, because it was never this layer's to enforce: a staged
+        // capability enforces is not weakened by the clone, because it was never this layer's to enforce (a staged
         // handle is held to it while the program is traced, and an eager clone shares the allocation that reports the
-        // misuse.
+        // misuse).
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().freeze()?])
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceFreezeOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceFreezeOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceFreezeOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceFreezeOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // Freezing yields the final packed referent, batched at the reference's own axis.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // Freezing yields the final packed referent, batched at the reference's own axis.
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![P::batch(
             context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
@@ -173,23 +164,21 @@ where
     }
 }
 
-impl<T, U, C> DifferentiableOperation<C> for ReferenceFreezeOperation<T, U>
+impl<T: Type, U: DifferentiableType, C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>>
+    DifferentiableOperation<C> for ReferenceFreezeOperation<T, U>
 where
-    T: Type,
-    U: DifferentiableType,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
 {
-    // Freezing a reference freezes its tangent reference alongside, so the final value pairs with the final tangent
-    // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent. The
-    // operands are cloned before consumption for the same reason the interpretation rule clones them: the rule replays
-    // an already-built application over borrowed duals, and a clone names the same allocation.
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Freezing a reference freezes its tangent reference alongside, so the final value pairs with the final tangent
+        // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent.
+        // The operands are cloned before consumption for the same reason the interpretation rule clones them (the rule
+        // replays an already-built application over borrowed duals, and a clone names the same allocation).
         check_count!("input", inputs, 1, ProgramError);
         let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
         Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
@@ -198,20 +187,18 @@ where
     }
 }
 
-impl<T, U, V, O> TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
-where
+impl<
     T: Type,
     U: DifferentiableType + ReferenceMemberType,
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + ResidualZeroProvider<U, Operation = O>
         + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>,
+> TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
+where
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
-    // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
-    // cotangent into the root's cotangent reference exactly like a read. The cotangent reference stays live for the
-    // earlier (in program order) accesses that the reverse sweep visits next.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -220,6 +207,9 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
+        // cotangent into the root's cotangent reference exactly like a read. The cotangent reference stays live for the
+        // earlier (in program order) accesses that the reverse sweep visits next.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -231,25 +221,26 @@ where
     }
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
-//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
-//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
-//  implementation constrains its target to `Operation<Type = T>` instead.
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayType, ArrayIrType>> for O
-{
+// Gradient extraction requires a freeze provider to read reference cotangents, including in generic code used
+// for scalar/array-only inputs. This implementation satisfies that bound; reference-free inputs never take the
+// freeze path, and direct freeze requests are unsupported.
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<NoReferent, DataType>> for O {
     type Operation = Self;
 
     fn provide(
-        request: ReferenceFreezeOperation<ArrayType, ArrayIrType>,
-        input_types: &[&ArrayIrType],
+        _request: ReferenceFreezeOperation<NoReferent, DataType>,
+        input_types: &[&DataType],
     ) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 1, ProgramError);
-        request.infer_output_types(&[input_types[0].clone()], &[])?;
-        Ok(request.into())
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("`{REFERENCE_FREEZE_OPERATION_NAME}` is not supported in a reference-free type universe"),
+        })
     }
 }
 
+// Gradient extraction requires a freeze provider to read reference cotangents, including in generic code used
+// for scalar/array-only inputs. This implementation satisfies that bound; reference-free inputs never take the
+// freeze path, and direct freeze requests are unsupported.
 impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreezeOperation<NoReferent, ArrayType>>
     for O
 {
@@ -266,35 +257,35 @@ impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreez
     }
 }
 
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<NoReferent, DataType>> for O {
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayType, ArrayIrType>> for O
+{
     type Operation = Self;
 
     fn provide(
-        _request: ReferenceFreezeOperation<NoReferent, DataType>,
-        input_types: &[&DataType],
+        request: ReferenceFreezeOperation<ArrayType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
     ) -> Result<Self, ProgramError> {
         check_count!("input", input_types, 1, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("`{REFERENCE_FREEZE_OPERATION_NAME}` is not supported in a reference-free type universe"),
-        })
+        request.infer_output_types(&[input_types[0].clone()], &[])?;
+        Ok(request.into())
     }
 }
 
-/// Consumes a reference, returning its final value and invalidating its complete alias family.
+/// Capability to consume a reference, returning its final value and invalidating its complete alias family.
 pub trait ReferenceFreeze<Output = Self>: Sized {
     /// Returns the final stored value and invalidates this reference and all aliases.
     ///
-    /// The handle is taken by value, because consumption is linear: after this call the reference denotes nothing.
-    /// Passing it by value makes the common single-handle misuse — freezing and then reading through the same
-    /// binding — a compile error rather than a runtime one. Aliases obtained by cloning the handle are a different
-    /// case and remain a dynamic failure, because the type system cannot see them: an eager alias fails at its next
+    /// This handle is taken by value, because consumption is _linear_. That is, after this call the reference denotes
+    /// nothing. Passing it by value makes the common single-handle misuse (i.e., freezing and then reading through the
+    /// same binding) a compile error rather than a runtime one. Aliases obtained by cloning the handle are a different
+    /// case and remain a dynamic failure, because the type system cannot see them (an eager alias fails at its next
     /// access against the shared reference state, and a staged alias fails while tracing, because every clone of one
-    /// [`Tracer`](crate::Tracer) names the same staged atom. Freezing through a shared borrow is therefore an
-    /// explicit clone-then-freeze, which reads as the deliberate act it is.
+    /// [`Tracer`] names the same staged atom). Freezing through a shared borrow is therefore an explicit
+    /// clone-then-freeze, which reads as the deliberate act that it is:
     ///
     /// ```compile_fail
-    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
-    ///
+    /// # use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
     /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
     /// let frozen = allocation.freeze()?;
     /// // The handle was consumed, so reading it again does not compile.
@@ -303,7 +294,7 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// ```
     ///
     /// ```
-    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
+    /// # use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
     ///
     /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
     /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()).reference_new()?;
@@ -320,18 +311,38 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
 
 impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
     fn freeze(self) -> Result<Self, ProgramError> {
-        ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let operation = ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(&self)?;
         Ok(Self::Array(reference.freeze()?))
     }
 }
 
-impl<V> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceFreeze<V> for V
+{
+    fn freeze(self) -> Result<V, ProgramError> {
+        let domain = self.dispatch_domain();
+        Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
+            >,
+        > + ValueProjection<ArrayType>,
+> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
 {
     fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
         let domain = self.value().dispatch_domain();
@@ -340,17 +351,6 @@ where
             .remove(0)
             .into_projected()
             .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceFreeze<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
-{
-    fn freeze(self) -> Result<V, ProgramError> {
-        let domain = self.dispatch_domain();
-        Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
 }
 
@@ -382,7 +382,7 @@ mod tests {
 
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
-    type TestIrFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceFreezeOperation = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_freeze() {
@@ -442,7 +442,7 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::F32);
         let dimension_type = DimensionType::new("n", DimensionBounds::unbounded());
         check_operation_type_inference!(
-            operation = TestIrFreeze::new(),
+            operation = TestIrReferenceFreezeOperation::new(),
             cases = [
                 {
                     input_types = [ArrayIrType::Reference(ReferenceType::new(array_type.clone()))],
@@ -471,7 +471,7 @@ mod tests {
         // fails its next access against the shared allocation state.
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-                &TestIrFreeze::new(),
+                &TestIrReferenceFreezeOperation::new(),
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&reference),
@@ -487,7 +487,7 @@ mod tests {
         let error = alias.freeze().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         let error = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrFreeze::new(),
+            &TestIrReferenceFreezeOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&reference),
@@ -502,7 +502,7 @@ mod tests {
         // Only reference members can be frozen.
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-                &TestIrFreeze::new(),
+                &TestIrReferenceFreezeOperation::new(),
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&value),
@@ -526,7 +526,7 @@ mod tests {
         let reference = TestIrValue::Reference(ArrayReference::new(initial));
         reference.swap(&TestIrValue::Array(replacement)).unwrap();
         let frozen = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrFreeze::new(),
+            &TestIrReferenceFreezeOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&reference),
@@ -553,7 +553,7 @@ mod tests {
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
         let outputs = staging
-            .fold_or_residualize(TestIrFreeze::new(), Vec::new(), std::slice::from_ref(&reference))
+            .fold_or_residualize(TestIrReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&reference))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
@@ -562,7 +562,9 @@ mod tests {
         // Under the default `Execute` placement a known reference folds the freeze against the live state, which the
         // freeze consumes.
         let executing = PartialEvaluationContext::new(TestContext::new());
-        let outputs = executing.fold_or_residualize(TestIrFreeze::new(), Vec::new(), &[reference]).unwrap();
+        let outputs = executing
+            .fold_or_residualize(TestIrReferenceFreezeOperation::new(), Vec::new(), &[reference])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&value));
         assert_eq!(live.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
@@ -574,7 +576,7 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = TestIrFreeze::new(),
+            operation = TestIrReferenceFreezeOperation::new(),
             cases = [
                 {
                     inputs = [(@known, known)],
@@ -671,7 +673,9 @@ mod tests {
         let reference = builder
             .add_instruction(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![initial], None)
             .unwrap()[0];
-        let output = builder.add_instruction(TestIrFreeze::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = builder
+            .add_instruction(TestIrReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -699,7 +703,7 @@ mod tests {
         let mut context = TranspositionContext::new(tracing);
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrFreeze::new().transpose(
+            TestIrReferenceFreezeOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -713,7 +717,7 @@ mod tests {
 
         // A symbolic zero result cotangent contributes nothing, so the rule never touches the cotangent reference.
         assert_eq!(
-            TestIrFreeze::new().transpose(
+            TestIrReferenceFreezeOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,

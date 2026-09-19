@@ -309,6 +309,21 @@ impl<
     V: Value<
             Type = ArrayIrType,
             DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
+        >,
+> ReferenceNew<V> for V
+{
+    fn reference_new(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
         > + ValueProjection<ReferenceType<ArrayType>>,
 > ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
 {
@@ -319,21 +334,6 @@ impl<
             .remove(0)
             .into_projected()
             .map_err(Into::into)
-    }
-}
-
-impl<
-    V: Value<
-            Type = ArrayIrType,
-            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
-        >,
-> ReferenceNew<V> for V
-{
-    fn reference_new(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
     }
 }
 
