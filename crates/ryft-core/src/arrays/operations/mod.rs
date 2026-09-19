@@ -1052,8 +1052,8 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder,
-        ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-        ValueProjection,
+        ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+        Typed, Value, ValueProjection,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -1092,7 +1092,85 @@ mod tests {
         >();
     }
 
-    // TODO(eaplatanios): Review this module.
+    #[test]
+    fn test_shape_dependencies_are_input_edges_or_dimension_size_reads() {
+        // One representative mixed program: a dynamically shaped input is read with `dimension_size`, the extent is
+        // combined with ordinary dimension arithmetic, and the derived extent is then consumed by two shape-carrying
+        // operations as an explicit input.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let size_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
+        let size_type = size_operation.output_type().clone();
+        let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
+        let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
+        let one_value = DimensionValue::constant(1).unwrap();
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::new(
+            0,
+            &[input_type.clone().into(), input_type.clone().into(), sum_type.into()],
+        )
+        .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
+        let size = builder.add_instruction(size_operation, Vec::new(), vec![input], None).unwrap()[0];
+        let sum = builder
+            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size], None)
+            .unwrap()[0];
+        let concatenated =
+            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum], None).unwrap()[0];
+        let reshaped = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![reshaped], Placeholder, Placeholder)
+            .unwrap();
+
+        // Every derived extent is visible in the rendered program: one `dimension_size` read plus explicit input
+        // edges into the shape-carrying operations. No shape is recovered from ambient or type-level metadata.
+        let [size_instruction, sum_instruction, concatenate_instruction, reshape_instruction] = program.instructions()
+        else {
+            panic!("expected a dimension read, dimension arithmetic, a concatenate, and a reshape");
+        };
+        assert_eq!(size_instruction.inputs(), &[input]);
+        assert_eq!(sum_instruction.inputs(), &[size, size]);
+        assert_eq!(concatenate_instruction.inputs(), &[input, input, sum]);
+        assert_eq!(reshape_instruction.inputs(), &[concatenated, sum, one]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows] .
+                let %1:dimension<1> = const 1
+                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
+                    %4:f32[rows + rows] = concatenate [axis=0, requires_runtime_assertion=true] %0 %0 %3
+                    %5:f32[rows + rows, 1] = reshape %4 %3 %1
+                in (%5)"},
+        );
+
+        // Drift gate: an instruction output may only *reference* a dimension identity that one of its own inputs
+        // carries. A rule that recovered geometry from stored metadata instead of an input edge would produce a
+        // output type naming an identity that reaches the instruction through no rendered edge.
+        let atoms = program.atoms();
+        for instruction in program.instructions() {
+            let mut input_identities = Vec::new();
+            for input in instruction.inputs() {
+                let r#type = atoms[input.index()].r#type();
+                input_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+            }
+            for output in instruction.outputs() {
+                let r#type = atoms[output.index()].r#type();
+                for (position, identity) in r#type.identities() {
+                    assert!(
+                        position != TypeIdentityPosition::Reference || input_identities.contains(identity),
+                        "instruction `{}` output type {} references identity {identity} that no input carries",
+                        instruction.operation().name(),
+                        r#type.as_ref(),
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_dimension_tracer_projection() {
