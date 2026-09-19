@@ -795,8 +795,6 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 /// Canonical operation name for [`UpdateSliceOperation`].
 pub const UPDATE_SLICE_OPERATION_NAME: &str = "update_slice";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`] that overwrites a contiguous sub-array of its first input with its second input at static start
 /// indices. Refer to the documentation of [`UpdateSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -812,8 +810,8 @@ impl UpdateSliceOperation {
         Self { start_indices }
     }
 
-    /// Returns the inclusive start indices at which this [`UpdateSliceOperation`] writes the update, one per input
-    /// axis.
+    /// Returns the inclusive start indices at which this [`UpdateSliceOperation`] writes the update,
+    /// one per input axis.
     #[inline]
     pub fn start_indices(&self) -> &[usize] {
         self.start_indices.as_slice()
@@ -886,11 +884,8 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        // Batching rule for [`UpdateSliceOperation`]: the input and update inputs are aligned on one physical batch
-        // axis
-        // (replicated inputs are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
-        // so each
-        // batch item updates its own block.
+        // The input and update inputs are aligned on one physical batch axis (replicated inputs are broadcast to gain
+        // it), and the lifted operation inserts start index `0` at that axis so each batch item updates its own block.
         // Static or clamped windows cannot describe a changed ragged extent.
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(ProgramError::UnsupportedOperation {
@@ -917,13 +912,13 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType> + Zero<C::Value>,
-        C::Operation: From<UpdateSliceOperation>,
         C::Value: UpdateSlice,
+        C::Operation: From<UpdateSliceOperation>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for [`UpdateSliceOperation`]: the operation is jointly linear in its input and update,
-            // so the tangent updates the input tangent with the update tangent at the same static start indices. A zero
-            // input and update tangent yields a typed zero output tangent.
+            // The operation is jointly linear in its input and update, so the tangent updates the input tangent with
+            // the update tangent at the same static start indices. A zero input and update tangent yields a typed zero
+            // output tangent.
             check_count!("input", inputs, 2, ProgramError);
             let input = &inputs[0];
             let update = &inputs[1];
@@ -948,24 +943,25 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose (vector-Jacobian product) for an [`UpdateSliceOperation`].
-            //
             // The forward map overwrites a block of the input with the update, so its pullback splits the output
-            // cotangent into two contributions: the input cotangent is the cotangent with the update window zeroed
-            // (`update_slice(cotangent, zeros(update_type), start_indices)`) and the update cotangent is the static
-            // slice of the cotangent at the update window (`slice(cotangent, start_indices, start_indices +
-            // update_shape)`). A structural-zero output cotangent contributes nothing: untouched accumulators default
-            // to structural zeros when the transposition context collects its cotangents.
+            // cotangent into two contributions: (1) the input cotangent is the cotangent with the update window zeroed
+            // (i.e., `update_slice(cotangent, zeros(update_type), start_indices)`), and (2) the update cotangent is the
+            // static slice of the cotangent at the update window (i.e., `slice(cotangent, start_indices, start_indices
+            // + update_shape)`). A structural-zero output cotangent contributes nothing as untouched accumulators
+            // default to structural zeros when the transposition context collects its cotangents.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
+
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 return Ok(());
             };
+
             if !accumulators[0].is_needed() && !accumulators[1].is_needed() {
                 return Ok(());
             }
-            // Both contributions need the update's static shape: the input cotangent zeroes a window of that shape
+
+            // Both contributions need the update's static shape as the input cotangent zeroes a window of that shape
             // and the update cotangent slices exactly that window.
             let update_type = inputs[1].r#type();
             let update_sizes = update_type
@@ -976,10 +972,11 @@ impl_differentiable_operation! {
                 .map(|(axis, size)| {
                     size.value().ok_or_else(|| TypeError::invalid(format!(
                         "`{UPDATE_SLICE_OPERATION_NAME}` transpose requires a static update shape \
-                         but axis {axis} has size {size}"
+                         but axis {axis} has size {size}",
                     )))
                 })
                 .collect::<Result<Vec<_>, TypeError>>()?;
+
             if accumulators[0].is_needed() {
                 let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(&**context)?;
                 let input_cotangents = context.stage_operation(
@@ -990,6 +987,7 @@ impl_differentiable_operation! {
                 check_count!("output", input_cotangents, 1, ProgramError);
                 accumulators[0].accumulate(context, MaybeZero::Value(input_cotangents.into_iter().next().unwrap()))?;
             }
+
             if accumulators[1].is_needed() {
                 let limit_indices = operation
                     .start_indices()
@@ -1007,22 +1005,25 @@ impl_differentiable_operation! {
                     update_cotangents.into_iter().next().unwrap().unalign_cotangent(&update_type.cotangent()?)?;
                 accumulators[1].accumulate(context, MaybeZero::Value(update_cotangent))?;
             }
+
             Ok(())
         }
     },
 }
 
-impl<C> MemberDifferentiableOperation<C> for UpdateSliceOperation
+impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for UpdateSliceOperation
 where
-    C: Context<Type = ArrayIrType>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<SliceOperation>
-        + From<UpdateSliceOperation>
-        + From<ZeroOperation<ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                           + From<SliceOperation>
+                           + From<UpdateSliceOperation>
+                           + From<ZeroOperation<ArrayType>>,
+        >,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1037,12 +1038,13 @@ where
             return jvp_projected_operation(context, &operation, inputs);
         }
 
-        // Only the update tangent is live. For an input of shape `[n]`, its zero tangent still needs the runtime `n`:
+        // Only the update tangent is live. For an input of shape `[n]`, its zero tangent still needs the runtime `n` as
         // the type alone cannot allocate it. Validate the primal first, then retain just its dynamic dimensions in a
         // linear call. The pullback extracts the updated window and does not need to retain the input's array data.
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let mut primals = context.primal().bind(operation, Vec::new(), &primal_inputs)?;
         check_count!("output", primals, 1, ProgramError);
+
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let tangent_context = context.tangent();
         let mut residuals = LinearResiduals::new();
@@ -1058,14 +1060,16 @@ where
                 size.value().ok_or_else(|| {
                     TypeError::invalid(format!(
                         "`{UPDATE_SLICE_OPERATION_NAME}` transpose requires a static update shape \
-                         but axis {axis} has size {size}"
+                         but axis {axis} has size {size}",
                     ))
                 })
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
+
         let limit_indices = self.start_indices.iter().zip(update_sizes).map(|(start, size)| start + size).collect();
         let transpose_operation = SliceOperation::new(self.start_indices.clone(), limit_indices);
         let forward_operation = self.clone();
+
         let tangent_type = input_type.tangent()?;
         let mut tangents = LinearCallOperation::stage(
             tangent_context,
@@ -1094,16 +1098,15 @@ where
                 )
             },
         )?;
+
         check_count!("output", tangents, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
     }
 }
 
-/// Represents the ability to overwrite a contiguous sub-array with an update value at static start indices. This is the
-/// statically indexed sibling of [`DynamicUpdateSlice`] and the transpose partner of [`Slice`]: writing a cotangent
-/// block into a zero array at the slice offsets is exactly an update-slice of a zero input. StableHLO has no statically
-/// indexed update operation, so backends lower this operation to
-/// [`dynamic_update_slice`](https://openxla.org/stablehlo/spec#dynamic_update_slice) with constant start indices.
+/// Represents the ability to overwrite a contiguous sub-array with an update value at static start indices. This is
+/// the statically indexed sibling of [`DynamicUpdateSlice`] and the transpose partner of [`Slice`]: writing a cotangent
+/// block into a zero array at the slice offsets is exactly an update-slice of a zero input.
 ///
 /// `input.update_slice(update, start_indices)` returns a value equal to `input` except that the block starting at
 /// `start_indices` is replaced by `update`. The update must have the same element data type and rank as the input,
@@ -1147,6 +1150,7 @@ pub trait UpdateSlice: Sized {
 impl UpdateSlice for ArrayType {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
         validate_update_compatibility(UPDATE_SLICE_OPERATION_NAME, self, update)?;
+
         let rank = self.rank();
         if start_indices.len() != rank {
             return Err(TypeError::invalid(format!(
@@ -1157,6 +1161,7 @@ impl UpdateSlice for ArrayType {
             ))
             .into());
         }
+
         for (axis, &start) in start_indices.iter().enumerate() {
             let update_dimension = update.dimension(axis);
             let Dimension::Static(update_size) = update_dimension else {
@@ -1166,11 +1171,13 @@ impl UpdateSlice for ArrayType {
                 ))
                 .into());
             };
+
             let limit = start.checked_add(update_size).ok_or_else(|| {
                 TypeError::invalid(format!(
-                    "`{UPDATE_SLICE_OPERATION_NAME}` update limit overflows `usize` on axis {axis}"
+                    "`{UPDATE_SLICE_OPERATION_NAME}` update limit overflows `usize` on axis {axis}",
                 ))
             })?;
+
             match self.dimension(axis) {
                 Dimension::Static(input_size) if limit > input_size => {
                     return Err(TypeError::invalid(format!(
@@ -1192,7 +1199,8 @@ impl UpdateSlice for ArrayType {
                 _ => {}
             }
         }
-        // The output is distributed like the input (the update is written in place); the input's placement
+
+        // The output is distributed like the input (the update is written in place). The input's placement
         // and reduction state carry through, with the update's varying-manual axes folded in.
         let sharding = update_slice_output_sharding(self, update, UPDATE_SLICE_OPERATION_NAME)?;
         self.clone().with_sharding(sharding).map_err(|error| {
@@ -1203,10 +1211,10 @@ impl UpdateSlice for ArrayType {
 
 impl UpdateSlice for Array {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        let output_type = self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
-        let output = self.clone().replace_block(update, start_indices);
         // Type inference preserves the input's shape, element type, memory, and physical layout; only sharding
         // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
+        let output_type = self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
+        let output = self.clone().replace_block(update, start_indices);
         Ok(Self::new_unchecked(output_type, output.shared_storage().clone()))
     }
 }
@@ -1219,13 +1227,11 @@ impl<A: UpdateSlice + Value<Type = ArrayType>> UpdateSlice for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<Type = ArrayType>> UpdateSlice for V
-where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>,
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>>
+    UpdateSlice for V
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        // Any context-carrying value updates a slice by binding an [`UpdateSliceOperation`] through its own context.
-        // The
+        // Any context-carrying value updates a slice by binding an `UpdateSliceOperation` through its own context. The
         // `From<UpdateSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
         // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
@@ -1238,6 +1244,8 @@ where
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`DynamicSliceOperation`].
 pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
