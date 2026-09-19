@@ -241,12 +241,40 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
+// Reverse-mode differentiation requires an allocation provider for every operation family, even when its types
+// cannot contain references. This lets scalar/array-only differentiation satisfy the generic bounds; it never
+// takes the reference-allocation path. Direct allocation requests are unsupported.
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<NoReferent, DataType>> for O {
+    type Operation = Self;
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
-//  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
-//  equality at bound sites whose tracing context is built from the bounded operation family (E0284); every
-//  implementation constrains its target to `Operation<Type = T>` instead.
+    fn provide(
+        _request: ReferenceNewOperation<NoReferent, DataType>,
+        input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("`{REFERENCE_NEW_OPERATION_NAME}` is not supported in a reference-free type universe"),
+        })
+    }
+}
+
+// Reverse-mode differentiation requires an allocation provider for every operation family, even when its types
+// cannot contain references. This lets scalar/array-only differentiation satisfy the generic bounds; it never
+// takes the reference-allocation path. Direct allocation requests are unsupported.
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<NoReferent, ArrayType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<NoReferent, ArrayType>,
+        input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("`{REFERENCE_NEW_OPERATION_NAME}` is not supported in a reference-free type universe"),
+        })
+    }
+}
+
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
     OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayType, ArrayIrType>> for O
 {
@@ -262,35 +290,7 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, Ar
     }
 }
 
-impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<NoReferent, ArrayType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<NoReferent, ArrayType>,
-        input_types: &[&ArrayType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("`{REFERENCE_NEW_OPERATION_NAME}` is not supported in a reference-free type universe"),
-        })
-    }
-}
-
-impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<NoReferent, DataType>> for O {
-    type Operation = Self;
-
-    fn provide(
-        _request: ReferenceNewOperation<NoReferent, DataType>,
-        input_types: &[&DataType],
-    ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("`{REFERENCE_NEW_OPERATION_NAME}` is not supported in a reference-free type universe"),
-        })
-    }
-}
-
-/// Creates a new reference initialized from this value.
+/// Capability for creating new references initialized from a value.
 pub trait ReferenceNew<Output = Self>: Sized {
     /// Creates an independent reference whose initial state is this value.
     fn reference_new(&self) -> Result<Output, ProgramError>;
@@ -298,18 +298,19 @@ pub trait ReferenceNew<Output = Self>: Sized {
 
 impl<A: Value<Type = ArrayType>> ReferenceNew for ArrayIrValue<A> {
     fn reference_new(&self) -> Result<Self, ProgramError> {
-        ReferenceNewOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        let operation = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let value = <Self as ValueProjection<ArrayType>>::projected(self)?.clone();
         Ok(Self::Reference(ArrayReference::new(value)))
     }
 }
 
-impl<V> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
+        > + ValueProjection<ReferenceType<ArrayType>>,
+> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
 {
     fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
         self.value()
@@ -321,10 +322,12 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<Type = ArrayIrType, Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>>,
+        >,
+> ReferenceNew<V> for V
 {
     fn reference_new(&self) -> Result<V, ProgramError> {
         Ok(self
@@ -365,7 +368,7 @@ mod tests {
 
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
-    type TestIrNew = ReferenceNewOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceNewOperation = ReferenceNewOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_new() {
@@ -443,7 +446,7 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::F32);
         let dimension_type = DimensionType::new("n", DimensionBounds::unbounded());
         check_operation_type_inference!(
-            operation = TestIrNew::new(),
+            operation = TestIrReferenceNewOperation::new(),
             cases = [
                 {
                     input_types = [ArrayIrType::Array(array_type.clone())],
@@ -468,7 +471,7 @@ mod tests {
 
         // Allocation yields a live reference whose type and initial state come from the initializer.
         let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrNew::new(),
+            &TestIrReferenceNewOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&initial),
@@ -493,7 +496,7 @@ mod tests {
         let mismatch: ProgramError = TypeError::invalid("expected array type but got reference type").into();
         assert_eq!(
             InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-                &TestIrNew::new(),
+                &TestIrReferenceNewOperation::new(),
                 &context,
                 &EmptyRegionDriver,
                 std::slice::from_ref(&other),
@@ -512,7 +515,7 @@ mod tests {
         let dynamic =
             TestIrValue::Array(Array::with_unchecked_type(dynamic_type.clone(), 1.0_f32.to_le_bytes().to_vec()));
         let outputs = InterpretableOperation::<EagerContext<TestIrValue, TestIrOperation>>::interpret(
-            &TestIrNew::new(),
+            &TestIrReferenceNewOperation::new(),
             &context,
             &EmptyRegionDriver,
             std::slice::from_ref(&dynamic),
@@ -532,7 +535,11 @@ mod tests {
         // is a live reference holding the initial value.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let outputs = executing
-            .fold_or_residualize(TestIrNew::new(), Vec::new(), &[PartialEvaluationValue::known(initial.clone())])
+            .fold_or_residualize(
+                TestIrReferenceNewOperation::new(),
+                Vec::new(),
+                &[PartialEvaluationValue::known(initial.clone())],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         let reference = outputs[0].as_known().unwrap();
@@ -543,7 +550,8 @@ mod tests {
         // only when the residual program replays against the runtime initial value.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let unknown = executing.unknown_input(scalar_type.clone(), 0);
-        let outputs = executing.fold_or_residualize(TestIrNew::new(), Vec::new(), &[unknown]).unwrap();
+        let outputs =
+            executing.fold_or_residualize(TestIrReferenceNewOperation::new(), Vec::new(), &[unknown]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
         let evaluation = executing.into_evaluation(outputs).unwrap();
@@ -565,13 +573,18 @@ mod tests {
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
         let outputs = staging
-            .fold_or_residualize(TestIrNew::new(), Vec::new(), &[PartialEvaluationValue::known(initial.clone())])
+            .fold_or_residualize(
+                TestIrReferenceNewOperation::new(),
+                Vec::new(),
+                &[PartialEvaluationValue::known(initial.clone())],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let input = builder.add_input(scalar_type);
-        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let reference =
+            builder.add_instruction(TestIrReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -673,7 +686,9 @@ mod tests {
         // accumulator exactly once.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar_type.clone());
-        let reference = builder.add_instruction(TestIrNew::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let reference = builder
+            .add_instruction(TestIrReferenceNewOperation::new(), Vec::new(), vec![initial], None)
+            .unwrap()[0];
         let output = builder
             .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -701,7 +716,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar_type.clone());
         let value = builder.add_input(scalar_type.clone());
-        builder.add_instruction(TestIrNew::new(), Vec::new(), vec![initial], None).unwrap();
+        builder
+            .add_instruction(TestIrReferenceNewOperation::new(), Vec::new(), vec![initial], None)
+            .unwrap();
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -727,7 +744,7 @@ mod tests {
         let mut context = TranspositionContext::new(TracingContext::<TestIrValue, TestIrOperation>::new());
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrNew::new().transpose(
+            TestIrReferenceNewOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -736,7 +753,7 @@ mod tests {
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "output 0 has no reference allocation in a transposition context that is not scoped to \
-                    a reference-carrying instruction",
+                               a reference-carrying instruction",
         ));
     }
 
