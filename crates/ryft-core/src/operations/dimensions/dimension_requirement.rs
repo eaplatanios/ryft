@@ -20,6 +20,12 @@ use crate::programs::{
 /// Canonical operation name for [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIREMENT_OPERATION_NAME: &str = "dimension_requirement";
 
+// TODO(eaplatanios): Is this list of predicates sufficient? Is there reason to expect that we might need a more
+//  expressive language and include support for things like conjunctions and disjunctions? Or to put this differently,
+//  should we consider introducing a general purpose `AssertOperation` and make this just an assertion over a Boolean
+//  expression computed from standard SSA values? I can't quite tell why dimension values specifically need special
+//  treatment like what is happening here. And if we do go with such a general purpose `AssertOperation`, should we
+//  put it in `ryft_core::operations::debugging`?
 /// Requirement predicate selected by [`DimensionRequirementOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DimensionRequirementPredicate {
@@ -32,7 +38,7 @@ pub enum DimensionRequirementPredicate {
     /// Requires a positive `divisor` that divides `dividend` exactly.
     DivisibleBy,
 
-    /// Requires one input to lie within the provided bounds.
+    /// Requires the input to lie within the provided bounds.
     Bounds(DimensionBounds),
 }
 

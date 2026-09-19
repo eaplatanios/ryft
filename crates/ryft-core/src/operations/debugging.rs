@@ -1,7 +1,10 @@
+//! Debugging operations that print values while preserving their data flow.
+
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::ArrayType;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -12,14 +15,13 @@ use crate::programs::{
     Value,
 };
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`PrintOperation`].
 pub const PRINT_OPERATION_NAME: &str = "print";
 
-/// [`Operation`] that returns its input unchanged while printing it to standard error with a label — the analogue of
-/// [`jax.debug.print`](https://docs.jax.dev/en/latest/debugging/print_breakpoint.html). Refer to the documentation of
-/// [`Print`] for more information.
+// TODO(eaplatanios): Review from here onwards.
+
+/// [`Operation`] that returns its input unchanged while printing it to standard error with a label.
+/// Refer to the documentation of [`Print`] for more information.
 ///
 /// By default, [`Operation::effects`] reports [`EffectClass::OrderedIo`], so program transforms never eliminate it as
 /// dead code (even when nothing consumes its output) and preserve its execution order relative to other ordered-I/O
@@ -27,13 +29,14 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// contract instead: [`EffectClass::DeviceOrderedIo`] keeps program order only among the ordered I/O executing on
 /// the same device, which allows the print to run once per device inside `shard_map` bodies, and
 /// [`EffectClass::UnorderedIo`] retains the print without ordering it relative to other I/O. Partial evaluation
-/// places it by input known-ness like any other operation — an all-known print folds into the known side (printing
-/// at partial-evaluation time under an eager known-side context, which is also what makes linearization print during
-/// the forward pass), while a mixed-input print residualizes. Differentiation passes the tangent through unchanged
-/// while re-printing the primal value, and transposition is the identity on the cotangent (adjoints are not printed).
+/// places it on the known side when its input is known (printing at partial-evaluation time under an eager known-side
+/// context, which also makes linearization print during the forward pass), and residualizes it otherwise.
+/// Differentiation passes the tangent through unchanged while printing the primal value. The primitive transposition
+/// rule passes the cotangent through without printing it; whole-program transposition rejects effectful linear
+/// instructions, so reverse differentiation transposes the print-free tangent program.
 ///
 /// Eager interpretation prints directly. The XLA backend lowers this operation to a StableHLO host-callback custom
-/// call (`@ryft.print`) threaded on a token chain that preserves ordered-I/O execution order within one dispatch,
+/// call (`@ryft.print`), using a token chain for ordered I/O to preserve execution order within one dispatch,
 /// including through `while`/`if` regions; refer to `ryft-xla`'s `experimental::debugging` module for the calling
 /// convention and the capturable output sink.
 ///
@@ -41,13 +44,13 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// [`Operation`] contract.
 #[derive(Clone, Debug)]
 pub struct PrintOperation<T: Type> {
-    /// Label printed before the value.
+    /// Refer to the documentation of [`label`](Self::label) for more information.
     label: String,
 
-    /// Observable I/O effect class of this print.
+    /// Refer to the documentation of [`effect_class`](Self::effect_class) for more information.
     effect_class: EffectClass,
 
-    /// Type universe in which this operation is valid.
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
 
@@ -58,7 +61,16 @@ impl<T: Type> PrintOperation<T> {
         Self { label: label.into(), effect_class: EffectClass::OrderedIo, marker: PhantomData }
     }
 
-    /// Returns the label carried by this [`PrintOperation`].
+    /// Returns a copy of this [`PrintOperation`] with its effect class set to the provided `effect_class`.
+    /// Use [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] to select
+    /// the I/O ordering contract described in the type documentation.
+    #[inline]
+    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
+        self.effect_class = effect_class;
+        self
+    }
+
+    /// Returns the label printed before the input value, separated from it by `: `.
     #[inline]
     pub fn label(&self) -> &str {
         self.label.as_str()
@@ -68,15 +80,6 @@ impl<T: Type> PrintOperation<T> {
     #[inline]
     pub fn effect_class(&self) -> EffectClass {
         self.effect_class
-    }
-
-    /// Returns this print declaring the provided I/O effect class, replacing the default [`EffectClass::OrderedIo`].
-    /// Every class keeps the print observable; they differ only in ordering scope, as described in the type
-    /// documentation.
-    #[inline]
-    pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
-        self.effect_class = effect_class;
-        self
     }
 }
 
@@ -120,33 +123,32 @@ impl<T: Type> Operation for PrintOperation<T> {
     }
 }
 
-impl ElementwiseOperation for PrintOperation<crate::arrays::ArrayType> {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
-impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
-    fn interpret<D: InterpretationDriver<C>>(
+impl<D: Domain> InterpretableOperation<D> for PrintOperation<D::Type> {
+    fn interpret<I: InterpretationDriver<D>>(
         &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
+        _context: &D,
+        _driver: &I,
+        inputs: &[D::Value],
+    ) -> Result<Vec<D::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         eprintln!("{}: {}", self.label, inputs[0]);
         Ok(vec![inputs[0].clone()])
     }
 }
 
-// Partial evaluation defers to the default behavior of
-// [`Program::partially_evaluate`](crate::Program::partially_evaluate): the print folds into the known side when its
-// input is known and residualizes otherwise, with dead-code elimination keeping residual prints alive because
-// [`Operation::effects`] is not pure.
+// Partial evaluation uses the default behavior of `Program::partially_evaluate`: the print folds into the known
+// side when its input is known and residualizes otherwise. Dead-code elimination keeps residual prints alive
+// because the operation declares an observable effect.
 impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
     C::Operation: From<PrintOperation<C::Type>>
 {
+}
+
+impl ElementwiseOperation for PrintOperation<ArrayType> {
+    #[inline]
+    fn input_count(&self) -> usize {
+        1
+    }
 }
 
 impl_differentiable_elementwise_operation! {
@@ -173,10 +175,9 @@ pub trait Print: Sized {
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self;
 }
 
-// Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
+// Any context-carrying value prints by binding a `PrintOperation` through its own context. The
 // `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context operation is
-// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers
-// without conflicting with concrete implementations.
+// `ConstantOperation`), so it covers the transform tracers without conflicting with concrete implementations.
 impl<V: Value> Print for V
 where
     V::DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>,
@@ -192,36 +193,36 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
-    use crate::contexts::EagerContext;
-    use crate::differentiation::differentiate_at;
-    use crate::programs::EmptyRegionDriver;
-    use crate::tracing::{DomainTracer, Trace};
+    use crate::arrays::{Array, ArrayOperation, DataType};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_type_inference,
+    };
+    use crate::partial::PartialValue;
+    use crate::programs::{EmptyRegionDriver, MaybeZero};
+    use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
 
-    /// Computes `f(x) = x * x` while printing `x` and discarding the printed value, so the staged `print` is dead
-    /// code that only its effect keeps alive.
-    fn print_square<V: Clone + Print + std::ops::Mul<Output = V>>(x: V) -> V {
-        let _printed = x.clone().print("x");
-        x.clone() * x
-    }
-
     #[test]
     fn test_print() {
-        let operation = PrintOperation::new("x");
-        let scalar_type = ArrayType::scalar(DataType::F64);
+        let operation = PrintOperation::<ArrayType>::new("x");
 
         assert_eq!(operation.label(), "x");
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
-        assert_eq!(Operation::infer_output_types(&operation, &[scalar_type.clone()], &[]), Ok(vec![scalar_type]));
+        assert_eq!(operation.name(), PRINT_OPERATION_NAME);
+        assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
+        assert_eq!(operation.input_count(), 1);
         assert_eq!(operation.to_string(), "print [label=x]");
     }
 
     #[test]
-    fn test_print_operation_with_effect_class() {
+    fn test_print_with_effect_class() {
         let operation = PrintOperation::<ArrayType>::new("x");
         assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
         for effect_class in [EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo] {
@@ -236,65 +237,111 @@ mod tests {
     }
 
     #[test]
-    fn test_print_with_effect_class() {
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                let _printed = x.clone().print_with_effect_class("x", EffectClass::UnorderedIo);
-                Ok(x.clone() * x)
-            },
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
-        let program = program.to_flat_program();
-        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-        // An unused unordered print survives the primal partition, retaining its class through differentiation.
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
+    fn test_print_type_inference() {
+        check_operation_type_inference!(
+            operation = PrintOperation::<ArrayType>::new("x"),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F64)],
+                output_types = [ArrayType::scalar(DataType::F64)],
+            }, {
+                input_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+                output_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+            }, {
+                input_types = [],
+                error = "expected 1 input but got 0",
+            }, {
+                input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+                error = "expected 1 input but got 2",
+            }],
+        );
     }
 
     #[test]
     fn test_print_interpretation() {
         let context = EagerContext::<Array>::new();
         let input = Array::scalar(3.0).unwrap();
-        let outputs =
-            PrintOperation::new("x").interpret(&context.clone(), &EmptyRegionDriver, &[input.clone()]).unwrap();
-        assert_eq!(outputs, vec![input]);
+        let operation = PrintOperation::new("x");
+        // Standard error capture is not available here; verify the returned value and input validation.
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), input]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
+        );
     }
 
     #[test]
-    fn test_print_stages_through_the_tracer_capability() {
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.print("x")),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
-        let program = program.to_flat_program();
-        assert_eq!(program.instructions().len(), 1);
-        assert!(matches!(
-            program.instructions()[0].operation(),
-            ArrayOperation::Print(operation) if operation.label() == "x",
-        ));
-        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+    fn test_print_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = PrintOperation::new("x"),
+            inputs = [Array::scalar(3.0).unwrap()],
+            expected = Array::scalar(3.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_print_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = PrintOperation::new("x"),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
+            }],
+        );
     }
 
     #[test]
     fn test_print_differentiation() {
-        // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
-        // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
-        // the gradient) exercises the effect keep-alive of the partition projections.
-        let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap()).value_and_gradient(print_square).unwrap();
-        assert_eq!(value.to_f64s()[0], 9.0);
-        assert_eq!(gradient.to_f64s()[0], 6.0);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = PrintOperation::new("x"),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(2.0).unwrap()],
+                tangent_outputs = [Array::scalar(3.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = print [label=x] %0
+                    in (%2, %1)
+                "},
+            }],
+        );
     }
 
     #[test]
-    fn test_dead_prints_survive_linearization_on_the_primal_side() {
-        // Linearizing `print_square` partitions its jvp program into primal and tangent stages: the dead print rides
+    fn test_print_differentiation_unused_output() {
+        // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
+        // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
+        // the gradient) exercises the effect keep-alive of the partition projections.
+        let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap())
+            .value_and_gradient(|input| {
+                input.clone().print("x");
+                input.clone() * input
+            })
+            .unwrap();
+        assert_eq!(value, Array::scalar(9.0).unwrap());
+        assert_eq!(gradient, Array::scalar(6.0).unwrap());
+    }
+
+    #[test]
+    fn test_print_differentiation_preserves_primal_effects() {
+        // Linearizing the computation partitions its JVP program into primal and tangent stages: the dead print rides
         // the primal (known) stage through the partition projections' effect keep-alive, and the tangent stage stays
         // print-free because the JVP rule keeps the effect on the primal side.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(print_square(x)),
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input.clone().print("x");
+                Ok(input.clone() * input)
+            },
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -313,5 +360,66 @@ mod tests {
             .count();
         assert_eq!(primal_prints, 1);
         assert_eq!(tangent_prints, 0);
+    }
+
+    #[test]
+    fn test_print_transposition() {
+        // Whole-program transposition rejects observable effects before calling the primitive rule.
+        // Check directly that this rule passes the cotangent through without staging another print.
+        let tracing = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let cotangent = tracing.input(ArrayType::scalar(DataType::F64));
+        let mut context = TranspositionContext::new(tracing);
+        let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::F64))];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert_eq!(
+            PrintOperation::new("x").transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent.clone())],
+                &accumulators,
+            ),
+            Ok(()),
+        );
+        let outputs = context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], MaybeZero::Value(output) if output.atom_id() == cotangent.atom_id()));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_print_for_tracer() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x] %0
+                in (%1)"},
+        );
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+    }
+
+    #[test]
+    fn test_print_for_tracer_with_effect_class() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input.clone().print_with_effect_class("x", EffectClass::UnorderedIo);
+                Ok(input.clone() * input)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        // An unused unordered print survives the primal partition, retaining its class through differentiation.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
+        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
     }
 }
