@@ -1,7 +1,3 @@
-//! Generic read-write reference replacement operation and its value-level capability.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -27,7 +23,9 @@ use crate::programs::{
     RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 
-use super::{align_stored_batch, stored_tangents, validate_operand_types};
+// TODO(eaplatanios): Review from here onwards.
+
+use super::{align_stored_batch, stored_tangents, validate_input_types};
 
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
@@ -43,6 +41,13 @@ impl<T: Type, U: Type> ReferenceSwapOperation<T, U> {
     }
 }
 
+impl<T: Type, U: Type> Default for ReferenceSwapOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Type, U: Type> Copy for ReferenceSwapOperation<T, U> {}
 
 impl<T: Type, U: Type> Display for ReferenceSwapOperation<T, U> {
@@ -52,10 +57,8 @@ impl<T: Type, U: Type> Display for ReferenceSwapOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceSwapOperation<T, U>
+impl<T: Type, U: Type + From<T>> Operation for ReferenceSwapOperation<T, U>
 where
-    T: Type,
-    U: Type + From<T>,
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
 {
@@ -100,13 +103,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceSwapOperation<T, U>
-where
+impl<
     T: Type,
-    U: From<T> + From<ReferenceType<T>> + Type,
-    ReferenceSwapOperation<T, U>: Operation<Type = U>,
+    U: Type + From<T> + From<ReferenceType<T>>,
     C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>,
     P: ReferenceDischargePolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceSwapOperation<T, U>
+where
+    ReferenceSwapOperation<T, U>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -120,18 +124,16 @@ where
 
         // The replacement must carry exactly the handle's referent. A universe whose write mechanics only require the
         // replacement to fit inside the selected coordinates would otherwise perform a silent partial write, so the
-        // rule re-derives the operand relationship its own inference already states.
-        validate_operand_types(self, inputs)?;
+        // rule re-derives the input relationship its own inference already states.
+        validate_input_types(self, inputs)?;
         Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceSwapOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceSwap<C::Value>>> InterpretableOperation<C>
+    for ReferenceSwapOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceSwap<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -144,32 +146,24 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceSwapOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceSwapOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceSwapOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceSwapOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // The replacement is aligned with the reference's fixed batch axis before the packed swap, and the previous packed
-    // value is batched at that same axis.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // The replacement is aligned with the reference's fixed batch axis before the packed swap, and the previous
+        // packed value is batched at that same axis.
         check_count!("input", inputs, 2, ProgramError);
         let replacement =
             align_stored_batch(context, driver, REFERENCE_SWAP_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
@@ -188,9 +182,9 @@ impl_differentiable_operation! {
         T: Type,
         U: DifferentiableType,
         C: Context<
-                Type = U,
-                Operation: From<ReferenceSwapOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
-            > + Zero<C::Value>,
+            Type = U,
+            Operation: From<ReferenceSwapOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
             // The tangent reference is swapped exactly as the primal reference is, so the returned previous value pairs
@@ -265,7 +259,7 @@ impl_differentiable_operation! {
     },
 }
 
-/// Replaces the value stored by a reference in program order and returns its previous immutable snapshot.
+/// Capability to replace the value stored by a reference in program order and return its previous immutable snapshot.
 pub trait ReferenceSwap<Replacement = Self, Output = Replacement>: Sized {
     /// Replaces the stored value in program order and returns the previously stored value.
     fn swap(&self, replacement: &Replacement) -> Result<Output, ProgramError>;
@@ -273,20 +267,42 @@ pub trait ReferenceSwap<Replacement = Self, Output = Replacement>: Sized {
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceSwap for ArrayIrValue<A> {
     fn swap(&self, replacement: &Self) -> Result<Self, ProgramError> {
-        ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()
-            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
+        let operation = ReferenceSwapOperation::<ArrayType, ArrayIrType>::new();
+        operation.infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
         Ok(Self::Array(reference.swap(replacement)?))
     }
 }
 
-impl<V> ReferenceSwap<ProjectedValue<ArrayType, V>, <V as ValueProjection<ArrayType>>::Projected>
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
+            >,
+        >,
+> ReferenceSwap<V, V> for V
+{
+    fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceSwapOperation::new(), Vec::new(), &[self.clone(), replacement.clone()])?
+            .remove(0))
+    }
+}
+
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
+            >,
+        > + ValueProjection<ArrayType>,
+> ReferenceSwap<ProjectedValue<ArrayType, V>, <V as ValueProjection<ArrayType>>::Projected>
     for ProjectedValue<ReferenceType<ArrayType>, V>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
 {
     fn swap(
         &self,
@@ -298,19 +314,6 @@ where
             .remove(0)
             .into_projected()
             .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceSwap<V, V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
-{
-    fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ReferenceSwapOperation::new(), Vec::new(), &[self.clone(), replacement.clone()])?
-            .remove(0))
     }
 }
 
@@ -344,20 +347,20 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
-    type TestIrSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceSwapOperation = ReferenceSwapOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_reference_swap() {
         let operation = Swap::new();
+        assert_eq!(Swap::default().to_string(), operation.to_string());
         assert_eq!(operation.name(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(operation.to_string(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            "ReferenceSwapOperation(PhantomData<fn() -> (ryft_core::operations::references::tests::TestReferent, \
-             ryft_core::operations::references::tests::TestType)>)",
+            format!("ReferenceSwapOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
         );
 
-        // A swap orders against other state effects, reads and writes its reference operand, and aliases nothing.
+        // A swap orders against other state effects, reads and writes its reference input, and aliases nothing.
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),
@@ -414,7 +417,7 @@ mod tests {
 
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
         check_operation_type_inference!(
-            operation = TestIrSwap::new(),
+            operation = TestIrReferenceSwapOperation::new(),
             cases = [
                 {
                     input_types = [
@@ -454,7 +457,7 @@ mod tests {
         // A replacement carrying exactly the referent type replaces the stored value and returns the previous value.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrSwap::new(),
+                &TestIrReferenceSwapOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap())],
@@ -463,10 +466,10 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
 
-        // Exact operand inference runs before the swap, so a rejected replacement leaves the stored value unchanged.
+        // Exact input inference runs before the swap, so a rejected replacement leaves the stored value unchanged.
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrSwap::new(),
+                &TestIrReferenceSwapOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0, 7.0]).unwrap())],
@@ -478,11 +481,11 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
 
-        // Each operand must be the member kind the operation expects.
+        // Each input must be the member kind the operation expects.
         let array = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]).unwrap());
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrSwap::new(),
+                &TestIrReferenceSwapOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[array.clone(), array],
@@ -491,7 +494,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<TestIrContext>::interpret(
-                &TestIrSwap::new(),
+                &TestIrReferenceSwapOperation::new(),
                 &TestIrContext::new(),
                 &EmptyRegionDriver,
                 &[reference.clone(), reference],
@@ -513,7 +516,7 @@ mod tests {
         let live = ArrayReference::new(Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone()));
         let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
         let mut outputs = InterpretableOperation::<TestIrContext>::interpret(
-            &TestIrSwap::new(),
+            &TestIrReferenceSwapOperation::new(),
             &TestIrContext::new(),
             &EmptyRegionDriver,
             &[TestIrValue::Reference(live.clone()), TestIrValue::Array(replacement)],
@@ -530,13 +533,13 @@ mod tests {
 
     #[test]
     fn test_reference_swap_partial_evaluation() {
-        // Program replay uses the `Stage` placement: a swap stages regardless of operand knowledge, its previous value
+        // Program replay uses the `Stage` placement: a swap stages regardless of input knowledge, its previous value
         // is an unknown of the residual program, the live handle is passed to that program as a known reference input,
         // and the swap runs only when that program runs.
         let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         check_operation_partial_evaluation!(
             backend = (TestIrValue, TestIrOperation),
-            operation = TestIrSwap::new(),
+            operation = TestIrReferenceSwapOperation::new(),
             cases = [
                 {
                     inputs = [
@@ -561,14 +564,18 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
 
-        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every operand
+        // Under the `Stage` placement the live state is untouched at partial evaluation time even when every input
         // is known.
         let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
         let replacement = PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(4.0_f32).unwrap()));
         let staging =
             PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
         let swapped = staging
-            .fold_or_residualize(TestIrSwap::new(), Vec::new(), &[reference.clone(), replacement.clone()])
+            .fold_or_residualize(
+                TestIrReferenceSwapOperation::new(),
+                Vec::new(),
+                &[reference.clone(), replacement.clone()],
+            )
             .unwrap();
         assert_eq!(swapped.len(), 1);
         assert!(swapped[0].is_unknown());
@@ -577,7 +584,9 @@ mod tests {
         // Under the default `Execute` placement an all-known swap folds: it runs against the live state in program
         // order at partial evaluation time and its previous value is known.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let swapped = executing.fold_or_residualize(TestIrSwap::new(), Vec::new(), &[reference, replacement]).unwrap();
+        let swapped = executing
+            .fold_or_residualize(TestIrReferenceSwapOperation::new(), Vec::new(), &[reference, replacement])
+            .unwrap();
         assert_eq!(swapped.len(), 1);
         assert_eq!(swapped[0].as_known(), Some(&TestIrValue::Array(Array::scalar(3.0_f32).unwrap())));
         assert_eq!(live.read(), Ok(Array::scalar(4.0_f32).unwrap()));
@@ -707,7 +716,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // The swap transposes through the cotangent accumulator of its reference operand, which only a transposition
+        // The swap transposes through the cotangent accumulator of its reference input, which only a transposition
         // context scoped to the instruction being transposed can resolve, so a detached context rejects it.
         let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(scalar_type.clone())];
         let tracing = TracingContext::<TestIrValue, TestIrOperation>::new();
@@ -715,7 +724,7 @@ mod tests {
         let mut context = TranspositionContext::new(tracing);
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            TestIrSwap::new().transpose(
+            TestIrReferenceSwapOperation::new().transpose(
                 &mut context,
                 &EmptyRegionDriver,
                 &inputs,
@@ -724,7 +733,7 @@ mod tests {
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "input 0 has no reference root in a transposition context that is not scoped to a \
-                    reference-carrying instruction",
+                               reference-carrying instruction",
         ));
 
         // `r = new(v); y = swap(r, x); z = freeze(r)`: the freeze lands `z̄` in the allocation's accumulator, the swap
@@ -772,7 +781,7 @@ mod tests {
             ]),
         );
 
-        // A dead swap result whose accumulator a later freeze allocated instantiates its zero cotangent, because the
+        // A dead swap output whose accumulator a later freeze allocated instantiates its zero cotangent, because the
         // accumulator must observe the swap: `x̄ = z̄` and `v̄ = 0`.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar_type.clone());
@@ -810,7 +819,7 @@ mod tests {
             ]),
         );
 
-        // A dead swap result with an accumulator that nothing reached stages nothing and leaves both cotangents
+        // A dead swap output with an accumulator that nothing reached stages nothing and leaves both cotangents
         // symbolic zeros.
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let initial = builder.add_input(scalar_type.clone());
@@ -909,7 +918,7 @@ mod tests {
     #[test]
     fn test_reference_swap_staging() {
         // A traced reference stages the swap as the native variant of its operation family, with the previous value
-        // as its result and the ordered-state effect of the program.
+        // as its output and the ordered-state effect of the program.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let (output_types, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
             |inputs| {

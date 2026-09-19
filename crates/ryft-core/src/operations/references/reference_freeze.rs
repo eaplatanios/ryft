@@ -26,8 +26,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::forwarded_tangent;
-
 /// Canonical operation name for [`ReferenceFreezeOperation`].
 pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
 
@@ -181,9 +179,13 @@ where
         // replays an already-built application over borrowed duals, and a clone names the same allocation).
         check_count!("input", inputs, 1, ProgramError);
         let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
-            Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
-        })?])
+        Ok(vec![match inputs[0].tangent() {
+            MaybeZero::Value(reference) => {
+                let tangent = context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0);
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal)?,
+        }])
     }
 }
 
