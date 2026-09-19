@@ -1031,25 +1031,25 @@ mod tests {
             std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[2] .
-                let %2:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; ryft::differentiation::associative_scan
-                    %3:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %1 ; ryft::differentiation::associative_scan
-                    %4:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; ryft::differentiation::associative_scan
-                    %5:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %1 ; ryft::differentiation::associative_scan
-                    %6:f64[1] = mul %2 %4 ; ryft::differentiation::associative_scan
-                    %7:f64[1] = mul %4 %3 ; ryft::differentiation::associative_scan
-                    %8:f64[1] = mul %2 %5 ; ryft::differentiation::associative_scan
-                    %9:f64[1] = add %7 %8 ; ryft::differentiation::associative_scan
-                    %10:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; ryft::differentiation::associative_scan
-                    %11:f64[1] = slice [start_indices=[0], limit_indices=[1]] %1 ; ryft::differentiation::associative_scan
-                    %12:f64[] = zero [type=f64[]] ; ryft::differentiation::associative_scan
-                    %13:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %10 %12 ; ryft::differentiation::associative_scan
-                    %14:f64[] = zero [type=f64[]] ; ryft::differentiation::associative_scan
-                    %15:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %11 %14 ; ryft::differentiation::associative_scan
-                    %16:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %12 ; ryft::differentiation::associative_scan
-                    %17:f64[] = zero [type=f64[]] ; ryft::differentiation::associative_scan
-                    %18:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %9 %17 ; ryft::differentiation::associative_scan
-                    %19:f64[2] = add %13 %16 ; ryft::differentiation::associative_scan
-                    %20:f64[2] = add %15 %18 ; ryft::differentiation::associative_scan
+                let %2:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %3:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %1 ; provenance=ryft::differentiation::associative_scan
+                    %4:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %5:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %1 ; provenance=ryft::differentiation::associative_scan
+                    %6:f64[1] = mul %2 %4 ; provenance=ryft::differentiation::associative_scan
+                    %7:f64[1] = mul %4 %3 ; provenance=ryft::differentiation::associative_scan
+                    %8:f64[1] = mul %2 %5 ; provenance=ryft::differentiation::associative_scan
+                    %9:f64[1] = add %7 %8 ; provenance=ryft::differentiation::associative_scan
+                    %10:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %11:f64[1] = slice [start_indices=[0], limit_indices=[1]] %1 ; provenance=ryft::differentiation::associative_scan
+                    %12:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::associative_scan
+                    %13:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %10 %12 ; provenance=ryft::differentiation::associative_scan
+                    %14:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::associative_scan
+                    %15:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %11 %14 ; provenance=ryft::differentiation::associative_scan
+                    %16:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %12 ; provenance=ryft::differentiation::associative_scan
+                    %17:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::associative_scan
+                    %18:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %9 %17 ; provenance=ryft::differentiation::associative_scan
+                    %19:f64[2] = add %13 %16 ; provenance=ryft::differentiation::associative_scan
+                    %20:f64[2] = add %15 %18 ; provenance=ryft::differentiation::associative_scan
                 in (%19, %20)
             "}
             .trim_end(),

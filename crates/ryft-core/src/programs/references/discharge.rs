@@ -9981,8 +9981,8 @@ mod tests {
             preserved.program().render(formatter, 0, ProgramRenderingMode::WithProvenance)
         })
         .to_string();
-        assert!(rendered.contains("; probe_write"), "write provenance lost:\n{rendered}");
-        assert!(rendered.contains("; probe_read"), "read provenance lost:\n{rendered}");
+        assert!(rendered.contains("; provenance=probe_write"), "write provenance lost:\n{rendered}");
+        assert!(rendered.contains("; provenance=probe_read"), "read provenance lost:\n{rendered}");
     }
 
     #[test]

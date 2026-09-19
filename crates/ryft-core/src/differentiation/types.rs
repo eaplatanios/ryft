@@ -1272,13 +1272,13 @@ mod tests {
             indoc! {"
                 lambda %0:f32[] .
                 let %1:f32[] = mul %0 %0
-                    %2:u64[6, 6] = iota [type=u64[6, 6], dimension=0] ; ryft::differentiation::coordinate_basis
-                    %3:u64[6, 6] = iota [type=u64[6, 6], dimension=1] ; ryft::differentiation::coordinate_basis
-                    %4:bool[6, 6] = compare [direction=Equal] %2 %3 ; ryft::differentiation::coordinate_basis
-                    %5:f32[6, 6] = zero [type=f32[6, 6]] ; ryft::differentiation::coordinate_basis
-                    %6:f32[6, 6] = one [type=f32[6, 6]] ; ryft::differentiation::coordinate_basis
-                    %7:f32[6, 6] = select %4 %6 %5 ; ryft::differentiation::coordinate_basis
-                    %8:f32[6, 2, 3] = reshape [shape=[6, 2, 3]] %7 ; ryft::differentiation::coordinate_basis
+                    %2:u64[6, 6] = iota [type=u64[6, 6], dimension=0] ; provenance=ryft::differentiation::coordinate_basis
+                    %3:u64[6, 6] = iota [type=u64[6, 6], dimension=1] ; provenance=ryft::differentiation::coordinate_basis
+                    %4:bool[6, 6] = compare [direction=Equal] %2 %3 ; provenance=ryft::differentiation::coordinate_basis
+                    %5:f32[6, 6] = zero [type=f32[6, 6]] ; provenance=ryft::differentiation::coordinate_basis
+                    %6:f32[6, 6] = one [type=f32[6, 6]] ; provenance=ryft::differentiation::coordinate_basis
+                    %7:f32[6, 6] = select %4 %6 %5 ; provenance=ryft::differentiation::coordinate_basis
+                    %8:f32[6, 2, 3] = reshape [shape=[6, 2, 3]] %7 ; provenance=ryft::differentiation::coordinate_basis
                 in (%1, %8)
             "}
             .trim_end(),

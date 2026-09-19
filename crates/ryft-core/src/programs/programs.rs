@@ -18,19 +18,28 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// Mode selecting what a [`Program`] rendering includes. The semantic rendering is the canonical structural fingerprint
-/// and must never change because of diagnostic annotations, so provenance output is a separate, explicitly requested
-/// mode rather than a boolean flag on the semantic renderer.
+/// and must never change because of diagnostic annotations, so effect and provenance annotations are explicitly
+/// requested through separate rendering modes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProgramRenderingMode {
     /// Renders only the canonical semantic program text. This is what [`Display`] produces for [`Program`]s and what
     /// structural equivalence fingerprints compare.
     Semantic,
 
-    /// Renders the semantic program text with a non-semantic, comment-style ` ; ...` provenance suffix appended to
+    /// Renders non-empty instruction effect classes as a comment-style ` ; effects=[...]` suffix. Includes effects
+    /// from attached computation regions, excluding dormant rule regions, as in [`Program::instruction_effects`].
+    /// Each suffix follows the complete instruction, including any nested bodies.
+    WithEffects,
+
+    /// Renders the semantic program text with a non-semantic, comment-style ` ; provenance=...` suffix appended to
     /// every instruction whose [`Provenance`](crate::Provenance) is not unknown. The suffix is inserted immediately
     /// before each instruction statement's final newline (i.e., after the final closing bracket for instructions whose
     /// rendering spans multiple lines) and never inside nested bodies.
     WithProvenance,
+
+    /// Renders both effect and provenance annotations, in that order, using the same suffixes and omission rules as
+    /// [`WithEffects`](Self::WithEffects) and [`WithProvenance`](Self::WithProvenance).
+    WithEffectsAndProvenance,
 }
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
@@ -1316,15 +1325,12 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         /// Renders one [`Instruction`] as a single statement of the enclosing region's `let` block, recursively
         /// rendering its attached regions according to `reference_counts` and `rendered`. An instruction that binds
         /// no output atom renders with an empty `()` binding. `statement_count` is the number of statements already
-        /// rendered in this block and selects the `let` keyword for the first one. Under
-        /// [`ProgramRenderingMode::WithProvenance`], a non-unknown provenance renders as a comment-style ` ; ...`
-        /// suffix immediately before the statement's final newline (i.e., after the final closing bracket for
-        /// multiline instructions), never inside nested bodies.
+        /// rendered in this block and selects the `let` keyword for the first one. Optional provenance and effect
+        /// annotations follow the complete statement, after the final closing bracket for multiline instructions.
         #[allow(clippy::too_many_arguments)]
         fn render_instruction<V: Value, O: Operation<Type = V::Type>>(
             regions: &RegionArena<V, O>,
-            atoms: &[Atom<V>],
-            instruction: &Instruction<O>,
+            id: InstructionId,
             formatter: &mut std::fmt::Formatter<'_>,
             indentation: usize,
             statement_count: usize,
@@ -1332,6 +1338,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             rendered: &mut [bool],
             mode: ProgramRenderingMode,
         ) -> std::fmt::Result {
+            let region = RegionRef::new(regions, id.region()).unwrap();
+            let atoms = region.atoms();
+            let instruction = &region.instructions()[id.index()];
             let line_indentation = if statement_count == 0 { indentation } else { indentation + 4 };
             write!(formatter, "{:indentation$}", "")?;
             write!(formatter, "{} ", if statement_count == 0 { "let" } else { "   " })?;
@@ -1386,9 +1395,27 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 write!(formatter, "{:width$}", "", width = line_indentation)?;
                 write!(formatter, "]")?;
             }
-            if mode == ProgramRenderingMode::WithProvenance && !instruction.provenance.is_unknown() {
-                write!(formatter, " ; {}", instruction.provenance)?;
+
+            if matches!(mode, ProgramRenderingMode::WithEffects | ProgramRenderingMode::WithEffectsAndProvenance) {
+                let effects = region.instruction_effects(id.index()).unwrap().classes();
+                if !effects.is_empty() {
+                    write!(formatter, " ; effects=[")?;
+                    for (index, effect) in effects.into_iter().enumerate() {
+                        if index > 0 {
+                            write!(formatter, ", ")?;
+                        }
+                        write!(formatter, "{effect}")?;
+                    }
+                    write!(formatter, "]")?;
+                }
             }
+
+            if matches!(mode, ProgramRenderingMode::WithProvenance | ProgramRenderingMode::WithEffectsAndProvenance)
+                && !instruction.provenance.is_unknown()
+            {
+                write!(formatter, " ; provenance={}", instruction.provenance)?;
+            }
+
             writeln!(formatter)
         }
 
@@ -1453,8 +1480,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                 if pending.outputs.is_empty() {
                                     render_instruction(
                                         regions,
-                                        &region.atoms,
-                                        pending,
+                                        InstructionId::new(id, pending_index),
                                         formatter,
                                         indentation,
                                         statement_count,
@@ -1468,8 +1494,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                             next_instruction_index = next_instruction_index.max(instruction_index + 1);
                             render_instruction(
                                 regions,
-                                &region.atoms,
-                                &region.instructions[instruction_index],
+                                InstructionId::new(id, instruction_index),
                                 formatter,
                                 indentation,
                                 statement_count,
@@ -1482,12 +1507,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     }
                 }
             }
-            for pending in &region.instructions[next_instruction_index..] {
+            for (index, pending) in region.instructions.iter().enumerate().skip(next_instruction_index) {
                 if pending.outputs.is_empty() {
                     render_instruction(
                         regions,
-                        &region.atoms,
-                        pending,
+                        InstructionId::new(id, index),
                         formatter,
                         indentation,
                         statement_count,
@@ -3847,6 +3871,62 @@ mod tests {
     }
 
     #[test]
+    fn test_program_render_with_effects() {
+        let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        assert!(
+            builder
+                .add_instruction(
+                    ZeroOutputEffectOperation,
+                    Vec::new(),
+                    vec![input],
+                    Some(Provenance::scope(ProvenanceScope::new("check"), Provenance::unknown())),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let program = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::Semantic)).to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let () = zero_output_effect %0
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let () = zero_output_effect %0 ; provenance=check
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithEffects)).to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let () = zero_output_effect %0 ; effects=[ordered_io]
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithEffectsAndProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let () = zero_output_effect %0 ; effects=[ordered_io] ; provenance=check
+                in ()
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_program_render_with_provenance() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3900,8 +3980,8 @@ mod tests {
                 .to_string(),
             indoc! {r#"
                 lambda %0:f64[] .
-                let %1:f64[] = add %0 %0 ; outer::inner
-                    %2:f64[] = mul %1 %1 ; fused[b, "quo\"te"]
+                let %1:f64[] = add %0 %0 ; provenance=outer::inner
+                    %2:f64[] = mul %1 %1 ; provenance=fused[b, "quo\"te"]
                     %3:f64[] = neg %2
                 in (%3)
             "#}
@@ -3941,7 +4021,7 @@ mod tests {
                         lambda %0:f64[] .
                         in (%0)
                     },
-                ] ; scoped
+                ] ; provenance=scoped
                 in (%1)
             "}
             .trim_end(),
@@ -3993,6 +4073,22 @@ mod tests {
         let effects = program.effects();
         assert_eq!(effects.classes(), EffectClasses::single(EffectClass::OrderedState));
         assert!(effects.has_observable_effects_when_unused());
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithEffects)).to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = with_regions %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = effectful %0 ; effects=[ordered_state]
+                        in (%1)
+                    },
+                ] ; effects=[ordered_state]
+                    %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
 
         // EffectClasses in transform-only rule regions are dormant during ordinary execution and therefore do not make the
         // containing instruction or program effectful.
@@ -4014,5 +4110,20 @@ mod tests {
         let effects = program.effects();
         assert_eq!(effects.classes(), EffectClasses::NONE);
         assert!(!effects.has_observable_effects_when_unused());
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithEffects)).to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = dormant_region %0 [
+                    rule={
+                        lambda %0:f64[] .
+                        let %1:f64[] = effectful %0 ; effects=[ordered_io]
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 }

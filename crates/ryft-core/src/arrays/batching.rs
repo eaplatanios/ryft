@@ -5461,15 +5461,15 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
-                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1 ; ryft::batching::ragged_identity_mask
-                    %4:dimension<3> = constant [value=3] ; ryft::batching::ragged_identity_mask
-                    %5:i32[3] = iota [type=i32[3], dimension=0] ; ryft::batching::ragged_identity_mask
-                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4 ; ryft::batching::ragged_identity_mask
-                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4 ; ryft::batching::ragged_identity_mask
-                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7 ; ryft::batching::ragged_identity_mask
-                    %9:f32[] = constant [value=inf] ; ryft::batching::ragged_identity_mask
-                    %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4 ; ryft::batching::ragged_identity_mask
-                    %11:f32[items, 3] = select %8 %1 %10 ; ryft::batching::ragged_identity_mask
+                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1 ; provenance=ryft::batching::ragged_identity_mask
+                    %4:dimension<3> = constant [value=3] ; provenance=ryft::batching::ragged_identity_mask
+                    %5:i32[3] = iota [type=i32[3], dimension=0] ; provenance=ryft::batching::ragged_identity_mask
+                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4 ; provenance=ryft::batching::ragged_identity_mask
+                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4 ; provenance=ryft::batching::ragged_identity_mask
+                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7 ; provenance=ryft::batching::ragged_identity_mask
+                    %9:f32[] = constant [value=inf] ; provenance=ryft::batching::ragged_identity_mask
+                    %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4 ; provenance=ryft::batching::ragged_identity_mask
+                    %11:f32[items, 3] = select %8 %1 %10 ; provenance=ryft::batching::ragged_identity_mask
                 in (%11)
             "}
             .trim_end(),
