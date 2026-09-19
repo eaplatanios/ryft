@@ -46,12 +46,28 @@ use crate::programs::{
 use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Failure of a correctness assertion, including the named values observed at that assertion.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionError {
     /// The Boolean condition was false.
-    #[error("assertion failed: {message}; observations={observations:?}")]
     Failed { message: String, observations: Vec<(String, String)> },
 }
+
+impl Display for AssertionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed { message, observations } => {
+                write!(formatter, "assertion failed: {message}")?;
+                for (index, (label, value)) in observations.iter().enumerate() {
+                    let separator = if index == 0 { "; " } else { ", " };
+                    write!(formatter, "{separator}{label}={value}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for AssertionError {}
 
 impl From<AssertionError> for ProgramError {
     fn from(error: AssertionError) -> Self {
@@ -218,9 +234,12 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
                 Err(error) => return Err(error),
             }
             return Err(self
-                .failure(inputs[1..].iter().map(|input| match context.resolve(input) {
-                    ValueResolution::Constant(input) => Some(input),
-                    _ => None,
+                .failure(inputs[1..].iter().map(|input| {
+                    let value = match context.resolve(input) {
+                        ValueResolution::Constant(value) => Some(value),
+                        _ => None,
+                    };
+                    (value, input.r#type().into_owned())
                 }))?
                 .into());
         }
@@ -228,8 +247,8 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         Ok(())
     }
 
-    /// Constructs a failure from validated observations, retaining labels for values that cannot be resolved.
-    fn failure<V: AssertionValue, I: IntoIterator<Item = Option<V>>>(
+    /// Constructs a failure from validated observations, retaining dimension facts when values cannot be resolved.
+    fn failure<V: AssertionValue<Type = T>, I: IntoIterator<Item = (Option<V>, T)>>(
         &self,
         observations: I,
     ) -> Result<AssertionError, ProgramError> {
@@ -237,14 +256,21 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
             .labels
             .iter()
             .zip(observations)
-            .map(|(label, input)| {
+            .map(|(label, (input, r#type))| {
+                let fallback = || match r#type.into() {
+                    ArrayIrType::Dimension(dimension) => match dimension.extent() {
+                        Some(extent) => extent.to_string(),
+                        None => format!("<unknown: `{dimension}`>"),
+                    },
+                    _ => "<unknown>".to_owned(),
+                };
                 let observation = match input {
                     Some(input) => match input.assertion_observation() {
                         Ok(value) => value,
-                        Err(ProgramError::Concretization { .. }) => "<unknown>".to_owned(),
+                        Err(ProgramError::Concretization { .. }) => fallback(),
                         Err(error) => return Err(error),
                     },
-                    None => "<unknown>".to_owned(),
+                    None => fallback(),
                 };
                 Ok((label.clone(), observation))
             })
@@ -377,10 +403,11 @@ where
             }
             return Err(self
                 .failure(inputs[1..].iter().map(|input| {
-                    input.as_known().and_then(|input| match context.parent().resolve(input) {
+                    let value = input.as_known().and_then(|input| match context.parent().resolve(input) {
                         ValueResolution::Constant(input) => Some(input),
                         _ => None,
-                    })
+                    });
+                    (value, input.r#type().into_owned())
                 }))?
                 .into());
         }
@@ -559,7 +586,9 @@ impl Assert for Array {
         if Concretizable::<bool>::concretize(self)? {
             return Ok(());
         }
-        Err(operation.failure(observations.iter().map(|(_, input)| Some(input.clone())))?.into())
+        Err(operation
+            .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
+            .into())
     }
 }
 
@@ -574,7 +603,9 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
         if Concretizable::<bool>::concretize(self)? {
             return Ok(());
         }
-        Err(operation.failure(observations.iter().map(|(_, input)| Some(input.clone())))?.into())
+        Err(operation
+            .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
+            .into())
     }
 }
 
@@ -818,6 +849,7 @@ mod tests {
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed { message: "condition must hold".to_owned(), observations: vec![] })
         );
+        assert_eq!(error.to_string(), "assertion failed: condition must hold");
         let error = Array::scalar(false)
             .unwrap()
             .assert(
@@ -841,6 +873,10 @@ mod tests {
                     ("float".to_owned(), "1.5".to_owned()),
                 ],
             })
+        );
+        assert_eq!(
+            error.to_string(),
+            "assertion failed: observations; unsigned=18446744073709551615, signed=-9223372036854775808, boolean=true, float=1.5",
         );
         // Even a true condition must validate unsupported observations before returning.
         assert_eq!(
@@ -948,6 +984,63 @@ mod tests {
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed { message: "condition must hold".to_owned(), observations: vec![] })
+        );
+    }
+
+    #[test]
+    fn test_assert_dimension_observations() {
+        let exact = DimensionType::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
+        let bounded = DimensionType::new("bounded", DimensionBounds::new(2, Some(8)).unwrap());
+        let input_types = vec![
+            ArrayIrType::from(ArrayType::scalar(DataType::Boolean)),
+            exact.into(),
+            bounded.clone().into(),
+            ArrayType::scalar(DataType::I32).into(),
+        ];
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let observations = input_types[1..].iter().map(|r#type| trace.input(r#type.clone())).collect::<Vec<_>>();
+        let condition = trace.constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        let error = condition
+            .assert(
+                "dimension requirement",
+                &[
+                    ("exact", observations[0].clone()),
+                    ("bounded", observations[1].clone()),
+                    ("scalar", observations[2].clone()),
+                ],
+            )
+            .unwrap_err();
+        let expected = format!(
+            "assertion failed: dimension requirement; exact=4, bounded=<unknown: `{bounded}`>, scalar=<unknown>",
+        );
+        assert_eq!(error.to_string(), expected);
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        builder
+            .add_instruction(
+                AssertOperation::new("dimension requirement").with_labels(vec![
+                    "exact".to_owned(),
+                    "bounded".to_owned(),
+                    "scalar".to_owned(),
+                ]),
+                Vec::new(),
+                inputs,
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 4], vec![])
+            .unwrap();
+        let mut inputs = input_types.into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
+        inputs[0] = PartialValue::Known(ArrayIrValue::Array(Array::scalar(false).unwrap()));
+        assert_eq!(program.partially_evaluate(&inputs).unwrap_err().to_string(), expected);
+
+        // Concrete observations take precedence over their wider declared bounds.
+        inputs[2] = PartialValue::Known(ArrayIrValue::Dimension(DimensionValue::new(bounded, 6).unwrap()));
+        assert_eq!(
+            program.partially_evaluate(&inputs).unwrap_err().to_string(),
+            "assertion failed: dimension requirement; exact=4, bounded=6, scalar=<unknown>",
         );
     }
 

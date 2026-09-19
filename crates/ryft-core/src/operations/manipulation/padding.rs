@@ -5864,7 +5864,7 @@ mod tests {
         );
         assert_eq!(
             program.interpret(inputs(1, 3)).unwrap_err().to_string(),
-            r#"assertion failed: padding end must not exceed the output extent; observations=[("end", "4"), ("extent", "3")]"#,
+            "assertion failed: padding end must not exceed the output extent; end=4, extent=3",
         );
 
         // The pullback gathers the input cotangent back out of the written positions and sums the padding positions

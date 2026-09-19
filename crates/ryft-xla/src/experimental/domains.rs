@@ -7433,7 +7433,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(r#"assertion failed: `first` <= `second`; observations=[("first", "4"), ("second", "3")]"#),
+                .contains("assertion failed: `first` <= `second`; first=4, second=3"),
             "{error}",
         );
         assert!(!error.to_string().contains("`second` <= `third`"), "{error}");

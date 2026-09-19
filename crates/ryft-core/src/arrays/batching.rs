@@ -6901,10 +6901,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(
-            mismatched.to_string(),
-            r#"assertion failed: batch dimensions must agree; observations=[("expected", "3"), ("actual", "2")]"#,
-        );
+        assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=3, actual=2",);
 
         // A mapped reference whose referent has a dynamic extent at the batch axis cannot supply the mapped extent
         // itself, so a mapped array must expose that same dimension identity regardless of input order. Arrays are
@@ -7007,11 +7004,7 @@ mod tests {
             pack_inputs(&trace, vec![reference, array], vec![BatchAxis::new(0); 2], BatchAxisSpecification::default())
                 .unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(
-            mismatched.to_string(),
-            r#"assertion failed: batch dimensions must agree; \
-               observations=[("expected", "<unknown>"), ("actual", "<unknown>")]"#,
-        );
+        assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=4, actual=2",);
 
         // A mapped reference contributes its referent's batch-axis placement to the sharding join, so a mapped array
         // whose placement is only replicated is renormalized onto the reference's placement. Both mapped extents fold
@@ -8666,10 +8659,7 @@ mod tests {
             batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(0), mismatched_extent);
         let mismatched = mismatched.unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(
-            mismatched.to_string(),
-            r#"assertion failed: batch dimensions must agree; observations=[("expected", "3"), ("actual", "2")]"#,
-        );
+        assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=3, actual=2",);
 
         // A first-class dimension itself cannot be declared mapped at the transform boundary.
         let mapped_input: Result<ArrayIrValue<Array>, BatchingError> = batch(

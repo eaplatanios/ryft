@@ -1078,62 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn test_program_builder_add_instruction_or_fold() {
-        let scalar = ArrayType::new_static(DataType::F64, []);
-        let mut builder = ProgramBuilder::<Array, FoldOperation>::new();
-        let inputs = vec![builder.add_input(scalar.clone()), builder.add_input(scalar.clone())];
-        let operation = FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![1, 0] };
-        assert_eq!(
-            builder.add_instruction_or_fold(operation.clone(), Vec::new(), inputs.clone(), None).unwrap(),
-            vec![inputs[1], inputs[0]],
-        );
-        assert_eq!(builder.atoms().len(), 2);
-        assert!(builder.instructions().is_empty());
-        assert!(
-            builder
-                .add_instruction_or_fold(
-                    FoldOperation { output_types: Vec::new(), replacements: Vec::new() },
-                    Vec::new(),
-                    inputs.clone(),
-                    None,
-                )
-                .unwrap()
-                .is_empty()
-        );
-        assert!(builder.instructions().is_empty());
-
-        // Folding never bypasses ordinary application validation or accepts malformed output replacements.
-        assert_eq!(
-            builder.add_instruction_or_fold(operation.clone(), Vec::new(), vec![inputs[0]], None),
-            Err(TypeError::invalid("expected 2 inputs but got 1").into()),
-        );
-        assert_eq!(
-            builder.add_instruction_or_fold(
-                FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![0] },
-                Vec::new(),
-                inputs.clone(),
-                None,
-            ),
-            Err(TypeError::invalid("expected 2 fold outputs but got 1").into()),
-        );
-        assert_eq!(
-            builder.add_instruction_or_fold(
-                FoldOperation { output_types: vec![scalar], replacements: vec![2] },
-                Vec::new(),
-                inputs.clone(),
-                None,
-            ),
-            Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
-        );
-        assert_eq!(builder.atoms().len(), 2);
-        assert!(builder.instructions().is_empty());
-
-        // Raw construction still records the instruction, independently of its folding rule.
-        assert_eq!(builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().len(), 2);
-        assert_eq!(builder.instructions().len(), 1);
-    }
-
-    #[test]
     fn test_program_builder() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1733,6 +1677,62 @@ mod tests {
             )
             .unwrap()[0];
         assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), ArrayType::scalar(DataType::I64));
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold() {
+        let scalar = ArrayType::new_static(DataType::F64, []);
+        let mut builder = ProgramBuilder::<Array, FoldOperation>::new();
+        let inputs = vec![builder.add_input(scalar.clone()), builder.add_input(scalar.clone())];
+        let operation = FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![1, 0] };
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), inputs.clone(), None).unwrap(),
+            vec![inputs[1], inputs[0]],
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+        assert!(
+            builder
+                .add_instruction_or_fold(
+                    FoldOperation { output_types: Vec::new(), replacements: Vec::new() },
+                    Vec::new(),
+                    inputs.clone(),
+                    None,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(builder.instructions().is_empty());
+
+        // Folding never bypasses ordinary application validation or accepts malformed output replacements.
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), vec![inputs[0]], None),
+            Err(TypeError::invalid("expected 2 inputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![0] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("expected 2 fold outputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar], replacements: vec![2] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+
+        // Raw construction still records the instruction, independently of its folding rule.
+        assert_eq!(builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().len(), 2);
+        assert_eq!(builder.instructions().len(), 1);
     }
 
     #[test]
