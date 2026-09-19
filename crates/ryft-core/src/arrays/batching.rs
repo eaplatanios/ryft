@@ -7004,7 +7004,7 @@ mod tests {
             pack_inputs(&trace, vec![reference, array], vec![BatchAxis::new(0); 2], BatchAxisSpecification::default())
                 .unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=4, actual=2",);
+        assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=2, actual=4");
 
         // A mapped reference contributes its referent's batch-axis placement to the sharding join, so a mapped array
         // whose placement is only replicated is renormalized onto the reference's placement. Both mapped extents fold
