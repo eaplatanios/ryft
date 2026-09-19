@@ -1,7 +1,3 @@
-//! Generic reference allocation operation and its value-level capability.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -29,7 +25,7 @@ use crate::programs::{
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
 
-/// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
+/// Creates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
 #[derive(Clone, Debug)]
 pub struct ReferenceNewOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
 
@@ -37,6 +33,13 @@ impl<T: Type, U: Type> ReferenceNewOperation<T, U> {
     /// Creates a new [`ReferenceNewOperation`].
     pub const fn new() -> Self {
         Self(PhantomData)
+    }
+}
+
+impl<T: Type, U: Type> Default for ReferenceNewOperation<T, U> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -49,10 +52,8 @@ impl<T: Type, U: Type> Display for ReferenceNewOperation<T, U> {
     }
 }
 
-impl<T, U> Operation for ReferenceNewOperation<T, U>
+impl<T: Type, U: Type + From<ReferenceType<T>>> Operation for ReferenceNewOperation<T, U>
 where
-    T: Type,
-    U: Type + From<ReferenceType<T>>,
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
 {
     type Type = U;
@@ -72,8 +73,8 @@ where
         let referent = <&T>::try_from(&input_types[0])?;
         if referent.is_reference() {
             return Err(TypeError::invalid(format!(
-                "`{REFERENCE_NEW_OPERATION_NAME}` cannot allocate a reference whose referent type `{referent}` is \
-                 itself a reference",
+                "`{REFERENCE_NEW_OPERATION_NAME}` cannot allocate a reference whose referent type \
+                 `{referent}` is itself a reference",
             )));
         }
         Ok(vec![ReferenceType::new(referent.clone()).into()])
@@ -81,10 +82,7 @@ where
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        // The effect descriptor is built once and shared by every `<T, U>` instantiation of this operation: the
-        // `static` names no generic parameter, so this generic function owns exactly one instance, and `LazyLock` is
-        // required because `Effects::new` validates and allocates at runtime. Nesting it here scopes it to its only
-        // reader and lets `effects` hand out a borrowed `'static` descriptor without cloning on every query.
+        // Share one descriptor across all type instantiations to avoid allocating and validating it on every query.
         static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
             Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
         });
@@ -92,13 +90,14 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
-where
+impl<
     T: Type,
-    U: From<T> + From<ReferenceType<T>> + Type,
-    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    U: Type + From<T> + From<ReferenceType<T>>,
     C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
     P: ReferenceDischargePolicy<C, Referent = T>,
+> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
+where
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -116,8 +115,8 @@ where
         check_count!("output", output_types, 1, ProgramError);
         let r#type = <&ReferenceType<P::Referent>>::try_from(&output_types[0]).map_err(|_| {
             ProgramError::MalformedProgram(format!(
-                "`{REFERENCE_NEW_OPERATION_NAME}` inferred the non-reference output type `{}`",
-                output_types[0],
+                "`{}` inferred the non-reference output type `{}`",
+                REFERENCE_NEW_OPERATION_NAME, output_types[0],
             ))
         })?;
         let r#type = r#type.clone();
@@ -133,13 +132,12 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceNewOperation<T, U>
+impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceNew<C::Value>>> InterpretableOperation<C>
+    for ReferenceNewOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceNew<C::Value>>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -151,33 +149,25 @@ where
     }
 }
 
-impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceNewOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>>
+    PartiallyEvaluatableOperation<C> for ReferenceNewOperation<T, U>
 {
-    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
-    // before any operation rule runs.
 }
 
-impl<T, U, C, P> BatchableOperation<C, P> for ReferenceNewOperation<T, U>
+impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for ReferenceNewOperation<T, U>
 where
-    T: Type,
-    U: Type,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
-    P: BatchingPolicy<C>,
 {
-    // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at allocation
-    // time, so the allocation is always batched: a mapped initial value keeps its axis and a replicated one is first
-    // broadcast along a new leading batch axis through the driver.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at
+        // allocation time, so the allocation is always batched (a mapped initial value keeps its axis and a
+        // replicated one is first broadcast along a new leading batch axis through the driver).
         check_count!("input", inputs, 1, ProgramError);
         let batch_axis = P::batch_axis(&inputs[0]).axis().unwrap_or(Axis::from(0));
         let initial = driver.align_batch_axis(context, inputs[0].clone(), batch_axis)?;
@@ -193,15 +183,15 @@ impl_differentiable_operation! {
         T: Type,
         U: DifferentiableType,
         C: Context<
-                Type = U,
-                Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
-            > + Zero<C::Value>,
+            Type = U,
+            Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
             // Forward mode allocates a tangent reference beside the primal one, initialized from the initial value's
             // tangent. A symbolic zero tangent is instantiated first, because the tangent reference must exist as a
-            // concrete allocation for later stores to land in: a reference type is never zero-space, so the
-            // allocation's dual always carries a live tangent reference.
+            // concrete allocation for later stores to land in (a reference type is never zero-space, so the
+            // allocation's dual always carries a live tangent reference).
             check_count!("input", inputs, 1, ProgramError);
             let primal = context
                 .primal()
@@ -233,8 +223,8 @@ impl_differentiable_operation! {
     {
         |_operation, context, driver, inputs, outputs, accumulators| {
             // The allocation is the map from the initial value to the initial state, so its transpose is the final
-            // step of the reverse sweep for its root: the cotangent accumulated into the root's cotangent reference is
-            // frozen into the cotangent of the initial value. An accumulator that nothing ever reached was never
+            // step of the reverse sweep for its root (the cotangent accumulated into the root's cotangent reference
+            // is frozen into the cotangent of the initial value). An accumulator that nothing ever reached was never
             // allocated, so the initial value's cotangent is a symbolic zero and neither `reference_new` nor
             // `reference_freeze` is staged.
             check_count!("input", inputs, 1, ProgramError);
@@ -250,6 +240,8 @@ impl_differentiable_operation! {
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound on the three reference operation
 //  providers once the next-generation trait solver stabilizes. The current solver cannot discharge this projection
