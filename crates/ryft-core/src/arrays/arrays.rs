@@ -895,10 +895,10 @@ macro_rules! impl_array_scalar_concretization {
         impl_array_scalar_concretization!(@checked $scalar, |value| <$scalar>::try_from(value).ok());
     };
 
-    // Sub-byte targets validate their narrower range after conversion to their storage integer.
-    (@sub_byte $scalar:ty => $storage:ty) => {
+    // Sub-byte constructors infer the storage integer type and validate the narrower range.
+    (@sub_byte $scalar:ty) => {
         impl_array_scalar_concretization!(@checked $scalar, |value| {
-            <$storage>::try_from(value).ok().and_then(|value| <$scalar>::new(value).ok())
+            value.try_into().ok().and_then(|value| <$scalar>::new(value).ok())
         });
     };
 
@@ -933,12 +933,12 @@ impl_array_scalar_concretization!(@integer u32);
 impl_array_scalar_concretization!(@integer u64);
 impl_array_scalar_concretization!(@integer u128);
 impl_array_scalar_concretization!(@integer usize);
-impl_array_scalar_concretization!(@sub_byte i1 => i8);
-impl_array_scalar_concretization!(@sub_byte i2 => i8);
-impl_array_scalar_concretization!(@sub_byte i4 => i8);
-impl_array_scalar_concretization!(@sub_byte u1 => u8);
-impl_array_scalar_concretization!(@sub_byte u2 => u8);
-impl_array_scalar_concretization!(@sub_byte u4 => u8);
+impl_array_scalar_concretization!(@sub_byte i1);
+impl_array_scalar_concretization!(@sub_byte i2);
+impl_array_scalar_concretization!(@sub_byte i4);
+impl_array_scalar_concretization!(@sub_byte u1);
+impl_array_scalar_concretization!(@sub_byte u2);
+impl_array_scalar_concretization!(@sub_byte u4);
 impl_array_scalar_concretization!(@exact f4e2m1fn);
 impl_array_scalar_concretization!(@exact f6e2m3fn);
 impl_array_scalar_concretization!(@exact f6e3m2fn);

@@ -1818,8 +1818,8 @@ mod tests {
         let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
         assert!(transposed.input_ids().is_empty());
         assert!(transposed.output_ids().is_empty());
-        assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::InvalidArgument { message })
-            if message == "`dimension_from_scalar` scalar input must be a non-negative host-representable extent but is -1"));
+        assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
+            if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range"));
     }
 
     #[test]
