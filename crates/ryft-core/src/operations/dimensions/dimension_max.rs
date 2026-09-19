@@ -1,4 +1,6 @@
-use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
+use crate::arrays::{
+    ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT,
+};
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 use crate::programs::{Operation, ProgramError, Typed, Value};
@@ -23,8 +25,19 @@ define_dimension_arithmetic_operation!(
         let bounds = DimensionBounds::new(left_lower.max(right_lower), left_maximum.max(right_maximum).checked_add(1))?;
         Ok((bounds, false))
     },
+    fold = |left: &DimensionType, right: &DimensionType| {
+        if left.variable() == right.variable()
+            || left.bounds().lower() >= right.maximum_extent().unwrap_or(MAX_DIMENSION_EXTENT)
+        {
+            Some(vec![0])
+        } else if right.bounds().lower() >= left.maximum_extent().unwrap_or(MAX_DIMENSION_EXTENT) {
+            Some(vec![1])
+        } else {
+            None
+        }
+    },
     capability = {
-        /// Returns the larger of two [`DimensionValue`]s.
+        /// Returns the larger of two first-class dimensions.
         ///
         /// # Example
         ///
@@ -60,10 +73,13 @@ impl DimensionMax for DimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
+    use crate::contexts::StagingContext;
     use crate::programs::EffectClasses;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -93,5 +109,76 @@ mod tests {
                 .extent(),
             7,
         );
+    }
+
+    #[test]
+    fn test_dimension_max_identity() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(value, _zero, one)| {
+                Ok(vec![value.dimension_max(&value)?, value.dimension_max(&one)?, one.dimension_max(&value)?])
+            },
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                in (%0, %0, %0)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_max_identity_bounds() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(left, right)| left.dimension_max(&right),
+            (
+                DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap()),
+                DimensionType::new("right", DimensionBounds::new(1, Some(9)).unwrap()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [1, 9)>, %1:dimension<right ∈ [1, 9)> .
+                let %2:dimension<max(left, right) ∈ [1, 9)> = dimension_max %0 %1
+                in (%2)"},
+        );
+
+        // Inclusive ordering also proves the boundary case with unbounded positive dimensions.
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(positive, one)| Ok((positive.dimension_max(&one)?, one.dimension_max(&positive)?)),
+            (
+                DimensionType::new("positive", DimensionBounds::new(1, None).unwrap()),
+                DimensionValue::constant(1).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<positive ∈ [1, ∞)>, %1:dimension<1> .
+                in (%0, %0)"},
+        );
+
+        // Even identical inputs must validate their portable extent range before being reused.
+        if let Some(invalid_extent) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let context = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+            let invalid =
+                context.input(DimensionType::new("invalid", DimensionBounds::new(invalid_extent, None).unwrap()));
+            let error = invalid.dimension_max(&invalid).unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<DimensionError>(),
+                Some(&DimensionError::ExtentExceedsBackendWidth {
+                    value: invalid_extent,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }),
+            );
+        }
     }
 }

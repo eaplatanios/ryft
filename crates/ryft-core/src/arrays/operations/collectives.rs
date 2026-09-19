@@ -826,7 +826,7 @@ mod tests {
         let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
         assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
         assert!(pullback.contains("dimension_from_scalar"));
-        assert!(pullback.contains("dimension_mul"));
+        assert!(!pullback.contains("dimension_mul"));
         assert!(pullback.contains("dynamic_slice"));
     }
 
@@ -943,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_untiled_collective_retains_dynamic_extent_requirement() {
+    fn test_array_ir_untiled_collective_retains_dynamic_extent_assertion() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let input_variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(5)).unwrap());
@@ -955,15 +955,16 @@ mod tests {
         )
         .unwrap();
 
-        let [dimension_size, axis_size, requirement, parallel_sum_scatter] = program.instructions() else {
-            panic!("expected dimension observation, axis-size constant, equality requirement, and sum-scatter");
+        let [dimension_size, axis_size, comparison, assertion, parallel_sum_scatter] = program.instructions() else {
+            panic!("expected dimension observation, axis-size constant, comparison, assertion, and sum-scatter");
         };
         assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
         assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
-        assert!(matches!(requirement.operation(), ArrayIrOperation::Dimension(DimensionOperation::Requirement(_)),));
-        assert_eq!(requirement.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
+        assert!(matches!(comparison.operation(), ArrayIrOperation::Compare(_)));
+        assert!(matches!(assertion.operation(), ArrayIrOperation::Assert(_)));
+        assert_eq!(comparison.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
+        assert_eq!(assertion.inputs(), &[comparison.outputs()[0], dimension_size.outputs()[0], axis_size.outputs()[0]]);
         assert!(matches!(parallel_sum_scatter.operation(), ArrayIrOperation::ParallelSumScatter(_)));
-        assert_eq!(requirement.inputs()[0], dimension_size.outputs()[0]);
         assert_eq!(parallel_sum_scatter.inputs(), &[program.input_ids()[0]]);
         assert_eq!(program.output_types(), &[ArrayIrType::Array(ArrayType::scalar(DataType::F32))],);
     }

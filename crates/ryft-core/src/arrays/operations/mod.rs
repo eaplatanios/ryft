@@ -40,32 +40,31 @@ use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::random::RngBitGeneratorOperation;
 use crate::operations::sort::{Sort, SortOperation};
 use crate::operations::{
-    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation,
-    Ceil, CeilOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation,
-    ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, CumulativeLogSumExp,
-    CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
-    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, CustomJvpOperation,
-    CustomVjpOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Assert, AssertOperation, Atan2, Atan2Operation, Broadcast,
+    BroadcastOperation, Ceil, CeilOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation,
+    ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
+    CumulativeLogSumExp, CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin,
+    CumulativeMinOperation, CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation,
+    CustomJvpOperation, CustomVjpOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
     DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
-    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
-    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p,
-    Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic,
-    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
-    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow,
-    PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
-    ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
-    ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
-    ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation,
-    StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
+    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
+    DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    DynamicReshape, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation,
+    IotaOperation, LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation,
+    LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul,
+    MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad,
+    PadOperation, ParallelReduceOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce,
+    ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse, ReverseOperation,
+    Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter,
+    ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation,
+    Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation,
+    Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -198,6 +197,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Tag(TagOperation<ArrayType>),
     Rematerialize(RematerializeOperation<ArrayType>),
     Print(PrintOperation<ArrayType>),
+    Assert(AssertOperation<ArrayType>),
     CustomCall(CustomCallOperation),
     CustomJvp(CustomJvpOperation<ArrayType>),
     CustomVjp(CustomVjpOperation<ArrayType>),
@@ -279,7 +279,7 @@ pub trait ArrayOperations:
     + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
     + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
     // Constants and differentiation barriers.
-    + ZeroLike + OneLike + StopGradient
+    + ZeroLike + OneLike + StopGradient + Assert
 {
 }
 
@@ -297,7 +297,7 @@ where
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
     V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
-    V: ZeroLike + OneLike + StopGradient,
+    V: ZeroLike + OneLike + StopGradient + Assert,
 {
 }
 
@@ -314,7 +314,6 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Rem(DimensionRemOperation),
     Min(DimensionMinOperation),
     Max(DimensionMaxOperation),
-    Requirement(DimensionRequirementOperation),
 }
 
 // Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
@@ -354,8 +353,8 @@ where
 /// take [`DimensionType`]-typed values and stage or execute one [`DimensionOperation`] variant. Checked arithmetic
 /// reaches the shared capabilities [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`] pinned to
 /// dimension-typed values, alongside the dedicated [`DimensionSaturatingSub`], [`DimensionPow`], [`DimensionMin`],
-/// and [`DimensionMax`]. [`DimensionRequirement`] is the family's assertion surface and is a member even though its
-/// methods return no value, because it is still performed by a dimension-typed value.
+/// and [`DimensionMax`]. Boolean comparisons and assertions belong to the composite family because their
+/// signatures include ordinary array predicates.
 ///
 /// What a variant needs in order to exist, but that a dimension value does not itself perform, stays out:
 ///
@@ -377,8 +376,6 @@ pub trait DimensionOperations:
     Value<Type = DimensionType>
     // Checked first-class-dimension arithmetic.
     + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub + DimensionPow + DimensionMin + DimensionMax
-    // Runtime assertions over first-class dimensions.
-    + DimensionRequirement
 {
 }
 
@@ -387,7 +384,7 @@ pub trait DimensionOperations:
 impl<V> DimensionOperations for V
 where
     V: Value<Type = DimensionType> + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub,
-    V: DimensionPow + DimensionMin + DimensionMax + DimensionRequirement,
+    V: DimensionPow + DimensionMin + DimensionMax,
 {
 }
 
@@ -463,6 +460,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// variant does not permit array-dimension or dimension-array comparisons; it reuses [`CompareOperation`] for the
     /// dimension-dimension signature whose result crosses from the dimension member kind to the array member kind.
     Compare(CompareOperation<ArrayIrType>),
+
+    /// Asserts a Boolean array predicate with optional array or dimension diagnostics.
+    Assert(AssertOperation<ArrayIrType>),
 
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
@@ -658,7 +658,7 @@ pub trait ArrayIrOperations:
     // First-class-dimension member profile.
     + ValueProjection<DimensionType, Projected: DimensionOperations>
     // Comparison of first-class dimensions, producing ordinary Boolean array data.
-    + Compare
+    + Compare + Assert
     // First-class dimensions.
     + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
@@ -673,7 +673,7 @@ pub trait ArrayIrOperations:
 // when every one of its member capabilities is.
 impl<V> ArrayIrOperations for V
 where
-    V: Value<Type = ArrayIrType> + Compare,
+    V: Value<Type = ArrayIrType> + Compare + Assert,
     V: DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
     V: ReferenceNew
@@ -1043,8 +1043,8 @@ mod tests {
     use crate::operations::collectives::{AllGatherOutputVariance, CollectiveMode, CollectiveOptions};
     use crate::operations::random::RandomAlgorithm;
     use crate::operations::{
-        AddOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation, DimensionAddOperation,
-        DimensionFromScalarOperation, DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation,
+        AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
+        DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionSizeOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
         ScanOperation, SinOperation, WhileOperation, ZeroOperation,
     };
@@ -1201,10 +1201,8 @@ mod tests {
                 %5:dimension<max(0, rows * columns + columns - rows) / columns ∈ [0, 32)> = dimension_div %4 %1
                 %6:dimension<max(0, rows * columns + columns - rows) % columns ∈ [0, 4)> = dimension_rem %4 %1
                 %7:dimension<rows ^ columns ∈ [5, 4097)> = dimension_pow %0 %1
-                %8:dimension<max(rows, columns) ∈ [5, 9)> = dimension_max %0 %1
-                %9:dimension<min(rows, columns) ∈ [1, 5)> = dimension_min %0 %1
-                %10:dimension<max(rows, columns) - min(rows, columns) ∈ [1, 8)> = dimension_sub %8 %9
-            in (%5, %6, %7, %10)
+                %8:dimension<rows - columns ∈ [1, 8)> = dimension_sub %0 %1
+            in (%5, %6, %7, %8)
         "};
         assert_eq!(program.to_string(), expected.trim_end());
     }
@@ -1344,14 +1342,32 @@ mod tests {
         let extent = builder
             .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
+        let lower = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let upper = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(8).unwrap()));
+        let above_lower = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::GreaterThanOrEqual),
+                Vec::new(),
+                vec![extent, lower],
+                None,
+            )
+            .unwrap()[0];
+        let below_upper = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![extent, upper],
+                None,
+            )
+            .unwrap()[0];
+        let condition = builder
+            .add_instruction(ArrayOperation::And(AndOperation::new()), Vec::new(), vec![above_lower, below_upper], None)
+            .unwrap()[0];
         builder
             .add_instruction(
-                DimensionOperation::Requirement(DimensionRequirementOperation::bounds(
-                    &DimensionType::from(rows),
-                    DimensionBounds::new(2, Some(8)).unwrap(),
-                )),
+                AssertOperation::<ArrayIrType>::new("`rows` must be in `[2, 8)`").with_labels(vec!["rows".to_owned()]),
                 Vec::new(),
-                vec![extent],
+                vec![condition, extent],
                 None,
             )
             .unwrap();
@@ -1385,7 +1401,10 @@ mod tests {
                     .contains(EffectClass::OrderedAssertion))
                 .map(|instruction| instruction.operation().to_string())
                 .collect::<Vec<_>>(),
-            vec!["dimension_from_scalar [bounds=[1, 9)]", "dimension_requirement [predicate=Bounds, bounds=[2, 8)]"],
+            vec![
+                "dimension_from_scalar [bounds=[1, 9)]",
+                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
+            ],
         );
 
         // Dimensions have no tangent, so forward differentiation must not duplicate either assertion.
@@ -1401,7 +1420,10 @@ mod tests {
                     .contains(EffectClass::OrderedAssertion))
                 .map(|instruction| instruction.operation().to_string())
                 .collect::<Vec<_>>(),
-            vec!["dimension_from_scalar [bounds=[1, 9)]", "dimension_requirement [predicate=Bounds, bounds=[2, 8)]"],
+            vec![
+                "dimension_from_scalar [bounds=[1, 9)]",
+                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
+            ],
         );
 
         // Linearization keeps both assertions in the primal; the tangent consumes the checked extent as a residual.
@@ -1419,7 +1441,10 @@ mod tests {
                     .contains(EffectClass::OrderedAssertion))
                 .map(|instruction| instruction.operation().to_string())
                 .collect::<Vec<_>>(),
-            vec!["dimension_from_scalar [bounds=[1, 9)]", "dimension_requirement [predicate=Bounds, bounds=[2, 8)]"],
+            vec![
+                "dimension_from_scalar [bounds=[1, 9)]",
+                r#"assert [message="`rows` must be in `[2, 8)`", labels=["rows"]]"#
+            ],
         );
         assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
         assert_eq!(
@@ -1579,10 +1604,8 @@ mod tests {
             panic!("expected one dimension result type");
         };
         assert_eq!(result_type.bounds(), DimensionBounds::new(2, Some(17)).unwrap());
-        let requirement = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(
-            DimensionRequirementOperation::equal(&left_type, &right_type),
-        ));
-        assert_eq!(requirement.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let assertion = ArrayIrOperation::<Array>::from(AssertOperation::<ArrayIrType>::new("dimensions must match"));
+        assert_eq!(assertion.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         // Each dimension operation also lifts directly, so generic composite code never has to name the member family.
         let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left_type, &right_type).unwrap());
@@ -1820,22 +1843,11 @@ mod tests {
         assert_eq!(operation.effects(), concatenate.effects());
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
-        // A dimension requirement is likewise pure when provable and otherwise needs an ordered runtime assertion.
-        // Both states must reach the composite family unchanged.
-        let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let left_type = DimensionType::new("left", bounds);
-        let right_type = DimensionType::new("right", bounds);
-
-        // Provable: the same dimension variable is trivially equal to itself.
-        let proven = DimensionRequirementOperation::equal(&left_type, &left_type);
-        let operation = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(proven.clone()));
-        assert_eq!(operation.effects(), proven.effects());
-        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
-
-        // Unprovable: two distinct variables whose `[1, 9)` bounds admit both equal and unequal extents.
-        let inconclusive = DimensionRequirementOperation::equal(&left_type, &right_type);
-        let operation = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(inconclusive.clone()));
-        assert_eq!(operation.effects(), inconclusive.effects());
+        // Assertion effects reach the composite family unchanged. Predicate proofs belong to comparison and
+        // assertion staging rather than the operation's unconditional effect declaration.
+        let assertion = AssertOperation::<ArrayIrType>::new("dimensions must match");
+        let operation = ArrayIrOperation::<Array>::from(assertion.clone());
+        assert_eq!(operation.effects(), assertion.effects());
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 
@@ -2976,6 +2988,21 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_dimension_folding() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value_type = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
+        let value = context.input(value_type.clone().into());
+        let one = context.input(one_type.clone().into());
+        let outputs = context
+            .bind(DimensionMulOperation::new(&value_type, &one_type).unwrap(), Vec::new(), &[value.clone(), one])
+            .unwrap();
+        assert_eq!(outputs[0].atom_id(), value.atom_id());
+        assert_eq!(outputs[0].r#type(), value.r#type());
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
     fn test_array_ir_explicit_shape_vertical_slice() {
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let extent_variable = DimensionVariable::new("extent", bounds);
@@ -3053,6 +3080,32 @@ mod tests {
         let input_value = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]).unwrap());
         let expected = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(program.interpret(vec![input_value.clone(), extent_value.clone()]), Ok(vec![expected.clone()]));
+
+        // Composite partial evaluation folds dimension multiplication and substitutes its output identity in both
+        // shape consumers, even when the extent remains unknown.
+        let unknown = program
+            .partially_evaluate(&[
+                PartialValue::Unknown(input_type.clone().into()),
+                PartialValue::Unknown(extent_type.clone().into()),
+            ])
+            .unwrap();
+        assert_eq!(
+            unknown.program().to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
+                let %2:dimension<1> = const 1
+                    %3:f64[1, extent] = reshape %0 %2 %1
+                    %4:dimension<2> = const 2
+                    %5:f64[2, extent] = broadcast [output_axes=[0, 1]] %3 %4 %1
+                in (%5)"},
+        );
+        assert_eq!(
+            unknown.interpret(
+                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                &[input_value.clone(), extent_value.clone()],
+            ),
+            Ok(vec![expected.clone()]),
+        );
 
         // Known dimension arithmetic folds during partial evaluation while the two shape operations retain their
         // explicit extent inputs in the residual program.
@@ -3321,6 +3374,9 @@ mod tests {
         /// converting a value from one member kind into the other.
         GeometryMixed,
 
+        /// Checks a Boolean array condition with optional scalar array or dimension observations and no outputs.
+        AssertionToUnit,
+
         /// Forwards composite regions whose bodies may carry every admitted member kind.
         RegionForwarding,
     }
@@ -3340,6 +3396,7 @@ mod tests {
             ArrayIrOperation::Array(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
+            ArrayIrOperation::Assert(_) => MemberKindSignature::AssertionToUnit,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
             ArrayIrOperation::ReferenceDynamicIndex(_)
@@ -3390,7 +3447,8 @@ mod tests {
         // signature. Exactly two variants may turn a dimension value into array data (the explicit
         // `dimension_to_scalar` gateway and the deliberately composite-level dimension comparison) and exactly one may
         // turn array data into a dimension value (the checked `dimension_from_scalar` gateway). Everything else either
-        // stays inside one homogeneous member family, treats dimensions as geometry, or forwards regions.
+        // stays inside one homogeneous member family, treats dimensions as geometry, observes them in an assertion,
+        // or forwards regions.
         let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
             (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
             (ArrayIrOperation::One(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
@@ -3408,6 +3466,10 @@ mod tests {
             (
                 ArrayIrOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
                 MemberKindSignature::DimensionToArrayGateway,
+            ),
+            (
+                ArrayIrOperation::Assert(AssertOperation::new("dimensions must match")),
+                MemberKindSignature::AssertionToUnit,
             ),
             (
                 ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
@@ -3534,7 +3596,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 36);
+        assert_eq!(expected.len(), 37);
         assert_eq!(
             expected
                 .iter()
@@ -3547,6 +3609,10 @@ mod tests {
                 .iter()
                 .filter(|(_, signature)| *signature == MemberKindSignature::ArrayToDimensionGateway)
                 .count(),
+            1,
+        );
+        assert_eq!(
+            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::AssertionToUnit).count(),
             1,
         );
         assert_eq!(

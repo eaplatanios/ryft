@@ -9,8 +9,7 @@ use crate::kernels::gpu::Error;
 use crate::kernels::gpu::lowering::{KernelValue, Lowering, append};
 
 impl<'c, 't> Lowering<'c, 't> {
-    /// Lowers arithmetic whose canonical type bounds prove that no runtime assertion is necessary. Requirements and
-    /// potentially failing arithmetic are rejected until native device failure propagation is supported.
+    /// Lowers arithmetic whose canonical type bounds prove that no runtime assertion is necessary. Potentially failing arithmetic are rejected until native device failure propagation is supported.
     pub(super) fn dimension(
         &self,
         block: &mut DetachedBlock<'c, 't>,
@@ -36,7 +35,7 @@ impl<'c, 't> Lowering<'c, 't> {
             DimensionOperation::Rem(_) => append(block, arith::remui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Min(_) => append(block, arith::minui(inputs[0], inputs[1], self.location)?)?,
             DimensionOperation::Max(_) => append(block, arith::maxui(inputs[0], inputs[1], self.location)?)?,
-            DimensionOperation::Pow(_) | DimensionOperation::Requirement(_) => {
+            DimensionOperation::Pow(_) => {
                 return Err(Error::Unsupported {
                     operation: operation.name(),
                     reason: "dimension operation is outside the native arithmetic baseline".to_owned(),
@@ -90,8 +89,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::kernels::BoundaryPolicy;
     use ryft_core::{
-        Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionRequirementOperation,
-        DimensionSaturatingSubOperation, DimensionType, Placeholder, ProgramBuilder,
+        Array, ArrayIrType, ConstantOperation, DimensionAddOperation, DimensionBounds, DimensionSaturatingSubOperation,
+        DimensionSubOperation, DimensionType, Placeholder, ProgramBuilder,
     };
     use ryft_mlir::{Block, Context, Operation as MlirOperation, Value};
 
@@ -133,10 +132,9 @@ mod tests {
             .map(|operation| operation.unwrap().name().as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, ["arith.addi", "arith.maxui", "arith.subi", "arith.constant"]);
-        let requirement =
-            DimensionOperation::Requirement(DimensionRequirementOperation::equal(&left_type, &right_type));
-        assert!(matches!(lowering.dimension(&mut block, &requirement, &[left, right]),
-            Err(Error::Unsupported { operation: "dimension_requirement", reason })
+        let subtraction = DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap());
+        assert!(matches!(lowering.dimension(&mut block, &subtraction, &[left, right]),
+            Err(Error::Unsupported { operation: "dimension_sub", reason })
                 if reason == "runtime dimension assertions require native failure propagation"));
         assert_eq!(block.operations().unwrap().count(), 4);
     }

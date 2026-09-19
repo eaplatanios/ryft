@@ -399,13 +399,16 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
     )?;
     for (instruction_id, instruction) in kernel.definition().body().entry_region_ref().instructions_in_closure() {
         let supported = match instruction.operation() {
+            KernelOperation::Portable(ArrayIrOperation::Assert(_))
+            | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
+                return Err(Error::Unsupported {
+                    operation: "assert",
+                    reason: "runtime assertions require native failure propagation".to_owned(),
+                });
+            }
             KernelOperation::Portable(ArrayIrOperation::Array(_)) => true,
             KernelOperation::Portable(ArrayIrOperation::Dimension(operation)) => {
-                operation.effects().is_pure()
-                    && !matches!(
-                        operation,
-                        ryft_core::DimensionOperation::Pow(_) | ryft_core::DimensionOperation::Requirement(_)
-                    )
+                operation.effects().is_pure() && !matches!(operation, ryft_core::DimensionOperation::Pow(_))
             }
             KernelOperation::Portable(
                 ArrayIrOperation::DimensionFromScalar(_)
@@ -905,6 +908,13 @@ impl<'c, 't> Lowering<'c, 't> {
             let output_buffers = output_ids.iter().map(|id| self.storage.get(id).cloned()).collect::<Vec<_>>();
             let output = || output_buffers[0].as_ref().unwrap();
             let results = match instruction.operation() {
+                KernelOperation::Portable(ArrayIrOperation::Assert(_))
+                | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
+                    return Err(Error::Unsupported {
+                        operation: "assert",
+                        reason: "runtime assertions require native failure propagation".to_owned(),
+                    });
+                }
                 KernelOperation::Portable(ArrayIrOperation::Array(operation)) => {
                     let arrays = inputs.iter().map(|input| input.array().clone()).collect::<Vec<_>>();
                     if let Some(scratch) = self.instruction_scratch.get(&self.current_instruction.unwrap()).cloned() {
@@ -1623,6 +1633,30 @@ mod tests {
             matches!(validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
             Err(Error::Unsupported { operation: "sqrt", reason })
                 if reason == "operation or its metadata has no baseline scalar implementation")
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_assertions() {
+        let operation = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(ArrayType::scalar(DataType::Boolean), KernelParameterAccess::ReadOnly).unwrap()],
+        )
+        .unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            let predicate = references[0].read()?;
+            predicate.context().bind(
+                ArrayIrOperation::Assert(ryft_core::AssertOperation::new("check")),
+                vec![],
+                &[predicate.clone()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        assert!(
+            matches!(validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
+            Err(Error::Unsupported { operation: "assert", reason }) if reason == "runtime assertions require native failure propagation")
         );
     }
 

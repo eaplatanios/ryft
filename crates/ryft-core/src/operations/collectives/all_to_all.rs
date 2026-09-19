@@ -24,9 +24,11 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::assertions::Assert;
+use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
+use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
@@ -34,6 +36,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
+use crate::operations::math::rem::Rem;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -415,12 +418,13 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: DimensionSize
+    C::Value: Assert
+        + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -559,11 +563,12 @@ pub trait AllToAll: Sized {
 
 impl<V> AllToAll for V
 where
-    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + DimensionSize<V> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div + Mul,
+    <V as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div + Mul,
 {
     fn all_to_all_with_options(
         &self,
@@ -716,11 +721,13 @@ where
             (input_extents, P::collective_extent_constant(context, 1)?)
         }
         CollectiveMode::Tiled if operation.split_axis == operation.concat_axis => {
-            P::require_divisible_collective_extents(&output_extents[operation.split_axis], &axis_extent)?;
+            let axis_extent =
+                P::require_divisible_collective_extents(context, &output_extents[operation.split_axis], &axis_extent)?;
             (output_extents.clone(), output_extents[operation.split_axis].div(&axis_extent)?)
         }
         CollectiveMode::Tiled => {
-            P::require_divisible_collective_extents(&output_extents[operation.concat_axis], &axis_extent)?;
+            let axis_extent =
+                P::require_divisible_collective_extents(context, &output_extents[operation.concat_axis], &axis_extent)?;
             let mut input_extents = output_extents.clone();
             input_extents[operation.split_axis] = output_extents[operation.split_axis].mul(&axis_extent)?;
             input_extents[operation.concat_axis] = output_extents[operation.concat_axis].div(&axis_extent)?;
@@ -1011,15 +1018,27 @@ mod tests {
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, input_split, input_concat], \
                     %2:dimension<output_split ∈ [1, 65)>, %3:dimension<output_concat ∈ [1, 129)> .
                 let %4:dimension<4> = constant [value=4]
-                    () = dimension_requirement [predicate=Equal] %0 %4
-                    () = dimension_requirement [predicate=DivisibleBy] %3 %0
-                    %5:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
-                    %6:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
-                    %7:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %6
-                    %8:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %7
-                    %9:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %8
-                    %10:f32[batch, output_split, output_concat] = reshape %9 %0 %2 %3
-                in (%10)
+                    %5:bool[] = compare [direction=Equal] %0 %4
+                    () = assert [
+                        message=\"collective axis extent must match the participant count\",
+                        labels=[\"extent\", \"participants\"],
+                    ] %5 %0 %4
+                    %6:dimension<0> = constant [value=0]
+                    %7:dimension<1> = constant [value=1]
+                    %8:bool[] = const true
+                    %9:dimension<output_concat % batch ∈ [0, 8)> = dimension_rem %3 %0
+                    %10:bool[] = compare [direction=Equal] %9 %6
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %10 %3 %0
+                    %11:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
+                    %12:dimension<output_concat / batch ∈ [0, 129)> = dimension_div %3 %0
+                    %13:f32[batch, batch, output_split, output_concat / batch] = reshape %1 %0 %0 %2 %12
+                    %14:f32[batch, batch, output_split, output_concat / batch] = transpose [permutation=[1, 0, 2, 3]] %13
+                    %15:f32[batch, output_split, batch, output_concat / batch] = transpose [permutation=[0, 2, 1, 3]] %14
+                    %16:f32[batch, output_split, output_concat] = reshape %15 %0 %2 %3
+                in (%16)
             "}
             .trim_end(),
         );

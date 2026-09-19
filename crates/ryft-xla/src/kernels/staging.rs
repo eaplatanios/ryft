@@ -684,6 +684,9 @@ fn definition_from_body(
                         Atom::Constant(XlaConstant::Dimension(value)) => {
                             Atom::Constant(ArrayIrValue::<CpuArray>::Dimension(value.clone()))
                         }
+                        Atom::Constant(XlaConstant::Boolean(value)) => {
+                            Atom::Constant(ArrayIrValue::Array(CpuArray::scalar(*value)?))
+                        }
                         Atom::Constant(XlaConstant::Captured(_)) => {
                             return Err(ProgramError::MalformedProgram(
                                 "kernel body cannot capture an external XLA value".to_owned(),
@@ -1664,10 +1667,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stage_kernel_with_fallback_rejects_observable_primal_effects() {
-        use ryft_core::{
-            DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionType, DimensionValue,
-            ProgramBuilder,
-        };
+        use ryft_core::{ArrayIrOperation, AssertOperation, ProgramBuilder};
 
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
@@ -1675,16 +1675,11 @@ pub(crate) mod tests {
         let inputs =
             definition.body().input_types().into_iter().map(|r#type| body.add_input(r#type)).collect::<Vec<_>>();
         body.splice_program(definition.body(), &inputs).unwrap();
-        let variable = DimensionType::new("checked", DimensionBounds::non_negative(Some(2)).unwrap());
-        let left = DimensionValue::new(variable.clone(), 0).unwrap();
-        let right = DimensionValue::constant(1).unwrap();
-        let requirement = DimensionRequirementOperation::equal(&variable, right.r#type().as_ref());
-        let left = body.add_constant(ArrayIrValue::Dimension(left));
-        let right = body.add_constant(ArrayIrValue::Dimension(right));
+        let predicate = body.add_constant(ArrayIrValue::Array(CpuArray::scalar(false).unwrap()));
         body.add_instruction(
-            KernelOperation::from(DimensionOperation::Requirement(requirement)),
+            KernelOperation::from(ArrayIrOperation::Assert(AssertOperation::new("check"))),
             vec![],
-            vec![left, right],
+            vec![predicate],
             None,
         )
         .unwrap();

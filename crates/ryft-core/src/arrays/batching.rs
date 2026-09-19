@@ -34,8 +34,8 @@ use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, V
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
-    AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
-    DimensionConstant, DimensionRequirement, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
+    AndOperation, Assert, Broadcast, BroadcastOperation, Compare, CompareOperation, ComparisonDirection,
+    ConstantOperation, DimensionConstant, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
     DynamicBroadcastOperation, ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose,
     TransposeOperation, ZeroLikeOperation,
 };
@@ -2817,9 +2817,10 @@ where
 impl<C: Context<Type = ArrayIrType>> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
     C::Value: DimensionSize
+        + Assert
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
+        + ValueProjection<DimensionType, Projected: Compare<C::Value>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -2908,11 +2909,16 @@ where
             };
 
             if let Some(axis_extent) = &axis_extent {
-                // Binding the requirement through the dimension member, rather than comparing on the host, lets
-                // the same check fold against concrete extents under eager batching and stay staged as a runtime
-                // requirement when either extent is symbolic.
+                // Dimension comparisons fold known relationships and retain an assertion when either extent is symbolic.
                 <C::Value as ValueProjection<DimensionType>>::into_projected(axis_extent.clone())?
-                    .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(input_extent)?)?;
+                    .compare(
+                        &<C::Value as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?,
+                        ComparisonDirection::Equal,
+                    )?
+                    .assert(
+                        "batch dimensions must agree",
+                        &[("expected", axis_extent.clone()), ("actual", input_extent)],
+                    )?;
             } else {
                 axis_extent = Some(input_extent);
             }
@@ -6895,7 +6901,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(mismatched.to_string(), "3 == size(axis=0); observed 3=3, size(axis=0)=2");
+        assert_eq!(
+            mismatched.to_string(),
+            r#"assertion failed: batch dimensions must agree; observations=[("expected", "3"), ("actual", "2")]"#,
+        );
 
         // A mapped reference whose referent has a dynamic extent at the batch axis cannot supply the mapped extent
         // itself, so a mapped array must expose that same dimension identity regardless of input order. Arrays are
@@ -6997,12 +7006,16 @@ mod tests {
         let mismatched =
             pack_inputs(&trace, vec![reference, array], vec![BatchAxis::new(0); 2], BatchAxisSpecification::default())
                 .unwrap_err();
-        assert!(matches!(mismatched, BatchingError::Program(ProgramError::Type(TypeError::Custom(_)))));
-        assert_eq!(mismatched.to_string(), "2 == 4; observed 2=2, 4=4");
+        assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
+        assert_eq!(
+            mismatched.to_string(),
+            r#"assertion failed: batch dimensions must agree; \
+               observations=[("expected", "<unknown>"), ("actual", "<unknown>")]"#,
+        );
 
         // A mapped reference contributes its referent's batch-axis placement to the sharding join, so a mapped array
         // whose placement is only replicated is renormalized onto the reference's placement. Both mapped extents fold
-        // to exact constants (checked against each other by the ordered requirement), and the renormalizing broadcast
+        // to equal exact constants, so their comparison and assertion fold away, and the renormalizing broadcast
         // takes the transform's extent at the mapped axis while folding the statically known axis into an exact
         // constant rather than a `dimension_size` read.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -7038,11 +7051,11 @@ mod tests {
                     %1:f32[2, 3][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
                 let %2:dimension<2> = constant [value=2]
                     %3:dimension<2> = constant [value=2]
-                    () = dimension_requirement [predicate=Equal] %2 %3
-                    %4:dimension<3> = constant [value=3]
-                    %5:f32[2, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = broadcast [output_axes=[0, 1], \
-                        output_sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] %1 %2 %4
-                in (%5)
+                    %4:bool[] = const true
+                    %5:dimension<3> = constant [value=3]
+                    %6:f32[2, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = \
+                        broadcast [output_axes=[0, 1], output_sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] %1 %2 %5
+                in (%6)
             "}
             .trim_end(),
         );
@@ -8653,7 +8666,10 @@ mod tests {
             batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(0), mismatched_extent);
         let mismatched = mismatched.unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
-        assert_eq!(mismatched.to_string(), "3 == size(axis=0); observed 3=3, size(axis=0)=2");
+        assert_eq!(
+            mismatched.to_string(),
+            r#"assertion failed: batch dimensions must agree; observations=[("expected", "3"), ("actual", "2")]"#,
+        );
 
         // A first-class dimension itself cannot be declared mapped at the transform boundary.
         let mapped_input: Result<ArrayIrValue<Array>, BatchingError> = batch(

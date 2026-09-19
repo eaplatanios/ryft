@@ -31,6 +31,13 @@ define_dimension_arithmetic_operation!(
         let requires_runtime_assertion = right.maximum_extent().is_none_or(|right| left.bounds().lower() < right);
         Ok((bounds, requires_runtime_assertion))
     },
+    fold = |_left: &DimensionType, right: &DimensionType| {
+        if right.extent() == Some(0) {
+            Some(vec![0])
+        } else {
+            None
+        }
+    },
     provider = SubOperation<DimensionType>,
 );
 
@@ -99,10 +106,13 @@ impl std::ops::Sub<&DimensionValue> for &DimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
-    use crate::programs::{EffectClass, EffectClasses};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};
 
     use super::*;
 
@@ -157,5 +167,53 @@ mod tests {
         let left = DimensionValue::new(left_type, 1).unwrap();
         let right = DimensionValue::new(right_type, 3).unwrap();
         let _ = left - right;
+    }
+
+    #[test]
+    fn test_dimension_sub_partial_evaluation_identity() {
+        let input_types = [
+            DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+            DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            DimensionValue::constant(1).unwrap().r#type().into_owned(),
+        ];
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = [(0, 1)]
+            .into_iter()
+            .map(|(left, right)| {
+                builder
+                    .add_instruction(
+                        DimensionSubOperation::new(&input_types[left], &input_types[right]).unwrap(),
+                        Vec::new(),
+                        vec![inputs[left], inputs[right]],
+                        None,
+                    )
+                    .unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let output_count = outputs.len();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                outputs,
+                vec![Placeholder; 3],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                let %3:dimension<value - 0 ∈ [2, 9)> = dimension_sub %0 %1
+                in (%3)"},
+        );
+        let evaluation = program
+            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                in (%0)"},
+        );
     }
 }

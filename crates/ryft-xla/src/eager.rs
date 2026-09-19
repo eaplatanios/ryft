@@ -1,9 +1,9 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Add, AndOperation, ArrayIrType, ArrayOperation, Broadcast, Concretizable, Context, DataType, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType, DimensionValue,
-    DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError, Select, Sub,
-    Typed, Value, WhilePredicate, XorOperation,
+    Add, AndOperation, ArrayIrType, ArrayOperation, AssertionValue, Broadcast, Concretizable, Context, DataType,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
+    DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
+    Select, Sub, Typed, Value, WhilePredicate, XorOperation,
 };
 
 use crate::experimental::ops::XlaArrayConstant;
@@ -81,6 +81,18 @@ impl Concretizable<i128> for Array<'_> {
         // Decode through the CPU capability to preserve every signed and unsigned integer value. Rank-zero
         // arrays are replicated, so reading one addressable shard provides the complete scalar.
         ryft_core::Array::new(self.r#type().into_owned(), shard_host_bytes(shard)?)?.concretize()
+    }
+}
+
+impl AssertionValue for Array<'_> {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
+            message: format!(
+                "cannot read an assertion observation from an array of type `{}` with no addressable shards",
+                self.r#type()
+            ),
+        })?;
+        ryft_core::Array::new(self.r#type().into_owned(), shard_host_bytes(shard)?)?.assertion_observation()
     }
 }
 

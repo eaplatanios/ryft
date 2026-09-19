@@ -4648,6 +4648,46 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialization_retains_assertions_only_in_forward() {
+        use crate::operations::{Assert, AssertionError, Compare, ZeroLike};
+
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                input
+                    .greater_than(&input.zero_like()?)?
+                    .assert("input must be positive", &[("input", input.clone())])?;
+                Ok(input.clone() * input)
+            },
+        );
+        let operation = staged_operation(&function, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            operation
+                .forward()
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == "assert")
+                .count(),
+            1
+        );
+        assert!(!operation.backward().effects().classes().contains(EffectClass::OrderedAssertion));
+        assert!(!operation.tangent().effects().classes().contains(EffectClass::OrderedAssertion));
+        let error = operation.forward().interpret(vec![Array::scalar(-1.0_f64).unwrap()]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "input must be positive".to_owned(),
+                observations: vec![("input".to_owned(), "-1".to_owned())],
+            })
+        );
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .differentiate_at(Array::scalar(2.0_f64).unwrap())
+            .value_and_gradient(|input| function.call(input).unwrap())
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![4.0]);
+        assert_eq!(gradient.to_f64s(), vec![4.0]);
+    }
+
+    #[test]
     fn test_residual_slice_is_recomputable() {
         // An opaque ordered-state operation is not a reference lifecycle: classification sees its effect through the
         // pure residual root and therefore must upgrade that root from recompute to save. This is the exact predicate

@@ -106,7 +106,8 @@ impl Concretizable<usize> for DimensionValue {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::operations::{Add, DimensionRequirement, Div, Rem, Sub};
+    use crate::arrays::arrays::Array;
+    use crate::operations::{Add, Assert, Compare, Div, Rem, Sub};
 
     use super::*;
 
@@ -139,7 +140,8 @@ mod tests {
         let left = DimensionValue::constant(7).unwrap();
         let right = DimensionValue::constant(3).unwrap();
         assert_eq!(left.add(&right).unwrap().extent(), 10);
-        left.require_less_than_or_equal(&DimensionValue::constant(8).unwrap()).unwrap();
+        let predicate: Array = left.less_than_or_equal(&DimensionValue::constant(8).unwrap()).unwrap();
+        predicate.assert("dimension is at most `8`", &[]).unwrap();
 
         // Concrete capabilities derive fresh result types from their operands without exposing IR operations in the
         // value-level API.

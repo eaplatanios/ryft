@@ -867,8 +867,8 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             let provenance = self.provenance();
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, region_ids, inputs, Some(provenance)) {
-                    Ok(outputs) => outputs.to_vec(),
+                match builder.add_instruction_or_fold(operation, region_ids, inputs, Some(provenance)) {
+                    Ok(outputs) => outputs,
                     Err(error) => {
                         if builder.error.is_none() {
                             builder.error = Some(error.clone());

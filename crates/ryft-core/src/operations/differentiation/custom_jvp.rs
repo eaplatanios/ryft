@@ -689,6 +689,7 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{Differentiate, DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -1229,6 +1230,75 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(2.0_f32).unwrap()),
         ];
         assert_eq!(jvp.interpret(inputs.clone()), Ok(inputs));
+    }
+
+    #[test]
+    fn test_custom_jvp_replays_dormant_assertions() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut primal = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = primal.add_input(scalar_type.clone());
+        let primal = primal.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut rule = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = rule.add_input(scalar_type.clone());
+        let tangent = rule.add_input(scalar_type.clone());
+        let zero = rule.add_constant(Array::scalar(0.0_f32).unwrap());
+        let predicate = rule
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![input, zero],
+                None,
+            )
+            .unwrap()[0];
+        rule.add_instruction(
+            AssertOperation::new("custom derivative requires positive input").with_labels(vec!["input".to_owned()]),
+            Vec::new(),
+            vec![predicate, input],
+            None,
+        )
+        .unwrap();
+        let rule = rule
+            .build::<Vec<Array>, Vec<Array>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let regions = [primal, rule]
+            .iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
+        let input = builder.add_input(scalar_type);
+        let outputs = builder.add_instruction(CustomJvpOperation::new(), regions, vec![input], None).unwrap().to_vec();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Dormant derivative rules do not contribute execution effects to the primal call.
+        assert_eq!(program.effects().classes(), EffectClasses::NONE);
+        assert_eq!(
+            program.interpret(vec![Array::scalar(-1.0_f32).unwrap()]),
+            Ok(vec![Array::scalar(-1.0_f32).unwrap()])
+        );
+        let differentiated = program.jvp().unwrap();
+        assert_eq!(differentiated.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_eq!(
+            differentiated
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == "assert")
+                .count(),
+            1
+        );
+        assert_eq!(
+            differentiated.interpret(vec![Array::scalar(1.0_f32).unwrap(), Array::scalar(2.0_f32).unwrap()]),
+            Ok(vec![Array::scalar(1.0_f32).unwrap(), Array::scalar(2.0_f32).unwrap()])
+        );
+        let error = differentiated
+            .interpret(vec![Array::scalar(-1.0_f32).unwrap(), Array::scalar(2.0_f32).unwrap()])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "custom derivative requires positive input".to_owned(),
+                observations: vec![("input".to_owned(), "-1".to_owned())],
+            })
+        );
     }
 
     #[test]

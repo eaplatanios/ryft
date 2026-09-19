@@ -122,7 +122,7 @@ pub use effects::{
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{
-    MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider,
+    MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider, fold_projected_operation,
     infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};

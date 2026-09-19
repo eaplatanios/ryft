@@ -24,11 +24,13 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::assertions::Assert;
+use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
+use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
@@ -37,6 +39,7 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
+use crate::operations::math::rem::Rem;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -457,12 +460,13 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: DimensionSize
+    C::Value: Assert
+        + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -747,7 +751,7 @@ pub trait AllGather: Sized {
 
 impl<V> AllGather for V
 where
-    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + DimensionSize<V> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<AllGatherOperation>,
@@ -1018,7 +1022,8 @@ where
             input_extents.remove(operation.concat_axis);
         }
         CollectiveMode::Tiled => {
-            P::require_divisible_collective_extents(&output_extents[operation.concat_axis], &axis_extent)?;
+            let axis_extent =
+                P::require_divisible_collective_extents(context, &output_extents[operation.concat_axis], &axis_extent)?;
             input_extents[operation.concat_axis] = output_extents[operation.concat_axis].div(&axis_extent)?;
         }
     }
@@ -1645,13 +1650,25 @@ mod tests {
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[sequence, width], %2:dimension<gathered ∈ [1, 65)>, \
                     %3:dimension<width ∈ [1, 33)> .
                 let %4:dimension<4> = constant [value=4]
-                    () = dimension_requirement [predicate=Equal] %0 %4
-                    () = dimension_requirement [predicate=DivisibleBy] %2 %0
-                    %5:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
-                    %6:f32[gathered / batch, width] = reshape %1 %5 %3
-                    %7:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %6 %0 %5 %3
-                    %8:f32[gathered, width] = reshape %7 %2 %3
-                in (%8)
+                    %5:bool[] = compare [direction=Equal] %0 %4
+                    () = assert [
+                        message=\"collective axis extent must match the participant count\",
+                        labels=[\"extent\", \"participants\"],
+                    ] %5 %0 %4
+                    %6:dimension<0> = constant [value=0]
+                    %7:dimension<1> = constant [value=1]
+                    %8:bool[] = const true
+                    %9:dimension<gathered % batch ∈ [0, 8)> = dimension_rem %2 %0
+                    %10:bool[] = compare [direction=Equal] %9 %6
+                    () = assert [
+                        message=\"collective extent must be divisible by the participant count\",
+                        labels=[\"extent\", \"divisor\"],
+                    ] %10 %2 %0
+                    %11:dimension<gathered / batch ∈ [0, 65)> = dimension_div %2 %0
+                    %12:f32[gathered / batch, width] = reshape %1 %11 %3
+                    %13:f32[batch, gathered / batch, width] = broadcast [output_axes=[1, 2]] %12 %0 %11 %3
+                    %14:f32[gathered, width] = reshape %13 %2 %3
+                in (%14)
             "}
             .trim_end(),
         );

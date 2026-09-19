@@ -599,6 +599,10 @@ impl<'c, 't> Lowering<'c, 't> {
             let location = self.location;
             let native = |position: usize| inputs[position].native();
             let results = match instruction.operation() {
+                KernelOperation::Portable(ArrayIrOperation::Assert(_))
+                | KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Assert(_))) => {
+                    return Err(unsupported("assert", "runtime assertions require native failure propagation"));
+                }
                 KernelOperation::Portable(ArrayIrOperation::Array(operation)) => {
                     let array_types = input_types
                         .iter()
@@ -1284,6 +1288,40 @@ mod tests {
             .map(|operation| operation.unwrap().name().as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["arith.constant", "arith.cmpi", "scf.if", "scf.condition"]);
+    }
+
+    #[test]
+    fn test_lowering_rejects_assertions() {
+        for operation in [
+            ArrayIrOperation::Assert(ryft_core::AssertOperation::new("check")),
+            ArrayIrOperation::Array(ArrayOperation::Assert(ryft_core::AssertOperation::new("check"))),
+        ] {
+            let mut builder = ryft_core::ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            builder
+                .add_instruction(KernelOperation::Portable(operation), vec![], vec![predicate], None)
+                .unwrap();
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![],
+                    vec![ryft_core::Placeholder],
+                    vec![],
+                )
+                .unwrap();
+            let context = Context::new();
+            let mut lowering = Lowering {
+                context: &context,
+                location: context.unknown_location(),
+                remaining: 100,
+                maximum_tile_elements: 1024,
+            };
+            let mut block = context.block_with_no_arguments();
+            let predicate = lowering.boolean(&mut block, true).unwrap();
+            assert!(
+                matches!(lowering.region(&mut block, program.entry_region_ref(), &[LoweringValue::Native(predicate)]),
+                Err(Error::Unsupported { operation: "assert", reason }) if reason == "runtime assertions require native failure propagation")
+            );
+        }
     }
 
     #[test]

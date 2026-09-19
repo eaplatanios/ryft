@@ -24,6 +24,13 @@ define_dimension_arithmetic_operation!(
         )?;
         Ok((bounds, false))
     },
+    fold = |left: &DimensionType, right: &DimensionType| {
+        if right.extent() == Some(0) || left.extent() == Some(0) {
+            Some(vec![0])
+        } else {
+            None
+        }
+    },
     capability = {
         /// Subtracts one runtime dimension from another, saturating at zero instead of producing a negative output.
         ///
@@ -61,10 +68,12 @@ impl DimensionSaturatingSub for DimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
     use crate::programs::EffectClasses;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -93,6 +102,27 @@ mod tests {
                 .unwrap()
                 .extent(),
             0,
+        );
+    }
+
+    #[test]
+    fn test_dimension_saturating_sub_identity() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(value, zero, _one)| {
+                Ok(vec![value.dimension_saturating_sub(&zero)?, zero.dimension_saturating_sub(&value)?])
+            },
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                in (%0, %1)"},
         );
     }
 }

@@ -18,17 +18,17 @@ use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView,
-    ArrayReferenceViewOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
-    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
-    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CompareOperation, CompiledCallOperation,
-    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
-    CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeLogSumExpOperation,
-    CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
-    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    ArrayReferenceViewOperation, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CompareOperation,
+    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
+    ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations,
+    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
+    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
+    DimensionRemOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
     ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
@@ -55,12 +55,111 @@ use ryft_macros::Parameter;
 use crate::experimental::operations::ShardMapOperation;
 use crate::kernels::XlaKernelOperation;
 
-/// Lifetime-free reference to an array member captured by an XLA program.
-pub type XlaArrayConstant = CaptureReference<ArrayType>;
+/// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table; Boolean
+/// literals preserve dimension-comparison proofs without allocating device storage or introducing a capture.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum XlaArrayConstant {
+    /// A reference to array data in the enclosing capture table.
+    Captured(CaptureReference<ArrayType>),
+
+    /// An immediate scalar Boolean predicate.
+    Boolean(bool),
+}
+
+impl From<CaptureReference<ArrayType>> for XlaArrayConstant {
+    fn from(value: CaptureReference<ArrayType>) -> Self {
+        Self::Captured(value)
+    }
+}
+
+impl TryFrom<bool> for XlaArrayConstant {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
+    }
+}
+
+impl Display for XlaArrayConstant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Boolean(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl Typed for XlaArrayConstant {
+    type Type = ArrayType;
+
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        match self {
+            Self::Captured(value) => value.r#type(),
+            Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean)),
+        }
+    }
+}
+
+impl Value for XlaArrayConstant {
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
+
+    fn dispatch_domain(&self) -> Self::DispatchDomain {
+        EagerContext::new()
+    }
+
+    fn execution_domain(&self) -> Self::ExecutionDomain {
+        EagerContext::new()
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match self {
+            Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Boolean(value) => Ok(Self::Boolean(*value)),
+        }
+    }
+
+    fn capture_index(&self) -> Option<usize> {
+        match self {
+            Self::Captured(value) => Some(value.index()),
+            Self::Boolean(_) => None,
+        }
+    }
+}
+
+impl CaptureConstant for XlaArrayConstant {
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+        match self {
+            Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Boolean(value) => Self::Boolean(*value),
+        }
+    }
+}
+
+impl Concretizable<bool> for XlaArrayConstant {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Captured(value) => value.concretize(),
+            Self::Boolean(value) => Ok(*value),
+        }
+    }
+}
+
+impl AssertionValue for XlaArrayConstant {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Captured(value) => value.assertion_observation(),
+            Self::Boolean(value) => Ok(value.to_string()),
+        }
+    }
+}
 
 /// Constant payload stored in the atom table of a staged XLA [`Program`].
 ///
-/// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
+/// Staged XLA programs keep three kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
 ///   - **Captured runtime values:** array buffers and external references stay in the surrounding
@@ -72,6 +171,8 @@ pub type XlaArrayConstant = CaptureReference<ArrayType>;
 ///     a nested region — most importantly a `shard_map` manual computation, which owns no capture table of its own —
 ///     and that is what lets shape arithmetic such as the explicit result extents of the collectives be staged
 ///     against a manual region's shard-local values.
+///   - **Immediate Boolean predicates:** static dimension proofs remain concrete through array projection, logical
+///     composition, and assertion folding without requiring a captured device buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum XlaConstant {
     /// Reference to a value held in the surrounding compiled function's capture table.
@@ -79,6 +180,9 @@ pub enum XlaConstant {
 
     /// Immediate checked host-side first-class dimension extent.
     Dimension(DimensionValue),
+
+    /// Immediate scalar Boolean predicate.
+    Boolean(bool),
 }
 
 impl Display for XlaConstant {
@@ -87,6 +191,7 @@ impl Display for XlaConstant {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
             Self::Dimension(value) => Display::fmt(value, formatter),
+            Self::Boolean(value) => Display::fmt(value, formatter),
         }
     }
 }
@@ -99,6 +204,7 @@ impl Typed for XlaConstant {
         match self {
             Self::Captured(value) => value.r#type(),
             Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
+            Self::Boolean(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean).into()),
         }
     }
 }
@@ -125,6 +231,7 @@ impl Value for XlaConstant {
         match self {
             Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
+            Self::Boolean(value) => Ok(Self::Boolean(*value)),
         }
     }
 
@@ -132,7 +239,7 @@ impl Value for XlaConstant {
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
-            Self::Dimension(_) => None,
+            Self::Dimension(_) | Self::Boolean(_) => None,
         }
     }
 }
@@ -143,6 +250,7 @@ impl CaptureConstant for XlaConstant {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
             Self::Dimension(value) => Self::Dimension(value.clone()),
+            Self::Boolean(value) => Self::Boolean(*value),
         }
     }
 }
@@ -153,7 +261,10 @@ impl ValueProjection<ArrayType> for XlaConstant {
 
     #[inline]
     fn from_projected(value: XlaArrayConstant) -> Self {
-        Self::Captured(ValueProjection::<ArrayType>::from_projected(value))
+        match value {
+            XlaArrayConstant::Captured(value) => Self::Captured(ValueProjection::<ArrayType>::from_projected(value)),
+            XlaArrayConstant::Boolean(value) => Self::Boolean(value),
+        }
     }
 
     #[inline]
@@ -167,7 +278,8 @@ impl ValueProjection<ArrayType> for XlaConstant {
     #[inline]
     fn into_projected(self) -> Result<XlaArrayConstant, TypeError> {
         match self {
-            Self::Captured(value) => value.into_projected(),
+            Self::Captured(value) => value.into_projected().map(XlaArrayConstant::Captured),
+            Self::Boolean(value) => Ok(XlaArrayConstant::Boolean(value)),
             Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
         }
     }
@@ -189,6 +301,7 @@ impl ValueProjection<DimensionType> for XlaConstant {
     {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
             Self::Dimension(value) => Ok(value),
         }
     }
@@ -197,6 +310,7 @@ impl ValueProjection<DimensionType> for XlaConstant {
     fn into_projected(self) -> Result<DimensionValue, TypeError> {
         match self {
             Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Boolean(_) => Err(TypeError::invalid("expected a dimension but got a Boolean array")),
             Self::Dimension(value) => Ok(value),
         }
     }
@@ -216,15 +330,34 @@ impl From<DimensionValue> for XlaConstant {
     }
 }
 
-// A captured constant is a reference into a side table rather than the concrete predicate value itself, and an
-// immediate dimension is an extent rather than Boolean array data, and so neither variant can be read back as a
-// concrete predicate. Control-flow staging must keep predicates in the IR or add a transform-specific rule instead.
+impl TryFrom<bool> for XlaConstant {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
+    }
+}
+
 impl Concretizable<bool> for XlaConstant {
-    #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
-        Err(ProgramError::Concretization {
-            message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
-        })
+        match self {
+            Self::Boolean(value) => Ok(*value),
+            _ => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
+            }),
+        }
+    }
+}
+
+impl AssertionValue for XlaConstant {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Dimension(value) => Ok(value.extent().to_string()),
+            Self::Boolean(value) => Ok(value.to_string()),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a captured constant reference".to_owned(),
+            }),
+        }
     }
 }
 
@@ -277,6 +410,9 @@ where
 
     /// Mixed comparison of two dimensions producing Boolean array data.
     Compare(CompareOperation<ArrayIrType>),
+
+    /// Ordered assertion with optional scalar diagnostic inputs.
+    Assert(AssertOperation<ArrayIrType>),
 
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
@@ -484,6 +620,7 @@ where
             ArrayIrOperation::Array(operation) => Self::Array(operation),
             ArrayIrOperation::Dimension(operation) => Self::Dimension(operation),
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
+            ArrayIrOperation::Assert(operation) => Self::Assert(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
             ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
@@ -542,16 +679,6 @@ where
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
         }
-    }
-}
-
-impl<Constant> From<DimensionRequirementOperation> for XlaOperation<Constant>
-where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: DimensionRequirementOperation) -> Self {
-        Self::Dimension(DimensionOperation::Requirement(operation))
     }
 }
 
@@ -699,6 +826,8 @@ impl_array_operation_conversion!(
     PrintOperation<ArrayType>,
 );
 
+impl_array_operation_conversion!(AssertOperation<ArrayType>);
+
 impl<Constant> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -749,6 +878,7 @@ where
             Self::Array(operation) => ArrayIrOperation::Array(operation.clone()),
             Self::Dimension(operation) => ArrayIrOperation::Dimension(operation.clone()),
             Self::Compare(operation) => ArrayIrOperation::Compare(operation.clone()),
+            Self::Assert(operation) => ArrayIrOperation::Assert(operation.clone()),
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
             Self::ReferenceNew(operation) => ArrayIrOperation::ReferenceNew(*operation),
             Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
@@ -1507,10 +1637,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, CaptureReference, CapturingContext, ConditionOperation,
+        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Assert, AssertOperation, AssertionError,
+        CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation,
         Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
         DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClass,
         EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
         MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
         ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
@@ -1519,7 +1650,7 @@ mod tests {
         ReferenceViewValidationError, ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef,
         RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
         StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
-        ValueProjection, WhileOperation, ZeroOperation,
+        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1644,13 +1775,52 @@ mod tests {
     }
 
     #[test]
+    fn test_xla_dimension_assertion_proofs() {
+        let dimension_type = DimensionType::new("extent", DimensionBounds::unbounded());
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let dimension = context.input(dimension_type.clone().into());
+        let dimension = ValueProjection::<DimensionType>::into_projected(dimension).unwrap();
+        let predicate = dimension.equal(&dimension).unwrap();
+        assert!(matches!(context.resolve(&predicate), ValueResolution::Constant(XlaConstant::Boolean(true))));
+        predicate.assert("identity must agree", &[]).unwrap();
+        let predicate = dimension.not_equal(&dimension).unwrap();
+        assert!(
+            matches!(predicate.assert("identity must differ", &[]).unwrap_err().downcast_custom::<AssertionError>(),
+            Some(AssertionError::Failed { message, observations }) if message == "identity must differ" && observations.is_empty())
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        let mut builder = XlaProgramBuilder::new();
+        let dimension = builder.add_input(dimension_type.clone().into());
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                vec![],
+                vec![dimension, dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(AssertOperation::<ArrayIrType>::new("identity must agree"), vec![], vec![predicate], None)
+            .unwrap();
+        let program = builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let evaluation = program
+            .partially_evaluate_in_context(&context, &[PartialValue::Unknown(dimension_type.into())])
+            .unwrap();
+        assert_eq!(evaluation.program().effects().classes(), EffectClasses::NONE);
+        assert!(evaluation.program().instructions().is_empty());
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
     fn test_xla_constant() {
         let array_type = vector_type();
         let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let extent = DimensionValue::new(extent_type.clone(), 4).unwrap();
 
-        // Both variants are reachable through the payload conversions, report their own member type, and render
+        // Captures and dimensions are reachable through their payload conversions, report their member type, and render
         // exactly like the payload they wrap.
         let captured = XlaConstant::from(capture.clone());
         let immediate = XlaConstant::from(extent.clone());
@@ -1660,6 +1830,20 @@ mod tests {
         assert_eq!(immediate.r#type().into_owned(), ArrayIrType::Dimension(extent_type));
         assert_eq!(captured.to_string(), "capture#2:f64[4]");
         assert_eq!(immediate.to_string(), extent.to_string());
+
+        let predicate = XlaConstant::try_from(true).unwrap();
+        assert_eq!(predicate, XlaConstant::Boolean(true));
+        assert_eq!(predicate.r#type().into_owned(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        assert_eq!(predicate.to_string(), "true");
+        assert_eq!(ryft_core::Concretizable::<bool>::concretize(&predicate), Ok(true));
+        assert_eq!(predicate.capture_index(), None);
+        assert_eq!(predicate.map_capture_index(|_| 99), predicate);
+        let projected = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
+        assert_eq!(projected, XlaArrayConstant::Boolean(true));
+        assert_eq!(ryft_core::Concretizable::<bool>::concretize(&projected), Ok(true));
+        assert_eq!(projected.capture_index(), None);
+        assert_eq!(projected.map_capture_index(|_| 99), projected);
+        assert_eq!(<XlaConstant as ValueProjection<ArrayType>>::from_projected(projected), predicate);
 
         // Only the captured variant names a capture-table slot, and so only it is renumbered by capture bookkeeping.
         // An immediate is index-free and passes through every remapping unchanged.
@@ -1675,14 +1859,16 @@ mod tests {
         // and reject the other one.
         assert_eq!(
             <XlaConstant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
-            Ok(XlaArrayConstant::new(2, array_type.clone())),
+            Ok(XlaArrayConstant::Captured(CaptureReference::new(2, array_type.clone()))),
         );
         assert_eq!(
             <XlaConstant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         assert_eq!(
-            <XlaConstant as ValueProjection<ArrayType>>::from_projected(XlaArrayConstant::new(2, array_type)),
+            <XlaConstant as ValueProjection<ArrayType>>::from_projected(XlaArrayConstant::Captured(
+                CaptureReference::new(2, array_type)
+            )),
             captured,
         );
         assert_eq!(<XlaConstant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));

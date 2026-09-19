@@ -50,6 +50,16 @@ define_dimension_arithmetic_operation!(
             .is_none_or(|output| output > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
+    fold = |left: &DimensionType, right: &DimensionType| {
+        if right.extent() == Some(1)
+            || left.extent() == Some(1)
+            || (left.extent() == Some(0) && right.bounds().lower() > 0)
+        {
+            Some(vec![0])
+        } else {
+            None
+        }
+    },
     capability = {
         /// Raises one [`DimensionValue`] to another [`DimensionValue`]'s power using checked integer exponentiation.
         ///
@@ -113,10 +123,12 @@ fn checked_power(mut base: usize, mut exponent: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
     use crate::programs::{EffectClass, EffectClasses};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -156,5 +168,43 @@ mod tests {
                 .extent(),
             81,
         );
+    }
+
+    #[test]
+    fn test_dimension_pow_identity() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |(value, zero, one)| {
+                Ok(vec![value.dimension_pow(&one)?, one.dimension_pow(&value)?, zero.dimension_pow(&value)?])
+            },
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+                DimensionValue::constant(1).unwrap().r#type().into_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                in (%0, %2, %1)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_pow_identity_preserves_zero_exponent() {
+        let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+            |zero| zero.dimension_pow(&zero),
+            DimensionValue::constant(0).unwrap().r#type().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<0> .
+                let %1:dimension<1> = dimension_pow %0 %0
+                in (%1)"},
+        );
+        assert_eq!(program.interpret(DimensionValue::constant(0).unwrap()).unwrap().extent(), 1);
     }
 }

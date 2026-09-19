@@ -32,7 +32,6 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::references::forwarded_tangent;
 use crate::operations::{
     AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ReshapeOperation, SliceOperation,
     UpdateSliceOperation,
@@ -452,9 +451,16 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceDynamicIndex>> Differentiabl
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let primal = inputs[0].primal().reference_dynamic_index(self.axis, inputs[1].primal())?;
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
-            reference.reference_dynamic_index(self.axis, &context.primal_to_tangent(inputs[1].primal().clone())?)
-        })?])
+        // Apply the same view to a live tangent reference. A reference without tangent storage keeps a symbolic
+        // zero typed with the new view, without constructing a tangent reference.
+        Ok(vec![match inputs[0].tangent() {
+            MaybeZero::Value(reference) => {
+                let tangent = reference
+                    .reference_dynamic_index(self.axis, &context.primal_to_tangent(inputs[1].primal().clone())?)?;
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal)?,
+        }])
     }
 }
 
@@ -705,9 +711,6 @@ impl_default_reference_view_transposition!(ReferenceSliceOperation, 1);
 impl<C: Context<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> DifferentiableOperation<C>
     for ReferenceIndexOperation
 {
-    // A view is pure aliasing metadata, so the tangent reference receives the same view as the primal reference. A
-    // plumbing reference (i.e., a reference dual whose tangent is a symbolic zero) carries no tangent reference, so its
-    // view stays plumbing.
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         _context: &DifferentiationContext<C, P>,
@@ -716,16 +719,21 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> Differenti
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reference_index(self.axis, self.index)?;
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| {
-            tangent_reference.reference_index(self.axis, self.index)
-        })?])
+        // Apply the same view to a live tangent reference. A reference without tangent storage keeps a symbolic
+        // zero typed with the new view, without constructing a tangent reference.
+        Ok(vec![match inputs[0].tangent() {
+            MaybeZero::Value(reference) => {
+                let tangent = reference.reference_index(self.axis, self.index)?;
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal)?,
+        }])
     }
 }
 
 impl<C: Context<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> DifferentiableOperation<C>
     for ReferenceSliceOperation
 {
-    // As in the `ReferenceIndexOperation` rule, the tangent reference receives the same view as the primal reference.
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         _context: &DifferentiationContext<C, P>,
@@ -734,9 +742,15 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Differenti
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reference_slice(self.axes.as_slice())?;
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| {
-            tangent_reference.reference_slice(self.axes.as_slice())
-        })?])
+        // Apply the same view to a live tangent reference. A reference without tangent storage keeps a symbolic
+        // zero typed with the new view, without constructing a tangent reference.
+        Ok(vec![match inputs[0].tangent() {
+            MaybeZero::Value(reference) => {
+                let tangent = reference.reference_slice(self.axes.as_slice())?;
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal)?,
+        }])
     }
 }
 

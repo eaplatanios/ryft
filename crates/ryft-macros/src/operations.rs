@@ -796,6 +796,25 @@ impl OperationEnum {
                 }
             }
         });
+        let fold_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let call = match &variant.class {
+                OperationVariantClass::MixedMember { .. } => quote! {
+                    <#payload_type as #ryft::MemberOperation<#primary_type>>::fold_parent(
+                        #receiver, input_types, region_interfaces,
+                    )
+                },
+                OperationVariantClass::CompositeNative => quote! {
+                    <#payload_type as #ryft::Operation>::fold(#receiver, input_types, region_interfaces)
+                },
+                OperationVariantClass::ProjectedMember { .. } => quote! {
+                    #ryft::fold_projected_operation(#receiver, input_types, region_interfaces)
+                },
+            };
+            quote! { Self::#variant_ident(operation) => { #call }, }
+        });
         let type_identity_renaming_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -913,6 +932,14 @@ impl OperationEnum {
                     region_interfaces: &[#ryft::RegionInterface<#primary_type>],
                 ) -> ::std::result::Result<::std::vec::Vec<#primary_type>, #ryft::TypeError> {
                     match self { #(#infer_output_type_arms)* }
+                }
+
+                fn fold(
+                    &self,
+                    input_types: &[#primary_type],
+                    region_interfaces: &[#ryft::RegionInterface<#primary_type>],
+                ) -> ::std::result::Result<::std::option::Option<::std::vec::Vec<usize>>, #ryft::TypeError> {
+                    match self { #(#fold_arms)* }
                 }
 
                 fn input_region_provenance(

@@ -15,7 +15,6 @@ pub mod dimension_min;
 pub mod dimension_mul;
 pub mod dimension_pow;
 pub mod dimension_rem;
-pub mod dimension_requirement;
 pub mod dimension_saturating_sub;
 pub mod dimension_size;
 pub mod dimension_sub;
@@ -31,10 +30,6 @@ pub use dimension_min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMin
 pub use dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
 pub use dimension_pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
 pub use dimension_rem::{DIMENSION_REM_OPERATION_NAME, DimensionRemOperation};
-pub use dimension_requirement::{
-    DIMENSION_REQUIREMENT_OPERATION_NAME, DimensionRequirement, DimensionRequirementOperation,
-    DimensionRequirementPredicate,
-};
 pub use dimension_saturating_sub::{
     DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
 };
@@ -72,6 +67,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
     ) -> Result<DimensionBounds, DimensionError>;
 
     /// Infers this operation's output [`DimensionType`]s after validating the provided input [`DimensionType`]s.
+    /// Proven input folds preserve the selected input's bounds while still allocating a fresh output identity.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types.iter().zip([self.left_type(), self.right_type()]).enumerate().try_for_each(
@@ -92,7 +88,18 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
 
         // Reusing an operation with narrower inputs must recompute its bounds formula. Its stored effect metadata
         // remains conservative as refinement never removes an assertion from the original operation.
-        let bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
+        let mut bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
+
+        // A proven input replacement preserves its bounds, including an implicit backend-width limit represented
+        // by an unbounded upper endpoint. Fresh output identity allocation remains independent of folding.
+        if let Some(replacements) = self.fold(input_types, &[])? {
+            check_count!("fold output", replacements, 1, TypeError);
+            let input = input_types.get(replacements[0]).ok_or_else(|| {
+                TypeError::invalid(format!("`{}` fold references missing input {}", self.name(), replacements[0]))
+            })?;
+            bounds = input.bounds();
+        }
+
         Ok(vec![DimensionType::new(self.output_name(), bounds)])
     }
 }

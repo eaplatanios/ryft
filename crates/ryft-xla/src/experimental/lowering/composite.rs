@@ -11,8 +11,8 @@
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
-    DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation,
-    DimensionType, DynamicSliceBounds, EffectClass, Layout, Operation, ProgramError, Shape,
+    DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
+    DynamicSliceBounds, EffectClass, Layout, Operation, ProgramError, Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -23,9 +23,9 @@ use ryft_mlir::{
 use super::{
     CollectiveLoweringState, EffectTokens, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
     PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
-    lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_concatenate_tree,
-    lower_constant_elements_attribute, lower_constant_output, lower_custom_call_to_mlir,
-    lower_dimension_arithmetic_assertion, lower_dimension_extent, lower_dimension_requirement_to_assertion,
+    lower_assert_to_custom_call, lower_assertion_custom_call, lower_compare_to_mlir,
+    lower_concatenate_extent_assertion, lower_concatenate_tree, lower_constant_elements_attribute,
+    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dynamic_slice_assertion, lower_pad_extent_assertion, lower_pad_to_mlir, lower_parallel_sum_scatter_to_mlir,
     lower_physical_bound_value, lower_ragged_all_to_all_to_mlir, lower_reshape_element_count_assertion,
     lower_restore_dynamic_dimensions, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
@@ -545,21 +545,20 @@ where
                     };
                     Ok(vec![result.result(0).unwrap().as_ref()])
                 }
-                DimensionOperation::Requirement(operation) => {
-                    if operation.effects().classes().contains(ryft_core::EffectClass::OrderedAssertion) {
-                        lower_dimension_requirement_to_assertion(
-                            operation,
-                            operation.name(),
-                            input_values,
-                            effect_tokens,
-                            block,
-                            context,
-                            location,
-                        )?;
-                    }
-                    Ok(Vec::new())
-                }
             }
+        }
+        ArrayIrOperation::Assert(operation) => {
+            lower_assert_to_custom_call(
+                operation.name(),
+                operation.message(),
+                operation.labels(),
+                input_values,
+                effect_tokens,
+                block,
+                context,
+                location,
+            )?;
+            Ok(Vec::new())
         }
         ArrayIrOperation::Compare(operation) => {
             let [left, right] = input_values else {
@@ -617,12 +616,46 @@ where
             let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
             let converted = block.append_operation(stable_hlo::convert(*input, i64_type, location)?)?;
             let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
-            let requirement =
-                DimensionRequirementOperation::bounds(operation.output_type(), operation.output_type().bounds());
-            lower_dimension_requirement_to_assertion(
-                &requirement,
-                operation.name(),
+            let bounds = operation.output_type().bounds();
+            let lower = lower_static_index_constants(&[bounds.lower()], block, context, location)?[0];
+            let at_least_lower =
+                lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, converted, lower, block, location)?;
+            // Do not encode an exclusive maximum-plus-one in the signed runtime extent representation.
+            let predicate = match bounds.upper().filter(|upper| *upper <= ryft_core::MAX_DIMENSION_EXTENT) {
+                Some(upper) => {
+                    let upper = lower_static_index_constants(&[upper], block, context, location)?[0];
+                    let below_upper =
+                        lower_compare_to_mlir(ComparisonDirection::LessThan, converted, upper, block, location)?;
+                    block
+                        .append_operation(stable_hlo::and(at_least_lower, below_upper, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref()
+                }
+                None => at_least_lower,
+            };
+            let backend_config = context.dictionary_attribute(&[
+                context.named_attribute(
+                    context.identifier(super::ASSERT_ACTOR_ATTRIBUTE),
+                    context.string_attribute(operation.name()),
+                ),
+                context.named_attribute(
+                    context.identifier(super::ASSERT_KIND_ATTRIBUTE),
+                    context.string_attribute(super::ASSERT_BOUNDS_KIND),
+                ),
+                context.named_attribute(
+                    context.identifier(super::ASSERT_LEFT_ATTRIBUTE),
+                    context.string_attribute(operation.output_type().variable().to_string().as_str()),
+                ),
+                context.named_attribute(
+                    context.identifier(super::ASSERT_DETAIL_ATTRIBUTE),
+                    context.string_attribute(bounds.to_string().as_str()),
+                ),
+            ]);
+            lower_assertion_custom_call(
+                predicate,
                 &[converted],
+                backend_config,
                 effect_tokens,
                 block,
                 context,

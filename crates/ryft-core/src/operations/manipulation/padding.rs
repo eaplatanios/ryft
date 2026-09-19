@@ -21,6 +21,8 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::assertions::Assert;
+use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::one::{One, OneOperation};
@@ -30,7 +32,6 @@ use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
@@ -1742,11 +1743,12 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
     ) -> Result<Self, ProgramError>
     where
         Self: DimensionSize
+            + Assert
             + DimensionToScalar
             + DynamicBroadcast
             + DynamicReshape
             + ValueProjection<ArrayType, Projected: Add + Scatter + TransferToMemory>
-            + ValueProjection<DimensionType, Projected: Add + DimensionRequirement>,
+            + ValueProjection<DimensionType, Projected: Add + Compare<Self>>,
         Self::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<Self>,
     {
         let input_type = self.r#type();
@@ -1775,7 +1777,14 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         let size = input_dimensions[axis].clone();
         let end = ValueProjection::<DimensionType>::into_projected(edge_padding_low.clone())?
             .add(&ValueProjection::<DimensionType>::into_projected(size.clone())?)?;
-        end.require_less_than_or_equal(&ValueProjection::<DimensionType>::into_projected(extent.clone())?)?;
+        end.compare(
+            &ValueProjection::<DimensionType>::into_projected(extent.clone())?,
+            ComparisonDirection::LessThanOrEqual,
+        )?
+        .assert(
+            "padding end must not exceed the output extent",
+            &[("end", ValueProjection::<DimensionType>::from_projected(end)), ("extent", extent.clone())],
+        )?;
 
         // For the output geometry, the padded axis takes the target extent and every other axis
         // keeps its runtime extent.
@@ -4779,9 +4788,9 @@ mod tests {
                 let %4:f64[result] = linear_call [residual_count=2] %2 %3 %0 %1 [
                     forward={
                         lambda %0:dimension<result ∈ [3, 11)>, %1:dimension<source ∈ [0, 5)>, %2:f64[source], \
-                            %3:f64[] .
-                        let %4:f64[result] = pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]] \
-                            %2 %3 %0
+                    %3:f64[] .
+                        let %4:f64[result] = pad [edge_padding_low=[1], edge_padding_high=[2], \
+                    interior_padding=[1]] %2 %3 %0
                         in (%4)
                     },
                     transpose={
@@ -4789,28 +4798,20 @@ mod tests {
                         let %3:f64[] = zero [type=f64[]]
                             %4:dimension<1> = constant [value=1]
                             %5:dimension<max(0, source - 1) ∈ [0, 4)> = dimension_saturating_sub %1 %4
-                            %6:dimension<1> = constant [value=1]
-                            %7:dimension<max(0, source - 1) * 1 ∈ [0, 4)> = dimension_mul %5 %6
-                            %8:dimension<source + max(0, source - 1) * 1 ∈ [0, 8)> = dimension_add %1 %7
-                            %9:f64[source + max(0, source - 1) * 1] = pad [\
-                                edge_padding_low=[-1], \
-                                edge_padding_high=[-2], \
-                                interior_padding=[0]\
-                            ] %2 %3 %8
-                            %10:dimension<0> = constant [value=0]
-                            %11:f64[source] = dynamic_slice [\
-                                strides=[2], \
-                                bounds=checked, \
-                                requires_runtime_assertion=true\
-                            ] %9 %10 %1
-                            %12:bool[source] = zero [type=bool[source]] %1
-                            %13:bool[] = one [type=bool[]]
-                            %14:bool[result] = pad [edge_padding_low=[1], edge_padding_high=[2], \
-                                interior_padding=[1]] %12 %13 %0
-                            %15:f64[result] = zero [type=f64[result]] %0
-                            %16:f64[result] = select %14 %2 %15
-                            %17:f64[] = reduce_sum [axes=[0]] %16
-                        in (%11, %17)
+                            %6:dimension<source + max(0, source - 1) ∈ [0, 8)> = dimension_add %1 %5
+                            %7:f64[source + max(0, source - 1)] = pad [edge_padding_low=[-1], \
+                    edge_padding_high=[-2], interior_padding=[0]] %2 %3 %6
+                            %8:dimension<0> = constant [value=0]
+                            %9:f64[source] = dynamic_slice [strides=[2], bounds=checked, \
+                    requires_runtime_assertion=true] %7 %8 %1
+                            %10:bool[source] = zero [type=bool[source]] %1
+                            %11:bool[] = one [type=bool[]]
+                            %12:bool[result] = pad [edge_padding_low=[1], edge_padding_high=[2], \
+                    interior_padding=[1]] %10 %11 %0
+                            %13:f64[result] = zero [type=f64[result]] %0
+                            %14:f64[result] = select %12 %2 %13
+                            %15:f64[] = reduce_sum [axes=[0]] %14
+                        in (%9, %15)
                     },
                 ]
                 in (%4)
@@ -5292,27 +5293,26 @@ mod tests {
                         let %3:f32[] = zero [type=f32[]]
                             %4:dimension<1> = constant [value=1]
                             %5:dimension<max(0, size - 1) ∈ [0, 4)> = dimension_saturating_sub %1 %4
-                            %6:dimension<1> = constant [value=1]
-                            %7:dimension<max(0, size - 1) * 1 ∈ [0, 4)> = dimension_mul %5 %6
-                            %8:dimension<size + max(0, size - 1) * 1 ∈ [0, 8)> = dimension_add %1 %7
-                            %9:f32[size + max(0, size - 1) * 1] = pad [edge_padding_low=[0], edge_padding_high=[0], \
-                                interior_padding=[0]] %2 %3 %8
-                            %10:dimension<0> = constant [value=0]
-                            %11:f32[size] = dynamic_slice [strides=[2], bounds=checked, requires_runtime_assertion=true] %9 %10 %1
-                            %12:bool[size] = zero [type=bool[size]] %1
-                            %13:bool[] = one [type=bool[]]
-                            %14:bool[output_size] = pad [edge_padding_low=[0], edge_padding_high=[0], \
-                                interior_padding=[1]] %12 %13 %0
-                            %15:f32[output_size] = zero [type=f32[output_size]] %0
-                            %16:f32[output_size] = select %14 %2 %15
-                            %17:f32[] = reduce_sum [axes=[0]] %16
-                        in (%11, %17)
+                            %6:dimension<size + max(0, size - 1) ∈ [0, 8)> = dimension_add %1 %5
+                            %7:f32[size + max(0, size - 1)] = pad [edge_padding_low=[0], edge_padding_high=[0], \
+                    interior_padding=[0]] %2 %3 %6
+                            %8:dimension<0> = constant [value=0]
+                            %9:f32[size] = dynamic_slice [strides=[2], bounds=checked, \
+                    requires_runtime_assertion=true] %7 %8 %1
+                            %10:bool[size] = zero [type=bool[size]] %1
+                            %11:bool[] = one [type=bool[]]
+                            %12:bool[output_size] = pad [edge_padding_low=[0], edge_padding_high=[0], \
+                    interior_padding=[1]] %10 %11 %0
+                            %13:f32[output_size] = zero [type=f32[output_size]] %0
+                            %14:f32[output_size] = select %12 %2 %13
+                            %15:f32[] = reduce_sum [axes=[0]] %14
+                        in (%9, %15)
                     },
                     transpose={
                         lambda %0:dimension<output_size ∈ [0, 9)>, %1:dimension<size ∈ [0, 5)>, %2:f32[size], \
-                            %3:f32[] .
+                    %3:f32[] .
                         let %4:f32[output_size] = pad [edge_padding_low=[0], edge_padding_high=[0], \
-                            interior_padding=[1]] %2 %3 %0
+                    interior_padding=[1]] %2 %3 %0
                         in (%4)
                     },
                 ]
@@ -5816,24 +5816,28 @@ mod tests {
                 let %4:dimension<2> = constant [value=2]
                     %5:dimension<size ∈ [1, 5)> = dimension_size [axis=1] %0
                     %6:dimension<low + size ∈ [1, 8)> = dimension_add %2 %5
-                    () = dimension_requirement [predicate=LessThanOrEqual] %6 %3
-                    %7:i64[size] = iota [type=i64[size], dimension=0] %5
-                    %8:i64[] = dimension_to_scalar %2
-                    %9:i64[] = transfer_to_memory [destination=Device] %8
-                    %10:i64[size] = broadcast [output_axes=[]] %9 %5
-                    %11:i64[size] = add %7 %10
-                    %12:dimension<size ∈ [1, 5)> = dimension_size [axis=0] %11
-                    %13:dimension<1> = constant [value=1]
-                    %14:i64[size, 1] = reshape [requires_runtime_assertion=false] %11 %12 %13
-                    %15:f32[2, target] = broadcast [output_axes=[]] %1 %4 %3
-                    %16:f32[2, target] = scatter [
+                    %7:bool[] = compare [direction=LessThanOrEqual] %6 %3
+                    () = assert [
+                        message=\"padding end must not exceed the output extent\",
+                        labels=[\"end\", \"extent\"],
+                    ] %7 %6 %3
+                    %8:i64[size] = iota [type=i64[size], dimension=0] %5
+                    %9:i64[] = dimension_to_scalar %2
+                    %10:i64[] = transfer_to_memory [destination=Device] %9
+                    %11:i64[size] = broadcast [output_axes=[]] %10 %5
+                    %12:i64[size] = add %8 %11
+                    %13:dimension<size ∈ [1, 5)> = dimension_size [axis=0] %12
+                    %14:dimension<1> = constant [value=1]
+                    %15:i64[size, 1] = reshape [requires_runtime_assertion=false] %12 %13 %14
+                    %16:f32[2, target] = broadcast [output_axes=[]] %1 %4 %3
+                    %17:f32[2, target] = scatter [
                         kind=overwrite,
                         dimensions=(update_window=[0], inserted_window=[1], scatter_to_operand=[1], \
                         operand_batching=[], scatter_indices_batching=[]),
                         indices_are_sorted=true,
                         unique_indices=true,
-                    ] %15 %14 %0
-                in (%16)
+                    ] %16 %15 %0
+                in (%17)
             "}
             .trim_end(),
         );
@@ -5860,7 +5864,7 @@ mod tests {
         );
         assert_eq!(
             program.interpret(inputs(1, 3)).unwrap_err().to_string(),
-            "1 + size(axis=1) <= 3; observed 1 + size(axis=1)=4, 3=3",
+            r#"assertion failed: padding end must not exceed the output extent; observations=[("end", "4"), ("extent", "3")]"#,
         );
 
         // The pullback gathers the input cotangent back out of the written positions and sums the padding positions

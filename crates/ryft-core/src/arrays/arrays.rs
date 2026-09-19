@@ -777,6 +777,14 @@ impl Value for Array {
     }
 }
 
+impl TryFrom<bool> for Array {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, Self::Error> {
+        Self::scalar(value)
+    }
+}
+
 // Approximate equality requires identical array types. Floating-point payloads compare through their exactly widened
 // `f64` values, complex payloads compare both components, and all other element types use exact equality.
 impl AbsDiffEq for Array {
@@ -1255,6 +1263,11 @@ mod tests {
 
     #[test]
     fn test_array_scalar() {
+        for value in [false, true] {
+            let array = Array::try_from(value).unwrap();
+            assert_eq!(array.r#type().as_ref(), &ArrayType::scalar(DataType::Boolean));
+            assert_eq!(Concretizable::<bool>::concretize(&array), Ok(value));
+        }
         assert_eq!(Array::scalar(2.5).unwrap().r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(Array::scalar(2.5), Array::from_elements(ArrayType::scalar(DataType::F64), &[2.5]));
     }

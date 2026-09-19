@@ -9,7 +9,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error};
 
-/// Name of the typed XLA FFI custom call that reports failed first-class-dimension requirements.
+/// Name of the typed XLA FFI custom call that reports failed runtime assertions.
 pub(crate) const ASSERT_CUSTOM_CALL_TARGET: &str = "ryft.assert";
 
 /// Backend-config attribute containing the canonical Ryft operation name that owns the assertion.
@@ -27,14 +27,14 @@ pub(crate) const ASSERT_RIGHT_ATTRIBUTE: &str = "right";
 /// Backend-config attribute identifying the formatting contract used for a failed assertion.
 pub(crate) const ASSERT_KIND_ATTRIBUTE: &str = "kind";
 
-/// Formatting kind used for an equality requirement.
-pub(crate) const ASSERT_EQUAL_KIND: &str = "equal";
+/// Formatting kind for a general assertion with named scalar observations.
+pub(crate) const ASSERT_GENERIC_KIND: &str = "generic";
 
-/// Formatting kind used for a less-than-or-equal requirement.
-pub(crate) const ASSERT_LESS_THAN_OR_EQUAL_KIND: &str = "less_than_or_equal";
+/// Backend-config attribute containing a general assertion's literal diagnostic message.
+pub(crate) const ASSERT_MESSAGE_ATTRIBUTE: &str = "message";
 
-/// Formatting kind used for a positive-divisibility requirement.
-pub(crate) const ASSERT_DIVISIBLE_BY_KIND: &str = "divisible_by";
+/// Backend-config attribute containing the number of `label_N` observation labels.
+pub(crate) const ASSERT_LABEL_COUNT_ATTRIBUTE: &str = "label_count";
 
 /// Formatting kind used for explicit dimension bounds.
 pub(crate) const ASSERT_BOUNDS_KIND: &str = "bounds";
@@ -242,11 +242,34 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     }
     if buffers.is_empty() {
         return Err(FfiError::invalid_argument(format!(
-            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` custom call to receive a predicate and observed extents"
+            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` custom call to receive a predicate"
         )));
     }
     let actor = string_attribute(call_frame, ASSERT_ACTOR_ATTRIBUTE)?;
     let kind = string_attribute(call_frame, ASSERT_KIND_ATTRIBUTE)?;
+    if kind == ASSERT_GENERIC_KIND {
+        let count = string_attribute(call_frame, ASSERT_LABEL_COUNT_ATTRIBUTE)?
+            .parse::<usize>()
+            .map_err(|_| FfiError::invalid_argument("invalid assertion diagnostic label count"))?;
+        if buffers.len().checked_sub(1) != Some(count) {
+            return Err(FfiError::invalid_argument("assertion diagnostic label count does not match its inputs"));
+        }
+        let message = string_attribute(call_frame, ASSERT_MESSAGE_ATTRIBUTE)?;
+        let labels = (0..count)
+            .map(|index| string_attribute(call_frame, &format!("label_{index}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if scalar_predicate(&buffers[0], memory)? {
+            return Ok(());
+        }
+        let observations = labels
+            .into_iter()
+            .zip(&buffers[1..])
+            .map(|(label, buffer)| Ok((label.to_owned(), scalar_observation(buffer, memory)?)))
+            .collect::<Result<Vec<_>, FfiError>>()?;
+        return Err(FfiError::invalid_argument(
+            ryft_core::AssertionError::Failed { message: message.to_owned(), observations }.to_string(),
+        ));
+    }
     if kind == ASSERT_RESHAPE_KIND {
         let input_rank = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?
             .parse::<usize>()
@@ -347,46 +370,23 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         return validate_arithmetic(kind, left_name, left, right_name, right).map_err(FfiError::invalid_argument);
     }
 
-    let expected_extent_count = match kind {
-        ASSERT_EQUAL_KIND | ASSERT_LESS_THAN_OR_EQUAL_KIND | ASSERT_DIVISIBLE_BY_KIND => 2,
-        ASSERT_BOUNDS_KIND => 1,
-        _ => {
-            return Err(FfiError::invalid_argument(format!(
-                "unsupported `{ASSERT_KIND_ATTRIBUTE}` value `{kind}` for `{ASSERT_CUSTOM_CALL_TARGET}`"
-            )));
-        }
-    };
-    if buffers.len() != expected_extent_count + 1 {
+    if kind != ASSERT_BOUNDS_KIND {
         return Err(FfiError::invalid_argument(format!(
-            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` requirement assertion to receive {expected_extent_count} \
-             extent(s)"
+            "unsupported `{ASSERT_KIND_ATTRIBUTE}` value `{kind}` for `{ASSERT_CUSTOM_CALL_TARGET}`"
         )));
+    }
+    if buffers.len() != 2 {
+        return Err(FfiError::invalid_argument("dimension conversion assertion requires one observed extent"));
     }
     if scalar_predicate(&buffers[0], memory)? {
         return Ok(());
     }
     let left_name = string_attribute(call_frame, ASSERT_LEFT_ATTRIBUTE)?;
     let left = scalar_i64(&buffers[1], memory)?;
-    let message = match kind {
-        ASSERT_EQUAL_KIND | ASSERT_LESS_THAN_OR_EQUAL_KIND | ASSERT_DIVISIBLE_BY_KIND => {
-            let right_name = string_attribute(call_frame, ASSERT_RIGHT_ATTRIBUTE)?;
-            let right = scalar_i64(&buffers[2], memory)?;
-            let requirement = match kind {
-                ASSERT_EQUAL_KIND => format!("{left_name} == {right_name}"),
-                ASSERT_LESS_THAN_OR_EQUAL_KIND => format!("{left_name} <= {right_name}"),
-                ASSERT_DIVISIBLE_BY_KIND if right == 0 => format!("{right_name} > 0 for divisibility"),
-                ASSERT_DIVISIBLE_BY_KIND => format!("{left_name} % {right_name} == 0"),
-                _ => unreachable!(),
-            };
-            format!("`{actor}` failed: {requirement}; observed {left_name}={left}, {right_name}={right}")
-        }
-        ASSERT_BOUNDS_KIND => {
-            let bounds = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
-            format!("`{actor}` failed: input dimension `{left_name}` = {left} is outside its declared bounds {bounds}")
-        }
-        _ => unreachable!(),
-    };
-    Err(FfiError::invalid_argument(message))
+    let bounds = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
+    Err(FfiError::invalid_argument(format!(
+        "`{actor}` failed: input dimension `{left_name}` = {left} is outside its declared bounds {bounds}"
+    )))
 }
 
 /// Evaluates one checked dimension-arithmetic predicate and returns its eager-compatible diagnostic on failure.
@@ -564,6 +564,39 @@ fn scalar_predicate(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Re
     Ok(scalar_bytes::<1>(buffer, memory)?[0] != 0)
 }
 
+/// Renders one supported scalar observation without narrowing unsigned integers or changing float precision.
+fn scalar_observation(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<String, FfiError> {
+    if buffer.rank() != 0 {
+        return Err(FfiError::invalid_argument("assertion observations must be rank-zero buffers"));
+    }
+    Ok(match buffer.element_type() {
+        FfiBufferType::Predicate => (scalar_bytes::<1>(buffer, memory)?[0] != 0).to_string(),
+        FfiBufferType::I1 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 7 >> 7).to_string(),
+        FfiBufferType::I2 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 6 >> 6).to_string(),
+        FfiBufferType::I4 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 4 >> 4).to_string(),
+        FfiBufferType::U1 => (scalar_bytes::<1>(buffer, memory)?[0] & 1).to_string(),
+        FfiBufferType::U2 => (scalar_bytes::<1>(buffer, memory)?[0] & 3).to_string(),
+        FfiBufferType::U4 => (scalar_bytes::<1>(buffer, memory)?[0] & 15).to_string(),
+        FfiBufferType::I8 => i8::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::I16 => i16::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::I32 => i32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::I64 => i64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::U8 => u8::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::U16 => u16::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::U32 => u32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::U64 => u64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::F16 => {
+            half::f16::from_bits(u16::from_ne_bytes(scalar_bytes(buffer, memory)?)).to_f32().to_string()
+        }
+        FfiBufferType::BF16 => {
+            half::bf16::from_bits(u16::from_ne_bytes(scalar_bytes(buffer, memory)?)).to_f32().to_string()
+        }
+        FfiBufferType::F32 => f32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::F64 => f64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        r#type => return Err(FfiError::invalid_argument(format!("unsupported assertion observation type `{type}`"))),
+    })
+}
+
 /// Reads one rank-zero signed 64-bit extent buffer.
 fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i64, FfiError> {
     if buffer.element_type() != FfiBufferType::I64 || buffer.rank() != 0 {
@@ -577,10 +610,10 @@ fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-
     use ryft_core::{
         DimensionBounds, DimensionError, DimensionPow, DimensionType, DimensionValue, Div, ProgramError, Rem, Sub,
     };
+    use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
     use super::*;
 
@@ -595,6 +628,34 @@ mod tests {
             Some(DimensionError::ArithmeticOverflow { message })
             | Some(DimensionError::RequirementViolation { message }) => message.clone(),
             other => panic!("unexpected eager dimension error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_observation() {
+        for (r#type, bytes, expected) in [
+            (FfiBufferType::Predicate, vec![1], "true"),
+            (FfiBufferType::I1, vec![1], "-1"),
+            (FfiBufferType::I2, vec![2], "-2"),
+            (FfiBufferType::I4, vec![8], "-8"),
+            (FfiBufferType::U4, vec![15], "15"),
+            (FfiBufferType::U64, u64::MAX.to_ne_bytes().to_vec(), "18446744073709551615"),
+            (FfiBufferType::I64, i64::MIN.to_ne_bytes().to_vec(), "-9223372036854775808"),
+            (FfiBufferType::F16, half::f16::from_f32(-0.5).to_bits().to_ne_bytes().to_vec(), "-0.5"),
+            (FfiBufferType::BF16, half::bf16::from_f32(0.5).to_bits().to_ne_bytes().to_vec(), "0.5"),
+            (FfiBufferType::F32, (-0.0_f32).to_ne_bytes().to_vec(), "-0"),
+            (FfiBufferType::F64, f64::INFINITY.to_ne_bytes().to_vec(), "inf"),
+        ] {
+            let buffer = XLA_FFI_Buffer {
+                struct_size: size_of::<XLA_FFI_Buffer>(),
+                extension_start: std::ptr::null_mut(),
+                data_type: unsafe { r#type.to_c_api() },
+                data: bytes.as_ptr().cast_mut().cast(),
+                rank: 0,
+                dimensions: std::ptr::null_mut(),
+            };
+            let buffer = unsafe { FfiBuffer::from_c_api(&buffer) }.unwrap();
+            assert_eq!(scalar_observation(&buffer, AssertionBufferMemory::Host).unwrap(), expected);
         }
     }
 

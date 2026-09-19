@@ -30,15 +30,18 @@ use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::macros::check_count;
+use crate::operations::assertions::Assert;
+use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
+use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
+use crate::operations::math::rem::Rem;
 use crate::partial::PartialValue;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,
@@ -394,11 +397,12 @@ pub(crate) trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType
         Self::collective_extent_constant(context, extent)
     }
 
-    /// Enforces exact divisibility when it is not statically decidable.
+    /// Enforces exact divisibility and returns a positive divisor safe for subsequent arithmetic.
     fn require_divisible_collective_extents(
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
-    ) -> Result<(), BatchingError>;
+    ) -> Result<Self::ShapeExtent, BatchingError>;
 
     /// Aligns `batch` to the leading mapped axis using its complete logical input extents.
     fn match_collective_axis(
@@ -448,15 +452,16 @@ where
     }
 
     fn require_divisible_collective_extents(
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
-    ) -> Result<(), BatchingError> {
+    ) -> Result<Self::ShapeExtent, BatchingError> {
         if *right == 0 || left % right != 0 {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("extent {left} must be divisible by extent {right}"),
             });
         }
-        Ok(())
+        Ok(*right)
     }
 
     fn match_collective_axis(
@@ -492,12 +497,13 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: DimensionSize
+    C::Value: Assert
+        + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
 
@@ -507,9 +513,15 @@ where
         _axis_name: &str,
         axis_size: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
-        let axis_extent = <C::Value as ValueProjection<DimensionType>>::into_projected(context.axis_extent().clone())?;
+        let axis_extent = ValueProjection::<DimensionType>::into_projected(context.axis_extent().clone())?;
         let axis_size = Self::collective_extent_constant(context, axis_size)?;
-        axis_extent.require_equal(&axis_size)?;
+        axis_extent.compare(&axis_size, ComparisonDirection::Equal)?.assert(
+            "collective axis extent must match the participant count",
+            &[
+                ("extent", ValueProjection::<DimensionType>::from_projected(axis_extent.clone())),
+                ("participants", ValueProjection::<DimensionType>::from_projected(axis_size)),
+            ],
+        )?;
         Ok(axis_extent)
     }
 
@@ -520,14 +532,29 @@ where
         let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
         let mut outputs = context.parent().parent().bind(ConstantOperation::new(value), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(outputs.remove(0))?)
+        Ok(ValueProjection::<DimensionType>::into_projected(outputs.remove(0))?)
     }
 
     fn require_divisible_collective_extents(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         left: &Self::ShapeExtent,
         right: &Self::ShapeExtent,
-    ) -> Result<(), BatchingError> {
-        left.require_divisible_by(right).map_err(Into::into)
+    ) -> Result<Self::ShapeExtent, BatchingError> {
+        let zero = Self::collective_extent_constant(context, 0)?;
+        let one = Self::collective_extent_constant(context, 1)?;
+        right.compare(&zero, ComparisonDirection::GreaterThan)?.assert(
+            "collective divisor must be positive",
+            &[("divisor", ValueProjection::<DimensionType>::from_projected(right.clone()))],
+        )?;
+        let divisor = right.dimension_max(&one)?;
+        left.rem(&divisor)?.compare(&zero, ComparisonDirection::Equal)?.assert(
+            "collective extent must be divisible by the participant count",
+            &[
+                ("extent", ValueProjection::<DimensionType>::from_projected(left.clone())),
+                ("divisor", ValueProjection::<DimensionType>::from_projected(right.clone())),
+            ],
+        )?;
+        Ok(divisor)
     }
 
     fn match_collective_axis(
@@ -875,7 +902,7 @@ macro_rules! impl_shape_changing_collective_member_operation {
                     });
                 }
                 for (axis, (extent, expected)) in output_extents.iter().zip(expected_extents.dimensions()).enumerate() {
-                    let actual = <C::Value as ValueProjection<DimensionType>>::into_projected(extent.clone())?.extent();
+                    let actual = ValueProjection::<DimensionType>::into_projected(extent.clone())?.extent();
                     if actual != *expected {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
@@ -966,16 +993,30 @@ pub(super) fn divided_collective_extent<V>(
     effective_axis_size: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
+    <V as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
     let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
-    input_extent.require_divisible_by(&effective_axis_size)?;
-    Ok(<V as ValueProjection<DimensionType>>::from_projected(input_extent.div(&effective_axis_size)?))
+    let zero = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?;
+    let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1)?)?;
+    effective_axis_size.compare(&zero, ComparisonDirection::GreaterThan)?.assert(
+        "collective divisor must be positive",
+        &[("divisor", ValueProjection::<DimensionType>::from_projected(effective_axis_size.clone()))],
+    )?;
+    let divisor = effective_axis_size.dimension_max(&one)?;
+    input_extent.rem(&divisor)?.compare(&zero, ComparisonDirection::Equal)?.assert(
+        "collective extent must be divisible by the participant count",
+        &[
+            ("extent", ValueProjection::<DimensionType>::from_projected(input_extent.clone())),
+            ("divisor", ValueProjection::<DimensionType>::from_projected(effective_axis_size)),
+        ],
+    )?;
+    Ok(ValueProjection::<DimensionType>::from_projected(input_extent.div(&divisor)?))
 }
 
 /// Requires an input axis extent to equal the effective participant count used by an untiled collective.
@@ -985,15 +1026,21 @@ pub(super) fn require_collective_axis_extent<V>(
     effective_axis_size: usize,
 ) -> Result<(), ProgramError>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V>,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
     let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
-    input_extent.require_equal(&effective_axis_size)
+    input_extent.compare(&effective_axis_size, ComparisonDirection::Equal)?.assert(
+        "collective axis extent must match the participant count",
+        &[
+            ("extent", ValueProjection::<DimensionType>::from_projected(input_extent)),
+            ("participants", ValueProjection::<DimensionType>::from_projected(effective_axis_size)),
+        ],
+    )
 }
 
 /// Requires an input axis extent to be exactly divisible by the effective participant count.
@@ -1003,15 +1050,30 @@ pub(super) fn require_collective_axis_divisible<V>(
     effective_axis_size: usize,
 ) -> Result<(), ProgramError>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
+    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
     let effective_axis_size = collective_extent_constant(context, effective_axis_size)?;
     let effective_axis_size = <V as ValueProjection<DimensionType>>::into_projected(effective_axis_size)?;
-    input_extent.require_divisible_by(&effective_axis_size)
+    let zero = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?;
+    let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1)?)?;
+    effective_axis_size.compare(&zero, ComparisonDirection::GreaterThan)?.assert(
+        "collective divisor must be positive",
+        &[("divisor", ValueProjection::<DimensionType>::from_projected(effective_axis_size.clone()))],
+    )?;
+    input_extent
+        .rem(&effective_axis_size.dimension_max(&one)?)?
+        .compare(&zero, ComparisonDirection::Equal)?
+        .assert(
+            "collective extent must be divisible by the participant count",
+            &[
+                ("extent", ValueProjection::<DimensionType>::from_projected(input_extent)),
+                ("divisor", ValueProjection::<DimensionType>::from_projected(effective_axis_size)),
+            ],
+        )
 }
 
 /// Applies the mixed array IR JVP shared by shape-changing collectives whose transpose is another collective.

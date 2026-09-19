@@ -26,17 +26,17 @@ use ryft_core::{
     CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
     CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ComparisonDirection, ConstantOperation,
     ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
-    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
-    DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
-    ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation, Layout,
-    Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
-    MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
-    ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
-    Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind, RegionId, RegionRef,
-    RemOperation, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME,
-    ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, Sharding,
-    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation,
-    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass,
+    EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation,
+    Instruction, IotaOperation, Layout, Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
+    LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
+    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
+    ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind,
+    RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation,
+    SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
+    Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation,
+    SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
+    WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -52,9 +52,10 @@ use ryft_mlir::{
 use crate::ToMlir;
 use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
-    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DIVISIBLE_BY_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND,
-    ASSERT_EQUAL_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_LESS_THAN_OR_EQUAL_KIND, ASSERT_MUL_KIND,
-    ASSERT_PAD_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
+    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_GENERIC_KIND,
+    ASSERT_KIND_ATTRIBUTE, ASSERT_LABEL_COUNT_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_MESSAGE_ATTRIBUTE,
+    ASSERT_MUL_KIND, ASSERT_PAD_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE,
+    ASSERT_SUB_KIND,
 };
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -3996,100 +3997,39 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     Ok(())
 }
 
-/// Lowers one retained first-class-dimension requirement to a typed XLA FFI assertion custom call.
-///
-/// The predicate is computed in StableHLO from the concrete scalar extent operands. The custom call receives that
-/// predicate, the observed extents, and only the [`EffectClass::OrderedAssertion`] token. Its backend configuration keeps
-/// the canonical actor and variable names needed to reconstruct the eager diagnostic if the predicate is false.
-fn lower_dimension_requirement_to_assertion<'b, 'c: 'b, 't: 'c>(
-    operation: &DimensionRequirementOperation,
+/// Emits an assertion with a literal message and named scalar observations. Diagnostic buffers retain their
+/// element types so unsigned values and floating-point values reach the callback without lossy conversions.
+fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     actor: &str,
+    message: &str,
+    labels: &[String],
     input_values: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
-    let left = *input_values.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-    let right = match operation.right_type() {
-        Some(_) => Some(
-            *input_values
-                .get(1)
-                .ok_or(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() })?,
-        ),
-        None => None,
-    };
-    let (predicate, kind, requirement) = match operation.predicate() {
-        DimensionRequirementPredicate::Equal => (
-            lower_compare_to_mlir(ComparisonDirection::Equal, left, right.unwrap(), block, location)?,
-            ASSERT_EQUAL_KIND,
-            None,
-        ),
-        DimensionRequirementPredicate::LessThanOrEqual => (
-            lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, left, right.unwrap(), block, location)?,
-            ASSERT_LESS_THAN_OR_EQUAL_KIND,
-            None,
-        ),
-        DimensionRequirementPredicate::DivisibleBy => {
-            let right = right.unwrap();
-            let constants = lower_static_index_constants(&[0, 1], block, context, location)?;
-            let zero = constants[0];
-            let one = constants[1];
-            let positive = lower_compare_to_mlir(ComparisonDirection::GreaterThan, right, zero, block, location)?;
-            let safe_divisor = block.append_operation(stable_hlo::select(positive, right, one, location)?)?;
-            let safe_divisor = safe_divisor.result(0).expect("stablehlo.select should return one result").as_ref();
-            let remainder = block.append_operation(stable_hlo::remainder(left, safe_divisor, location)?)?;
-            let remainder = remainder.result(0).expect("stablehlo.remainder should return one result").as_ref();
-            let divisible = lower_compare_to_mlir(ComparisonDirection::Equal, remainder, zero, block, location)?;
-            let predicate = block.append_operation(stable_hlo::and(positive, divisible, location)?)?;
-            (
-                predicate.result(0).expect("stablehlo.and should return one result").as_ref(),
-                ASSERT_DIVISIBLE_BY_KIND,
-                None,
-            )
-        }
-        DimensionRequirementPredicate::Bounds(bounds) => {
-            let lower = lower_static_index_constants(&[bounds.lower()], block, context, location)?[0];
-            let at_least_lower =
-                lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, left, lower, block, location)?;
-            // An exclusive upper bound above the maximum representable runtime extent is redundant. Omitting it also
-            // avoids attempting to encode `MAX_DIMENSION_EXTENT + 1` in the signed StableHLO index representation.
-            let predicate = match bounds.upper().filter(|upper| *upper <= MAX_DIMENSION_EXTENT) {
-                Some(upper) => {
-                    let upper = lower_static_index_constants(&[upper], block, context, location)?[0];
-                    let below_upper =
-                        lower_compare_to_mlir(ComparisonDirection::LessThan, left, upper, block, location)?;
-                    let predicate = block.append_operation(stable_hlo::and(at_least_lower, below_upper, location)?)?;
-                    predicate.result(0).expect("stablehlo.and should return one result").as_ref()
-                }
-                None => at_least_lower,
-            };
-            (predicate, ASSERT_BOUNDS_KIND, Some(bounds.to_string()))
-        }
-    };
-
-    let left_name = operation.left_type().variable().to_string();
-    let right_name = operation.right_type().map(|right_type| right_type.variable().to_string());
+    check_count!("input", input_values, labels.len() + 1, ProgramError);
     let mut attributes = vec![
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(actor)),
-        context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(kind)),
         context
-            .named_attribute(context.identifier(ASSERT_LEFT_ATTRIBUTE), context.string_attribute(left_name.as_str())),
+            .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_GENERIC_KIND)),
+        context.named_attribute(context.identifier(ASSERT_MESSAGE_ATTRIBUTE), context.string_attribute(message)),
+        context.named_attribute(
+            context.identifier(ASSERT_LABEL_COUNT_ATTRIBUTE),
+            context.string_attribute(labels.len().to_string().as_str()),
+        ),
     ];
-    if let Some(right_name) = right_name.as_deref() {
-        attributes.push(
-            context.named_attribute(context.identifier(ASSERT_RIGHT_ATTRIBUTE), context.string_attribute(right_name)),
-        );
-    }
-    if let Some(requirement) = requirement.as_deref() {
-        attributes.push(
-            context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(requirement)),
-        );
+    for (index, label) in labels.iter().enumerate() {
+        attributes.push(context.named_attribute(
+            context.identifier(format!("label_{index}").as_str()),
+            context.string_attribute(label.as_str()),
+        ));
     }
     lower_assertion_custom_call(
-        predicate,
-        input_values,
-        context.dictionary_attribute(attributes.as_slice()),
+        input_values[0],
+        &input_values[1..],
+        context.dictionary_attribute(&attributes),
         effect_tokens,
         block,
         context,
@@ -5212,6 +5152,19 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback
             // custom call that consumes and produces a StableHLO token, so the effect ordering rides the scope's
             // token chain instead of the value dataflow.
+            ArrayOperation::Assert(operation) => {
+                lower_assert_to_custom_call(
+                    operation.name(),
+                    operation.message(),
+                    operation.labels(),
+                    input_values,
+                    &mut lowerer.effect_tokens,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(Vec::new())
+            }
             ArrayOperation::Print(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
                 lower_print_to_custom_call(
@@ -6790,13 +6743,13 @@ where
     // optional signature shardings, so the func attributes can refer to `@mesh`.
     let mut signature_mesh = None;
     for sharding in arg_shardings.into_iter().flatten().chain(result_shardings.into_iter().flatten()) {
-        if signature_mesh.is_none() {
-            signature_mesh = Some(sharding.mesh().clone());
-            break;
-        }
+        signature_mesh = Some(match signature_mesh.take() {
+            Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
+            None => sharding.mesh().clone(),
+        });
     }
-    let nested_mesh = collect_nested_sharding_mesh(program, None)?;
-    if let Some(mesh) = nested_mesh.as_ref().or(signature_mesh.as_ref()) {
+    let mesh = collect_nested_sharding_mesh(program, signature_mesh)?;
+    if let Some(mesh) = mesh.as_ref() {
         let mesh_operation = mesh.to_mlir(location)?;
         module.body()?.append_operation(mesh_operation)?;
     }
@@ -6885,7 +6838,7 @@ where
         }
         None => None,
     };
-    if signature.has_ordered_io() && nested_mesh.as_ref().or(signature_mesh.as_ref()).is_some() {
+    if signature.has_ordered_io() && mesh.is_some() {
         let token_sharding = context.shardy_tensor_sharding(
             context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
             &[],
@@ -7120,25 +7073,30 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
 impl MlirLowerableValue for XlaArrayConstant {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
-        _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        _context: &'c MlirContext<'t>,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        Err(LoweringError::MissingCapturedConstant { index: self.index() })
+        match self {
+            Self::Captured(value) => Err(LoweringError::MissingCapturedConstant { index: value.index() }),
+            Self::Boolean(value) => CpuArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+        }
     }
 
-    #[inline]
     fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
-        _block: &mut B,
-        _context: &'c MlirContext<'t>,
-        _location: L,
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>,
     {
-        lower_captured_constant(self, captured_values)
+        match self {
+            Self::Captured(value) => lower_captured_constant(value, captured_values),
+            Self::Boolean(_) => lower_literal_value(self, block, context, location),
+        }
     }
 }
 
@@ -7346,6 +7304,7 @@ fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
     serialize_lowered_module(&module, &collective_state)
 }
 
+/// Collects meshes referenced by emitted sharding constraints and nested-computation boundaries.
 fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     existing: Option<LogicalMesh>,
@@ -7354,68 +7313,58 @@ where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
 {
-    // Attached nested computations (control-flow bodies, custom-derivative programs, and `jit_call` callees) are
-    // regions of this program's one canonical arena, so iterating every arena region covers them without any
-    // per-operation recursion; only `shard_map` still carries its body as a payload and recurses explicitly.
+    // Attached computations share the canonical region arena. Type metadata alone does not require a mesh:
+    // bounded-dynamic replica lowering retains that metadata without emitting Shardy operations.
     let mut mesh = existing;
     for region in program.regions().iter() {
         for instruction in region.instructions() {
-            match &instruction.operation() {
-                XlaOperation::ShardMap(shard_map_op) => {
-                    // The body is an attached arena region covered by this same walk; only the boundary metadata's
-                    // mesh needs merging here.
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, shard_map_op.shard_map().mesh())?,
-                        None => shard_map_op.shard_map().mesh().clone(),
-                    });
-                }
-                XlaOperation::Array(ArrayOperation::Reshard(operation)) => {
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
-                        None => operation.sharding().mesh().clone(),
-                    });
-                }
+            let incoming = match instruction.operation() {
+                XlaOperation::ShardMap(operation) => Some(operation.shard_map().mesh().clone()),
+                XlaOperation::Array(ArrayOperation::Reshard(operation)) => Some(operation.sharding().mesh().clone()),
                 XlaOperation::Array(ArrayOperation::ShardingConstraint(operation)) => {
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
-                        None => operation.sharding().mesh().clone(),
-                    });
+                    Some(operation.sharding().mesh().clone())
                 }
-                XlaOperation::Broadcast(operation)
-                    if {
+                operation => {
+                    let output_axes = match operation {
+                        XlaOperation::Broadcast(operation) => Some(operation.output_axes()),
+                        XlaOperation::Array(ArrayOperation::Broadcast(operation)) => Some(operation.output_axes()),
+                        _ => None,
+                    };
+                    let emits_constraint = if let Some(output_axes) = output_axes {
                         let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
                         let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
                         let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
                         let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                        broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes())
-                    } =>
-                {
+                        broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
+                    } else {
+                        match operation {
+                            XlaOperation::Reshape(operation) => operation.output_sharding().is_some(),
+                            XlaOperation::Array(ArrayOperation::Reshape(operation)) => {
+                                operation.output_sharding().is_some()
+                            }
+                            XlaOperation::Array(ArrayOperation::Gather(operation)) => {
+                                operation.output_sharding().is_some()
+                            }
+                            XlaOperation::Array(ArrayOperation::Scatter(operation)) => {
+                                operation.output_sharding().is_some()
+                            }
+                            XlaOperation::Array(ArrayOperation::ZeroLike(_) | ArrayOperation::OneLike(_)) => true,
+                            _ => false,
+                        }
+                    };
+                    if !emits_constraint {
+                        continue;
+                    }
                     let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
                     let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                    let output_sharding = output_type.sharding().unwrap();
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, output_sharding.mesh())?,
-                        None => output_sharding.mesh().clone(),
-                    });
+                    output_type.sharding().map(|sharding| sharding.mesh().clone())
                 }
-                XlaOperation::Array(ArrayOperation::Broadcast(operation))
-                    if {
-                        let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
-                        let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
-                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                        let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                        broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes())
-                    } =>
-                {
-                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                    let output_sharding = output_type.sharding().unwrap();
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(&existing_mesh, output_sharding.mesh())?,
-                        None => output_sharding.mesh().clone(),
-                    });
-                }
-                _ => {}
+            };
+            if let Some(incoming) = incoming {
+                mesh = Some(match mesh.take() {
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, &incoming)?,
+                    None => incoming,
+                });
             }
         }
     }
@@ -9385,6 +9334,9 @@ where
     match value {
         XlaConstant::Captured(value) => lower_captured_constant(value, captured_values),
         XlaConstant::Dimension(value) => lower_dimension_extent(value, block, context, location),
+        XlaConstant::Boolean(value) => {
+            lower_literal_value(&XlaArrayConstant::Boolean(*value), block, context, location)
+        }
     }
 }
 
@@ -14213,6 +14165,67 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_nested_sharding_mesh() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 2);
+        let input_type = test_vector_type(4);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        builder
+            .add_instruction(
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                    .with_output_sharding(sharding),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap()
+            .into_unprojected::<XlaConstant, XlaOperation>()
+            .unwrap();
+        assert_eq!(collect_nested_sharding_mesh(&program, None).unwrap(), Some(mesh.clone()));
+        // The mesh exists only on an internal value. Lowering must still declare the symbol referenced by its
+        // reshape constraint, even though neither the signature nor an explicit sharding operation supplies it.
+        to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type.clone()],
+            &Vec::<ArrayType>::new(),
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap());
+        let metadata_only = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap()
+            .into_unprojected::<XlaConstant, XlaOperation>()
+            .unwrap();
+        assert_eq!(collect_nested_sharding_mesh(&metadata_only, None).unwrap(), None);
+        let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert!(matches!(
+            collect_nested_sharding_mesh(&program, Some(incompatible.clone())),
+            Err(LoweringError::IncompatibleNestedMeshes)
+        ));
+        assert!(matches!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type],
+                &Vec::<ArrayType>::new(),
+                "main",
+                Some(&[Sharding::replicated(incompatible, 1)]),
+                None,
+            ),
+            Err(LoweringError::IncompatibleNestedMeshes)
+        ));
+    }
+
+    #[test]
     fn test_plain_reshape_explicit_output_sharding_lowers_constraint() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
@@ -18935,15 +18948,23 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_effectful_while_condition_once_per_evaluation() {
-        use ryft_core::PrintOperation;
+        use ryft_core::{AssertOperation, PrintOperation};
 
         // StableHLO condition regions cannot return tokens. The lowering therefore evaluates an effectful scalar
         // condition once before the loop and once after each body execution, carrying its predicate through the loop
-        // state so both prints remain on the enclosing ordered-I/O chain.
+        // state so assertions and prints remain on their independent enclosing effect chains.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone().into());
+            builder
+                .add_instruction(
+                    AssertOperation::<ArrayIrType>::new("condition must be true"),
+                    Vec::new(),
+                    vec![state],
+                    None,
+                )
+                .unwrap();
             let predicate =
                 builder.add_instruction(PrintOperation::new("condition"), Vec::new(), vec![state], None).unwrap()[0];
             builder
@@ -18968,10 +18989,12 @@ mod tests {
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
 
-        assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("@ryft.print").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("@ryft.assert").count(), 2, "{stablehlo}");
         let condition_region = stablehlo.split_once("cond {").unwrap().1.split_once("} do {").unwrap().0;
         assert!(!condition_region.contains("@ryft.print"), "{stablehlo}");
+        assert!(!condition_region.contains("@ryft.assert"), "{stablehlo}");
         let while_header = stablehlo.lines().find(|line| line.contains("stablehlo.while(")).unwrap();
         assert!(while_header.contains("tensor<i1>, !stablehlo.token"), "{stablehlo}");
     }
@@ -20228,24 +20251,22 @@ mod tests {
                     %c = stablehlo.constant dense<2> : tensor<i64>
                     %c_0 = stablehlo.constant dense<1> : tensor<i64>
                     %c_1 = stablehlo.constant dense<16> : tensor<i64>
-                    %1 = stablehlo.divide %c_1, %c_0 : tensor<i64>
-                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<2x1xf8E4M3FN>) -> tensor<2x1x16xf8E4M3FN>
+                    %1 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<2x1xf8E4M3FN>) -> tensor<2x1x16xf8E4M3FN>
                     %c_2 = stablehlo.constant dense<2> : tensor<i64>
-                    %3 = stablehlo.reshape %2 : (tensor<2x1x16xf8E4M3FN>) -> tensor<2x16xf8E4M3FN>
-                    %4 = stablehlo.convert %3 : (tensor<2x16xf8E4M3FN>) -> tensor<2x16xbf16>
-                    %5 = stablehlo.multiply %0, %4 : tensor<2x16xbf16>
-                    %6 = stablehlo.convert %arg1 : (tensor<2x16xf4E2M1FN>) -> tensor<2x16xbf16>
+                    %2 = stablehlo.reshape %1 : (tensor<2x1x16xf8E4M3FN>) -> tensor<2x16xf8E4M3FN>
+                    %3 = stablehlo.convert %2 : (tensor<2x16xf8E4M3FN>) -> tensor<2x16xbf16>
+                    %4 = stablehlo.multiply %0, %3 : tensor<2x16xbf16>
+                    %5 = stablehlo.convert %arg1 : (tensor<2x16xf4E2M1FN>) -> tensor<2x16xbf16>
                     %c_3 = stablehlo.constant dense<2> : tensor<i64>
                     %c_4 = stablehlo.constant dense<1> : tensor<i64>
                     %c_5 = stablehlo.constant dense<16> : tensor<i64>
-                    %7 = stablehlo.divide %c_5, %c_4 : tensor<i64>
-                    %8 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1] : (tensor<2x1xf8E4M3FN>) -> tensor<2x1x16xf8E4M3FN>
+                    %6 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1] : (tensor<2x1xf8E4M3FN>) -> tensor<2x1x16xf8E4M3FN>
                     %c_6 = stablehlo.constant dense<2> : tensor<i64>
-                    %9 = stablehlo.reshape %8 : (tensor<2x1x16xf8E4M3FN>) -> tensor<2x16xf8E4M3FN>
-                    %10 = stablehlo.convert %9 : (tensor<2x16xf8E4M3FN>) -> tensor<2x16xbf16>
-                    %11 = stablehlo.multiply %6, %10 : tensor<2x16xbf16>
-                    %12 = stablehlo.dot_general %5, %11, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x16xbf16>, tensor<2x16xbf16>) -> tensor<2x2xf32>
-                    return %12 : tensor<2x2xf32>
+                    %7 = stablehlo.reshape %6 : (tensor<2x1x16xf8E4M3FN>) -> tensor<2x16xf8E4M3FN>
+                    %8 = stablehlo.convert %7 : (tensor<2x16xf8E4M3FN>) -> tensor<2x16xbf16>
+                    %9 = stablehlo.multiply %5, %8 : tensor<2x16xbf16>
+                    %10 = stablehlo.dot_general %4, %9, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x16xbf16>, tensor<2x16xbf16>) -> tensor<2x2xf32>
+                    return %10 : tensor<2x2xf32>
                   }
                   func.func @main(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: tensor<2x1xf8E4M3FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
                     %0 = stablehlo.composite "xla.scaled_dot" %arg0, %arg1, %arg2, %arg3 {composite_attributes = {dimension_numbers = [[[1], [1]], [[], []]], preferred_element_type = f32}, decomposition = @xla.scaled_dot} : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
@@ -20384,13 +20405,14 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_retains_dynamic_scaled_dot_requirements_on_cuda() {
-        // A dynamic contracting block ratio is a runtime semantic requirement. Keep that case on the logical
-        // decomposition instead of erasing its dimension checks merely to reach CUDA's static fused boundary.
+    fn test_lower_mlir_module_for_program_lowers_dynamic_scaled_dot_composition_on_cuda() {
+        // Dynamic contracting dimensions stay on the logical decomposition rather than CUDA's static fused
+        // boundary. A single block makes divisibility trivial; folding the dimension arithmetic also preserves
+        // the reshape extent identity without an equality assertion.
         for block_bound in [2, 3] {
             let elements = DimensionVariable::new("elements", DimensionBounds::new(32, Some(65)).unwrap());
-            // A single-block allocation keeps the decomposition's reshape capacities equal while its runtime ratio
-            // still varies with `elements` and needs the same semantic assertion.
+            // A single block keeps reshape capacities equal, and the element bounds prove the minimum ratio.
+            // Multiple possible blocks still fail when their physical reshape capacities differ.
             let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(block_bound)).unwrap());
             let element_type = ArrayType::new(
                 DataType::F8E4M3FN,
@@ -20449,7 +20471,7 @@ mod tests {
             let module = module.unwrap().stable_hlo;
 
             assert!(module.contains("call @xla.scaled_dot"));
-            assert!(module.contains("stablehlo.custom_call @ryft.assert"));
+            assert!(!module.contains("stablehlo.custom_call @ryft.assert"));
             assert!(!module.contains("stablehlo.composite \"xla.scaled_dot\""));
         }
     }
@@ -21386,23 +21408,31 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_both_ordered_effect_classes_through_scan() {
-        use ryft_core::{DimensionFromScalarOperation, PrintOperation, ScanOperation as CoreScanOperation};
+        use ryft_core::{AssertOperation, PrintOperation, ScanOperation as CoreScanOperation};
 
-        // The scan body uses both ordered classes: the checked gateway contributes an assertion and the print
+        // The scan body uses both ordered classes: the scalar check contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let value = body_builder.add_input(scalar_type.clone().into());
+        let predicate = body_builder
+            .add_instruction(
+                XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                    ComparisonDirection::Equal,
+                ))),
+                Vec::new(),
+                vec![carry, value],
+                None,
+            )
+            .unwrap()[0];
         body_builder
             .add_instruction(
-                DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "extent",
-                    DimensionBounds::new(0, Some(5)).unwrap(),
-                )),
+                AssertOperation::<ArrayIrType>::new("scan value must equal carry")
+                    .with_labels(vec!["value".to_owned(), "carry".to_owned()]),
                 Vec::new(),
-                vec![value],
+                vec![predicate, value, carry],
                 None,
             )
             .unwrap();
@@ -21517,7 +21547,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_threads_branch_effect_class_union_independently() {
-        use ryft_core::{DimensionFromScalarOperation, PrintOperation};
+        use ryft_core::{AssertOperation, PrintOperation};
 
         // Each branch uses a different ordered class. StableHLO requires identical branch result signatures, so both
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
@@ -21525,14 +21555,22 @@ mod tests {
         let true_branch = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
+            let predicate = builder
+                .add_instruction(
+                    XlaOperation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                        ComparisonDirection::Equal,
+                    ))),
+                    Vec::new(),
+                    vec![input, input],
+                    None,
+                )
+                .unwrap()[0];
             builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(DimensionVariable::new(
-                        "extent",
-                        DimensionBounds::new(0, Some(5)).unwrap(),
-                    )),
+                    AssertOperation::<ArrayIrType>::new("scalar must equal itself")
+                        .with_labels(vec!["scalar".to_owned()]),
                     Vec::new(),
-                    vec![input],
+                    vec![predicate, input],
                     None,
                 )
                 .unwrap();
@@ -21590,15 +21628,11 @@ mod tests {
 
     #[test]
     fn test_executable_assertions_remain_local() {
-        use ryft_core::{DimensionFromScalarOperation, DimensionRequirementOperation};
+        use ryft_core::{AssertOperation, DimensionFromScalarOperation};
 
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let requirement = DimensionRequirementOperation::equal(
-            &DimensionType::from(left_variable.clone()),
-            &DimensionType::from(right_variable.clone()),
-        );
         let mut builder = CompositeXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
@@ -21608,8 +21642,21 @@ mod tests {
         let right_dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
             .unwrap()[0];
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                Vec::new(),
+                vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
         builder
-            .add_instruction(requirement, Vec::new(), vec![left_dimension, right_dimension], None)
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("dimensions must agree"),
+                Vec::new(),
+                vec![predicate],
+                None,
+            )
             .unwrap();
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder, Placeholder], vec![])
@@ -21642,13 +21689,11 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_separates_assertion_and_io_token_chains() {
-        use ryft_core::{DimensionFromScalarOperation, DimensionRequirementOperation, PrintOperation};
+        use ryft_core::{AssertOperation, DimensionFromScalarOperation, PrintOperation};
 
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let left_dimension_type = DimensionType::from(left_variable.clone());
-        let right_dimension_type = DimensionType::from(right_variable.clone());
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let left = builder.add_input(scalar_type.clone().into());
@@ -21659,20 +21704,38 @@ mod tests {
         let right_dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(right_variable), Vec::new(), vec![right], None)
             .unwrap()[0];
-        builder
+        let predicate = builder
             .add_instruction(
-                DimensionRequirementOperation::less_than_or_equal(&left_dimension_type, &right_dimension_type),
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
                 None,
             )
-            .unwrap();
-        builder.add_instruction(PrintOperation::new("value"), Vec::new(), vec![left], None).unwrap();
+            .unwrap()[0];
         builder
             .add_instruction(
-                DimensionRequirementOperation::equal(&left_dimension_type, &right_dimension_type),
+                AssertOperation::<ArrayIrType>::new("`left_dimension` <= `right_dimension`")
+                    .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
+                Vec::new(),
+                vec![predicate, left_dimension, right_dimension],
+                None,
+            )
+            .unwrap();
+        builder.add_instruction(PrintOperation::new("value"), Vec::new(), vec![left], None).unwrap();
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
                 Vec::new(),
                 vec![left_dimension, right_dimension],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left_dimension` == `right_dimension`")
+                    .with_labels(vec!["left_dimension".to_owned(), "right_dimension".to_owned()]),
+                Vec::new(),
+                vec![predicate, left_dimension, right_dimension],
                 None,
             )
             .unwrap();

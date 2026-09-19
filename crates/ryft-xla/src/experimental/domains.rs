@@ -1001,8 +1001,10 @@ impl<'c> Domain for XlaDomain<'c> {
     type Operation = XlaOperation;
 }
 
+impl ryft_core::AssertionContext for XlaDomain<'_> {}
+
 impl<'c> Context for XlaDomain<'c> {
-    /// An immediate [`XlaConstant::Dimension`] extent is a checked host integer and materializes directly. A
+    /// Immediate dimension extents materialize directly; Boolean literals upload a replicated scalar. A
     /// [`XlaConstant::Captured`] payload is a symbolic index into a compiled function's capture table carrying only a
     /// type and no data, so there is nothing to materialize without the surrounding capture table and lifting it is
     /// always rejected.
@@ -1013,6 +1015,19 @@ impl<'c> Context for XlaDomain<'c> {
             ))
             .into()),
             XlaConstant::Dimension(value) => Ok(ArrayIrValue::Dimension(value)),
+            XlaConstant::Boolean(value) => {
+                let client =
+                    self.client().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                let output_type = ArrayType::scalar(DataType::Boolean);
+                let mesh = self.eager_mesh(client, &[], std::slice::from_ref(&output_type))?;
+                let output_type = output_type
+                    .replicated(&mesh)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                let output = Array::from_host_buffer(client, output_type, mesh, [u8::from(value)])
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+                    .with_execution_domain(self.clone());
+                Ok(ArrayIrValue::Array(output))
+            }
         }
     }
 
@@ -1095,7 +1110,7 @@ impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
 }
 
 // Materialization delegates to [`Context::lift`] and therefore shares its semantics: an immediate
-// [`XlaConstant::Dimension`] extent materializes directly as a host-side dimension value, while a
+// dimension extent materializes directly and a Boolean literal uploads a replicated scalar, while a
 // [`XlaConstant::Captured`] payload carries only a type and no data and is always rejected outside a surrounding
 // capture table. The implementation exists because interpretation- and batching-capable operation families require a
 // [`Constant`] leaf on their contexts; programs whose constants were compiled into capture tables never take the
@@ -5039,7 +5054,8 @@ fn array_data_dependent_padding_discipline(
         }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
-        ArrayOperation::Zero(_)
+        ArrayOperation::Assert(_)
+        | ArrayOperation::Zero(_)
         | ArrayOperation::ZeroLike(_)
         | ArrayOperation::One(_)
         | ArrayOperation::OneLike(_)
@@ -5150,6 +5166,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::DynamicIota(_)
         | XlaOperation::Dimension(_)
         | XlaOperation::Compare(_)
+        | XlaOperation::Assert(_)
         | XlaOperation::DimensionSize(_)
         | XlaOperation::DimensionFromScalar(_)
         | XlaOperation::DimensionToScalar(_)
@@ -6233,14 +6250,14 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArraySliceAxis, Atan2Operation,
-        BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
-        ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
-        CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
-        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
-        DimensionRequirementOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation, ArraySliceAxis,
+        Assert, AssertOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver,
+        CaptureReference, CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
+        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation,
+        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension,
+        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
         DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
         DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
@@ -7322,7 +7339,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_dimension_requirements_report_the_first_same_class_failure_on_cpu() {
+    fn test_compiled_assertions_report_the_first_same_class_failure_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -7363,19 +7380,37 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder
+        let predicate = builder
             .add_instruction(
-                DimensionRequirementOperation::less_than_or_equal(&first_type, &second_type),
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![first, second],
                 None,
             )
-            .unwrap();
+            .unwrap()[0];
         builder
             .add_instruction(
-                DimensionRequirementOperation::less_than_or_equal(&second_type, &third_type),
+                AssertOperation::<ArrayIrType>::new("`first` <= `second`")
+                    .with_labels(vec!["first".to_owned(), "second".to_owned()]),
+                Vec::new(),
+                vec![predicate, first, second],
+                None,
+            )
+            .unwrap();
+        let predicate = builder
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![second, third],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`second` <= `third`")
+                    .with_labels(vec!["second".to_owned(), "third".to_owned()]),
+                Vec::new(),
+                vec![predicate, second, third],
                 None,
             )
             .unwrap();
@@ -7398,14 +7433,14 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("`dimension_requirement` failed: first <= second; observed first=4, second=3"),
+                .contains(r#"assertion failed: `first` <= `second`; observations=[("first", "4"), ("second", "3")]"#),
             "{error}",
         );
-        assert!(!error.to_string().contains("second <= third"), "{error}");
+        assert!(!error.to_string().contains("`second` <= `third`"), "{error}");
     }
 
     #[test]
-    fn test_compiled_dimension_requirement_predicates_preserve_diagnostics_on_cpu() {
+    fn test_compiled_assertions_preserve_diagnostics_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -7416,7 +7451,7 @@ mod tests {
         let bounds = DimensionBounds::new(0, Some(20)).unwrap();
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
-        let check = |operation: DimensionRequirementOperation, left_value: i64, right_value: i64, expected: &str| {
+        for (left_value, right_value, divisible) in [(3_i64, 4_i64, false), (7, 3, true), (7, 0, true)] {
             let mut builder = XlaProgramBuilder::new();
             let left_input = builder.add_input(input_type.clone().into());
             let right_input = builder.add_input(input_type.clone().into());
@@ -7436,8 +7471,84 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap();
-            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![right], None).unwrap()[0];
+            let mut output = right;
+            let (predicate, message) = if divisible {
+                let zero = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
+                let one = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(1).unwrap()));
+                let positive = builder
+                    .add_instruction(
+                        CompareOperation::<ArrayIrType>::new(ComparisonDirection::GreaterThan),
+                        Vec::new(),
+                        vec![right, zero],
+                        None,
+                    )
+                    .unwrap()[0];
+                builder
+                    .add_instruction(
+                        AssertOperation::<ArrayIrType>::new("divisor must be positive")
+                            .with_labels(vec!["right".to_owned()]),
+                        Vec::new(),
+                        vec![positive, right],
+                        None,
+                    )
+                    .unwrap();
+                let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
+                let maximum = ryft_core::DimensionMaxOperation::new(&right_type, &one_type).unwrap();
+                let safe_type = maximum.infer_output_types(&[right_type.clone(), one_type], &[]).unwrap().remove(0);
+                let safe = builder
+                    .add_instruction(ryft_core::DimensionOperation::Max(maximum), Vec::new(), vec![right, one], None)
+                    .unwrap()[0];
+                let remainder = builder
+                    .add_instruction(
+                        ryft_core::DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &safe_type).unwrap()),
+                        Vec::new(),
+                        vec![left, safe],
+                        None,
+                    )
+                    .unwrap()[0];
+                output = builder
+                    .add_instruction(
+                        ryft_core::DimensionOperation::Div(DimensionDivOperation::new(&left_type, &safe_type).unwrap()),
+                        Vec::new(),
+                        vec![left, safe],
+                        None,
+                    )
+                    .unwrap()[0];
+                (
+                    builder
+                        .add_instruction(
+                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                            Vec::new(),
+                            vec![remainder, zero],
+                            None,
+                        )
+                        .unwrap()[0],
+                    "`left` must be divisible by `right`",
+                )
+            } else {
+                (
+                    builder
+                        .add_instruction(
+                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                            Vec::new(),
+                            vec![left, right],
+                            None,
+                        )
+                        .unwrap()[0],
+                    "dimensions must agree",
+                )
+            };
+            builder
+                .add_instruction(
+                    AssertOperation::<ArrayIrType>::new(message)
+                        .with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                    Vec::new(),
+                    vec![predicate, left, right],
+                    None,
+                )
+                .unwrap();
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![output], None).unwrap()[0];
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -7451,29 +7562,257 @@ mod tests {
                 Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap()
             };
-
             let error = domain.execute_xla_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
-        };
+            let expected = if right_value == 0 {
+                ryft_core::AssertionError::Failed {
+                    message: "divisor must be positive".to_owned(),
+                    observations: vec![("right".to_owned(), "0".to_owned())],
+                }
+            } else {
+                ryft_core::AssertionError::Failed {
+                    message: message.to_owned(),
+                    observations: vec![
+                        ("left".to_owned(), left_value.to_string()),
+                        ("right".to_owned(), right_value.to_string()),
+                    ],
+                }
+            };
+            assert!(error.to_string().contains(&expected.to_string()), "{error}");
+        }
+    }
 
-        check(
-            DimensionRequirementOperation::equal(&left_type, &right_type),
-            3,
-            4,
-            "`dimension_requirement` failed: left == right; observed left=3, right=4",
-        );
-        check(
-            DimensionRequirementOperation::divisible_by(&left_type, &right_type),
-            7,
-            3,
-            "`dimension_requirement` failed: left % right == 0; observed left=7, right=3",
-        );
-        check(
-            DimensionRequirementOperation::divisible_by(&left_type, &right_type),
-            7,
-            0,
-            "`dimension_requirement` failed: right > 0 for divisibility; observed left=7, right=0",
-        );
+    #[test]
+    fn test_compiled_assertion_scalar_observations_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
+        for observations in [
+            vec![],
+            vec![
+                ("unsigned", DataType::U64, u64::MAX.to_ne_bytes().to_vec(), u64::MAX.to_string()),
+                ("signed", DataType::I64, i64::MIN.to_ne_bytes().to_vec(), i64::MIN.to_string()),
+                ("float", DataType::F32, (-0.5_f32).to_ne_bytes().to_vec(), "-0.5".to_owned()),
+                ("boolean", DataType::Boolean, vec![1], "true".to_owned()),
+            ],
+        ] {
+            let mut builder = XlaProgramBuilder::new();
+            let predicate = builder.add_input(predicate_type.clone().into());
+            let predicate =
+                builder.add_instruction(AndOperation::new(), vec![], vec![predicate, predicate], None).unwrap()[0];
+            let mut inputs = vec![predicate];
+            for (_, data_type, _, _) in &observations {
+                inputs.push(builder.add_input(replicated_scalar_type(&mesh, *data_type).into()));
+            }
+            builder
+                .add_instruction(
+                    AssertOperation::<ArrayIrType>::new("scalar check")
+                        .with_labels(observations.iter().map(|(label, _, _, _)| (*label).to_owned()).collect()),
+                    Vec::new(),
+                    inputs,
+                    None,
+                )
+                .unwrap();
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; observations.len() + 1], vec![])
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            for passed in [true, false] {
+                let mut inputs = vec![
+                    Array::from_host_buffer(&client, predicate_type.clone(), mesh.clone(), &[u8::from(passed)])
+                        .unwrap(),
+                ];
+                for (_, data_type, bytes, _) in &observations {
+                    inputs.push(
+                        Array::from_host_buffer(
+                            &client,
+                            replicated_scalar_type(&mesh, *data_type),
+                            mesh.clone(),
+                            bytes,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let output = domain.execute_xla_program(&compiled, inputs);
+                if passed {
+                    assert!(output.unwrap().is_empty());
+                } else {
+                    let expected = ryft_core::AssertionError::Failed {
+                        message: "scalar check".to_owned(),
+                        observations: observations
+                            .iter()
+                            .map(|(label, _, _, rendered)| ((*label).to_owned(), rendered.clone()))
+                            .collect(),
+                    };
+                    let error = output.unwrap_err();
+                    assert!(error.to_string().contains(&expected.to_string()), "{error}");
+                }
+            }
+        }
+
+        let predicates = boolean_vector(&client, &mesh, &[true, false, false]);
+        let observations = f32_vector(&client, &mesh, &[10., 20., 30.]);
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| {
+                batch(
+                    |(predicate, observation)| predicate.assert("mapped check", &[("value", observation)]),
+                    (inputs[0].clone(), inputs[1].clone()),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    (),
+                    None,
+                )
+                .unwrap();
+                vec![]
+            },
+            vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let program = staged.source_program().program();
+        let lowered = domain.lower_xla_program(program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let error = domain.execute_xla_program(&compiled, vec![predicates, observations]).unwrap_err();
+        let expected = ryft_core::AssertionError::Failed {
+            message: "mapped check".to_owned(),
+            observations: vec![("value".to_owned(), "20".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
+        };
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+    }
+
+    #[test]
+    fn test_compiled_assertion_dynamic_batching_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let size = context.input(input_type.clone().into());
+        let limit = context.input(input_type.clone().into());
+        let dimension = context
+            .bind(DimensionFromScalarOperation::new(extent.clone()), Vec::new(), &[size])
+            .unwrap()
+            .remove(0);
+        let indices = context
+            .bind(
+                IotaOperation::new(ArrayType::new(DataType::I64, Shape::new(vec![extent.into()])), 0).unwrap(),
+                Vec::new(),
+                std::slice::from_ref(&dimension),
+            )
+            .unwrap()
+            .remove(0);
+        let limits = context
+            .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[limit, dimension.clone()])
+            .unwrap()
+            .remove(0);
+        let predicates = context
+            .bind(
+                XlaOperation::Array(ryft_core::ArrayOperation::Compare(CompareOperation::new(
+                    ComparisonDirection::LessThan,
+                ))),
+                Vec::new(),
+                &[indices.clone(), limits],
+            )
+            .unwrap()
+            .remove(0);
+        let batching = BatchingContext::new(context.clone(), dimension);
+        AssertOperation::new("dynamic mapped check")
+            .with_labels(vec!["value".to_owned()])
+            .batch(
+                &batching,
+                &EmptyRegionDriver,
+                &[ArrayIrBatch::new(predicates, 0).unwrap(), ArrayIrBatch::new(indices, 0).unwrap()],
+            )
+            .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        for (size, limit) in [(0_i64, 0_i64), (1, 1), (3, 3)] {
+            let inputs = [size, limit]
+                .into_iter()
+                .map(|value| {
+                    Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(domain.execute_xla_program(&compiled, inputs).unwrap().is_empty());
+        }
+        let inputs = [3_i64, 1_i64]
+            .into_iter()
+            .map(|value| {
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let error = domain.execute_xla_program(&compiled, inputs).unwrap_err();
+        let expected = ryft_core::AssertionError::Failed {
+            message: "dynamic mapped check".to_owned(),
+            observations: vec![("value".to_owned(), "1".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
+        };
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+    }
+
+    #[test]
+    fn test_compiled_assertion_dynamic_replicated_batching_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let size = context.input(input_type.clone().into());
+        let dimension = context
+            .bind(
+                DimensionFromScalarOperation::new(DimensionVariable::new(
+                    "batch",
+                    DimensionBounds::new(0, Some(5)).unwrap(),
+                )),
+                Vec::new(),
+                std::slice::from_ref(&size),
+            )
+            .unwrap()
+            .remove(0);
+        let condition = context.lift(XlaConstant::Boolean(false)).unwrap();
+        let batching = BatchingContext::new(context.clone(), dimension);
+        AssertOperation::new("dynamic replicated check")
+            .with_labels(vec!["size".to_owned()])
+            .batch(
+                &batching,
+                &EmptyRegionDriver,
+                &[ArrayIrBatch::replicated(condition), ArrayIrBatch::replicated(size)],
+            )
+            .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let empty = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
+        assert!(domain.execute_xla_program(&compiled, vec![empty]).unwrap().is_empty());
+        let nonempty = Array::from_host_buffer(&client, input_type, mesh, &3_i64.to_ne_bytes()).unwrap();
+        let error = domain.execute_xla_program(&compiled, vec![nonempty]).unwrap_err();
+        let expected = ryft_core::AssertionError::Failed {
+            message: "dynamic replicated check".to_owned(),
+            observations: vec![("size".to_owned(), "3".to_owned())],
+        };
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
     }
 
     #[test]
@@ -7599,11 +7938,20 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder
+        let predicate = builder
             .add_instruction(
-                DimensionRequirementOperation::less_than_or_equal(&left_type, &right_type),
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
                 Vec::new(),
                 vec![left, right],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                AssertOperation::<ArrayIrType>::new("`left` <= `right`")
+                    .with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                Vec::new(),
+                vec![predicate, left, right],
                 None,
             )
             .unwrap();

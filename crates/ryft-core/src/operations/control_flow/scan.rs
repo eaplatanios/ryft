@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType,
-    Dimension, DimensionBounds, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, ReferenceSliceOperation, Shape,
+    Dimension, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, ReferenceSliceOperation, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -28,11 +28,12 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::assertions::{AssertOperation, AssertionError};
+use crate::operations::compare::{CompareOperation, ComparisonDirection};
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
-use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
@@ -1878,8 +1879,10 @@ where
             Type = ArrayIrType,
             Operation: ArrayReferenceViewOperation
                            + From<ReferenceSliceOperation>
-                           + From<DimensionRequirementOperation>,
-        > + Zero<C::Value>,
+                           + From<CompareOperation<ArrayIrType>>
+                           + From<AssertOperation<ArrayIrType>>,
+        > + Zero<C::Value>
+        + DimensionConstant,
     P: ReferenceDischargePolicy<C, Referent = ArrayType>,
 {
     fn discharge_scan<Capture: Value<Type = Self>, D: ReferenceDischargeDriver<C, P>>(
@@ -2054,14 +2057,36 @@ where
                 // the error for nonzero executions while avoiding any lowering of the unreachable body.
                 let runtime_length = context.boundary_value(inputs.last().unwrap())?;
                 let runtime_type = runtime_length.r#type();
-                context.parent().bind(
-                    DimensionRequirementOperation::bounds(
-                        <&DimensionType>::try_from(runtime_type.as_ref())?,
-                        DimensionBounds::new(0, Some(1))?,
-                    ),
-                    Vec::new(),
-                    std::slice::from_ref(&runtime_length),
-                )?;
+                let dimension = <&DimensionType>::try_from(runtime_type.as_ref())?;
+                let (minimum, maximum) = dimension.bounds().representable_extent_range()?;
+                if minimum > 0 {
+                    return Err(AssertionError::Failed {
+                        message: "empty carried roots require a zero scan length".to_owned(),
+                        observations: vec![(
+                            "length".to_owned(),
+                            dimension
+                                .extent()
+                                .map(|extent| extent.to_string())
+                                .unwrap_or_else(|| "<unknown>".to_owned()),
+                        )],
+                    }
+                    .into());
+                }
+                if maximum > 0 {
+                    let zero = context.parent().dimension_constant(0)?;
+                    let predicates = context.parent().bind(
+                        CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
+                        Vec::new(),
+                        &[runtime_length.clone(), zero],
+                    )?;
+                    check_count!("output", predicates, 1, ProgramError);
+                    context.parent().bind(
+                        AssertOperation::new("empty carried roots require a zero scan length")
+                            .with_labels(vec!["length".to_owned()]),
+                        Vec::new(),
+                        &[predicates[0].clone(), runtime_length],
+                    )?;
+                }
             }
             let output_types = composite_scan_boundary_types(
                 ScanBoundarySide::Output,
@@ -3860,7 +3885,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, DimensionBounds,
-        DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         ReferenceDynamicIndexOperation, ReferenceIndexOperation, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchingTracer, batch};
@@ -5977,13 +6002,11 @@ mod tests {
             ProgramError::from(TypeError::invalid("cannot dynamically index an empty reference axis"))
         );
         assert_eq!(
-            discharged_error.to_string(),
-            ProgramError::from(DimensionError::BindingOutOfBounds {
-                variable: length.to_string(),
-                value: 1,
-                bounds: DimensionBounds::new(0, Some(1)).unwrap(),
-            })
-            .to_string(),
+            discharged_error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "empty carried roots require a zero scan length".to_owned(),
+                observations: vec![("length".to_owned(), "1".to_owned())],
+            }),
         );
     }
 

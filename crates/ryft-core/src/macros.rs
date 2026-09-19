@@ -230,14 +230,14 @@ macro_rules! check_builders {
 
 /// Defines a nominal binary dimension arithmetic operation.
 ///
-/// The generated operation stores the two declared operand types and the name and bounds needed to infer one fresh
-/// result identity. The resulting program atom owns that inferred identity; the operation does not duplicate it. The
+/// The generated operation stores the two declared input types and the name and bounds needed to infer one fresh
+/// output identity. The resulting program atom owns that inferred identity; the operation does not duplicate it. The
 /// generated type implements [`Operation`](crate::Operation),
 /// [`ArithmeticDimensionOperation`](crate::ArithmeticDimensionOperation), [`Display`](std::fmt::Display),
 /// identity renaming, capability-based interpretation, and partial evaluation.
 ///
 /// The caller supplies the operation's public documentation and name, its value-level capability and semantic method,
-/// a diagnostic result-name expression, and a bounds-transfer expression. This keeps operation structure and
+/// a diagnostic output-name expression, and a bounds-transfer expression. This keeps operation structure and
 /// interpretation centralized while leaving concrete value semantics in backend capability implementations.
 /// Exactly one dispatch form is required: `provider = Type` implements [`OperationProvider`](crate::OperationProvider)
 /// for an existing capability's marker, while `capability = { ... }` defines a dimension-specific capability through
@@ -293,6 +293,8 @@ macro_rules! check_builders {
 ///   - `$infer_bounds`: Expression evaluating to a function or closure that accepts references to the left and right
 ///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
 ///     The Boolean reports whether their bounds leave a checked runtime failure possible.
+///   - `$fold`: Optional expression accepting the actual left and right types and returning input replacements
+///     according to [`Operation::fold`](crate::Operation::fold). Omission disables local folding.
 ///   - `$provider`: Explicit marker type whose provider validates two inputs and constructs the generated operation.
 ///     This argument is mutually exclusive with `capability`.
 ///   - `capability`: Documentation attributes before `trait;` document the generated capability trait. Attributes
@@ -307,6 +309,7 @@ macro_rules! define_dimension_arithmetic_operation {
         $capability:ident, $method:ident,
         output_name = $output_name:expr,
         infer_bounds = $infer_bounds:expr,
+        $(fold = $fold:expr,)?
         provider = $provider:ty $(,)?
     ) => {
         $crate::define_dimension_arithmetic_operation!(
@@ -315,6 +318,7 @@ macro_rules! define_dimension_arithmetic_operation {
             $operation, $name, $capability, $method,
             output_name = $output_name,
             infer_bounds = $infer_bounds,
+            $(fold = $fold,)?
         );
 
         impl $crate::programs::OperationProvider<$crate::arrays::DimensionType> for $provider {
@@ -338,6 +342,7 @@ macro_rules! define_dimension_arithmetic_operation {
         $capability:ident, $method:ident,
         output_name = $output_name:expr,
         infer_bounds = $infer_bounds:expr,
+        $(fold = $fold:expr,)?
         capability = {
             $(#[$capability_documentation:meta])+
             trait;
@@ -351,6 +356,7 @@ macro_rules! define_dimension_arithmetic_operation {
             $operation, $name, $capability, $method,
             output_name = $output_name,
             infer_bounds = $infer_bounds,
+            $(fold = $fold,)?
         );
 
         $crate::define_arithmetic_dimension_capability!(
@@ -369,7 +375,8 @@ macro_rules! define_dimension_arithmetic_operation {
         $operation:ident, $name:ident,
         $capability:ident, $method:ident,
         output_name = $output_name:expr,
-        infer_bounds = $infer_bounds:expr $(,)?
+        infer_bounds = $infer_bounds:expr
+        $(, fold = $fold:expr)? $(,)?
     ) => {
         $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
@@ -446,9 +453,21 @@ macro_rules! define_dimension_arithmetic_operation {
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::arrays::DimensionType],
-                _region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::arrays::DimensionType>],
+                region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::arrays::DimensionType>],
             ) -> Result<Vec<$crate::arrays::DimensionType>, $crate::programs::types::TypeError> {
+                $crate::check_count!("region", region_interfaces, 0, TypeError);
                 $crate::operations::dimensions::ArithmeticDimensionOperation::infer_output_types(self, input_types)
+            }
+
+            #[inline]
+            fn fold(
+                &self,
+                input_types: &[$crate::arrays::DimensionType],
+                region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::arrays::DimensionType>],
+            ) -> Result<Option<Vec<usize>>, $crate::programs::types::TypeError> {
+                $crate::check_count!("input", input_types, 2, TypeError);
+                $crate::check_count!("region", region_interfaces, 0, TypeError);
+                Ok(None$(.or_else(|| ($fold)(&input_types[0], &input_types[1])))?)
             }
 
             #[inline]
@@ -563,9 +582,9 @@ macro_rules! define_dimension_arithmetic_operation {
 
 /// Defines a value-level capability for a binary dimension arithmetic operation.
 ///
-/// The generated trait exposes one semantic binary method. Its blanket implementation constructs and stages the
-/// corresponding operation through a context-carrying value's dispatch domain; concrete eager values provide
-/// backend-owned implementations.
+/// The generated trait exposes one semantic binary method. Its blanket implementation constructs and binds the
+/// corresponding operation through the value's dispatch domain. Concrete eager values provide backend-owned
+/// implementations.
 ///
 /// # Examples
 ///
@@ -590,6 +609,7 @@ macro_rules! define_dimension_arithmetic_operation {
 ///     `DimensionMaxOperation`).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_capability {
+    // Defines a binary capability that binds its validated operation through the value's dispatch domain.
     (
         $(#[$capability_documentation:meta])*
         $capability:ident,

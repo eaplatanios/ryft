@@ -24,10 +24,11 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::assertions::Assert;
+use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
@@ -499,9 +500,10 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: DimensionSize
+        + Assert
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
+        + ValueProjection<DimensionType, Projected: Compare<C::Value>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
 {
@@ -622,10 +624,15 @@ where
                 ArrayIrType::Dimension(_) => {
                     true_output.validate_replicated_dimension()?;
                     false_output.validate_replicated_dimension()?;
-                    <C::Value as ValueProjection<DimensionType>>::into_projected(true_output.value().clone())?
-                        .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(
-                            false_output.value().clone(),
-                        )?)?;
+                    ValueProjection::<DimensionType>::into_projected(true_output.value().clone())?
+                        .compare(
+                            &ValueProjection::<DimensionType>::into_projected(false_output.value().clone())?,
+                            ComparisonDirection::Equal,
+                        )?
+                        .assert(
+                            "branch dimensions must agree",
+                            &[("true", true_output.value().clone()), ("false", false_output.value().clone())],
+                        )?;
                     Ok(true_output)
                 }
                 ArrayIrType::Reference(_) => {
@@ -1690,6 +1697,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
@@ -4061,8 +4069,13 @@ mod tests {
                 &[BatchingTracer::new(context.clone(), ArrayIrBatch::new(predicate, BatchAxis::new(0))?)],
             )
             .unwrap_err();
-        assert!(matches!(error, ProgramError::Type(TypeError::Custom(_))));
-        assert_eq!(error.to_string(), "2 == 3; observed 2=2, 3=3");
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "branch dimensions must agree".to_owned(),
+                observations: vec![("true".to_owned(), "2".to_owned()), ("false".to_owned(), "3".to_owned())],
+            }),
+        );
         Ok(())
     }
 

@@ -289,6 +289,14 @@ trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
+    fn fold(
+        &self,
+        _input_types: &[Self::Type],
+        _region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<usize>>, TypeError> {
+        Ok(None)
+    }
+
     fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> InputRegionProvenance {
         InputRegionProvenance::None
     }
@@ -389,6 +397,19 @@ where
 {
     let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
     Ok(operation.infer_output_types(&input_types, &region_interfaces)?.into_iter().map(U::from).collect())
+}
+
+/// Folds a member operation through the same projected boundary as output inference.
+fn fold_projected_operation<T: Type, U: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[U],
+    region_interfaces: &[RegionInterface<U>],
+) -> Result<Option<Vec<usize>>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    operation.fold(&input_types, &region_interfaces)
 }
 
 /// Projects a stand-in composite inference boundary to one member type.
@@ -1283,6 +1304,13 @@ impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
     ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
         Ok(input_types.to_vec())
     }
+    fn fold(
+        &self,
+        input_types: &[Self::Type],
+        _region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<usize>>, TypeError> {
+        Ok((MEMBER == 0).then(|| (0..input_types.len()).collect()))
+    }
 }
 
 impl<const MEMBER: u8>
@@ -1342,6 +1370,13 @@ fn test_operation_generates_projected_member_dispatch() {
     assert_eq!(
         first.infer_region_input_types(std::slice::from_ref(&first_type), &[RegionInterface::new()]),
         Ok(vec![None]),
+    );
+
+    assert_eq!(first.fold(std::slice::from_ref(&first_type), &[]), Ok(Some(vec![0])));
+    assert_eq!(third.fold(std::slice::from_ref(&third_type), &[]), Ok(None));
+    assert_eq!(
+        first.fold(std::slice::from_ref(&third_type), &[]),
+        Err(TypeError::invalid("wrong projected member type")),
     );
 
     // Eager interpretation executes in the selected member universe and lifts the result into the composite value.

@@ -24,9 +24,11 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
+use crate::operations::assertions::Assert;
+use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
+use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
@@ -35,6 +37,7 @@ use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
 use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::math::rem::Rem;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -391,12 +394,13 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: DimensionSize
+    C::Value: Assert
+        + DimensionSize
         + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Reduce + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+        Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -531,11 +535,12 @@ pub trait ParallelSumScatter: Sized {
 
 impl<V> ParallelSumScatter for V
 where
-    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V: Value<Type = ArrayIrType> + Assert + DimensionSize<V> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
     V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<ParallelSumScatterOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
+    <V as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
 {
     fn parallel_sum_scatter_with_options(
         &self,

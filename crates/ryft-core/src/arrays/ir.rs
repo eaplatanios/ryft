@@ -253,6 +253,14 @@ impl<A: Concretizable<bool> + Value<Type = ArrayType>> Concretizable<bool> for A
     }
 }
 
+impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> TryFrom<bool> for ArrayIrValue<A> {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, Self::Error> {
+        Ok(Self::Array(A::try_from(value)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::hash::{BuildHasher, RandomState};
@@ -294,6 +302,12 @@ mod tests {
 
     #[test]
     fn test_array_ir_value_projection() {
+        for value in [false, true] {
+            let array = ArrayIrValue::<Array>::try_from(value).unwrap();
+            assert_eq!(array, ArrayIrValue::Array(Array::scalar(value).unwrap()));
+            assert_eq!(Concretizable::<bool>::concretize(&array), Ok(value));
+            assert_eq!(ValueProjection::<ArrayType>::into_projected(array).unwrap(), Array::try_from(value).unwrap());
+        }
         let array = Array::vector((0..4096).map(|value| value as f32).collect()).unwrap();
         let payload = array.storage_bytes().as_ptr();
         let stored = ArrayIrValue::Array(array);

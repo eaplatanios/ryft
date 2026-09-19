@@ -1104,6 +1104,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::StopGradient(_)
                 | ArrayOperation::Tag(_)
                 | ArrayOperation::Rematerialize(_)
+                | ArrayOperation::Assert(_)
                 | ArrayOperation::Print(_)
                 | ArrayOperation::CustomJvp(_)
                 | ArrayOperation::CustomVjp(_)
@@ -1149,6 +1150,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::CustomJvp(_)
             | ArrayIrOperation::CustomVjp(_)
             | ArrayIrOperation::LinearCall(_)
+            | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Rematerialize(_) => {}
         }
         Ok(())

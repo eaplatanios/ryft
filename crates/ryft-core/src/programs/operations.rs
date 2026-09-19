@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::effects::{Effects, ReferenceAccessMode};
@@ -328,7 +329,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     still live on the payload implementations; the enum is only an adapter and dispatcher.
 ///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that forwards native
 ///     variants to their payload rules. Member variants use the enclosing operation's canonical fold-or-residualize
-///     path, avoiding a second projected partial-value protocol.
+///     path, which also consults projected [`Operation::fold`] rules without a second partial-value protocol.
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
@@ -525,6 +526,36 @@ pub trait Operation: Clone {
         input_types: &[Self::Type],
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
+
+    /// Folds this validated [`Operation`] to existing inputs without executing it or creating new operations. Returns
+    /// `None` when no folding is possible, or one input index per output, in output order, when folding is possible.
+    /// An empty replacement vector folds a zero-output operation.
+    ///
+    /// Callers must validate the complete application through [`Self::infer_output_types`] before calling this function
+    /// and validate replacement indices, output count, and type refinements before applying a fold. Implementations use
+    /// the actual input types, including refined bounds, rather than only stored metadata. Equal types do not imply
+    /// equal values unless the type's identity contract explicitly guarantees it.
+    ///
+    /// A successful fold guarantees that omitting this operation, including its executable regions, preserves all
+    /// observable behavior, possible failures, and transformation semantics (including differentiation). Effects of
+    /// input producers remain live. Replacement types may refine inferred output types and substitute their identities,
+    /// but callers must propagate those substitutions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
+    ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
+    ///     empty slice and ignore it.
+    #[inline]
+    fn fold(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<usize>>, TypeError> {
+        let _ = (input_types, region_interfaces);
+        Ok(None)
+    }
 
     /// Describes how this operation supplies input `input_index` of the attached [`Region`](crate::Region) at
     /// `region_index`. [`InputRegionProvenance::Input`] records operand correspondence rather than equal runtime values
@@ -808,6 +839,15 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
+    fn fold(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+    ) -> Result<Option<Vec<usize>>, TypeError> {
+        self.as_ref().fold(input_types, region_interfaces)
+    }
+
+    #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         self.as_ref().input_region_provenance(region_index, input_index)
     }
@@ -982,6 +1022,17 @@ pub trait MemberOperation<U: Type>: Operation {
         region_interfaces: &[RegionInterface<U>],
     ) -> Result<Vec<U>, TypeError>;
 
+    /// Folds this payload's validated instruction in parent universe `U`, using [`Operation::fold`] semantics.
+    #[inline]
+    fn fold_parent(
+        &self,
+        input_types: &[U],
+        region_interfaces: &[RegionInterface<U>],
+    ) -> Result<Option<Vec<usize>>, TypeError> {
+        let _ = (input_types, region_interfaces);
+        Ok(None)
+    }
+
     /// Renames parent-universe [`TypeIdentity`](crate::TypeIdentity)s referenced by this payload.
     fn rename_parent_type_identities(&self, renaming: &TypeIdentityRenaming<U::Identity>) -> Result<Self, TypeError>;
 }
@@ -1040,6 +1091,47 @@ where
     Ok(operation.infer_output_types(&input_types, &region_interfaces)?.into_iter().map(I::from).collect())
 }
 
+/// Folds a projected member operation after projecting every input and region interface to its native type.
+/// Input positions are unchanged by projection, so replacement indices also apply to the enclosing operation.
+/// This function supports projected variants generated by `#[derive(Operation)]`.
+pub fn fold_projected_operation<T: Type, I: Type, O: Operation<Type = T>>(
+    operation: &O,
+    input_types: &[I],
+    region_interfaces: &[RegionInterface<I>],
+) -> Result<Option<Vec<usize>>, TypeError>
+where
+    for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
+{
+    let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
+    operation.fold(&input_types, &region_interfaces)
+}
+
+/// Validates input replacements against an already inferred operation boundary, including relationships between
+/// input and output identities. Returning input values needs no conversion or new identity allocation.
+pub(crate) fn validate_operation_fold<T: Type>(
+    operation_name: &str,
+    input_types: &[T],
+    output_types: &[T],
+    replacements: &[usize],
+) -> Result<(), TypeError> {
+    check_count!("fold output", replacements, output_types.len(), TypeError);
+    let mut actual = input_types.to_vec();
+    for &index in replacements {
+        let input_type = input_types.get(index).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "`{}` fold references input {} but has {} inputs",
+                operation_name,
+                index,
+                input_types.len(),
+            ))
+        })?;
+        actual.push(input_type.clone());
+    }
+    let declared = input_types.iter().chain(output_types).cloned().collect::<Vec<_>>();
+    T::derive_identity_renaming(&declared, &actual)?;
+    Ok(())
+}
+
 /// Projects one member [`Operation`]'s complete inference boundary from the enclosing composite type `U` to its native
 /// member type `T`. This includes every ordinary input type and both the input and output types of every attached
 /// [`RegionInterface`]. Region effects are structural metadata rather than member-typed values, so they are preserved
@@ -1091,8 +1183,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType};
-    use crate::operations::StopGradientOperation;
+    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionType};
+    use crate::operations::{DimensionAddOperation, StopGradientOperation};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{EffectClass, EffectClasses, ReferenceEffect};
@@ -1264,6 +1356,7 @@ mod tests {
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], EffectClasses::NONE),
         ];
 
+        assert_eq!(operation.fold(&[DataType::F64], &[]), Ok(None));
         assert_eq!(operation.region_slots(), &[]);
         assert_eq!(operation.region_role(0), None);
         assert_eq!(operation.validate_region_count(0), Ok(()));
@@ -1335,6 +1428,26 @@ mod tests {
             Ok(Box::new(ForwardingOperation::<DataType> { renamed: true, marker: PhantomData })),
         );
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "forwarded",);
+    }
+
+    #[test]
+    fn test_operation_fold() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = Box::new(DimensionAddOperation::new(&value, &zero).unwrap());
+        let inputs = [value, zero];
+        let outputs = operation.infer_output_types(&inputs, &[]).unwrap();
+        assert_eq!(operation.fold(&inputs, &[]), Ok(Some(vec![0])));
+        assert_eq!(validate_operation_fold(operation.name(), &inputs, &outputs, &[0]), Ok(()));
+
+        // A replacement must refine the declared output; the zero input cannot replace this positive sum.
+        assert_eq!(
+            validate_operation_fold(operation.name(), &inputs, &outputs, &[1]),
+            Err(TypeError::invalid(format!(
+                "dimension type {} cannot instantiate declared type {}",
+                inputs[1], outputs[0],
+            ))),
+        );
     }
 
     #[test]

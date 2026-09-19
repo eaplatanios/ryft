@@ -109,6 +109,7 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
+use crate::programs::operations::validate_operation_fold;
 use crate::programs::{
     AtomId, BindingRegionDriver, EffectClass, EffectClasses, EffectsSummary, EmptyRegionDriver, FlatProgram,
     InstructionId, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
@@ -1190,9 +1191,9 @@ pub enum ReferencePlacement {
 /// and transform interpreters that bind operations directly over [`PartialTracer`]s.
 ///
 /// Each [`Context::bind`] dispatches the operation's [`PartiallyEvaluatableOperation::partially_evaluate`]
-/// implementation. The default [`fold_or_residualize`](Self::fold_or_residualize) policy binds an all-known operation
-/// through the parent context and emits a mixed or unknown operation into the residual builder. Specialized rules can
-/// instead inline nested programs or preserve more known work.
+/// implementation. The default [`fold_or_residualize`](Self::fold_or_residualize) policy first applies supported
+/// [`Operation::fold`] substitutions, then binds eligible all-known operations through the parent context or emits
+/// residual work. Specialized rules can instead inline nested programs or preserve more known work.
 ///
 /// # Evaluation Pipeline
 ///
@@ -1465,11 +1466,23 @@ impl<C: Context> PartialEvaluationContext<C> {
         PartialEvaluationValue::variable(r#type, atom)
     }
 
+    /// Returns whether the provided effects may execute in the known-side context at this point. Reference placement
+    /// and input knowledge impose additional constraints in [`Self::fold_or_residualize`].
+    #[inline]
+    pub fn can_fold_effects(&self, effects: EffectClasses) -> bool {
+        (self.allow_effect_folding || effects.is_empty())
+            && (!effects.is_ordered() || !self.defer_ordered_effects.get())
+    }
+
     /// Applies the default partial-evaluation policy to the provided `operation`. When all inputs are known, the
     /// operation is [`bind`](Context::bind)ed in the known-side [`Context`] (i.e., interpreting it under an eager
     /// context and staging it into the outer program under a [`StagingContext`]), and its outputs become known trace
     /// values. When any input is residual, all inputs are materialized into the residual program and the operation is
     /// emitted unchanged.
+    ///
+    /// Before that execution policy, regionless operations without references can use [`Operation::fold`] to return
+    /// existing inputs, even when unknown. Those substitutions prove that the operation has no observable behavior
+    /// to execute; they preserve input materialization and do not alter previously recorded effect ordering.
     ///
     /// # Effect Placement Contract
     ///
@@ -1508,6 +1521,33 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         let operation = operation.into();
 
+        // Reference and region applications retain their existing binding and failure-ordering paths. Local
+        // regionless folds validate before substitution and preserve each input's shared materialization slot.
+        if regions.is_empty() && !operation.effects().has_reference_declarations() {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            if !input_types.iter().any(Type::is_reference) {
+                let replacements = (|| -> Result<_, ProgramError> {
+                    operation.validate_region_count(0)?;
+                    let output_types = operation.infer_output_types(&input_types, &[])?;
+                    operation.effects().validate_application(operation.name(), &input_types, &output_types)?;
+                    let replacements = operation.fold(&input_types, &[])?;
+                    if let Some(replacements) = &replacements {
+                        validate_operation_fold(operation.name(), &input_types, &output_types, replacements)?;
+                    }
+                    Ok(replacements)
+                })()
+                .inspect_err(|_| {
+                    // A failed ordered application must not let later known effects run ahead of the failed work.
+                    if operation.effects().classes().is_ordered() {
+                        self.defer_ordered_effects.set(true);
+                    }
+                })?;
+                if let Some(replacements) = replacements {
+                    return Ok(replacements.into_iter().map(|index| inputs[index].clone()).collect());
+                }
+            }
+        }
+
         // Combine the operation's effect classes with those of its executable computation regions. Dormant
         // derivative rules and other non-computation regions do not contribute effects when this operation runs.
         let effects = regions
@@ -1536,8 +1576,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         };
 
         if !inputs.iter().all(PartialEvaluationValue::is_known)
-            || (!self.allow_effect_folding && !effects.is_empty())
-            || (effects.is_ordered() && self.defer_ordered_effects.get())
+            || !self.can_fold_effects(effects)
             || must_defer_references()
         {
             return self.residualize_with_effects(operation, regions, inputs, effects);
@@ -3394,15 +3433,18 @@ mod tests {
         let known = source.lift(Array::scalar(3.0).unwrap()).unwrap();
         assert_eq!(
             source.bind(AddOperation::new(), Vec::new(), &[known.clone()]),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+            Err(ProgramError::Type(TypeError::invalid("expected 2 inputs but got 1"))),
         );
         let imported = target.import_known(&known).unwrap();
-        assert!(matches!(imported.value(), Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })));
+        assert_eq!(
+            imported.value().unwrap_err(),
+            ProgramError::Type(TypeError::invalid("expected 2 inputs but got 1")),
+        );
         drop(imported);
-        assert!(matches!(
-            target.into_evaluation(Vec::new()),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        ),);
+        assert_eq!(
+            target.into_evaluation(Vec::new()).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("expected 2 inputs but got 1")),
+        );
     }
 
     #[test]

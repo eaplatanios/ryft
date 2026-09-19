@@ -313,7 +313,7 @@ fn test_dot_product_attention_batching_with_dynamic_extent() -> Result<(), Progr
 
     assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(r#type));
     let operation_counts = program.statistics().total_operation_counts();
-    assert_eq!(operation_counts.get("dimension_mul"), Some(&1));
+    assert_eq!(operation_counts.get("dimension_mul"), None);
     assert_eq!(operation_counts.get(DOT_PRODUCT_ATTENTION_OPERATION_NAME), Some(&1));
     assert_eq!(operation_counts.get("reshape"), Some(&4));
 

@@ -395,7 +395,15 @@ pub fn scaled_dot_composition<V>(
     preferred_element_type: DataType,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + DimensionSize<usize> + Dot + Mul + Reshape,
+    V: Value<Type = ArrayType>
+        + TryFrom<bool, Error = ProgramError>
+        + AssertionValue
+        + Broadcast
+        + ConvertElementType
+        + DimensionSize<usize>
+        + Dot
+        + Mul
+        + Reshape,
 {
     let lhs = ArrayIrValue::from(lhs.clone());
     let rhs = ArrayIrValue::from(rhs.clone());
@@ -407,7 +415,7 @@ where
 /// Evaluates generalized scaled dot over the mixed array IR.
 ///
 /// This is the authoritative staged composition. It obtains operand and scale extents through [`DimensionSize`],
-/// proves each dynamic contracting ratio with [`DimensionRequirement`], and supplies every broadcast and reshape
+/// proves each dynamic contracting ratio with comparisons and [`Assert`], and supplies every broadcast and reshape
 /// extent as an ordinary first-class dimension operand. Array arithmetic remains delegated to the projected
 /// [`ArrayType`] member, so this function introduces neither another value universe nor backend-specific shape logic.
 pub fn scaled_dot_ir_composition<V>(
@@ -420,13 +428,15 @@ pub fn scaled_dot_ir_composition<V>(
 ) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError>
 where
     V: Value<Type = ArrayIrType>
+        + Assert
         + DimensionSize
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
         + ValueProjection<DimensionType>,
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Dot + Mul,
-    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + DimensionRequirement + Div,
+    <V as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
 {
@@ -458,13 +468,15 @@ fn dequantize_block_scaled_ir<V>(
 ) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError>
 where
     V: Value<Type = ArrayIrType>
+        + Assert
         + DimensionSize
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
         + ValueProjection<DimensionType>,
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Mul,
-    <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + DimensionRequirement + Div,
+    <V as ValueProjection<DimensionType>>::Projected:
+        Value<Type = DimensionType> + Compare<V> + DimensionMax + Rem + Div,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
 {
@@ -474,7 +486,7 @@ where
     let element_dimensions =
         (0..element_type.rank()).map(|axis| elements.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
     let elements =
-        <V as ValueProjection<ArrayType>>::into_projected(elements.clone())?.convert_element_type(DataType::BF16)?;
+        ValueProjection::<ArrayType>::into_projected(elements.clone())?.convert_element_type(DataType::BF16)?;
     let Some(scale) = scale else { return Ok(elements) };
     let scale_type = scale.r#type();
     let scale_type = <&ArrayType>::try_from(scale_type.as_ref())?;
@@ -487,21 +499,36 @@ where
         output_axes.push(expanded_dimensions.len());
         expanded_dimensions.push(scale_dimension.clone());
         if contracting_dimensions.contains(&axis) {
-            let element_extent =
-                <V as ValueProjection<DimensionType>>::into_projected(element_dimensions[axis].clone())?;
-            let scale_extent = <V as ValueProjection<DimensionType>>::into_projected(scale_dimension.clone())?;
-            element_extent.require_divisible_by(&scale_extent)?;
-            let ratio = element_extent.div(&scale_extent)?;
-            let two = <V as ValueProjection<DimensionType>>::into_projected(context.dimension_constant(2)?)?;
-            two.require_less_than_or_equal(&ratio)?;
-            expanded_dimensions.push(<V as ValueProjection<DimensionType>>::from_projected(ratio));
+            let element_extent = ValueProjection::<DimensionType>::into_projected(element_dimensions[axis].clone())?;
+            let scale_extent = ValueProjection::<DimensionType>::into_projected(scale_dimension.clone())?;
+            let zero = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(0)?)?;
+            let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1)?)?;
+            scale_extent.compare(&zero, ComparisonDirection::GreaterThan)?.assert(
+                "scale extent must be positive",
+                &[("scale", ValueProjection::<DimensionType>::from_projected(scale_extent.clone()))],
+            )?;
+            let divisor = scale_extent.dimension_max(&one)?;
+            element_extent.rem(&divisor)?.compare(&zero, ComparisonDirection::Equal)?.assert(
+                "element extent must be divisible by scale extent",
+                &[
+                    ("elements", ValueProjection::<DimensionType>::from_projected(element_extent.clone())),
+                    ("scale", ValueProjection::<DimensionType>::from_projected(scale_extent)),
+                ],
+            )?;
+            let ratio = element_extent.div(&divisor)?;
+            let two = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(2)?)?;
+            two.compare(&ratio, ComparisonDirection::LessThanOrEqual)?.assert(
+                "contracting ratio must be at least two",
+                &[("ratio", ValueProjection::<DimensionType>::from_projected(ratio.clone()))],
+            )?;
+            expanded_dimensions.push(ValueProjection::<DimensionType>::from_projected(ratio));
         }
     }
     let expanded_scale = scale
         .dynamic_broadcast(expanded_dimensions.as_slice(), output_axes.as_slice())?
         .dynamic_reshape(element_dimensions.as_slice())?;
     let expanded_scale =
-        <V as ValueProjection<ArrayType>>::into_projected(expanded_scale)?.convert_element_type(DataType::BF16)?;
+        ValueProjection::<ArrayType>::into_projected(expanded_scale)?.convert_element_type(DataType::BF16)?;
     elements.mul(&expanded_scale)
 }
 
@@ -510,11 +537,18 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, ArrayType, DataType, Dimension, Shape};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, Shape,
+    };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::operations::assertions::AssertionError;
     use crate::operations::dot::DotDimensionNumbers;
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, Operation, TypeError};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -679,6 +713,93 @@ mod tests {
         .unwrap();
         let output = lhs.scaled_matmul(&rhs, &lhs_scale, &independently_scaled_rhs, None).unwrap();
         assert_eq!(output.to_f64s(), vec![4.0; 2]);
+    }
+
+    #[test]
+    fn test_dequantize_block_scaled_ir_safe_divisor() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let elements = context.input(ArrayType::new_static(DataType::F32, [8]).into());
+        let scale_extent = DimensionVariable::new("scale", DimensionBounds::new(0, Some(5)).unwrap());
+        let scale =
+            context.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scale_extent)])).into());
+        let output = dequantize_block_scaled_ir(&elements, Some(&scale), &[0]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.value().atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let maximum = program
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "dimension_max")
+            .unwrap();
+        let remainder = program
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "dimension_rem")
+            .unwrap();
+        let quotient = program
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "dimension_div")
+            .unwrap();
+        assert_eq!(remainder.inputs()[1], maximum.outputs()[0]);
+        assert_eq!(quotient.inputs()[1], maximum.outputs()[0]);
+        let assertions = program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "assert")
+            .collect::<Vec<_>>();
+        assert_eq!(assertions[0].inputs()[1], maximum.inputs()[0]);
+        assert_eq!(assertions[1].inputs()[2], maximum.inputs()[0]);
+
+        let evaluation = program
+            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .unwrap();
+        // A zero divisor reports the original positivity check rather than a speculative remainder or division
+        // failure. A positive non-divisor reaches the divisibility check with the original observed extent.
+        for (scale, message, observations) in [
+            (Vec::<f32>::new(), "scale extent must be positive", vec![("scale".to_owned(), "0".to_owned())]),
+            (
+                vec![1.0_f32; 3],
+                "element extent must be divisible by scale extent",
+                vec![("elements".to_owned(), "8".to_owned()), ("scale".to_owned(), "3".to_owned())],
+            ),
+        ] {
+            let error = program
+                .interpret(vec![
+                    ArrayIrValue::Array(Array::vector(vec![1.0_f32; 8]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(scale.clone()).unwrap()),
+                ])
+                .unwrap_err();
+            let residual_error = evaluation
+                .interpret(
+                    &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                    &[
+                        ArrayIrValue::Array(Array::vector(vec![1.0_f32; 8]).unwrap()),
+                        ArrayIrValue::Array(Array::vector(scale.clone()).unwrap()),
+                    ],
+                )
+                .unwrap_err();
+            assert_eq!(residual_error.downcast_custom::<AssertionError>(), error.downcast_custom::<AssertionError>());
+            assert_eq!(
+                error.downcast_custom::<AssertionError>(),
+                Some(&AssertionError::Failed { message: message.to_owned(), observations })
+            );
+        }
+        let output = program
+            .interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32; 8]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32; 4]).unwrap()),
+            ])
+            .unwrap();
+        let ArrayIrValue::Array(output) = &output[0] else { panic!("expected an array output") };
+        assert_eq!(output.to_f64s(), vec![1.0; 8]);
     }
 
     #[test]

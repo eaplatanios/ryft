@@ -2,11 +2,11 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType,
-    DimensionValue,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, Broadcastable, DataType,
+    DimensionType, DimensionValue,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
@@ -14,9 +14,12 @@ use crate::macros::{
 };
 use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::conversions::ElementType;
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Value,
+    Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError, Typed, Value,
+    ValueProjection,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -189,11 +192,47 @@ where
     }
 }
 
-impl<C: Context<Operation: From<CompareOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
-    for CompareOperation<C::Type>
-where
-    CompareOperation<C::Type>: Operation<Type = C::Type>,
+impl<C: Context<Type = DataType, Operation: From<CompareOperation<DataType>>>> PartiallyEvaluatableOperation<C>
+    for CompareOperation<DataType>
 {
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<CompareOperation<ArrayType>>>> PartiallyEvaluatableOperation<C>
+    for CompareOperation<ArrayType>
+{
+}
+
+impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for CompareOperation<ArrayIrType>
+where
+    C::Operation: From<Self>,
+    C::Constant: TryFrom<bool, Error = ProgramError> + ValueProjection<DimensionType, Projected = DimensionValue>,
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let regions = driver.regions().map(|region| region.to_program()).collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &regions.iter().map(|region| region.interface()).collect::<Vec<_>>())?;
+        let left = <&DimensionType>::try_from(&input_types[0])?;
+        let right = <&DimensionType>::try_from(&input_types[1])?;
+        let mut exact = [None, None];
+        for (input, extent) in inputs.iter().zip(exact.iter_mut()) {
+            if let Some(value) = input.as_known()
+                && let ValueResolution::Constant(value) = context.parent().resolve(value)
+                && value.capture_index().is_none()
+            {
+                // Captures name runtime data, so only immediate constants refine the declared extent interval.
+                *extent = Some(value.into_projected()?.extent());
+            }
+        }
+        if let Some(output) = prove_dimension_comparison(left, right, exact, self.direction)? {
+            return Ok(vec![PartialEvaluationValue::known(context.parent().lift(C::Constant::try_from(output)?)?)]);
+        }
+        context.fold_or_residualize(*self, regions, inputs)
+    }
 }
 
 // Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
@@ -308,8 +347,14 @@ impl<V: Value<Type = ArrayIrType>> Compare<V> for ProjectedValue<DimensionType, 
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<CompareOperation<V::Type>>,
+    <V::DispatchDomain as Domain>::Constant: TryFrom<bool, Error = ProgramError>,
 {
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
+        if let Some(output) =
+            prove_dimension_comparison(self.r#type().as_ref(), rhs.r#type().as_ref(), [None, None], direction)?
+        {
+            return self.value().dispatch_domain().lift(<V::DispatchDomain as Domain>::Constant::try_from(output)?);
+        }
         Ok(self
             .value()
             .dispatch_domain()
@@ -332,6 +377,72 @@ impl Compare<Array> for DimensionValue {
         };
         Array::scalar(result)
     }
+}
+
+impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<ArrayIrValue<A>> for DimensionValue {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<ArrayIrValue<A>, ProgramError> {
+        let output = prove_dimension_comparison(
+            self.r#type().as_ref(),
+            rhs.r#type().as_ref(),
+            [Some(self.extent()), Some(rhs.extent())],
+            direction,
+        )?
+        .unwrap();
+        Ok(ArrayIrValue::Array(A::try_from(output)?))
+    }
+}
+
+/// Proves comparisons using dimension identities and inclusive representable extent intervals.
+fn prove_dimension_comparison(
+    left: &DimensionType,
+    right: &DimensionType,
+    exact: [Option<usize>; 2],
+    direction: ComparisonDirection,
+) -> Result<Option<bool>, ProgramError> {
+    let left_range = left.bounds().representable_extent_range()?;
+    let right_range = right.bounds().representable_extent_range()?;
+    let (left_minimum, left_maximum) = exact[0].map_or(left_range, |extent| (extent, extent));
+    let (right_minimum, right_maximum) = exact[1].map_or(right_range, |extent| (extent, extent));
+    // Resolved extents take precedence over symbolic identity, including inconsistent concrete inputs supplied
+    // directly to partial evaluation rather than through a program's dimension binding validation.
+    let identical = left.variable() == right.variable() && !matches!(exact, [Some(left), Some(right)] if left != right);
+    let equal = if identical
+        || (left_minimum == left_maximum && right_minimum == right_maximum && left_minimum == right_minimum)
+    {
+        Some(true)
+    } else if left_maximum < right_minimum || right_maximum < left_minimum {
+        Some(false)
+    } else {
+        None
+    };
+    Ok(match direction {
+        ComparisonDirection::Equal => equal,
+        ComparisonDirection::NotEqual => equal.map(|equal| !equal),
+        ComparisonDirection::LessThan => {
+            if identical || left_minimum >= right_maximum {
+                Some(false)
+            } else if left_maximum < right_minimum {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        ComparisonDirection::LessThanOrEqual => {
+            if identical || left_maximum <= right_minimum {
+                Some(true)
+            } else if left_minimum > right_maximum {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        ComparisonDirection::GreaterThan => {
+            prove_dimension_comparison(right, left, [exact[1], exact[0]], ComparisonDirection::LessThan)?
+        }
+        ComparisonDirection::GreaterThanOrEqual => {
+            prove_dimension_comparison(right, left, [exact[1], exact[0]], ComparisonDirection::LessThanOrEqual)?
+        }
+    })
 }
 
 #[cfg(test)]
@@ -454,6 +565,81 @@ mod tests {
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
+    }
+
+    #[test]
+    fn test_dimension_comparison_proofs() {
+        let directions = [
+            ComparisonDirection::Equal,
+            ComparisonDirection::NotEqual,
+            ComparisonDirection::LessThan,
+            ComparisonDirection::LessThanOrEqual,
+            ComparisonDirection::GreaterThan,
+            ComparisonDirection::GreaterThanOrEqual,
+        ];
+        for left_minimum in 0..4 {
+            for left_maximum in left_minimum..4 {
+                for right_minimum in 0..4 {
+                    for right_maximum in right_minimum..4 {
+                        let left = DimensionType::new(
+                            "left",
+                            DimensionBounds::new(left_minimum, Some(left_maximum + 1)).unwrap(),
+                        );
+                        let right = DimensionType::new(
+                            "right",
+                            DimensionBounds::new(right_minimum, Some(right_maximum + 1)).unwrap(),
+                        );
+                        for direction in directions {
+                            let mut outcomes = Vec::new();
+                            for left in left_minimum..=left_maximum {
+                                for right in right_minimum..=right_maximum {
+                                    outcomes.push(match direction {
+                                        ComparisonDirection::Equal => left == right,
+                                        ComparisonDirection::NotEqual => left != right,
+                                        ComparisonDirection::LessThan => left < right,
+                                        ComparisonDirection::LessThanOrEqual => left <= right,
+                                        ComparisonDirection::GreaterThan => left > right,
+                                        ComparisonDirection::GreaterThanOrEqual => left >= right,
+                                    });
+                                }
+                            }
+                            let expected =
+                                outcomes.iter().all(|outcome| *outcome == outcomes[0]).then_some(outcomes[0]);
+                            assert_eq!(
+                                prove_dimension_comparison(&left, &right, [None, None], direction).unwrap(),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let dimension = DimensionType::new("dimension", DimensionBounds::new(0, None).unwrap());
+        for (direction, expected) in directions.into_iter().zip([true, false, false, true, false, true]) {
+            assert_eq!(
+                prove_dimension_comparison(&dimension, &dimension, [None, None], direction).unwrap(),
+                Some(expected)
+            );
+        }
+        for (direction, expected) in directions.into_iter().zip([false, true, true, true, false, false]) {
+            assert_eq!(
+                prove_dimension_comparison(&dimension, &dimension, [Some(4), Some(5)], direction).unwrap(),
+                Some(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn test_compare_dimension_staging_proof() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let context = TestContext::new();
+        let dimension = context.input(DimensionType::new("extent", DimensionBounds::new(0, None).unwrap()).into());
+        let dimension = ValueProjection::<DimensionType>::into_projected(dimension).unwrap();
+        let predicate = dimension.equal(&dimension).unwrap();
+        assert!(
+            matches!(context.resolve(&predicate), ValueResolution::Constant(ArrayIrValue::Array(value)) if value == Array::scalar(true).unwrap())
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
@@ -594,6 +780,31 @@ mod tests {
                         (@residual, ArrayIrValue::Array(Array::scalar(true).unwrap())),
                     ],
                     residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayIrType::Dimension(left_type.clone()),
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap())
+                        )),
+                        (@unknown(
+                            type = ArrayIrType::Dimension(left_type.clone()),
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap())
+                        )),
+                    ],
+                    outputs = [(@known, ArrayIrValue::Array(Array::scalar(false).unwrap()))],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@known, ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 8).unwrap())),
+                        (@unknown(
+                            type = ArrayIrType::Dimension(right_type.clone()),
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap())
+                        )),
+                    ],
+                    outputs = [(@known, ArrayIrValue::Array(Array::scalar(false).unwrap()))],
+                    residual_instructions = 0,
                 },
             ],
         );

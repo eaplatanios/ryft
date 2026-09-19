@@ -35,6 +35,15 @@ define_dimension_arithmetic_operation!(
             .is_none_or(|output| output > MAX_DIMENSION_EXTENT);
         Ok((bounds, requires_runtime_assertion))
     },
+    fold = |left: &DimensionType, right: &DimensionType| {
+        if left.extent() == Some(0) || right.extent() == Some(1) {
+            Some(vec![0])
+        } else if right.extent() == Some(0) || left.extent() == Some(1) {
+            Some(vec![1])
+        } else {
+            None
+        }
+    },
     provider = MulOperation<DimensionType>,
 );
 
@@ -101,11 +110,16 @@ impl std::ops::Mul<&DimensionValue> for &DimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionValue};
+    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
+    use crate::contexts::StagingContext;
     use crate::operations::math::mul::Mul;
-    use crate::programs::{EffectClass, EffectClasses};
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -143,5 +157,80 @@ mod tests {
         assert_eq!((left.clone() * &right).extent(), 21);
         assert_eq!((&left * right.clone()).extent(), 21);
         assert_eq!((&left * &right).extent(), 21);
+    }
+
+    #[test]
+    fn test_dimension_mul_partial_evaluation_identity() {
+        let input_types = [
+            DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+            DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            DimensionValue::constant(1).unwrap().r#type().into_owned(),
+        ];
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = [(0, 2), (2, 0), (0, 1), (1, 0)]
+            .into_iter()
+            .map(|(left, right)| {
+                builder
+                    .add_instruction(
+                        DimensionMulOperation::new(&input_types[left], &input_types[right]).unwrap(),
+                        Vec::new(),
+                        vec![inputs[left], inputs[right]],
+                        None,
+                    )
+                    .unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let output_count = outputs.len();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                outputs,
+                vec![Placeholder; 3],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                let %3:dimension<value * 1 ∈ [2, 9)> = dimension_mul %0 %2
+                    %4:dimension<1 * value ∈ [2, 9)> = dimension_mul %2 %0
+                    %5:dimension<0> = dimension_mul %0 %1
+                    %6:dimension<0> = dimension_mul %1 %0
+                in (%3, %4, %5, %6)"},
+        );
+        let evaluation = program
+            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0>, %2:dimension<1> .
+                in (%0, %0, %1, %1)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_mul_identity_validates_discarded_input() {
+        if let Some(invalid_extent) = MAX_DIMENSION_EXTENT.checked_add(1) {
+            let context = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+            let invalid =
+                context.input(DimensionType::new("invalid", DimensionBounds::new(invalid_extent, None).unwrap()));
+            let zero = context.input(DimensionValue::constant(0).unwrap().r#type().into_owned());
+            assert_eq!(
+                invalid.mul(&zero).unwrap_err().downcast_custom::<DimensionError>(),
+                Some(&DimensionError::ExtentExceedsBackendWidth {
+                    value: invalid_extent,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }),
+            );
+            assert_eq!(
+                zero.mul(&invalid).unwrap_err().downcast_custom::<DimensionError>(),
+                Some(&DimensionError::ExtentExceedsBackendWidth {
+                    value: invalid_extent,
+                    maximum: MAX_DIMENSION_EXTENT,
+                }),
+            );
+        }
     }
 }

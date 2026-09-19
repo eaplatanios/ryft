@@ -11,7 +11,7 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::{ReferenceAccessMode, ReferenceAliasKind};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, validate_operation_fold};
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
 use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
@@ -335,127 +335,31 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         provenance: Option<Provenance>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
-        self.references.validate(&operation, inputs.as_slice())?;
-        operation.validate_region_count(regions.len())?;
-        for region in regions.iter().copied() {
-            if region.index() >= self.regions.len() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "instruction references region {region} which has not been sealed yet",
-                )));
-            }
+        let (_, _, output_types) = self.validate_instruction(&operation, &regions, &inputs)?;
+        Ok(self.push_instruction(operation, regions, inputs, provenance, output_types))
+    }
+
+    /// Folds a validated operation to existing inputs when [`Operation::fold`] proves equivalence, or records it
+    /// through the same checked construction path as [`Self::add_instruction`]. Input producers remain unchanged.
+    /// Unlike raw instruction construction, returned outputs can alias existing atoms and carry refined types.
+    /// Region-carrying applications remain explicit so their already imported bodies retain a reachable owner.
+    pub fn add_instruction_or_fold<P: Into<O>>(
+        &mut self,
+        operation: P,
+        regions: Vec<RegionId>,
+        inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        let operation = operation.into();
+        let (input_types, region_interfaces, output_types) =
+            self.validate_instruction(&operation, &regions, &inputs)?;
+        if regions.is_empty()
+            && let Some(replacements) = operation.fold(&input_types, &region_interfaces)?
+        {
+            validate_operation_fold(operation.name(), &input_types, &output_types, &replacements)?;
+            return Ok(replacements.into_iter().map(|index| inputs[index]).collect());
         }
-        let input_types = inputs
-            .iter()
-            .map(|input| {
-                self.atoms
-                    .get(input.index())
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(ProgramError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let region_interfaces = if regions.is_empty() {
-            Vec::new()
-        } else {
-            regions
-                .iter()
-                .map(|region_id| {
-                    let region = &self.regions[region_id.index()];
-                    RegionInterface::new(
-                        region.input_types(),
-                        region.output_types(),
-                        self.regions.effects(*region_id).unwrap().classes(),
-                    )
-                })
-                .collect()
-        };
-        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-        let effects = operation.effects();
-        effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;
-
-        // A region-carrying operation must state how references cross its boundaries, because reference analysis and
-        // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
-        // them here reports an inconsistent operation at construction rather than when a transform first needs them.
-        for (region_index, region_id) in regions.iter().copied().enumerate() {
-            let region_input_types = self.regions[region_id.index()].input_types();
-            if let Some(count) = operation.region_capture_input_count(region_index)
-                && count > region_input_types.len()
-            {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares a capture prefix of {} for region {}, which has {} inputs",
-                    operation.name(),
-                    count,
-                    region_index,
-                    region_input_types.len(),
-                )));
-            }
-
-            // The reference-typed inputs of a dormant rule region are bound by the transform that instantiates the
-            // rule (e.g., the forward tail and cotangent destinations of a rematerialized call) rather than by this
-            // application's inputs, so, exactly as the reference analysis does, the check skips rule regions.
-            if operation.region_role(region_index) == Some(RegionRole::Rule) {
-                continue;
-            }
-
-            // References require an explicit operand or local origin; ordinary values carry no allocation ownership.
-            for (input_index, input_type) in region_input_types.iter().enumerate() {
-                if input_type.is_reference()
-                    && operation.input_region_provenance(region_index, input_index) == InputRegionProvenance::None
-                {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` passes a reference into region {} input {} without \
-                         declaring which input supplies it",
-                        operation.name(),
-                        region_index,
-                        input_index,
-                    )));
-                }
-            }
-        }
-
-        if !regions.is_empty() {
-            for (output_index, output_type) in output_types.iter().enumerate() {
-                let declared = effects.allocation_output_indices().any(|index| index == output_index)
-                    || effects.reference_aliases().iter().any(|alias| alias.output_index() == output_index)
-                    || operation.reference_output_identity_input(output_index).is_some()
-                    || !operation.output_region_provenance(output_index).is_empty();
-                if output_type.is_reference() && !declared {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` produces a reference at output {} without declaring which input \
-                         allocation it preserves or which region output it forwards",
-                        operation.name(),
-                        output_index,
-                    )));
-                }
-            }
-        }
-
-        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(
-            Instruction::new(operation, inputs, outputs, regions)
-                .with_provenance(provenance.unwrap_or_else(Provenance::unknown)),
-        );
-
-        // The accepted application is read back off the instruction just appended, which borrows a different field of
-        // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
-        // operand list. It runs for an application that declares reference effects or aliases and for one that merely
-        // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
-        // declares nothing and is recognized only by its identity-forwarding hook.
-        let instruction = self.instructions.last().unwrap();
-        let contains_references = instruction.operation().effects().has_reference_declarations()
-            || instruction
-                .inputs
-                .iter()
-                .chain(instruction.outputs.iter())
-                .any(|atom| self.atoms[atom.index()].r#type().is_reference());
-        if contains_references {
-            self.references.record(
-                instruction.operation(),
-                instruction.inputs.as_slice(),
-                instruction.outputs.as_slice(),
-            );
-        }
-
-        Ok(self.instructions.last().unwrap().outputs.as_slice())
+        Ok(self.push_instruction(operation, regions, inputs, provenance, output_types).to_vec())
     }
 
     /// Adds an already-formed [`Instruction`] without inferring output types or allocating output atoms. Prefer
@@ -749,6 +653,152 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
         Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
     }
+
+    /// Validates an operation application before folding or mutating the instruction and atom tables.
+    fn validate_instruction(
+        &self,
+        operation: &O,
+        regions: &[RegionId],
+        inputs: &[AtomId],
+    ) -> Result<(Vec<V::Type>, Vec<RegionInterface<V::Type>>, Vec<V::Type>), ProgramError> {
+        self.references.validate(operation, inputs)?;
+        operation.validate_region_count(regions.len())?;
+        for region in regions.iter().copied() {
+            if region.index() >= self.regions.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "instruction references region {region} which has not been sealed yet",
+                )));
+            }
+        }
+
+        let input_types = inputs
+            .iter()
+            .map(|input| {
+                self.atoms
+                    .get(input.index())
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(ProgramError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let region_interfaces = if regions.is_empty() {
+            Vec::new()
+        } else {
+            regions
+                .iter()
+                .map(|region_id| {
+                    let region = &self.regions[region_id.index()];
+                    RegionInterface::new(
+                        region.input_types(),
+                        region.output_types(),
+                        self.regions.effects(*region_id).unwrap().classes(),
+                    )
+                })
+                .collect()
+        };
+
+        let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+        let effects = operation.effects();
+        effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;
+
+        // A region-carrying operation must state how references cross its boundaries, because reference analysis and
+        // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
+        // them here reports an inconsistent operation at construction rather than when a transform first needs them.
+        for (region_index, region_id) in regions.iter().copied().enumerate() {
+            let region_input_types = self.regions[region_id.index()].input_types();
+            if let Some(count) = operation.region_capture_input_count(region_index)
+                && count > region_input_types.len()
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares a capture prefix of {} for region {}, which has {} inputs",
+                    operation.name(),
+                    count,
+                    region_index,
+                    region_input_types.len(),
+                )));
+            }
+
+            // The reference-typed inputs of a dormant rule region are bound by the transform that instantiates the
+            // rule (e.g., the forward tail and cotangent destinations of a rematerialized call) rather than by this
+            // application's inputs, so, exactly as the reference analysis does, the check skips rule regions.
+            if operation.region_role(region_index) == Some(RegionRole::Rule) {
+                continue;
+            }
+
+            // References require an explicit operand or local origin; ordinary values carry no allocation ownership.
+            for (input_index, input_type) in region_input_types.iter().enumerate() {
+                if input_type.is_reference()
+                    && operation.input_region_provenance(region_index, input_index) == InputRegionProvenance::None
+                {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` passes a reference into region {} input {} without \
+                         declaring which input supplies it",
+                        operation.name(),
+                        region_index,
+                        input_index,
+                    )));
+                }
+            }
+        }
+
+        if !regions.is_empty() {
+            for (output_index, output_type) in output_types.iter().enumerate() {
+                let declared = effects.allocation_output_indices().any(|index| index == output_index)
+                    || effects.reference_aliases().iter().any(|alias| alias.output_index() == output_index)
+                    || operation.reference_output_identity_input(output_index).is_some()
+                    || !operation.output_region_provenance(output_index).is_empty();
+                if output_type.is_reference() && !declared {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` produces a reference at output {} without declaring which input \
+                         allocation it preserves or which region output it forwards",
+                        operation.name(),
+                        output_index,
+                    )));
+                }
+            }
+        }
+
+        Ok((input_types, region_interfaces, output_types))
+    }
+
+    /// Records an operation application whose input, region, output, and reference contracts
+    /// have already been validated.
+    fn push_instruction(
+        &mut self,
+        operation: O,
+        regions: Vec<RegionId>,
+        inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
+        output_types: Vec<V::Type>,
+    ) -> &[AtomId] {
+        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
+        self.instructions.push(
+            Instruction::new(operation, inputs, outputs, regions)
+                .with_provenance(provenance.unwrap_or_else(Provenance::unknown)),
+        );
+
+        // The accepted application is read back off the instruction just appended, which borrows a different field of
+        // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
+        // operand list. It runs for an application that declares reference effects or aliases and for one that merely
+        // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
+        // declares nothing and is recognized only by its identity-forwarding hook.
+        let instruction = self.instructions.last().unwrap();
+        let contains_references = instruction.operation().effects().has_reference_declarations()
+            || instruction
+                .inputs
+                .iter()
+                .chain(instruction.outputs.iter())
+                .any(|atom| self.atoms[atom.index()].r#type().is_reference());
+        if contains_references {
+            self.references.record(
+                instruction.operation(),
+                instruction.inputs.as_slice(),
+                instruction.outputs.as_slice(),
+            );
+        }
+
+        self.instructions.last().unwrap().outputs.as_slice()
+    }
 }
 
 /// [`ProgramBuilder`]-private cache record for one imported [`TypeIdentity`](crate::TypeIdentity) instantiation of a
@@ -989,6 +1039,98 @@ mod tests {
                 Self::Call(_) => Cow::Borrowed(Effects::empty()),
             }
         }
+    }
+
+    /// Operation fixture with explicit fold outputs, including deliberately malformed replacement contracts.
+    #[derive(Clone)]
+    struct FoldOperation {
+        /// Inferred outputs against which the driver validates replacements.
+        output_types: Vec<ArrayType>,
+
+        /// Input indices returned by the folding rule.
+        replacements: Vec<usize>,
+    }
+
+    impl Operation for FoldOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "test_fold"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            check_count!("input", input_types, 2, TypeError);
+            check_count!("region", region_interfaces, 0, TypeError);
+            Ok(self.output_types.clone())
+        }
+
+        fn fold(
+            &self,
+            _input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Option<Vec<usize>>, TypeError> {
+            Ok(Some(self.replacements.clone()))
+        }
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold() {
+        let scalar = ArrayType::new_static(DataType::F64, []);
+        let mut builder = ProgramBuilder::<Array, FoldOperation>::new();
+        let inputs = vec![builder.add_input(scalar.clone()), builder.add_input(scalar.clone())];
+        let operation = FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![1, 0] };
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), inputs.clone(), None).unwrap(),
+            vec![inputs[1], inputs[0]],
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+        assert!(
+            builder
+                .add_instruction_or_fold(
+                    FoldOperation { output_types: Vec::new(), replacements: Vec::new() },
+                    Vec::new(),
+                    inputs.clone(),
+                    None,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(builder.instructions().is_empty());
+
+        // Folding never bypasses ordinary application validation or accepts malformed output replacements.
+        assert_eq!(
+            builder.add_instruction_or_fold(operation.clone(), Vec::new(), vec![inputs[0]], None),
+            Err(TypeError::invalid("expected 2 inputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![0] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("expected 2 fold outputs but got 1").into()),
+        );
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar], replacements: vec![2] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
+        );
+        assert_eq!(builder.atoms().len(), 2);
+        assert!(builder.instructions().is_empty());
+
+        // Raw construction still records the instruction, independently of its folding rule.
+        assert_eq!(builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().len(), 2);
+        assert_eq!(builder.instructions().len(), 1);
     }
 
     #[test]
@@ -1798,6 +1940,14 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
+            fn fold(
+                &self,
+                _input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Option<Vec<usize>>, TypeError> {
+                panic!("invalid effects must be rejected before folding")
+            }
+
             fn effects(&self) -> Cow<'_, Effects> {
                 Cow::Borrowed(&self.0)
             }
@@ -1820,6 +1970,14 @@ mod tests {
         // An out-of-range position is rejected before the builder is mutated.
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(read(1)), Vec::new(), vec![reference], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
+                    .to_string(),
+            )),
+        );
+
+        assert_eq!(
+            builder.add_instruction_or_fold(InvalidReferenceOperation(read(1)), Vec::new(), vec![reference], None),
             Err(ProgramError::MalformedProgram(
                 "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
                     .to_string(),

@@ -3198,18 +3198,19 @@ mod tests {
                     %10:f32[left + right] = linear_call [residual_count=3] %6 %8 %9 %2 %3 [
                         forward={
                             lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
+                    %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
                             let %5:f32[left + right] = concatenate [axis=0, requires_runtime_assertion=true] %3 %4 %0
                             in (%5)
                         },
                         transpose={
                             lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
+                    %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
                             let %4:dimension<0> = constant [value=0]
-                                %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
-                                %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                                %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
-                            in (%5, %7)
+                                %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %4 %1
+                                %6:f32[right] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %1 %2
+                            in (%5, %6)
                         },
                     ]
                 in (%7, %10)
@@ -3252,25 +3253,27 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             indoc! {"
-                lambda %0:f32[left], %1:f32[right], %2:dimension<left + right ∈ [2, 10)>, \
-                %3:dimension<left ∈ [1, 5)>, %4:dimension<right ∈ [1, 6)> .
+                lambda %0:f32[left], %1:f32[right], %2:dimension<left + right ∈ [2, 10)>, %3:dimension<left ∈ [1, \
+                    5)>, %4:dimension<right ∈ [1, 6)> .
                 let %5:f32[left + right] = linear_call [residual_count=3] %2 %3 %4 %0 %1 [
                     forward={
                         lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
+                    %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
                         let %5:f32[left + right] = concatenate [axis=0, requires_runtime_assertion=true] %3 %4 %0
                         in (%5)
                     },
                     transpose={
-                        lambda %0:dimension<left + right ∈ [2, 10)>, \
-                               %1:dimension<left ∈ [1, 5)>, \
-                               %2:dimension<right ∈ [1, 6)>, \
-                               %3:f32[left + right] .
+                        lambda \
+                            %0:dimension<left + right ∈ [2, 10)>, \
+                            %1:dimension<left ∈ [1, 5)>, \
+                            %2:dimension<right ∈ [1, 6)>, \
+                            %3:f32[left + right] .
                         let %4:dimension<0> = constant [value=0]
-                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
-                            %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                            %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
-                        in (%5, %7)
+                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %4 %1
+                            %6:f32[right] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %1 %2
+                        in (%5, %6)
                     },
                 ]
                 in (%5)
@@ -3283,20 +3286,21 @@ mod tests {
             linearization.pullback().unwrap().to_string(),
             indoc! {"
                 lambda %0:f32[left + right], %1:dimension<left + right ∈ [2, 10)>, %2:dimension<left ∈ [1, 5)>, \
-                %3:dimension<right ∈ [1, 6)> .
+                    %3:dimension<right ∈ [1, 6)> .
                 let %4:f32[left], %5:f32[right] = linear_call [residual_count=3] %1 %2 %3 %0 [
                     forward={
                         lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
+                    %2:dimension<right ∈ [1, 6)>, %3:f32[left + right] .
                         let %4:dimension<0> = constant [value=0]
-                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %4 %1
-                            %6:dimension<0 + left ∈ [1, 5)> = dimension_add %4 %1
-                            %7:f32[right] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %6 %2
-                        in (%5, %7)
+                            %5:f32[left] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %4 %1
+                            %6:f32[right] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %3 %1 %2
+                        in (%5, %6)
                     },
                     transpose={
                         lambda %0:dimension<left + right ∈ [2, 10)>, %1:dimension<left ∈ [1, 5)>, \
-                %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
+                    %2:dimension<right ∈ [1, 6)>, %3:f32[left], %4:f32[right] .
                         let %5:f32[left + right] = concatenate [axis=0, requires_runtime_assertion=true] %3 %4 %0
                         in (%5)
                     },
@@ -3391,17 +3395,18 @@ mod tests {
                     %8:f32[result] = linear_call [residual_count=2] %3 %7 %2 %6 [
                         forward={
                             lambda %0:dimension<result ∈ [2, 15)>, %1:dimension<extent ∈ [1, 8)>, %2:f32[extent], \
-                %3:f32[extent] .
+                    %3:f32[extent] .
                             let %4:f32[result] = concatenate [axis=0, requires_runtime_assertion=true] %2 %3 %0
                             in (%4)
                         },
                         transpose={
                             lambda %0:dimension<result ∈ [2, 15)>, %1:dimension<extent ∈ [1, 8)>, %2:f32[result] .
                             let %3:dimension<0> = constant [value=0]
-                                %4:f32[extent] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %3 %1
-                                %5:dimension<0 + extent ∈ [1, 8)> = dimension_add %3 %1
-                                %6:f32[extent] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %5 %1
-                            in (%4, %6)
+                                %4:f32[extent] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %2 %3 %1
+                                %5:f32[extent] = dynamic_slice [strides=[1], bounds=checked, \
+                    requires_runtime_assertion=true] %2 %1 %1
+                            in (%4, %5)
                         },
                     ]
                 in (%4, %8)
@@ -3465,10 +3470,9 @@ mod tests {
                             lambda %0:dimension<result ∈ [2, 5)>, %1:dimension<left ∈ [1, 4)>, %2:f64[result] .
                             let %3:dimension<0> = constant [value=0]
                                 %4:f64[left] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %3 %1
-                                %5:dimension<0 + left ∈ [1, 4)> = dimension_add %3 %1
-                                %6:dimension<1> = constant [value=1]
-                                %7:f64[1] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %5 %6
-                            in (%4, %7)
+                                %5:dimension<1> = constant [value=1]
+                                %6:f64[1] = dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %1 %5
+                            in (%4, %6)
                         },
                     ]
                 in (%6, %8)
