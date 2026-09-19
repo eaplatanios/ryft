@@ -14,7 +14,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
-use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
+use crate::operations::{ConstantOperation, DimensionConstant};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{

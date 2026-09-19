@@ -1,6 +1,6 @@
 use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError, DimensionType, DimensionValue};
 use crate::macros::define_dimension_arithmetic_operation;
-use crate::operations::math::div::{Div, DivOperation};
+use crate::operations::{Div, DivOperation};
 use crate::parameters::Parameter;
 use crate::programs::{Operation, ProgramError, Typed, Value};
 

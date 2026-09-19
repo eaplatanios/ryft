@@ -139,7 +139,7 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 /// # }
 /// ```
 pub trait DimensionToScalar<Output = Self>: Typed + Sized {
-    /// Returns this dimension as ordinary rank-zero signed 64-bit array data represented by `Output`.
+    /// Returns this dimension as an ordinary rank-zero signed 64-bit array represented by `Output`.
     fn to_scalar(&self) -> Result<Output, ProgramError>;
 }
 
