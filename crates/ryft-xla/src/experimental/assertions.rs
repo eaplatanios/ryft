@@ -391,7 +391,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
 
 /// Evaluates one checked dimension-arithmetic predicate and returns its eager-compatible diagnostic on failure.
 fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str, right: i64) -> Result<(), String> {
-    // This deliberately duplicates `ryft-core`'s crate-private `checked_power` rather than widening that helper's
+    // This deliberately duplicates `ryft-core`'s private `checked_power` rather than widening that helper's
     // visibility: the eager helper computes over `usize` extents while this one validates the signed 64-bit values
     // that cross the FFI boundary, and the wording parity between the two paths is pinned by
     // `test_validate_arithmetic_matches_eager_checked_diagnostics` below.

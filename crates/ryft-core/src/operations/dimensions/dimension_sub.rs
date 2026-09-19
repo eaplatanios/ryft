@@ -4,19 +4,18 @@ use crate::operations::math::sub::{Sub, SubOperation};
 use crate::parameters::Parameter;
 use crate::programs::{Operation, ProgramError, Typed};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
 
 define_dimension_arithmetic_operation!(
-    /// Checked dimension-subtraction operation used by [`Sub`].
-    DimensionSubOperation, DIMENSION_SUB_OPERATION_NAME,
-    Sub, sub,
+    /// Checked dimension-subtraction operation used by [`Sub`] for [`DimensionValue`]s.
+    DimensionSubOperation,
+    DIMENSION_SUB_OPERATION_NAME,
+    Sub,
+    sub,
     output_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} - {}", left.variable(), right.variable())
     },
-    // Derives sound bounds for checked dimension subtraction and reports whether runtime underflow remains possible.
     infer_bounds = |left: &DimensionType, right: &DimensionType| -> Result<(DimensionBounds, bool), DimensionError> {
         let (left_lower, left_maximum) = left.bounds().representable_extent_range()?;
         let (right_lower, right_maximum) = right.bounds().representable_extent_range()?;
@@ -25,8 +24,10 @@ define_dimension_arithmetic_operation!(
                 message: format!("{} >= {} is impossible from declared bounds", left.variable(), right.variable()),
             });
         }
-        let bounds =
-            DimensionBounds::new(left_lower.saturating_sub(right_maximum), (left_maximum - right_lower).checked_add(1))?;
+        let bounds = DimensionBounds::new(
+            left_lower.saturating_sub(right_maximum),
+            (left_maximum - right_lower).checked_add(1),
+        )?;
         let requires_runtime_assertion = right.maximum_extent().is_none_or(|right| left.bounds().lower() < right);
         Ok((bounds, requires_runtime_assertion))
     },
@@ -66,8 +67,9 @@ mod tests {
         let left = DimensionType::new("left", DimensionBounds::new(2, Some(9)).unwrap());
         let right = DimensionType::new("right", DimensionBounds::new(1, Some(5)).unwrap());
         let operation = DimensionSubOperation::new(&left, &right).unwrap();
-        // These operand bounds admit an underflow, so the rendering carries the runtime-assertion classification that
-        // makes this instruction effectful.
+
+        // These operand bounds admit an underflow, so the rendering carries the runtime-assertion classification
+        // that makes this instruction effectful.
         assert_eq!(operation.to_string(), format!("{DIMENSION_SUB_OPERATION_NAME} [requires_runtime_assertion=true]"));
         assert_eq!(operation.output_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
         assert_eq!(

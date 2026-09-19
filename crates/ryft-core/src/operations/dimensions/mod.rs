@@ -251,21 +251,6 @@ impl ArithmeticDimensionOperationMetadata {
     }
 }
 
-/// Computes `base.pow(exponent)` without narrowing `exponent`.
-pub(crate) fn checked_power(mut base: usize, mut exponent: usize) -> Option<usize> {
-    let mut result = 1usize;
-    while exponent != 0 {
-        if exponent & 1 != 0 {
-            result = result.checked_mul(base)?;
-        }
-        exponent >>= 1;
-        if exponent != 0 {
-            base = base.checked_mul(base)?;
-        }
-    }
-    Some(result)
-}
-
 /// Returns the smallest positive divisor admitted by `divisor`, rejecting an exact-zero divisor.
 pub(crate) fn positive_divisor_lower_bound(divisor: &DimensionType, maximum: usize) -> Result<usize, DimensionError> {
     if maximum == 0 {

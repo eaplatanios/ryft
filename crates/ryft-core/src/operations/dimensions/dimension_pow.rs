@@ -3,9 +3,6 @@ use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
 use crate::programs::{Operation, ProgramError, Typed};
 
-// TODO(eaplatanios): Move this to this module.
-use super::checked_power;
-
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
 
@@ -88,6 +85,21 @@ impl DimensionPow for DimensionValue {
             })?;
         Ok(Self::new(result_type, extent)?)
     }
+}
+
+/// Computes `base.pow(exponent)` without narrowing `exponent`.
+fn checked_power(mut base: usize, mut exponent: usize) -> Option<usize> {
+    let mut result = 1usize;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            result = result.checked_mul(base)?;
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base = base.checked_mul(base)?;
+        }
+    }
+    Some(result)
 }
 
 #[cfg(test)]

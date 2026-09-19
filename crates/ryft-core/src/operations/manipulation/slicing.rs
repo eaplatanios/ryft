@@ -1436,7 +1436,7 @@ impl DynamicSliceOperation<ArrayIrType> {
     /// when available instead of staging new definitions of their dimension identities. Positive strides make the
     /// logical coordinates unique. Physical padding and inactive updates remain the responsibility of the existing
     /// bounded scatter lowering, rather than becoming extra logical updates here.
-    fn scatter_cotangent<
+    fn apply_adjoint<
         V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
             + DimensionSize
             + DimensionToScalar
@@ -2247,7 +2247,7 @@ impl_differentiable_operation! {
                         .collect::<Vec<_>>();
                     let sizes = bounds[transpose.strides.len()..].iter().map(|index| residuals[*index].clone())
                         .collect::<Vec<_>>();
-                    Ok(vec![transpose.scatter_cotangent(&zeros, &cotangents[0], &starts, &sizes)?])
+                    Ok(vec![transpose.apply_adjoint(&zeros, &cotangents[0], &starts, &sizes)?])
                 },
             )?.remove(0);
             Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
@@ -2288,7 +2288,7 @@ impl_differentiable_operation! {
             let zeros = (**context).dynamic_zero(input_type, &[])?;
             let sizes = (0..operation.strides.len()).map(|axis| cotangent.dimension_size(axis))
                 .collect::<Result<Vec<_>, _>>()?;
-            let cotangent = operation.scatter_cotangent(&zeros, cotangent, &starts, &sizes)?;
+            let cotangent = operation.apply_adjoint(&zeros, cotangent, &starts, &sizes)?;
             accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
         }
     },
