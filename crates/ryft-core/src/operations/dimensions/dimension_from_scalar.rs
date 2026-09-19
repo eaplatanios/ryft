@@ -156,9 +156,8 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
         let unbatched_type = input.unbatched_type();
         let input_type = <&ArrayType>::try_from(&unbatched_type)?.clone();
         Self::validate_input_type(&input_type)?;

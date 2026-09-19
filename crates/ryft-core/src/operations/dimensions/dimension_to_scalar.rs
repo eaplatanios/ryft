@@ -105,9 +105,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
         if input.mapped_dimension_extents().is_some() {
             return Ok(vec![ArrayIrBatch::new(input.value().clone(), input.batch_axis())?].into());
         }

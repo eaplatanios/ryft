@@ -22,36 +22,36 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 
-/// Mixed array-to-dimension operation used by [`DimensionSize`].
-///
-/// Refer to [`DimensionSize`] for semantic details and an example.
+/// Array-to-dimension operation used by [`DimensionSize`]. Refer to the documentation of [`DimensionSize`]
+/// for semantic details and an example.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct DimensionSizeOperation {
-    /// Normalized nonnegative input axis.
+    /// Normalized non-negative input axis.
     axis: usize,
 
-    /// Declared selected dimension against which later inference inputs are checked as refinements.
+    /// Declared selected [`Dimension`] against which later inference inputs are checked as refinements.
     input_dimension: Dimension,
 
-    /// First-class dimension type produced by this operation.
+    /// Output [`DimensionType`] of this [`Operation`].
     output_type: DimensionType,
 }
 
 impl DimensionSizeOperation {
-    /// Creates an operation that reads `axis` of `input_type`.
-    pub fn new<AxisValue: Into<Axis>>(input_type: &ArrayType, axis: AxisValue) -> Result<Self, TypeError> {
+    /// Creates a new [`DimensionSizeOperation`] that reads the `axis` size of `input_type`-typed inputs.
+    pub fn new<A: Into<Axis>>(input_type: &ArrayType, axis: A) -> Result<Self, TypeError> {
         let axis = axis.into();
         let position = axis.normalize(input_type.rank()).map_err(|_| {
             TypeError::invalid(format!(
-                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {axis} is out of bounds for rank {}",
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
+                axis,
                 input_type.rank(),
             ))
         })?;
+
         let input_dimension = input_type.shape().dimensions()[position].clone();
         let minimum_extent = input_dimension.bounds().lower();
         if minimum_extent > MAX_DIMENSION_EXTENT {
@@ -61,41 +61,45 @@ impl DimensionSizeOperation {
             }
             .into());
         }
+
         let output_variable = match &input_dimension {
             Dimension::Static(_) => DimensionVariable::new(format!("size(axis={position})"), input_dimension.bounds()),
             Dimension::Dynamic(variable) => variable.clone(),
         };
+
         Ok(Self { axis: position, input_dimension, output_type: DimensionType::from(output_variable) })
     }
 
-    /// Returns the normalized nonnegative input axis.
+    /// Returns the normalized non-negative input axis of this [`DimensionSizeOperation`].
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
     }
 
-    /// Returns the declared selected input dimension.
+    /// Returns the declared selected input [`Dimension`] of this [`DimensionSizeOperation`].
     #[inline]
     pub fn input_dimension(&self) -> &Dimension {
         &self.input_dimension
     }
 
-    /// Returns the first-class dimension type produced by this operation.
+    /// Returns the output [`DimensionType`] of this [`DimensionSizeOperation`].
     #[inline]
     pub fn output_type(&self) -> &DimensionType {
         &self.output_type
     }
 
-    /// Validates one complete composite input type against this operation's selected declared axis.
+    /// Validates the provided input [`ArrayIrType`] against this operation's selected declared axis.
     fn validate_input_type(&self, input_type: &ArrayIrType) -> Result<(), TypeError> {
         let input_type = <&ArrayType>::try_from(input_type)?;
         let actual_dimension = input_type.shape().dimensions().get(self.axis).ok_or_else(|| {
             TypeError::invalid(format!(
-                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {} is out of bounds for rank {}",
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
                 self.axis,
                 input_type.rank(),
             ))
         })?;
+
         let minimum_extent = actual_dimension.bounds().lower();
         if minimum_extent > MAX_DIMENSION_EXTENT {
             return Err(DimensionError::ExtentExceedsBackendWidth {
@@ -104,9 +108,11 @@ impl DimensionSizeOperation {
             }
             .into());
         }
+
         if self.input_dimension.is_refined_by(actual_dimension) {
             return Ok(());
         }
+
         if let (Dimension::Dynamic(variable), Dimension::Static(extent)) = (&self.input_dimension, actual_dimension)
             && !variable.bounds().contains(*extent)
         {
@@ -117,10 +123,10 @@ impl DimensionSizeOperation {
             }
             .into());
         }
+
         Err(TypeError::invalid(format!(
-            "`{DIMENSION_SIZE_OPERATION_NAME}` input axis {} dimension {actual_dimension} does not refine declared \
-             dimension {}",
-            self.axis, self.input_dimension,
+            "`{}` input axis {} dimension {} does not refine declared dimension {}",
+            DIMENSION_SIZE_OPERATION_NAME, self.axis, actual_dimension, self.input_dimension,
         )))
     }
 }
@@ -150,6 +156,7 @@ impl Operation for DimensionSizeOperation {
         self.validate_input_type(&input_types[0])?;
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
         let bounds = input_type.shape().dimensions()[self.axis].bounds();
+
         // Dimension variables have immutable bounds. A concrete refinement therefore defines a new exact-bound
         // identity, which program replay relates to the original definition before validating downstream uses.
         let output_type = if bounds == self.output_type.bounds() {
@@ -157,9 +164,11 @@ impl Operation for DimensionSizeOperation {
         } else {
             DimensionType::new(self.output_type.variable().name(), bounds)
         };
+
         Ok(vec![output_type.into()])
     }
 
+    #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
         Ok(Self {
             axis: self.axis,
@@ -198,10 +207,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 {
 }
 
-// Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
-// or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
-// per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
-// exposing its packed storage bound.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
     BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionSizeOperation
 {
@@ -211,9 +216,12 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
+        // Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary
+        // static or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead
+        // returns its per-item extent array as the mapped dimension carrier, preserving the logical dimension identity
+        // rather than exposing its packed storage bound.
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
         let input_type = input.value().r#type();
         let batched_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let packed_axis = match input.batch_axis().axis() {
@@ -223,12 +231,14 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
             }
             None => self.axis(),
         };
+
         if let Some(ragged_axis) = input.ragged_axes().iter().find(|ragged_axis| ragged_axis.axis() == packed_axis) {
             let Some(batch_axis) = input.batch_axis_position() else {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!("ragged axis {packed_axis} has no mapped batch axis"),
                 });
             };
+
             let Some(extent_axis) = ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis) else {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
@@ -236,6 +246,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
                     ),
                 });
             };
+
             return Ok(vec![ArrayIrBatch::mapped_dimension(
                 ragged_axis.extents().clone(),
                 BatchAxis::from_position(extent_axis),
@@ -243,6 +254,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
             )?]
             .into());
         }
+
         let operation = Self::new(batched_type, packed_axis)?;
         Ok(context
             .parent()
@@ -259,19 +271,19 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 
 /// Reads the runtime extent of one array axis.
 ///
-/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
-/// selected by `Output`: a materialized array backend can return its host extent, while a composite program value
-/// returns a dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other
-/// dimension operations. A program output is not an integer array; convert it to ordinary scalar data explicitly when
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation
+/// is selected by `Output` (e.g., a materialized array backend can return its host extent, while a composite program
+/// value returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
+/// dimension operations). A program output is not an integer array; convert it to ordinary scalar data explicitly when
 /// a numerical computation needs the extent as data.
 ///
 /// In a composite trace, the capability works both on the outer array member and on a
 /// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
 /// an array operation output to feed shape computation without exposing an adapter conversion in user code.
 ///
-/// Negative axes index from the final array axis. The representation of the output depends on whether the type already
-/// pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the axis's
-/// [`DimensionVariable`]. A static selected axis is folded: its extent is known from the type, so staging
+/// Negative axes index from the final array axis. The representation of the output depends on whether the type
+/// already pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the
+/// axis's [`DimensionVariable`]. A static selected axis is folded: its extent is known from the type, so staging
 /// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
@@ -281,11 +293,12 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// ```rust
 /// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
 /// # use ryft_core::arrays::Array;
+/// #
 /// # fn main() -> Result<(), ProgramError> {
 /// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]).unwrap());
 /// let columns = array.dimension_size(-1)?;
 /// let ArrayIrValue::Dimension(columns) = columns else {
-///     unreachable!("dimension_size always returns a dimension member");
+///     unreachable!("`dimension_size` always returns a dimension member");
 /// };
 /// assert_eq!(columns.extent(), 3);
 /// # Ok(())
@@ -293,15 +306,20 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// ```
 pub trait DimensionSize<Output = Self>: Typed + Sized {
     /// Returns the runtime extent of `axis` in the representation selected by `Output`.
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Output, ProgramError>;
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Output, ProgramError>;
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+            >,
+        >,
+> DimensionSize<V> for V
 {
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
 
@@ -318,25 +336,27 @@ where
 }
 
 impl DimensionSize<usize> for Array {
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
         let axis = axis.into();
         let position = axis.normalize(self.r#type().rank()).map_err(|_| {
             TypeError::invalid(format!(
-                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {axis} is out of bounds for rank {}",
+                "`{}` axis {} is out of bounds for rank {}",
+                DIMENSION_SIZE_OPERATION_NAME,
+                axis,
                 self.r#type().rank(),
             ))
         })?;
         let r#type = self.r#type();
         let dimension = &r#type.shape().dimensions()[position];
         dimension.value().ok_or_else(|| {
-            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}",))
+            TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}"))
                 .into()
         })
     }
 }
 
 impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayIrValue<A> {
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Self, ProgramError> {
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let input_type = array.r#type();
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
@@ -345,14 +365,19 @@ impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize for ArrayI
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+            >,
+        >,
+> DimensionSize<V> for ProjectedValue<ArrayType, V>
 {
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
-        // The projected view stages into and returns the parent composite carrier, folding static axes exactly like
-        // the composite implementation above.
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
+        // The projected view stages into and returns the parent composite carrier,
+        // folding static axes exactly like the composite implementation above.
         let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
         if let Dimension::Static(extent) = operation.input_dimension() {
             return self.value().dispatch_domain().dimension_constant(*extent);
@@ -421,10 +446,12 @@ mod tests {
             DimensionSizeOperation::new(&static_type, 1),
             Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1")),
         );
+
         assert_eq!(
             DimensionSizeOperation::new(&static_type, -2),
             Err(TypeError::invalid("`dimension_size` axis -2 is out of bounds for rank 1")),
         );
+
         if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
             let unrepresentable_type =
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(unrepresentable)]));
@@ -458,7 +485,7 @@ mod tests {
 
         // The mixed signature requires one array input, no regions, and a compatible selected dimension.
         let dimension_type = DimensionType::new("other", bounds);
-        assert_eq!(operation.infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")),);
+        assert_eq!(operation.infer_output_types(&[], &[]), Err(TypeError::invalid("expected 1 input but got 0")));
         assert_eq!(
             operation.infer_output_types(&[dimension_type.clone().into()], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
@@ -499,7 +526,7 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into()],
                 &[],
             ),
-            Err(TypeError::invalid("`dimension_size` input axis 0 dimension 4 does not refine declared dimension 3",)),
+            Err(TypeError::invalid("`dimension_size` input axis 0 dimension 4 does not refine declared dimension 3")),
         );
 
         // Renaming preserves the relationship between the selected dynamic input dimension and the output.
