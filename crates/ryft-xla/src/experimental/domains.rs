@@ -1,3 +1,5 @@
+//! XLA staging, compilation, and execution through the shared compilation-domain interfaces.
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -7430,12 +7432,7 @@ mod tests {
         };
 
         let error = domain.execute_xla_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("assertion failed: `first` <= `second`; first=4, second=3"),
-            "{error}",
-        );
+        assert!(error.to_string().contains("assertion failed: `first` <= `second`; first=4, second=3"), "{error}",);
         assert!(!error.to_string().contains("`second` <= `third`"), "{error}");
     }
 
@@ -7582,6 +7579,180 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_per_lane_validation_on_cpu() {
+        use ryft_core::Compare;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let values = f32_vector(&client, &mesh, &[1., -2., 3., -4.]);
+        let limits = f32_vector(&client, &mesh, &[0., 0., 0., 0.]);
+        let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+            |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
+            vec![values.r#type().into_owned(), limits.r#type().into_owned()],
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let lowered = domain
+            .lower_xla_program(staged.source_program().program(), 0, &XlaOptions::new(mesh.clone()))
+            .unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        assert!(!compiled.requires_assertion_handler);
+        let outputs = domain.execute_xla_program(&compiled, vec![values, limits]).unwrap();
+        assert_eq!(
+            outputs[0]
+                .addressable_shards()
+                .next()
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap(),
+            vec![1, 0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn test_compiled_assertion_bounded_lanes_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        for mode in [0, 1, 2] {
+            let predicates = boolean_vector(&client, &mesh, &[true, false, false, false]);
+            let observations = f32_vector(&client, &mesh, &[10., 20., 30., 40.]);
+            let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    if mode == 1 {
+                        batch(
+                            |(predicate, observation)| {
+                                predicate.assert_with_limit(
+                                    "bounded check",
+                                    &[("value", observation)],
+                                    std::num::NonZeroUsize::new(2).unwrap(),
+                                )
+                            },
+                            (inputs[0].clone(), inputs[1].clone()),
+                            (BatchAxis::new(0), BatchAxis::new(0)),
+                            (),
+                            None,
+                        )
+                        .unwrap();
+                    } else {
+                        let predicate = if mode == 2 { inputs[0].reshape([2, 2]).unwrap() } else { inputs[0].clone() };
+                        let observation =
+                            if mode == 2 { inputs[1].reshape([2, 2]).unwrap() } else { inputs[1].clone() };
+                        predicate
+                            .assert_with_limit(
+                                "bounded check",
+                                &[("value", observation)],
+                                std::num::NonZeroUsize::new(2).unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    vec![]
+                },
+                vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
+                &domain,
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let lowered = domain
+                .lower_xla_program(staged.source_program().program(), 0, &XlaOptions::new(mesh.clone()))
+                .unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let error = domain.execute_xla_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
+            let expected = ryft_core::AssertionError::FailedLanes {
+                message: "bounded check".to_owned(),
+                lanes: vec![
+                    ryft_core::AssertionLane {
+                        index: if mode == 2 { vec![0, 1] } else { vec![1] },
+                        observations: vec![("value".to_owned(), "20".to_owned())],
+                    },
+                    ryft_core::AssertionLane {
+                        index: if mode == 2 { vec![1, 0] } else { vec![2] },
+                        observations: vec![("value".to_owned(), "30".to_owned())],
+                    },
+                ],
+                omitted: 1,
+            };
+            assert!(error.to_string().contains(&expected.to_string()), "{error}");
+            let predicates = boolean_vector(&client, &mesh, &[true; 4]);
+            assert!(domain.execute_xla_program(&compiled, vec![predicates, observations]).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_compiled_assertion_bounded_sub_byte_observations_on_cpu() {
+        use ryft_core::ConvertElementType;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        for (data_type, values) in [
+            (DataType::I1, [0., -1., 0., -1.]),
+            (DataType::U1, [0., 1., 0., 1.]),
+            (DataType::I2, [0., -2., -1., 1.]),
+            (DataType::U2, [0., 1., 2., 3.]),
+            (DataType::I4, [0., -8., -1., 7.]),
+            (DataType::U4, [0., 1., 8., 15.]),
+        ] {
+            let predicates = boolean_vector(&client, &mesh, &[false; 4]);
+            let observations = f32_vector(&client, &mesh, &values);
+            let staged = crate::jit::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
+                |inputs| {
+                    let observation = inputs[1].convert_element_type(data_type).unwrap();
+                    inputs[0]
+                        .assert_with_limit(
+                            "narrow values",
+                            &[("value", observation)],
+                            std::num::NonZeroUsize::new(3).unwrap(),
+                        )
+                        .unwrap();
+                    vec![]
+                },
+                vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
+                &domain,
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let lowered = domain
+                .lower_xla_program(staged.source_program().program(), 0, &XlaOptions::new(mesh.clone()))
+                .unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let error = domain.execute_xla_program(&compiled, vec![predicates, observations]).unwrap_err();
+            let expected = ryft_core::AssertionError::FailedLanes {
+                message: "narrow values".to_owned(),
+                lanes: values
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                    .map(|(index, value)| ryft_core::AssertionLane {
+                        index: vec![index],
+                        observations: vec![("value".to_owned(), value.to_string())],
+                    })
+                    .collect(),
+                omitted: 1,
+            };
+            assert!(error.to_string().contains(&expected.to_string()), "{data_type}: {error}");
+        }
+    }
+
+    #[test]
     fn test_compiled_assertion_scalar_observations_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -7694,74 +7865,99 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let size = context.input(input_type.clone().into());
-        let limit = context.input(input_type.clone().into());
-        let dimension = context
-            .bind(DimensionFromScalarOperation::new(extent.clone()), Vec::new(), &[size])
-            .unwrap()
-            .remove(0);
-        let indices = context
-            .bind(
-                IotaOperation::new(ArrayType::new(DataType::I64, Shape::new(vec![extent.into()])), 0).unwrap(),
-                Vec::new(),
-                std::slice::from_ref(&dimension),
-            )
-            .unwrap()
-            .remove(0);
-        let limits = context
-            .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[limit, dimension.clone()])
-            .unwrap()
-            .remove(0);
-        let predicates = context
-            .bind(
-                XlaOperation::Array(ryft_core::ArrayOperation::Compare(CompareOperation::new(
-                    ComparisonDirection::LessThan,
-                ))),
-                Vec::new(),
-                &[indices.clone(), limits],
-            )
-            .unwrap()
-            .remove(0);
-        let batching = BatchingContext::new(context.clone(), dimension);
-        AssertOperation::new("dynamic mapped check")
-            .with_labels(vec!["value".to_owned()])
-            .batch(
-                &batching,
-                &EmptyRegionDriver,
-                &[ArrayIrBatch::new(predicates, 0).unwrap(), ArrayIrBatch::new(indices, 0).unwrap()],
-            )
-            .unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; 2], vec![])
-            .unwrap();
-        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_xla_program(&lowered).unwrap();
-        for (size, limit) in [(0_i64, 0_i64), (1, 1), (3, 3)] {
-            let inputs = [size, limit]
+        for bounded in [false, true] {
+            let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+            let context = TracingContext::<XlaConstant, XlaOperation>::new();
+            let size = context.input(input_type.clone().into());
+            let limit = context.input(input_type.clone().into());
+            let dimension = context
+                .bind(DimensionFromScalarOperation::new(extent.clone()), Vec::new(), &[size])
+                .unwrap()
+                .remove(0);
+            let indices = context
+                .bind(
+                    IotaOperation::new(ArrayType::new(DataType::I64, Shape::new(vec![extent.into()])), 0).unwrap(),
+                    Vec::new(),
+                    std::slice::from_ref(&dimension),
+                )
+                .unwrap()
+                .remove(0);
+            let limits = context
+                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[limit, dimension.clone()])
+                .unwrap()
+                .remove(0);
+            let predicates = context
+                .bind(
+                    XlaOperation::Array(ryft_core::ArrayOperation::Compare(CompareOperation::new(
+                        ComparisonDirection::LessThan,
+                    ))),
+                    Vec::new(),
+                    &[indices.clone(), limits],
+                )
+                .unwrap()
+                .remove(0);
+            let batching = BatchingContext::new(context.clone(), dimension);
+            let operation = AssertOperation::new("dynamic mapped check").with_labels(vec!["value".to_owned()]);
+            let operation =
+                if bounded { operation.with_failure_limit(std::num::NonZeroUsize::new(2).unwrap()) } else { operation };
+            operation
+                .batch(
+                    &batching,
+                    &EmptyRegionDriver,
+                    &[ArrayIrBatch::new(predicates, 0).unwrap(), ArrayIrBatch::new(indices, 0).unwrap()],
+                )
+                .unwrap();
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder; 2], vec![])
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            for (size, limit) in [(0_i64, 0_i64), (1, 1), (3, 3)] {
+                let inputs = [size, limit]
+                    .into_iter()
+                    .map(|value| {
+                        Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes())
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert!(domain.execute_xla_program(&compiled, inputs).unwrap().is_empty());
+            }
+            let inputs = [3_i64, 1_i64]
                 .into_iter()
                 .map(|value| {
                     Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
                 })
                 .collect::<Vec<_>>();
-            assert!(domain.execute_xla_program(&compiled, inputs).unwrap().is_empty());
+            let error = domain.execute_xla_program(&compiled, inputs).unwrap_err();
+            let expected = if bounded {
+                ryft_core::AssertionError::FailedLanes {
+                    message: "dynamic mapped check".to_owned(),
+                    lanes: vec![
+                        ryft_core::AssertionLane {
+                            index: vec![1],
+                            observations: vec![("value".to_owned(), "1".to_owned())],
+                        },
+                        ryft_core::AssertionLane {
+                            index: vec![2],
+                            observations: vec![("value".to_owned(), "2".to_owned())],
+                        },
+                    ],
+                    omitted: 0,
+                }
+            } else {
+                ryft_core::AssertionError::Failed {
+                    message: "dynamic mapped check".to_owned(),
+                    observations: vec![
+                        ("value".to_owned(), "1".to_owned()),
+                        ("batch_index".to_owned(), "1".to_owned()),
+                    ],
+                }
+            };
+            assert!(error.to_string().contains(&expected.to_string()), "{error}");
         }
-        let inputs = [3_i64, 1_i64]
-            .into_iter()
-            .map(|value| {
-                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let error = domain.execute_xla_program(&compiled, inputs).unwrap_err();
-        let expected = ryft_core::AssertionError::Failed {
-            message: "dynamic mapped check".to_owned(),
-            observations: vec![("value".to_owned(), "1".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
-        };
-        assert!(error.to_string().contains(&expected.to_string()), "{error}");
     }
 
     #[test]
@@ -7773,46 +7969,69 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let context = TracingContext::<XlaConstant, XlaOperation>::new();
-        let size = context.input(input_type.clone().into());
-        let dimension = context
-            .bind(
-                DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "batch",
-                    DimensionBounds::new(0, Some(5)).unwrap(),
-                )),
-                Vec::new(),
-                std::slice::from_ref(&size),
-            )
-            .unwrap()
-            .remove(0);
-        let condition = context.lift(XlaConstant::Boolean(false)).unwrap();
-        let batching = BatchingContext::new(context.clone(), dimension);
-        AssertOperation::new("dynamic replicated check")
-            .with_labels(vec!["size".to_owned()])
-            .batch(
-                &batching,
-                &EmptyRegionDriver,
-                &[ArrayIrBatch::replicated(condition), ArrayIrBatch::replicated(size)],
-            )
-            .unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![])
-            .unwrap();
-        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let empty = Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
-        assert!(domain.execute_xla_program(&compiled, vec![empty]).unwrap().is_empty());
-        let nonempty = Array::from_host_buffer(&client, input_type, mesh, &3_i64.to_ne_bytes()).unwrap();
-        let error = domain.execute_xla_program(&compiled, vec![nonempty]).unwrap_err();
-        let expected = ryft_core::AssertionError::Failed {
-            message: "dynamic replicated check".to_owned(),
-            observations: vec![("size".to_owned(), "3".to_owned())],
-        };
-        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+        for bounded in [false, true] {
+            let context = TracingContext::<XlaConstant, XlaOperation>::new();
+            let size = context.input(input_type.clone().into());
+            let dimension = context
+                .bind(
+                    DimensionFromScalarOperation::new(DimensionVariable::new(
+                        "batch",
+                        DimensionBounds::new(0, Some(5)).unwrap(),
+                    )),
+                    Vec::new(),
+                    std::slice::from_ref(&size),
+                )
+                .unwrap()
+                .remove(0);
+            let condition = context.lift(XlaConstant::Boolean(false)).unwrap();
+            let batching = BatchingContext::new(context.clone(), dimension);
+            let operation = AssertOperation::new("dynamic replicated check").with_labels(vec!["size".to_owned()]);
+            let operation =
+                if bounded { operation.with_failure_limit(std::num::NonZeroUsize::new(2).unwrap()) } else { operation };
+            operation
+                .batch(
+                    &batching,
+                    &EmptyRegionDriver,
+                    &[ArrayIrBatch::replicated(condition), ArrayIrBatch::replicated(size)],
+                )
+                .unwrap();
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![], vec![Placeholder], vec![])
+                .unwrap();
+            let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+            let compiled = domain.compile_xla_program(&lowered).unwrap();
+            let empty =
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &0_i64.to_ne_bytes()).unwrap();
+            assert!(domain.execute_xla_program(&compiled, vec![empty]).unwrap().is_empty());
+            let nonempty =
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &3_i64.to_ne_bytes()).unwrap();
+            let error = domain.execute_xla_program(&compiled, vec![nonempty]).unwrap_err();
+            let expected = if bounded {
+                ryft_core::AssertionError::FailedLanes {
+                    message: "dynamic replicated check".to_owned(),
+                    lanes: vec![
+                        ryft_core::AssertionLane {
+                            index: vec![0],
+                            observations: vec![("size".to_owned(), "3".to_owned())],
+                        },
+                        ryft_core::AssertionLane {
+                            index: vec![1],
+                            observations: vec![("size".to_owned(), "3".to_owned())],
+                        },
+                    ],
+                    omitted: 1,
+                }
+            } else {
+                ryft_core::AssertionError::Failed {
+                    message: "dynamic replicated check".to_owned(),
+                    observations: vec![("size".to_owned(), "3".to_owned())],
+                }
+            };
+            assert!(error.to_string().contains(&expected.to_string()), "{error}");
+        }
     }
 
     #[test]

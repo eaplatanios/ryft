@@ -4040,8 +4040,8 @@ mod tests {
     #[test]
     fn test_condition_batching_rejects_batch_varying_dimension_results() -> Result<(), ProgramError> {
         // Under a batch-varying predicate, dimension results of the two branches stay replicated and are guarded by an
-        // equality requirement, so branches whose dimension results differ are rejected instead of becoming ragged
-        // values.
+        // equality assertion, so branches whose dimension results differ fail during execution instead of becoming
+        // ragged values.
         let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let true_extent = true_builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2)?));
         let true_branch = true_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -4060,14 +4060,35 @@ mod tests {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let predicate =
-            trace.input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(batch)])).into());
-        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, batch_extent);
-        let error = context
+            trace.input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(batch.clone())])).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let outputs = context
             .bind(
                 ArrayIrOperation::Condition(ConditionOperation::new()),
                 vec![true_branch, false_branch],
                 &[BatchingTracer::new(context.clone(), ArrayIrBatch::new(predicate, BatchAxis::new(0))?)],
             )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert!(
+            trace
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .any(|instruction| { instruction.operation().name() == "assert" })
+        );
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            Vec::new(),
+            vec![Placeholder; 2],
+            Vec::new(),
+        )?;
+        let error = program
+            .interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(batch), 2)?),
+                ArrayIrValue::Array(Array::vector(vec![true, false])?),
+            ])
             .unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),

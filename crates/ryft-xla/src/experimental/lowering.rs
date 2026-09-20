@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -52,10 +53,10 @@ use ryft_mlir::{
 use crate::ToMlir;
 use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
-    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_GENERIC_KIND,
-    ASSERT_KIND_ATTRIBUTE, ASSERT_LABEL_COUNT_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_MESSAGE_ATTRIBUTE,
-    ASSERT_MUL_KIND, ASSERT_PAD_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE,
-    ASSERT_SUB_KIND,
+    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_FAILURE_LIMIT_ATTRIBUTE,
+    ASSERT_GENERIC_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LABEL_COUNT_ATTRIBUTE, ASSERT_LANE_RANK_ATTRIBUTE,
+    ASSERT_LANES_KIND, ASSERT_LEFT_ATTRIBUTE, ASSERT_MESSAGE_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_PAD_KIND,
+    ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
 };
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -3925,6 +3926,20 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
     inputs.push(predicate);
     inputs.extend_from_slice(observed_values);
     inputs.push(input_token);
+    let layouts = inputs
+        .iter()
+        .map(|input| {
+            Ok(input
+                .r#type()?
+                .cast::<TensorTypeRef>()
+                .map(|tensor| (0..tensor.dimensions().count()).rev().collect::<Vec<_>>())
+                .unwrap_or_default())
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    let layouts = layouts
+        .iter()
+        .any(|layout| !layout.is_empty())
+        .then_some(CustomCallMemoryLayouts { operands: layouts, results: vec![Vec::new()] });
     let operation = block.append_operation(stable_hlo::custom_call(
         inputs.as_slice(),
         ASSERT_CUSTOM_CALL_TARGET,
@@ -3932,7 +3947,7 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
         Some(backend_config.as_ref()),
         CustomCallApiVersion::TypedFfi,
         &[],
-        None,
+        layouts,
         &[],
         None,
         &[context.stable_hlo_token_type()?],
@@ -3997,12 +4012,14 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     Ok(())
 }
 
-/// Emits an assertion with a literal message and named scalar observations. Diagnostic buffers retain their
+/// Emits an assertion with a literal message and named observations. Bounded lane reports carry logical extents. Diagnostic buffers retain their
 /// element types so unsigned values and floating-point values reach the callback without lossy conversions.
 fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     actor: &str,
     message: &str,
     labels: &[String],
+    failure_limit: Option<NonZeroUsize>,
+    input_types: &[ArrayType],
     input_values: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -4010,10 +4027,13 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
     check_count!("input", input_values, labels.len() + 1, ProgramError);
+    check_count!("input", input_types, input_values.len(), ProgramError);
     let mut attributes = vec![
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(actor)),
-        context
-            .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_GENERIC_KIND)),
+        context.named_attribute(
+            context.identifier(ASSERT_KIND_ATTRIBUTE),
+            context.string_attribute(if failure_limit.is_some() { ASSERT_LANES_KIND } else { ASSERT_GENERIC_KIND }),
+        ),
         context.named_attribute(context.identifier(ASSERT_MESSAGE_ATTRIBUTE), context.string_attribute(message)),
         context.named_attribute(
             context.identifier(ASSERT_LABEL_COUNT_ATTRIBUTE),
@@ -4026,9 +4046,56 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
             context.string_attribute(label.as_str()),
         ));
     }
+    let mut arguments = input_values.to_vec();
+    if let Some(limit) = failure_limit {
+        // Use byte-wide diagnostic carriers rather than relying on backend sub-byte buffer packing.
+        for (value, input_type) in arguments[1..].iter_mut().zip(&input_types[1..]) {
+            let data_type = input_type.data_type();
+            let carrier = match data_type {
+                DataType::I1 | DataType::I2 | DataType::I4 => DataType::I8,
+                DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
+                _ => continue,
+            };
+            let tensor_type = lower_tensor_type(&input_type.clone().with_data_type(carrier), context, location)?;
+            let converted = block.append_operation(stable_hlo::convert(*value, tensor_type, location)?)?;
+            *value = converted.result(0).unwrap().as_ref();
+            if data_type == DataType::I1 {
+                let signed = block.append_operation(stable_hlo::negate(*value, location)?)?;
+                *value = signed.result(0).unwrap().as_ref();
+            }
+        }
+        let rank = input_values[0].r#type()?.cast::<TensorTypeRef>().unwrap().dimensions().count();
+        attributes.push(context.named_attribute(
+            context.identifier(ASSERT_FAILURE_LIMIT_ATTRIBUTE),
+            context.string_attribute(limit.get().to_string().as_str()),
+        ));
+        attributes.push(context.named_attribute(
+            context.identifier(ASSERT_LANE_RANK_ATTRIBUTE),
+            context.string_attribute(rank.to_string().as_str()),
+        ));
+        for axis in 0..rank {
+            arguments.push(lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?);
+        }
+        // XLA custom calls require static physical carriers; the separately captured logical extents exclude padding.
+        for (value, input_type) in arguments.iter_mut().zip(input_types) {
+            let data_type = match input_type.data_type() {
+                DataType::I1 | DataType::I2 | DataType::I4 => DataType::I8,
+                DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
+                data_type => data_type,
+            };
+            *value = lower_physical_bound_value(
+                *value,
+                &input_type.clone().with_data_type(data_type),
+                0.0,
+                block,
+                context,
+                location,
+            )?;
+        }
+    }
     lower_assertion_custom_call(
-        input_values[0],
-        &input_values[1..],
+        arguments[0],
+        &arguments[1..],
         context.dictionary_attribute(&attributes),
         effect_tokens,
         block,
@@ -5157,6 +5224,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     operation.name(),
                     operation.message(),
                     operation.labels(),
+                    operation.failure_limit(),
+                    &lowerer.input_types,
                     input_values,
                     &mut lowerer.effect_tokens,
                     &mut lowerer.block,

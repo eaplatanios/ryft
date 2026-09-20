@@ -82,8 +82,8 @@ pub use interpretation::{
 pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs,
     AbsOperation, Add, AddOperation, And, AndOperation, ArithmeticDimensionOperation, Assert, AssertOperation,
-    AssertionContext, AssertionError, AssertionValue, Atan2, Atan2Operation, BROADCAST_OPERATION_NAME, BasicIndex,
-    BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, COMPARE_OPERATION_NAME,
+    AssertionContext, AssertionError, AssertionLane, AssertionValue, Atan2, Atan2Operation, BROADCAST_OPERATION_NAME,
+    BasicIndex, BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, COMPARE_OPERATION_NAME,
     CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME,
     COS_OPERATION_NAME, CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME,
     CUMULATIVE_MIN_OPERATION_NAME, CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME,

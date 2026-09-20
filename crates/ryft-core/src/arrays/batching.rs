@@ -6988,7 +6988,7 @@ mod tests {
         assert_eq!(context.axis_extent(), &extent);
 
         // A referent whose dynamic batch dimension has exact bounds supplies its extent as a constant, and that extent
-        // is then required to match every other mapped input.
+        // is then required to match every other mapped input. Tracing retains a known mismatch for execution.
         let trace = ArrayIrTraceContext::new();
         let exact = DimensionVariable::new("n", DimensionBounds::new(4, Some(5)).unwrap());
         let exact_reference_type = ReferenceType::new(ArrayType::new(
@@ -7000,10 +7000,23 @@ mod tests {
             pack_inputs(&trace, vec![reference.clone()], vec![BatchAxis::new(0)], BatchAxisSpecification::default())?;
         assert_eq!(context.axis_extent().r#type().to_string(), "dimension<4>");
         let array = trace.input(ArrayType::new_static(DataType::F32, [2, 3]).into());
-        let mismatched =
-            pack_inputs(&trace, vec![reference, array], vec![BatchAxis::new(0); 2], BatchAxisSpecification::default())
-                .unwrap_err();
-        assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
+        pack_inputs(&trace, vec![reference, array], vec![BatchAxis::new(0); 2], BatchAxisSpecification::default())?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            Vec::new(),
+            vec![Placeholder; 2],
+            Vec::new(),
+        )?;
+        assert!(program.instructions().iter().any(|instruction| {
+            matches!(instruction.operation(), ArrayIrOperation::Assert(operation)
+                if operation.message() == "batch dimensions must agree")
+        }));
+        let mismatched = program
+            .interpret(vec![
+                ArrayIrValue::Reference(ArrayReference::new(Array::matrix(4, 3, vec![0.0_f32; 12]).unwrap())),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap()),
+            ])
+            .unwrap_err();
+        assert!(matches!(mismatched, ProgramError::Custom(_)));
         assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=2, actual=4");
 
         // A mapped reference contributes its referent's batch-axis placement to the sharding join, so a mapped array

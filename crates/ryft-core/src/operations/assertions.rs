@@ -1,10 +1,27 @@
-//! Correctness assertions over Boolean predicates, with named scalar observations on failure.
+//! Correctness assertions over Boolean predicates, with named observations on failure.
+//!
+//! Use [`Assert::assert_with_limit`] for bounded reporting over an array of predicates. To inspect per-lane
+//! outcomes without raising, return the predicate array as an ordinary program output instead:
+//!
+//! ```rust
+//! use ryft_core::{Array, Compare, ProgramError, ZeroLike};
+//!
+//! # fn main() -> Result<(), ProgramError> {
+//! let divisors = Array::vector(vec![2_i32, 0, 4])?;
+//! let valid = divisors.not_equal(&divisors.zero_like()?)?;
+//! assert_eq!(valid.elements::<bool>()?, vec![true, false, true]);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A validation mask does not guard later operations; callers must ensure their inputs remain valid.
 
 // TODO(eaplatanios): Review from here onwards.
 
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 
 use half::{bf16, f16};
 
@@ -31,10 +48,13 @@ use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::DynamicSlice;
+use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::reduce::{Reduce, ReductionKind};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -50,11 +70,35 @@ use crate::tracing::{NestedTracingContext, TracingContext};
 pub enum AssertionError {
     /// The Boolean condition was false.
     Failed { message: String, observations: Vec<(String, String)> },
+    /// One or more logical lanes failed, with a bounded diagnostic sample and the number omitted.
+    FailedLanes { message: String, lanes: Vec<AssertionLane>, omitted: usize },
+}
+
+/// Coordinates and named observations for one failed logical assertion lane.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AssertionLane {
+    /// Logical row-major coordinates of the failed lane.
+    pub index: Vec<usize>,
+    /// Named scalar values observed at the failed lane.
+    pub observations: Vec<(String, String)>,
 }
 
 impl Display for AssertionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FailedLanes { message, lanes, omitted } => {
+                write!(formatter, "assertion failed: {message}")?;
+                for lane in lanes {
+                    write!(formatter, "; lane {:?}", lane.index)?;
+                    for (label, value) in &lane.observations {
+                        write!(formatter, ", {label}={value}")?;
+                    }
+                }
+                if *omitted > 0 {
+                    write!(formatter, "; {omitted} additional failing lanes omitted")?;
+                }
+                Ok(())
+            }
             Self::Failed { message, observations } => {
                 write!(formatter, "assertion failed: {message}")?;
                 for (index, (label, value)) in observations.iter().enumerate() {
@@ -78,15 +122,17 @@ impl From<AssertionError> for ProgramError {
 /// Canonical operation name for [`AssertOperation`].
 pub const ASSERT_OPERATION_NAME: &str = "assert";
 
-/// Checks a scalar Boolean condition and produces no outputs. Failed checks report the message and named scalar
-/// observations. Assertions remain enabled independently of debug builds. Every residual instruction declares
+/// Checks Boolean conditions and produces no outputs. By default, the condition and observations are scalar.
+/// [`with_failure_limit`](Self::with_failure_limit) enables array conditions and bounded lane diagnostics.
+/// Failed checks report the message and named observations. Assertions remain enabled independently of debug builds. Every residual instruction declares
 /// [`EffectClass::OrderedAssertion`]; known conditions are handled by [`Assert`] and partial evaluation.
 ///
 /// The first input is the condition; subsequent inputs correspond to [`labels`](Self::labels). Supported observations
 /// are dimensions and scalar Boolean, integer, `bf16`, `f16`, `f32`, or `f64` arrays. Labels and messages are literal
-/// descriptions and do not refer to type identities. Separate assertions preserve separate ordered failures.
-/// Mapped batching reports the first failing lane at each batching level. Batch extents must fit the `i32` index
-/// range. Mixed array programs support dynamic extents, including empty batches, which pass vacuously. Observations
+/// descriptions and do not refer to type identities. With bounded reporting, array observations may instead have
+/// the condition's shape. Separate assertions preserve separate ordered failures.
+/// Default mapped batching reports the first failing lane at each level, with batch extents restricted to the
+/// `i32` index range. Bounded reporting instead preserves all logical lanes and reports a row-major sample. Mixed array programs support dynamic extents, including empty batches, which pass vacuously. Observations
 /// with a potentially empty mapped axis receive one unused padding lane so diagnostic selection remains valid;
 /// the padded extent must also fit `i32`.
 #[derive(Clone, Debug)]
@@ -97,6 +143,9 @@ pub struct AssertOperation<T: Type> {
     /// Refer to the documentation of [`labels`](Self::labels) for more information.
     labels: Vec<String>,
 
+    /// Refer to the documentation of [`failure_limit`](Self::failure_limit) for more information.
+    failure_limit: Option<NonZeroUsize>,
+
     /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
@@ -104,12 +153,20 @@ pub struct AssertOperation<T: Type> {
 impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
     /// Creates an assertion with the provided message and no diagnostic observations.
     pub fn new<M: Into<String>>(message: M) -> Self {
-        Self { message: message.into(), labels: Vec::new(), marker: PhantomData }
+        Self { message: message.into(), labels: Vec::new(), failure_limit: None, marker: PhantomData }
     }
 
     /// Returns a copy of this [`AssertOperation`] with its diagnostic labels set to the provided `labels`.
     pub fn with_labels(mut self, labels: Vec<String>) -> Self {
         self.labels = labels;
+        self
+    }
+
+    /// Returns a copy of this [`AssertOperation`] with bounded lane reporting enabled with the provided `limit`.
+    /// Conditions may then be Boolean arrays; observations must be scalars or have the condition's shape.
+    /// At most `limit` failed lanes are reported in logical row-major order, along with the number omitted.
+    pub fn with_failure_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.failure_limit = Some(limit);
         self
     }
 
@@ -123,8 +180,13 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         &self.labels
     }
 
+    /// Returns the maximum reported failed lanes, or `None` for the default scalar assertion behavior.
+    pub fn failure_limit(&self) -> Option<NonZeroUsize> {
+        self.failure_limit
+    }
+
     /// Batches logical scalar inputs, selecting one observed failing lane at the current transform level.
-    fn batch_inputs<C, P, V, Project, Lift, Indices, MaskEmpty, PadEmpty, Driver>(
+    fn batch_inputs<C, P, V, Project, Lift, Indices, MaskEmpty, PadEmpty, Pack, Driver>(
         &self,
         context: &BatchingContext<C, P>,
         driver: &Driver,
@@ -135,6 +197,7 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         indices: Indices,
         mask_empty: MaskEmpty,
         mut pad_empty: PadEmpty,
+        pack: Pack,
     ) -> Result<BatchedOutputs<C, P>, BatchingError>
     where
         C: AssertionContext<Type = T>,
@@ -145,6 +208,7 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         Indices: Fn(&ArrayType) -> Result<V, ProgramError>,
         MaskEmpty: Fn(V) -> Result<V, ProgramError>,
         PadEmpty: FnMut(C::Value) -> Result<C::Value, ProgramError>,
+        Pack: Fn(&[P::Batch]) -> Result<Vec<C::Value>, BatchingError>,
         Driver: BatchingDriver<C, P>,
     {
         self.infer_output_types(
@@ -153,6 +217,11 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         )?;
         // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
         if extent.value() == Some(0) {
+            return Ok(Vec::new().into());
+        }
+        if self.failure_limit.is_some() {
+            let arguments = pack(inputs)?;
+            context.parent().assert(self.clone(), &arguments)?;
             return Ok(Vec::new().into());
         }
         let mapped = inputs.iter().any(|input| P::batch_axis(input).axis().is_some());
@@ -216,7 +285,7 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         Ok(Vec::new().into())
     }
 
-    /// Folds concrete conditions only at a staging boundary; transform contexts first apply their own rule.
+    /// Elides known successes at a staging boundary; transform contexts first apply their own rule.
     fn fold_or_bind<C: Context<Type = T, Constant: AssertionValue, Operation: From<Self>>>(
         &self,
         context: &C,
@@ -226,25 +295,73 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         if let ValueResolution::Constant(condition) = context.resolve(&inputs[0]) {
             match condition.concretize() {
                 Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(ProgramError::Concretization { .. }) => {
-                    context.bind(self.clone(), Vec::new(), inputs)?;
-                    return Ok(());
-                }
+                Ok(false) | Err(ProgramError::Concretization { .. }) => {}
                 Err(error) => return Err(error),
             }
-            return Err(self
-                .failure(inputs[1..].iter().map(|input| {
-                    let value = match context.resolve(input) {
-                        ValueResolution::Constant(value) => Some(value),
-                        _ => None,
-                    };
-                    (value, input.r#type().into_owned())
-                }))?
-                .into());
         }
         context.bind(self.clone(), Vec::new(), inputs)?;
         Ok(())
+    }
+
+    /// Checks concrete logical lanes without changing ordinary scalar assertion behavior.
+    fn check_lanes<V: AssertionValue<Type = T>>(
+        &self,
+        condition: &V,
+        observations: &[(&str, V)],
+    ) -> Result<(), ProgramError> {
+        let input_types = std::iter::once(condition.r#type().into_owned())
+            .chain(observations.iter().map(|(_, value)| value.r#type().into_owned()))
+            .collect::<Vec<_>>();
+        self.infer_output_types(&input_types, &[])?;
+        let condition = condition.assertion_array()?.unwrap();
+        let values = condition.elements::<bool>()?;
+        let failure_count = values.iter().filter(|value| !**value).count();
+        if failure_count == 0 {
+            return Ok(());
+        }
+        let shape = condition
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| dimension.value().unwrap())
+            .collect::<Vec<_>>();
+        let observations = observations
+            .iter()
+            .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let limit = self.failure_limit.unwrap().get();
+        let mut lanes = Vec::new();
+        for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
+            let mut remaining = position;
+            let mut index = vec![0; shape.len()];
+            for axis in (0..shape.len()).rev() {
+                index[axis] = remaining % shape[axis];
+                remaining /= shape[axis];
+            }
+            let starts =
+                index.iter().map(|&coordinate| Array::scalar(coordinate as i64)).collect::<Result<Vec<_>, _>>()?;
+            let observations = observations
+                .iter()
+                .map(|(label, value, array)| {
+                    let observation = match array {
+                        Some(array) if array.r#type().rank() > 0 => {
+                            array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
+                        }
+                        Some(array) => array.assertion_observation()?,
+                        None => value.assertion_observation()?,
+                    };
+                    Ok(((*label).to_owned(), observation))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            lanes.push(AssertionLane { index, observations });
+        }
+        Err(AssertionError::FailedLanes {
+            message: self.message.clone(),
+            omitted: failure_count.saturating_sub(limit),
+            lanes,
+        }
+        .into())
     }
 
     /// Constructs a failure from validated observations, retaining dimension facts when values cannot be resolved.
@@ -300,10 +417,11 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
         check_count!("input", input_types, 1 + self.labels.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let condition: ArrayIrType = input_types[0].clone().into();
-        if !matches!(&condition, ArrayIrType::Array(array) if array.rank() == 0 && array.data_type() == DataType::Boolean)
+        if !matches!(&condition, ArrayIrType::Array(array) if (self.failure_limit.is_some() || array.rank() == 0) && array.data_type() == DataType::Boolean)
         {
             return Err(TypeError::invalid(format!(
-                "assertion condition must have type `bool[]` but has type `{condition}`"
+                "assertion condition must have type `{}` but has type `{condition}`",
+                if self.failure_limit.is_some() { "bool[...]" } else { "bool[]" },
             )));
         }
         for (label, input) in self.labels.iter().zip(&input_types[1..]) {
@@ -311,7 +429,9 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
             let supported = match &input {
                 ArrayIrType::Dimension(_) => true,
                 ArrayIrType::Array(array) => {
-                    array.rank() == 0
+                    (array.rank() == 0
+                        || (self.failure_limit.is_some()
+                            && matches!(&condition, ArrayIrType::Array(condition) if array.shape() == condition.shape())))
                         && (array.data_type().is_integer()
                             || matches!(
                                 array.data_type(),
@@ -337,6 +457,9 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("message", format_args!("{:?}", self.message))?;
             operation.field("labels", format_args!("{:?}", self.labels))?;
+            if let Some(limit) = self.failure_limit {
+                operation.field("failure_limit", limit)?;
+            }
             Ok(())
         })
     }
@@ -365,7 +488,10 @@ where
             .zip(&inputs[1..])
             .map(|(label, input)| (label.as_str(), input.clone()))
             .collect::<Vec<_>>();
-        inputs[0].assert(&self.message, &observations)?;
+        match self.failure_limit {
+            Some(limit) => inputs[0].assert_with_limit(&self.message, &observations, limit)?,
+            None => inputs[0].assert(&self.message, &observations)?,
+        }
         Ok(Vec::new())
     }
 }
@@ -386,14 +512,17 @@ where
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
+        if self.failure_limit.is_some() {
+            return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
+        }
         if let Some(condition) = inputs[0].as_known()
             && let ValueResolution::Constant(condition) = context.parent().resolve(condition)
         {
             match condition.concretize() {
                 Ok(true) => return Ok(Vec::new()),
                 Ok(false) => {
-                    if !context.can_fold_effects(self.effects().classes()) {
-                        return context.residualize(self.clone(), Vec::new(), inputs);
+                    if !context.parent().is_eager() || !context.can_fold_effects(self.effects().classes()) {
+                        return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
                     }
                 }
                 Err(ProgramError::Concretization { .. }) => {
@@ -418,7 +547,7 @@ where
 impl<C: AssertionContext<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatchingPolicy<P>> for AssertOperation<ArrayType>
 where
-    C::Operation: From<Self> + From<IotaOperation<ArrayType>>,
+    C::Operation: From<Self> + From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
     C::Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -453,6 +582,37 @@ where
                 Ok(condition)
             },
             Ok,
+            |inputs| {
+                let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone();
+                let condition_type = condition.r#type().into_owned();
+                let mut arguments = vec![condition];
+                for input in &inputs[1..] {
+                    let value = if input.batch_axis().is_replicated() {
+                        input.value().clone()
+                    } else {
+                        P::match_axis(context, input, Axis::from(0))?.value().clone()
+                    };
+                    let input_type = value.r#type();
+                    if input_type.rank() == 0 {
+                        arguments.push(value);
+                        continue;
+                    }
+                    let output_axes = if input.batch_axis().is_replicated() {
+                        (1..=input_type.rank()).collect::<Vec<_>>()
+                    } else {
+                        (0..input_type.rank()).collect::<Vec<_>>()
+                    };
+                    let output_type = condition_type.clone().with_data_type(input_type.data_type());
+                    let mut outputs = context.parent().bind(
+                        BroadcastOperation::new(output_type, output_axes),
+                        Vec::new(),
+                        &[value],
+                    )?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    arguments.push(outputs.remove(0));
+                }
+                Ok(arguments)
+            },
         )
     }
 }
@@ -466,7 +626,9 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<DimensionAddOperation>
         + From<CompareOperation<ArrayIrType>>
-        + From<PadOperation<ArrayIrType>>,
+        + From<PadOperation<ArrayIrType>>
+        + From<DynamicBroadcastOperation>
+        + From<DimensionSizeOperation>,
     C::Value: ValueProjection<
             ArrayType,
             Projected: Value<Type = ArrayType>
@@ -475,7 +637,8 @@ where
                            + DynamicSlice
                            + Reshape
                            + ConvertElementType
-                           + ZeroLike,
+                           + ZeroLike
+                           + Transpose,
         >,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -560,6 +723,52 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             },
+            |inputs| {
+                let value = inputs[0].value().clone();
+                let condition_type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
+                let mut dimensions = vec![context.axis_extent().clone()];
+                let mapped_axis = inputs[0].batch_axis_position();
+                for axis in (0..condition_type.rank()).filter(|axis| Some(*axis) != mapped_axis) {
+                    let mut outputs = context.parent().bind(
+                        DimensionSizeOperation::new(&condition_type, axis)?,
+                        Vec::new(),
+                        std::slice::from_ref(&value),
+                    )?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    dimensions.push(outputs.remove(0));
+                }
+                let mut arguments = Vec::new();
+                for input in inputs {
+                    let mut value = input.value().clone();
+                    let input_type = value.r#type();
+                    let ArrayIrType::Array(input_type) = input_type.as_ref() else {
+                        arguments.push(value);
+                        continue;
+                    };
+                    let rank = input_type.rank();
+                    if !arguments.is_empty() && rank == 0 {
+                        arguments.push(value);
+                        continue;
+                    }
+                    let output_axes = if let Some(mapped_axis) = input.batch_axis_position() {
+                        if mapped_axis != 0 {
+                            let permutation = std::iter::once(mapped_axis)
+                                .chain((0..rank).filter(|axis| *axis != mapped_axis))
+                                .collect::<Vec<_>>();
+                            value = C::Value::from_projected(value.into_projected()?.transpose(permutation)?);
+                        }
+                        (0..rank).collect::<Vec<_>>()
+                    } else {
+                        (1..=rank).collect::<Vec<_>>()
+                    };
+                    let inputs = std::iter::once(value).chain(dimensions.iter().cloned()).collect::<Vec<_>>();
+                    let mut outputs =
+                        context.parent().bind(DynamicBroadcastOperation::new(output_axes), Vec::new(), &inputs)?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    arguments.push(outputs.remove(0));
+                }
+                Ok(arguments)
+            },
         )
     }
 }
@@ -568,11 +777,21 @@ impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<A
 impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
 /// Checks Boolean conditions, reporting a message and named scalar observations when they fail.
-/// Known true conditions stage nothing; known false conditions fail immediately. Symbolic conditions remain ordered
-/// assertions. Validation of all input types occurs before either folding or staging.
+/// Eager execution reports failures immediately. Tracing elides known successes and retains failing or symbolic
+/// conditions as ordered assertions. All input types are validated before folding or staging.
 pub trait Assert: Sized {
     /// Requires this scalar Boolean value to be true, reporting `message` and `observations` on failure.
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError>;
+
+    /// Requires every logical lane to be true, reporting at most `limit` failed lanes in row-major order.
+    /// Observations must be scalar values or arrays with the condition's shape. Empty conditions pass vacuously.
+    /// This bounds diagnostic output, not the amount of data inspected or transferred to the host.
+    fn assert_with_limit(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        limit: NonZeroUsize,
+    ) -> Result<(), ProgramError>;
 }
 
 impl Assert for Array {
@@ -589,6 +808,18 @@ impl Assert for Array {
         Err(operation
             .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
             .into())
+    }
+
+    fn assert_with_limit(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        limit: NonZeroUsize,
+    ) -> Result<(), ProgramError> {
+        let operation = AssertOperation::new(message)
+            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
+            .with_failure_limit(limit);
+        operation.check_lanes(self, observations)
     }
 }
 
@@ -607,6 +838,18 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
             .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
             .into())
     }
+
+    fn assert_with_limit(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        limit: NonZeroUsize,
+    ) -> Result<(), ProgramError> {
+        let operation = AssertOperation::new(message)
+            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
+            .with_failure_limit(limit);
+        operation.check_lanes(self, observations)
+    }
 }
 
 impl<V: Value> Assert for V
@@ -622,13 +865,26 @@ where
             .collect::<Vec<_>>();
         self.dispatch_domain().assert(operation, &inputs)
     }
+
+    fn assert_with_limit(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        limit: NonZeroUsize,
+    ) -> Result<(), ProgramError> {
+        let operation = AssertOperation::new(message)
+            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
+            .with_failure_limit(limit);
+        let inputs = std::iter::once(self.clone())
+            .chain(observations.iter().map(|(_, input)| input.clone()))
+            .collect::<Vec<_>>();
+        self.dispatch_domain().assert(operation, &inputs)
+    }
 }
 
-/// Context dispatch for [`Assert`]. Tracing folds concrete predicates immediately, while transform contexts bind
-/// first so that batching applies its empty-batch semantics, partial evaluation preserves ordered failures, and
-/// differentiation retains assertions only in the primal computation. Unlike [`Print`](crate::operations::Print),
-/// which always binds its operation, assertions need this distinction to report known failures during tracing without
-/// bypassing transformation rules.
+/// Context dispatch for [`Assert`]. Tracing elides known successes and stages potential failures. Transform
+/// contexts bind first so batching applies its empty-batch semantics, partial evaluation honors effect-folding
+/// policy, and differentiation retains assertions only in the primal computation.
 pub trait AssertionContext:
     Context<Type: Into<ArrayIrType>, Operation: From<AssertOperation<<Self as Domain>::Type>>>
 {
@@ -658,7 +914,12 @@ where
         operation
             .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
         self.parent().assert(
-            AssertOperation::new(operation.message).with_labels(operation.labels),
+            AssertOperation {
+                message: operation.message,
+                labels: operation.labels,
+                failure_limit: operation.failure_limit,
+                marker: PhantomData,
+            },
             &inputs.iter().cloned().map(C::Value::from_projected).collect::<Vec<_>>(),
         )
     }
@@ -711,9 +972,16 @@ where
 pub trait AssertionValue: Value + Concretizable<bool> {
     /// Renders the concrete scalar observation, rejecting unsupported representations.
     fn assertion_observation(&self) -> Result<String, ProgramError>;
+
+    /// Materializes an array for logical lane inspection, or returns `None` for a non-array scalar value.
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError>;
 }
 
 impl AssertionValue for Array {
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+        Ok(Some(self.clone()))
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self.r#type().data_type() {
             DataType::Boolean => Ok(Concretizable::<bool>::concretize(self)?.to_string()),
@@ -730,6 +998,16 @@ impl AssertionValue for Array {
 }
 
 impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+        match self {
+            Self::Array(array) => array.assertion_array(),
+            Self::Dimension(_) => Ok(None),
+            Self::Reference(_) => {
+                Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
+            }
+        }
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self {
             Self::Array(array) => array.assertion_observation(),
@@ -742,6 +1020,12 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
 }
 
 impl<T: Type> AssertionValue for CaptureReference<T> {
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+        Err(ProgramError::Concretization {
+            message: "cannot inspect a captured assertion array before execution".to_owned(),
+        })
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         Err(ProgramError::Concretization {
             message: "cannot inspect a captured assertion observation before execution".to_owned(),
@@ -761,9 +1045,10 @@ mod tests {
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::StagingContext;
     use crate::macros::check_operation_type_inference;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
+    use crate::operations::control_flow::ConditionOperation;
     use crate::parameters::Placeholder;
-    use crate::partial::PartialValue;
+    use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope};
     use crate::tracing::TracingContext;
 
@@ -776,6 +1061,11 @@ mod tests {
         assert_eq!(operation.name(), ASSERT_OPERATION_NAME);
         assert_eq!(operation.message(), "input must be \"valid\"\nnext");
         assert_eq!(operation.labels(), &["value"]);
+        assert_eq!(operation.failure_limit(), None);
+        let bounded = operation.clone().with_failure_limit(NonZeroUsize::new(3).unwrap());
+        assert_eq!(bounded.failure_limit(), NonZeroUsize::new(3));
+        assert_eq!(bounded.effects(), operation.effects());
+        assert!(bounded.to_string().contains("failure_limit=3"));
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(operation.to_string(), r#"assert [message="input must be \"valid\"\nnext", labels=["value"]]"#);
     }
@@ -929,6 +1219,129 @@ mod tests {
     }
 
     #[test]
+    fn test_assert_with_limit() {
+        let condition = Array::matrix(2, 2, vec![false, true, false, false]).unwrap();
+        let observations = Array::matrix(2, 2, vec![10_i32, 20, 30, 40]).unwrap();
+        let error = condition
+            .assert_with_limit("valid", &[("value", observations)], NonZeroUsize::new(2).unwrap())
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::FailedLanes {
+                message: "valid".to_owned(),
+                lanes: vec![
+                    AssertionLane { index: vec![0, 0], observations: vec![("value".to_owned(), "10".to_owned())] },
+                    AssertionLane { index: vec![1, 0], observations: vec![("value".to_owned(), "30".to_owned())] },
+                ],
+                omitted: 1,
+            })
+        );
+        assert_eq!(
+            error.to_string(),
+            "assertion failed: valid; lane [0, 0], value=10; lane [1, 0], value=30; 1 additional failing lanes omitted"
+        );
+        assert!(
+            Array::vector(Vec::<bool>::new())
+                .unwrap()
+                .assert_with_limit("empty", &[], NonZeroUsize::MIN)
+                .is_ok()
+        );
+        assert!(Array::vector(vec![true, true]).unwrap().assert_with_limit("true", &[], NonZeroUsize::MIN).is_ok());
+        assert!(
+            Array::vector(vec![true, true])
+                .unwrap()
+                .assert_with_limit("invalid", &[("value", Array::vector(vec![1_i32]).unwrap())], NonZeroUsize::MIN)
+                .is_err()
+        );
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |condition| condition.assert_with_limit("valid", &[], NonZeroUsize::new(2).unwrap()),
+            ArrayType::new(DataType::Boolean, [3].into()),
+        )
+        .unwrap();
+        assert!(program.to_string().contains("failure_limit=2"));
+        let error = program.interpret(Array::vector(vec![true, false, false]).unwrap()).unwrap_err();
+        assert_eq!(error.to_string(), "assertion failed: valid; lane [1]; lane [2]");
+    }
+
+    #[test]
+    fn test_assert_with_limit_batching() {
+        let output: Result<(), BatchingError> = batch(
+            |(condition, observation)| {
+                condition.assert_with_limit("valid", &[("value", observation)], NonZeroUsize::new(2).unwrap())
+            },
+            (Array::vector(vec![true, false, false]).unwrap(), Array::vector(vec![10_i32, 20, 30]).unwrap()),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (),
+            None,
+        );
+        assert_eq!(output.unwrap_err().to_string(), "assertion failed: valid; lane [1], value=20; lane [2], value=30");
+        let output: Result<(), BatchingError> = batch(
+            |(condition, observation)| {
+                condition.assert_with_limit("replicated", &[("value", observation)], NonZeroUsize::MIN)
+            },
+            (Array::scalar(false).unwrap(), Array::vector(vec![10_i32, 20]).unwrap()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            (),
+            None,
+        );
+        assert_eq!(
+            output.unwrap_err().to_string(),
+            "assertion failed: replicated; lane [0], value=10; 1 additional failing lanes omitted"
+        );
+        let output: Result<(), BatchingError> = batch(
+            |(condition, observation)| {
+                condition.assert_with_limit("empty", &[("value", observation)], NonZeroUsize::MIN)
+            },
+            (Array::scalar(false).unwrap(), Array::vector(Vec::<i32>::new()).unwrap()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            (),
+            None,
+        );
+        assert_eq!(output, Ok(()));
+    }
+
+    #[test]
+    fn test_assert_with_limit_nested_batching() {
+        let output: Result<(), BatchingError> = batch(
+            |(condition, observation)| {
+                batch(
+                    |(condition, observation)| {
+                        condition.assert_with_limit("nested", &[("value", observation)], NonZeroUsize::new(2).unwrap())
+                    },
+                    (condition, observation),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    (),
+                    None,
+                )
+                .map_err(ProgramError::from)
+            },
+            (
+                Array::matrix(2, 2, vec![true, false, false, false]).unwrap(),
+                Array::matrix(2, 2, vec![10_i32, 20, 30, 40]).unwrap(),
+            ),
+            (BatchAxis::new(1), BatchAxis::new(1)),
+            (),
+            None,
+        );
+        assert_eq!(
+            output.unwrap_err().to_string(),
+            "assertion failed: nested; lane [0, 1], value=30; lane [1, 0], value=20; 1 additional failing lanes omitted"
+        );
+    }
+
+    #[test]
+    fn test_per_lane_validation_outputs() {
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |divisors| divisors.not_equal(&divisors.zero_like()?),
+            ArrayType::new(DataType::I32, [3].into()),
+        )
+        .unwrap();
+        assert!(program.effects().classes().is_empty());
+        let outcomes = program.interpret(Array::vector(vec![2_i32, 0, 4]).unwrap()).unwrap();
+        assert_eq!(outcomes.elements::<bool>().unwrap(), vec![true, false, true]);
+    }
+
+    #[test]
     fn test_assert_program() {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| input.assert("condition must hold", &[]),
@@ -953,17 +1366,52 @@ mod tests {
         )
         .unwrap();
         assert!(folded.instructions().is_empty());
-        let error = TracingContext::<Array, ArrayOperation<Array>>::trace(
+        let (_, failing) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| {
                 let condition = input.dispatch_domain().lift(Array::scalar(false).unwrap())?;
                 condition.assert("always false", &[])
             },
             ArrayType::scalar(DataType::Boolean),
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(failing.instructions().len(), 1);
+        let error = failing.interpret(Array::scalar(true).unwrap()).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed { message: "always false".to_owned(), observations: vec![] })
+        );
+    }
+
+    #[test]
+    fn test_assert_conditional_staging() {
+        let (_, failing) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| {
+                let condition = input.dispatch_domain().lift(Array::scalar(false).unwrap())?;
+                condition.assert("selected failure", &[])
+            },
+            ArrayType::scalar(DataType::Boolean),
+        )
+        .unwrap();
+        let (_, passing) =
+            TracingContext::<Array, ArrayOperation<Array>>::trace(|_| Ok(()), ArrayType::scalar(DataType::Boolean))
+                .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let failing = builder.import_program(failing.to_flat_program());
+        let passing = builder.import_program(passing.to_flat_program());
+        builder
+            .add_instruction(ConditionOperation::new(), vec![failing, passing], vec![predicate, input], None)
+            .unwrap();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::scalar(false).unwrap(), Array::scalar(true).unwrap()]),
+            Ok(Vec::new())
+        );
+        let error = program.interpret(vec![Array::scalar(true).unwrap(), Array::scalar(true).unwrap()]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed { message: "selected failure".to_owned(), observations: Vec::new() })
         );
     }
 
@@ -988,6 +1436,29 @@ mod tests {
     }
 
     #[test]
+    fn test_assert_partial_evaluation_staged_observation() {
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let partial = PartialEvaluationContext::new(parent.clone());
+        let condition = partial.lift(Array::scalar(false).unwrap()).unwrap();
+        let observation =
+            PartialTracer::new(partial.clone(), partial.unknown_input(ArrayType::scalar(DataType::I32), 0));
+        condition.assert("residual failure", &[("value", observation.clone())]).unwrap();
+        drop((condition, observation));
+        let evaluation = partial.into_evaluation(Vec::new()).unwrap();
+        assert!(parent.builder().borrow().instructions().is_empty());
+        assert_eq!(evaluation.program().instructions().len(), 1);
+        assert_eq!(evaluation.program().input_count(), 1);
+        let error = evaluation.program().interpret(vec![Array::scalar(7i32).unwrap()]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "residual failure".to_owned(),
+                observations: vec![("value".to_owned(), "7".to_owned())]
+            })
+        );
+    }
+
+    #[test]
     fn test_assert_dimension_observations() {
         let exact = DimensionType::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
         let bounded = DimensionType::new("bounded", DimensionBounds::new(2, Some(8)).unwrap());
@@ -1000,7 +1471,7 @@ mod tests {
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let observations = input_types[1..].iter().map(|r#type| trace.input(r#type.clone())).collect::<Vec<_>>();
         let condition = trace.constant(ArrayIrValue::Array(Array::scalar(false).unwrap()));
-        let error = condition
+        condition
             .assert(
                 "dimension requirement",
                 &[
@@ -1009,11 +1480,11 @@ mod tests {
                     ("scalar", observations[2].clone()),
                 ],
             )
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(trace.builder().borrow().instructions().len(), 1);
         let expected = format!(
             "assertion failed: dimension requirement; exact=4, bounded=<unknown: `{bounded}`>, scalar=<unknown>",
         );
-        assert_eq!(error.to_string(), expected);
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
@@ -1239,6 +1710,54 @@ mod tests {
                     ("batch_index_2".to_owned(), "1".to_owned()),
                 ],
             })
+        );
+    }
+
+    #[test]
+    fn test_assert_with_limit_dynamic_batching() {
+        let extent_type = DimensionType::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
+        let shape = Shape::new(vec![extent_type.to_dimension()]);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(extent, condition, observation)| {
+                let batching = BatchingContext::new(extent.dispatch_domain(), extent);
+                AssertOperation::new("dynamic")
+                    .with_labels(vec!["value".to_owned()])
+                    .with_failure_limit(NonZeroUsize::new(2).unwrap())
+                    .batch(
+                        &batching,
+                        &EmptyRegionDriver,
+                        &[
+                            ArrayIrBatch::new(condition, BatchAxis::new(0))?,
+                            ArrayIrBatch::new(observation, BatchAxis::new(0))?,
+                        ],
+                    )?;
+                Ok(())
+            },
+            (
+                ArrayIrType::Dimension(extent_type.clone()),
+                ArrayIrType::Array(ArrayType::new(DataType::Boolean, shape.clone())),
+                ArrayIrType::Array(ArrayType::new(DataType::I32, shape)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 0).unwrap()),
+                ArrayIrValue::Array(Array::vector(Vec::<bool>::new()).unwrap()),
+                ArrayIrValue::Array(Array::vector(Vec::<i32>::new()).unwrap()),
+            )),
+            Ok(())
+        );
+        let error = program
+            .interpret((
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![true, false, false, false]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30, 40]).unwrap()),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "assertion failed: dynamic; lane [1], value=20; lane [2], value=30; 1 additional failing lanes omitted"
         );
     }
 

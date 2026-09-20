@@ -30,6 +30,15 @@ pub(crate) const ASSERT_KIND_ATTRIBUTE: &str = "kind";
 /// Formatting kind for a general assertion with named scalar observations.
 pub(crate) const ASSERT_GENERIC_KIND: &str = "generic";
 
+/// Formatting kind for bounded reporting of failed mapped assertion lanes.
+pub(crate) const ASSERT_LANES_KIND: &str = "lanes";
+
+/// Backend-config attribute containing the maximum number of lanes to report.
+pub(crate) const ASSERT_FAILURE_LIMIT_ATTRIBUTE: &str = "failure_limit";
+
+/// Backend-config attribute containing the number of mapped predicate axes.
+pub(crate) const ASSERT_LANE_RANK_ATTRIBUTE: &str = "lane_rank";
+
 /// Backend-config attribute containing a general assertion's literal diagnostic message.
 pub(crate) const ASSERT_MESSAGE_ATTRIBUTE: &str = "message";
 
@@ -205,30 +214,127 @@ pub(crate) fn copy_cuda_bytes(
     Ok(())
 }
 
+/// Copies a group of buffers, draining queued transfers even when a later enqueue fails.
+///
+/// The destinations remain allocated if synchronization fails because completion of asynchronous writes cannot
+/// then be established. This exceptional leak prevents a driver failure from becoming a host use-after-free.
+#[cfg(any(test, feature = "cuda-12", feature = "cuda-13"))]
+fn copy_buffer_group<E, S>(
+    sources: &[(*mut std::ffi::c_void, usize)],
+    mut enqueue: E,
+    synchronize: S,
+) -> Result<Vec<Vec<u8>>, FfiError>
+where
+    E: FnMut(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> Result<(), FfiError>,
+    S: FnOnce() -> Result<(), FfiError>,
+{
+    let mut destinations = sources.iter().map(|(_, size)| vec![0; *size]).collect::<Vec<_>>();
+    if sources.iter().all(|(_, size)| *size == 0) {
+        return Ok(destinations);
+    }
+    let copied = sources.iter().zip(&mut destinations).try_for_each(|((source, size), destination)| {
+        if *size == 0 { Ok(()) } else { enqueue(*source, destination.as_mut_ptr().cast(), *size) }
+    });
+    if let Err(error) = synchronize() {
+        std::mem::forget(destinations);
+        return Err(error);
+    }
+    copied?;
+    Ok(destinations)
+}
+
+/// Reads validated buffers together, using a single stream synchronization for CUDA memory.
+fn buffer_bytes(
+    sources: &[(*mut std::ffi::c_void, usize)],
+    memory: AssertionBufferMemory,
+) -> Result<Vec<Vec<u8>>, FfiError> {
+    if sources.iter().any(|(source, size)| source.is_null() && *size != 0) {
+        return Err(FfiError::invalid_argument(format!(
+            "encountered a null scalar buffer in `{ASSERT_CUSTOM_CALL_TARGET}`",
+        )));
+    }
+    match memory {
+        AssertionBufferMemory::Host => Ok(sources
+            .iter()
+            .map(|(source, size)| {
+                // SAFETY: Callers validate buffer types and sizes, and XLA owns these invocation-scoped addresses.
+                if *size == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(source.cast::<u8>(), *size).to_vec() }
+                }
+            })
+            .collect::<Vec<_>>()),
+        #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+        AssertionBufferMemory::Cuda(stream) => copy_buffer_group(
+            sources,
+            |source, destination, size| {
+                let status = unsafe { cuMemcpyDtoHAsync_v2(destination, source as usize as u64, size, stream) };
+                if status == CUDA_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(FfiError::internal(format!(
+                        "CUDA device-to-host operand copy failed with driver error {status}",
+                    )))
+                }
+            },
+            || {
+                let status = unsafe { cuStreamSynchronize(stream) };
+                if status == CUDA_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(FfiError::internal(format!(
+                        "CUDA operand copy stream synchronization failed with driver error {status}",
+                    )))
+                }
+            },
+        ),
+    }
+}
+
+/// Reads rank-zero signed 64-bit extent buffers together.
+fn scalar_extents(buffers: &[FfiBuffer<'_>], memory: AssertionBufferMemory) -> Result<Vec<i64>, FfiError> {
+    let sources = buffers
+        .iter()
+        .map(|buffer| {
+            if buffer.element_type() != FfiBufferType::I64 || buffer.rank() != 0 {
+                return Err(FfiError::invalid_argument(format!(
+                    "expected the `{ASSERT_CUSTOM_CALL_TARGET}` observed extent to be a rank-zero i64 buffer",
+                )));
+            }
+            Ok((unsafe { buffer.data() }, size_of::<i64>()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(buffer_bytes(&sources, memory)?
+        .into_iter()
+        .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>())
+}
+
 /// Reads `BYTE_COUNT` bytes from a validated scalar assertion buffer.
 fn scalar_bytes<const BYTE_COUNT: usize>(
     buffer: &FfiBuffer<'_>,
     memory: AssertionBufferMemory,
 ) -> Result<[u8; BYTE_COUNT], FfiError> {
-    // SAFETY: The scalar readers validate the element type and rank before calling this function, so XLA owns at
-    // least `BYTE_COUNT` bytes at the returned invocation-scoped address.
     let source = unsafe { buffer.data() };
     if source.is_null() {
         return Err(FfiError::invalid_argument(format!(
             "encountered a null scalar buffer in `{ASSERT_CUSTOM_CALL_TARGET}`",
         )));
     }
-    let mut bytes = [0; BYTE_COUNT];
     match memory {
-        AssertionBufferMemory::Host => unsafe {
-            std::ptr::copy_nonoverlapping(source.cast::<u8>(), bytes.as_mut_ptr(), BYTE_COUNT);
-        },
+        AssertionBufferMemory::Host => {
+            let mut bytes = [0; BYTE_COUNT];
+            // SAFETY: Scalar readers validate the type and rank before requesting this element's bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source.cast::<u8>(), bytes.as_mut_ptr(), BYTE_COUNT) };
+            Ok(bytes)
+        }
         #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-        AssertionBufferMemory::Cuda(stream) => {
-            copy_cuda_bytes(source, bytes.as_mut_ptr().cast(), BYTE_COUNT, stream)?;
+        AssertionBufferMemory::Cuda(_) => {
+            let bytes = buffer_bytes(&[(source, BYTE_COUNT)], memory)?;
+            Ok(bytes.into_iter().next().unwrap().try_into().unwrap())
         }
     }
-    Ok(bytes)
 }
 
 /// Decodes and evaluates one assertion call frame.
@@ -247,6 +353,9 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     }
     let actor = string_attribute(call_frame, ASSERT_ACTOR_ATTRIBUTE)?;
     let kind = string_attribute(call_frame, ASSERT_KIND_ATTRIBUTE)?;
+    if kind == ASSERT_LANES_KIND {
+        return handle_assertion_lanes(call_frame, &buffers, memory);
+    }
     if kind == ASSERT_GENERIC_KIND {
         let count = string_attribute(call_frame, ASSERT_LABEL_COUNT_ATTRIBUTE)?
             .parse::<usize>()
@@ -261,11 +370,8 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         if scalar_predicate(&buffers[0], memory)? {
             return Ok(());
         }
-        let observations = labels
-            .into_iter()
-            .zip(&buffers[1..])
-            .map(|(label, buffer)| Ok((label.to_owned(), scalar_observation(buffer, memory)?)))
-            .collect::<Result<Vec<_>, FfiError>>()?;
+        let observations =
+            labels.into_iter().map(str::to_owned).zip(scalar_observations(&buffers[1..], memory)?).collect();
         return Err(FfiError::invalid_argument(
             ryft_core::AssertionError::Failed { message: message.to_owned(), observations }.to_string(),
         ));
@@ -274,7 +380,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         let input_rank = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?
             .parse::<usize>()
             .map_err(|_| FfiError::invalid_argument("invalid reshape assertion input rank"))?;
-        let extents = buffers[1..].iter().map(|buffer| scalar_i64(buffer, memory)).collect::<Result<Vec<_>, _>>()?;
+        let extents = scalar_extents(&buffers[1..], memory)?;
         if input_rank > extents.len() {
             return Err(FfiError::invalid_argument("reshape assertion input rank exceeds the number of extents"));
         }
@@ -298,15 +404,8 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         let high = fields[2].parse::<i64>().map_err(|_| FfiError::invalid_argument("invalid high padding"))?;
         let interior =
             fields[3].parse::<usize>().map_err(|_| FfiError::invalid_argument("invalid interior padding"))?;
-        return validate_pad(
-            axis,
-            scalar_i64(&buffers[1], memory)?,
-            scalar_i64(&buffers[2], memory)?,
-            low,
-            high,
-            interior,
-        )
-        .map_err(FfiError::invalid_argument);
+        let extents = scalar_extents(&buffers[1..], memory)?;
+        return validate_pad(axis, extents[0], extents[1], low, high, interior).map_err(FfiError::invalid_argument);
     }
     if kind == ASSERT_CONCATENATE_KIND {
         // Concatenation is variadic, so its callback recomputes the checked sum from every input extent instead of
@@ -317,11 +416,11 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
                  least one input extent"
             )));
         }
-        let actual = scalar_i64(&buffers[1], memory)?;
-        let input_extents =
-            buffers[2..].iter().map(|buffer| scalar_i64(buffer, memory)).collect::<Result<Vec<_>, _>>()?;
+        let extents = scalar_extents(&buffers[1..], memory)?;
+        let actual = extents[0];
+        let input_extents = &extents[1..];
         let axis = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
-        return validate_concatenate(actor, axis, actual, input_extents.as_slice()).map_err(FfiError::invalid_argument);
+        return validate_concatenate(actor, axis, actual, input_extents).map_err(FfiError::invalid_argument);
     }
     if kind == ASSERT_DYNAMIC_SHAPE_SLICE_KIND {
         if buffers.len() != 4 {
@@ -346,9 +445,8 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
                 "expected the `{ASSERT_CUSTOM_CALL_TARGET}` dynamic-shape-slice stride to be an unsigned integer"
             ))
         })?;
-        let input_size = scalar_i64(&buffers[1], memory)?;
-        let start = scalar_i64(&buffers[2], memory)?;
-        let size = scalar_i64(&buffers[3], memory)?;
+        let extents = scalar_extents(&buffers[1..], memory)?;
+        let [input_size, start, size] = extents[..] else { unreachable!() };
         return validate_dynamic_slice_with_dimensions(axis, stride, input_size, start, size)
             .map_err(FfiError::invalid_argument);
     }
@@ -364,9 +462,9 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
             )));
         }
         let left_name = string_attribute(call_frame, ASSERT_LEFT_ATTRIBUTE)?;
-        let left = scalar_i64(&buffers[1], memory)?;
         let right_name = string_attribute(call_frame, ASSERT_RIGHT_ATTRIBUTE)?;
-        let right = scalar_i64(&buffers[2], memory)?;
+        let extents = scalar_extents(&buffers[1..], memory)?;
+        let [left, right] = extents[..] else { unreachable!() };
         return validate_arithmetic(kind, left_name, left, right_name, right).map_err(FfiError::invalid_argument);
     }
 
@@ -387,6 +485,151 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     Err(FfiError::invalid_argument(format!(
         "`{actor}` failed: input dimension `{left_name}` = {left} is outside its declared bounds {bounds}"
     )))
+}
+
+/// Returns a checked physical element count for an assertion buffer.
+fn buffer_element_count(buffer: &FfiBuffer<'_>) -> Result<usize, FfiError> {
+    buffer.dimensions().iter().try_fold(1_usize, |count, extent| {
+        usize::try_from(*extent)
+            .ok()
+            .and_then(|extent| count.checked_mul(extent))
+            .ok_or_else(|| FfiError::invalid_argument("invalid assertion buffer dimensions"))
+    })
+}
+
+/// Computes the row-major offset of a logical lane in a physical assertion buffer.
+fn lane_offset(index: &[usize], dimensions: &[i64]) -> Result<usize, FfiError> {
+    if index.len() != dimensions.len() {
+        return Err(FfiError::invalid_argument("assertion lane rank does not match its buffer"));
+    }
+    index.iter().zip(dimensions).try_fold(0_usize, |offset, (index, extent)| {
+        let extent =
+            usize::try_from(*extent).map_err(|_| FfiError::invalid_argument("negative assertion buffer extent"))?;
+        if *index >= extent {
+            return Err(FfiError::invalid_argument("assertion lane exceeds its physical buffer"));
+        }
+        offset
+            .checked_mul(extent)
+            .and_then(|offset| offset.checked_add(*index))
+            .ok_or_else(|| FfiError::invalid_argument("assertion buffer offset overflows"))
+    })
+}
+
+/// Reports a bounded set of failing logical lanes, reading observations only after a failure is found.
+fn handle_assertion_lanes(
+    call_frame: &FfiCallFrame<'_>,
+    buffers: &[FfiBuffer<'_>],
+    memory: AssertionBufferMemory,
+) -> Result<(), FfiError> {
+    let count = string_attribute(call_frame, ASSERT_LABEL_COUNT_ATTRIBUTE)?
+        .parse::<usize>()
+        .map_err(|_| FfiError::invalid_argument("invalid assertion diagnostic label count"))?;
+    let rank = string_attribute(call_frame, ASSERT_LANE_RANK_ATTRIBUTE)?
+        .parse::<usize>()
+        .map_err(|_| FfiError::invalid_argument("invalid assertion lane rank"))?;
+    let limit = string_attribute(call_frame, ASSERT_FAILURE_LIMIT_ATTRIBUTE)?
+        .parse::<std::num::NonZeroUsize>()
+        .map_err(|_| FfiError::invalid_argument("invalid assertion failure limit"))?
+        .get();
+    if count.checked_add(rank).and_then(|count| count.checked_add(1)) != Some(buffers.len()) {
+        return Err(FfiError::invalid_argument("assertion lane metadata does not match its inputs"));
+    }
+    let predicate = &buffers[0];
+    if predicate.element_type() != FfiBufferType::Predicate || predicate.rank() != rank {
+        return Err(FfiError::invalid_argument("assertion lane predicate has an invalid type or rank"));
+    }
+    let message = string_attribute(call_frame, ASSERT_MESSAGE_ATTRIBUTE)?;
+    let labels = (0..count)
+        .map(|index| string_attribute(call_frame, &format!("label_{index}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut sources = vec![(unsafe { predicate.data() }, buffer_element_count(predicate)?)];
+    for buffer in &buffers[1 + count..] {
+        if buffer.element_type() != FfiBufferType::I64 || buffer.rank() != 0 {
+            return Err(FfiError::invalid_argument("assertion logical extents must be rank-zero i64 buffers"));
+        }
+        sources.push((unsafe { buffer.data() }, size_of::<i64>()));
+    }
+    let bytes = buffer_bytes(&sources, memory)?;
+    let extents = bytes[1..]
+        .iter()
+        .map(|bytes| {
+            usize::try_from(i64::from_ne_bytes(bytes.as_slice().try_into().unwrap()))
+                .map_err(|_| FfiError::invalid_argument("negative assertion logical extent"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (logical, physical) in extents.iter().zip(predicate.dimensions()) {
+        if *logical > usize::try_from(*physical).unwrap() {
+            return Err(FfiError::invalid_argument("assertion logical extent exceeds its physical buffer"));
+        }
+    }
+    let observations = &buffers[1..1 + count];
+    let observation_sources = observations
+        .iter()
+        .map(|buffer| {
+            if buffer.rank() != 0 {
+                if buffer.rank() != rank
+                    || extents.iter().zip(buffer.dimensions()).any(|(logical, physical)| {
+                        usize::try_from(*physical).map_or(true, |physical| *logical > physical)
+                    })
+                {
+                    return Err(FfiError::invalid_argument(
+                        "assertion observation shape does not contain its logical lanes",
+                    ));
+                }
+            }
+            let size = buffer_element_count(buffer)?
+                .checked_mul(observation_byte_count(buffer.element_type())?)
+                .ok_or_else(|| FfiError::invalid_argument("assertion observation byte count overflows"))?;
+            Ok((unsafe { buffer.data() }, size))
+        })
+        .collect::<Result<Vec<_>, FfiError>>()?;
+    let lane_count = extents
+        .iter()
+        .try_fold(1_usize, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| FfiError::invalid_argument("assertion logical lane count overflows"))?;
+    let mut failed = Vec::new();
+    let mut failures = 0;
+    let mut index = vec![0; rank];
+    for lane in 0..lane_count {
+        let mut remaining = lane;
+        for axis in (0..rank).rev() {
+            index[axis] = remaining % extents[axis];
+            remaining /= extents[axis];
+        }
+        if bytes[0][lane_offset(&index, predicate.dimensions())?] == 0 {
+            failures += 1;
+            if failed.len() < limit {
+                failed.push(index.clone());
+            }
+        }
+    }
+    if failures == 0 {
+        return Ok(());
+    }
+    let bytes = buffer_bytes(&observation_sources, memory)?;
+    let lanes = failed
+        .into_iter()
+        .map(|index| {
+            let observations = labels
+                .iter()
+                .zip(observations)
+                .zip(&bytes)
+                .map(|((label, buffer), bytes)| {
+                    let width = observation_byte_count(buffer.element_type())?;
+                    let offset = if buffer.rank() == 0 { 0 } else { lane_offset(&index, buffer.dimensions())? } * width;
+                    Ok((
+                        (*label).to_owned(),
+                        format_observation(buffer.element_type(), &bytes[offset..offset + width])?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, FfiError>>()?;
+            Ok(ryft_core::AssertionLane { index, observations })
+        })
+        .collect::<Result<Vec<_>, FfiError>>()?;
+    let omitted = failures - lanes.len();
+    Err(FfiError::invalid_argument(
+        ryft_core::AssertionError::FailedLanes { message: message.to_owned(), lanes, omitted }.to_string(),
+    ))
 }
 
 /// Evaluates one checked dimension-arithmetic predicate and returns its eager-compatible diagnostic on failure.
@@ -564,35 +807,67 @@ fn scalar_predicate(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Re
     Ok(scalar_bytes::<1>(buffer, memory)?[0] != 0)
 }
 
-/// Renders one supported scalar observation without narrowing unsigned integers or changing float precision.
-fn scalar_observation(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<String, FfiError> {
-    if buffer.rank() != 0 {
-        return Err(FfiError::invalid_argument("assertion observations must be rank-zero buffers"));
+/// Returns the byte width of a supported assertion observation.
+fn observation_byte_count(r#type: FfiBufferType) -> Result<usize, FfiError> {
+    match r#type {
+        FfiBufferType::Predicate
+        | FfiBufferType::I1
+        | FfiBufferType::I2
+        | FfiBufferType::I4
+        | FfiBufferType::U1
+        | FfiBufferType::U2
+        | FfiBufferType::U4
+        | FfiBufferType::I8
+        | FfiBufferType::U8 => Ok(1),
+        FfiBufferType::I16 | FfiBufferType::U16 | FfiBufferType::F16 | FfiBufferType::BF16 => Ok(2),
+        FfiBufferType::I32 | FfiBufferType::U32 | FfiBufferType::F32 => Ok(4),
+        FfiBufferType::I64 | FfiBufferType::U64 | FfiBufferType::F64 => Ok(8),
+        _ => Err(FfiError::invalid_argument(format!("unsupported assertion observation type `{type}`"))),
     }
-    Ok(match buffer.element_type() {
-        FfiBufferType::Predicate => (scalar_bytes::<1>(buffer, memory)?[0] != 0).to_string(),
-        FfiBufferType::I1 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 7 >> 7).to_string(),
-        FfiBufferType::I2 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 6 >> 6).to_string(),
-        FfiBufferType::I4 => ((scalar_bytes::<1>(buffer, memory)?[0] as i8) << 4 >> 4).to_string(),
-        FfiBufferType::U1 => (scalar_bytes::<1>(buffer, memory)?[0] & 1).to_string(),
-        FfiBufferType::U2 => (scalar_bytes::<1>(buffer, memory)?[0] & 3).to_string(),
-        FfiBufferType::U4 => (scalar_bytes::<1>(buffer, memory)?[0] & 15).to_string(),
-        FfiBufferType::I8 => i8::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::I16 => i16::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::I32 => i32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::I64 => i64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::U8 => u8::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::U16 => u16::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::U32 => u32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::U64 => u64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::F16 => {
-            half::f16::from_bits(u16::from_ne_bytes(scalar_bytes(buffer, memory)?)).to_f32().to_string()
-        }
+}
+
+/// Reads and renders scalar observations together without narrowing integers or changing float precision.
+fn scalar_observations(buffers: &[FfiBuffer<'_>], memory: AssertionBufferMemory) -> Result<Vec<String>, FfiError> {
+    let sources = buffers
+        .iter()
+        .map(|buffer| {
+            if buffer.rank() != 0 {
+                return Err(FfiError::invalid_argument("assertion observations must be rank-zero buffers"));
+            }
+            Ok((unsafe { buffer.data() }, observation_byte_count(buffer.element_type())?))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    buffers
+        .iter()
+        .zip(buffer_bytes(&sources, memory)?)
+        .map(|(buffer, bytes)| format_observation(buffer.element_type(), &bytes))
+        .collect()
+}
+
+/// Renders the validated bytes of one scalar observation.
+fn format_observation(r#type: FfiBufferType, bytes: &[u8]) -> Result<String, FfiError> {
+    Ok(match r#type {
+        FfiBufferType::Predicate => (bytes[0] != 0).to_string(),
+        FfiBufferType::I1 => ((bytes[0] as i8) << 7 >> 7).to_string(),
+        FfiBufferType::I2 => ((bytes[0] as i8) << 6 >> 6).to_string(),
+        FfiBufferType::I4 => ((bytes[0] as i8) << 4 >> 4).to_string(),
+        FfiBufferType::U1 => (bytes[0] & 1).to_string(),
+        FfiBufferType::U2 => (bytes[0] & 3).to_string(),
+        FfiBufferType::U4 => (bytes[0] & 15).to_string(),
+        FfiBufferType::I8 => i8::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::I16 => i16::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::I32 => i32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::I64 => i64::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::U8 => u8::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::U16 => u16::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::U32 => u32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::U64 => u64::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::F16 => half::f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32().to_string(),
         FfiBufferType::BF16 => {
-            half::bf16::from_bits(u16::from_ne_bytes(scalar_bytes(buffer, memory)?)).to_f32().to_string()
+            half::bf16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32().to_string()
         }
-        FfiBufferType::F32 => f32::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
-        FfiBufferType::F64 => f64::from_ne_bytes(scalar_bytes(buffer, memory)?).to_string(),
+        FfiBufferType::F32 => f32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+        FfiBufferType::F64 => f64::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
         r#type => return Err(FfiError::invalid_argument(format!("unsupported assertion observation type `{type}`"))),
     })
 }
@@ -632,6 +907,73 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_buffer_group() {
+        for failed_enqueue in [None, Some(1)] {
+            let queued = std::cell::RefCell::new(Vec::new());
+            let synchronized = std::cell::Cell::new(0);
+            let source = [4_u8, 7];
+            let sources =
+                source.iter().map(|value| (std::ptr::from_ref(value).cast_mut().cast(), 1)).collect::<Vec<_>>();
+            let output = copy_buffer_group(
+                &sources,
+                |source, destination, size| {
+                    if failed_enqueue == Some(queued.borrow().len()) {
+                        return Err(FfiError::internal("mock enqueue failure"));
+                    }
+                    queued.borrow_mut().push((source, destination, size));
+                    Ok(())
+                },
+                || {
+                    synchronized.set(synchronized.get() + 1);
+                    for (source, destination, size) in queued.borrow().iter().copied() {
+                        unsafe { std::ptr::copy_nonoverlapping(source.cast::<u8>(), destination.cast::<u8>(), size) };
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(synchronized.get(), 1);
+            if failed_enqueue.is_some() {
+                assert!(output.is_err());
+                assert_eq!(queued.borrow().len(), 1);
+            } else {
+                assert_eq!(output.unwrap(), vec![vec![4], vec![7]]);
+            }
+        }
+        assert!(
+            copy_buffer_group(&[], |_, _, _| panic!("unexpected copy"), || panic!("unexpected synchronization"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_copy_buffer_group_failed_synchronization() {
+        let destination = std::cell::Cell::new(std::ptr::null_mut::<u8>());
+        let source = 4_u8;
+        let output = copy_buffer_group(
+            &[(std::ptr::from_ref(&source).cast_mut().cast(), 1)],
+            |_, buffer, _| {
+                destination.set(buffer.cast());
+                Ok(())
+            },
+            || Err(FfiError::internal("mock synchronization failure")),
+        );
+        assert!(output.is_err());
+        // The failed synchronization leaves the allocation alive for a potentially outstanding asynchronous write.
+        unsafe { destination.get().write(7) };
+        assert_eq!(unsafe { destination.get().read() }, 7);
+    }
+
+    #[test]
+    fn test_lane_offset() {
+        assert_eq!(lane_offset(&[1, 2], &[3, 5]).unwrap(), 7);
+        assert_eq!(lane_offset(&[], &[]).unwrap(), 0);
+        assert!(lane_offset(&[1], &[3, 5]).is_err());
+        assert!(lane_offset(&[3, 2], &[3, 5]).is_err());
+        assert!(lane_offset(&[0], &[-1]).is_err());
+    }
+
+    #[test]
     fn test_scalar_observation() {
         for (r#type, bytes, expected) in [
             (FfiBufferType::Predicate, vec![1], "true"),
@@ -655,7 +997,7 @@ mod tests {
                 dimensions: std::ptr::null_mut(),
             };
             let buffer = unsafe { FfiBuffer::from_c_api(&buffer) }.unwrap();
-            assert_eq!(scalar_observation(&buffer, AssertionBufferMemory::Host).unwrap(), expected);
+            assert_eq!(scalar_observations(&[buffer], AssertionBufferMemory::Host).unwrap()[0], expected);
         }
     }
 

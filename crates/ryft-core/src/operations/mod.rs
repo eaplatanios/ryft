@@ -29,7 +29,7 @@ pub mod tag;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
 pub use assertions::{
-    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionValue,
+    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionLane, AssertionValue,
 };
 pub use collectives::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind, forward_collective_to_parent};
 pub use compare::*;

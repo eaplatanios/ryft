@@ -1,11 +1,12 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Add, AndOperation, ArrayIrType, ArrayOperation, AssertionValue, Broadcast, Concretizable, Context, DataType,
-    DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
+    Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Concretizable, Context,
+    DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
     DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation, OrOperation, ProgramError,
     Select, Sub, Typed, Value, WhilePredicate, XorOperation,
 };
 
+use crate::arrays_v0::host::materialize_dense_array_bytes;
 use crate::experimental::ops::XlaArrayConstant;
 use crate::{Array, ArrayShard};
 
@@ -85,6 +86,12 @@ impl Concretizable<i128> for Array<'_> {
 }
 
 impl AssertionValue for Array<'_> {
+    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
+        let bytes = materialize_dense_array_bytes(self)
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
             message: format!(

@@ -552,6 +552,17 @@ where
                 operation.name(),
                 operation.message(),
                 operation.labels(),
+                operation.failure_limit(),
+                &input_types
+                    .iter()
+                    .map(|input| match input {
+                        ArrayIrType::Array(array) => array.clone(),
+                        ArrayIrType::Dimension(_) => ArrayType::scalar(DataType::I64),
+                        ArrayIrType::Reference(_) => {
+                            unreachable!("assertion validation rejects reference observations")
+                        }
+                    })
+                    .collect::<Vec<_>>(),
                 input_values,
                 effect_tokens,
                 block,

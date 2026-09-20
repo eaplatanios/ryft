@@ -149,6 +149,13 @@ impl Concretizable<bool> for XlaArrayConstant {
 }
 
 impl AssertionValue for XlaArrayConstant {
+    fn assertion_array(&self) -> Result<Option<ReferenceArray>, ProgramError> {
+        match self {
+            Self::Captured(value) => value.assertion_array(),
+            Self::Boolean(value) => Ok(Some(ReferenceArray::scalar(*value)?)),
+        }
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_observation(),
@@ -350,6 +357,16 @@ impl Concretizable<bool> for XlaConstant {
 }
 
 impl AssertionValue for XlaConstant {
+    fn assertion_array(&self) -> Result<Option<ReferenceArray>, ProgramError> {
+        match self {
+            Self::Dimension(_) => Ok(None),
+            Self::Boolean(value) => Ok(Some(ReferenceArray::scalar(*value)?)),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a captured constant reference".to_owned(),
+            }),
+        }
+    }
+
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self {
             Self::Dimension(value) => Ok(value.extent().to_string()),
@@ -1637,9 +1654,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Assert, AssertOperation, AssertionError,
-        CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation,
-        Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
+        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Assert, AssertOperation, CaptureReference,
+        CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation, Context,
+        CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
         DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClass,
         EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
@@ -1784,12 +1801,11 @@ mod tests {
         assert!(matches!(context.resolve(&predicate), ValueResolution::Constant(XlaConstant::Boolean(true))));
         predicate.assert("identity must agree", &[]).unwrap();
         let predicate = dimension.not_equal(&dimension).unwrap();
-        assert!(
-            matches!(predicate.assert("identity must differ", &[]).unwrap_err().downcast_custom::<AssertionError>(),
-            Some(AssertionError::Failed { message, observations }) if message == "identity must differ" && observations.is_empty())
-        );
-        assert!(context.builder().borrow().instructions().is_empty());
+        predicate.assert("identity must differ", &[]).unwrap();
+        assert!(matches!(context.builder().borrow().instructions(), [instruction]
+            if matches!(instruction.operation(), XlaOperation::Assert(operation) if operation.message() == "identity must differ")));
 
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let mut builder = XlaProgramBuilder::new();
         let dimension = builder.add_input(dimension_type.clone().into());
         let predicate = builder
