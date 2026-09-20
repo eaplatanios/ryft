@@ -2354,9 +2354,13 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Represents slicing at runtime start indices, with either stored sizes or first-class dimension sizes.
-/// Fixed-size windows use [`dynamic_slice`](Self::dynamic_slice). Dimension-taking functions require
-/// [`Value<Type = ArrayIrType>`](Value), so they are unavailable for homogeneous arrays and type descriptors:
+/// Value capability for extracting a sub-array at runtime start indices.
+/// [`dynamic_slice`](Self::dynamic_slice) extracts a window of static sizes with clamped scalar-array starts,
+/// while [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions) and
+/// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) take first-class dimension starts and sizes, so the
+/// result extents may vary at runtime. The dimension-taking functions require [`Value<Type = ArrayIrType>`](Value),
+/// because the mixed [`ArrayIrValue`] representation is what carries dimensions alongside arrays, and so they are
+/// unavailable for homogeneous arrays and type descriptors:
 ///
 /// ```compile_fail
 /// use ryft_core::{Array, DynamicSlice};
@@ -2364,26 +2368,22 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// input.dynamic_slice_with_dimensions(&[], &[], &[]).unwrap();
 /// ```
 ///
-/// With dimension inputs, the result sizes may vary at runtime. Starts are non-negative dimensions. By default every
-/// selected element must lie within the input, and an empty axis permits a start at its end. Explicit
-/// [`DynamicSliceBounds::Clamp`] moves the start so the requested window fits without shrinking it.
-/// Positive static strides select `start + i * stride`, for `0 <= i < size`. Invalid runtime bounds remain observable
-/// even when the result is unused. The output preserves memory and inferred sharding. An identity slice preserves
-/// the input layout; other slices use a fresh dense layout. Array tangents follow the same slice. Reverse mode retains
-/// the original input extents and adds cotangents at the selected coordinates; starts and sizes are discrete metadata.
+/// With dimension inputs, starts are non-negative dimensions and positive static strides select `start + i * stride`
+/// for `0 <= i < size`. The [`DynamicSliceBounds`] policy decides how starts meet the input: under
+/// [`Checked`](DynamicSliceBounds::Checked), the default, every selected element must lie within the input and an
+/// empty axis permits a start at its end, while [`Clamp`](DynamicSliceBounds::Clamp) moves the start so that the
+/// requested window fits without shrinking it. Invalid runtime bounds remain observable even when the result is
+/// unused. The output preserves the input memory space and inferred sharding; an identity slice preserves the input
+/// layout and any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse-mode
+/// differentiation retains the original input extents and adds cotangents at the selected coordinates, treating starts
+/// and sizes as discrete metadata.
 ///
-/// Dimension-sized windows use the mixed [`ArrayIrValue`] representation to carry dimensions alongside arrays. Finite
-/// dimension bounds are required by the current XLA lowering; accepting a dynamic shape in the core does not imply
-/// support for unbounded allocation or runtime byte strides. When a variable-sized result is unnecessary, ordinary
-/// program outputs can instead return a padded array together with its lengths as separate values. Such a tuple does
-/// not automatically acquire ragged indexing or batching semantics.
-///
-/// For fixed window sizes, prefer [`dynamic_slice`](Self::dynamic_slice). Its mixed-value linearization retains the
-/// original runtime input extent for the pullback; a direct homogeneous transpose does not have those shape residuals.
+/// Backends may require finite bounds on dimension-sized windows (e.g., the XLA backend); accepting a dynamic shape in
+/// the core does not imply support for unbounded allocation or runtime byte strides.
 ///
 /// # Example
 ///
-/// ```
+/// ```rust
 /// # use ryft_core::{Array, ArrayIrValue, DimensionValue, DynamicSlice, ProgramError};
 /// # fn example() -> Result<(), ProgramError> {
 /// // Shapes: input [4] -> result [2]; start and size are dimension values, not tensors.
@@ -2398,25 +2398,21 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// ```
 pub trait DynamicSlice: Sized {
     /// Extracts a statically shaped sub-array at runtime start indices, with the semantics of StableHLO's
-    /// [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation.
-    ///
-    /// `t.dynamic_slice(start_indices, sizes)` extracts the block of shape `sizes` whose origin is given by the scalar
-    /// integer values in `start_indices` (one per input axis). Start indices are clamped per StableHLO semantics so the
-    /// extracted block always lies in bounds: the effective start index along axis `d` is `clamp(0, start_indices[d],
-    /// input_dimension[d] - sizes[d])`. The output shape is exactly `sizes` and is fully static even though the slice
-    /// origin is not. Each static input axis must satisfy `sizes[d] <= input_dimension[d]`. For a
-    /// [`Dimension::Dynamic`] input axis, its declared lower bound must be at least the requested size, proving that
-    /// the block fits every admitted runtime extent. Negative starts clamp to zero; they are not interpreted relative
-    /// to the end of the input. The input and start indices must reside in the same memory space. A slice whose sizes
-    /// equal the input shape passes it through unchanged because every clamped origin is necessarily zero. Any other
-    /// output preserves the input memory space and clears explicit physical layout metadata. An input carrying
-    /// reduction state keeps it, provided the start indices are invariant over its
-    /// reduction-state mesh axes: indexing with one routing on every device commutes with the pending sum of partial
-    /// contributions.
+    /// [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation. `t.dynamic_slice(start_indices,
+    /// sizes)` extracts the block of shape `sizes` whose origin is given by the scalar integer values in
+    /// `start_indices` (one per input axis). Start indices are clamped so that the extracted block always lies in
+    /// bounds: the effective start index along axis `d` is `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
+    /// The output shape is exactly `sizes` and is fully static even though the slice origin is not. Each static input
+    /// axis must satisfy `sizes[d] <= input_dimension[d]`. For a [`Dimension::Dynamic`] input axis, its declared lower
+    /// bound must be at least the requested size, proving that the block fits every admitted runtime extent. Negative
+    /// starts clamp to zero; they are not interpreted relative to the end of the input. The input and start indices
+    /// must reside in the same memory space. A slice whose sizes equal the input shape passes it through unchanged
+    /// because every clamped origin is necessarily zero. Any other output preserves the input memory space and clears
+    /// explicit physical layout metadata. An input carrying reduction state keeps it, provided the start indices are
+    /// invariant over its reduction-state mesh axes: indexing with one routing on every device commutes with the
+    /// pending sum of partial contributions.
     ///
     /// # Example
-    ///
-    /// The following example shows how to use [`DynamicSlice`] in practice:
     ///
     /// ```rust
     /// # use ryft_core::{Array, ArrayType, DataType, DynamicSlice, ProgramError};
@@ -2424,9 +2420,9 @@ pub trait DynamicSlice: Sized {
     /// # fn main() -> Result<(), ProgramError> {
     /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
     /// // Shapes: input [2, 3], row and column [] (scalars) -> output [1, 2].
-    /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-    /// let row = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
-    /// let column = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap();
+    /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// let row = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1])?;
+    /// let column = Array::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1])?;
     /// let output = input.dynamic_slice(&[row, column], &[1, 2])?;
     /// // `output` has shape [1, 2] with values [[5.0, 6.0]].
     /// assert_eq!(output.to_f64s(), vec![5.0, 6.0]);
@@ -2435,13 +2431,9 @@ pub trait DynamicSlice: Sized {
     /// ```
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError>;
 
-    /// Extracts a slice whose origin and size are dimension values.
-    ///
-    /// # Parameters
-    ///
-    ///   - `start_indices`: One non-negative dimension value per input axis, specifying its inclusive start.
-    ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
-    ///   - `strides`: One strictly positive static step per input axis.
+    /// Extracts a window whose starts and sizes are dimension values, rejecting windows that extend outside the input
+    /// (i.e., using the [`Checked`](DynamicSliceBounds::Checked) bounds policy). Refer to the documentation of
+    /// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) for more information.
     fn dynamic_slice_with_dimensions(
         &self,
         start_indices: &[Self],
@@ -2454,8 +2446,18 @@ pub trait DynamicSlice: Sized {
         self.dynamic_slice_with_bounds(start_indices, sizes, strides, DynamicSliceBounds::Checked)
     }
 
-    /// Extracts a dimension-sized window using the provided bounds policy. `Clamp` moves the origin without changing
-    /// the requested sizes; both policies reject windows whose span exceeds the logical input extent.
+    /// Extracts a window whose starts and sizes are dimension values, resolving the starts against the input extents
+    /// according to the provided [`DynamicSliceBounds`] policy. [`Clamp`](DynamicSliceBounds::Clamp) moves each start
+    /// so that its window fits without changing the requested sizes, whereas [`Checked`](DynamicSliceBounds::Checked)
+    /// rejects a window that extends outside the input. Both policies reject a window whose span exceeds the logical
+    /// input extent.
+    ///
+    /// # Parameters
+    ///
+    ///   - `start_indices`: One non-negative dimension value per input axis, specifying its inclusive start.
+    ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
+    ///   - `strides`: One strictly positive static step per input axis.
+    ///   - `bounds`: Policy resolving the starts against the input extents.
     fn dynamic_slice_with_bounds(
         &self,
         start_indices: &[Self],
