@@ -11,10 +11,12 @@
 //!     or size-one axes, [`Concatenate`] joins arrays along an axis, and [`Pad`] adds, removes, or interleaves edge
 //!     and interior padding.
 //!   - **Selecting and updating elements:** [`Slice`] and [`UpdateSlice`] take static windows, [`DynamicSlice`] and
-//!     [`DynamicUpdateSlice`] take runtime start indices, [`Gather`] and [`Scatter`] read and write arbitrary
-//!     coordinates, and [`Indexing`] composes all of these behind an [`index!`](crate::index) selector list with
+//!     [`DynamicUpdateSlice`] take runtime start indices, [`DynamicSliceWithDimensions`] takes dimension-valued
+//!     windows, [`Gather`] and [`Scatter`] read and write arbitrary coordinates, and [`Indexing`] composes all of
+//!     these behind an [`index!`](crate::index) selector list with
 //!     [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) integers, ranges, strides, new axes,
-//!     array indices, and masks.
+//!     array indices, and masks. On array values the selection reads or returns updated copies, and on reference
+//!     values it derives a view that is read and written in place.
 //!   - **Changing representation and placement:** [`ConvertElementType`] changes the element data type and
 //!     [`TransferToMemory`] moves an array between memory spaces.
 //!
@@ -49,6 +51,18 @@
 //! let start = Array::scalar(-2_i32)?;
 //! let window = matrix.dynamic_slice_in_axis(&start, 2, 1)?;
 //! assert_eq!(window, Array::matrix(2, 2, vec![2_i32, 3, 5, 6])?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The same selections can update references in place through a view of the selected region:
+//!
+//! ```rust
+//! # use ryft_core::{Array, ArrayIrValue, Indexing, ProgramError, ReferenceNew, ReferenceRead, index};
+//! # fn main() -> Result<(), ProgramError> {
+//! let buffer = ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 5, 6])?).reference_new()?;
+//! buffer.at(&index![1, 1..]).write(&ArrayIrValue::Array(Array::vector(vec![50_i32, 60])?))?;
+//! assert_eq!(buffer.read()?, ArrayIrValue::Array(Array::matrix(2, 3, vec![1_i32, 2, 3, 4, 50, 60])?));
 //! # Ok(())
 //! # }
 //! ```
@@ -87,7 +101,7 @@ pub use scattering::{
 };
 pub use slicing::{
     DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceBounds,
-    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, SLICE_OPERATION_NAME, Slice,
-    SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
+    DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
