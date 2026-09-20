@@ -622,8 +622,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
@@ -718,11 +716,26 @@ impl<
         self.update(updates, ScatterReductionKind::Max, options)
     }
 
-    /// Uses the same window/query mapping as reads, removing only inserted singleton axes from the updates.
+    /// Shared implementation of [`set`](Self::set), [`add`](Self::add), [`mul`](Self::mul), [`min`](Self::min), and
+    /// [`max`](Self::max), which differ only in how `kind` combines the updates with the selected elements. It builds
+    /// the same [`IndexPlan`] as [`get`](Self::get), so an update touches exactly the positions that a read of the same
+    /// selection would return, and then scatters into the input. The updates are broadcast to the selection shape the
+    /// caller sees, the inserted extent-one axes are reshaped away to obtain the scatter update shape, and the plan's
+    /// gather dimension numbers are reused as scatter dimension numbers. The updates must already have the input's data
+    /// type, because scatter does not promote. The sortedness promise is cleared, since normalization and interleaved
+    /// slice coordinates may reorder the selected positions, while the uniqueness promise is passed through unchecked.
+    /// The input is left unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Values with the input's data type, broadcastable to the selection shape.
+    ///   - `kind`: Scatter reduction combining each update with the element it lands on.
+    ///   - `options`: Bounds handling, output placement, and index promises, as described on [`Indexed`].
     fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
         if updates.r#type().data_type() != self.input.r#type().data_type() {
             return Err(TypeError::invalid("index updates must have the input data type").into());
         }
+
         let expanded = self.expanded()?;
         let plan = self.plan(&expanded, matches!(options.mode(), ScatterMode::PromiseInBounds))?;
         let updates = updates.broadcast_to(Shape::from(plan.output_shape))?.reshape(Shape::from(plan.shape))?;
@@ -731,17 +744,31 @@ impl<
             plan.dimensions.collapsed_slice_dimensions().to_vec(),
             plan.dimensions.start_index_map().to_vec(),
         );
-        self.input
-            .scatter(&plan.indices, &updates, &dimensions, kind, &options.clone().with_indices_are_sorted(false))
+        let options = options.clone().with_indices_are_sorted(false);
+        self.input.scatter(&plan.indices, &updates, &dimensions, kind, &options)
     }
 }
-impl<V> Indexed<'_, '_, '_, V, ArrayType>
-where
-    V: Value<Type = ArrayType> + Broadcast + Reshape + Concatenate + ConvertElementType + Compare + Add + Select,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+
+impl<
+    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+        + Broadcast
+        + Reshape
+        + Concatenate
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select,
+> Indexed<'_, '_, '_, V, ArrayType>
 {
-    /// Expands ellipses and concrete masks once, keeping separators for advanced-index axis ordering.
+    /// Turns the caller's [`IndexSelector`] list into the explicit [`ExpandedIndexSelector`] list that
+    /// [`plan`](Self::plan) consumes, validating the selection against the input on the way. It rejects a selection
+    /// that consumes more axes than the input has or that contains more than one ellipsis, requires index arrays to be
+    /// integer-typed and to share the input's memory space, and requires each mask to match the extents of the axes it
+    /// consumes. The ellipsis (or, without one, the omitted trailing axes) is expanded into full slices over the
+    /// unspecified axes, while the ellipsis entry itself is kept as a zero-width separator between advanced-index
+    /// groups. Each non-scalar mask is replaced by one host coordinate array per mask axis holding the positions
+    /// of its true entries, lifted as constants in the input's memory space, and a scalar mask becomes a
+    /// [`Boolean`](ExpandedIndexSelector::Boolean) entry.
     fn expanded(&self) -> Result<Vec<ExpandedIndexSelector<V>>, ProgramError> {
         let rank = self.input.r#type().rank();
         let consumed = self
@@ -753,12 +780,14 @@ where
                 _ => 1,
             })
             .sum::<usize>();
+
         if consumed > rank {
             return Err(TypeError::invalid(format!(
-                "index selection consumes {consumed} axes but input rank is {rank}"
+                "index selection consumes {consumed} axes but input rank is {rank}",
             ))
             .into());
         }
+
         if self
             .selectors
             .iter()
@@ -768,14 +797,15 @@ where
         {
             return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
         }
+
         let mut result = Vec::new();
         let mut axis = 0;
         let mut ellipsis = false;
         for selector in self.selectors {
             match selector {
                 IndexSelector::Basic(BasicIndex::Ellipsis) => {
-                    ellipsis = true;
                     // A zero-width ellipsis still separates two advanced groups.
+                    ellipsis = true;
                     result.push(ExpandedIndexSelector::Basic(BasicIndex::Ellipsis));
                     for _ in 0..rank - consumed {
                         result.push(ExpandedIndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
@@ -796,9 +826,11 @@ where
                         )
                         .into());
                     }
+
                     if r#type.memory() != self.input.r#type().memory() {
                         return Err(TypeError::invalid("index arrays and input must share one memory space").into());
                     }
+
                     result.push(ExpandedIndexSelector::Array((*value).clone()));
                     axis += 1;
                 }
@@ -807,6 +839,7 @@ where
                         result.push(ExpandedIndexSelector::Boolean(mask.values[0]));
                         continue;
                     }
+
                     for (offset, &extent) in mask.shape.iter().enumerate() {
                         if self.input.r#type().dimension(axis + offset).value() != Some(extent) {
                             return Err(
@@ -814,9 +847,10 @@ where
                             );
                         }
                     }
+
                     for coordinate_axis in 0..mask.shape.len() {
                         // An empty mask can have huge trailing extents whose product does not fit in `usize`.
-                        // No coordinate is decoded in that case. For nonempty masks the constructor has checked
+                        // No coordinate is decoded in that case. For non-empty masks the constructor has checked
                         // the entire positive shape product, so every trailing product fits as well.
                         let stride = if mask.values.is_empty() {
                             1
@@ -832,17 +866,22 @@ where
                             .collect::<Vec<_>>();
                         result.push(ExpandedIndexSelector::Array(self.constant(Array::vector(coordinates)?)?));
                     }
+
                     axis += mask.shape.len();
                 }
             }
         }
+
         if !ellipsis {
             for _ in consumed..rank {
                 result.push(ExpandedIndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
             }
         }
+
         Ok(result)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Lifts a host coordinate using the input's memory space and execution domain.
     #[inline]
@@ -1737,7 +1776,18 @@ where
         self.update(updates, ScatterReductionKind::Max, options)
     }
 
-    /// Projects concrete geometry or retains explicit dimensions for a symbolic selection.
+    /// Shared implementation of the mixed-IR [`set`](Self::set), [`add`](Self::add), [`mul`](Self::mul),
+    /// [`min`](Self::min), and [`max`](Self::max). A selection whose input and index arrays all have concrete shapes
+    /// is projected into the array member family and served by the homogeneous [`Indexed`] implementation, with the
+    /// result lifted back into the mixed family. A selection with a symbolic shape instead goes through
+    /// [`dynamic_index_update`], which keeps the dimension values available so that the scatter geometry can be
+    /// expressed with dynamic operations.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Array value with the input's data type, broadcastable to the selection shape.
+    ///   - `kind`: Scatter reduction combining each update with the element it lands on.
+    ///   - `options`: Bounds handling, output placement, and index promises, as described on [`Indexed`].
     fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
         if self.has_symbolic_shape()? {
             return dynamic_index_update(self.input, self.selectors, updates, kind, options);
