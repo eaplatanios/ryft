@@ -381,7 +381,7 @@ impl<V: Value> From<RangeFull> for IndexSelector<'_, V> {
 /// ```
 pub trait Indexing: Value {
     /// Borrows this value and the provided [`IndexSelector`]s in an [`Indexed`] wrapper. For array values, its `get`
-    /// function reads the selection while `set`, `add`, `multiply`, `min`, and `max` return a new array, leaving the
+    /// function reads the selection while `set`, `add`, `mul`, `min`, and `max` return a new array, leaving the
     /// input unchanged. For reference values, `view` derives a reference to the selected region and `read`, `write`,
     /// `add_update`, and `swap` access the reference's state through that view in place. Validation occurs in those
     /// terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported geometry and
@@ -643,7 +643,7 @@ impl<
     ///
     ///   - `updates`: Values broadcast to the selected shape, with the same data type as the input.
     ///   - `options`: Bounds handling, output placement, and promises about the final normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     Sortedness is cleared before scatter while uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
     ///
     /// # Examples
@@ -668,7 +668,7 @@ impl<
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     Sortedness is cleared before scatter while uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
     #[inline]
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
@@ -683,10 +683,10 @@ impl<
     ///
     ///   - `updates`: Factors with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     Sortedness is cleared before scatter while uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
     #[inline]
-    pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+    pub fn mul(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
 
@@ -697,7 +697,7 @@ impl<
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     Sortedness is cleared before scatter while uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
     #[inline]
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
@@ -711,7 +711,7 @@ impl<
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     Sortedness is cleared before scatter while uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
     #[inline]
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
@@ -1719,7 +1719,7 @@ where
     /// Multiplies selected updates into a mixed-IR array; scatter's differentiation restrictions apply. Updates
     /// broadcast to the selected shape using retained dimension values when necessary. Refer to the documentation of
     /// [`set`](Self::set) for the shared parameter contract.
-    pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+    pub fn mul(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
 
@@ -3064,12 +3064,12 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_multiply() {
+    fn test_indexed_mul() {
         let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
         let indices = Array::vector(vec![1_i32, 1, -1]).unwrap();
         let updates = Array::vector(vec![2_i32, 3, 4]).unwrap();
         assert_eq!(
-            input.at(&index![&indices]).multiply(&updates, &ScatterOptions::new()),
+            input.at(&index![&indices]).mul(&updates, &ScatterOptions::new()),
             Array::vector(vec![10_i32, 120, 120])
         );
     }
