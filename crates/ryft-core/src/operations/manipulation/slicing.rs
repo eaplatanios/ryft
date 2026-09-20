@@ -2531,6 +2531,30 @@ pub trait DynamicSlice: Sized {
     /// counts from the end of its axis exactly as [`dynamic_slice`](Self::dynamic_slice) describes; with `false`,
     /// negative starts are out of bounds and clamp to zero, which is StableHLO's native rule. Unsigned and Boolean
     /// starts are unaffected either way.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [4], start [] (scalar) -> output [2].
+    /// let input = Array::vector(vec![10i32, 20, 30, 40])?;
+    /// let start = Array::scalar(-1i32)?;
+    ///
+    /// // A negative start wraps to `3` and then clamps to the last valid origin `2`.
+    /// assert_eq!(
+    ///     input.dynamic_slice_with_negative_indices(&[start.clone()], &[2], true)?,
+    ///     Array::vector(vec![30i32, 40])?,
+    /// );
+    ///
+    /// // Without wrapping, the same start is out of bounds and clamps to zero.
+    /// assert_eq!(
+    ///     input.dynamic_slice_with_negative_indices(&[start], &[2], false)?,
+    ///     Array::vector(vec![10i32, 20])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_slice_with_negative_indices(
         &self,
         start_indices: &[Self],
@@ -2541,6 +2565,23 @@ pub trait DynamicSlice: Sized {
     /// Extracts a window whose starts and sizes are dimension values, rejecting windows that extend outside the input
     /// (i.e., using the [`Checked`](DynamicSliceBounds::Checked) bounds policy). Refer to the documentation of
     /// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) for more information.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayIrValue, DimensionValue, DynamicSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [4] -> output [2]. Every second element from `1` onwards is selected.
+    /// let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30, 40])?);
+    /// let start = ArrayIrValue::Dimension(DimensionValue::constant(1)?);
+    /// let size = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
+    /// assert_eq!(
+    ///     input.dynamic_slice_with_dimensions(&[start], &[size], &[2])?,
+    ///     ArrayIrValue::Array(Array::vector(vec![20i32, 40])?),
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
     fn dynamic_slice_with_dimensions(
         &self,
@@ -2566,6 +2607,31 @@ pub trait DynamicSlice: Sized {
     ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
     ///   - `strides`: One strictly positive static step per input axis.
     ///   - `bounds`: Policy resolving the starts against the input extents.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayIrValue, DimensionValue, DynamicSlice, DynamicSliceBounds, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [4] -> output [2]. A window of size `2` starting at `3` extends past the input.
+    /// let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30, 40])?);
+    /// let start = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+    /// let size = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
+    ///
+    /// // `Clamp` moves the start back to `2` so that the window fits.
+    /// assert_eq!(
+    ///     input.dynamic_slice_with_bounds(&[start.clone()], &[size.clone()], &[1], DynamicSliceBounds::Clamp)?,
+    ///     ArrayIrValue::Array(Array::vector(vec![30i32, 40])?),
+    /// );
+    ///
+    /// // `Checked` rejects the window instead.
+    /// assert!(matches!(
+    ///     input.dynamic_slice_with_bounds(&[start], &[size], &[1], DynamicSliceBounds::Checked),
+    ///     Err(ProgramError::InvalidArgument { .. }),
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_slice_with_bounds(
         &self,
         start_indices: &[Self],
