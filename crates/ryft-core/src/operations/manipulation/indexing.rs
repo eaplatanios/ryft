@@ -166,10 +166,18 @@ struct NormalizedIndexSlice {
     reversed: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// A basic selector that consumes one axis for an integer or slice, inserts an axis for [`Self::NewAxis`], or
-/// expands over the axes not explicitly selected for [`Self::Ellipsis`]. Integer indices remove the selected axis.
+/// Basic index that is a host-known selector that acts on one axis at a time without any broadcasting.
+/// Basic indexing is one of the two categories of [`IndexSelector`] that is inspired by
+/// [NumPy's basic indexing](https://numpy.org/doc/stable/user/basics.indexing.html#basic-indexing). The other is
+/// inspired by [NumPy's advanced indexing](https://numpy.org/doc/stable/user/basics.indexing.html#advanced-indexing),
+/// consists of the [`Array`](IndexSelector::Array) and [`Mask`](IndexSelector::Mask) selectors, and has no dedicated
+/// type because its two members carry unrelated payloads (i.e., a borrowed value and a host-known [`IndexMask`]). An
+/// integer or slice consumes one input axis, where integers remove the axis and slices preserve it,
+/// [`NewAxis`](Self::NewAxis) inserts an output axis of extent one without consuming an input axis, and
+/// [`Ellipsis`](Self::Ellipsis) expands to full slices over the axes not explicitly selected. Basic indices leave
+/// the relative order of the axes they touch unchanged, whereas advanced indices broadcast jointly and may move their
+/// result axes to the front. Refer to the documentation of [`IndexSelector`] for how the two categories combine
+/// in one selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BasicIndex {
     /// A signed scalar index. Negative indices count backward from the axis extent.
@@ -178,18 +186,22 @@ pub enum BasicIndex {
     /// A signed, potentially strided slice that preserves the selected axis.
     Slice(IndexSlice),
 
-    /// Inserts a new axis of extent one without consuming an input axis.
+    /// Index that inserts a new axis of extent one without consuming an input axis.
     NewAxis,
 
-    /// Expands to full slices over the otherwise unspecified input axes.
+    /// Index that expands to full slices over the otherwise unspecified input axes.
     Ellipsis,
 }
 
-/// A host-known Boolean mask with explicit shape. Constructing it validates the number of entries. Indexing converts
-/// its true positions into constant integer coordinates; it never reads a device value or tracer back to the host.
-/// A scalar mask inserts an advanced axis of size one (`true`) or zero (`false`) without consuming an input axis.
-/// Boolean indexing requires this concrete descriptor; runtime Boolean compaction and host reads of device or
-/// traced masks are unsupported.
+/// A host-known Boolean mask with explicit shape, which is the Boolean form of advanced indexing
+/// (the other form is an integer [`Array`](IndexSelector::Array) selector), following NumPy's
+/// [Boolean array indexing](https://numpy.org/doc/stable/user/basics.indexing.html#boolean-array-indexing).
+/// Constructing it validates the number of entries. Indexing converts its true positions into constant integer
+/// coordinates, one advanced integer index per mask axis, exactly as NumPy replaces a mask with the arrays returned
+/// by [`numpy.nonzero`](https://numpy.org/doc/stable/reference/generated/numpy.nonzero.html); it never reads a device
+/// value or tracer back to the host. A scalar mask inserts an advanced axis of size one (i.e., `true`) or zero
+/// (i.e., `false`) without consuming an input axis. Boolean indexing requires this concrete descriptor; runtime
+/// Boolean compaction and host reads of device or traced masks are unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexMask {
     /// Refer to the documentation of [`shape`](Self::shape) for more information.
@@ -198,6 +210,8 @@ pub struct IndexMask {
     /// Refer to the documentation of [`values`](Self::values) for more information.
     values: Vec<bool>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl IndexMask {
     /// Creates a concrete mask with row-major `values` and the specified axis extents. The product of the extents
@@ -237,19 +251,33 @@ impl IndexMask {
 /// The value parameter is inferred from the receiver of [`Indexing::at`], including for a list containing only basic
 /// indices. Array selectors borrow the receiver's value family; lift constants into the trace before using them.
 ///
+/// Selectors fall into NumPy's two [indexing](https://numpy.org/doc/stable/user/basics.indexing.html) categories.
+/// [`Basic`](Self::Basic) selectors are host-known and act on one axis at a time (refer to the documentation of
+/// [`BasicIndex`] for more information). [`Array`](Self::Array) and [`Mask`](Self::Mask) selectors are advanced
+/// indices: all advanced selectors in one selection broadcast jointly to a single coordinate shape, and the selection
+/// gathers (or scatters) at those coordinates. When a selection mixes the two categories, the basic selectors are
+/// applied axis by axis around the advanced gather, and host integers count as advanced for the purpose of axis
+/// placement, as in NumPy's rules for [combining advanced and basic indexing][combining]. Advanced selectors that are
+/// adjacent in the selection insert their broadcast axes in place of the first consumed axis, while advanced selectors
+/// separated by a slice, new axis, or ellipsis move their broadcast axes to the front of the result.
+///
 /// Negative integer indices count backward from the axis end once. Remaining invalid integer indices follow the
-/// bounds options supplied to the read or update function. Array indices broadcast jointly; separated advanced
-/// indices put their broadcast axes first, while adjacent ones insert those axes in place.
+/// bounds options supplied to the read or update function.
+///
+/// [combining]: https://numpy.org/doc/stable/user/basics.indexing.html#combining-advanced-and-basic-indexing
 #[derive(Clone, Debug, PartialEq)]
 pub enum IndexSelector<'i, V: Value> {
-    /// Host integer, slice, new axis, or ellipsis.
+    /// Basic index: a host integer, slice, new axis, or ellipsis.
     Basic(BasicIndex),
 
-    /// Integer array of coordinates, including rank-zero arrays. Boolean arrays are rejected; use [`IndexMask`] for
-    /// concrete masks. Keeping rank-zero arrays distinct from host integers preserves advanced-index semantics.
+    /// Advanced index: an integer array of coordinates, including rank-zero arrays. Boolean arrays are rejected; use
+    /// [`IndexMask`] for concrete masks. Keeping rank-zero arrays distinct from host integers preserves advanced-index
+    /// semantics (a rank-zero array contributes to the joint broadcast and does not remove the axis the way a host
+    /// integer does).
     Array(&'i V),
 
-    /// Explicitly host-known mask, consuming one input axis per mask axis.
+    /// Advanced index: an explicitly host-known mask, consuming one input axis per mask axis and contributing one
+    /// advanced axis whose extent is the number of true entries.
     Mask(&'i IndexMask),
 }
 
