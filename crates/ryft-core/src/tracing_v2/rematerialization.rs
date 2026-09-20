@@ -44,7 +44,7 @@
 //! programs through the forward tail's region inputs, and a local one is rejected as an escaping handle.
 //!
 //! The built-in policies mirror JAX's `jax.checkpoint_policies` (the name-based members classify residuals by the
-//! [`tag`](crate::operations::tag::Tag::tag) key carried by the producing
+//! [`tag`](crate::Tag::tag) key carried by the producing
 //! [`TagOperation`]), and closure-backed custom policies wrap in [`PolicyFn`] with full access to every operation that
 //! may have produced the boundary residual. Policies are pure classifiers: they never stage operations or touch
 //! program builders, and reusable policies state their operation requirements as derive-generated variant-projection
@@ -1214,8 +1214,8 @@ where
     operation.try_into().ok()
 }
 
-/// Returns the [`tag`](crate::operations::tag::Tag::tag) key when `operation` is a
-/// [`TagOperation`](crate::operations::tag::TagOperation), and [`None`] otherwise.
+/// Returns the [`tag`](crate::operations::tagging::Tag::tag) key when `operation` is a
+/// [`TagOperation`](crate::operations::tagging::TagOperation), and [`None`] otherwise.
 #[inline]
 fn tag_key<'a, T: Type + 'a, O>(operation: &'a O) -> Option<&'a str>
 where
@@ -1322,7 +1322,7 @@ where
     }
 }
 
-/// Save only residuals tagged with one of the provided [`tag`](crate::operations::tag::Tag::tag) keys and recompute
+/// Save only residuals tagged with one of the provided [`tag`](crate::operations::tagging::Tag::tag) keys and recompute
 /// everything else. Matches JAX's `save_only_these_names`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SaveOnlyTheseNames {
@@ -1490,7 +1490,7 @@ where
     }
 }
 
-/// Saves residuals tagged with one of the `saveable` [`tag`](crate::operations::tag::Tag::tag) keys in place,
+/// Saves residuals tagged with one of the `saveable` [`tag`](crate::operations::tagging::Tag::tag) keys in place,
 /// offloads residuals tagged with one of the `offloadable` names to `destination`, and recomputes everything else
 /// (including unnamed residuals). Matches JAX's `save_and_offload_only_these_names`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3021,7 +3021,12 @@ mod tests {
                 .unwrap()[0];
             let output = if tag_output {
                 builder
-                    .add_instruction(crate::operations::tag::TagOperation::new("false"), Vec::new(), vec![dot], None)
+                    .add_instruction(
+                        crate::operations::tagging::TagOperation::new("false"),
+                        Vec::new(),
+                        vec![dot],
+                        None,
+                    )
                     .unwrap()[0]
             } else {
                 dot

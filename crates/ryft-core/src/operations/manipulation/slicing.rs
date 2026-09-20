@@ -2831,11 +2831,26 @@ pub trait DynamicSlice: Sized {
     {
         let input_type = self.r#type();
         let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
-        let mut sizes = static_dimensions_for_axis_window(DYNAMIC_SLICE_OPERATION_NAME, &input_type, axis)?;
-        sizes[axis] = size;
         let starts = (0..input_type.rank())
             .map(|input_axis| if input_axis == axis { Ok(start.clone()) } else { start.zero_like() })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // The window spans every other axis in full, which requires their extents to be static.
+        let sizes = input_type
+            .shape()
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(input_axis, dimension)| match dimension {
+                _ if input_axis == axis => Ok(size),
+                Dimension::Static(extent) => Ok(*extent),
+                Dimension::Dynamic(_) => Err(TypeError::invalid(format!(
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` along axis {axis} requires static extents on the other axes but \
+                     axis {input_axis} of `{input_type}` is dynamic",
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         self.dynamic_slice(&starts, &sizes)
     }
 
@@ -2872,42 +2887,21 @@ pub trait DynamicSlice: Sized {
     where
         Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
     {
-        let input_type = self.r#type();
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis =
+            axis.into().normalize(self.r#type().rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
         let output = self.dynamic_slice_in_axis(index, 1, axis)?;
         if keep_axis {
             return Ok(output);
         }
-        let mut dimensions = static_dimensions_for_axis_window(DYNAMIC_SLICE_OPERATION_NAME, &input_type, axis)?;
+
+        // The slice output is fully static, so squeezing the selected axis only needs its dimensions.
+        let mut dimensions = output.r#type().shape().dimensions().to_vec();
         dimensions.remove(axis);
-        output.reshape(dimensions)
+        output.reshape(Shape::new(dimensions))
     }
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns the static extents of `input_type` for a window that spans every axis other than `axis` in full, naming
-/// `operation_name` in the diagnostic when another axis is dynamic.
-fn static_dimensions_for_axis_window(
-    operation_name: &str,
-    input_type: &ArrayType,
-    axis: usize,
-) -> Result<Vec<usize>, TypeError> {
-    input_type
-        .shape()
-        .dimensions()
-        .iter()
-        .enumerate()
-        .map(|(input_axis, dimension)| match dimension {
-            Dimension::Static(size) => Ok(*size),
-            Dimension::Dynamic(_) if input_axis == axis => Ok(0),
-            Dimension::Dynamic(_) => Err(TypeError::invalid(format!(
-                "`{operation_name}` along axis {axis} requires static extents on the other axes but axis {input_axis} \
-                 of `{input_type}` is dynamic",
-            ))),
-        })
-        .collect()
-}
 
 impl DynamicSlice for ArrayType {
     fn dynamic_slice_with_negative_indices(
@@ -3744,6 +3738,23 @@ pub trait DynamicUpdateSlice: Sized {
     ///   - `start_indices`: Scalar integer arrays, one per input axis, all with the same element data type. Negative
     ///     signed values count from the end of their axis once; values beyond the last valid origin clamp to keep the
     ///     complete update in bounds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicUpdateSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [2, 3], update [1, 2], row and column [] (scalars) -> output [2, 3].
+    /// let input = Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// let update = Array::matrix(1, 2, vec![8.0_f64, 9.0])?;
+    /// // The row start `-1` counts from the end, and the column start `5` clamps so that the update fits.
+    /// assert_eq!(
+    ///     input.dynamic_update_slice(&update, &[Array::scalar(-1_i32)?, Array::scalar(5_i32)?])?,
+    ///     Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 8.0, 9.0])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         self.dynamic_update_slice_with_negative_indices(update, start_indices, true)
@@ -3754,6 +3765,29 @@ pub trait DynamicUpdateSlice: Sized {
     /// `allow_negative_indices` set to `true`, a negative start counts from the end of its axis exactly as
     /// [`dynamic_update_slice`](Self::dynamic_update_slice) describes; with `false`, negative starts are out of bounds
     /// and clamp to zero, which is StableHLO's native rule. Unsigned and Boolean starts are unaffected either way.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicUpdateSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [4], update [2], start [] (scalar) -> output [4].
+    /// let input = Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0])?;
+    /// let update = Array::vector(vec![8.0_f64, 9.0])?;
+    /// let start = Array::scalar(-1_i32)?;
+    /// // A negative start wraps to `3` and then clamps to the last valid origin `2`.
+    /// assert_eq!(
+    ///     input.dynamic_update_slice_with_negative_indices(&update, &[start.clone()], true)?,
+    ///     Array::vector(vec![1.0_f64, 2.0, 8.0, 9.0])?,
+    /// );
+    /// // Without wrapping, the same start is out of bounds and clamps to zero.
+    /// assert_eq!(
+    ///     input.dynamic_update_slice_with_negative_indices(&update, &[start], false)?,
+    ///     Array::vector(vec![8.0_f64, 9.0, 3.0, 4.0])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_update_slice_with_negative_indices(
         &self,
         update: &Self,
@@ -3771,6 +3805,23 @@ pub trait DynamicUpdateSlice: Sized {
     ///   - `update`: Array written into the selected block, with the input's element data type and rank.
     ///   - `start`: Scalar integer array giving the start along `axis`.
     ///   - `axis`: Axis of the update; negative axes count backward from the input rank.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicUpdateSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [2, 3], update [1, 2], start [] (scalar) -> output [2, 3].
+    /// let input = Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// let update = Array::matrix(1, 2, vec![8.0_f64, 9.0])?;
+    /// // The start `-1` along the column axis clamps to `1` so that the two update columns fit; the row start is zero.
+    /// assert_eq!(
+    ///     input.dynamic_update_slice_in_axis(&update, &Array::scalar(-1_i32)?, 1)?,
+    ///     Array::matrix(2, 3, vec![1.0_f64, 8.0, 9.0, 4.0, 5.0, 6.0])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_update_slice_in_axis<A: Into<Axis>>(
         &self,
         update: &Self,
@@ -3798,6 +3849,22 @@ pub trait DynamicUpdateSlice: Sized {
     ///   - `update`: Array written at the selected position, of the input's rank or one less.
     ///   - `index`: Scalar integer array giving the position along `axis`.
     ///   - `axis`: Axis of the update; negative axes count backward from the input rank.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicUpdateSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Shapes: input [2, 3], update [2], index [] (scalar) -> output [2, 3].
+    /// let input = Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// // The rank-deficient update gains the column axis with extent one and is written into the last column.
+    /// assert_eq!(
+    ///     input.dynamic_update_index_in_axis(&Array::vector(vec![7.0_f64, 8.0])?, &Array::scalar(-1_i32)?, 1)?,
+    ///     Array::matrix(2, 3, vec![1.0_f64, 2.0, 7.0, 4.0, 5.0, 8.0])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_update_index_in_axis<A: Into<Axis>>(
         &self,
         update: &Self,
@@ -4107,6 +4174,7 @@ fn indexed_slice_output_type(
             None => mesh = Some(index_sharding.mesh().clone()),
         }
     }
+
     // Only variation over manual axes changes the placement; a replicated index leaves an unsharded output unsharded.
     let index_varying_manual_axes = indices
         .iter()

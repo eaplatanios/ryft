@@ -7579,7 +7579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_per_lane_validation_on_cpu() {
+    fn test_compiled_per_element_validation_on_cpu() {
         use ryft_core::Compare;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -7620,7 +7620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_assertion_bounded_lanes_on_cpu() {
+    fn test_compiled_assertion_bounded_elements_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -7672,14 +7672,14 @@ mod tests {
                 .unwrap();
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedLanes {
+            let expected = ryft_core::AssertionError::FailedElements {
                 message: "bounded check".to_owned(),
-                lanes: vec![
-                    ryft_core::AssertionLane {
+                failures: vec![
+                    ryft_core::AssertionFailure {
                         index: if mode == 2 { vec![0, 1] } else { vec![1] },
                         observations: vec![("value".to_owned(), "20".to_owned())],
                     },
-                    ryft_core::AssertionLane {
+                    ryft_core::AssertionFailure {
                         index: if mode == 2 { vec![1, 0] } else { vec![2] },
                         observations: vec![("value".to_owned(), "30".to_owned())],
                     },
@@ -7735,13 +7735,13 @@ mod tests {
                 .unwrap();
             let compiled = domain.compile_xla_program(&lowered).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![predicates, observations]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedLanes {
+            let expected = ryft_core::AssertionError::FailedElements {
                 message: "narrow values".to_owned(),
-                lanes: values
+                failures: values
                     .iter()
                     .take(3)
                     .enumerate()
-                    .map(|(index, value)| ryft_core::AssertionLane {
+                    .map(|(index, value)| ryft_core::AssertionFailure {
                         index: vec![index],
                         observations: vec![("value".to_owned(), value.to_string())],
                     })
@@ -7933,14 +7933,14 @@ mod tests {
                 .collect::<Vec<_>>();
             let error = domain.execute_xla_program(&compiled, inputs).unwrap_err();
             let expected = if bounded {
-                ryft_core::AssertionError::FailedLanes {
+                ryft_core::AssertionError::FailedElements {
                     message: "dynamic mapped check".to_owned(),
-                    lanes: vec![
-                        ryft_core::AssertionLane {
+                    failures: vec![
+                        ryft_core::AssertionFailure {
                             index: vec![1],
                             observations: vec![("value".to_owned(), "1".to_owned())],
                         },
-                        ryft_core::AssertionLane {
+                        ryft_core::AssertionFailure {
                             index: vec![2],
                             observations: vec![("value".to_owned(), "2".to_owned())],
                         },
@@ -8010,14 +8010,14 @@ mod tests {
                 Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &3_i64.to_ne_bytes()).unwrap();
             let error = domain.execute_xla_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
-                ryft_core::AssertionError::FailedLanes {
+                ryft_core::AssertionError::FailedElements {
                     message: "dynamic replicated check".to_owned(),
-                    lanes: vec![
-                        ryft_core::AssertionLane {
+                    failures: vec![
+                        ryft_core::AssertionFailure {
                             index: vec![0],
                             observations: vec![("size".to_owned(), "3".to_owned())],
                         },
-                        ryft_core::AssertionLane {
+                        ryft_core::AssertionFailure {
                             index: vec![1],
                             observations: vec![("size".to_owned(), "3".to_owned())],
                         },

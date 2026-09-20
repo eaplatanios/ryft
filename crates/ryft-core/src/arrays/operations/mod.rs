@@ -86,7 +86,7 @@ mod quantization;
 mod random;
 mod references;
 mod sort;
-mod tag;
+mod tagging;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
@@ -222,7 +222,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     [`ConditionTypeSemantics`](crate::operations::control_flow::condition::ConditionTypeSemantics), and
 ///     [`WhilePredicate`](crate::operations::control_flow::WhilePredicate);
 ///   - staging machinery such as [`Constant`](crate::operations::constants::Constant) and
-///     [`Tag`](crate::operations::tag::Tag), and the context-side constructors [`Zero`],
+///     [`Tag`](crate::operations::tagging::Tag), and the context-side constructors [`Zero`],
 ///     [`One`](crate::operations::constants::One), [`Fill`](crate::operations::constants::Fill), and
 ///     [`Iota`](crate::operations::constants::Iota), whose value-driven counterparts [`ZeroLike`] and [`OneLike`] are
 ///     members instead;

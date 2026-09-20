@@ -1,6 +1,50 @@
+//! Operations that attach string keys to values so that program transforms can recognize them later. Tags are
+//! identity functions on their data: interpretation, batching, partial evaluation, and backend lowering all pass the
+//! input through unchanged, and the key lives only in the staged instruction. This module provides the following:
+//!
+//!   - The [`Tag`] value capability, whose [`tag`](Tag::tag) returns its input unchanged while marking the producing
+//!     instruction with a key.
+//!   - The [`TagOperation`] that the capability stages, whose [`key`](TagOperation::key) is what consumers match on.
+//!     Forward-mode differentiation re-tags the primal value and passes the tangent through, so a tag placed in the
+//!     body of a function is still present on the instructions that define the residuals of its linearization.
+//!
+//! The main consumer of tags is key-based rematerialization. Policies such as
+//! [`SaveOnlyTheseNames`](crate::tracing_v2::rematerialization::SaveOnlyTheseNames),
+//! [`SaveAnyNamesButThese`](crate::tracing_v2::rematerialization::SaveAnyNamesButThese), and
+//! [`SaveAndOffloadOnlyTheseNames`](crate::tracing_v2::rematerialization::SaveAndOffloadOnlyTheseNames) decide
+//! whether to save, offload, or recompute each residual of a [`rematerialize`](crate::tracing_v2::rematerialize)d
+//! function by looking at the key of the [`TagOperation`] that produced it, which mirrors the role of
+//! `checkpoint_name` in JAX. Tags carry no other semantics, so they are safe to leave in production programs.
+//!
+//! # Example
+//!
+//! Tagging a traced value stages a `tag` instruction that carries the key and forwards its input:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, Mul, ProgramError, Tag, Trace, TracingContext};
+//! # fn main() -> Result<(), ProgramError> {
+//! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+//!     |input| Ok(input.clone().mul(&input)?.tag("squared")),
+//!     ArrayType::scalar(DataType::F64),
+//! )?;
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:f64[] .
+//!         let %1:f64[] = mul %0 %0
+//!             %2:f64[] = tag [key=squared] %1
+//!         in (%2)"},
+//! );
+//! assert_eq!(program.interpret(Array::scalar(3.0_f64)?)?, Array::scalar(9.0_f64)?);
+//! # Ok(())
+//! # }
+//! ```
+
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::arrays::ArrayType;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -21,10 +65,10 @@ pub const TAG_OPERATION_NAME: &str = "tag";
 /// need.
 #[derive(Clone, Debug)]
 pub struct TagOperation<T: Type> {
-    /// Key tagging the operation's output [`Value`].
+    /// Refer to the documentation of [`key`](Self::key) for more information.
     key: String,
 
-    /// Type universe in which this operation is valid.
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
 
@@ -35,7 +79,7 @@ impl<T: Type> TagOperation<T> {
         Self { key: key.into(), marker: PhantomData }
     }
 
-    /// Returns the key carried by this [`TagOperation`].
+    /// Returns the key that tags the output [`Value`] of this [`TagOperation`].
     #[inline]
     pub fn key(&self) -> &str {
         self.key.as_str()
@@ -73,7 +117,7 @@ impl<T: Type> Operation for TagOperation<T> {
     }
 }
 
-impl ElementwiseOperation for TagOperation<crate::arrays::ArrayType> {
+impl ElementwiseOperation for TagOperation<ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -103,9 +147,9 @@ impl_differentiable_elementwise_operation! {
 
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
-/// differentiation (the [`DifferentiableOperation`] rule re-tags the primal value and passes the tangent value
-/// through), so that it marks the instructions that define linearization residuals, which rematerialization
-/// policies classify by key through the producing [`TagOperation`].
+/// differentiation (the [`DifferentiableOperation`](crate::differentiation::DifferentiableOperation) rule re-tags the
+/// primal value and passes the tangent value through), so that it marks the instructions that define linearization
+/// residuals, which rematerialization policies classify by key through the producing [`TagOperation`].
 pub trait Tag: Sized {
     /// Returns this value unchanged while tagging it with `key`.
     fn tag(self, key: &str) -> Self;
@@ -127,22 +171,26 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> 
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, DataType};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::EmptyRegionDriver;
+    use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
 
     #[test]
     fn test_tag() {
         let operation = TagOperation::<ArrayType>::new("residual");
+        assert_eq!(operation.name(), TAG_OPERATION_NAME);
         assert_eq!(operation.key(), "residual");
+        assert_eq!(operation.input_count(), 1);
         assert_eq!(operation.to_string(), "tag [key=residual]");
     }
 
@@ -215,6 +263,22 @@ mod tests {
                 output_cotangents = [Array::scalar(2.0).unwrap()],
                 input_cotangents = [Array::scalar(2.0).unwrap()],
             }],
+        );
+    }
+
+    #[test]
+    fn test_tag_staging() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.tag("residual")),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = tag [key=residual] %0
+                in (%1)"},
         );
     }
 }

@@ -1,4 +1,55 @@
-//! Debugging operations that print values while preserving their data flow.
+//! Operations that expose intermediate values while a program runs without changing what it computes. Debugging
+//! operations behave as identity functions on their inputs and exist only for their side effects, so they can be
+//! inserted anywhere in a computation, including inside traced and transformed programs, and later removed without
+//! touching the surrounding code. This module provides the following:
+//!
+//!   - The [`Print`] value capability, whose [`print`](Print::print) returns its input unchanged while printing it to
+//!     standard error under a label, and whose [`print_with_effect_class`](Print::print_with_effect_class) selects how
+//!     strongly the print is ordered relative to other I/O.
+//!   - The [`PrintOperation`] that the capability stages. By default it declares the
+//!     [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo) effect, so dead-code elimination never removes it and
+//!     prints appear in program order across all participating devices.
+//!     [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo) keeps program order only among the
+//!     prints executing on the same device, which lets a print inside a `shard_map` body run once per device, and
+//!     [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) retains the print without ordering it at all.
+//!
+//! Program transforms treat prints as identities on their data. Batching prints the whole batch, partial evaluation
+//! prints known inputs when it encounters them and residualizes unknown ones, and differentiation prints the primal
+//! value while passing the tangent through unchanged. Backends decide how the effect is realized; the XLA backend
+//! lowers a print to a host callback that is threaded through a token chain so that ordered prints stay ordered
+//! within one dispatch.
+//!
+//! # Example
+//!
+//! Eager values print immediately, whereas traced values stage a `print` instruction that runs whenever the program
+//! is interpreted or executed. Its output value is the input, so the print is transparent to consumers:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, EffectClass, Mul, Print, ProgramError, Trace, TracingContext,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+//!     |input| {
+//!         let squared = input.clone().mul(&input)?;
+//!         Ok(squared.print_with_effect_class("squared", EffectClass::UnorderedIo))
+//!     },
+//!     ArrayType::scalar(DataType::F64),
+//! )?;
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:f64[] .
+//!         let %1:f64[] = mul %0 %0
+//!             %2:f64[] = print [label=squared, effect_class=unordered_io] %1
+//!         in (%2)"},
+//! );
+//! // Interpreting the program prints `squared = 9` to standard error and returns the squared input.
+//! assert_eq!(program.interpret(Array::scalar(3.0_f64)?)?, Array::scalar(9.0_f64)?);
+//! # Ok(())
+//! # }
+//! ```
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -123,13 +174,20 @@ impl<T: Type> Operation for PrintOperation<T> {
     }
 }
 
-impl<D: Domain> InterpretableOperation<D> for PrintOperation<D::Type> {
-    fn interpret<I: InterpretationDriver<D>>(
+impl ElementwiseOperation for PrintOperation<ArrayType> {
+    #[inline]
+    fn input_count(&self) -> usize {
+        1
+    }
+}
+
+impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
+    fn interpret<D: InterpretationDriver<C>>(
         &self,
-        _context: &D,
-        _driver: &I,
-        inputs: &[D::Value],
-    ) -> Result<Vec<D::Value>, ProgramError> {
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         eprintln!("{}: {}", self.label, inputs[0]);
         Ok(vec![inputs[0].clone()])
@@ -142,13 +200,6 @@ impl<D: Domain> InterpretableOperation<D> for PrintOperation<D::Type> {
 impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
     C::Operation: From<PrintOperation<C::Type>>
 {
-}
-
-impl ElementwiseOperation for PrintOperation<ArrayType> {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
 }
 
 impl_differentiable_elementwise_operation! {
@@ -388,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_print_for_tracer() {
+    fn test_print_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")),
             ArrayType::scalar(DataType::F64),
@@ -406,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_print_for_tracer_with_effect_class() {
+    fn test_print_staging_with_effect_class() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 input.clone().print_with_effect_class("x", EffectClass::UnorderedIo);

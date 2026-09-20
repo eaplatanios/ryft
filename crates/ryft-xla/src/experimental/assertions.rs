@@ -30,14 +30,14 @@ pub(crate) const ASSERT_KIND_ATTRIBUTE: &str = "kind";
 /// Formatting kind for a general assertion with named scalar observations.
 pub(crate) const ASSERT_GENERIC_KIND: &str = "generic";
 
-/// Formatting kind for bounded reporting of failed mapped assertion lanes.
-pub(crate) const ASSERT_LANES_KIND: &str = "lanes";
+/// Formatting kind for bounded reporting of failed assertion elements.
+pub(crate) const ASSERT_ELEMENTS_KIND: &str = "elements";
 
-/// Backend-config attribute containing the maximum number of lanes to report.
+/// Backend-config attribute containing the maximum number of failed elements to report.
 pub(crate) const ASSERT_FAILURE_LIMIT_ATTRIBUTE: &str = "failure_limit";
 
-/// Backend-config attribute containing the number of mapped predicate axes.
-pub(crate) const ASSERT_LANE_RANK_ATTRIBUTE: &str = "lane_rank";
+/// Backend-config attribute containing the rank of the predicate and of its logical extents.
+pub(crate) const ASSERT_PREDICATE_RANK_ATTRIBUTE: &str = "predicate_rank";
 
 /// Backend-config attribute containing a general assertion's literal diagnostic message.
 pub(crate) const ASSERT_MESSAGE_ATTRIBUTE: &str = "message";
@@ -353,8 +353,8 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     }
     let actor = string_attribute(call_frame, ASSERT_ACTOR_ATTRIBUTE)?;
     let kind = string_attribute(call_frame, ASSERT_KIND_ATTRIBUTE)?;
-    if kind == ASSERT_LANES_KIND {
-        return handle_assertion_lanes(call_frame, &buffers, memory);
+    if kind == ASSERT_ELEMENTS_KIND {
+        return handle_assertion_elements(call_frame, &buffers, memory);
     }
     if kind == ASSERT_GENERIC_KIND {
         let count = string_attribute(call_frame, ASSERT_LABEL_COUNT_ATTRIBUTE)?
@@ -497,16 +497,16 @@ fn buffer_element_count(buffer: &FfiBuffer<'_>) -> Result<usize, FfiError> {
     })
 }
 
-/// Computes the row-major offset of a logical lane in a physical assertion buffer.
-fn lane_offset(index: &[usize], dimensions: &[i64]) -> Result<usize, FfiError> {
+/// Computes the row-major offset of a logical element in a physical assertion buffer.
+fn element_offset(index: &[usize], dimensions: &[i64]) -> Result<usize, FfiError> {
     if index.len() != dimensions.len() {
-        return Err(FfiError::invalid_argument("assertion lane rank does not match its buffer"));
+        return Err(FfiError::invalid_argument("assertion element index rank does not match its buffer"));
     }
     index.iter().zip(dimensions).try_fold(0_usize, |offset, (index, extent)| {
         let extent =
             usize::try_from(*extent).map_err(|_| FfiError::invalid_argument("negative assertion buffer extent"))?;
         if *index >= extent {
-            return Err(FfiError::invalid_argument("assertion lane exceeds its physical buffer"));
+            return Err(FfiError::invalid_argument("assertion element index exceeds its physical buffer"));
         }
         offset
             .checked_mul(extent)
@@ -515,8 +515,8 @@ fn lane_offset(index: &[usize], dimensions: &[i64]) -> Result<usize, FfiError> {
     })
 }
 
-/// Reports a bounded set of failing logical lanes, reading observations only after a failure is found.
-fn handle_assertion_lanes(
+/// Reports a bounded set of failing logical elements, reading observations only after a failure is found.
+fn handle_assertion_elements(
     call_frame: &FfiCallFrame<'_>,
     buffers: &[FfiBuffer<'_>],
     memory: AssertionBufferMemory,
@@ -524,19 +524,19 @@ fn handle_assertion_lanes(
     let count = string_attribute(call_frame, ASSERT_LABEL_COUNT_ATTRIBUTE)?
         .parse::<usize>()
         .map_err(|_| FfiError::invalid_argument("invalid assertion diagnostic label count"))?;
-    let rank = string_attribute(call_frame, ASSERT_LANE_RANK_ATTRIBUTE)?
+    let rank = string_attribute(call_frame, ASSERT_PREDICATE_RANK_ATTRIBUTE)?
         .parse::<usize>()
-        .map_err(|_| FfiError::invalid_argument("invalid assertion lane rank"))?;
+        .map_err(|_| FfiError::invalid_argument("invalid assertion predicate rank"))?;
     let limit = string_attribute(call_frame, ASSERT_FAILURE_LIMIT_ATTRIBUTE)?
         .parse::<std::num::NonZeroUsize>()
         .map_err(|_| FfiError::invalid_argument("invalid assertion failure limit"))?
         .get();
     if count.checked_add(rank).and_then(|count| count.checked_add(1)) != Some(buffers.len()) {
-        return Err(FfiError::invalid_argument("assertion lane metadata does not match its inputs"));
+        return Err(FfiError::invalid_argument("assertion element metadata does not match its inputs"));
     }
     let predicate = &buffers[0];
     if predicate.element_type() != FfiBufferType::Predicate || predicate.rank() != rank {
-        return Err(FfiError::invalid_argument("assertion lane predicate has an invalid type or rank"));
+        return Err(FfiError::invalid_argument("assertion predicate has an invalid type or rank"));
     }
     let message = string_attribute(call_frame, ASSERT_MESSAGE_ATTRIBUTE)?;
     let labels = (0..count)
@@ -573,7 +573,7 @@ fn handle_assertion_lanes(
                     })
                 {
                     return Err(FfiError::invalid_argument(
-                        "assertion observation shape does not contain its logical lanes",
+                        "assertion observation shape does not contain its logical elements",
                     ));
                 }
             }
@@ -583,31 +583,31 @@ fn handle_assertion_lanes(
             Ok((unsafe { buffer.data() }, size))
         })
         .collect::<Result<Vec<_>, FfiError>>()?;
-    let lane_count = extents
+    let element_count = extents
         .iter()
         .try_fold(1_usize, |count, extent| count.checked_mul(*extent))
-        .ok_or_else(|| FfiError::invalid_argument("assertion logical lane count overflows"))?;
+        .ok_or_else(|| FfiError::invalid_argument("assertion logical element count overflows"))?;
     let mut failed = Vec::new();
-    let mut failures = 0;
+    let mut failure_count = 0;
     let mut index = vec![0; rank];
-    for lane in 0..lane_count {
-        let mut remaining = lane;
+    for element in 0..element_count {
+        let mut remaining = element;
         for axis in (0..rank).rev() {
             index[axis] = remaining % extents[axis];
             remaining /= extents[axis];
         }
-        if bytes[0][lane_offset(&index, predicate.dimensions())?] == 0 {
-            failures += 1;
+        if bytes[0][element_offset(&index, predicate.dimensions())?] == 0 {
+            failure_count += 1;
             if failed.len() < limit {
                 failed.push(index.clone());
             }
         }
     }
-    if failures == 0 {
+    if failure_count == 0 {
         return Ok(());
     }
     let bytes = buffer_bytes(&observation_sources, memory)?;
-    let lanes = failed
+    let failures = failed
         .into_iter()
         .map(|index| {
             let observations = labels
@@ -616,19 +616,20 @@ fn handle_assertion_lanes(
                 .zip(&bytes)
                 .map(|((label, buffer), bytes)| {
                     let width = observation_byte_count(buffer.element_type())?;
-                    let offset = if buffer.rank() == 0 { 0 } else { lane_offset(&index, buffer.dimensions())? } * width;
+                    let offset =
+                        if buffer.rank() == 0 { 0 } else { element_offset(&index, buffer.dimensions())? } * width;
                     Ok((
                         (*label).to_owned(),
                         format_observation(buffer.element_type(), &bytes[offset..offset + width])?,
                     ))
                 })
                 .collect::<Result<Vec<_>, FfiError>>()?;
-            Ok(ryft_core::AssertionLane { index, observations })
+            Ok(ryft_core::AssertionFailure { index, observations })
         })
         .collect::<Result<Vec<_>, FfiError>>()?;
-    let omitted = failures - lanes.len();
+    let omitted = failure_count - failures.len();
     Err(FfiError::invalid_argument(
-        ryft_core::AssertionError::FailedLanes { message: message.to_owned(), lanes, omitted }.to_string(),
+        ryft_core::AssertionError::FailedElements { message: message.to_owned(), failures, omitted }.to_string(),
     ))
 }
 
@@ -965,12 +966,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_offset() {
-        assert_eq!(lane_offset(&[1, 2], &[3, 5]).unwrap(), 7);
-        assert_eq!(lane_offset(&[], &[]).unwrap(), 0);
-        assert!(lane_offset(&[1], &[3, 5]).is_err());
-        assert!(lane_offset(&[3, 2], &[3, 5]).is_err());
-        assert!(lane_offset(&[0], &[-1]).is_err());
+    fn test_element_offset() {
+        assert_eq!(element_offset(&[1, 2], &[3, 5]).unwrap(), 7);
+        assert_eq!(element_offset(&[], &[]).unwrap(), 0);
+        assert!(element_offset(&[1], &[3, 5]).is_err());
+        assert!(element_offset(&[3, 2], &[3, 5]).is_err());
+        assert!(element_offset(&[0], &[-1]).is_err());
     }
 
     #[test]

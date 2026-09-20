@@ -53,10 +53,10 @@ use ryft_mlir::{
 use crate::ToMlir;
 use crate::experimental::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_CONCATENATE_KIND, ASSERT_CUSTOM_CALL_TARGET,
-    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_FAILURE_LIMIT_ATTRIBUTE,
-    ASSERT_GENERIC_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LABEL_COUNT_ATTRIBUTE, ASSERT_LANE_RANK_ATTRIBUTE,
-    ASSERT_LANES_KIND, ASSERT_LEFT_ATTRIBUTE, ASSERT_MESSAGE_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_PAD_KIND,
-    ASSERT_POW_KIND, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
+    ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_ELEMENTS_KIND,
+    ASSERT_FAILURE_LIMIT_ATTRIBUTE, ASSERT_GENERIC_KIND, ASSERT_KIND_ATTRIBUTE, ASSERT_LABEL_COUNT_ATTRIBUTE,
+    ASSERT_LEFT_ATTRIBUTE, ASSERT_MESSAGE_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_PAD_KIND, ASSERT_POW_KIND,
+    ASSERT_PREDICATE_RANK_ATTRIBUTE, ASSERT_REM_KIND, ASSERT_RESHAPE_KIND, ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND,
 };
 use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -4092,8 +4092,9 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     Ok(())
 }
 
-/// Emits an assertion with a literal message and named observations. Bounded lane reports carry logical extents. Diagnostic buffers retain their
-/// element types so unsigned values and floating-point values reach the callback without lossy conversions.
+/// Emits an assertion with a literal message and named observations. Bounded element reports carry logical
+/// extents. Diagnostic buffers retain their element types so unsigned values and floating-point values reach the
+/// callback without lossy conversions.
 fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     actor: &str,
     message: &str,
@@ -4112,7 +4113,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(actor)),
         context.named_attribute(
             context.identifier(ASSERT_KIND_ATTRIBUTE),
-            context.string_attribute(if failure_limit.is_some() { ASSERT_LANES_KIND } else { ASSERT_GENERIC_KIND }),
+            context.string_attribute(if failure_limit.is_some() { ASSERT_ELEMENTS_KIND } else { ASSERT_GENERIC_KIND }),
         ),
         context.named_attribute(context.identifier(ASSERT_MESSAGE_ATTRIBUTE), context.string_attribute(message)),
         context.named_attribute(
@@ -4150,7 +4151,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
             context.string_attribute(limit.get().to_string().as_str()),
         ));
         attributes.push(context.named_attribute(
-            context.identifier(ASSERT_LANE_RANK_ATTRIBUTE),
+            context.identifier(ASSERT_PREDICATE_RANK_ATTRIBUTE),
             context.string_attribute(rank.to_string().as_str()),
         ));
         for axis in 0..rank {

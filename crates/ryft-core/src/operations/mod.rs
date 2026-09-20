@@ -25,11 +25,11 @@ pub mod random;
 pub mod references;
 pub mod sharding;
 pub mod sort;
-pub mod tag;
+pub mod tagging;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
 pub use assertions::{
-    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionLane, AssertionValue,
+    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionFailure, AssertionValue,
 };
 pub use collectives::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind, forward_collective_to_parent};
 pub use compare::*;
@@ -70,7 +70,7 @@ pub use references::{
     ReferenceWriteOperation,
 };
 pub use sharding::*;
-pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
+pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
 /// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations.
