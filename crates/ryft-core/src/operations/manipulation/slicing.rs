@@ -1161,7 +1161,7 @@ pub trait UpdateSlice: Sized {
 
 impl UpdateSlice for ArrayType {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
-        validate_update_compatibility(UPDATE_SLICE_OPERATION_NAME, self, update)?;
+        validate_update_slice_inputs(UPDATE_SLICE_OPERATION_NAME, self, update)?;
 
         let rank = self.rank();
         if start_indices.len() != rank {
@@ -1214,7 +1214,7 @@ impl UpdateSlice for ArrayType {
 
         // The output is distributed like the input (the update is written in place). The input's placement
         // and reduction state carry through, with the update's varying-manual axes folded in.
-        let sharding = update_slice_output_sharding(self, update, UPDATE_SLICE_OPERATION_NAME)?;
+        let sharding = infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, self, update)?;
         self.clone().with_sharding(sharding).map_err(|error| {
             TypeError::invalid(format!("`{UPDATE_SLICE_OPERATION_NAME}` output type is invalid: {error}")).into()
         })
@@ -2682,7 +2682,7 @@ impl DynamicSlice for ArrayType {
             .into());
         }
 
-        validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self, start_indices)?;
+        validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self, start_indices)?;
 
         for (axis, &size) in sizes.iter().enumerate() {
             // Clamping can keep the window in bounds only if it fits every possible input extent. Static axes use
@@ -2711,7 +2711,7 @@ impl DynamicSlice for ArrayType {
 
         let output_dimensions = sizes.iter().map(|size| Dimension::Static(*size)).collect::<Vec<_>>();
         if output_dimensions.as_slice() == self.shape().dimensions() {
-            return indexed_slice_output_type(self.clone(), start_indices, DYNAMIC_SLICE_OPERATION_NAME);
+            return infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, self.clone(), start_indices);
         }
 
         let sharding = self.resized_sharding(&output_dimensions, DYNAMIC_SLICE_OPERATION_NAME)?;
@@ -2722,7 +2722,7 @@ impl DynamicSlice for ArrayType {
                 TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` output type is invalid: {error}"))
             })?;
 
-        indexed_slice_output_type(output_type, start_indices, DYNAMIC_SLICE_OPERATION_NAME)
+        infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output_type, start_indices)
     }
 }
 
@@ -3968,7 +3968,7 @@ impl DynamicUpdateSlice for ArrayType {
         start_indices: &[Self],
         _allow_negative_indices: bool,
     ) -> Result<ArrayType, ProgramError> {
-        validate_update_compatibility(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, update)?;
+        validate_update_slice_inputs(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, update)?;
 
         let rank = self.rank();
         if start_indices.len() != rank {
@@ -3981,7 +3981,7 @@ impl DynamicUpdateSlice for ArrayType {
             .into());
         }
 
-        validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, start_indices)?;
+        validate_dynamic_slice_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, start_indices)?;
         for axis in 0..rank {
             let update_dimension = update.dimension(axis);
             let Dimension::Static(update_size) = update_dimension else {
@@ -4016,12 +4016,12 @@ impl DynamicUpdateSlice for ArrayType {
 
         // The output is distributed like the input (the update is written in place). The input's placement
         // and reduction state carry through, with the update's varying-manual axes folded in.
-        let sharding = update_slice_output_sharding(self, update, DYNAMIC_UPDATE_SLICE_OPERATION_NAME)?;
+        let sharding = infer_update_slice_output_sharding(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, update)?;
         let output_type = self.clone().with_sharding(sharding).map_err(|error| {
             TypeError::invalid(format!("`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` output type is invalid: {error}"))
         })?;
 
-        indexed_slice_output_type(output_type, start_indices, DYNAMIC_UPDATE_SLICE_OPERATION_NAME)
+        infer_dynamic_slice_output_type(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, output_type, start_indices)
     }
 }
 
@@ -4119,11 +4119,119 @@ impl Array {
     }
 }
 
+/// Validates the input/update agreement shared by the static and dynamic update slices (i.e., equal element data types,
+/// one memory space, and equal ranks). Start-index arity is checked by each caller with its own wording.
+fn validate_update_slice_inputs(
+    operation_name: &'static str,
+    input: &ArrayType,
+    update: &ArrayType,
+) -> Result<(), ProgramError> {
+    if input.data_type() != update.data_type() {
+        return Err(TypeError::invalid(format!(
+            "`{}` input data type `{}` does not match update data type `{}`",
+            operation_name,
+            input.data_type(),
+            update.data_type(),
+        ))
+        .into());
+    }
+
+    if input.memory() != update.memory() {
+        return Err(TypeError::invalid(format!(
+            "`{}` input and update must share one memory space but reside in `{}` and `{}`",
+            operation_name,
+            input.memory(),
+            update.memory(),
+        ))
+        .into());
+    }
+
+    if update.rank() != input.rank() {
+        return Err(TypeError::invalid(format!(
+            "`{}` update has rank {} but input has rank {}",
+            operation_name,
+            update.rank(),
+            input.rank(),
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Computes the output [`Sharding`] for an in-place update (i.e., [`UpdateSlice`] or [`DynamicUpdateSlice`]).
+/// Because the update is written into the input without resharding, the two must agree on placement and reduction state
+/// wherever an [`Explicit`](crate::MeshAxisType::Explicit) mesh axis is involved. Differences confined to `Manual` and
+/// `Auto` axes are tolerated (i.e., left to the underlying backend). The output keeps the input's sharding, except that
+/// the update's [`varying_manual_axes`](Sharding::varying_manual_axes) are unioned in (the written region may vary over
+/// manual axes the input does not, so the result does too). An unsharded input acquires replicated placement on the
+/// update's mesh when that is needed to represent the update's manual-axis variation.
+fn infer_update_slice_output_sharding(
+    operation_name: &'static str,
+    input: &ArrayType,
+    update: &ArrayType,
+) -> Result<Option<Sharding>, TypeError> {
+    let input_unreduced = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+    let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
+    let update_unreduced = update.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+    let update_reduced = update.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
+    if input_unreduced != update_unreduced || input_reduced != update_reduced {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` input and update must carry identical reduction state",
+        )));
+    }
+
+    let Some(input_sharding) = input.sharding() else {
+        return update
+            .sharding()
+            .filter(|sharding| !sharding.varying_manual_axes().is_empty())
+            .map(|sharding| {
+                Sharding::replicated(sharding.mesh().clone(), input.rank())
+                    .with_varying_manual_axes(sharding.varying_manual_axes().clone())
+                    .map_err(|error| {
+                        TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}"))
+                    })
+            })
+            .transpose();
+    };
+
+    let Some(update_sharding) = update.sharding() else {
+        return Ok(Some(input_sharding.clone()));
+    };
+
+    if input_sharding.mesh() != update_sharding.mesh() {
+        return Err(TypeError::invalid(format!("`{operation_name}` input and update must use the same mesh")));
+    }
+
+    if input_sharding.conflicts_on_explicit_axes_with(update_sharding) {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` input and update must be sharded identically, but got `{input_sharding}` and \
+             `{update_sharding}`"
+        )));
+    }
+
+    if update_sharding.varying_manual_axes().is_subset(input_sharding.varying_manual_axes()) {
+        return Ok(Some(input_sharding.clone()));
+    }
+
+    let varying_manual_axes = input_sharding
+        .varying_manual_axes()
+        .union(update_sharding.varying_manual_axes())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    input_sharding
+        .clone()
+        .with_varying_manual_axes(varying_manual_axes)
+        .map(Some)
+        .map_err(|error| TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}")))
+}
+
 /// Validates the scalar integer start-index input types of a dynamic slicing operation. Each index type must be a
 /// rank-0 integer type, all indices must share one integer type, and every index must reside in the input memory space.
 /// The `operation_name` parameter selects the reported operation name because this helper serves both
 /// [`DynamicSliceOperation`] and [`DynamicUpdateSliceOperation`].
-fn validate_start_index_types(
+fn validate_dynamic_slice_start_index_types(
     operation_name: &'static str,
     input_type: &ArrayType,
     index_types: &[ArrayType],
@@ -4187,10 +4295,10 @@ fn validate_start_index_types(
 /// Carries the distribution of dynamic start indices into the result of a slicing operation. Index values are discrete
 /// control inputs and so their reduction state is invalid, while variation over manual mesh axes makes the selected or
 /// updated result vary over the same axes.
-fn indexed_slice_output_type(
+fn infer_dynamic_slice_output_type(
+    operation_name: &'static str,
     output_type: ArrayType,
     indices: &[ArrayType],
-    operation_name: &'static str,
 ) -> Result<ArrayType, ProgramError> {
     // Every sharded start index must share one mesh with the output and with each other, whether or not it changes the
     // output placement, so the check does not depend on index order or on whether the array is already sharded.
@@ -4238,8 +4346,6 @@ fn indexed_slice_output_type(
         .map_err(|error| TypeError::invalid(format!("`{operation_name}` output type is invalid: {error}")).into())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates that a [`DynamicSlice`] call supplies one start index and one size per input axis,
 /// naming the list that is wrong.
 fn validate_dynamic_slice_bound_counts(rank: usize, start_count: usize, size_count: usize) -> Result<(), ProgramError> {
@@ -4254,100 +4360,7 @@ fn validate_dynamic_slice_bound_counts(rank: usize, start_count: usize, size_cou
     Ok(())
 }
 
-/// Returns the output [`Sharding`] for an in-place update ([`UpdateSlice`] / [`DynamicUpdateSlice`]). Because the
-/// update is written into the input without resharding, the two must agree on placement and reduction state wherever an
-/// [`Explicit`](crate::arrays::MeshAxisType::Explicit) mesh axis is involved; differences confined to `Manual`/`Auto`
-/// axes are tolerated (left to `shard_map` / the compiler). The output keeps the input's sharding, except that the
-/// update's [`varying_manual_axes`](Sharding::varying_manual_axes) are unioned in: the written region may vary over
-/// manual axes the input does not, so the result does too. An unsharded input acquires replicated placement on the
-/// update's mesh when that is needed to represent the update's manual-axis variation.
-fn update_slice_output_sharding(
-    input: &ArrayType,
-    update: &ArrayType,
-    operation_name: &'static str,
-) -> Result<Option<Sharding>, TypeError> {
-    let input_unreduced = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
-    let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-    let update_unreduced = update.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
-    let update_reduced = update.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-    if input_unreduced != update_unreduced || input_reduced != update_reduced {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input and update must carry identical reduction state",
-        )));
-    }
-    let Some(input_sharding) = input.sharding() else {
-        return update
-            .sharding()
-            .filter(|sharding| !sharding.varying_manual_axes().is_empty())
-            .map(|sharding| {
-                Sharding::replicated(sharding.mesh().clone(), input.rank())
-                    .with_varying_manual_axes(sharding.varying_manual_axes().clone())
-                    .map_err(|error| {
-                        TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}"))
-                    })
-            })
-            .transpose();
-    };
-    let Some(update_sharding) = update.sharding() else {
-        return Ok(Some(input_sharding.clone()));
-    };
-    if input_sharding.mesh() != update_sharding.mesh() {
-        return Err(TypeError::invalid(format!("`{operation_name}` input and update must use the same mesh")));
-    }
-    if input_sharding.conflicts_on_explicit_axes_with(update_sharding) {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input and update must be sharded identically, but got `{input_sharding}` and \
-            `{update_sharding}`"
-        )));
-    }
-    if update_sharding.varying_manual_axes().is_subset(input_sharding.varying_manual_axes()) {
-        return Ok(Some(input_sharding.clone()));
-    }
-    let varying_manual_axes = input_sharding
-        .varying_manual_axes()
-        .union(update_sharding.varying_manual_axes())
-        .cloned()
-        .collect::<Vec<_>>();
-    input_sharding
-        .clone()
-        .with_varying_manual_axes(varying_manual_axes)
-        .map(Some)
-        .map_err(|error| TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}")))
-}
-
-/// Validates the input/update agreement shared by the static and dynamic update slices: equal element data types, one
-/// memory space, and equal ranks. Start-index arity is checked by each caller with its own wording.
-fn validate_update_compatibility(
-    operation_name: &'static str,
-    input: &ArrayType,
-    update: &ArrayType,
-) -> Result<(), ProgramError> {
-    if input.data_type() != update.data_type() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input data type `{}` does not match update data type `{}`",
-            input.data_type(),
-            update.data_type(),
-        ))
-        .into());
-    }
-    if input.memory() != update.memory() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` input and update must share one memory space but reside in `{}` and `{}`",
-            input.memory(),
-            update.memory(),
-        ))
-        .into());
-    }
-    if update.rank() != input.rank() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` update has rank {} but input has rank {}",
-            update.rank(),
-            input.rank(),
-        ))
-        .into());
-    }
-    Ok(())
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Applies a single-output `operation` independently per batch item and restacks the results along a fresh leading
 /// batch axis: every input is realigned so any mapped batch axis sits at the leading physical axis, item `item` of each
@@ -9545,22 +9558,26 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_start_index_types() {
+    fn test_validate_dynamic_slice_start_index_types() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("n", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input = ArrayType::new_static(DataType::F32, [4]);
         let index = ArrayType::scalar(DataType::I32);
 
         // Scalar integers of one type in the input's memory space pass, including an empty index list.
-        assert_eq!(validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[]), Ok(()));
+        assert_eq!(validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[]), Ok(()));
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[index.clone(), index.clone()]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &input,
+                &[index.clone(), index.clone()]
+            ),
             Ok(()),
         );
 
         // Each index must be a rank-0 integer in the input's memory space; the caller's operation name is reported.
         assert_eq!(
-            validate_start_index_types(
+            validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
                 &[ArrayType::new_static(DataType::I32, [1])]
@@ -9571,7 +9588,7 @@ mod tests {
             .into()),
         );
         assert_eq!(
-            validate_start_index_types(
+            validate_dynamic_slice_start_index_types(
                 DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 &input,
                 &[ArrayType::scalar(DataType::F32)]
@@ -9582,7 +9599,7 @@ mod tests {
             .into()),
         );
         assert_eq!(
-            validate_start_index_types(
+            validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
                 &[index.clone().with_memory(Memory::Host { pinned: true })],
@@ -9609,17 +9626,17 @@ mod tests {
         ))
         .into());
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[unreduced_index]),
+            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[unreduced_index]),
             reduction_state_error
         );
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[reduced_index]),
+            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[reduced_index]),
             reduction_state_error
         );
         let sharded_input = input.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         let other_index = index.clone().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &sharded_input, &[other_index]),
+            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &sharded_input, &[other_index]),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must use the same mesh"
             ))
@@ -9634,7 +9651,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &unreduced_input, &[varying_index]),
+            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &unreduced_input, &[varying_index]),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must be invariant when the input carries reduction \
                  state"
@@ -9643,13 +9660,17 @@ mod tests {
         );
         let replicated_index = index.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         assert_eq!(
-            validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &unreduced_input, &[replicated_index]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &unreduced_input,
+                &[replicated_index]
+            ),
             Ok(()),
         );
 
         // All indices share the first index's integer type.
         assert_eq!(
-            validate_start_index_types(
+            validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
                 &[index, ArrayType::scalar(DataType::I64)]
@@ -9663,7 +9684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_slice_output_type() {
+    fn test_infer_dynamic_slice_output_type() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
@@ -9682,16 +9703,16 @@ mod tests {
         // Unsharded and replicated indices leave an unsharded output untouched; only variation over manual axes places
         // it, as a replicated sharding on the indices' mesh carrying that variation.
         assert_eq!(
-            indexed_slice_output_type(output.clone(), &[index], DYNAMIC_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[index]),
             Ok(output.clone())
         );
         assert_eq!(
-            indexed_slice_output_type(output.clone(), &[replicated_index.clone()], DYNAMIC_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[replicated_index.clone()]),
             Ok(output.clone()),
         );
         let acquired = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
-            indexed_slice_output_type(output.clone(), &[varying_index.clone()], DYNAMIC_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[varying_index.clone()]),
             Ok(output.clone().with_sharding(acquired).unwrap()),
         );
 
@@ -9699,15 +9720,19 @@ mod tests {
         let unreduced = Sharding::replicated(mesh, 1).with_unreduced_axes(["m"]).unwrap();
         let sharded_output = output.clone().with_sharding(unreduced.clone()).unwrap();
         assert_eq!(
-            indexed_slice_output_type(
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
                 sharded_output.clone(),
-                &[replicated_index.clone()],
-                DYNAMIC_SLICE_OPERATION_NAME
+                &[replicated_index.clone()]
             ),
             Ok(sharded_output.clone()),
         );
         assert_eq!(
-            indexed_slice_output_type(sharded_output.clone(), &[varying_index.clone()], DYNAMIC_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                sharded_output.clone(),
+                &[varying_index.clone()]
+            ),
             Ok(output.clone().with_sharding(unreduced.with_varying_manual_axes(["x"]).unwrap()).unwrap()),
         );
 
@@ -9717,27 +9742,27 @@ mod tests {
             Err(TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must use the same mesh"))
                 .into());
         assert_eq!(
-            indexed_slice_output_type(sharded_output, &[other_index.clone()], DYNAMIC_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, sharded_output, &[other_index.clone()]),
             same_mesh_error,
         );
         assert_eq!(
-            indexed_slice_output_type(
-                output.clone(),
-                &[replicated_index.clone(), other_index.clone()],
+            infer_dynamic_slice_output_type(
                 DYNAMIC_SLICE_OPERATION_NAME,
-            ),
-            same_mesh_error,
-        );
-        assert_eq!(
-            indexed_slice_output_type(
                 output.clone(),
-                &[other_index.clone(), replicated_index],
-                DYNAMIC_SLICE_OPERATION_NAME
+                &[replicated_index.clone(), other_index.clone()]
             ),
             same_mesh_error,
         );
         assert_eq!(
-            indexed_slice_output_type(output, &[other_index, varying_index], DYNAMIC_UPDATE_SLICE_OPERATION_NAME),
+            infer_dynamic_slice_output_type(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                output.clone(),
+                &[other_index.clone(), replicated_index]
+            ),
+            same_mesh_error,
+        );
+        assert_eq!(
+            infer_dynamic_slice_output_type(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, output, &[other_index, varying_index]),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start indices must use the same mesh"
             ))
@@ -9746,7 +9771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_slice_output_sharding() {
+    fn test_infer_update_slice_output_sharding() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
@@ -9758,13 +9783,16 @@ mod tests {
 
         // Unsharded inputs stay unsharded unless the update varies over manual axes, in which case the output acquires
         // a replicated placement on the update's mesh carrying that variation. Reduction state must agree first.
-        assert_eq!(update_slice_output_sharding(&input, &update, UPDATE_SLICE_OPERATION_NAME), Ok(None));
+        assert_eq!(infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &update), Ok(None));
         let replicated_update = update.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
-        assert_eq!(update_slice_output_sharding(&input, &replicated_update, UPDATE_SLICE_OPERATION_NAME), Ok(None));
+        assert_eq!(
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &replicated_update),
+            Ok(None)
+        );
         let varying = Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["m"]).unwrap();
         let varying_update = update.clone().with_sharding(varying.clone()).unwrap();
         assert_eq!(
-            update_slice_output_sharding(&input, &varying_update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &varying_update),
             Ok(Some(varying.clone())),
         );
         let unreduced_input = input
@@ -9772,7 +9800,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            update_slice_output_sharding(&unreduced_input, &update, DYNAMIC_UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &unreduced_input, &update),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and update must carry identical reduction state"
             ))),
@@ -9785,30 +9813,34 @@ mod tests {
                 .unwrap();
         let sharded_input = input.clone().with_sharding(sharded.clone()).unwrap();
         assert_eq!(
-            update_slice_output_sharding(&sharded_input, &update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &update),
             Ok(Some(sharded.clone())),
         );
         let sharded_varying = sharded.clone().with_varying_manual_axes(["m"]).unwrap();
         let sharded_varying_input = input.clone().with_sharding(sharded_varying.clone()).unwrap();
         let sharded_varying_update = update.clone().with_sharding(sharded_varying.clone()).unwrap();
         assert_eq!(
-            update_slice_output_sharding(&sharded_varying_input, &sharded_varying_update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(
+                UPDATE_SLICE_OPERATION_NAME,
+                &sharded_varying_input,
+                &sharded_varying_update
+            ),
             Ok(Some(sharded_varying.clone())),
         );
         assert_eq!(
-            update_slice_output_sharding(&sharded_input, &sharded_varying_update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &sharded_varying_update),
             Ok(Some(sharded_varying)),
         );
         let other_update = update.clone().with_sharding(Sharding::replicated(other_mesh, 2)).unwrap();
         assert_eq!(
-            update_slice_output_sharding(&sharded_input, &other_update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &other_update),
             Err(TypeError::invalid(format!("`{UPDATE_SLICE_OPERATION_NAME}` input and update must use the same mesh"))),
         );
         let conflicting =
             Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
         let conflicting_update = update.with_sharding(conflicting.clone()).unwrap();
         assert_eq!(
-            update_slice_output_sharding(&sharded_input, &conflicting_update, UPDATE_SLICE_OPERATION_NAME),
+            infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &conflicting_update),
             Err(TypeError::invalid(format!(
                 "`{UPDATE_SLICE_OPERATION_NAME}` input and update must be sharded identically, but got `{sharded}` \
                  and `{conflicting}`"
