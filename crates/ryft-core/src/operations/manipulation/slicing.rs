@@ -1421,10 +1421,10 @@ impl DynamicSliceOperation<ArrayIrType> {
                 Dimension::Static(size) => size,
                 Dimension::Dynamic(variable) => variable.bounds().lower(),
             };
-            if !maximum_start
+            if maximum_start
                 .zip(span)
                 .and_then(|(start, span)| start.checked_add(span))
-                .is_some_and(|limit| limit <= minimum_input)
+                .is_none_or(|limit| limit > minimum_input)
             {
                 return Ok(false);
             }
@@ -1516,8 +1516,6 @@ impl DynamicSliceOperation<ArrayIrType> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> Display for DynamicSliceOperation<T>
 where
     Self: Operation,
@@ -1528,7 +1526,7 @@ where
     }
 }
 
-impl Operation for DynamicSliceOperation {
+impl Operation for DynamicSliceOperation<ArrayType> {
     type Type = ArrayType;
 
     #[inline]
@@ -1544,8 +1542,8 @@ impl Operation for DynamicSliceOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         if input_types.is_empty() {
             return Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects an array input followed by its start index inputs but got no \
-                 inputs"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects an array input followed by its start index inputs \
+                 but got no inputs",
             )));
         }
         match input_types[0].dynamic_slice(&input_types[1..], self.sizes.as_slice()) {
@@ -1561,9 +1559,9 @@ impl Operation for DynamicSliceOperation {
     }
 }
 
-impl_reference_dischargeable_operation!(@reference_free DynamicSliceOperation);
+impl_reference_dischargeable_operation!(@reference_free DynamicSliceOperation<ArrayType>);
 
-impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C> for DynamicSliceOperation {
+impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C> for DynamicSliceOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -1576,15 +1574,19 @@ impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C>
     }
 }
 
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicSliceOperation where
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicSliceOperation<ArrayType> where
     C::Operation: From<DynamicSliceOperation>
 {
 }
 
-impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation
+impl<
+    C: Context<
+            Type = ArrayType,
+            Value: ZeroLike + Broadcast + Transpose + Slice + Reshape + Reshard + Concatenate + Gather,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation<ArrayType>
 where
-    C: Context<Type = ArrayType>,
-    C::Value: ZeroLike + Broadcast + Transpose + Slice + Reshape + Reshard + Concatenate + Gather,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -1594,29 +1596,24 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // Batched starts are packed into one gather index vector per item. Mapped sources use paired gather batch
-        // dimensions so
-        // each item reads only its own source. Explicit-layout inputs retain per-item expansion, which extracts each
-        // input/start tuple and stacks its slice along a leading batch axis. Both paths use existing capabilities in
-        // eager and
-        // tracing contexts.
+        // dimensions so each item reads only its own source. Explicit-layout inputs retain per-item expansion, which
+        // extracts each input/start tuple and stacks its slice along a leading batch axis. Both paths use existing
+        // capabilities in eager and tracing contexts.
         //
         // Replicated start indices keep the structural fast path: a batched input keeps its batch axis by slicing it
-        // fully, so
-        // the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
-        // derived from
-        // an existing index input via [`ZeroLike`] so the inserted index carries the same scalar integer type. Rank-0
-        // inputs
-        // have no index inputs to donate a zero index, but a rank-0 dynamic slice is the identity map, so the batched
-        // input
-        // passes through unchanged.
-        // Static or clamped windows cannot describe a changed ragged extent.
+        // fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for
+        // it, derived from an existing index input via `ZeroLike` so the inserted index carries the same scalar integer
+        // type. Rank-0 inputs have no index inputs to donate a zero index, but a rank-0 dynamic slice is the identity
+        // map, so the batched input passes through unchanged. Static or clamped windows cannot describe a changed
+        // ragged extent.
+        check_count!("input", inputs, 1 + self.sizes().len(), ProgramError);
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
             }
             .into());
         }
-        check_count!("input", inputs, 1 + self.sizes().len(), ProgramError);
+
         let batch_axes = inputs.iter().map(|input| input.batch_axis_position()).collect::<Vec<_>>();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1..].iter().any(Option::is_some) {
@@ -1642,16 +1639,18 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let indices = C::Value::concatenate(&indices, 1)?;
+
                 // Paired batching dimensions select source item `i` with index vector `i`, without adding item numbers
                 // to the integer indices. In particular, this does not narrow `u64` starts or require a batch extent to
-                // fit in the index element type. The batch axis contributes no
-                // output window dimension; the index batch axis supplies that leading output dimension.
+                // fit in the index element type. The batch axis contributes no output window dimension; the index batch
+                // axis supplies that leading output dimension.
                 let mapped_source = batch_axes[0].is_some();
                 let source = if mapped_source {
                     P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone()
                 } else {
                     inputs[0].value().clone()
                 };
+
                 let mut sizes = self.sizes.clone();
                 let dimensions = if mapped_source {
                     // Empty batches need a zero window to stay within the empty source batch axis.
@@ -1669,12 +1668,14 @@ where
                         (0..self.sizes.len()).collect(),
                     )
                 };
+
                 let options = GatherOptions::new()
                     .with_mode(GatherMode::Clip)
                     .with_output_sharding(output_type.sharding().cloned());
                 let output = source.gather(&indices, &dimensions, &sizes, &options)?;
                 return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?].into());
             }
+
             return Ok(batch_by_item_expansion(
                 context,
                 DYNAMIC_SLICE_OPERATION_NAME,
@@ -1683,24 +1684,28 @@ where
                 axis_size.ok_or_else(|| ProgramError::UnsupportedOperation {
                     message: format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` batching with mapped start indices requires a statically \
-                         known mapped extent"
+                         known mapped extent",
                     ),
                 })?,
             )?
             .into());
         }
+
         let Some(batch_axis) = batch_axes[0] else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
+
         if self.sizes().is_empty() {
             // An empty size list is an identity only for a scalar per-item input. The shortcut bypasses the
             // parent bind, so validate the original unbatched call before returning its input unchanged.
             self.infer_output_types(&inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>(), &[])?;
             return Ok(vec![inputs[0].clone()].into());
         }
+
         let axis_size = axis_size.ok_or_else(|| ProgramError::UnsupportedOperation {
             message: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` batching requires a statically known mapped extent"),
         })?;
+
         let mut sizes = self.sizes().to_vec();
         sizes.insert(batch_axis, axis_size);
         let zero_index = ArrayBatch::replicated(inputs[1].value().zero_like()?);
@@ -1717,13 +1722,13 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<DynamicSliceOperation>,
         C::Value: DynamicSlice,
+        C::Operation: From<DynamicSliceOperation>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for [`DynamicSliceOperation`]: `dynamic_slice` is linear in the input, and the scalar
-            // start indices are non-differentiated primal input edges, so the tangent slices the input tangent at the
-            // same primal start indices. A zero input tangent yields a typed zero output tangent.
+            // `dynamic_slice` is linear in the input, and the scalar start indices are non-differentiated primal input
+            // edges, so the tangent slices the input tangent at the same primal start indices. A zero input tangent
+            // yields a typed zero output tangent.
             let (input, start_indices) =
                 inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
             let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
@@ -1749,23 +1754,22 @@ impl_differentiable_operation! {
             + From<DynamicUpdateSliceOperation>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
-            // (inputs 1 onward) have no tangent space, so in a valid pushforward they are the known inputs and the
-            // sliced input (input 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)`
-            // transposes by scattering the output cotangent back into a zero array of the input type at the same start
-            // indices, i.e. a dynamic update-slice at those indices. The transpose reads the known start indices from
-            // the pullback boundary and stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains
-            // the indices as regular SSA residuals. The start indices receive structural zeros, and a zero output
-            // cotangent stays a structural zero.
+            // The scalar integer start indices (i.e., inputs 1 onward) have no tangent space, so in a valid pushforward
+            // they are the known inputs and the sliced input (i.e., input 0) is the linear one. The forward map
+            // `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output cotangent back into a
+            // zero array of the input type at the same start indices (i.e. a dynamic update-slice at those indices).
+            // The transpose reads the known start indices from the pullback boundary and stages an ordinary
+            // `DynamicUpdateSliceOperation`, so linearization retains the indices as regular Single Static Assignment
+            // (SSA) residuals. The start indices receive structural zeros, and a zero output cotangent stays a
+            // structural zero.
             //
-            // **Contract:** this homogeneous rule requires a statically shaped input. The update target is a zero of
-            // the input's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class
+            // **Contract:** This homogeneous rule requires a statically shaped input. The update target is a zero
+            // of the input's cotangent type, and the homogeneous `ArrayType` operation family owns no first-class
             // dimension operations, so it has no constructor that can supply a runtime extent for that zero. A
-            // dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed
-            // [`ArrayIrType`](crate::ArrayIrType) programs are unaffected: the
-            // [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a dynamically shaped
-            // dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
-            // zero from the retained exact extents.
+            // dynamically shaped input is therefore rejected here with an exact diagnostic. Mixed `ArrayIrType`
+            // programs are unaffected as the `MemberDifferentiableOperation` rule routes a dynamically shaped dynamic
+            // slice into a residual-carrying `LinearCallOperation` whose transpose region rebuilds the same zero from
+            // the retained exact extents.
             if inputs.is_empty() {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             }
@@ -1784,6 +1788,7 @@ impl_differentiable_operation! {
                         })
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
+
                 // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                 // contract explicitly instead of letting a dynamic input surface the constructor's own diagnostic.
                 let input_cotangent_type = inputs[0].r#type().cotangent()?;
@@ -1794,6 +1799,7 @@ impl_differentiable_operation! {
                     ))
                     .into());
                 }
+
                 let zeros = MaybeZero::Zero(input_cotangent_type).materialize(&**context)?;
                 let mut inputs = Vec::with_capacity(2 + start_indices.len());
                 inputs.push(zeros);
@@ -1808,17 +1814,19 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C> MemberDifferentiableOperation<C> for DynamicSliceOperation
+impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for DynamicSliceOperation<ArrayType>
 where
-    C: Context<Type = ArrayIrType>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation:
-        From<DimensionSizeOperation> + From<LinearCallOperation<ArrayIrType>> + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ZeroOperation<ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                           + From<DynamicSliceOperation>
+                           + From<DynamicUpdateSliceOperation>
+                           + From<ZeroOperation<ArrayType>>,
+        >,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1826,9 +1834,8 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Projected array IR JVP rule for [`DynamicSliceOperation`]. A dynamically shaped input retains its exact
-        // extents and scalar start indices as ordinary residual values; a static input delegates to the homogeneous
-        // projected rule.
+        // A dynamically shaped input retains its exact extents and scalar start indices as ordinary residual values.
+        // A static input delegates to the homogeneous projected rule.
         let (input, _) = inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
@@ -1848,8 +1855,8 @@ where
         let tangent = match input.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_primal.r#type().tangent()?),
             MaybeZero::Value(input_tangent) => {
-                // Start indices have zero differential spaces but remain ordinary residual SSA values because both the
-                // forward slice and its transpose need their concrete runtime values.
+                // Start indices have zero differential spaces but remain ordinary residual Single Static Assignment
+                // (SSA) values because both the forward slice and its transpose need their concrete runtime values.
                 let mut residuals = LinearResiduals::new();
                 let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
                 let input_shape = residuals.retain_shape(tangent_context, input.primal())?;
@@ -1904,20 +1911,22 @@ where
     }
 }
 
-impl<V, O> MemberTransposableOperation<V, O> for DynamicSliceOperation
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTransposableOperation<V, O>
+    for DynamicSliceOperation<ArrayType>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType>
-        + From<AddOperation<ArrayIrType>>
-        + OperationProjection<ArrayType>
+    V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: From<AddOperation<ArrayIrType>>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-    <O as OperationProjection<ArrayType>>::Projected: TransposableOperation<
-            <V as ValueProjection<ArrayType>>::Projected,
-            <O as OperationProjection<ArrayType>>::Projected,
-        > + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<AddOperation<ArrayType>>,
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: TransposableOperation<
+                <V as ValueProjection<ArrayType>>::Projected,
+                <O as OperationProjection<ArrayType>>::Projected,
+            > + From<DynamicSliceOperation>
+                           + From<DynamicUpdateSliceOperation>
+                           + From<AddOperation<ArrayType>>,
+        >,
 {
     fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
@@ -1934,8 +1943,8 @@ where
         if let Some(reference) = accumulators[0].reference(context)? {
             if let MaybeZero::Value(cotangent) = &outputs[0] {
                 // Runtime indices remain ordinary residual inputs, so this typed rule can choose buffer updates when
-                // transposition runs. Add to the selected block, then replace that block in the current referent. This
-                // preserves prior contributions and uses the same index clamping as the forward slice without
+                // transposition runs. Add to the selected block, then replace that block in the current referent.
+                // This preserves prior contributions and uses the same index clamping as the forward slice without
                 // constructing a full-size zero gradient. Until dynamic reference views are supported, the final write
                 // still describes an update to the complete reference and eager execution may copy its complete
                 // storage.
@@ -1980,6 +1989,7 @@ where
             }
             return Ok(());
         }
+
         transpose_projected_operation(
             context,
             &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
@@ -2005,7 +2015,7 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some(input_type) = input_types.first() else {
-            return Err(TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` expects an array input",)));
+            return Err(TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` expects an array input")));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         if self.strides.len() != input_type.rank() {
@@ -2017,12 +2027,14 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
             )));
         }
         check_count!("input", input_types, 1 + 2 * input_type.rank(), TypeError);
+
         let starts = &input_types[1..1 + input_type.rank()];
         let sizes = &input_types[1 + input_type.rank()..];
         for (axis, (start, size)) in starts.iter().zip(sizes).enumerate() {
             let start = <&DimensionType>::try_from(start)?.bounds().lower();
             let start = if self.bounds == DynamicSliceBounds::Clamp { 0 } else { start };
             let size = <&DimensionType>::try_from(size)?.bounds().lower();
+
             // Bounds can disprove a slice even before its dimension inputs become concrete. Wider valid ranges
             // retain the runtime assertion because separate identities cannot prove the joint bounds relation.
             let span = if size == 0 {
@@ -2030,23 +2042,29 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
             } else {
                 (size - 1).checked_mul(self.strides[axis]).and_then(|span| span.checked_add(1))
             };
+
             let limit = span.and_then(|span| start.checked_add(span)).ok_or_else(|| {
                 TypeError::invalid(format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` minimum limit overflows `usize` on axis {axis}"
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` minimum limit overflows `usize` on axis {axis}",
                 ))
             })?;
+
             let maximum = match input_type.dimension(axis) {
                 Dimension::Static(size) => Some(size),
                 Dimension::Dynamic(variable) => variable.bounds().upper().map(|upper| upper - 1),
             };
+
             if maximum.is_some_and(|maximum| limit > maximum) {
                 return Err(TypeError::invalid(format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` minimum limit {limit} exceeds maximum input extent {} on \
-                    axis {axis}",
+                    "`{}` minimum limit {} exceeds maximum input extent {} on axis {}",
+                    DYNAMIC_SLICE_OPERATION_NAME,
+                    limit,
                     maximum.unwrap(),
+                    axis,
                 )));
             }
         }
+
         let dimensions = ArrayIrType::extents(sizes)?;
         let output_type = if dimensions.as_slice() == input_type.shape().dimensions() {
             input_type.clone()
@@ -2058,12 +2076,14 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
                     TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` output type is invalid: {error}"))
                 })?
         };
+
         if !self.requires_runtime_assertion && !self.has_proven_window(input_types)? {
             return Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` was constructed without a runtime window check but these input \
-                 types require one"
+                 types require one",
             )));
         }
+
         Ok(vec![output_type.into()])
     }
 
@@ -2076,7 +2096,6 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
         }))
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("strides", format_args!("{:?}", self.strides))?;
@@ -2113,12 +2132,12 @@ impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for Dynami
 {
 }
 
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicSliceOperation<ArrayIrType>
-where
+impl<
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicSliceOperation<ArrayIrType>> + From<ConstantOperation<DimensionValue>>,
         >,
+> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicSliceOperation<ArrayIrType>
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -2127,12 +2146,10 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         // This rule currently supports replicated first-class starts and sizes. Different sizes can require ragged
-        // output;
-        // different starts with shared sizes would remain rectangular but need a separate reindexing rule. Insert a
-        // mapped
-        // array axis with start zero, the transform's exact extent, and unit stride.
-        // The payload's stride count and the input's rank bound the arity independently: a payload built for another
-        // rank must be rejected rather than indexed.
+        // output. Different starts with shared sizes would remain rectangular but need a separate reindexing rule.
+        // Insert a mapped array axis with start zero, the transform's exact extent, and unit stride. The payload's
+        // stride count and the input's rank bound the arity independently as a payload built for another rank must
+        // be rejected rather than indexed.
         check_count!("input", inputs, 1 + 2 * self.strides.len(), ProgramError);
         if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(ProgramError::UnsupportedOperation {
@@ -2140,13 +2157,16 @@ where
             }
             .into());
         }
+
         let (input, bounds) = inputs.split_first().unwrap();
         let unbatched_type = input.unbatched_type();
         let input_type = <&ArrayType>::try_from(&unbatched_type)?;
         check_count!("input", inputs, 1 + 2 * input_type.rank(), ProgramError);
+
         for bound in bounds {
             bound.validate_replicated_dimension()?;
         }
+
         if input.batch_axis().is_replicated() {
             return Ok(context
                 .parent()
@@ -2168,10 +2188,12 @@ where
                 ),
             });
         }
+
         let (starts, sizes) = bounds.split_at(input_type.rank());
         let zero = DimensionValue::constant(0).map_err(ProgramError::from)?;
         let mut zero = context.parent().bind(ConstantOperation::new(zero), Vec::new(), &[])?;
         check_count!("output", zero, 1, ProgramError);
+
         let mut packed_inputs = Vec::with_capacity(inputs.len() + 2);
         packed_inputs.push(input.value().clone());
         packed_inputs.extend(starts.iter().take(batch_axis).map(|bound| bound.value().clone()));
@@ -2221,7 +2243,8 @@ impl_differentiable_operation! {
                 let zero = MaybeZero::Zero(primal.r#type().tangent()?);
                 return Ok(vec![DifferentiationDual::new(primal, zero)?]);
             };
-            // Static geometry needs no shape residuals: the ordinary transpose can recover the destination type.
+
+            // Static geometry needs no shape residuals as the ordinary transpose can recover the destination type.
             // Keep this common case as one slice rather than introducing paired regions and coordinate arrays early.
             let input_type = tangent.r#type();
             if <&ArrayType>::try_from(input_type.as_ref())?.static_shape().is_some()
@@ -2234,7 +2257,8 @@ impl_differentiable_operation! {
                 let tangent = context.tangent().bind(operation.clone(), Vec::new(), &arguments)?.remove(0);
                 return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
             }
-            // The result cannot reveal the original extent (e.g. slicing [n] to [k]). Retain that geometry once,
+
+            // The result cannot reveal the original extent (e.g., slicing `[n]` to `[k]`). Retain that geometry once,
             // alongside discrete starts and sizes, so the transpose survives replay and specialization.
             let mut residuals = LinearResiduals::new();
             let bounds = residuals.retain_all(tangent_inputs[1..].iter().map(|input| input.primal().clone()));
@@ -2327,6 +2351,8 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
         Ok(<Self as OperationProjection<ArrayType>>::Projected::from(request).into())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents slicing at runtime start indices, with either stored sizes or first-class dimension sizes.
 /// Fixed-size windows use [`dynamic_slice`](Self::dynamic_slice). Dimension-taking functions require
