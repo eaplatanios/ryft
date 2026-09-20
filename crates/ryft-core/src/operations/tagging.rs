@@ -44,7 +44,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::ArrayType;
+use crate::arrays::{Array, ArrayType};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
@@ -153,6 +153,14 @@ impl_differentiable_elementwise_operation! {
 pub trait Tag: Sized {
     /// Returns this value unchanged while tagging it with `key`.
     fn tag(self, key: &str) -> Self;
+}
+
+// Tagging is metadata for staged programs only, so a concrete array carries itself through unchanged.
+impl Tag for Array {
+    #[inline]
+    fn tag(self, _key: &str) -> Self {
+        self
+    }
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> Tag for V {

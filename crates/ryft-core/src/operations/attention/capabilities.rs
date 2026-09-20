@@ -15,6 +15,31 @@ pub trait DotProductAttention: Parameter + Sized {
     ) -> Result<(Self, Option<Self>), ProgramError>;
 }
 
+// The reference array backend has no fused attention kernel and answers the forward contract by evaluating the
+// shared universe-neutral composition eagerly over concrete arrays.
+impl DotProductAttention for Array {
+    fn dot_product_attention(
+        inputs: AttentionInputs<Self>,
+        configuration: AttentionConfiguration,
+    ) -> Result<(Self, Option<Self>), ProgramError> {
+        if configuration.implementation() == AttentionImplementation::Fused {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "the eager array backend does not provide a fused attention implementation".to_string(),
+            });
+        }
+        let inputs = AttentionInputs {
+            query: ArrayIrValue::Array(inputs.query),
+            key: ArrayIrValue::Array(inputs.key),
+            value: ArrayIrValue::Array(inputs.value),
+            bias: inputs.bias.map(ArrayIrValue::Array),
+            mask: inputs.mask.map(ArrayIrValue::Array),
+            query_sequence_lengths: inputs.query_sequence_lengths.map(ArrayIrValue::Array),
+            key_value_sequence_lengths: inputs.key_value_sequence_lengths.map(ArrayIrValue::Array),
+        };
+        dot_product_attention_ir_composition(&inputs, configuration)
+    }
+}
+
 /// Value-level backward (gradient) pass of scaled dot-product attention. Refer to the documentation of
 /// [`DotProductAttentionBackwardOperation`] for the operand convention and the exact semantics.
 pub(crate) trait DotProductAttentionBackward: Parameter + Sized {
@@ -33,6 +58,40 @@ pub(crate) trait DotProductAttentionBackward: Parameter + Sized {
         output_cotangent: Self,
         configuration: AttentionConfiguration,
     ) -> Result<Vec<Self>, ProgramError>;
+}
+
+// The reference array backend answers the backward contract like the forward one, by evaluating the shared
+// composition eagerly over concrete arrays.
+impl DotProductAttentionBackward for Array {
+    fn dot_product_attention_backward(
+        inputs: AttentionInputs<Self>,
+        output: Self,
+        residual: Self,
+        output_cotangent: Self,
+        configuration: AttentionConfiguration,
+    ) -> Result<Vec<Self>, ProgramError> {
+        if configuration.implementation() == AttentionImplementation::Fused {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "the eager array backend does not provide a fused attention implementation".to_string(),
+            });
+        }
+        let inputs = AttentionInputs {
+            query: ArrayIrValue::Array(inputs.query),
+            key: ArrayIrValue::Array(inputs.key),
+            value: ArrayIrValue::Array(inputs.value),
+            bias: inputs.bias.map(ArrayIrValue::Array),
+            mask: inputs.mask.map(ArrayIrValue::Array),
+            query_sequence_lengths: inputs.query_sequence_lengths.map(ArrayIrValue::Array),
+            key_value_sequence_lengths: inputs.key_value_sequence_lengths.map(ArrayIrValue::Array),
+        };
+        dot_product_attention_backward_ir_composition(
+            &inputs,
+            &ArrayIrValue::Array(output),
+            &ArrayIrValue::Array(residual),
+            &ArrayIrValue::Array(output_cotangent),
+            configuration,
+        )
+    }
 }
 
 /// Any context-carrying value computes attention by binding a [`DotProductAttentionOperation`] through its own

@@ -346,6 +346,31 @@ pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
     }
 }
 
+// The reference array backend evaluates the canonical portable composition eagerly over concrete arrays.
+impl ScaledDot for Array {
+    fn scaled_dot(
+        &self,
+        rhs: &Self,
+        lhs_scale: Option<&Self>,
+        rhs_scale: Option<&Self>,
+        dimensions: Option<&DotDimensionNumbers>,
+        preferred_element_type: Option<DataType>,
+    ) -> Result<Self, ProgramError> {
+        let dimensions = dimensions
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| ScaledDotOperation::default_dimensions(self.r#type().rank()))?;
+        scaled_dot_composition(
+            self,
+            rhs,
+            lhs_scale,
+            rhs_scale,
+            &dimensions,
+            preferred_element_type.unwrap_or(DataType::BF16),
+        )
+    }
+}
+
 // Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
 // context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
 // context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the

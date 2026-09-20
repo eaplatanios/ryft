@@ -4,8 +4,8 @@ use std::fmt::Display;
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
+    ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
     ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
@@ -1966,6 +1966,22 @@ pub trait CustomCall: Sized {
     ) -> Result<Vec<Self>, ProgramError>
     where
         Self: 'a;
+}
+
+impl CustomCall for Array {
+    /// The reference array backend has no foreign-kernel registry, so custom calls always report an
+    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error instead of silently producing a value.
+    fn custom_call<'a, I: IntoIterator<Item = &'a Self>>(
+        operation: &CustomCallOperation,
+        _inputs: I,
+    ) -> Result<Vec<Self>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "the reference array backend cannot execute the foreign kernel `{}`",
+                operation.target_name(),
+            ),
+        })
+    }
 }
 
 // Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation`] through its own

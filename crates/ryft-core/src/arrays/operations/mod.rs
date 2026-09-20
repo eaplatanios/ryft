@@ -74,19 +74,15 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
 
-mod attention;
 mod collectives;
 mod compare;
 mod complex;
 mod control_flow;
 mod cumulative;
-mod custom_call;
 mod math;
-mod quantization;
 mod random;
 mod references;
 mod sort;
-mod tagging;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
