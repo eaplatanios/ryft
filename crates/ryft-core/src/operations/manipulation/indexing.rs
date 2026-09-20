@@ -75,86 +75,79 @@ pub struct IndexSlice {
     step: i128,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl IndexSlice {
-    /// Creates a signed slice with the provided optional endpoints and step. Endpoints are exclusive at the stop
-    /// and are clipped to the axis when normalized. This constructor preserves omitted endpoints so that reverse
-    /// slicing can distinguish an omitted stop from an explicit negative index, and it accepts any step so that the
-    /// [`index!`](crate::index) macro stays infallible; a zero step is rejected when the slice is normalized against
-    /// an axis.
+    /// Creates a new signed [`IndexSlice`] with the provided optional endpoints and step. Endpoints are exclusive
+    /// at the stop and are clipped to the axis when normalized. This constructor preserves omitted endpoints so that
+    /// reverse slicing can distinguish an omitted stop from an explicit negative index, and it accepts any step so that
+    /// the [`index!`] macro stays infallible; a zero step is rejected when the slice is normalized against an axis.
+    #[inline]
     pub fn new(start: Option<i128>, stop: Option<i128>, step: i128) -> Self {
         Self { start, stop, step }
     }
 
-    /// Returns the inclusive start index, or [`None`] to start at the first position in the traversal direction.
+    /// Returns the inclusive start index for this [`IndexSlice`], or [`None`] to start at the first position
+    /// in the traversal direction.
+    #[inline]
     pub fn start(&self) -> Option<i128> {
         self.start
     }
 
-    /// Returns the exclusive stop index, or [`None`] to continue through the end in the traversal direction.
+    /// Returns the exclusive stop index for this [`IndexSlice`], or [`None`] to continue through the end
+    /// in the traversal direction.
+    #[inline]
     pub fn stop(&self) -> Option<i128> {
         self.stop
     }
 
-    /// Returns the signed distance between selected positions. Positive values traverse forward, negative values
-    /// traverse backward, and zero is invalid. Omitting the step in indexing syntax uses `1`.
+    /// Returns the signed distance between selected positions for this [`IndexSlice`]. Positive values traverse
+    /// forward, negative values traverse backward, and zero is invalid. Omitting the step in indexing syntax uses `1`.
+    #[inline]
     pub fn step(&self) -> i128 {
         self.step
     }
 
     /// Resolves signed endpoints against an axis extent, producing a positive-stride slice. For a negative step,
     /// the coordinates refer to the reversed input axis. Endpoint clipping and unsigned step magnitudes avoid
-    /// overflow even for `i128::MIN`, and empty intervals remain valid empty slices.
+    /// overflow even for [`i128::MIN`], and empty intervals remain valid empty slices.
     fn normalize(&self, extent: usize) -> Result<NormalizedIndexSlice, ProgramError> {
         if self.step == 0 {
             return Err(TypeError::invalid("index slice step must not be zero").into());
         }
+
         let reversed = self.step < 0;
         let extent = extent as i128;
         let lower = if reversed { -1 } else { 0 };
         let upper = if reversed { extent - 1 } else { extent };
+
         // Only explicit negative endpoints count backward from the extent. The default reverse stop is the
         // sentinel before index zero and must not undergo that translation.
         let start = self.start.map_or(if reversed { upper } else { lower }, |start| {
             if start < 0 { start + extent } else { start }.clamp(lower, upper)
         });
+
         let stop = self.stop.map_or(if reversed { lower } else { upper }, |stop| {
             if stop < 0 { stop + extent } else { stop }.clamp(lower, upper)
         });
+
         let (start, limit) = if reversed {
             ((extent - 1 - start) as usize, (extent - 1 - stop) as usize)
         } else {
             (start as usize, stop as usize)
         };
+
         let limit = limit.max(start);
+
         // A stride larger than the axis extent still selects at most one element. Cap it at that extent (or one
         // for an empty axis), preserving the positions without sending an enormous unsigned stride to backends
         // whose slice configuration uses signed integers.
         let stride = self.step.unsigned_abs().min((extent as usize).max(1) as u128) as usize;
         let length = (limit - start).div_ceil(stride);
+
         Ok(NormalizedIndexSlice { start, limit, stride, length, reversed })
     }
 }
 
-/// A basic selector that consumes one axis for an integer or slice, inserts an axis for [`Self::NewAxis`], or
-/// expands over the axes not explicitly selected for [`Self::Ellipsis`]. Integer indices remove the selected axis.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum BasicIndex {
-    /// A signed scalar index. Negative indices count backward from the axis extent.
-    Integer(i128),
-
-    /// A signed, potentially strided slice that preserves the selected axis.
-    Slice(IndexSlice),
-
-    /// Inserts a new axis of extent one without consuming an input axis.
-    NewAxis,
-
-    /// Expands to full slices over the otherwise unspecified input axes.
-    Ellipsis,
-}
-
-/// Positive-stride coordinates for a normalized basic slice, optionally applied after reversing its input axis.
+/// Positive-stride coordinates for a normalized [`IndexSlice`], optionally applied after reversing its input axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct NormalizedIndexSlice {
     /// Inclusive coordinate on the input axis, or on its reversal when `reversed` is true.
@@ -171,6 +164,25 @@ struct NormalizedIndexSlice {
 
     /// Whether the coordinates apply to the reversal of the input axis.
     reversed: bool,
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// A basic selector that consumes one axis for an integer or slice, inserts an axis for [`Self::NewAxis`], or
+/// expands over the axes not explicitly selected for [`Self::Ellipsis`]. Integer indices remove the selected axis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BasicIndex {
+    /// A signed scalar index. Negative indices count backward from the axis extent.
+    Integer(i128),
+
+    /// A signed, potentially strided slice that preserves the selected axis.
+    Slice(IndexSlice),
+
+    /// Inserts a new axis of extent one without consuming an input axis.
+    NewAxis,
+
+    /// Expands to full slices over the otherwise unspecified input axes.
+    Ellipsis,
 }
 
 /// A host-known Boolean mask with explicit shape. Constructing it validates the number of entries. Indexing converts

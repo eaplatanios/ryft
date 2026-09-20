@@ -22,7 +22,7 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review this module. Also, make into a `sorting` directory module with per-operation submodules.
 
 /// Direction in which a [`SortOperation`] orders its key operand.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
