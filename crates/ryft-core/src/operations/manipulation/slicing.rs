@@ -1699,26 +1699,44 @@ where
                 };
 
                 // The gather clamps but never wraps, so mapped signed starts are wrapped first under the negative-index
-                // policy, using each sliced axis extent as a value (a constant for a static axis, and a reduction over
-                // the source for a dynamic one).
+                // policy: each negative entry has its axis extent added, taken as a value (a constant for a static
+                // axis, and a reduction over the source for a dynamic one), so that the clamp-only gather resolves it
+                // like the unbatched kernel does. Unsigned starts cannot be negative and Boolean starts are predicate
+                // carriers, so neither wraps.
                 let input_type = &input_types[0];
                 let indices = inputs[1..]
                     .iter()
                     .enumerate()
                     .map(|(axis, input)| {
                         let starts = P::match_axis(context, input, Axis::from(0))?.value().clone();
-                        let starts = if self.allow_negative_indices && wraps_negative_start(starts.r#type().data_type())
-                        {
+                        let starts_type = starts.r#type().into_owned();
+                        let wraps = !starts_type.data_type().is_unsigned() && starts_type.data_type() != DataType::I1;
+                        let starts = if self.allow_negative_indices && wraps {
                             let extent = match input_type.dimension(axis) {
                                 Dimension::Static(extent) => context
                                     .parent()
                                     .bind(ConstantOperation::new(Array::scalar(extent as i64)?), Vec::new(), &[])?
                                     .remove(0),
                                 Dimension::Dynamic(_) => {
-                                    dynamic_axis_extent(&source, axis + usize::from(mapped_source))?
+                                    // The homogeneous array family has no dimension operation, so the runtime extent
+                                    // is counted from the source itself: a reduction of ones over every other axis
+                                    // has that extent, and a second reduction of ones over the result counts it.
+                                    let source_axis = axis + usize::from(mapped_source);
+                                    let other_axes = (0..source.r#type().rank())
+                                        .filter(|candidate| *candidate != source_axis)
+                                        .collect::<Vec<_>>();
+                                    let ones = source.convert_element_type(DataType::I64)?.one_like()?;
+                                    ones.reduce(&other_axes, ReductionKind::Sum)
+                                        .one_like()?
+                                        .reduce(&[0], ReductionKind::Sum)
                                 }
                             };
-                            wrap_negative_starts(&starts, &extent)?
+                            let extent = extent
+                                .convert_element_type(starts_type.data_type())?
+                                .transfer_to_memory(starts_type.memory())?
+                                .broadcast(starts_type, &[])?;
+                            let negative = starts.less_than(&starts.zero_like()?)?;
+                            C::Value::select(&negative, &starts.add(&extent)?, &starts)?
                         } else {
                             starts
                         };
@@ -4080,51 +4098,17 @@ impl Array {
             .iter()
             .enumerate()
             .map(|(axis, index)| {
-                // Input validation guarantees a scalar integer. Preserve unsigned extremes until after clamping.
+                // Input validation guarantees a scalar integer. Preserve unsigned extremes until after clamping. Only
+                // signed starts can be negative, so the sign test alone selects the starts that wrap.
                 let mut raw: i128 = index.concretize().unwrap();
                 let extent = input_shape[axis] as i128;
-                if allow_negative_indices && raw < 0 && wraps_negative_start(index.r#type().data_type()) {
+                if allow_negative_indices && raw < 0 {
                     raw += extent;
                 }
                 raw.clamp(0, extent - block_sizes[axis] as i128) as usize
             })
             .collect()
     }
-}
-
-/// Returns whether a start index of `data_type` can be negative and therefore counts from the end of its axis when a
-/// dynamic slicing operation allows negative indices. Unsigned starts cannot be negative, and Boolean starts are
-/// predicate carriers that never wrap.
-fn wraps_negative_start(data_type: DataType) -> bool {
-    !data_type.is_unsigned() && data_type != DataType::I1
-}
-
-/// Counts the negative entries of a signed start array from the end of an axis whose extent is the scalar integer
-/// value `extent`, leaving the other entries unchanged, so that a clamp-only consumer such as a gather resolves them
-/// like the unbatched kernel does.
-fn wrap_negative_starts<V>(starts: &V, extent: &V) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + ZeroLike + Broadcast + Compare + Add + Select + ConvertElementType + TransferToMemory,
-{
-    let starts_type = starts.r#type().into_owned();
-    let extent = extent
-        .convert_element_type(starts_type.data_type())?
-        .transfer_to_memory(starts_type.memory())?
-        .broadcast(starts_type, &[])?;
-    let negative = starts.less_than(&starts.zero_like()?)?;
-    V::select(&negative, &starts.add(&extent)?, starts)
-}
-
-/// Returns the runtime extent of the dynamic `axis` of `source` as a scalar `i64` value without any dimension
-/// operation, which the homogeneous array family does not have: a reduction of ones over every other axis has that
-/// extent, and a second reduction of ones over the result counts it.
-fn dynamic_axis_extent<V: Value<Type = ArrayType> + ConvertElementType + OneLike + Reduce>(
-    source: &V,
-    axis: usize,
-) -> Result<V, ProgramError> {
-    let other_axes = (0..source.r#type().rank()).filter(|source_axis| *source_axis != axis).collect::<Vec<_>>();
-    let ones = source.convert_element_type(DataType::I64)?.one_like()?;
-    Ok(ones.reduce(&other_axes, ReductionKind::Sum).one_like()?.reduce(&[0], ReductionKind::Sum))
 }
 
 /// Validates that a [`DynamicSlice`] call supplies one start index and one size per input axis, naming the list
