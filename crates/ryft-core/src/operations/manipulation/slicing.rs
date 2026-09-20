@@ -2636,8 +2636,6 @@ pub trait DynamicSlice: Sized {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl DynamicSlice for ArrayType {
     fn dynamic_slice_with_negative_indices(
         &self,
@@ -2655,6 +2653,7 @@ impl DynamicSlice for ArrayType {
             ))
             .into());
         }
+
         if sizes.len() != rank {
             return Err(TypeError::invalid(format!(
                 "`{}` sizes has length {} but input has rank {}",
@@ -2664,15 +2663,17 @@ impl DynamicSlice for ArrayType {
             ))
             .into());
         }
+
         validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self, start_indices)?;
+
         for (axis, &size) in sizes.iter().enumerate() {
             // Clamping can keep the window in bounds only if it fits every possible input extent. Static axes use
             // their exact size; dynamic axes must have a lower bound at least as large as the requested window.
             match self.dimension(axis) {
                 Dimension::Static(input_size) if size > input_size => {
                     return Err(TypeError::invalid(format!(
-                        "`{DYNAMIC_SLICE_OPERATION_NAME}` size {size} is out of bounds for axis {axis} with size \
-                        {input_size}",
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` size {size} is out of bounds for axis {axis} \
+                         with size {input_size}",
                     ))
                     .into());
                 }
@@ -2689,10 +2690,12 @@ impl DynamicSlice for ArrayType {
                 _ => {}
             }
         }
+
         let output_dimensions = sizes.iter().map(|size| Dimension::Static(*size)).collect::<Vec<_>>();
         if output_dimensions.as_slice() == self.shape().dimensions() {
             return indexed_slice_output_type(self.clone(), start_indices, DYNAMIC_SLICE_OPERATION_NAME);
         }
+
         let sharding = self.resized_sharding(&output_dimensions, DYNAMIC_SLICE_OPERATION_NAME)?;
         let output_type = ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_memory(self.memory())
@@ -2700,6 +2703,7 @@ impl DynamicSlice for ArrayType {
             .map_err(|error| {
                 TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` output type is invalid: {error}"))
             })?;
+
         indexed_slice_output_type(output_type, start_indices, DYNAMIC_SLICE_OPERATION_NAME)
     }
 }
@@ -2741,11 +2745,18 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
     }
 }
 
-impl<V: Value> DynamicSlice for V
-where
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<DynamicSliceOperation<V::Type>>
-        + OperationProvider<V::Type, DynamicSliceOperation, Operation = <V::DispatchDomain as Domain>::Operation>,
+impl<
+    V: Value<
+        DispatchDomain: Context<
+            Operation: From<DynamicSliceOperation<V::Type>>
+                           + OperationProvider<
+                V::Type,
+                DynamicSliceOperation,
+                Operation = <V::DispatchDomain as Domain>::Operation,
+            >,
+        >,
+    >,
+> DynamicSlice for V
 {
     fn dynamic_slice_with_negative_indices(
         &self,
@@ -2761,15 +2772,19 @@ where
             DynamicSliceOperation::new(sizes.to_vec()).with_allow_negative_indices(allow_negative_indices),
             &input_types.iter().collect::<Vec<_>>(),
         )?;
+
         // Preserve the identity-window shortcut after the operation has validated all start-index types.
         if operation.infer_output_types(&input_types, &[])? == vec![self.r#type().into_owned()] {
             return Ok(self.clone());
         }
+
         let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value capability for extracting a sub-array whose starts and sizes are first-class dimension values, so the result
 /// extents may vary at runtime. [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions) and
