@@ -3,7 +3,7 @@ use crate::arrays::{
 };
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed, Value};
+use crate::programs::{Operation, OperationFoldOutput, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionPowOperation`].
 pub const DIMENSION_POW_OPERATION_NAME: &str = "dimension_pow";
@@ -55,7 +55,11 @@ define_dimension_arithmetic_operation!(
             || left.extent() == Some(1)
             || (left.extent() == Some(0) && right.bounds().lower() > 0)
         {
-            Some(vec![0])
+            Some(OperationFoldOutput::Input(0))
+        } else if right.extent() == Some(0) {
+            // Every base raised to the zero power is one, including a zero base, so the inferred output bounds are
+            // exact and the output is the singleton of its type.
+            Some(OperationFoldOutput::Singleton)
         } else {
             None
         }
@@ -126,9 +130,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
-    use crate::programs::{EffectClass, EffectClasses};
-    use crate::tracing::TracingContext;
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionBounds, DimensionOperation, DimensionValue};
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::{EffectClass, EffectClasses, ProgramBuilder, ValueProjection};
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -192,19 +198,94 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_pow_identity_preserves_zero_exponent() {
+    fn test_dimension_pow_zero_exponent_fold() {
+        // A zero exponent determines the output, so tracing records the singleton constant instead of the operation.
+        // The constant keeps the inferred output type, whose singleton bounds render as the literal extent.
         let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
-            |zero| zero.dimension_pow(&zero),
-            DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            |(value, zero)| Ok(vec![value.dimension_pow(&zero)?, zero.dimension_pow(&zero)?]),
+            (
+                DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+                DimensionValue::constant(0).unwrap().r#type().into_owned(),
+            ),
         )
         .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:dimension<0> .
-                let %1:dimension<1> = dimension_pow %0 %0
-                in (%1)"},
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0> .
+                let %2:dimension<1> = const 1
+                    %3:dimension<1> = const 1
+                in (%2, %3)"},
         );
-        assert_eq!(program.interpret(DimensionValue::constant(0).unwrap()).unwrap().extent(), 1);
+        let outputs = program
+            .interpret((
+                DimensionValue::new(program.input_types()[0].clone(), 5).unwrap(),
+                DimensionValue::constant(0).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(outputs.iter().map(DimensionValue::extent).collect::<Vec<_>>(), vec![1, 1]);
+
+        // The mixed array/dimension family materializes the same constant through its dimension member.
+        type MixedTracer = Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(value, zero): (MixedTracer, MixedTracer)| {
+                let value = ValueProjection::<DimensionType>::into_projected(value)?;
+                let zero = ValueProjection::<DimensionType>::into_projected(zero)?;
+                Ok(MixedTracer::from_projected(value.dimension_pow(&zero)?))
+            },
+            (
+                ArrayIrType::Dimension(DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap())),
+                ArrayIrType::Dimension(DimensionValue::constant(0).unwrap().r#type().into_owned()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0> .
+                let %2:dimension<1> = const 1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_dimension_pow_partial_evaluation_zero_exponent_fold() {
+        // Partial evaluation resolves the same rule against a recorded instruction whose base is unknown, so the
+        // output becomes a known constant rather than residual work.
+        let input_types = [
+            DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap()),
+            DimensionValue::constant(0).unwrap().r#type().into_owned(),
+        ];
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let outputs = builder
+            .add_instruction(
+                DimensionPowOperation::new(&input_types[0], &input_types[1]).unwrap(),
+                Vec::new(),
+                inputs,
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<value ∈ [2, 9)>, %1:dimension<0> .
+                let %2:dimension<1> = dimension_pow %0 %1
+                in (%2)"},
+        );
+        let evaluation = program
+            .partially_evaluate(&program.input_types().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>())
+            .unwrap();
+        let PartialEvaluationOutput::Known(output) = &evaluation.outputs()[0] else {
+            panic!("expected the zero-exponent power to evaluate to a known constant");
+        };
+        assert_eq!(output.extent(), 1);
+        assert_eq!(output.r#type().variable().name(), "value ^ 0");
+        assert_eq!(output.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
+        assert!(evaluation.program().instructions().is_empty());
     }
 }

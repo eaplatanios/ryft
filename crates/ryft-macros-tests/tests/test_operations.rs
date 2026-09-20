@@ -261,6 +261,14 @@ struct RegionSlot {
     role: RegionRole,
 }
 
+/// Stand-in for `ryft_core::OperationFoldOutput`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OperationFoldOutput {
+    Input(usize),
+    #[allow(dead_code)]
+    Singleton,
+}
+
 /// Stand-in for `ryft_core::Operation`.
 trait Operation: Clone {
     type Type: Type;
@@ -293,7 +301,7 @@ trait Operation: Clone {
         &self,
         _input_types: &[Self::Type],
         _region_interfaces: &[RegionInterface<Self::Type>],
-    ) -> Result<Option<Vec<usize>>, TypeError> {
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         Ok(None)
     }
 
@@ -404,7 +412,7 @@ fn fold_projected_operation<T: Type, U: Type, O: Operation<Type = T>>(
     operation: &O,
     input_types: &[U],
     region_interfaces: &[RegionInterface<U>],
-) -> Result<Option<Vec<usize>>, TypeError>
+) -> Result<Option<Vec<OperationFoldOutput>>, TypeError>
 where
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
 {
@@ -1308,8 +1316,8 @@ impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
         &self,
         input_types: &[Self::Type],
         _region_interfaces: &[RegionInterface<Self::Type>],
-    ) -> Result<Option<Vec<usize>>, TypeError> {
-        Ok((MEMBER == 0).then(|| (0..input_types.len()).collect()))
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+        Ok((MEMBER == 0).then(|| (0..input_types.len()).map(OperationFoldOutput::Input).collect()))
     }
 }
 
@@ -1372,7 +1380,7 @@ fn test_operation_generates_projected_member_dispatch() {
         Ok(vec![None]),
     );
 
-    assert_eq!(first.fold(std::slice::from_ref(&first_type), &[]), Ok(Some(vec![0])));
+    assert_eq!(first.fold(std::slice::from_ref(&first_type), &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
     assert_eq!(third.fold(std::slice::from_ref(&third_type), &[]), Ok(None));
     assert_eq!(
         first.fold(std::slice::from_ref(&third_type), &[]),

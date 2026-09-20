@@ -109,7 +109,7 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::operations::validate_operation_fold;
+use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
     AtomId, BindingRegionDriver, EffectClass, EffectClasses, EffectsSummary, EmptyRegionDriver, FlatProgram,
     InstructionId, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
@@ -1481,8 +1481,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// emitted unchanged.
     ///
     /// Before that execution policy, regionless operations without references can use [`Operation::fold`] to return
-    /// existing inputs, even when unknown. Those substitutions prove that the operation has no observable behavior
-    /// to execute; they preserve input materialization and do not alter previously recorded effect ordering.
+    /// existing inputs, even when unknown, or known constants determined by their inferred output types. Those
+    /// substitutions prove that the operation has no observable behavior to execute; they preserve input
+    /// materialization and do not alter previously recorded effect ordering.
     ///
     /// # Effect Placement Contract
     ///
@@ -1522,7 +1523,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         let operation = operation.into();
 
         // Reference and region applications retain their existing binding and failure-ordering paths. Local
-        // regionless folds validate before substitution and preserve each input's shared materialization slot.
+        // regionless folds resolve before substitution: an input replacement preserves that input's shared
+        // materialization slot, and a singleton replacement becomes a known constant of the inferred output type.
         if regions.is_empty() && !operation.effects().has_reference_declarations() {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             if !input_types.iter().any(Type::is_reference) {
@@ -1530,11 +1532,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                     operation.validate_region_count(0)?;
                     let output_types = operation.infer_output_types(&input_types, &[])?;
                     operation.effects().validate_application(operation.name(), &input_types, &output_types)?;
-                    let replacements = operation.fold(&input_types, &[])?;
-                    if let Some(replacements) = &replacements {
-                        validate_operation_fold(operation.name(), &input_types, &output_types, replacements)?;
-                    }
-                    Ok(replacements)
+                    Ok(operation.resolve_fold::<C::Constant>(&input_types, &[], &output_types)?)
                 })()
                 .inspect_err(|_| {
                     // A failed ordered application must not let later known effects run ahead of the failed work.
@@ -1543,7 +1541,15 @@ impl<C: Context> PartialEvaluationContext<C> {
                     }
                 })?;
                 if let Some(replacements) = replacements {
-                    return Ok(replacements.into_iter().map(|index| inputs[index].clone()).collect());
+                    return replacements
+                        .into_iter()
+                        .map(|replacement| match replacement {
+                            OperationFoldReplacement::Input(index) => Ok(inputs[index].clone()),
+                            OperationFoldReplacement::Constant(constant) => {
+                                Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant)?))
+                            }
+                        })
+                        .collect();
                 }
             }
         }

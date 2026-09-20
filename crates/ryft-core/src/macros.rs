@@ -293,8 +293,9 @@ macro_rules! check_builders {
 ///   - `$infer_bounds`: Expression evaluating to a function or closure that accepts references to the left and right
 ///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
 ///     The Boolean reports whether their bounds leave a checked runtime failure possible.
-///   - `$fold`: Optional expression accepting the actual left and right types and returning input replacements
-///     according to [`Operation::fold`](crate::Operation::fold). Omission disables local folding.
+///   - `$fold`: Optional expression accepting the actual left and right types and returning the single output's
+///     [`OperationFoldOutput`](crate::OperationFoldOutput) replacement according to
+///     [`Operation::fold`](crate::Operation::fold), or `None`. Omission disables local folding.
 ///   - `$provider`: Explicit marker type whose provider validates two inputs and constructs the generated operation.
 ///     This argument is mutually exclusive with `capability`.
 ///   - `capability`: Documentation attributes before `trait;` document the generated capability trait. Attributes
@@ -464,10 +465,13 @@ macro_rules! define_dimension_arithmetic_operation {
                 &self,
                 input_types: &[$crate::arrays::DimensionType],
                 region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::arrays::DimensionType>],
-            ) -> Result<Option<Vec<usize>>, $crate::programs::types::TypeError> {
+            ) -> Result<Option<Vec<$crate::programs::operations::OperationFoldOutput>>, $crate::programs::types::TypeError>
+            {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $crate::check_count!("region", region_interfaces, 0, TypeError);
-                Ok(None$(.or_else(|| ($fold)(&input_types[0], &input_types[1])))?)
+
+                // Arithmetic dimension operations have one output, so a rule selects one replacement.
+                Ok(None$(.or_else(|| ($fold)(&input_types[0], &input_types[1]).map(|output| vec![output])))?)
             }
 
             #[inline]

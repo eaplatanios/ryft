@@ -527,14 +527,19 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Folds this validated [`Operation`] to existing inputs without executing it or creating new operations. Returns
-    /// `None` when no folding is possible, or one input index per output, in output order, when folding is possible.
-    /// An empty replacement vector folds a zero-output operation.
+    /// Folds this validated [`Operation`] to existing inputs or to constants determined by its output types, without
+    /// executing it. Returns `None` when no folding is possible, or one [`OperationFoldOutput`] per output, in output
+    /// order, when folding is possible: an [`Input`](OperationFoldOutput::Input) replaces the output with the named
+    /// input, and a [`Singleton`](OperationFoldOutput::Singleton) replaces it with the unique value of its inferred
+    /// output type, which the staging boundary materializes as a program constant. An empty replacement vector folds
+    /// a zero-output operation.
     ///
     /// Callers must validate the complete application through [`Self::infer_output_types`] before calling this function
-    /// and validate replacement indices, output count, and type refinements before applying a fold. Implementations use
-    /// the actual input types, including refined bounds, rather than only stored metadata. Equal types do not imply
-    /// equal values unless the type's identity contract explicitly guarantees it.
+    /// and resolve replacements (i.e., input indices, output count, singleton materialization, and type refinements)
+    /// before applying a fold. Implementations use the actual input types, including refined bounds, rather than only
+    /// stored metadata. Equal types do not imply equal values unless the type's identity contract explicitly guarantees
+    /// it, and a singleton claim must follow from the inferred output type being exact rather than from the rule's own
+    /// arithmetic.
     ///
     /// A successful fold guarantees that omitting this operation, including its executable regions, preserves all
     /// observable behavior, possible failures, and transformation semantics (including differentiation). Effects of
@@ -552,9 +557,66 @@ pub trait Operation: Clone {
         &self,
         input_types: &[Self::Type],
         region_interfaces: &[RegionInterface<Self::Type>],
-    ) -> Result<Option<Vec<usize>>, TypeError> {
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         let _ = (input_types, region_interfaces);
         Ok(None)
+    }
+
+    /// Applies [`Self::fold`] and resolves its replacements against the already inferred application boundary,
+    /// returning `None` when the rule declines to fold. Input replacements must name existing inputs whose types
+    /// refine the declared outputs, including relationships between input and output identities, and singleton
+    /// replacements must be materializable by the value family `V` as storable program constants. Callers apply the
+    /// returned replacements without further validation. This is the application half of the folding contract and
+    /// is not meant to be overridden (i.e., operations must typically only customize [`Self::fold`]).
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Actual input [`Type`]s of the application, in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`]s of the application, as for [`Self::fold`].
+    ///   - `output_types`: Output [`Type`]s inferred for the application, in output order.
+    fn resolve_fold<V: Value<Type = Self::Type>>(
+        &self,
+        input_types: &[Self::Type],
+        region_interfaces: &[RegionInterface<Self::Type>],
+        output_types: &[Self::Type],
+    ) -> Result<Option<Vec<OperationFoldReplacement<V>>>, TypeError> {
+        let Some(outputs) = self.fold(input_types, region_interfaces)? else {
+            return Ok(None);
+        };
+        check_count!("fold output", outputs, output_types.len(), TypeError);
+        let mut replacements = Vec::with_capacity(outputs.len());
+        let mut actual = input_types.to_vec();
+        for (output, output_type) in outputs.iter().zip(output_types) {
+            match *output {
+                OperationFoldOutput::Input(index) => {
+                    let input_type = input_types.get(index).ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "`{}` fold references input {} but has {} inputs",
+                            self.name(),
+                            index,
+                            input_types.len(),
+                        ))
+                    })?;
+                    actual.push(input_type.clone());
+                    replacements.push(OperationFoldReplacement::Input(index));
+                }
+                OperationFoldOutput::Singleton => {
+                    let constant = V::singleton(output_type).ok_or_else(|| {
+                        TypeError::invalid(format!(
+                            "`{}` fold declares a singleton output but its type `{}` does not determine a value",
+                            self.name(),
+                            output_type,
+                        ))
+                    })?;
+                    constant.validate_as_constant()?;
+                    actual.push(constant.r#type().into_owned());
+                    replacements.push(OperationFoldReplacement::Constant(constant));
+                }
+            }
+        }
+        let declared = input_types.iter().chain(output_types).cloned().collect::<Vec<_>>();
+        Self::Type::derive_identity_renaming(&declared, &actual)?;
+        Ok(Some(replacements))
     }
 
     /// Describes how this operation supplies input `input_index` of the attached [`Region`](crate::Region) at
@@ -843,7 +905,7 @@ impl<O: Operation> Operation for Box<O> {
         &self,
         input_types: &[Self::Type],
         region_interfaces: &[RegionInterface<Self::Type>],
-    ) -> Result<Option<Vec<usize>>, TypeError> {
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         self.as_ref().fold(input_types, region_interfaces)
     }
 
@@ -1022,19 +1084,47 @@ pub trait MemberOperation<U: Type>: Operation {
         region_interfaces: &[RegionInterface<U>],
     ) -> Result<Vec<U>, TypeError>;
 
-    /// Folds this payload's validated instruction in parent universe `U`, using [`Operation::fold`] semantics.
+    /// Folds this payload's validated instruction in parent universe `U`, using [`Operation::fold`] semantics. A
+    /// singleton replacement names the enclosing instruction's inferred output type in `U`.
     #[inline]
     fn fold_parent(
         &self,
         input_types: &[U],
         region_interfaces: &[RegionInterface<U>],
-    ) -> Result<Option<Vec<usize>>, TypeError> {
+    ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
         let _ = (input_types, region_interfaces);
         Ok(None)
     }
 
     /// Renames parent-universe [`TypeIdentity`](crate::TypeIdentity)s referenced by this payload.
     fn rename_parent_type_identities(&self, renaming: &TypeIdentityRenaming<U::Identity>) -> Result<Self, TypeError>;
+}
+
+/// Replacement that an [`Operation::fold`] rule selects for one output. Rules return one replacement per output, in
+/// output order, and the staging boundary that applies the fold resolves them through [`Operation::resolve_fold`],
+/// which validates every replacement against the already inferred application boundary before it is applied, so rules
+/// never validate their own selections.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OperationFoldOutput {
+    /// The output is the input at this index. Returning an input needs no conversion and allocates no new identity;
+    /// the input's type must refine the inferred output type.
+    Input(usize),
+
+    /// The output is the unique value of its inferred output type (e.g., a first-class dimension whose inferred bounds
+    /// are a singleton interval). The value family materializes it through [`Value::singleton`] as a program constant
+    /// of exactly that type, so the constant keeps the inferred output identity.
+    Singleton,
+}
+
+/// Resolved replacement for one folded output, produced by [`Operation::resolve_fold`] from an
+/// [`OperationFoldOutput`] and ready to be applied by the staging boundary that requested the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationFoldReplacement<V> {
+    /// The output aliases the input at this index.
+    Input(usize),
+
+    /// The output is this materialized constant, whose type is the inferred output type.
+    Constant(V),
 }
 
 /// Infers the region input types of a member [`Operation`] through a composite type boundary. Every composite input
@@ -1092,44 +1182,19 @@ where
 }
 
 /// Folds a projected member operation after projecting every input and region interface to its native type.
-/// Input positions are unchanged by projection, so replacement indices also apply to the enclosing operation.
+/// Input positions are unchanged by projection, so input replacements also apply to the enclosing operation, and a
+/// singleton replacement names the enclosing operation's inferred output type, which projects to the same member.
 /// This function supports projected variants generated by `#[derive(Operation)]`.
 pub fn fold_projected_operation<T: Type, I: Type, O: Operation<Type = T>>(
     operation: &O,
     input_types: &[I],
     region_interfaces: &[RegionInterface<I>],
-) -> Result<Option<Vec<usize>>, TypeError>
+) -> Result<Option<Vec<OperationFoldOutput>>, TypeError>
 where
     for<'t> &'t T: TryFrom<&'t I, Error = TypeError>,
 {
     let (input_types, region_interfaces) = project_operation_boundary(input_types, region_interfaces)?;
     operation.fold(&input_types, &region_interfaces)
-}
-
-/// Validates input replacements against an already inferred operation boundary, including relationships between
-/// input and output identities. Returning input values needs no conversion or new identity allocation.
-pub(crate) fn validate_operation_fold<T: Type>(
-    operation_name: &str,
-    input_types: &[T],
-    output_types: &[T],
-    replacements: &[usize],
-) -> Result<(), TypeError> {
-    check_count!("fold output", replacements, output_types.len(), TypeError);
-    let mut actual = input_types.to_vec();
-    for &index in replacements {
-        let input_type = input_types.get(index).ok_or_else(|| {
-            TypeError::invalid(format!(
-                "`{}` fold references input {} but has {} inputs",
-                operation_name,
-                index,
-                input_types.len(),
-            ))
-        })?;
-        actual.push(input_type.clone());
-    }
-    let declared = input_types.iter().chain(output_types).cloned().collect::<Vec<_>>();
-    T::derive_identity_renaming(&declared, &actual)?;
-    Ok(())
 }
 
 /// Projects one member [`Operation`]'s complete inference boundary from the enclosing composite type `U` to its native
@@ -1183,8 +1248,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionType};
-    use crate::operations::{DimensionAddOperation, StopGradientOperation};
+    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue};
+    use crate::operations::{DimensionAddOperation, DimensionPowOperation, StopGradientOperation};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{EffectClass, EffectClasses, ReferenceEffect};
@@ -1273,6 +1338,48 @@ mod tests {
 
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
             formatter.write_str("forwarded")
+        }
+    }
+
+    /// Test operation over a fixed output boundary whose folding rule returns explicitly selected replacements.
+    #[derive(Clone, Debug)]
+    struct SelectedFoldOperation<T: Type> {
+        /// Output types this operation infers for every application.
+        output_types: Vec<T>,
+
+        /// Replacements returned by [`Operation::fold`].
+        outputs: Vec<OperationFoldOutput>,
+    }
+
+    impl<T: Type> Operation for SelectedFoldOperation<T> {
+        type Type = T;
+
+        fn name(&self) -> &'static str {
+            "selected_fold"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            Ok(self.output_types.clone())
+        }
+
+        fn fold(
+            &self,
+            _input_types: &[T],
+            _region_interfaces: &[RegionInterface<T>],
+        ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+            Ok(Some(self.outputs.clone()))
+        }
+
+        fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+            Ok(self.clone())
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+            formatter.write_str(self.name())
         }
     }
 
@@ -1431,23 +1538,103 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_fold() {
+    fn test_operation_fold_forwarding() {
+        // Boxed operations forward folding to their payload without altering the selected replacements.
         let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
         let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
         let operation = Box::new(DimensionAddOperation::new(&value, &zero).unwrap());
+        assert_eq!(operation.fold(&[value, zero], &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+    }
+
+    #[test]
+    fn test_operation_resolve_fold_input() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionAddOperation::new(&value, &zero).unwrap();
         let inputs = [value, zero];
         let outputs = operation.infer_output_types(&inputs, &[]).unwrap();
-        assert_eq!(operation.fold(&inputs, &[]), Ok(Some(vec![0])));
-        assert_eq!(validate_operation_fold(operation.name(), &inputs, &outputs, &[0]), Ok(()));
+        assert_eq!(
+            operation.resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Ok(Some(vec![OperationFoldReplacement::Input(0)])),
+        );
+
+        // A rule that declines to fold resolves to nothing.
+        let operation = DimensionAddOperation::new(&inputs[0], &inputs[0]).unwrap();
+        let sum_inputs = [inputs[0].clone(), inputs[0].clone()];
+        let sum_outputs = operation.infer_output_types(&sum_inputs, &[]).unwrap();
+        assert_eq!(operation.resolve_fold::<DimensionValue>(&sum_inputs, &[], &sum_outputs), Ok(None));
 
         // A replacement must refine the declared output; the zero input cannot replace this positive sum.
+        let selected = |selected| SelectedFoldOperation { output_types: outputs.clone(), outputs: selected };
         assert_eq!(
-            validate_operation_fold(operation.name(), &inputs, &outputs, &[1]),
+            selected(vec![OperationFoldOutput::Input(1)]).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
             Err(TypeError::invalid(format!(
                 "dimension type {} cannot instantiate declared type {}",
                 inputs[1], outputs[0],
             ))),
         );
+
+        // Every output needs exactly one replacement, and replacements may only name existing inputs.
+        assert_eq!(
+            selected(Vec::new()).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Err(TypeError::invalid("expected 1 fold output but got 0")),
+        );
+        assert_eq!(
+            selected(vec![OperationFoldOutput::Input(2)]).resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Err(TypeError::invalid("`selected_fold` fold references input 2 but has 2 inputs")),
+        );
+    }
+
+    #[test]
+    fn test_operation_resolve_fold_singleton() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionPowOperation::new(&value, &zero).unwrap();
+        let inputs = [value.clone(), zero.clone()];
+        let outputs = operation.infer_output_types(&inputs, &[]).unwrap();
+        assert_eq!(outputs[0].extent(), Some(1));
+        assert_eq!(operation.fold(&inputs, &[]), Ok(Some(vec![OperationFoldOutput::Singleton])));
+
+        // The materialized constant carries the inferred output type, including its identity.
+        assert_eq!(
+            operation.resolve_fold::<DimensionValue>(&inputs, &[], &outputs),
+            Ok(Some(vec![OperationFoldReplacement::Constant(DimensionValue::new(outputs[0].clone(), 1).unwrap())])),
+        );
+
+        // A singleton claim is rejected when the inferred output type admits more than one value.
+        let wide = DimensionType::new("wide", DimensionBounds::new(2, Some(9)).unwrap());
+        let selected =
+            SelectedFoldOperation { output_types: vec![wide.clone()], outputs: vec![OperationFoldOutput::Singleton] };
+        assert_eq!(
+            selected.resolve_fold::<DimensionValue>(&inputs, &[], &[wide.clone()]),
+            Err(TypeError::invalid(format!(
+                "`selected_fold` fold declares a singleton output but its type `{wide}` does not determine a value",
+            ))),
+        );
+
+        // A value family that cannot materialize the type's unique value rejects the claim too.
+        let scalar = ArrayType::scalar(DataType::F32);
+        let selected =
+            SelectedFoldOperation { output_types: vec![scalar.clone()], outputs: vec![OperationFoldOutput::Singleton] };
+        assert_eq!(
+            selected.resolve_fold::<Array>(&[scalar.clone()], &[], &[scalar.clone()]),
+            Err(TypeError::invalid(format!(
+                "`selected_fold` fold declares a singleton output but its type `{scalar}` does not determine a value",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_fold_projected_operation() {
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionType::new("zero", DimensionBounds::new(0, Some(1)).unwrap());
+        let operation = DimensionAddOperation::new(&value, &zero).unwrap();
+        let inputs = [ArrayIrType::Dimension(value), ArrayIrType::Dimension(zero)];
+        assert_eq!(fold_projected_operation(&operation, &inputs, &[]), Ok(Some(vec![OperationFoldOutput::Input(0)])));
+
+        // Inputs of a different member kind fail projection before the rule runs.
+        let inputs = [inputs[0].clone(), ArrayIrType::Array(ArrayType::scalar(DataType::F32))];
+        assert!(fold_projected_operation(&operation, &inputs, &[]).is_err());
     }
 
     #[test]

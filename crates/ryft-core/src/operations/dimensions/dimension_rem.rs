@@ -2,7 +2,7 @@ use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::{Rem, RemOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed, Value};
+use crate::programs::{Operation, OperationFoldOutput, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionRemOperation`].
 pub const DIMENSION_REM_OPERATION_NAME: &str = "dimension_rem";
@@ -36,7 +36,7 @@ define_dimension_arithmetic_operation!(
     },
     fold = |left: &DimensionType, right: &DimensionType| {
         if left.maximum_extent().is_some_and(|maximum| maximum < right.bounds().lower()) {
-            Some(vec![0])
+            Some(OperationFoldOutput::Input(0))
         } else {
             None
         }

@@ -938,7 +938,10 @@ impl OperationEnum {
                     &self,
                     input_types: &[#primary_type],
                     region_interfaces: &[#ryft::RegionInterface<#primary_type>],
-                ) -> ::std::result::Result<::std::option::Option<::std::vec::Vec<usize>>, #ryft::TypeError> {
+                ) -> ::std::result::Result<
+                    ::std::option::Option<::std::vec::Vec<#ryft::OperationFoldOutput>>,
+                    #ryft::TypeError,
+                > {
                     match self { #(#fold_arms)* }
                 }
 

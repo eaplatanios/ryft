@@ -4,7 +4,7 @@ use crate::arrays::{
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::{Mul, MulOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed, Value};
+use crate::programs::{Operation, OperationFoldOutput, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionMulOperation`].
 pub const DIMENSION_MUL_OPERATION_NAME: &str = "dimension_mul";
@@ -37,9 +37,9 @@ define_dimension_arithmetic_operation!(
     },
     fold = |left: &DimensionType, right: &DimensionType| {
         if left.extent() == Some(0) || right.extent() == Some(1) {
-            Some(vec![0])
+            Some(OperationFoldOutput::Input(0))
         } else if right.extent() == Some(0) || left.extent() == Some(1) {
-            Some(vec![1])
+            Some(OperationFoldOutput::Input(1))
         } else {
             None
         }

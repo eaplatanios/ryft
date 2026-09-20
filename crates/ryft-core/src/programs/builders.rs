@@ -11,7 +11,7 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::{ReferenceAccessMode, ReferenceAliasKind};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
-use crate::programs::operations::{Operation, validate_operation_fold};
+use crate::programs::operations::{Operation, OperationFoldReplacement};
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
 use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
@@ -339,10 +339,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         Ok(self.push_instruction(operation, regions, inputs, provenance, output_types))
     }
 
-    /// Folds a validated operation to existing inputs when [`Operation::fold`] proves equivalence, or records it
-    /// through the same checked construction path as [`Self::add_instruction`]. Input producers remain unchanged.
-    /// Unlike raw instruction construction, returned outputs can alias existing atoms and carry refined types.
-    /// Region-carrying applications remain explicit so their already imported bodies retain a reachable owner.
+    /// Folds a validated operation to existing inputs or program constants when [`Operation::fold`] proves equivalence,
+    /// or records it through the same checked construction path as [`Self::add_instruction`]. Input producers remain
+    /// unchanged, and a singleton output becomes a new constant atom of the inferred output type. Unlike raw
+    /// instruction construction, returned outputs can alias existing atoms and carry refined types. Region-carrying
+    /// applications remain explicit so their already imported bodies retain a reachable owner.
     pub fn add_instruction_or_fold<P: Into<O>>(
         &mut self,
         operation: P,
@@ -354,10 +355,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         let (input_types, region_interfaces, output_types) =
             self.validate_instruction(&operation, &regions, &inputs)?;
         if regions.is_empty()
-            && let Some(replacements) = operation.fold(&input_types, &region_interfaces)?
+            && let Some(replacements) = operation.resolve_fold::<V>(&input_types, &region_interfaces, &output_types)?
         {
-            validate_operation_fold(operation.name(), &input_types, &output_types, &replacements)?;
-            return Ok(replacements.into_iter().map(|index| inputs[index]).collect());
+            return Ok(replacements
+                .into_iter()
+                .map(|replacement| match replacement {
+                    OperationFoldReplacement::Input(index) => inputs[index],
+                    OperationFoldReplacement::Constant(constant) => self.add_constant(constant),
+                })
+                .collect());
         }
         Ok(self.push_instruction(operation, regions, inputs, provenance, output_types).to_vec())
     }
@@ -950,14 +956,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
+        DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::operations::{AddOperation, NegOperation};
+    use crate::operations::{AddOperation, DimensionPowOperation, NegOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::effects::{EffectClasses, Effects, ReferenceAlias, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
+    use crate::programs::operations::OperationFoldOutput;
     use crate::programs::provenance::ProvenanceScope;
     use crate::programs::references::ReferenceType;
     use crate::programs::regions::{OutputRegionProvenance, RegionSlot};
@@ -1047,8 +1055,8 @@ mod tests {
         /// Inferred outputs against which the driver validates replacements.
         output_types: Vec<ArrayType>,
 
-        /// Input indices returned by the folding rule.
-        replacements: Vec<usize>,
+        /// Replacements returned by the folding rule.
+        replacements: Vec<OperationFoldOutput>,
     }
 
     impl Operation for FoldOperation {
@@ -1072,7 +1080,7 @@ mod tests {
             &self,
             _input_types: &[ArrayType],
             _region_interfaces: &[RegionInterface<ArrayType>],
-        ) -> Result<Option<Vec<usize>>, TypeError> {
+        ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
             Ok(Some(self.replacements.clone()))
         }
     }
@@ -1684,7 +1692,10 @@ mod tests {
         let scalar = ArrayType::new_static(DataType::F64, []);
         let mut builder = ProgramBuilder::<Array, FoldOperation>::new();
         let inputs = vec![builder.add_input(scalar.clone()), builder.add_input(scalar.clone())];
-        let operation = FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![1, 0] };
+        let operation = FoldOperation {
+            output_types: vec![scalar.clone(); 2],
+            replacements: vec![OperationFoldOutput::Input(1), OperationFoldOutput::Input(0)],
+        };
         assert_eq!(
             builder.add_instruction_or_fold(operation.clone(), Vec::new(), inputs.clone(), None).unwrap(),
             vec![inputs[1], inputs[0]],
@@ -1711,7 +1722,10 @@ mod tests {
         );
         assert_eq!(
             builder.add_instruction_or_fold(
-                FoldOperation { output_types: vec![scalar.clone(); 2], replacements: vec![0] },
+                FoldOperation {
+                    output_types: vec![scalar.clone(); 2],
+                    replacements: vec![OperationFoldOutput::Input(0)],
+                },
                 Vec::new(),
                 inputs.clone(),
                 None,
@@ -1720,12 +1734,26 @@ mod tests {
         );
         assert_eq!(
             builder.add_instruction_or_fold(
-                FoldOperation { output_types: vec![scalar], replacements: vec![2] },
+                FoldOperation { output_types: vec![scalar.clone()], replacements: vec![OperationFoldOutput::Input(2)] },
                 Vec::new(),
                 inputs.clone(),
                 None,
             ),
             Err(TypeError::invalid("`test_fold` fold references input 2 but has 2 inputs").into()),
+        );
+
+        // Array types describe geometry rather than contents, so no array output is the singleton of its type.
+        assert_eq!(
+            builder.add_instruction_or_fold(
+                FoldOperation { output_types: vec![scalar], replacements: vec![OperationFoldOutput::Singleton] },
+                Vec::new(),
+                inputs.clone(),
+                None,
+            ),
+            Err(TypeError::invalid(
+                "`test_fold` fold declares a singleton output but its type `f64[]` does not determine a value",
+            )
+            .into()),
         );
         assert_eq!(builder.atoms().len(), 2);
         assert!(builder.instructions().is_empty());
@@ -1733,6 +1761,27 @@ mod tests {
         // Raw construction still records the instruction, independently of its folding rule.
         assert_eq!(builder.add_instruction(operation, Vec::new(), inputs, None).unwrap().len(), 2);
         assert_eq!(builder.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold_singleton() {
+        // A singleton replacement becomes a new constant atom carrying the inferred output type, and the folded
+        // instruction is never recorded.
+        let value = DimensionType::new("value", DimensionBounds::new(2, Some(9)).unwrap());
+        let zero = DimensionValue::constant(0).unwrap().r#type().into_owned();
+        let operation = DimensionPowOperation::new(&value, &zero).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = vec![builder.add_input(value), builder.add_input(zero)];
+        let outputs = builder.add_instruction_or_fold(operation, Vec::new(), inputs, None).unwrap();
+        assert_eq!(outputs, vec![AtomId::new(2)]);
+        assert_eq!(builder.atoms().len(), 3);
+        let Atom::Constant(constant) = &builder.atoms()[2] else {
+            panic!("expected the singleton replacement to be recorded as a constant atom");
+        };
+        assert_eq!(constant.extent(), 1);
+        assert_eq!(constant.r#type().variable().name(), "value ^ 0");
+        assert_eq!(constant.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
+        assert!(builder.instructions().is_empty());
     }
 
     #[test]
@@ -1944,7 +1993,7 @@ mod tests {
                 &self,
                 _input_types: &[ArrayIrType],
                 _region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Option<Vec<usize>>, TypeError> {
+            ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
                 panic!("invalid effects must be rejected before folding")
             }
 

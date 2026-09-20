@@ -114,6 +114,16 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
     }
 
     #[inline]
+    fn singleton(r#type: &ArrayIrType) -> Option<Self> {
+        // Only the dimension member has singleton types. Array types describe geometry rather than contents,
+        // and a reference type never determines the allocation that it names.
+        match r#type {
+            ArrayIrType::Dimension(r#type) => DimensionValue::singleton(r#type).map(Self::Dimension),
+            ArrayIrType::Array(_) | ArrayIrType::Reference(_) => None,
+        }
+    }
+
+    #[inline]
     fn reference_id(&self) -> Option<ReferenceId> {
         match self {
             Self::Array(_) | Self::Dimension(_) => None,
@@ -429,6 +439,25 @@ mod tests {
             )
             .map(|_| ()),
             expected_error,
+        );
+    }
+
+    #[test]
+    fn test_array_ir_value_singleton() {
+        // Only the dimension member determines a value from its type; the composite value keeps that type's identity.
+        let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());
+        assert_eq!(
+            ArrayIrValue::<Array>::singleton(&ArrayIrType::Dimension(singleton_type.clone())),
+            Some(ArrayIrValue::Dimension(DimensionValue::new(singleton_type.clone(), 4).unwrap())),
+        );
+        let wide_type = DimensionType::new("batch", DimensionBounds::new(4, Some(6)).unwrap());
+        assert_eq!(ArrayIrValue::<Array>::singleton(&ArrayIrType::Dimension(wide_type)), None);
+        assert_eq!(ArrayIrValue::<Array>::singleton(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))), None);
+        assert_eq!(
+            ArrayIrValue::<Array>::singleton(&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(
+                DataType::F32,
+            )))),
+            None,
         );
     }
 

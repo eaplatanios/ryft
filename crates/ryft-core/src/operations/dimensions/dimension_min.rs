@@ -3,7 +3,7 @@ use crate::arrays::{
 };
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed, Value};
+use crate::programs::{Operation, OperationFoldOutput, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionMinOperation`].
 pub const DIMENSION_MIN_OPERATION_NAME: &str = "dimension_min";
@@ -27,9 +27,9 @@ define_dimension_arithmetic_operation!(
         if left.variable() == right.variable()
             || left.maximum_extent().unwrap_or(MAX_DIMENSION_EXTENT) <= right.bounds().lower()
         {
-            Some(vec![0])
+            Some(OperationFoldOutput::Input(0))
         } else if right.maximum_extent().unwrap_or(MAX_DIMENSION_EXTENT) <= left.bounds().lower() {
-            Some(vec![1])
+            Some(OperationFoldOutput::Input(1))
         } else {
             None
         }

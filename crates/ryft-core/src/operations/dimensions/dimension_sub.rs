@@ -2,7 +2,7 @@ use crate::arrays::{ArrayIrOperation, ArrayType, DimensionBounds, DimensionError
 use crate::macros::define_dimension_arithmetic_operation;
 use crate::operations::{Sub, SubOperation};
 use crate::parameters::Parameter;
-use crate::programs::{Operation, ProgramError, Typed, Value};
+use crate::programs::{Operation, OperationFoldOutput, ProgramError, Typed, Value};
 
 /// Canonical operation name for [`DimensionSubOperation`].
 pub const DIMENSION_SUB_OPERATION_NAME: &str = "dimension_sub";
@@ -33,7 +33,7 @@ define_dimension_arithmetic_operation!(
     },
     fold = |_left: &DimensionType, right: &DimensionType| {
         if right.extent() == Some(0) {
-            Some(vec![0])
+            Some(OperationFoldOutput::Input(0))
         } else {
             None
         }

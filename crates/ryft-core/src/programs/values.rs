@@ -138,6 +138,21 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         Ok(())
     }
 
+    /// Returns the unique value inhabiting `r#type` when that type admits exactly one value, and [`None`] when it
+    /// admits several values or when this value family cannot materialize the unique one. A first-class dimension
+    /// type whose bounds are a singleton interval is the canonical example: it denotes exactly one extent, so the
+    /// corresponding [`DimensionValue`](crate::DimensionValue) is fully determined by the type. Folding rules that
+    /// return [`OperationFoldOutput::Singleton`](crate::OperationFoldOutput::Singleton) rely on this function to
+    /// replace an instruction whose inferred output type is a singleton with a program constant of that exact type,
+    /// so implementations must return a value whose [`Typed::r#type`] equals `r#type`, including its identity. Only
+    /// value families that store concrete payloads can materialize singletons; staged values such as tracers keep
+    /// the default, which returns [`None`], because their payload lives in a context rather than in the value.
+    #[inline]
+    fn singleton(r#type: &Self::Type) -> Option<Self> {
+        let _ = r#type;
+        None
+    }
+
     /// Returns the capture-table position that this value names when it is a compact reference to a runtime value in
     /// the surrounding capture table (e.g., a [`CaptureReference`]), or [`None`] for every other value, including
     /// immediate constants that carry their own data. This is the one canonical capture query: capture validation,

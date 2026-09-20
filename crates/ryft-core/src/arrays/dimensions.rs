@@ -93,6 +93,13 @@ impl Value for DimensionValue {
     ) -> Result<Self, TypeError> {
         Self::new(self.r#type.rename_identities(renaming)?, self.extent).map_err(Into::into)
     }
+
+    #[inline]
+    fn singleton(r#type: &DimensionType) -> Option<Self> {
+        // Bounds are not checked against the backend width when they are constructed, so a singleton interval above
+        // `MAX_DIMENSION_EXTENT` admits one extent that no value can represent; it has no singleton value.
+        r#type.extent().and_then(|extent| Self::new(r#type.clone(), extent).ok())
+    }
 }
 
 impl Concretizable<usize> for DimensionValue {
@@ -173,5 +180,28 @@ mod tests {
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
         );
+    }
+
+    #[test]
+    fn test_dimension_value_singleton() {
+        // A singleton interval determines its value, which keeps the type's identity rather than a literal's name.
+        let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());
+        let singleton = DimensionValue::singleton(&singleton_type).unwrap();
+        assert_eq!(singleton.r#type().as_ref(), &singleton_type);
+        assert_eq!(singleton.extent(), 4);
+        assert_eq!(DimensionValue::singleton(&DimensionValue::constant(0).unwrap().r#type()).unwrap().extent(), 0);
+
+        // Wider bounds admit several extents and so determine no value.
+        let wide_type = DimensionType::new("batch", DimensionBounds::new(4, Some(6)).unwrap());
+        assert_eq!(DimensionValue::singleton(&wide_type), None);
+        assert_eq!(DimensionValue::singleton(&DimensionType::new("batch", DimensionBounds::unbounded())), None);
+
+        // A singleton interval above the backend width admits one extent that no value can represent.
+        if let Some(unsupported_extent) = MAX_DIMENSION_EXTENT.checked_add(1)
+            && let Some(unsupported_upper) = unsupported_extent.checked_add(1)
+        {
+            let unsupported_bounds = DimensionBounds::new(unsupported_extent, Some(unsupported_upper)).unwrap();
+            assert_eq!(DimensionValue::singleton(&DimensionType::new("batch", unsupported_bounds)), None);
+        }
     }
 }

@@ -5,7 +5,7 @@
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
-use crate::programs::{Operation, Type, TypeError, TypeIdentityRenaming};
+use crate::programs::{Operation, OperationFoldOutput, Type, TypeError, TypeIdentityRenaming};
 
 pub mod dimension_add;
 pub mod dimension_div;
@@ -91,13 +91,26 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
         let mut bounds = self.infer_output_bounds(&input_types[0], &input_types[1])?;
 
         // A proven input replacement preserves its bounds, including an implicit backend-width limit represented
-        // by an unbounded upper endpoint. Fresh output identity allocation remains independent of folding.
-        if let Some(replacements) = self.fold(input_types, &[])? {
-            check_count!("fold output", replacements, 1, TypeError);
-            let input = input_types.get(replacements[0]).ok_or_else(|| {
-                TypeError::invalid(format!("`{}` fold references missing input {}", self.name(), replacements[0]))
-            })?;
-            bounds = input.bounds();
+        // by an unbounded upper endpoint, while a singleton replacement must already follow from exact inferred
+        // bounds. Fresh output identity allocation remains independent of folding.
+        if let Some(outputs) = self.fold(input_types, &[])? {
+            check_count!("fold output", outputs, 1, TypeError);
+            match outputs[0] {
+                OperationFoldOutput::Input(index) => {
+                    let input = input_types.get(index).ok_or_else(|| {
+                        TypeError::invalid(format!("`{}` fold references missing input {}", self.name(), index))
+                    })?;
+                    bounds = input.bounds();
+                }
+                OperationFoldOutput::Singleton if bounds.lower().checked_add(1) != bounds.upper() => {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` fold declares a singleton output but its inferred bounds `{}` admit more than one extent",
+                        self.name(),
+                        bounds,
+                    )));
+                }
+                OperationFoldOutput::Singleton => {}
+            }
         }
 
         Ok(vec![DimensionType::new(self.output_name(), bounds)])
