@@ -48,6 +48,37 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Traced dimension arithmetic records a program whose output types carry the bounds inferred from the inputs, so a
+//! consumer of `(rows + columns) * columns` knows its extent lies in `[3, 49)` without ever seeing a concrete value:
+//!
+//! ```rust
+//! # use indoc::indoc;
+//! # use ryft_core::{
+//! #     Add, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Mul, ProgramError, TracingContext,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let (_, program) = TracingContext::<DimensionValue, DimensionOperation<DimensionValue>>::trace(
+//!     |(rows, columns)| rows.add(&columns)?.mul(&columns),
+//!     (
+//!         DimensionType::new("rows", DimensionBounds::new(2, Some(9))?),
+//!         DimensionType::new("columns", DimensionBounds::new(1, Some(5))?),
+//!     ),
+//! )?;
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:dimension<rows ∈ [2, 9)>, %1:dimension<columns ∈ [1, 5)> .
+//!         let %2:dimension<rows + columns ∈ [3, 13)> = dimension_add %0 %1
+//!             %3:dimension<rows + columns * columns ∈ [3, 49)> = dimension_mul %2 %1
+//!         in (%3)
+//!     "}
+//!     .trim_end(),
+//! );
+//! assert_eq!(program.interpret((DimensionValue::constant(4)?, DimensionValue::constant(3)?))?.extent(), 21);
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;

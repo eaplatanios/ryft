@@ -22,10 +22,13 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
+use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_min::DimensionMin;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSub;
@@ -33,6 +36,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::gathering::{
     DynamicGather, Gather, GatherDimensionNumbers, GatherMode, GatherOptions,
 };
@@ -45,6 +49,7 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::math::mul::Mul;
+use crate::operations::math::reduce::{Reduce, ReductionKind};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -1252,7 +1257,9 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-/// Determines how a [`DynamicSliceOperation`] resolves its start coordinates against the input's logical extents.
+/// Determines how a [`DynamicSliceOperation`] over dimension-valued starts resolves its start coordinates against the
+/// input's logical extents. Dimension starts are non-negative by construction, so no negative-index policy applies to
+/// that form.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DynamicSliceBounds {
     /// Clamp each start so the entire requested window fits. The window itself must fit the input.
@@ -1265,12 +1272,14 @@ pub enum DynamicSliceBounds {
 /// Canonical operation name for [`DynamicSliceOperation`].
 pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 
-/// [`Operation`] that extracts a sub-array at runtime start indices. The [`ArrayType`] form stores its sizes and
-/// accepts scalar-array starts with clamping and unit strides. The [`ArrayIrType`] form accepts dimension starts and
-/// sizes, positive static strides, and a [`DynamicSliceBounds`] policy. The homogeneous [`MemberTransposableOperation`]
-/// rule adds to the selected block of an enclosing reference accumulator without constructing a dense zero gradient. It
-/// currently reads and replaces the complete referent, which may copy storage in eager execution. Value accumulators
-/// use the ordinary projected transpose rule. Refer to [`DynamicSlice`] for more information.
+/// [`Operation`] that extracts a sub-array at runtime start indices. The [`ArrayType`] form stores its sizes
+/// and accepts scalar-array starts with unit strides, counting negative signed starts from the end of their axes
+/// under its [`allows_negative_indices`](DynamicSliceOperation::<ArrayType>::allows_negative_indices) policy and
+/// then clamping. The [`ArrayIrType`] form accepts dimension starts and sizes, positive static strides, and a
+/// [`DynamicSliceBounds`] policy. The homogeneous [`MemberTransposableOperation`] rule adds to the selected block of
+/// an enclosing reference accumulator without constructing a dense zero gradient. It currently reads and replaces the
+/// complete referent, which may copy storage in eager execution. Value accumulators use the ordinary projected
+/// transpose rule. Refer to [`DynamicSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation<T: Type = ArrayType> {
     /// Refer to the documentation of [`sizes`](DynamicSliceOperation::<ArrayType>::sizes) for more information.
@@ -1281,6 +1290,9 @@ pub struct DynamicSliceOperation<T: Type = ArrayType> {
 
     /// Refer to the documentation of [`bounds`](Self::bounds) for more information.
     bounds: DynamicSliceBounds,
+
+    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for more information.
+    allow_negative_indices: bool,
 
     /// Refer to the documentation of [`requires_runtime_assertion`](Self::requires_runtime_assertion)
     /// for more information.
@@ -1296,6 +1308,16 @@ impl<T: Type> DynamicSliceOperation<T> {
     #[inline]
     pub fn bounds(&self) -> DynamicSliceBounds {
         self.bounds
+    }
+
+    /// Returns whether a negative signed start index counts from the end of its axis. When `true` (the default), a
+    /// negative start `i` on an axis of extent `d` is replaced by `i + d` once before clamping, so `-1` names the last
+    /// valid origin and a start that is still negative after that single wrap clamps to zero. When `false`, negative
+    /// starts are out of bounds and clamp to zero directly. Unsigned and Boolean starts cannot be negative and are
+    /// unaffected. This is a semantic switch that every execution path honors, and not just a lowering hint.
+    #[inline]
+    pub fn allows_negative_indices(&self) -> bool {
+        self.allow_negative_indices
     }
 
     /// Returns whether execution must validate the mixed slice window against the input's logical extents. When `true`,
@@ -1318,9 +1340,19 @@ impl DynamicSliceOperation<ArrayType> {
             sizes,
             strides: Vec::new(),
             bounds: DynamicSliceBounds::Clamp,
+            allow_negative_indices: true,
             requires_runtime_assertion: false,
             marker: PhantomData,
         }
+    }
+
+    /// Returns a copy of this [`DynamicSliceOperation`] with its negative-index policy set to `allow_negative_indices`.
+    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for the meaning of both
+    /// settings.
+    #[inline]
+    pub fn with_allow_negative_indices(mut self, allow_negative_indices: bool) -> Self {
+        self.allow_negative_indices = allow_negative_indices;
+        self
     }
 
     /// Returns the size of the extracted slice along each input axis for this [`DynamicSliceOperation`].
@@ -1341,6 +1373,7 @@ impl DynamicSliceOperation<ArrayIrType> {
             sizes: Vec::new(),
             strides: vec![1; rank],
             bounds: DynamicSliceBounds::Checked,
+            allow_negative_indices: true,
             requires_runtime_assertion: true,
             marker: PhantomData,
         }
@@ -1554,8 +1587,13 @@ impl Operation for DynamicSliceOperation<ArrayType> {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("sizes", format_args!("{:?}", self.sizes)))
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("sizes", format_args!("{:?}", self.sizes))?;
+            if !self.allow_negative_indices {
+                operation.field("allow_negative_indices", false)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1570,7 +1608,11 @@ impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C>
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1 + self.sizes.len(), ProgramError);
         let (input, start_indices) = inputs.split_first().unwrap();
-        Ok(vec![input.dynamic_slice(start_indices, self.sizes.as_slice())?])
+        Ok(vec![input.dynamic_slice_with_negative_indices(
+            start_indices,
+            self.sizes.as_slice(),
+            self.allow_negative_indices,
+        )?])
     }
 }
 
@@ -1582,7 +1624,22 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 impl<
     C: Context<
             Type = ArrayType,
-            Value: ZeroLike + Broadcast + Transpose + Slice + Reshape + Reshard + Concatenate + Gather,
+            Value: ZeroLike
+                       + Broadcast
+                       + Transpose
+                       + Slice
+                       + Reshape
+                       + Reshard
+                       + Concatenate
+                       + Gather
+                       + Compare
+                       + Add
+                       + Select
+                       + ConvertElementType
+                       + TransferToMemory
+                       + OneLike
+                       + Reduce,
+            Operation: From<ConstantOperation<Array>>,
         >,
     P: ArrayExtentBatchingPolicy<C>,
 > BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation<ArrayType>
@@ -1629,16 +1686,6 @@ where
                     Dimension::Static(axis_size),
                     context.axis_sharding().clone(),
                 )?;
-                let indices = inputs[1..]
-                    .iter()
-                    .map(|input| {
-                        P::match_axis(context, input, Axis::from(0))?
-                            .value()
-                            .reshape(Shape::new(vec![Dimension::Static(axis_size), Dimension::Static(1)]))
-                            .map_err(BatchingError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let indices = C::Value::concatenate(&indices, 1)?;
 
                 // Paired batching dimensions select source item `i` with index vector `i`, without adding item numbers
                 // to the integer indices. In particular, this does not narrow `u64` starts or require a batch extent to
@@ -1650,6 +1697,37 @@ where
                 } else {
                     inputs[0].value().clone()
                 };
+
+                // The gather clamps but never wraps, so mapped signed starts are wrapped first under the negative-index
+                // policy, using each sliced axis extent as a value (a constant for a static axis, and a reduction over
+                // the source for a dynamic one).
+                let input_type = &input_types[0];
+                let indices = inputs[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, input)| {
+                        let starts = P::match_axis(context, input, Axis::from(0))?.value().clone();
+                        let starts = if self.allow_negative_indices && wraps_negative_start(starts.r#type().data_type())
+                        {
+                            let extent = match input_type.dimension(axis) {
+                                Dimension::Static(extent) => context
+                                    .parent()
+                                    .bind(ConstantOperation::new(Array::scalar(extent as i64)?), Vec::new(), &[])?
+                                    .remove(0),
+                                Dimension::Dynamic(_) => {
+                                    dynamic_axis_extent(&source, axis + usize::from(mapped_source))?
+                                }
+                            };
+                            wrap_negative_starts(&starts, &extent)?
+                        } else {
+                            starts
+                        };
+                        starts
+                            .reshape(Shape::new(vec![Dimension::Static(axis_size), Dimension::Static(1)]))
+                            .map_err(BatchingError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let indices = C::Value::concatenate(&indices, 1)?;
 
                 let mut sizes = self.sizes.clone();
                 let dimensions = if mapped_source {
@@ -1732,7 +1810,12 @@ impl_differentiable_operation! {
             let (input, start_indices) =
                 inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
             let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-            let primal = input.primal().dynamic_slice(&primal_starts, operation.sizes())?;
+            let allow_negative_indices = operation.allows_negative_indices();
+            let primal = input.primal().dynamic_slice_with_negative_indices(
+                &primal_starts,
+                operation.sizes(),
+                allow_negative_indices,
+            )?;
             let tangent = match input.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
@@ -1740,7 +1823,11 @@ impl_differentiable_operation! {
                         .into_iter()
                         .map(|value| context.primal_to_tangent(value))
                         .collect::<Result<Vec<_>, _>>()?;
-                    MaybeZero::Value(tangent.dynamic_slice(&tangent_starts, operation.sizes())?)
+                    MaybeZero::Value(tangent.dynamic_slice_with_negative_indices(
+                        &tangent_starts,
+                        operation.sizes(),
+                        allow_negative_indices,
+                    )?)
                 }
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -1753,7 +1840,7 @@ impl_differentiable_operation! {
             + From<ZeroOperation<ArrayType>>
             + From<DynamicUpdateSliceOperation>,
     {
-        |_operation, context, _driver, inputs, outputs, accumulators| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // The scalar integer start indices (i.e., inputs 1 onward) have no tangent space, so in a valid pushforward
             // they are the known inputs and the sliced input (i.e., input 0) is the linear one. The forward map
             // `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output cotangent back into a
@@ -1805,7 +1892,11 @@ impl_differentiable_operation! {
                 inputs.push(zeros);
                 inputs.push(cotangent.clone());
                 inputs.extend(start_indices);
-                let outputs = context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), inputs.as_slice())?;
+
+                // The adjoint resolves the same raw starts, so it must share the forward negative-index policy.
+                let allows_negative_indices = operation.allows_negative_indices();
+                let adjoint = DynamicUpdateSliceOperation::new().with_allow_negative_indices(allows_negative_indices);
+                let outputs = context.stage_operation(adjoint, Vec::new(), inputs.as_slice())?;
                 check_count!("output", outputs, 1, ProgramError);
                 accumulators[0].accumulate(context, MaybeZero::Value(outputs.into_iter().next().unwrap()))?;
             }
@@ -1864,6 +1955,8 @@ where
                 let forward_start_indices = start_indices.clone();
                 let transpose_shape = input_shape.clone();
                 let transpose_input_type = input_type.cotangent()?;
+                let transpose_operation =
+                    DynamicUpdateSliceOperation::new().with_allow_negative_indices(self.allows_negative_indices());
                 let tangent = LinearCallOperation::stage(
                     tangent_context,
                     residuals.into_values(),
@@ -1895,9 +1988,7 @@ where
                         update_inputs.push(output_cotangents[0].clone());
                         update_inputs.extend(start_indices.iter().map(|index| residuals[*index].clone()));
                         transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                DynamicUpdateSliceOperation,
-                            ),
+                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
                             Vec::new(),
                             update_inputs.as_slice(),
                         )
@@ -1978,9 +2069,11 @@ where
                     .remove(0);
                 let mut update_inputs = vec![current, updated];
                 update_inputs.extend(start_indices);
+                let transpose_operation =
+                    DynamicUpdateSliceOperation::new().with_allow_negative_indices(self.allows_negative_indices());
                 let updated = context
                     .bind(
-                        <O as OperationProjection<ArrayType>>::Projected::from(DynamicUpdateSliceOperation),
+                        <O as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
                         Vec::new(),
                         &update_inputs,
                     )?
@@ -2355,8 +2448,9 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 // TODO(eaplatanios): Review from here onwards.
 
 /// Value capability for extracting a sub-array at runtime start indices.
-/// [`dynamic_slice`](Self::dynamic_slice) extracts a window of static sizes with clamped scalar-array starts,
-/// while [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions) and
+/// [`dynamic_slice`](Self::dynamic_slice) extracts a window of static sizes at scalar-array starts that count from
+/// the end of their axes when negative and then clamp, while
+/// [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions) and
 /// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) take first-class dimension starts and sizes, so the
 /// result extents may vary at runtime. The dimension-taking functions require [`Value<Type = ArrayIrType>`](Value),
 /// because the mixed [`ArrayIrValue`] representation is what carries dimensions alongside arrays, and so they are
@@ -2400,17 +2494,19 @@ pub trait DynamicSlice: Sized {
     /// Extracts a statically shaped sub-array at runtime start indices, with the semantics of StableHLO's
     /// [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation. `t.dynamic_slice(start_indices,
     /// sizes)` extracts the block of shape `sizes` whose origin is given by the scalar integer values in
-    /// `start_indices` (one per input axis). Start indices are clamped so that the extracted block always lies in
-    /// bounds: the effective start index along axis `d` is `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
-    /// The output shape is exactly `sizes` and is fully static even though the slice origin is not. Each static input
-    /// axis must satisfy `sizes[d] <= input_dimension[d]`. For a [`Dimension::Dynamic`] input axis, its declared lower
-    /// bound must be at least the requested size, proving that the block fits every admitted runtime extent. Negative
-    /// starts clamp to zero; they are not interpreted relative to the end of the input. The input and start indices
-    /// must reside in the same memory space. A slice whose sizes equal the input shape passes it through unchanged
-    /// because every clamped origin is necessarily zero. Any other output preserves the input memory space and clears
-    /// explicit physical layout metadata. An input carrying reduction state keeps it, provided the start indices are
-    /// invariant over its reduction-state mesh axes: indexing with one routing on every device commutes with the
-    /// pending sum of partial contributions.
+    /// `start_indices` (one per input axis). A negative signed start counts from the end of its axis: on an axis of
+    /// extent `d`, a start `i < 0` becomes `i + d` once. Every start is then clamped so that the extracted block
+    /// always lies in bounds: the effective start index along axis `d` is
+    /// `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`, so `-1` names the last valid origin and a start
+    /// that is still negative after the single wrap clamps to zero. Unsigned and Boolean starts never wrap. The output
+    /// shape is exactly `sizes` and is fully static even though the slice origin is not. Each static input axis must
+    /// satisfy `sizes[d] <= input_dimension[d]`. For a [`Dimension::Dynamic`] input axis, its declared lower bound
+    /// must be at least the requested size, proving that the block fits every admitted runtime extent. The input and
+    /// start indices must reside in the same memory space. A slice whose sizes equal the input shape passes it through
+    /// unchanged because every resolved origin is necessarily zero. Any other output preserves the input memory space
+    /// and clears explicit physical layout metadata. An input carrying reduction state keeps it, provided the start
+    /// indices are invariant over its reduction-state mesh axes: indexing with one routing on every device commutes
+    /// with the pending sum of partial contributions.
     ///
     /// # Example
     ///
@@ -2429,7 +2525,22 @@ pub trait DynamicSlice: Sized {
     /// # Ok(())
     /// # }
     /// ```
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError>;
+    #[inline]
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        self.dynamic_slice_with_negative_indices(start_indices, sizes, true)
+    }
+
+    /// Extracts a statically shaped sub-array at runtime start indices like [`dynamic_slice`](Self::dynamic_slice),
+    /// selecting how negative signed starts are treated. With `allow_negative_indices` set to `true`, a negative start
+    /// counts from the end of its axis exactly as [`dynamic_slice`](Self::dynamic_slice) describes; with `false`,
+    /// negative starts are out of bounds and clamp to zero, which is StableHLO's native rule. Unsigned and Boolean
+    /// starts are unaffected either way.
+    fn dynamic_slice_with_negative_indices(
+        &self,
+        start_indices: &[Self],
+        sizes: &[usize],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError>;
 
     /// Extracts a window whose starts and sizes are dimension values, rejecting windows that extend outside the input
     /// (i.e., using the [`Checked`](DynamicSliceBounds::Checked) bounds policy). Refer to the documentation of
@@ -2572,10 +2683,88 @@ pub trait DynamicSlice: Sized {
             .collect::<Result<Vec<_>, _>>()?;
         output.dynamic_reshape(&dimensions)
     }
+
+    /// Extracts `size` elements along `axis` starting at the runtime scalar `start`, keeping every other axis in full.
+    /// This is [`dynamic_slice`](Self::dynamic_slice) with a zero start on every other axis, so `start` counts from the
+    /// end of `axis` when negative and clamps so that the window fits, and it requires the other axes to have static
+    /// extents. Unlike [`dynamic_slice_axis`](Self::dynamic_slice_axis), which takes host-known bounds proven from
+    /// the declared extents, this function takes a traced start.
+    ///
+    /// # Parameters
+    ///
+    ///   - `start`: Scalar integer array giving the start along `axis`.
+    ///   - `size`: Static number of elements to extract along `axis`, at most the axis extent.
+    ///   - `axis`: Axis to slice; negative axes count backward from the input rank.
+    fn dynamic_slice_in_axis<A: Into<Axis>>(&self, start: &Self, size: usize, axis: A) -> Result<Self, ProgramError>
+    where
+        Self: Clone + Typed<Type = ArrayType> + ZeroLike,
+    {
+        let input_type = self.r#type();
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let mut sizes = static_dimensions_for_axis_window(DYNAMIC_SLICE_OPERATION_NAME, &input_type, axis)?;
+        sizes[axis] = size;
+        let starts = (0..input_type.rank())
+            .map(|input_axis| if input_axis == axis { Ok(start.clone()) } else { start.zero_like() })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dynamic_slice(&starts, &sizes)
+    }
+
+    /// Selects the element at the runtime scalar `index` along `axis`, optionally retaining that axis with extent one.
+    /// This is [`dynamic_slice_in_axis`](Self::dynamic_slice_in_axis) with a window of size one, so `index` counts from
+    /// the end of `axis` when negative and clamps into bounds. Unlike [`dynamic_index_axis`](Self::dynamic_index_axis),
+    /// which takes a host-known index, this function takes a traced index.
+    ///
+    /// # Parameters
+    ///
+    ///   - `index`: Scalar integer array giving the position along `axis`.
+    ///   - `axis`: Axis to index; negative axes count backward from the input rank.
+    ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
+    fn dynamic_index_in_axis<A: Into<Axis>>(&self, index: &Self, axis: A, keep_axis: bool) -> Result<Self, ProgramError>
+    where
+        Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
+    {
+        let input_type = self.r#type();
+        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let output = self.dynamic_slice_in_axis(index, 1, axis)?;
+        if keep_axis {
+            return Ok(output);
+        }
+        let mut dimensions = static_dimensions_for_axis_window(DYNAMIC_SLICE_OPERATION_NAME, &input_type, axis)?;
+        dimensions.remove(axis);
+        output.reshape(dimensions)
+    }
+}
+
+/// Returns the static extents of `input_type` for a window that spans every axis other than `axis` in full, naming
+/// `operation_name` in the diagnostic when another axis is dynamic.
+fn static_dimensions_for_axis_window(
+    operation_name: &str,
+    input_type: &ArrayType,
+    axis: usize,
+) -> Result<Vec<usize>, TypeError> {
+    input_type
+        .shape()
+        .dimensions()
+        .iter()
+        .enumerate()
+        .map(|(input_axis, dimension)| match dimension {
+            Dimension::Static(size) => Ok(*size),
+            Dimension::Dynamic(_) if input_axis == axis => Ok(0),
+            Dimension::Dynamic(_) => Err(TypeError::invalid(format!(
+                "`{operation_name}` along axis {axis} requires static extents on the other axes but axis {input_axis} \
+                 of `{input_type}` is dynamic",
+            ))),
+        })
+        .collect()
 }
 
 impl DynamicSlice for ArrayType {
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<ArrayType, ProgramError> {
+    fn dynamic_slice_with_negative_indices(
+        &self,
+        start_indices: &[Self],
+        sizes: &[usize],
+        _allow_negative_indices: bool,
+    ) -> Result<ArrayType, ProgramError> {
         let rank = self.rank();
         if start_indices.len() != rank {
             return Err(TypeError::invalid(format!(
@@ -2647,11 +2836,16 @@ impl DynamicSlice for ArrayType {
 }
 
 impl DynamicSlice for Array {
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+    fn dynamic_slice_with_negative_indices(
+        &self,
+        start_indices: &[Self],
+        sizes: &[usize],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         let index_types = start_indices.iter().map(|index| index.r#type().into_owned()).collect::<Vec<_>>();
         let output_type = self.r#type().dynamic_slice(&index_types, sizes)?;
         let input_shape = self.r#type().static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes, allow_negative_indices);
         let axes = starts
             .iter()
             .zip(sizes)
@@ -2673,14 +2867,19 @@ impl DynamicSlice for Array {
 }
 
 impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSlice for ArrayIrValue<A> {
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+    fn dynamic_slice_with_negative_indices(
+        &self,
+        start_indices: &[Self],
+        sizes: &[usize],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let start_indices = start_indices
             .iter()
             .cloned()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Array(input.dynamic_slice(&start_indices, sizes)?))
+        Ok(Self::Array(input.dynamic_slice_with_negative_indices(&start_indices, sizes, allow_negative_indices)?))
     }
 
     fn dynamic_slice_with_bounds(
@@ -2761,13 +2960,18 @@ where
     <V::DispatchDomain as Domain>::Operation: From<DynamicSliceOperation<V::Type>>
         + OperationProvider<V::Type, DynamicSliceOperation, Operation = <V::DispatchDomain as Domain>::Operation>,
 {
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+    fn dynamic_slice_with_negative_indices(
+        &self,
+        start_indices: &[Self],
+        sizes: &[usize],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self.clone());
         inputs.extend_from_slice(start_indices);
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let operation = <V::DispatchDomain as Domain>::Operation::provide(
-            DynamicSliceOperation::new(sizes.to_vec()),
+            DynamicSliceOperation::new(sizes.to_vec()).with_allow_negative_indices(allow_negative_indices),
             &input_types.iter().collect::<Vec<_>>(),
         )?;
         // Preserve the identity-window shortcut after the operation has validated all start-index types.
@@ -2810,9 +3014,46 @@ where
 pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &str = "dynamic_update_slice";
 
 /// [`Operation`] that overwrites a contiguous sub-array of its first input with its second input at start indices that
-/// are computed at run time. Refer to the documentation of [`DynamicUpdateSlice`] for more information.
+/// are computed at run time, counting negative signed starts from the end of their axes under its
+/// [`allows_negative_indices`](Self::allows_negative_indices) policy and then clamping. Refer to the documentation of
+/// [`DynamicUpdateSlice`] for more information.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DynamicUpdateSliceOperation;
+pub struct DynamicUpdateSliceOperation {
+    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for more information.
+    allow_negative_indices: bool,
+}
+
+impl DynamicUpdateSliceOperation {
+    /// Creates a new [`DynamicUpdateSliceOperation`] that counts negative start indices from the end of their axes.
+    #[inline]
+    pub fn new() -> Self {
+        Self { allow_negative_indices: true }
+    }
+
+    /// Returns a copy of this [`DynamicUpdateSliceOperation`] with its negative-index policy set to
+    /// `allow_negative_indices`. Refer to the documentation of
+    /// [`allows_negative_indices`](Self::allows_negative_indices) for the meaning of both settings.
+    #[inline]
+    pub fn with_allow_negative_indices(mut self, allow_negative_indices: bool) -> Self {
+        self.allow_negative_indices = allow_negative_indices;
+        self
+    }
+
+    /// Returns whether a negative signed start index counts from the end of its axis, with the same meaning as
+    /// [`DynamicSliceOperation::allows_negative_indices`]: when `true` (the default), a negative start `i` on an axis
+    /// of extent `d` is replaced by `i + d` once before clamping; when `false`, it clamps to zero directly.
+    #[inline]
+    pub fn allows_negative_indices(&self) -> bool {
+        self.allow_negative_indices
+    }
+}
+
+impl Default for DynamicUpdateSliceOperation {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Display for DynamicUpdateSliceOperation {
     #[inline]
@@ -2850,7 +3091,12 @@ impl Operation for DynamicUpdateSliceOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name()).map(|_| ())
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        // The default policy is implied so that ordinary renderings stay unchanged.
+        if self.allow_negative_indices {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.field("allow_negative_indices", false))
     }
 }
 
@@ -2867,7 +3113,11 @@ impl<C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>> InterpretableOperat
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
         check_count!("input", inputs, 2 + input.r#type().rank(), ProgramError);
-        Ok(vec![input.dynamic_update_slice(update, start_indices)?])
+        Ok(vec![input.dynamic_update_slice_with_negative_indices(
+            update,
+            start_indices,
+            self.allow_negative_indices,
+        )?])
     }
 }
 
@@ -2969,7 +3219,7 @@ impl_differentiable_operation! {
         C::Operation: From<DynamicUpdateSliceOperation>,
         C::Value: DynamicUpdateSlice,
     {
-        |_operation, context, _driver, inputs| {
+        |operation, context, _driver, inputs| {
             // Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the
             // input and the update, while the scalar start indices are non-differentiated primal input edges, so the
             // tangent updates the input tangent with the update tangent at the same primal start indices. A zero input
@@ -2980,19 +3230,25 @@ impl_differentiable_operation! {
             let input = &inputs[0];
             let update = &inputs[1];
             let primal_starts = inputs[2..].iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-            let primal = input.primal().dynamic_update_slice(update.primal(), &primal_starts)?;
+            let allow_negative_indices = operation.allows_negative_indices();
+            let primal = input.primal().dynamic_update_slice_with_negative_indices(
+                update.primal(),
+                &primal_starts,
+                allow_negative_indices,
+            )?;
             let tangent = if input.tangent().is_zero() && update.tangent().is_zero() {
                 MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
                 let input_tangent = input.tangent().clone().materialize(context.tangent())?;
                 let update_tangent = update.tangent().clone().materialize(context.tangent())?;
                 MaybeZero::Value(
-                    input_tangent.dynamic_update_slice(
+                    input_tangent.dynamic_update_slice_with_negative_indices(
                         &update_tangent,
                         &primal_starts
                             .into_iter()
                             .map(|value| context.primal_to_tangent(value))
                             .collect::<Result<Vec<_>, _>>()?,
+                        allow_negative_indices,
                     )?,
                 )
             };
@@ -3008,7 +3264,7 @@ impl_differentiable_operation! {
             + From<DynamicSliceOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
-        |_operation, context, _driver, inputs, outputs, accumulators| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start
             // indices (inputs 2 onward) have no tangent space, so in a valid pushforward they are the known inputs and
             // the input and update (inputs 0 and 1) are the linear ones. The forward map `(t, u) ↦
@@ -3058,7 +3314,8 @@ impl_differentiable_operation! {
                     input_cotangent_inputs.push(zeros);
                     input_cotangent_inputs.extend(start_indices.iter().cloned());
                     let input_cotangents = context.stage_operation(
-                        DynamicUpdateSliceOperation,
+                        DynamicUpdateSliceOperation::new()
+                            .with_allow_negative_indices(operation.allows_negative_indices()),
                         Vec::new(),
                         input_cotangent_inputs.as_slice(),
                     )?;
@@ -3072,7 +3329,8 @@ impl_differentiable_operation! {
                     update_inputs.push(cotangent.clone());
                     update_inputs.extend(start_indices);
                     let update_cotangents = context.stage_operation(
-                        DynamicSliceOperation::new(update_sizes),
+                        DynamicSliceOperation::new(update_sizes)
+                            .with_allow_negative_indices(operation.allows_negative_indices()),
                         Vec::new(),
                         update_inputs.as_slice(),
                     )?;
@@ -3149,6 +3407,8 @@ where
         let start_indices = residuals.retain_all(start_indices.iter().map(|index| index.primal().clone()));
         let input_is_live = !input.tangent().is_zero();
         let update_is_live = !update.tangent().is_zero();
+        // The forward update and both transpose branches resolve the same raw starts under one policy.
+        let allow_negative_indices = self.allows_negative_indices();
         let input_shape =
             (!input_is_live).then(|| residuals.retain_shape(tangent_context, input.primal())).transpose()?;
         let update_type = <&ArrayType>::try_from(update.primal().r#type().as_ref())?.clone();
@@ -3224,7 +3484,9 @@ where
                 update_inputs.extend([input_tangent, update_tangent]);
                 update_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
                 forward_context.bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(DynamicUpdateSliceOperation),
+                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
+                        DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices),
+                    ),
                     Vec::new(),
                     update_inputs.as_slice(),
                 )
@@ -3249,7 +3511,8 @@ where
                         transpose_context
                             .bind(
                                 <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    DynamicUpdateSliceOperation,
+                                    DynamicUpdateSliceOperation::new()
+                                        .with_allow_negative_indices(allow_negative_indices),
                                 ),
                                 Vec::new(),
                                 input_cotangent_inputs.as_slice(),
@@ -3265,7 +3528,8 @@ where
                         transpose_context
                             .bind(
                                 <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    DynamicSliceOperation::new(update_sizes),
+                                    DynamicSliceOperation::new(update_sizes)
+                                        .with_allow_negative_indices(allow_negative_indices),
                                 ),
                                 Vec::new(),
                                 update_cotangent_inputs.as_slice(),
@@ -3285,10 +3549,12 @@ where
 /// at run time, with the semantics of StableHLO's
 /// [`dynamic_update_slice`](https://openxla.org/stablehlo/spec#dynamic_update_slice) operation.
 ///
-/// `input.dynamic_update_slice(update, start_indices)` replaces a block of `input` with `update`. Its effective start
-/// on axis `d` is `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`, keeping the complete update
-/// in bounds. Negative starts clamp to zero; they are not interpreted relative to the end. All starts must be scalar
-/// arrays with the same integer element data type, one per input axis.
+/// `input.dynamic_update_slice(update, start_indices)` replaces a block of `input` with `update`. A negative signed
+/// start counts from the end of its axis: on an axis of extent `d`, a start `i < 0` becomes `i + d` once. The
+/// effective start on axis `d` is then `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`,
+/// keeping the complete update in bounds, so `-1` places the update's last element at the end of the axis and a
+/// start that is still negative after the single wrap clamps to zero. Unsigned and Boolean starts never wrap. All
+/// starts must be scalar arrays with the same integer element data type, one per input axis.
 ///
 /// The update must have the input's element data type and rank, with static dimensions. A static input axis must be
 /// at least as large as its update axis. A dynamic input axis is accepted when its declared lower bound proves that
@@ -3325,12 +3591,91 @@ pub trait DynamicUpdateSlice: Sized {
     ///   - `update`: Array written into the selected block. Its element data type and rank must match `self`; its
     ///     dimensions must be static and fit within every possible input extent.
     ///   - `start_indices`: Scalar integer arrays, one per input axis, all with the same element data type. Negative
-    ///     values clamp to zero; values beyond the last valid origin clamp to keep the complete update in bounds.
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError>;
+    ///     signed values count from the end of their axis once; values beyond the last valid origin clamp to keep the
+    ///     complete update in bounds.
+    #[inline]
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        self.dynamic_update_slice_with_negative_indices(update, start_indices, true)
+    }
+
+    /// Overwrites the block of `self` starting at `start_indices` with `update` like
+    /// [`dynamic_update_slice`](Self::dynamic_update_slice), selecting how negative signed starts are treated. With
+    /// `allow_negative_indices` set to `true`, a negative start counts from the end of its axis exactly as
+    /// [`dynamic_update_slice`](Self::dynamic_update_slice) describes; with `false`, negative starts are out of bounds
+    /// and clamp to zero, which is StableHLO's native rule. Unsigned and Boolean starts are unaffected either way.
+    fn dynamic_update_slice_with_negative_indices(
+        &self,
+        update: &Self,
+        start_indices: &[Self],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError>;
+
+    /// Overwrites the block of `self` that starts at the runtime scalar `start` along `axis` and at zero along every
+    /// other axis with `update`. This is [`dynamic_update_slice`](Self::dynamic_update_slice) with a zero start on
+    /// every other axis, so `start` counts from the end of `axis` when negative and clamps so that the update fits,
+    /// and the update's extents on the other axes need not match the input's.
+    ///
+    /// # Parameters
+    ///
+    ///   - `update`: Array written into the selected block, with the input's element data type and rank.
+    ///   - `start`: Scalar integer array giving the start along `axis`.
+    ///   - `axis`: Axis of the update; negative axes count backward from the input rank.
+    fn dynamic_update_slice_in_axis<A: Into<Axis>>(
+        &self,
+        update: &Self,
+        start: &Self,
+        axis: A,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: Clone + Typed<Type = ArrayType> + ZeroLike,
+    {
+        let rank = self.r#type().rank();
+        let axis = axis.into().normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let starts = (0..rank)
+            .map(|input_axis| if input_axis == axis { Ok(start.clone()) } else { start.zero_like() })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dynamic_update_slice(update, &starts)
+    }
+
+    /// Overwrites the extent-one block of `self` at the runtime scalar `index` along `axis` with `update`, which may
+    /// either carry the input's rank with extent one on `axis` or omit `axis` altogether. This is
+    /// [`dynamic_update_slice_in_axis`](Self::dynamic_update_slice_in_axis) after inserting the missing axis into a
+    /// rank-deficient update, so `index` counts from the end of `axis` when negative and clamps into bounds.
+    ///
+    /// # Parameters
+    ///
+    ///   - `update`: Array written at the selected position, of the input's rank or one less.
+    ///   - `index`: Scalar integer array giving the position along `axis`.
+    ///   - `axis`: Axis of the update; negative axes count backward from the input rank.
+    fn dynamic_update_index_in_axis<A: Into<Axis>>(
+        &self,
+        update: &Self,
+        index: &Self,
+        axis: A,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
+    {
+        let rank = self.r#type().rank();
+        let axis = axis.into().normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let update_type = update.r#type();
+        if update_type.rank() + 1 == rank {
+            let mut dimensions = update_type.shape().dimensions().to_vec();
+            dimensions.insert(axis, Dimension::Static(1));
+            let update = update.reshape(Shape::new(dimensions))?;
+            return self.dynamic_update_slice_in_axis(&update, index, axis);
+        }
+        self.dynamic_update_slice_in_axis(update, index, axis)
+    }
 }
 
 impl DynamicUpdateSlice for ArrayType {
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<ArrayType, ProgramError> {
+    fn dynamic_update_slice_with_negative_indices(
+        &self,
+        update: &Self,
+        start_indices: &[Self],
+        _allow_negative_indices: bool,
+    ) -> Result<ArrayType, ProgramError> {
         validate_update_compatibility(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, update)?;
         let rank = self.rank();
         if start_indices.len() != rank {
@@ -3384,12 +3729,18 @@ impl DynamicUpdateSlice for ArrayType {
 }
 
 impl DynamicUpdateSlice for Array {
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+    fn dynamic_update_slice_with_negative_indices(
+        &self,
+        update: &Self,
+        start_indices: &[Self],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         let index_types = start_indices.iter().map(|index| index.r#type().into_owned()).collect::<Vec<_>>();
         let output_type = self.r#type().dynamic_update_slice(update.r#type().as_ref(), &index_types)?;
         let input_shape = self.r#type().static_shape().unwrap();
         let update_shape = update.r#type().static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
+        let starts =
+            Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions(), allow_negative_indices);
         let output = self.clone().replace_block(update, starts.as_slice());
         // Type inference preserves the input's shape, element type, memory, and physical layout; only sharding
         // metadata can change. Apply that validated metadata without broadcasting and copying the updated bytes.
@@ -3398,7 +3749,12 @@ impl DynamicUpdateSlice for Array {
 }
 
 impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for ArrayIrValue<A> {
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+    fn dynamic_update_slice_with_negative_indices(
+        &self,
+        update: &Self,
+        start_indices: &[Self],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
         let start_indices = start_indices
@@ -3406,7 +3762,11 @@ impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for Arr
             .cloned()
             .map(ValueProjection::<ArrayType>::into_projected)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Array(input.dynamic_update_slice(update, &start_indices)?))
+        Ok(Self::Array(input.dynamic_update_slice_with_negative_indices(
+            update,
+            &start_indices,
+            allow_negative_indices,
+        )?))
     }
 }
 
@@ -3414,36 +3774,85 @@ impl<V: Value<Type = ArrayType>> DynamicUpdateSlice for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>,
 {
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+    fn dynamic_update_slice_with_negative_indices(
+        &self,
+        update: &Self,
+        start_indices: &[Self],
+        allow_negative_indices: bool,
+    ) -> Result<Self, ProgramError> {
         // Any context-carrying value dynamic-update-slices by binding a [`DynamicUpdateSliceOperation`] through its own
         // context. The `From<DynamicUpdateSliceOperation>` bound makes this disjoint from the eager value types (whose
-        // context
-        // operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-        // implementations.
+        // context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
+        // concrete implementations.
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
-        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, Vec::new(), &inputs)?;
+        let operation = DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices);
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
 impl Array {
-    /// Extracts the in-band scalar start indices of a dynamic slicing operation and clamps them per StableHLO
-    /// semantics: the effective start index along axis `d` is `clamp(0, start_indices[d], input_dimension[d] -
-    /// block_sizes[d])`.
-    fn clamped_start_indices(start_indices: &[Array], input_shape: &StaticShape, block_sizes: &[usize]) -> Vec<usize> {
+    /// Extracts the in-band scalar start indices of a dynamic slicing operation and resolves them against the input
+    /// extents: with `allow_negative_indices`, a negative signed start on axis `d` is first replaced by
+    /// `start_indices[d] + input_dimension[d]`, and every start is then clamped to
+    /// `[0, input_dimension[d] - block_sizes[d]]` as StableHLO does.
+    fn clamped_start_indices(
+        start_indices: &[Array],
+        input_shape: &StaticShape,
+        block_sizes: &[usize],
+        allow_negative_indices: bool,
+    ) -> Vec<usize> {
         start_indices
             .iter()
             .enumerate()
             .map(|(axis, index)| {
                 // Input validation guarantees a scalar integer. Preserve unsigned extremes until after clamping.
-                let raw: i128 = index.concretize().unwrap();
-                let maximum = (input_shape[axis] - block_sizes[axis]) as i128;
-                raw.clamp(0, maximum) as usize
+                let mut raw: i128 = index.concretize().unwrap();
+                let extent = input_shape[axis] as i128;
+                if allow_negative_indices && raw < 0 && wraps_negative_start(index.r#type().data_type()) {
+                    raw += extent;
+                }
+                raw.clamp(0, extent - block_sizes[axis] as i128) as usize
             })
             .collect()
     }
+}
+
+/// Returns whether a start index of `data_type` can be negative and therefore counts from the end of its axis when a
+/// dynamic slicing operation allows negative indices. Unsigned starts cannot be negative, and Boolean starts are
+/// predicate carriers that never wrap.
+fn wraps_negative_start(data_type: DataType) -> bool {
+    !data_type.is_unsigned() && data_type != DataType::I1
+}
+
+/// Counts the negative entries of a signed start array from the end of an axis whose extent is the scalar integer
+/// value `extent`, leaving the other entries unchanged, so that a clamp-only consumer such as a gather resolves them
+/// like the unbatched kernel does.
+fn wrap_negative_starts<V>(starts: &V, extent: &V) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + ZeroLike + Broadcast + Compare + Add + Select + ConvertElementType + TransferToMemory,
+{
+    let starts_type = starts.r#type().into_owned();
+    let extent = extent
+        .convert_element_type(starts_type.data_type())?
+        .transfer_to_memory(starts_type.memory())?
+        .broadcast(starts_type, &[])?;
+    let negative = starts.less_than(&starts.zero_like()?)?;
+    V::select(&negative, &starts.add(&extent)?, starts)
+}
+
+/// Returns the runtime extent of the dynamic `axis` of `source` as a scalar `i64` value without any dimension
+/// operation, which the homogeneous array family does not have: a reduction of ones over every other axis has that
+/// extent, and a second reduction of ones over the result counts it.
+fn dynamic_axis_extent<V: Value<Type = ArrayType> + ConvertElementType + OneLike + Reduce>(
+    source: &V,
+    axis: usize,
+) -> Result<V, ProgramError> {
+    let other_axes = (0..source.r#type().rank()).filter(|source_axis| *source_axis != axis).collect::<Vec<_>>();
+    let ones = source.convert_element_type(DataType::I64)?.one_like()?;
+    Ok(ones.reduce(&other_axes, ReductionKind::Sum).one_like()?.reduce(&[0], ReductionKind::Sum))
 }
 
 /// Validates that a [`DynamicSlice`] call supplies one start index and one size per input axis, naming the list
@@ -4961,7 +5370,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(
                 &context,
                 &EmptyRegionDriver,
@@ -5001,7 +5410,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&manual_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(
                 &context,
                 &EmptyRegionDriver,
@@ -5439,6 +5848,12 @@ mod tests {
         assert_eq!(operation.name(), DYNAMIC_SLICE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "dynamic_slice [sizes=[1, 2]]");
         assert_eq!(operation.sizes(), &[1, 2]);
+        assert!(operation.allows_negative_indices());
+
+        // The default negative-index policy is implied by the rendering; only the clamp-only policy is shown.
+        let clamping = operation.clone().with_allow_negative_indices(false);
+        assert!(!clamping.allows_negative_indices());
+        assert_eq!(format!("{clamping}"), "dynamic_slice [sizes=[1, 2], allow_negative_indices=false]");
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
@@ -5624,9 +6039,19 @@ mod tests {
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![5.0, 6.0]);
 
-        // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
-        // `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
+        // Out-of-bounds start indices resolve like the capability documents: the row start `5` clamps to the last
+        // valid origin `1`, and the column start `-2` counts from the end of the extent-3 axis to `1`.
         let clamped = operation
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), Array::scalar(5_i32).unwrap(), Array::scalar(-2_i32).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(clamped[0].to_f64s(), vec![5.0, 6.0]);
+        // Without the negative-index policy, the column start `-2` is out of bounds and clamps to zero.
+        let clamped = DynamicSliceOperation::new(vec![1, 2])
+            .with_allow_negative_indices(false)
             .interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
@@ -5858,9 +6283,35 @@ mod tests {
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 2]), &[]).unwrap()),
         );
 
+        // Mapped signed starts count from the end before the clipping gather, exactly as the unbatched kernel resolves
+        // each item: `-1` reads the last window, `-9` stays negative after one wrap and clamps to the first window,
+        // and `3` clamps to the last valid origin. The clamp-only policy resolves both negative starts to zero.
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            batch(
+                |(input, start)| input.dynamic_slice(&[start], &[2]),
+                (vector.clone(), Array::vector(vec![-1_i32, -9, 3]).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(Array::matrix(3, 2, vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0]).unwrap()),
+        );
+        assert_eq!(
+            batch(
+                |(input, start)| input.dynamic_slice_with_negative_indices(&[start], &[2], false),
+                (vector, Array::vector(vec![-1_i32, -9, 3]).unwrap()),
+                (BatchAxis::replicated(), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(Array::matrix(3, 2, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0]).unwrap()),
+        );
+
         // Mixed replicated/mapped coordinates form one index vector per window; the full-width second coordinate
-        // clamps to zero. Item 0's row start `-1` clamps to row 0 and item 1 reads row 2; an empty result window keeps
-        // the batch axis and the full-width column extent.
+        // clamps to zero. Item 0's row start `-1` counts from the end to row 2, as the unbatched kernel resolves it,
+        // and item 1 reads row 2 directly; an empty result window keeps the batch axis and the full-width column
+        // extent.
         let grid = Array::matrix(3, 3, (0..9).map(f64::from).collect()).unwrap();
         assert_eq!(
             batch(
@@ -5870,7 +6321,7 @@ mod tests {
                 BatchAxis::new(0),
                 None,
             ),
-            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 3]), &[0.0, 1.0, 2.0, 6.0, 7.0, 8.0],)
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 3]), &[6.0, 7.0, 8.0, 6.0, 7.0, 8.0],)
                 .unwrap()),
         );
         assert_eq!(
@@ -6025,19 +6476,28 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_batching_under_tracing() {
-        // A shared source with mapped starts stages one clipping gather over the packed index vectors, independent of
-        // the mapped length: every item reads its own window of the same vector.
+        // A shared source with mapped starts wraps the signed starts by the static axis extent, then stages one
+        // clipping gather over the packed index vectors, independent of the mapped length: every item reads its own
+        // window of the same vector.
         assert_eq!(
             trace_batched_dynamic_slice(ArrayType::new_static(DataType::F32, [4]), BatchAxis::replicated(), 2),
             indoc! {"
                 lambda %0:f32[4], %1:i32[2] .
-                let %2:i32[2, 1] = reshape [shape=[2, 1]] %1
-                    %3:f32[2, 2] = gather [
+                let %2:i64[] = constant [value=4]
+                    %3:i32[] = convert_element_type [data_type=i32] %2
+                    %4:i32[] = transfer_to_memory [destination=Device] %3
+                    %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
+                    %6:i32[2] = zero_like %1
+                    %7:bool[2] = compare [direction=LessThan] %1 %6
+                    %8:i32[2] = add %1 %5
+                    %9:i32[2] = select %7 %8 %1
+                    %10:i32[2, 1] = reshape [shape=[2, 1]] %9
+                    %11:f32[2, 2] = gather [
                         dimensions=(offset=[1], collapsed_slice=[], start_index_map=[0], batching=[]),
                         slice_sizes=[2],
                         mode=clip,
-                    ] %0 %2
-                in (%3)
+                    ] %0 %10
+                in (%11)
             "}
             .trim_end(),
         );
@@ -6045,13 +6505,21 @@ mod tests {
             trace_batched_dynamic_slice(ArrayType::new_static(DataType::F32, [4]), BatchAxis::replicated(), 256),
             indoc! {"
                 lambda %0:f32[4], %1:i32[256] .
-                let %2:i32[256, 1] = reshape [shape=[256, 1]] %1
-                    %3:f32[256, 2] = gather [
+                let %2:i64[] = constant [value=4]
+                    %3:i32[] = convert_element_type [data_type=i32] %2
+                    %4:i32[] = transfer_to_memory [destination=Device] %3
+                    %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
+                    %6:i32[256] = zero_like %1
+                    %7:bool[256] = compare [direction=LessThan] %1 %6
+                    %8:i32[256] = add %1 %5
+                    %9:i32[256] = select %7 %8 %1
+                    %10:i32[256, 1] = reshape [shape=[256, 1]] %9
+                    %11:f32[256, 2] = gather [
                         dimensions=(offset=[1], collapsed_slice=[], start_index_map=[0], batching=[]),
                         slice_sizes=[2],
                         mode=clip,
-                    ] %0 %2
-                in (%3)
+                    ] %0 %10
+                in (%11)
             "}
             .trim_end(),
         );
@@ -6062,13 +6530,21 @@ mod tests {
             trace_batched_dynamic_slice(ArrayType::new_static(DataType::F32, [2, 4]), BatchAxis::new(0), 2),
             indoc! {"
                 lambda %0:f32[2, 4], %1:i32[2] .
-                let %2:i32[2, 1] = reshape [shape=[2, 1]] %1
-                    %3:f32[2, 2] = gather [
+                let %2:i64[] = constant [value=4]
+                    %3:i32[] = convert_element_type [data_type=i32] %2
+                    %4:i32[] = transfer_to_memory [destination=Device] %3
+                    %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
+                    %6:i32[2] = zero_like %1
+                    %7:bool[2] = compare [direction=LessThan] %1 %6
+                    %8:i32[2] = add %1 %5
+                    %9:i32[2] = select %7 %8 %1
+                    %10:i32[2, 1] = reshape [shape=[2, 1]] %9
+                    %11:f32[2, 2] = gather [
                         dimensions=(offset=[1], collapsed_slice=[], start_index_map=[1], batching=[(0, 0)]),
                         slice_sizes=[1, 2],
                         mode=clip,
-                    ] %0 %2
-                in (%3)
+                    ] %0 %10
+                in (%11)
             "}
             .trim_end(),
         );
@@ -6076,13 +6552,21 @@ mod tests {
             trace_batched_dynamic_slice(ArrayType::new_static(DataType::F32, [256, 4]), BatchAxis::new(0), 256),
             indoc! {"
                 lambda %0:f32[256, 4], %1:i32[256] .
-                let %2:i32[256, 1] = reshape [shape=[256, 1]] %1
-                    %3:f32[256, 2] = gather [
+                let %2:i64[] = constant [value=4]
+                    %3:i32[] = convert_element_type [data_type=i32] %2
+                    %4:i32[] = transfer_to_memory [destination=Device] %3
+                    %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
+                    %6:i32[256] = zero_like %1
+                    %7:bool[256] = compare [direction=LessThan] %1 %6
+                    %8:i32[256] = add %1 %5
+                    %9:i32[256] = select %7 %8 %1
+                    %10:i32[256, 1] = reshape [shape=[256, 1]] %9
+                    %11:f32[256, 2] = gather [
                         dimensions=(offset=[1], collapsed_slice=[], start_index_map=[1], batching=[(0, 0)]),
                         slice_sizes=[1, 2],
                         mode=clip,
-                    ] %0 %2
-                in (%3)
+                    ] %0 %10
+                in (%11)
             "}
             .trim_end(),
         );
@@ -6202,6 +6686,29 @@ mod tests {
             step = 1e-3,
             tolerance = 1e-6,
         );
+
+        // A negative start counts from the end in the forward pass and in its transpose alike: `-1` names origin 3,
+        // which the size-2 window clamps to 2, so the Jacobian selects the last two elements.
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
+            .jacobian_forward(|x| {
+                let start = index_constant(&x, -1);
+                Ok(x.dynamic_slice(&[start], &[2]).unwrap())
+            })
+            .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().to_f64s(), vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        for start in [-1, -9] {
+            check_gradient!(
+                |x| {
+                    let start = index_constant(&x, start);
+                    let window = x.dynamic_slice(&[start], &[2])?;
+                    Ok((window.clone() * window).reduce(&[0], ReductionKind::Sum))
+                },
+                at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                step = 1e-3,
+                tolerance = 1e-6,
+            );
+        }
     }
 
     #[test]
@@ -6533,8 +7040,9 @@ mod tests {
             .trim_end(),
         );
 
-        // Different runtime starts share one transformed program, including the forward operation's clamping at either
-        // end. Repeated calls add to the prepopulated buffer instead of resetting earlier contributions.
+        // Different runtime starts share one transformed program, including the forward operation's clamping past the
+        // end and its wrapping of a negative start. Repeated calls add to the prepopulated buffer instead of resetting
+        // earlier contributions.
         let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5]).unwrap()).reference_new().unwrap();
         let seed = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap());
         assert_eq!(
@@ -6559,7 +7067,7 @@ mod tests {
         );
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![12.0_f64, 15.0, 13.0, 12.0, 13.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 14.0, 16.0]).unwrap()))
         );
 
         // The same retained rule returns a dense value when requested, while Ignore constructs no scratch buffer and
@@ -6798,9 +7306,13 @@ mod tests {
         // Dynamic start indices clamp so the block stays in bounds.
         let start = [Array::scalar(4i64).unwrap()];
         assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap());
-        // Index decoding is typed and supports sub-byte integers directly; a negative start still clamps to zero.
+        // Index decoding is typed and supports sub-byte integers directly; a negative start counts from the end.
         let start = [Array::scalar(i4::new(-1).unwrap()).unwrap()];
-        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap());
+        assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap());
+        assert_eq!(
+            vector.dynamic_slice_with_negative_indices(&start, &[2], false).unwrap(),
+            Array::vector(vec![1.0, 2.0]).unwrap(),
+        );
 
         // A nonscalar start must fail before any indexing takes place.
         assert_eq!(
@@ -7685,12 +8197,97 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_slice_in_axis() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        // The traced start counts from the end of the sliced axis and clamps so that the window fits, while every
+        // other axis is kept in full through a zero start.
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-2_i32).unwrap(), 2, 1).unwrap(),
+            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(5_i32).unwrap(), 2, -1).unwrap(),
+            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-9_i32).unwrap(), 2, 1).unwrap(),
+            Array::matrix(2, 2, vec![1.0, 2.0, 4.0, 5.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-1_i32).unwrap(), 1, 0).unwrap(),
+            Array::matrix(1, 3, vec![4.0, 5.0, 6.0]).unwrap(),
+        );
+
+        // Tracing stages the zero starts from the traced start and one ordinary dynamic slice.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
+            (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::scalar(DataType::I32)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:i32[] .
+                let %2:i32[] = zero_like %1
+                    %3:f32[2, 2] = dynamic_slice [sizes=[2, 2]] %0 %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Every other axis must be static because the window spans it in full.
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap())),
+                Dimension::Static(3),
+            ]),
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
+                (dynamic_type.clone(), ArrayType::scalar(DataType::I32)),
+            )
+            .map(|_| ()),
+            Err(TypeError::invalid(format!(
+                "`dynamic_slice` along axis 1 requires static extents on the other axes but axis 0 of \
+                 `{dynamic_type}` is dynamic",
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_index_in_axis() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        // The traced index counts from the end and clamps into bounds; the selected axis is squeezed unless kept.
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, false).unwrap(),
+            Array::vector(vec![3.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, true).unwrap(),
+            Array::matrix(2, 1, vec![3.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(7_i32).unwrap(), -2, false).unwrap(),
+            Array::vector(vec![4.0, 5.0, 6.0]).unwrap(),
+        );
+    }
+
+    #[test]
     fn test_dynamic_update_slice() {
-        let operation = DynamicUpdateSliceOperation;
+        let operation = DynamicUpdateSliceOperation::new();
 
         // Operation identity.
         assert_eq!(operation.name(), DYNAMIC_UPDATE_SLICE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "dynamic_update_slice");
+        assert!(operation.allows_negative_indices());
+
+        // The default negative-index policy is implied by the rendering; only the clamp-only policy is shown.
+        let clamping = operation.with_allow_negative_indices(false);
+        assert!(!clamping.allows_negative_indices());
+        assert_eq!(format!("{clamping}"), "dynamic_update_slice [allow_negative_indices=false]");
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -7729,7 +8326,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_type_inference() {
-        let operation = DynamicUpdateSliceOperation;
+        let operation = DynamicUpdateSliceOperation::new();
         // Type inference validates the update and index input types and returns the input type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -7836,7 +8433,7 @@ mod tests {
 
         // A slice operation cannot own nested regions.
         assert_eq!(
-            DynamicUpdateSliceOperation
+            DynamicUpdateSliceOperation::new()
                 .infer_output_types(&[], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -7846,7 +8443,7 @@ mod tests {
     fn test_dynamic_update_slice_reference_discharge() {
         // Replay preserves the complete slicing payload and its output type. Shared replay and reference rejection
         // are covered by the reference-discharge macro tests.
-        let expected = DynamicUpdateSliceOperation;
+        let expected = DynamicUpdateSliceOperation::new();
         let operation = ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(expected.clone()));
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = ReferenceDischargeContext::<_, ArrayReferenceDischarge>::new(trace.clone());
@@ -7889,7 +8486,7 @@ mod tests {
         assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
         assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
 
-        let operation = DynamicUpdateSliceOperation;
+        let operation = DynamicUpdateSliceOperation::new();
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         // Interpretation overwrites the block at the in-band start indices.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
@@ -7934,7 +8531,7 @@ mod tests {
         let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]).unwrap();
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
-            operation = DynamicUpdateSliceOperation,
+            operation = DynamicUpdateSliceOperation::new(),
             cases = [
                 {
                     inputs = [(@known, input.clone()), (@known, update.clone()), (@known, start.clone())],
@@ -7961,7 +8558,7 @@ mod tests {
         // Replicated starts align the input and update on one mapped axis.
         check_operation_batching!(
             @exact,
-            operation = DynamicUpdateSliceOperation,
+            operation = DynamicUpdateSliceOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -7985,7 +8582,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let update = ArrayBatch::replicated(Array::vector(vec![8.0, 9.0]).unwrap());
         assert!(matches!(
-            DynamicUpdateSliceOperation.batch(
+            DynamicUpdateSliceOperation::new().batch(
                 &context,
                 &EmptyRegionDriver,
                 &[ragged_batch(), update.clone(), ArrayBatch::replicated(Array::scalar(1_i32).unwrap())],
@@ -7997,7 +8594,7 @@ mod tests {
         ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
-            DynamicUpdateSliceOperation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
+            DynamicUpdateSliceOperation::new().batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
     }
@@ -8007,7 +8604,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         let scalars = ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap();
         let updates = ArrayBatch::new(Array::vector(vec![7.0, 8.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(&context, &EmptyRegionDriver, &[scalars.clone(), updates.clone()])
             .unwrap()
             .into_parts()
@@ -8020,7 +8617,9 @@ mod tests {
                 .unwrap();
         let updates = ArrayBatch::new(Array::matrix(2, 1, vec![7.0, 8.0]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
-            DynamicUpdateSliceOperation.batch(&context, &EmptyRegionDriver, &[vectors, updates]).unwrap_err(),
+            DynamicUpdateSliceOperation::new()
+                .batch(&context, &EmptyRegionDriver, &[vectors, updates])
+                .unwrap_err(),
             BatchingError::Type(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0"
             ))),
@@ -8029,7 +8628,7 @@ mod tests {
         // Actual scalar replacement still validates the input/update element types before returning the update.
         let integer_updates = ArrayBatch::new(Array::vector(vec![7_i32, 8]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
-            DynamicUpdateSliceOperation
+            DynamicUpdateSliceOperation::new()
                 .batch(&context, &EmptyRegionDriver, &[scalars, integer_updates])
                 .unwrap_err(),
             BatchingError::Type(TypeError::invalid(format!(
@@ -8041,7 +8640,7 @@ mod tests {
     #[test]
     fn test_dynamic_update_slice_batching_expands_batch_varying_indices() {
         // A scalar update still has to be repeated when only the overwritten scalar input is mapped.
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(
                 &BatchingContext::new(EagerContext::<Array>::new(), 2),
                 &EmptyRegionDriver,
@@ -8061,7 +8660,7 @@ mod tests {
         let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         let update =
             ArrayBatch::new(Array::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]).unwrap(), BatchAxis::new(0)).unwrap();
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(
                 &BatchingContext::new(EagerContext::<Array>::new(), 2),
                 &EmptyRegionDriver,
@@ -8082,7 +8681,7 @@ mod tests {
         )
         .unwrap();
         let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]).unwrap());
-        let outputs = DynamicUpdateSliceOperation
+        let outputs = DynamicUpdateSliceOperation::new()
             .batch(
                 &BatchingContext::new(EagerContext::<Array>::new(), 2),
                 &EmptyRegionDriver,
@@ -8148,6 +8747,32 @@ mod tests {
             step = 1e-3,
             tolerance = 1e-6,
         );
+
+        // A negative start counts from the end in the forward update and in both transpose branches: `-1` names
+        // origin 3, which the two-element update clamps to 2, so the input gradient zeroes the last two elements.
+        let (value, (input_gradient, update_gradient)) = differentiate_at((
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![7.0, 8.0]).unwrap(),
+        ))
+        .value_and_gradient(|(x, update)| {
+            let start = index_constant(&x, -1);
+            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+        })
+        .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 18.0, epsilon = 1e-9);
+        assert_eq!(input_gradient.to_f64s(), vec![1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
+        check_gradient!(
+            |input, update| {
+                let start = index_constant(&input, -1);
+                let updated = input.dynamic_update_slice(&update, &[start])?;
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+            },
+            at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            with = Array::vector(vec![7.0, 8.0]).unwrap(),
+            step = 1e-3,
+            tolerance = 1e-6,
+        );
         check_gradient!(
             |update, input| {
                 let start = index_constant(&input, 9);
@@ -8192,7 +8817,7 @@ mod tests {
         let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let output = builder
             .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)),
+                ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
                 Vec::new(),
                 vec![input, update, start],
                 None,
@@ -8273,7 +8898,7 @@ mod tests {
 
         check_operation_transposition!(
             @exact,
-            operation = DynamicUpdateSliceOperation,
+            operation = DynamicUpdateSliceOperation::new(),
             cases = [{
                 inputs = [
                     (@linear(type = input_type)),
@@ -8302,7 +8927,7 @@ mod tests {
         .unwrap();
         check_operation_transposition!(
             @exact,
-            operation = DynamicUpdateSliceOperation,
+            operation = DynamicUpdateSliceOperation::new(),
             cases = [{
                 inputs = [
                     (@linear(type = input_type.clone())),
@@ -8322,7 +8947,7 @@ mod tests {
     fn test_dynamic_update_slice_transposition_zero_cotangent() {
         // A structural-zero output cotangent contributes nothing, and when neither array cotangent is needed the rule
         // returns before extracting the update shape or reading the start indices.
-        let operation = DynamicUpdateSliceOperation;
+        let operation = DynamicUpdateSliceOperation::new();
         let input_type = ArrayType::new_static(DataType::F64, [4]);
         let update_type = ArrayType::new_static(DataType::F64, [2]);
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -8479,6 +9104,62 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_update_slice_in_axis() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        // The traced start counts from the end of the updated axis and clamps so that the update fits, while the
+        // update's extent on the other axis need not match the input's.
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
+        assert_eq!(
+            matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(-1_i32).unwrap(), 1).unwrap(),
+            Array::matrix(2, 3, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(-9_i32).unwrap(), -1).unwrap(),
+            Array::matrix(2, 3, vec![8.0, 9.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(-1_i32).unwrap(), 0).unwrap(),
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_update_index_in_axis() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        // A rank-deficient update gains the indexed axis with extent one; a full-rank update is written as is.
+        assert_eq!(
+            matrix
+                .dynamic_update_index_in_axis(
+                    &Array::vector(vec![7.0, 8.0]).unwrap(),
+                    &Array::scalar(-1_i32).unwrap(),
+                    1
+                )
+                .unwrap(),
+            Array::matrix(2, 3, vec![1.0, 2.0, 7.0, 4.0, 5.0, 8.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix
+                .dynamic_update_index_in_axis(
+                    &Array::matrix(2, 1, vec![7.0, 8.0]).unwrap(),
+                    &Array::scalar(9_i32).unwrap(),
+                    -1,
+                )
+                .unwrap(),
+            Array::matrix(2, 3, vec![1.0, 2.0, 7.0, 4.0, 5.0, 8.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix
+                .dynamic_update_index_in_axis(
+                    &Array::vector(vec![7.0, 8.0, 9.0]).unwrap(),
+                    &Array::scalar(-2_i32).unwrap(),
+                    0
+                )
+                .unwrap(),
+            Array::matrix(2, 3, vec![7.0, 8.0, 9.0, 4.0, 5.0, 6.0]).unwrap(),
+        );
+    }
+
+    #[test]
     fn test_array_dynamic_update_slice() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         // Dynamic start indices clamp so the block stays in bounds.
@@ -8512,43 +9193,81 @@ mod tests {
     #[test]
     fn test_clamped_start_indices() {
         let input_shape = StaticShape::new(vec![4, 3]);
-        // In-bounds starts pass through; negative starts clamp to zero and starts past the last valid origin clamp to
-        // `extent - size`, so the block always stays in bounds.
+        // In-bounds starts pass through, and starts past the last valid origin clamp to `extent - size`, so the block
+        // always stays in bounds.
         assert_eq!(
             Array::clamped_start_indices(
                 &[Array::scalar(1_i32).unwrap(), Array::scalar(0_i32).unwrap()],
                 &input_shape,
-                &[2, 3]
+                &[2, 3],
+                true,
             ),
-            vec![1, 0]
+            vec![1, 0],
         );
         assert_eq!(
             Array::clamped_start_indices(
-                &[Array::scalar(-7_i32).unwrap(), Array::scalar(9_i32).unwrap()],
+                &[Array::scalar(3_i32).unwrap(), Array::scalar(9_i32).unwrap()],
                 &input_shape,
-                &[2, 1]
+                &[2, 1],
+                true,
             ),
-            vec![0, 2]
+            vec![2, 2],
         );
-        // Signed and unsigned extremes are decoded exactly and clamped without wrapping.
+        // A negative signed start counts from the end of its axis once and then clamps: `-1` on the extent-4 axis names
+        // origin 3, which the size-2 window clamps to 2, while `-7` stays negative after one wrap and clamps to zero.
         assert_eq!(
             Array::clamped_start_indices(
-                &[Array::scalar(u64::MAX).unwrap(), Array::scalar(i64::MIN).unwrap()],
+                &[Array::scalar(-1_i32).unwrap(), Array::scalar(-7_i32).unwrap()],
                 &input_shape,
-                &[1, 1],
+                &[2, 1],
+                true,
+            ),
+            vec![2, 0],
+        );
+        assert_eq!(
+            Array::clamped_start_indices(
+                &[Array::scalar(-1_i32).unwrap(), Array::scalar(-1_i32).unwrap()],
+                &input_shape,
+                &[1, 3],
+                true,
             ),
             vec![3, 0],
         );
+        // Without the policy, negative starts are out of bounds and clamp to zero directly.
+        assert_eq!(
+            Array::clamped_start_indices(
+                &[Array::scalar(-1_i32).unwrap(), Array::scalar(-7_i32).unwrap()],
+                &input_shape,
+                &[2, 1],
+                false,
+            ),
+            vec![0, 0],
+        );
+        // Signed and unsigned extremes are decoded exactly: the unsigned maximum clamps without any signed
+        // reinterpretation, and the signed minimum stays negative after one wrap and clamps to zero under either
+        // policy.
+        for allow_negative_indices in [true, false] {
+            assert_eq!(
+                Array::clamped_start_indices(
+                    &[Array::scalar(u64::MAX).unwrap(), Array::scalar(i64::MIN).unwrap()],
+                    &input_shape,
+                    &[1, 1],
+                    allow_negative_indices,
+                ),
+                vec![3, 0],
+            );
+        }
         // A full-extent window always starts at zero, and a rank-0 slice has no starts.
         assert_eq!(
             Array::clamped_start_indices(
-                &[Array::scalar(3_i32).unwrap(), Array::scalar(3_i32).unwrap()],
+                &[Array::scalar(3_i32).unwrap(), Array::scalar(-3_i32).unwrap()],
                 &input_shape,
-                &[4, 3]
+                &[4, 3],
+                true,
             ),
-            vec![0, 0]
+            vec![0, 0],
         );
-        assert_eq!(Array::clamped_start_indices(&[], &StaticShape::scalar(), &[]), Vec::<usize>::new());
+        assert_eq!(Array::clamped_start_indices(&[], &StaticShape::scalar(), &[], true), Vec::<usize>::new());
     }
 
     #[test]
