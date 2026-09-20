@@ -14200,7 +14200,7 @@ mod tests {
         assert_eq!(read_f32s(&client, program_array(&sliced[0])), vec![3.0]);
         let updated = domain
             .bind(
-                XlaOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)),
+                XlaOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
                 Vec::new(),
                 &[input, ArrayIrValue::Array(f32_vector(&client, &mesh, &[9.0])), index],
             )

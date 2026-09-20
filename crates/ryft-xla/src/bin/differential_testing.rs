@@ -21,8 +21,9 @@ use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
     ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType,
     Device, DeviceMesh, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
-    DotDimensionNumbers, DynamicSliceOperation, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
-    ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension,
+    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis,
+    MeshAxisType, Placeholder, ProgramBuilder, ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape,
+    Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -80,6 +81,7 @@ fn registry() -> Vec<DifferentialCase> {
         DifferentialCase { case_id: "data_dependent_prefix_take", emit: emit_data_dependent_prefix_take },
         DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul },
         DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention },
+        DifferentialCase { case_id: "negative_dynamic_slice", emit: emit_negative_dynamic_slice },
     ];
     for (index, case) in cases.iter().enumerate() {
         assert!(
@@ -594,6 +596,38 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     Ok(DifferentialObservation {
         schema: SCHEMA,
         case_id: "dot_product_attention",
+        observations,
+        staging: None,
+        stablehlo: Some(traced.to_mlir_module("main")?),
+    })
+}
+
+/// Emits dynamic slicing values at negative and out-of-range starts under both negative-index policies, plus the
+/// StableHLO of a traced dynamic slice whose signed start wraps before the native clamp.
+fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let vector = CpuArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?;
+    let update = CpuArray::vector(vec![1.0_f32, 2.0])?;
+    let start = |value: i32| -> Result<CpuArray, ProgramError> { CpuArray::scalar(value) };
+    let values = |value: CpuArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+    let observations = BTreeMap::from([
+        ("slice_minus_one", values(vector.dynamic_slice(&[start(-1)?], &[2])?)),
+        ("slice_minus_nine", values(vector.dynamic_slice(&[start(-9)?], &[2])?)),
+        ("slice_past_end", values(vector.dynamic_slice(&[start(3)?], &[2])?)),
+        ("slice_minus_one_clamp_only", values(vector.dynamic_slice_with_negative_indices(&[start(-1)?], &[2], false)?)),
+        ("update_minus_one", values(vector.dynamic_update_slice(&update, &[start(-1)?])?)),
+        ("update_minus_nine", values(vector.dynamic_update_slice(&update, &[start(-9)?])?)),
+        (
+            "update_minus_one_clamp_only",
+            values(vector.dynamic_update_slice_with_negative_indices(&update, &[start(-1)?], false)?),
+        ),
+    ]);
+    let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
+        |(input, start): (ShardMapTracer, ShardMapTracer)| input.dynamic_slice(&[start], &[2]).unwrap(),
+        (ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)),
+    )?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "negative_dynamic_slice",
         observations,
         staging: None,
         stablehlo: Some(traced.to_mlir_module("main")?),

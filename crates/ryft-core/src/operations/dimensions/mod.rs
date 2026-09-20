@@ -1,6 +1,53 @@
-//! Operations and value capabilities for [`DimensionType`] values. These operations compute array extents, infer their
-//! [`DimensionBounds`], and validate runtime shape requirements. Dimension values are ordinary program inputs and
-//! outputs, so shape computations can be traced and transformed.
+//! Operations over _first-class dimensions_ (i.e., array extents that are ordinary program values rather than static
+//! type metadata). A [`DimensionValue`](crate::DimensionValue) carries one extent together with its [`DimensionType`],
+//! whose [`DimensionBounds`] record what is known about the extent statically, so shape arithmetic can be traced,
+//! batched, and differentiated through like any other computation while type inference keeps track of the resulting
+//! bounds.
+//!
+//! The operations fall into three groups:
+//!
+//!   - **Arithmetic:** Addition, subtraction, multiplication, division, and remainder use the ordinary
+//!     [`Add`](crate::Add), [`Sub`](crate::Sub), [`Mul`](crate::Mul), [`Div`](crate::Div), and [`Rem`](crate::Rem)
+//!     capabilities, while [`DimensionPow`], [`DimensionMax`], [`DimensionMin`], and [`DimensionSaturatingSub`] have
+//!     their own. Every operation infers the bounds of its result from the bounds of its inputs, folds identities such
+//!     as adding zero, and reports a checked runtime assertion effect only when the input bounds leave an overflow or
+//!     a division by zero possible.
+//!   - **Bridges Between Arrays and Dimensions:** [`DimensionSize`] reads an axis extent of an array as a dimension,
+//!     [`DimensionToScalar`] turns a dimension into a scalar integer array, and [`DimensionFromScalar`] turns a scalar
+//!     integer array back into a dimension with declared bounds, which is checked at run time.
+//!   - **Comparisons:** Represented using the ordinary [`Compare`](crate::Compare) capability, producing Boolean
+//!     arrays that can feed [`Assert`](crate::Assert) for runtime shape requirements.
+//!
+//! # Examples
+//!
+//! Dimension arithmetic runs eagerly on [`DimensionValue`](crate::DimensionValue)s and tracks bounds:
+//!
+//! ```rust
+//! # use ryft_core::{Add, Array, Assert, Compare, DimensionPow, DimensionValue, Mul, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
+//! let rows = DimensionValue::constant(4)?;
+//! let columns = DimensionValue::constant(3)?;
+//! let elements = rows.mul(&columns)?;
+//! assert_eq!(elements.extent(), 12);
+//! assert_eq!(rows.dimension_pow(&DimensionValue::constant(2)?)?.extent(), 16);
+//! let fits: Array = elements.less_than_or_equal(&DimensionValue::constant(16)?)?;
+//! fits.assert("the elements fit", &[])?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The bridges connect array shapes and scalar data in the mixed value family:
+//!
+//! ```rust
+//! # use ryft_core::{Array, ArrayIrValue, DimensionSize, DimensionToScalar, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
+//! let matrix = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])?);
+//! let columns = matrix.dimension_size(1)?;
+//! assert!(matches!(&columns, ArrayIrValue::Dimension(columns) if columns.extent() == 3));
+//! assert_eq!(columns.to_scalar()?, ArrayIrValue::Array(Array::scalar(3i64)?));
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::arrays::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::macros::check_count;

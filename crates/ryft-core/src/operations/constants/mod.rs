@@ -1,9 +1,54 @@
-//! Constant values and type-driven array constructors.
+//! Operations that create values from nothing but a type, a literal, or an exemplar. They are the leaves that every
+//! other computation starts from, and they come in three shapes:
 //!
-//! [`Zero`], [`One`], [`Iota`], and [`Fill`] construct values from types with statically known extents. Their
-//! dynamic counterparts accept explicit first-class dimension operands, allowing the same constructors to be used
-//! with runtime shapes. [`Constant`] carries an existing value, while [`ZeroLike`] and [`OneLike`] obtain their
-//! geometry from an exemplar and therefore need no separate dynamic capability.
+//!   - Type-driven constructors, which are context capabilities because building a value needs a place to build it
+//!     in. For example, [`Zero`], [`One`], and [`Fill`] produce a value of a given type filled with zeros, ones, or one
+//!     literal, and [`Iota`] counts upward along one axis. In an eager context they allocate immediately. In a staging
+//!     context they record the constructor as an instruction.
+//!   - Dynamic constructors (e.g., [`DynamicZero`], [`DynamicOne`], [`DynamicFill`], and [`DynamicIota`]), which take
+//!     one first-class dimension value per dynamic axis of the requested type, so shapes that are only known at run
+//!     time can still be constructed inside the mixed [`ArrayIrValue`](crate::ArrayIrValue) family.
+//!   - Literals and exemplars like [`Constant`] which embeds an existing value, [`DimensionConstant`] which embeds a
+//!     dimension extent, and [`ZeroLike`] and [`OneLike`] which take their geometry from a value they are called on,
+//!     which is why they are value capabilities and need no dynamic variant.
+//!
+//! # Examples
+//!
+//! Static constructors are called on a context and produce values of the requested type:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, EagerContext, Fill, Iota, OneLike, ProgramError, Zero,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+//! let zeros = context.zero(&ArrayType::new_static(DataType::F32, [2]))?;
+//! assert_eq!(zeros, Array::vector(vec![0.0_f32, 0.0])?);
+//! assert_eq!(zeros.one_like()?, Array::vector(vec![1.0_f32, 1.0])?);
+//! assert_eq!(context.fill(&ArrayType::new_static(DataType::F32, [2]), 2.5_f32)?, Array::vector(vec![2.5_f32, 2.5])?);
+//! assert_eq!(context.iota(&ArrayType::new_static(DataType::I32, [3]), 0)?, Array::vector(vec![0_i32, 1, 2])?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Dynamic constructors take the extents of their dynamic axes as dimension values:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+//! #     DimensionValue, DimensionVariable, DynamicZero, EagerContext, ProgramError, Shape,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+//! let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+//! let shape = Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(2)]);
+//! let r#type = ArrayType::new(DataType::F32, shape);
+//! let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(size), 3)?);
+//! let zeros = context.dynamic_zero(&r#type, &[extent])?;
+//! assert_eq!(zeros, ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6])?));
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
 use crate::programs::{ProgramError, RegionInterface, Type, TypeError, TypeIdentityPosition, Typed};

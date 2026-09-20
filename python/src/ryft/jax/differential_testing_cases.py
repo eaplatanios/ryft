@@ -310,6 +310,40 @@ def _build_dot_product_attention(jax: Any, jax_numpy: Any, numpy: Any) -> Differ
 _GROUPED_COLLECTIVE_GROUPS = ((0, 2), (3, 1))
 
 
+def _build_negative_dynamic_slice(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds dynamic slicing values at negative and out-of-range starts and the traced dynamic slice module."""
+
+    vector = jax_numpy.asarray([10.0, 20.0, 30.0, 40.0], dtype=jax_numpy.float32)
+    update = jax_numpy.asarray([1.0, 2.0], dtype=jax_numpy.float32)
+
+    # Traced starts take the runtime normalization path in JAX; static Python starts would be rejected up front under
+    # `allow_negative_indices=False` instead of clamping like the Ryft observation.
+    start = lambda value: jax_numpy.asarray(value, dtype=jax_numpy.int32)  # noqa: E731
+    function = jax.jit(lambda input_value, start_value: jax.lax.dynamic_slice(input_value, (start_value,), (2,)))
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="negative_dynamic_slice",
+        observations={
+            "slice_minus_one": _single_observation_values(jax.lax.dynamic_slice(vector, (start(-1),), (2,)), numpy),
+            "slice_minus_nine": _single_observation_values(jax.lax.dynamic_slice(vector, (start(-9),), (2,)), numpy),
+            "slice_past_end": _single_observation_values(jax.lax.dynamic_slice(vector, (start(3),), (2,)), numpy),
+            "slice_minus_one_clamp_only": _single_observation_values(
+                jax.lax.dynamic_slice(vector, (start(-1),), (2,), allow_negative_indices=False), numpy
+            ),
+            "update_minus_one": _single_observation_values(
+                jax.lax.dynamic_update_slice(vector, update, (start(-1),)), numpy
+            ),
+            "update_minus_nine": _single_observation_values(
+                jax.lax.dynamic_update_slice(vector, update, (start(-9),)), numpy
+            ),
+            "update_minus_one_clamp_only": _single_observation_values(
+                jax.lax.dynamic_update_slice(vector, update, (start(-1),), allow_negative_indices=False), numpy
+            ),
+        },
+        stablehlo=str(function.lower(vector, start(-1)).compiler_ir("stablehlo")),
+    )
+
+
 DIFFERENTIAL_CASES = (
     DifferentialCase(
         "grouped_shape_changing_collectives",
@@ -355,6 +389,12 @@ DIFFERENTIAL_CASES = (
         "parity",
         _build_dot_product_attention,
         stablehlo_patterns=("stablehlo.dot_general", "stablehlo.select", "stablehlo.exponential", "stablehlo.reduce"),
+    ),
+    DifferentialCase(
+        "negative_dynamic_slice",
+        "parity",
+        _build_negative_dynamic_slice,
+        stablehlo_patterns=("stablehlo.compare", "stablehlo.select", "stablehlo.dynamic_slice"),
     ),
 )
 

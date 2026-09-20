@@ -1,4 +1,62 @@
-//! Contains operations for working with references (i.e., allocating, reading, updating, and consuming mutable state).
+//! Operations over _references_ (i.e., handles to mutable state that programs allocate, read, update in place, and
+//! finally consume). A reference has a [`ReferenceType`](crate::ReferenceType) naming the referent it stores. Reads
+//! and updates declare reference effects, so a program that touches state keeps its accesses in order and its reference
+//! discharge can later turn that state into explicit dataflow for backends without mutable buffers.
+//!
+//! The core operations are:
+//!
+//!   - [`ReferenceNew`], which allocates a reference holding an initial value, and [`ReferenceFreeze`],
+//!     which consumes the reference and returns its final value.
+//!   - [`ReferenceRead`], which copies the current value out, and [`ReferenceWrite`] and [`ReferenceSwap`],
+//!     which replace it, with the swap also returning the previous value.
+//!   - [`ReferenceAddUpdate`], which adds an update into the referent, and [`ReferenceAtomicAddUpdate`],
+//!     its variant for updates that may race (e.g., within a kernel implementation).
+//!
+//! Every function is a value capability on the reference handle, so the same code updates eager state immediately
+//! and records reference instructions when the handle is a tracer.
+//!
+//! # Examples
+//!
+//! Eager references hold a value that updates mutate in place:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayIrValue, ProgramError, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead,
+//! #     ReferenceWrite,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let buffer = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])?).reference_new()?;
+//! buffer.add_update(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0])?))?;
+//! assert_eq!(buffer.read()?, ArrayIrValue::Array(Array::vector(vec![11.0_f32, 22.0])?));
+//! buffer.write(&ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0])?))?;
+//! assert_eq!(buffer.freeze()?, ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0])?));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Traced references record the same steps as instructions, and interpreting the program replays them:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, EagerContext, ProgramError,
+//! #     ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, Trace,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+//!     |input| {
+//!         let buffer = input.reference_new()?;
+//!         buffer.add_update(&input)?;
+//!         buffer.freeze()
+//!     },
+//!     ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+//! )?;
+//! assert_eq!(
+//!     program.interpret(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])?))?,
+//!     ArrayIrValue::Array(Array::vector(vec![2.0_f32, 4.0])?),
+//! );
+//! # Ok(())
+//! # }
+//! ```
 
 mod reference_add_update;
 mod reference_atomic_add_update;

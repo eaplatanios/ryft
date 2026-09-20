@@ -80,7 +80,9 @@ pub struct IndexSlice {
 impl IndexSlice {
     /// Creates a signed slice with the provided optional endpoints and step. Endpoints are exclusive at the stop
     /// and are clipped to the axis when normalized. This constructor preserves omitted endpoints so that reverse
-    /// slicing can distinguish an omitted stop from an explicit negative index.
+    /// slicing can distinguish an omitted stop from an explicit negative index, and it accepts any step so that the
+    /// [`index!`](crate::index) macro stays infallible; a zero step is rejected when the slice is normalized against
+    /// an axis.
     pub fn new(start: Option<i128>, stop: Option<i128>, step: i128) -> Self {
         Self { start, stop, step }
     }
@@ -366,6 +368,9 @@ impl<V: Value> Indexing for V {}
 /// for the caller. The concrete-shape frontend clears the sortedness promise before gathering or scattering because
 /// normalization and interleaved slice coordinates can change index order. Existing operation type rules validate
 /// memory, sharding, and reduction-state compatibility for the composed operations.
+///
+/// The value parameter precedes the type parameter, unlike the usual generic parameter order, because `T` defaults to
+/// the value's type and a defaulted parameter must follow the parameter it depends on.
 #[derive(Debug)]
 pub struct Indexed<'a, 's, 'i, V: Value, T: Type = <V as Typed>::Type> {
     /// The input whose elements are read or functionally updated.
@@ -429,6 +434,273 @@ enum OutputAxis {
     Advanced,
 }
 
+impl<V> Indexed<'_, '_, '_, V, ArrayType>
+where
+    V: Value<Type = ArrayType>
+        + Broadcast
+        + Reshape
+        + Concatenate
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select
+        + Slice
+        + Reverse
+        + Gather,
+    V::ExecutionDomain: Context,
+    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+{
+    /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
+    /// Slices clip their endpoints independently. Floating-point fill literals preserve their original encodings.
+    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts.
+    /// A host integer that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
+    ///
+    /// # Parameters
+    ///
+    ///   - `options`: Bounds handling, explicit fill, output placement, and caller promises for the selected input
+    ///     positions. Uniqueness refers to coordinates after normalization and clipping. Sortedness is cleared before
+    ///     composing the gather because selection normalization can change coordinate order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, GatherOptions, Indexing, index};
+    /// let input = Array::matrix(2, 3, vec![0_i32, 1, 2, 3, 4, 5]).unwrap();
+    /// assert_eq!(
+    ///     input.at(&index![.., .. by -2]).get(&GatherOptions::new()),
+    ///     Array::matrix(2, 2, vec![2_i32, 0, 5, 3]),
+    /// );
+    /// ```
+    pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
+        let expanded = self.expanded()?;
+        // Positive slices and valid scalar indices need only one slice and a rank adjustment. Reversal is a separate
+        // linear operation, preserving symbolic extents and avoiding index tensors for ordinary reverse slicing.
+        let input_type = self.input.r#type();
+        if let GatherMode::Fill { value: Some(value) } = options.mode() {
+            value.validate_as_constant()?;
+            if value.r#type().rank() != 0 || value.r#type().data_type() != input_type.data_type() {
+                return Err(TypeError::invalid("index fill must be a scalar of the input data type").into());
+            }
+        }
+        if expanded.iter().all(|index| matches!(index, ExpandedIndex::Basic(_)))
+            && input_type.shape().dimensions().iter().all(|dimension| dimension.value().is_some())
+        {
+            let mut starts = Vec::new();
+            let mut limits = Vec::new();
+            let mut strides = Vec::new();
+            let mut reversed = Vec::new();
+            let mut output = Vec::new();
+            let mut axis = 0;
+            let mut can_slice = true;
+            for index in &expanded {
+                match index {
+                    ExpandedIndex::Basic(BasicIndex::NewAxis) => output.push(1),
+                    ExpandedIndex::Basic(BasicIndex::Ellipsis) => {}
+                    ExpandedIndex::Basic(BasicIndex::Slice(slice)) => {
+                        let normalized = slice.normalize(input_type.dimension(axis).value().unwrap())?;
+                        starts.push(normalized.start);
+                        limits.push(normalized.limit);
+                        strides.push(normalized.stride);
+                        output.push(normalized.length);
+                        if normalized.reversed {
+                            reversed.push(axis);
+                        }
+                        axis += 1;
+                    }
+                    ExpandedIndex::Basic(BasicIndex::Integer(integer)) => {
+                        let extent = input_type.dimension(axis).value().unwrap();
+                        let integer = if *integer < 0 { integer.saturating_add(extent as i128) } else { *integer };
+                        let valid = integer >= 0 && integer < extent as i128;
+                        if !valid && matches!(options.mode(), GatherMode::PromiseInBounds) {
+                            return Err(TypeError::invalid(format!(
+                                "index {integer} is out of bounds for axis {axis} with extent {extent} under \
+                                 `PromiseInBounds`",
+                            ))
+                            .into());
+                        }
+                        if extent == 0 || (!valid && matches!(options.mode(), GatherMode::Fill { .. })) {
+                            can_slice = false;
+                            break;
+                        }
+                        let integer = integer.clamp(0, extent as i128 - 1) as usize;
+                        starts.push(integer);
+                        limits.push(integer + 1);
+                        strides.push(1);
+                        axis += 1;
+                    }
+                    _ => unreachable!("only basic selectors reach the slicing fast path"),
+                }
+            }
+            if can_slice {
+                let input = if reversed.is_empty() { self.input.clone() } else { self.input.reverse(reversed)? };
+                return input
+                    .slice(&starts, &limits, &strides)?
+                    .reshape_with_output_sharding(Shape::from(output), options.output_sharding().cloned());
+            }
+        }
+        let plan = self.plan(&expanded, matches!(options.mode(), GatherMode::PromiseInBounds))?;
+        // Negative-coordinate normalization and interleaving slice coordinates can change lexicographic order.
+        // Keep uniqueness as a caller promise about normalized selected positions, but do not forward sortedness.
+        let mut gather_options = options.clone().with_indices_are_sorted(false);
+        if let Some(sharding) = options.output_sharding() {
+            if sharding.dimensions().len() != plan.output_shape.len() {
+                return Err(TypeError::invalid("index output sharding rank does not match selection rank").into());
+            }
+            gather_options = gather_options.with_output_sharding(
+                sharding
+                    .with_dimensions(
+                        sharding
+                            .dimensions()
+                            .iter()
+                            .enumerate()
+                            .filter(|(axis, _)| !plan.new_axes.contains(axis))
+                            .map(|(_, dimension)| dimension.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|error| TypeError::invalid(error.to_string()))?,
+            );
+        }
+        let empty_indexed_axis = plan
+            .dimensions
+            .collapsed_slice_dimensions()
+            .iter()
+            .any(|&axis| input_type.dimension(axis).value() == Some(0));
+        let gathered = if empty_indexed_axis {
+            let mut validation_shape = input_type.shape().dimensions().to_vec();
+            for &axis in plan.dimensions.collapsed_slice_dimensions() {
+                if validation_shape[axis].value() == Some(0) {
+                    validation_shape[axis] = Dimension::Static(1);
+                }
+            }
+            let output_type = input_type.clone().into_owned().with_shape(Shape::new(validation_shape)).gather(
+                plan.indices.r#type().as_ref(),
+                &plan.dimensions,
+                &plan.sizes,
+                &gather_options,
+            )?;
+            if plan.shape.iter().all(|&extent| extent != 0) && !matches!(options.mode(), GatherMode::Fill { .. }) {
+                return Err(TypeError::invalid(
+                    "cannot index a nonempty selection from an empty axis without fill mode",
+                )
+                .into());
+            }
+            let fill = gather_options.resolved_fill_value(input_type.data_type())?;
+            self.constant(fill)?.broadcast(output_type, &[])?
+        } else {
+            self.input.gather(&plan.indices, &plan.dimensions, &plan.sizes, &gather_options)?
+        };
+        gathered.reshape_with_output_sharding(Shape::from(plan.output_shape), options.output_sharding().cloned())
+    }
+}
+
+impl<V> Indexed<'_, '_, '_, V, ArrayType>
+where
+    V: Value<Type = ArrayType>
+        + Broadcast
+        + Reshape
+        + Concatenate
+        + ConvertElementType
+        + Compare
+        + Add
+        + Select
+        + Scatter,
+    V::ExecutionDomain: Context,
+    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+{
+    /// Returns a value with selected elements overwritten by `updates`. Conflicting repeated indices do not promise
+    /// a deterministic winner. The input is unchanged, and updates broadcast to the selection shape.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Values broadcast to the selected shape, with the same data type as the input.
+    ///   - `options`: Bounds handling, output placement, and promises about the final normalized selected positions.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, Indexing, ScatterOptions, index};
+    /// let input = Array::vector(vec![0_i32, 1, 2, 3]).unwrap();
+    /// assert_eq!(
+    ///     input.at(&index![1..3]).set(&Array::scalar(9_i32).unwrap(), &ScatterOptions::new()),
+    ///     Array::vector(vec![0_i32, 9, 9, 3]),
+    /// );
+    /// ```
+    pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+        self.update(updates, ScatterReductionKind::Overwrite, options)
+    }
+
+    /// Returns a value with every selected update added, including all updates at repeated indices. Updates broadcast
+    /// to the selection shape, and the input remains unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
+    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
+    pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+        self.update(updates, ScatterReductionKind::Add, options)
+    }
+
+    /// Returns a value with selected updates multiplied into it. Derivatives with respect to the updates require the
+    /// existing scatter unique-indices promise; this function does not establish that promise. Updates broadcast
+    /// to the selection shape, and the input remains unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Factors with the input's data type, broadcast to the selection shape.
+    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
+    pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+        self.update(updates, ScatterReductionKind::Mul, options)
+    }
+
+    /// Returns a value with selected updates combined by the elementwise minimum. Updates broadcast
+    /// to the selection shape, and the input remains unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
+    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
+    pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+        self.update(updates, ScatterReductionKind::Min, options)
+    }
+
+    /// Returns a value with selected updates combined by the elementwise maximum. Updates broadcast
+    /// to the selection shape, and the input remains unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
+    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
+    pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
+        self.update(updates, ScatterReductionKind::Max, options)
+    }
+
+    /// Uses the same window/query mapping as reads, removing only inserted singleton axes from the updates.
+    fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
+        if updates.r#type().data_type() != self.input.r#type().data_type() {
+            return Err(TypeError::invalid("index updates must have the input data type").into());
+        }
+        let expanded = self.expanded()?;
+        let plan = self.plan(&expanded, matches!(options.mode(), ScatterMode::PromiseInBounds))?;
+        let updates = updates.broadcast_to(Shape::from(plan.output_shape))?.reshape(Shape::from(plan.shape))?;
+        let dimensions = ScatterDimensionNumbers::new(
+            plan.dimensions.offset_dimensions().to_vec(),
+            plan.dimensions.collapsed_slice_dimensions().to_vec(),
+            plan.dimensions.start_index_map().to_vec(),
+        );
+        self.input
+            .scatter(&plan.indices, &updates, &dimensions, kind, &options.clone().with_indices_are_sorted(false))
+    }
+}
 impl<V> Indexed<'_, '_, '_, V, ArrayType>
 where
     V: Value<Type = ArrayType> + Broadcast + Reshape + Concatenate + ConvertElementType + Compare + Add + Select,
@@ -538,18 +810,10 @@ where
         Ok(result)
     }
 
-    /// Lifts a host coordinate using the input's memory space and dispatch context.
+    /// Lifts a host coordinate using the input's memory space and execution domain.
+    #[inline]
     fn constant(&self, value: Array) -> Result<V, ProgramError> {
-        let r#type = value.r#type().into_owned().with_memory(self.input.r#type().memory());
-        // A portable literal is an operation payload, not the context's stored constant family. Compiled contexts
-        // can use capture references for stored constants while still lowering these small coordinate literals.
-        let mut outputs = self.input.execution_domain().bind(
-            ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
-            Vec::new(),
-            &[],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
+        portable_constant(self.input, value)
     }
 
     /// Converts integer queries without wrapping large unsigned values into valid signed positions. Negative signed
@@ -562,9 +826,6 @@ where
         } else {
             value.convert_element_type(DataType::I64)?
         };
-        if !value.r#type().data_type().is_integer() {
-            return Err(TypeError::invalid("index arrays must have an integer data type").into());
-        }
         let zero = self.constant(Array::scalar(0_i64)?)?;
         let extent = self.constant(Array::scalar(extent)?)?;
         V::select(&value.less_than(&zero)?, &value.add(&extent)?, &value)
@@ -574,9 +835,18 @@ where
     /// over every output element. Only genuinely strided slices add coordinate-query axes.
     fn plan(&self, expanded: &[ExpandedIndex<V>], promise: bool) -> Result<IndexPlan<V>, ProgramError> {
         let input_type = self.input.r#type();
-        let shape = input_type.shape().dimensions().iter().map(|dimension| dimension.value().ok_or_else(|| {
-            ProgramError::UnsupportedOperation { message: "general indexing requires concrete extents; use the supported single-axis mixed-IR selection for symbolic shapes".into() }
-        })).collect::<Result<Vec<_>,_>>()?;
+        let shape = input_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| ProgramError::UnsupportedOperation {
+                    message: "general indexing requires concrete extents; use the supported single-axis mixed-IR \
+                              selection for symbolic shapes"
+                        .into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if shape.iter().any(|&extent| i64::try_from(extent).is_err()) {
             return Err(TypeError::invalid("indexed axis extent exceeds `i64::MAX`").into());
         }
@@ -752,269 +1022,6 @@ where
     }
 }
 
-impl<V> Indexed<'_, '_, '_, V, ArrayType>
-where
-    V: Value<Type = ArrayType>
-        + Broadcast
-        + Reshape
-        + Concatenate
-        + ConvertElementType
-        + Compare
-        + Add
-        + Select
-        + Slice
-        + Reverse
-        + Gather,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
-    /// Slices clip their endpoints independently. Floating-point fill literals preserve their original encodings.
-    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts.
-    /// A host integer that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
-    ///
-    /// # Parameters
-    ///
-    ///   - `options`: Bounds handling, explicit fill, output placement, and caller promises for the selected input
-    ///     positions. Uniqueness refers to coordinates after normalization and clipping. Sortedness is cleared before
-    ///     composing the gather because selection normalization can change coordinate order.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::{Array, GatherOptions, Indexing, index};
-    /// let input = Array::matrix(2, 3, vec![0_i32, 1, 2, 3, 4, 5]).unwrap();
-    /// assert_eq!(
-    ///     input.at(&index![.., .. by -2]).get(&GatherOptions::new()),
-    ///     Array::matrix(2, 2, vec![2_i32, 0, 5, 3]),
-    /// );
-    /// ```
-    pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
-        let expanded = self.expanded()?;
-        // Positive slices and valid scalar indices need only one slice and a rank adjustment. Reversal is a separate
-        // linear operation, preserving symbolic extents and avoiding index tensors for ordinary reverse slicing.
-        let input_type = self.input.r#type();
-        if let GatherMode::Fill { value: Some(value) } = options.mode() {
-            value.validate_as_constant()?;
-            if value.r#type().rank() != 0 || value.r#type().data_type() != input_type.data_type() {
-                return Err(TypeError::invalid("index fill must be a scalar of the input data type").into());
-            }
-        }
-        if expanded.iter().all(|index| matches!(index, ExpandedIndex::Basic(_)))
-            && input_type.shape().dimensions().iter().all(|dimension| dimension.value().is_some())
-        {
-            let mut starts = Vec::new();
-            let mut limits = Vec::new();
-            let mut strides = Vec::new();
-            let mut reversed = Vec::new();
-            let mut output = Vec::new();
-            let mut axis = 0;
-            let mut can_slice = true;
-            for index in &expanded {
-                match index {
-                    ExpandedIndex::Basic(BasicIndex::NewAxis) => output.push(1),
-                    ExpandedIndex::Basic(BasicIndex::Ellipsis) => {}
-                    ExpandedIndex::Basic(BasicIndex::Slice(slice)) => {
-                        let normalized = slice.normalize(input_type.dimension(axis).value().unwrap())?;
-                        starts.push(normalized.start);
-                        limits.push(normalized.limit);
-                        strides.push(normalized.stride);
-                        output.push(normalized.length);
-                        if normalized.reversed {
-                            reversed.push(axis);
-                        }
-                        axis += 1;
-                    }
-                    ExpandedIndex::Basic(BasicIndex::Integer(integer)) => {
-                        let extent = input_type.dimension(axis).value().unwrap();
-                        let integer = if *integer < 0 { integer.saturating_add(extent as i128) } else { *integer };
-                        let valid = integer >= 0 && integer < extent as i128;
-                        if !valid && matches!(options.mode(), GatherMode::PromiseInBounds) {
-                            return Err(TypeError::invalid(format!("index {integer} is out of bounds for axis {axis} with extent {extent} under `PromiseInBounds`")).into());
-                        }
-                        if extent == 0 || (!valid && matches!(options.mode(), GatherMode::Fill { .. })) {
-                            can_slice = false;
-                            break;
-                        }
-                        let integer = integer.clamp(0, extent as i128 - 1) as usize;
-                        starts.push(integer);
-                        limits.push(integer + 1);
-                        strides.push(1);
-                        axis += 1;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            if can_slice {
-                let input = if reversed.is_empty() { self.input.clone() } else { self.input.reverse(reversed)? };
-                return input
-                    .slice(&starts, &limits, &strides)?
-                    .reshape_with_output_sharding(Shape::from(output), options.output_sharding().cloned());
-            }
-        }
-        let plan = self.plan(&expanded, matches!(options.mode(), GatherMode::PromiseInBounds))?;
-        // Negative-coordinate normalization and interleaving slice coordinates can change lexicographic order.
-        // Keep uniqueness as a caller promise about normalized selected positions, but do not forward sortedness.
-        let mut gather_options = options.clone().with_indices_are_sorted(false);
-        if let Some(sharding) = options.output_sharding() {
-            if sharding.dimensions().len() != plan.output_shape.len() {
-                return Err(TypeError::invalid("index output sharding rank does not match selection rank").into());
-            }
-            gather_options = gather_options.with_output_sharding(
-                sharding
-                    .with_dimensions(
-                        sharding
-                            .dimensions()
-                            .iter()
-                            .enumerate()
-                            .filter(|(axis, _)| !plan.new_axes.contains(axis))
-                            .map(|(_, dimension)| dimension.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|error| TypeError::invalid(error.to_string()))?,
-            );
-        }
-        let empty_indexed_axis = plan
-            .dimensions
-            .collapsed_slice_dimensions()
-            .iter()
-            .any(|&axis| input_type.dimension(axis).value() == Some(0));
-        let gathered = if empty_indexed_axis {
-            let mut validation_shape = input_type.shape().dimensions().to_vec();
-            for &axis in plan.dimensions.collapsed_slice_dimensions() {
-                if validation_shape[axis].value() == Some(0) {
-                    validation_shape[axis] = Dimension::Static(1);
-                }
-            }
-            let output_type = input_type.clone().into_owned().with_shape(Shape::new(validation_shape)).gather(
-                plan.indices.r#type().as_ref(),
-                &plan.dimensions,
-                &plan.sizes,
-                &gather_options,
-            )?;
-            if plan.shape.iter().all(|&extent| extent != 0) && !matches!(options.mode(), GatherMode::Fill { .. }) {
-                return Err(TypeError::invalid(
-                    "cannot index a nonempty selection from an empty axis without fill mode",
-                )
-                .into());
-            }
-            let fill = gather_options.resolved_fill_value(input_type.data_type())?;
-            self.constant(fill)?.broadcast(output_type, &[])?
-        } else {
-            self.input.gather(&plan.indices, &plan.dimensions, &plan.sizes, &gather_options)?
-        };
-        gathered.reshape_with_output_sharding(Shape::from(plan.output_shape), options.output_sharding().cloned())
-    }
-}
-
-impl<V> Indexed<'_, '_, '_, V, ArrayType>
-where
-    V: Value<Type = ArrayType>
-        + Broadcast
-        + Reshape
-        + Concatenate
-        + ConvertElementType
-        + Compare
-        + Add
-        + Select
-        + Scatter,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    /// Returns a value with selected elements overwritten by `updates`. Conflicting repeated indices do not promise
-    /// a deterministic winner. The input is unchanged, and updates broadcast to the selection shape.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Values broadcast to the selected shape, with the same data type as the input.
-    ///   - `options`: Bounds handling, output placement, and promises about the final normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
-    ///     [`Indexed`] for how normalization and clipping affect these promises.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::{Array, Indexing, ScatterOptions, index};
-    /// let input = Array::vector(vec![0_i32, 1, 2, 3]).unwrap();
-    /// assert_eq!(
-    ///     input.at(&index![1..3]).set(&Array::scalar(9_i32).unwrap(), &ScatterOptions::new()),
-    ///     Array::vector(vec![0_i32, 9, 9, 3]),
-    /// );
-    /// ```
-    pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
-        self.update(updates, ScatterReductionKind::Overwrite, options)
-    }
-
-    /// Returns a value with every selected update added, including all updates at repeated indices. Updates broadcast
-    /// to the selection shape, and the input remains unchanged.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
-    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
-    ///     [`Indexed`] for how normalization and clipping affect these promises.
-    pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
-        self.update(updates, ScatterReductionKind::Add, options)
-    }
-
-    /// Returns a value with selected updates multiplied into it. Derivatives with respect to the updates require the
-    /// existing scatter unique-indices promise; this function does not establish that promise. Updates broadcast
-    /// to the selection shape, and the input remains unchanged.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Factors with the input's data type, broadcast to the selection shape.
-    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
-    ///     [`Indexed`] for how normalization and clipping affect these promises.
-    pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
-        self.update(updates, ScatterReductionKind::Mul, options)
-    }
-
-    /// Returns a value with selected updates combined by the elementwise minimum. Updates broadcast
-    /// to the selection shape, and the input remains unchanged.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
-    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
-    ///     [`Indexed`] for how normalization and clipping affect these promises.
-    pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
-        self.update(updates, ScatterReductionKind::Min, options)
-    }
-
-    /// Returns a value with selected updates combined by the elementwise maximum. Updates broadcast
-    /// to the selection shape, and the input remains unchanged.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
-    ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
-    ///     [`Indexed`] for how normalization and clipping affect these promises.
-    pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
-        self.update(updates, ScatterReductionKind::Max, options)
-    }
-
-    /// Uses the same window/query mapping as reads, removing only inserted singleton axes from the updates.
-    fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
-        if updates.r#type().data_type() != self.input.r#type().data_type() {
-            return Err(TypeError::invalid("index updates must have the input data type").into());
-        }
-        let expanded = self.expanded()?;
-        let plan = self.plan(&expanded, matches!(options.mode(), ScatterMode::PromiseInBounds))?;
-        let updates = updates.broadcast_to(Shape::from(plan.output_shape))?.reshape(Shape::from(plan.shape))?;
-        let dimensions = ScatterDimensionNumbers::new(
-            plan.dimensions.offset_dimensions().to_vec(),
-            plan.dimensions.collapsed_slice_dimensions().to_vec(),
-            plan.dimensions.start_index_map().to_vec(),
-        );
-        self.input
-            .scatter(&plan.indices, &updates, &dimensions, kind, &options.clone().with_indices_are_sorted(false))
-    }
-}
 /// Constructs a fixed-size array of indexing descriptors for [`Indexing::at`].
 ///
 /// Integer expressions select one position, ordinary exclusive Rust ranges select a slice, and `range by step`
@@ -1031,7 +1038,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{Array, BasicIndex, IndexSelector, IndexSlice};
-/// use ryft_core::operations::manipulation::indexing::index;
+/// use ryft_core::index;
 /// let selection: [IndexSelector<'_, Array>; 3] = index![1..9 by 2, new_axis, ...];
 /// assert_eq!(selection[0], IndexSelector::Basic(BasicIndex::Slice(
 ///     IndexSlice::new(Some(1), Some(9), 2),
@@ -1123,6 +1130,8 @@ macro_rules! index {
     };
 }
 
+// The macro is exported at the crate root by `#[macro_export]`; this re-export lets callers that import the
+// manipulation facade reach it through the module path as well.
 pub use crate::index;
 
 /// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
@@ -1138,23 +1147,62 @@ struct DynamicIndexPlan<V> {
     inserted_axes: Vec<usize>,
 }
 
-/// Binds a portable coordinate literal in the projected array execution domain. A backend's stored constant
-/// family may contain capture handles; coordinate literals instead use the ordinary constant operation payload.
+/// Binds a portable coordinate literal in the execution domain of `exemplar`, placed in its memory space. A
+/// backend's stored constant family may contain capture handles, so coordinate literals use the ordinary constant
+/// operation payload instead, which compiled contexts lower directly.
+fn portable_constant<V>(exemplar: &V, value: Array) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType>,
+    V::ExecutionDomain: Context,
+    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+{
+    let r#type = value.r#type().into_owned().with_memory(exemplar.r#type().memory());
+    let mut outputs = exemplar.execution_domain().bind(
+        ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
+        Vec::new(),
+        &[],
+    )?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
+/// Binds a portable coordinate literal in the projected array execution domain of a mixed-IR `input`. Refer to the
+/// documentation of [`portable_constant`] for more information.
 fn dynamic_index_constant<V>(input: &V, value: Array) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     <V::Projected as Value>::ExecutionDomain: Context,
     <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
 {
-    let input = input.clone().into_projected()?;
-    let r#type = value.r#type().into_owned().with_memory(input.r#type().memory());
-    let mut outputs = input.execution_domain().bind(
-        ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
-        Vec::new(),
-        &[],
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(V::from_projected(outputs.remove(0)))
+    Ok(V::from_projected(portable_constant(&input.clone().into_projected()?, value)?))
+}
+
+/// Rejects the read and update options that the symbolic frontend does not remap yet: explicit output sharding and
+/// the sortedness and uniqueness index promises. Bounds modes and fills remain available.
+fn validate_symbolic_index_options(
+    has_output_sharding: bool,
+    indices_are_sorted: bool,
+    unique_indices: bool,
+) -> Result<(), ProgramError> {
+    if has_output_sharding || indices_are_sorted || unique_indices {
+        return Err(TypeError::invalid(
+            "symbolic indexing does not yet support explicit output sharding or index promises",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Returns `input` with the projected array member reversed along `axes`, or an unchanged clone when no axis is
+/// reversed, so that callers keep the mixed-IR value family on both paths.
+fn reversed_projection<V>(input: &V, axes: &[usize]) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reverse>,
+{
+    if axes.is_empty() {
+        return Ok(input.clone());
+    }
+    Ok(V::from_projected(input.clone().into_projected()?.reverse(axes.to_vec())?))
 }
 
 /// Resolves the supported symbolic selection geometry without reading traced array data on the host.
@@ -1175,15 +1223,18 @@ where
         .iter()
         .filter(|selector| !matches!(selector, IndexSelector::Basic(BasicIndex::NewAxis | BasicIndex::Ellipsis)))
         .count();
-    if consumed > input_type.rank() {
-        return Err(TypeError::invalid("index selection consumes more axes than the input rank").into());
+    let rank = input_type.rank();
+    if consumed > rank {
+        return Err(
+            TypeError::invalid(format!("index selection consumes {consumed} axes but input rank is {rank}")).into()
+        );
     }
     let ellipses = selectors
         .iter()
         .filter(|selector| matches!(selector, IndexSelector::Basic(BasicIndex::Ellipsis)))
         .count();
     if ellipses > 1 {
-        return Err(TypeError::invalid("index selection may contain at most one ellipsis").into());
+        return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
     }
     // Validate the whole selector list before lifting constants or staging dimension reads. A bad later selector
     // must not leave a partly staged indexing expression in the caller's context.
@@ -1234,7 +1285,7 @@ where
             }
             IndexSelector::Mask(_) => {
                 return Err(
-                    TypeError::invalid("Boolean masks in symbolic indexing require a concrete input shape").into()
+                    TypeError::invalid("index masks require a concrete input shape in symbolic indexing").into()
                 );
             }
         }
@@ -1273,11 +1324,7 @@ where
                 dynamic_index_constant(input, Array::scalar(index)?)?
             }
             IndexSelector::Array(indices) => (*indices).clone(),
-            IndexSelector::Mask(_) => {
-                return Err(
-                    TypeError::invalid("Boolean masks in symbolic indexing require a concrete input shape").into()
-                );
-            }
+            IndexSelector::Mask(_) => unreachable!("masks are rejected while validating the selector list"),
         };
         let indices_type = indices.r#type();
         let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
@@ -1319,12 +1366,11 @@ where
     <V::Projected as Value>::ExecutionDomain: Context,
     <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
 {
-    if options.output_sharding().is_some() || options.indices_are_sorted() || options.unique_indices() {
-        return Err(TypeError::invalid(
-            "symbolic indexing does not yet support explicit output sharding or index promises",
-        )
-        .into());
-    }
+    validate_symbolic_index_options(
+        options.output_sharding().is_some(),
+        options.indices_are_sorted(),
+        options.unique_indices(),
+    )?;
     // Identity and full-reversal selections skip gather, but explicit fills still have the same scalar/data-type
     // contract as indexed reads. Validate before those fast paths instead of silently accepting a malformed fill.
     if matches!(options.mode(), GatherMode::Fill { value: Some(_) }) {
@@ -1332,11 +1378,7 @@ where
         options.resolved_fill_value(<&ArrayType>::try_from(input_type.as_ref())?.data_type())?;
     }
     let plan = dynamic_index_plan(input, selectors, matches!(options.mode(), GatherMode::PromiseInBounds))?;
-    let mut output = if plan.reversed_axes.is_empty() {
-        input.clone()
-    } else {
-        V::from_projected(input.clone().into_projected()?.reverse(plan.reversed_axes)?)
-    };
+    let mut output = reversed_projection(input, &plan.reversed_axes)?;
     if let Some((axis, indices)) = plan.query {
         output = output.dynamic_gather_axis(&indices, axis, options.mode().clone())?;
     }
@@ -1369,12 +1411,11 @@ where
     <V::Projected as Value>::ExecutionDomain: Context,
     <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
 {
-    if options.output_sharding().is_some() || options.indices_are_sorted() || options.unique_indices() {
-        return Err(TypeError::invalid(
-            "symbolic indexing does not yet support explicit output sharding or index promises",
-        )
-        .into());
-    }
+    validate_symbolic_index_options(
+        options.output_sharding().is_some(),
+        options.indices_are_sorted(),
+        options.unique_indices(),
+    )?;
     let plan = dynamic_index_plan(input, selectors, options.mode() == ScatterMode::PromiseInBounds)?;
     let input_type = input.r#type();
     let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
@@ -1398,11 +1439,7 @@ where
     }
     let updates = updates.dynamic_broadcast_to(&selected_dimensions)?;
     let updates = if plan.inserted_axes.is_empty() { updates } else { updates.dynamic_reshape(&dimensions)? };
-    let base = if plan.reversed_axes.is_empty() {
-        input.clone()
-    } else {
-        V::from_projected(input.clone().into_projected()?.reverse(plan.reversed_axes.clone())?)
-    };
+    let base = reversed_projection(input, &plan.reversed_axes)?;
     let output = if let Some((axis, indices)) = plan.query {
         base.dynamic_scatter_axis(&indices, &updates, axis, kind, options.mode())?
     } else {
@@ -1417,17 +1454,42 @@ where
             options,
         )?)
     };
-    if plan.reversed_axes.is_empty() {
-        Ok(output)
-    } else {
-        Ok(V::from_projected(output.into_projected()?.reverse(plan.reversed_axes)?))
-    }
+    reversed_projection(&output, &plan.reversed_axes)
 }
 
 impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
+    /// Serves a concrete-geometry selection through the homogeneous frontend by projecting the input and every index
+    /// array into the array member family, re-borrowing the selectors over those projections, and handing the
+    /// projected selection to `select`.
+    fn with_projected_selection<R, F>(&self, select: F) -> Result<R, ProgramError>
+    where
+        F: FnOnce(Indexed<'_, '_, '_, V::Projected, ArrayType>) -> Result<R, ProgramError>,
+    {
+        let input = self.input.clone().into_projected()?;
+        let values = self
+            .selectors
+            .iter()
+            .map(|selector| match selector {
+                IndexSelector::Array(value) => Ok(Some((*value).clone().into_projected()?)),
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let selectors = self
+            .selectors
+            .iter()
+            .zip(&values)
+            .map(|(selector, value)| match selector {
+                IndexSelector::Basic(value) => IndexSelector::Basic(*value),
+                IndexSelector::Array(_) => IndexSelector::Array(value.as_ref().unwrap()),
+                IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
+            })
+            .collect::<Vec<_>>();
+        select(input.at(&selectors))
+    }
+
     /// Returns whether the input or an index array retains a non-concrete dimension.
     fn has_symbolic_shape(&self) -> Result<bool, ProgramError> {
         let r#type = self.input.r#type();
@@ -1496,26 +1558,7 @@ where
         if self.has_symbolic_shape()? {
             return dynamic_index_get(self.input, self.selectors, options);
         }
-        let input = self.input.clone().into_projected()?;
-        let values = self
-            .selectors
-            .iter()
-            .map(|selector| match selector {
-                IndexSelector::Array(value) => Ok(Some((*value).clone().into_projected()?)),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let selectors = self
-            .selectors
-            .iter()
-            .zip(&values)
-            .map(|(selector, value)| match selector {
-                IndexSelector::Basic(value) => IndexSelector::Basic(*value),
-                IndexSelector::Array(_) => IndexSelector::Array(value.as_ref().unwrap()),
-                IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
-            })
-            .collect::<Vec<_>>();
-        Ok(V::from_projected(input.at(&selectors).get(options)?))
+        self.with_projected_selection(|selection| selection.get(options)).map(V::from_projected)
     }
 }
 
@@ -1554,79 +1597,43 @@ where
     pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Overwrite, options)
     }
-    /// Adds every selected update, including duplicates, to a mixed-IR array.
-    /// Updates broadcast to the selected shape using retained dimension values when necessary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
-    ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
-    ///     bounds and index-promise contracts.
+
+    /// Adds every selected update, including duplicates, to a mixed-IR array. Updates broadcast to the selected shape
+    /// using retained dimension values when necessary. Refer to the documentation of [`set`](Self::set) for the
+    /// shared parameter contract.
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Add, options)
     }
-    /// Multiplies selected updates into a mixed-IR array; scatter's differentiation restrictions apply.
-    /// Updates broadcast to the selected shape using retained dimension values when necessary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
-    ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
-    ///     bounds and index-promise contracts.
+
+    /// Multiplies selected updates into a mixed-IR array; scatter's differentiation restrictions apply. Updates
+    /// broadcast to the selected shape using retained dimension values when necessary. Refer to the documentation of
+    /// [`set`](Self::set) for the shared parameter contract.
     pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
-    /// Combines selected mixed-IR updates with the input using the elementwise minimum.
-    /// Updates broadcast to the selected shape using retained dimension values when necessary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
-    ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
-    ///     bounds and index-promise contracts.
+
+    /// Combines selected mixed-IR updates with the input using the elementwise minimum. Updates broadcast to the
+    /// selected shape using retained dimension values when necessary. Refer to the documentation of
+    /// [`set`](Self::set) for the shared parameter contract.
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Min, options)
     }
-    /// Combines selected mixed-IR updates with the input using the elementwise maximum.
-    /// Updates broadcast to the selected shape using retained dimension values when necessary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
-    ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
-    ///     bounds and index-promise contracts.
+
+    /// Combines selected mixed-IR updates with the input using the elementwise maximum. Updates broadcast to the
+    /// selected shape using retained dimension values when necessary. Refer to the documentation of
+    /// [`set`](Self::set) for the shared parameter contract.
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Max, options)
     }
+
     /// Projects concrete geometry or retains explicit dimensions for a symbolic selection.
     fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
         if self.has_symbolic_shape()? {
             return dynamic_index_update(self.input, self.selectors, updates, kind, options);
         }
-        let input = self.input.clone().into_projected()?;
-        let values = self
-            .selectors
-            .iter()
-            .map(|selector| match selector {
-                IndexSelector::Array(value) => Ok(Some((*value).clone().into_projected()?)),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let selectors = self
-            .selectors
-            .iter()
-            .zip(&values)
-            .map(|(selector, value)| match selector {
-                IndexSelector::Basic(value) => IndexSelector::Basic(*value),
-                IndexSelector::Array(_) => IndexSelector::Array(value.as_ref().unwrap()),
-                IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
-            })
-            .collect::<Vec<_>>();
-        Ok(V::from_projected(input.at(&selectors).update(&updates.clone().into_projected()?, kind, options)?))
+        let updates = updates.clone().into_projected()?;
+        self.with_projected_selection(|selection| selection.update(&updates, kind, options))
+            .map(V::from_projected)
     }
 }
 
@@ -1643,9 +1650,12 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::partial::PartialValue;
-    use crate::tracing::Trace;
+    use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
+
+    /// Tracer of the mixed-IR eager context used by the symbolic-geometry tests.
+    type ArrayIrTracer = Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
 
     #[test]
     fn test_index_integer_to_index_integer() {
@@ -1786,6 +1796,15 @@ mod tests {
             IndexSelector::<Array>::from(..),
             IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1)))
         );
+        assert_eq!(IndexSelector::<Array>::from(BasicIndex::NewAxis), IndexSelector::Basic(BasicIndex::NewAxis));
+        assert_eq!(
+            IndexSelector::<Array>::from(IndexSlice::new(Some(-2), None, -1)),
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(-2), None, -1)))
+        );
+        let rows = Array::vector(vec![0_i32, 2]).unwrap();
+        assert_eq!(IndexSelector::from(&rows), IndexSelector::Array(&rows));
+        let mask = IndexMask::new(vec![2], vec![true, false]).unwrap();
+        assert_eq!(IndexSelector::<Array>::from(&mask), IndexSelector::Mask(&mask));
     }
 
     #[test]
@@ -1893,45 +1912,81 @@ mod tests {
         let clip = GatherOptions::new().with_mode(GatherMode::Clip);
         let fill =
             GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-99_i32).unwrap())) });
+        // Negative coordinates count from the end once; the remaining invalid coordinates clip or fill.
         assert_eq!(input.at(&index![&indices]).get(&clip), Array::vector(vec![10_i32, 30, 10, 30, 30]));
         assert_eq!(input.at(&index![&indices]).get(&fill), Array::vector(vec![-99_i32, 30, 10, -99, -99]));
         assert_eq!(input.at(&index![(i128::MAX)]).get(&clip), Array::scalar(30_i32));
         assert_eq!(input.at(&index![(i128::MIN)]).get(&fill), Array::scalar(-99_i32));
+
+        // The default fill is the gather's data-type default (the minimum for signed integers), for host integers as
+        // well as for query arrays.
+        let default_fill = GatherOptions::new().with_mode(GatherMode::Fill { value: None });
+        assert_eq!(input.at(&index![7]).get(&default_fill), Array::scalar(i32::MIN));
+        assert_eq!(
+            input.at(&index![&indices]).get(&default_fill),
+            Array::vector(vec![i32::MIN, 30, 10, i32::MIN, i32::MIN]),
+        );
+
+        // An explicit fill must be a scalar of the input data type.
+        let mismatched_fill =
+            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(0_f32).unwrap())) });
+        assert!(matches!(
+            input.at(&index![..]).get(&mismatched_fill),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index fill must be a scalar of the input data type",
+        ));
+
+        // An empty axis can only be read through fill mode.
         let empty = Array::vector(Vec::<i32>::new()).unwrap();
         assert_eq!(empty.at(&index![0]).get(&fill), Array::scalar(-99_i32));
-        assert!(
-            matches!(empty.at(&index![0]).get(&clip), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "cannot index a nonempty selection from an empty axis without fill mode")
-        );
+        assert!(matches!(
+            empty.at(&index![0]).get(&clip),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot index a nonempty selection from an empty axis without fill mode",
+        ));
     }
 
     #[test]
     fn test_indexed_get_validation() {
         let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
-        assert!(
-            matches!(input.at(&index![3]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index 3 is out of bounds for axis 0 with extent 3 under `PromiseInBounds`")
-        );
-        assert!(
-            matches!(input.at(&index![..., ...]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index selection contains more than one ellipsis")
-        );
-        assert!(
-            matches!(input.at(&index![0, 0]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index selection consumes 2 axes but input rank is 1")
-        );
-        assert!(
-            matches!(input.at(&index![.. by 0]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index slice step must not be zero")
-        );
+        // A host integer that stays out of bounds after normalization violates the default in-bounds promise.
+        assert!(matches!(
+            input.at(&index![3]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index 3 is out of bounds for axis 0 with extent 3 under `PromiseInBounds`",
+        ));
+
+        // Selector lists are validated as a whole: one ellipsis at most, no more consumed axes than the rank, and a
+        // nonzero slice step.
+        assert!(matches!(
+            input.at(&index![..., ...]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index selection contains more than one ellipsis",
+        ));
+        assert!(matches!(
+            input.at(&index![0, 0]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index selection consumes 2 axes but input rank is 1",
+        ));
+        assert!(matches!(
+            input.at(&index![.. by 0]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index slice step must not be zero",
+        ));
+
+        // Query arrays must be integers, and concrete masks must match the axes they consume.
         let boolean = Array::vector(vec![true, false, true]).unwrap();
-        assert!(
-            matches!(input.at(&index![&boolean]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index arrays must have an integer data type; use `IndexMask` for concrete Boolean masks")
-        );
+        assert!(matches!(
+            input.at(&index![&boolean]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index arrays must have an integer data type; use `IndexMask` for concrete Boolean masks",
+        ));
         let mask = IndexMask::new(vec![2], vec![true, false]).unwrap();
-        assert!(
-            matches!(input.at(&index![&mask]).get(&GatherOptions::new()), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index mask shape does not match the consumed input axes")
-        );
-        let fill =
-            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(0_f32).unwrap())) });
-        assert!(
-            matches!(input.at(&index![..]).get(&fill), Err(ProgramError::Type(TypeError::Invalid { message })) if message == "index fill must be a scalar of the input data type")
-        );
+        assert!(matches!(
+            input.at(&index![&mask]).get(&GatherOptions::new()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "index mask shape does not match the consumed input axes",
+        ));
     }
 
     #[test]
@@ -2008,7 +2063,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             program.to_string(),
-            indoc::indoc! {"
+            indoc! {"
                 lambda %0:f64[2, 3], %1:i32[2] .
                 let %2:i64[2] = convert_element_type [data_type=i64] %1
                     %3:i64[] = constant [value=0]
@@ -2066,6 +2121,205 @@ mod tests {
                 ArrayIrValue::Array(Array::vector(Vec::<i32>::new()).unwrap()),
             )),
             Ok(ArrayIrValue::Array(Array::matrix(2, 0, Vec::<f64>::new()).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_indexed_get_staging_symbolic_selections() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]),
+        ));
+        let matrix = ArrayIrValue::Array(Array::matrix(2, 3, vec![10_f64, 20., 30., 40., 50., 60.]).unwrap());
+
+        // A host integer index lifts a portable literal, counts from the end through the retained extent, and
+        // gathers along the symbolic axis.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.at(&index![-1, ..]).get(&GatherOptions::new()),
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[rows, 3] .
+                let %1:i64[] = constant [value=-1]
+                    %2:dimension<rows ∈ [1, 6)> = dimension_size [axis=0] %0
+                    %3:i64[] = dimension_to_scalar %2
+                    %4:i64[] = transfer_to_memory [destination=Device] %3
+                    %5:i64[] = constant [value=0]
+                    %6:bool[] = compare [direction=LessThan] %1 %5
+                    %7:i64[] = add %1 %4
+                    %8:i64[] = select %6 %7 %1
+                    %9:dimension<3> = constant [value=3]
+                    %10:dimension<1> = constant [value=1]
+                    %11:i64[3, 1] = broadcast [output_axes=[]] %8 %9 %10
+                    %12:f64[3] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                        slice_sizes=[1, 1],
+                    ] %0 %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(matrix.clone()),
+            Ok(ArrayIrValue::Array(Array::vector(vec![40_f64, 50., 60.]).unwrap())),
+        );
+
+        // A reversed full slice composes with a query on another axis, and an inserted axis is restored last.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices)| input.at(&index![..by - 1, &indices]).get(&GatherOptions::new()),
+            (input_type.clone(), ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]))),
+        )
+        .unwrap();
+        let indices = ArrayIrValue::Array(Array::vector(vec![-1_i32, 0]).unwrap());
+        assert_eq!(
+            program.interpret((matrix.clone(), indices.clone())),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![60_f64, 40., 30., 10.]).unwrap())),
+        );
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices)| input.at(&index![new_axis, .., &indices]).get(&GatherOptions::new()),
+            (input_type.clone(), ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((matrix.clone(), indices.clone())),
+            Ok(ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::F64, [1, 2, 2]), &[30_f64, 10., 60., 40.])
+                    .unwrap()
+            )),
+        );
+
+        // Bounds modes apply after normalization: an explicit fill replaces the out-of-range query.
+        let fill =
+            GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-1_f64).unwrap())) });
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            move |(input, indices)| input.at(&index![.., &indices]).get(&fill),
+            (input_type.clone(), ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((matrix.clone(), ArrayIrValue::Array(Array::vector(vec![-1_i32, 5]).unwrap()))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![30_f64, -1., 60., -1.]).unwrap())),
+        );
+
+        // An empty selector list is the identity on a symbolic input.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.at(&index![]).get(&GatherOptions::new()),
+            input_type,
+        )
+        .unwrap();
+        assert!(program.instructions().is_empty());
+        assert_eq!(program.interpret(matrix.clone()), Ok(matrix));
+    }
+
+    #[test]
+    fn test_indexed_get_staging_symbolic_validation() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]),
+        ));
+        let indices_type = ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2]));
+        let trace = |selectors: fn(&ArrayIrTracer, &ArrayIrTracer) -> Result<ArrayIrTracer, ProgramError>,
+                     indices_type: ArrayIrType| {
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                move |(input, indices)| selectors(&input, &indices),
+                (input_type.clone(), indices_type),
+            )
+            .map(|_| ())
+        };
+
+        // Only full forward or reverse slices, one indexed axis, and `i64`-representable host integers are supported.
+        assert_eq!(
+            trace(|input, _| input.at(&index![0.., ..]).get(&GatherOptions::new()), indices_type.clone()),
+            Err(TypeError::invalid("symbolic indexing currently requires full slices with step `1` or `-1`").into()),
+        );
+        assert_eq!(
+            trace(|input, _| input.at(&index![(i128::MAX), ..]).get(&GatherOptions::new()), indices_type.clone()),
+            Err(TypeError::invalid("symbolic indexing requires host integer indices representable as `i64`").into()),
+        );
+        assert_eq!(
+            trace(
+                |input, indices| input.at(&index![indices, indices]).get(&GatherOptions::new()),
+                indices_type.clone()
+            ),
+            Err(TypeError::invalid("symbolic indexing currently supports one indexed axis").into()),
+        );
+
+        // The in-bounds promise is checked against the largest admitted extent for host integers.
+        assert_eq!(
+            trace(|input, _| input.at(&index![9, ..]).get(&GatherOptions::new()), indices_type.clone()),
+            Err(TypeError::invalid("host integer index is out of bounds under `PromiseInBounds`").into()),
+        );
+
+        // Query arrays must be signed integers placed with the input, and masks need concrete geometry.
+        assert_eq!(
+            trace(
+                |input, indices| input.at(&index![.., indices]).get(&GatherOptions::new()),
+                ArrayIrType::Array(ArrayType::new_static(DataType::U32, [2])),
+            ),
+            Err(TypeError::invalid("symbolic indexing requires signed integer query arrays").into()),
+        );
+        assert_eq!(
+            trace(
+                |input, indices| input.at(&index![.., indices]).get(&GatherOptions::new()),
+                ArrayIrType::Array(
+                    ArrayType::new_static(DataType::I32, [2]).with_memory(Memory::Host { pinned: true }),
+                ),
+            ),
+            Err(TypeError::invalid("index arrays and input must share one memory space").into()),
+        );
+        assert_eq!(
+            trace(
+                |input, _| {
+                    let mask = IndexMask::new(vec![3], vec![true, false, true])?;
+                    input.at(&index![.., &mask]).get(&GatherOptions::new())
+                },
+                indices_type.clone(),
+            ),
+            Err(TypeError::invalid("index masks require a concrete input shape in symbolic indexing").into()),
+        );
+
+        // Selector-list structure errors share the concrete frontend's wording.
+        assert_eq!(
+            trace(|input, _| input.at(&index![0, 0, 0]).get(&GatherOptions::new()), indices_type.clone()),
+            Err(TypeError::invalid("index selection consumes 3 axes but input rank is 2").into()),
+        );
+        assert_eq!(
+            trace(|input, _| input.at(&index![..., ...]).get(&GatherOptions::new()), indices_type.clone()),
+            Err(TypeError::invalid("index selection contains more than one ellipsis").into()),
+        );
+
+        // Explicit placement and index promises are not remapped by the symbolic frontend yet.
+        assert_eq!(
+            trace(
+                |input, indices| input
+                    .at(&index![.., indices])
+                    .get(&GatherOptions::new().with_indices_are_sorted(true)),
+                indices_type.clone(),
+            ),
+            Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises"
+            )
+            .into()),
+        );
+        assert_eq!(
+            trace(
+                |input, indices| {
+                    let updates = ValueProjection::<ArrayType>::into_projected(indices.clone())?
+                        .convert_element_type(DataType::F64)?;
+                    let updates = <ArrayIrTracer as ValueProjection<ArrayType>>::from_projected(updates);
+                    input.at(&index![.., indices]).set(&updates, &ScatterOptions::new().with_unique_indices(true))
+                },
+                indices_type,
+            ),
+            Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises"
+            )
+            .into()),
         );
     }
 
@@ -2349,6 +2603,80 @@ mod tests {
                 ArrayIrValue::Array(Array::scalar(5_f64).unwrap()),
             )),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![15_f64, 20., 35., 45., 50., 65.]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_indexed_set_staging_symbolic() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6)).unwrap());
+        let input_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]),
+        ));
+        let matrix = ArrayIrValue::Array(Array::matrix(2, 3, vec![10_f64, 20., 30., 40., 50., 60.]).unwrap());
+        let indices = ArrayIrValue::Array(Array::vector(vec![-1_i32, 0]).unwrap());
+
+        // A reversed axis is reversed before the scatter and reversed back afterwards, so the result keeps the input
+        // geometry while the updates land in selection order.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices, updates)| input.at(&index![..by - 1, &indices]).set(&updates, &ScatterOptions::new()),
+            (
+                input_type.clone(),
+                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2])),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((
+                matrix.clone(),
+                indices.clone(),
+                ArrayIrValue::Array(Array::vector(vec![7_f64, 8.]).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![8_f64, 20., 7., 8., 50., 7.]).unwrap())),
+        );
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices, updates)| input.at(&index![..by - 1, &indices]).max(&updates, &ScatterOptions::new()),
+            (
+                input_type.clone(),
+                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2])),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((
+                matrix.clone(),
+                indices.clone(),
+                ArrayIrValue::Array(Array::vector(vec![70_f64, 80.]).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![80_f64, 20., 70., 80., 50., 70.]).unwrap())),
+        );
+
+        // Without a query, the whole array is updated through a zero-width index vector.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, updates)| input.at(&index![..by - 1]).set(&updates, &ScatterOptions::new()),
+            (input_type.clone(), ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((matrix.clone(), ArrayIrValue::Array(Array::scalar(5_f64).unwrap()))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![5_f64; 6]).unwrap())),
+        );
+
+        // An inserted axis is broadcast into the updates and removed again before the scatter.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices, updates)| input.at(&index![new_axis, .., &indices]).set(&updates, &ScatterOptions::new()),
+            (
+                input_type,
+                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((matrix, indices, ArrayIrValue::Array(Array::scalar(5_f64).unwrap()))),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![5_f64, 20., 5., 5., 50., 5.]).unwrap())),
         );
     }
 

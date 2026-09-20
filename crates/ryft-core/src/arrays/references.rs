@@ -2471,8 +2471,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        // Dynamic slicing clamps negative indices to the first row and oversized indices to the last row.
+
+        // Dynamic slicing counts a negative index from the end once, so `-1` selects the last row while `-8` stays
+        // negative and clamps to the first row; an oversized index clamps to the last row.
         for (index, selected, written, accumulated) in [
+            (-1, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
             (-8, vec![2.0, 3.0], vec![1.0, 20.0, 30.0, 4.0, 5.0, 6.0], vec![1.0, 22.0, 33.0, 4.0, 5.0, 6.0]),
             (1, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
             (80, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),

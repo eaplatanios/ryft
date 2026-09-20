@@ -267,7 +267,11 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         for input in &inputs[1..] {
             if P::batch_axis(input).axis().is_some() {
                 let input = project(pad_empty(P::value(input).clone())?)?;
-                arguments.push(lift(input.dynamic_slice(std::slice::from_ref(&index), &[1])?.reshape([])?));
+                // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
+                // gather path even when the mapped axis is dynamic.
+                let observation =
+                    input.dynamic_slice_with_negative_indices(std::slice::from_ref(&index), &[1], false)?;
+                arguments.push(lift(observation.reshape([])?));
             } else {
                 arguments.push(P::value(input).clone());
             }

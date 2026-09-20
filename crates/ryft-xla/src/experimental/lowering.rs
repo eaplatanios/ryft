@@ -3529,14 +3529,16 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping.
-/// Widen unsigned indices before clamping, and only then convert bounded starts to the common signed i64 carrier.
+/// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
+/// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
+/// before clamping, and only then are bounded starts converted to the common signed i64 carrier.
 fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
     starts: &[ValueRef<'b, 'c, 't>],
     start_types: &[ArrayType],
     sizes: &[usize],
+    allow_negative_indices: bool,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -3544,15 +3546,61 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     check_count!("input", starts, input_type.rank(), ProgramError);
     check_count!("input", start_types, input_type.rank(), ProgramError);
     check_count!("input", sizes, input_type.rank(), ProgramError);
+    // A signed start wraps only under the negative-index policy; unsigned starts cannot be negative and Boolean starts
+    // are predicate carriers that never wrap.
+    let wraps = |start_type: &ArrayType| {
+        allow_negative_indices && !start_type.data_type().is_unsigned() && start_type.data_type() != DataType::I1
+    };
     // Native clamping already has the right bounds for static inputs and uniformly typed ordinary signed indices.
-    // Keep that common path direct; unsigned extremes, predicate carriers, and mixed scalar types need normalization.
-    if input_type.static_shape().is_some()
+    // Keep that common path direct, wrapping negative starts in their own type when the static extents fit it;
+    // unsigned extremes, predicate carriers, mixed scalar types, and extents beyond the index type need normalization.
+    if let Some(static_shape) = input_type.static_shape()
         && start_types.first().is_none_or(|first| {
             matches!(first.data_type(), DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64)
                 && start_types.iter().all(|r#type| r#type.data_type() == first.data_type())
+                && static_shape
+                    .dimensions()
+                    .iter()
+                    .all(|extent| i64::try_from(*extent).is_ok_and(|extent| extent <= max_value(first.data_type())))
         })
     {
-        return Ok(starts.to_vec());
+        if !allow_negative_indices {
+            return Ok(starts.to_vec());
+        }
+        return starts
+            .iter()
+            .zip(start_types)
+            .enumerate()
+            .map(|(axis, (start, start_type))| {
+                let scalar_type = ArrayType::scalar(start_type.data_type());
+                let zero = lower_unplaced_constant_output(&[scalar_type.clone()], 0, block, context, location)?[0];
+                let extent = lower_unplaced_constant_output(
+                    &[scalar_type],
+                    static_shape[axis] as i64,
+                    block,
+                    context,
+                    location,
+                )?[0];
+                let negative = block
+                    .append_operation(stable_hlo::compare(
+                        *start,
+                        zero,
+                        stable_hlo::ComparisonDirection::LessThan,
+                        stable_hlo::ComparisonType::Signed,
+                        location,
+                    )?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let wrapped =
+                    block.append_operation(stable_hlo::add(*start, extent, location)?)?.result(0).unwrap().as_ref();
+                Ok(block
+                    .append_operation(stable_hlo::select(negative, wrapped, *start, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref())
+            })
+            .collect();
     }
     let signed_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
     starts
@@ -3573,6 +3621,28 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
                 start = block.append_operation(stable_hlo::negate(start, location)?)?.result(0).unwrap().as_ref();
             }
             let extent = lower_runtime_dimension_size_i64(input, axis, block, context, location)?;
+            let zero = lower_unplaced_constant_output(&[scalar_type], 0, block, context, location)?[0];
+            if wraps(start_type) {
+                // The start is a signed i64 here, like the extent: `select(start < 0, start + extent, start)`.
+                let negative = block
+                    .append_operation(stable_hlo::compare(
+                        start,
+                        zero,
+                        stable_hlo::ComparisonDirection::LessThan,
+                        stable_hlo::ComparisonType::Signed,
+                        location,
+                    )?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let wrapped =
+                    block.append_operation(stable_hlo::add(start, extent, location)?)?.result(0).unwrap().as_ref();
+                start = block
+                    .append_operation(stable_hlo::select(negative, wrapped, start, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+            }
             let size = lower_static_index_constants(&[*size], block, context, location)?[0];
             let maximum =
                 block.append_operation(stable_hlo::subtract(extent, size, location)?)?.result(0).unwrap().as_ref();
@@ -3581,7 +3651,6 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
                 .result(0)
                 .unwrap()
                 .as_ref();
-            let zero = lower_unplaced_constant_output(&[scalar_type], 0, block, context, location)?[0];
             let start =
                 block.append_operation(stable_hlo::maximum(start, zero, location)?)?.result(0).unwrap().as_ref();
             let start =
@@ -3593,6 +3662,17 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
                 .as_ref())
         })
         .collect()
+}
+
+/// Returns the largest value a signed integer start of `data_type` can hold, so static extents can be checked to fit
+/// the index type before a negative start is wrapped in that type.
+fn max_value(data_type: DataType) -> i64 {
+    match data_type {
+        DataType::I8 => i64::from(i8::MAX),
+        DataType::I16 => i64::from(i16::MAX),
+        DataType::I32 => i64::from(i32::MAX),
+        _ => i64::MAX,
+    }
 }
 
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
@@ -5688,6 +5768,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     &input_values[1..],
                     &lowerer.input_types[1..],
                     operation.sizes(),
+                    operation.allows_negative_indices(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -5700,7 +5781,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )?)?;
                 Ok(vec![result.result(0).unwrap().as_ref()])
             }
-            ArrayOperation::DynamicUpdateSlice(_) => {
+            ArrayOperation::DynamicUpdateSlice(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
                 check_count!("input", lowerer.input_types, output_types[0].rank() + 2, ProgramError);
@@ -5711,6 +5792,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     &input_values[2..],
                     &lowerer.input_types[2..],
                     &sizes,
+                    operation.allows_negative_indices(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -18004,7 +18086,7 @@ mod tests {
                 .add_instruction(DynamicSliceOperation::new(vec![1]), Vec::new(), vec![input, index], None)
                 .unwrap()[0];
             let updated = builder
-                .add_instruction(DynamicUpdateSliceOperation, Vec::new(), vec![input, update, index], None)
+                .add_instruction(DynamicUpdateSliceOperation::new(), Vec::new(), vec![input, update, index], None)
                 .unwrap()[0];
             let program = unproject_plain_program(
                 builder
@@ -22343,7 +22425,12 @@ mod tests {
             .add_instruction(DynamicSliceOperation::new(vec![1, 2]), Vec::new(), vec![input, index_0, index_1], None)
             .unwrap()[0];
         let dynamic_updated = builder
-            .add_instruction(DynamicUpdateSliceOperation, Vec::new(), vec![input, update, index_0, index_1], None)
+            .add_instruction(
+                DynamicUpdateSliceOperation::new(),
+                Vec::new(),
+                vec![input, update, index_0, index_1],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
@@ -22363,9 +22450,29 @@ mod tests {
                     %c = stablehlo.constant dense<0> : tensor<i64>
                     %c_0 = stablehlo.constant dense<1> : tensor<i64>
                     %1 = stablehlo.dynamic_update_slice %arg0, %arg1, %c, %c_0 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i64>, tensor<i64>) -> tensor<2x3xf32>
-                    %2 = stablehlo.dynamic_slice %arg0, %arg2, %arg3, sizes = [1, 2] : (tensor<2x3xf32>, tensor<i32>, tensor<i32>) -> tensor<1x2xf32>
-                    %3 = stablehlo.dynamic_update_slice %arg0, %arg1, %arg2, %arg3 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i32>, tensor<i32>) -> tensor<2x3xf32>
-                    return %0, %1, %2, %3 : tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_2 = stablehlo.constant dense<2> : tensor<i32>
+                    %2 = stablehlo.compare LT, %arg2, %c_1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %3 = stablehlo.add %arg2, %c_2 : tensor<i32>
+                    %4 = stablehlo.select %2, %3, %arg2 : tensor<i1>, tensor<i32>
+                    %c_3 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_4 = stablehlo.constant dense<3> : tensor<i32>
+                    %5 = stablehlo.compare LT, %arg3, %c_3, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %6 = stablehlo.add %arg3, %c_4 : tensor<i32>
+                    %7 = stablehlo.select %5, %6, %arg3 : tensor<i1>, tensor<i32>
+                    %8 = stablehlo.dynamic_slice %arg0, %4, %7, sizes = [1, 2] : (tensor<2x3xf32>, tensor<i32>, tensor<i32>) -> tensor<1x2xf32>
+                    %c_5 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_6 = stablehlo.constant dense<2> : tensor<i32>
+                    %9 = stablehlo.compare LT, %arg2, %c_5, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %10 = stablehlo.add %arg2, %c_6 : tensor<i32>
+                    %11 = stablehlo.select %9, %10, %arg2 : tensor<i1>, tensor<i32>
+                    %c_7 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_8 = stablehlo.constant dense<3> : tensor<i32>
+                    %12 = stablehlo.compare LT, %arg3, %c_7, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %13 = stablehlo.add %arg3, %c_8 : tensor<i32>
+                    %14 = stablehlo.select %12, %13, %arg3 : tensor<i1>, tensor<i32>
+                    %15 = stablehlo.dynamic_update_slice %arg0, %arg1, %11, %14 : (tensor<2x3xf32>, tensor<1x2xf32>, tensor<i32>, tensor<i32>) -> tensor<2x3xf32>
+                    return %0, %1, %8, %15 : tensor<1x2xf32>, tensor<2x3xf32>, tensor<1x2xf32>, tensor<2x3xf32>
                   }
                 }
             "#}
@@ -23075,8 +23182,13 @@ mod tests {
                     %c = stablehlo.constant dense<1> : tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                    %1 = stablehlo.dynamic_update_slice %0, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
-                    return %1 : tensor<4xf64>
+                    %c_0 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
+                    %1 = stablehlo.compare LT, %c, %c_0, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %2 = stablehlo.add %c, %c_1 : tensor<i32>
+                    %3 = stablehlo.select %1, %2, %c : tensor<i1>, tensor<i32>
+                    %4 = stablehlo.dynamic_update_slice %0, %arg0, %3 : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
+                    return %4 : tensor<4xf64>
                   }
                 }
             "#}
@@ -23122,10 +23234,20 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2xf64>, %arg1: tensor<5xf64>, %arg2: tensor<i32>) -> tensor<5xf64> {
-                    %0 = stablehlo.dynamic_slice %arg1, %arg2, sizes = [2] : (tensor<5xf64>, tensor<i32>) -> tensor<2xf64>
-                    %1 = stablehlo.add %0, %arg0 : tensor<2xf64>
-                    %2 = stablehlo.dynamic_update_slice %arg1, %1, %arg2 : (tensor<5xf64>, tensor<2xf64>, tensor<i32>) -> tensor<5xf64>
-                    return %2 : tensor<5xf64>
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %c_0 = stablehlo.constant dense<5> : tensor<i32>
+                    %0 = stablehlo.compare LT, %arg2, %c, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %1 = stablehlo.add %arg2, %c_0 : tensor<i32>
+                    %2 = stablehlo.select %0, %1, %arg2 : tensor<i1>, tensor<i32>
+                    %3 = stablehlo.dynamic_slice %arg1, %2, sizes = [2] : (tensor<5xf64>, tensor<i32>) -> tensor<2xf64>
+                    %4 = stablehlo.add %3, %arg0 : tensor<2xf64>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i32>
+                    %c_2 = stablehlo.constant dense<5> : tensor<i32>
+                    %5 = stablehlo.compare LT, %arg2, %c_1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %6 = stablehlo.add %arg2, %c_2 : tensor<i32>
+                    %7 = stablehlo.select %5, %6, %arg2 : tensor<i1>, tensor<i32>
+                    %8 = stablehlo.dynamic_update_slice %arg1, %4, %7 : (tensor<5xf64>, tensor<2xf64>, tensor<i32>) -> tensor<5xf64>
+                    return %8 : tensor<5xf64>
                   }
                 }
             "#},
