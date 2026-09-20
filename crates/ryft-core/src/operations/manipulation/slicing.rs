@@ -2576,8 +2576,6 @@ pub trait DynamicSlice: Sized {
     where
         Self: Value<Type = ArrayIrType>;
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Slices one axis with host-known indices while retaining every other runtime extent. This convenience constructs
     /// integer queries and uses [`DynamicGather`], sharing its gather/scatter transformation rules.
     ///
@@ -2587,6 +2585,30 @@ pub trait DynamicSlice: Sized {
     ///   - `start`: Non-negative inclusive start, no larger than `limit`.
     ///   - `limit`: Exclusive limit, which must be proven within the selected axis by its declared bounds.
     ///   - `stride`: Positive distance between selected elements. Indices do not wrap or clamp.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+    /// #     DimensionVariable, DynamicSlice, EagerContext, ProgramError, Shape, Trace,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Select columns 1 and 3 of every row. The staged program retains the symbolic row extent.
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6))?);
+    /// let shape = Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(4)]);
+    /// let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+    ///     |input| input.dynamic_slice_axis(1, 1, 4, 2),
+    ///     ArrayIrType::Array(ArrayType::new(DataType::F64, shape)),
+    /// )?;
+    /// let matrix = Array::matrix(2, 4, vec![0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])?;
+    /// assert_eq!(
+    ///     program.interpret(ArrayIrValue::Array(matrix))?,
+    ///     ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f64, 3.0, 5.0, 7.0])?),
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_slice_axis<A: Into<Axis>>(
         &self,
         axis: A,
@@ -2662,6 +2684,30 @@ pub trait DynamicSlice: Sized {
     ///   - `axis`: Input axis containing the index; negative axes count backward from the end.
     ///   - `index`: Non-negative coordinate that must be proven in bounds.
     ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{
+    /// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+    /// #     DimensionVariable, DynamicSlice, EagerContext, ProgramError, Shape, Trace,
+    /// # };
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Select column 3 of every row and drop the column axis. The staged program retains the symbolic row extent.
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6))?);
+    /// let shape = Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(4)]);
+    /// let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+    ///     |input| input.dynamic_index_axis(1, 3, false),
+    ///     ArrayIrType::Array(ArrayType::new(DataType::F64, shape)),
+    /// )?;
+    /// let matrix = Array::matrix(2, 4, vec![0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])?;
+    /// assert_eq!(
+    ///     program.interpret(ArrayIrValue::Array(matrix))?,
+    ///     ArrayIrValue::Array(Array::vector(vec![3.0f64, 7.0])?),
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
         Self: Value<Type = ArrayIrType>
@@ -2700,6 +2746,19 @@ pub trait DynamicSlice: Sized {
     ///   - `start`: Scalar integer array giving the start along `axis`.
     ///   - `size`: Static number of elements to extract along `axis`, at most the axis extent.
     ///   - `axis`: Axis to slice; negative axes count backward from the input rank.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // A start of `-2` counts from the end of the column axis, so the window covers the last two columns.
+    /// let matrix = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// let window = matrix.dynamic_slice_in_axis(&Array::scalar(-2i32)?, 2, 1)?;
+    /// assert_eq!(window, Array::matrix(2, 2, vec![2.0f64, 3.0, 5.0, 6.0])?);
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_slice_in_axis<A: Into<Axis>>(&self, start: &Self, size: usize, axis: A) -> Result<Self, ProgramError>
     where
         Self: Clone + Typed<Type = ArrayType> + ZeroLike,
@@ -2724,6 +2783,25 @@ pub trait DynamicSlice: Sized {
     ///   - `index`: Scalar integer array giving the position along `axis`.
     ///   - `axis`: Axis to index; negative axes count backward from the input rank.
     ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, DynamicSlice, ProgramError};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // An index of `-1` selects the last column; dropping the axis leaves one element per row.
+    /// let matrix = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+    /// assert_eq!(
+    ///     matrix.dynamic_index_in_axis(&Array::scalar(-1i32)?, 1, false)?,
+    ///     Array::vector(vec![3.0f64, 6.0])?,
+    /// );
+    /// assert_eq!(
+    ///     matrix.dynamic_index_in_axis(&Array::scalar(-1i32)?, 1, true)?,
+    ///     Array::matrix(2, 1, vec![3.0f64, 6.0])?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     fn dynamic_index_in_axis<A: Into<Axis>>(&self, index: &Self, axis: A, keep_axis: bool) -> Result<Self, ProgramError>
     where
         Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
@@ -2739,6 +2817,8 @@ pub trait DynamicSlice: Sized {
         output.reshape(dimensions)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the static extents of `input_type` for a window that spans every axis other than `axis` in full, naming
 /// `operation_name` in the diagnostic when another axis is dynamic.
